@@ -1,0 +1,36 @@
+[package]
+name = "glass-windows"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+glass-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "1"
+windows = { version = "0.58", features = [
+  "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Graphics_Dwm",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp",
+  # clipboard: CF_UNICODETEXT global memory clipboard
+  "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole",
+  # doctor: session (RemoteDesktop), WGC support probe, true build via RtlGetVersion
+  "Win32_System_RemoteDesktop", "Graphics_Capture",
+  "Wdk_System_SystemServices", "Win32_System_SystemInformation",
+] }
+
+# Only the on-box validation example (examples/onbox.rs) needs a PNG encoder to save captured
+# frames; the library itself has no image dependency. glass-core's `image` is webp-only, so the
+# example pulls the png feature for itself.
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# The onbox examples set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
+# onbox_a11y example also drives the UIA reader to validate the accessibility path on the box.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+glass-a11y-windows = { path = "../glass-a11y-windows" }

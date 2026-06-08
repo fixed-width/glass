@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux artifacts (gnu + musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Build (gnu)
+        run: cargo build --release -p glass-mcp --locked
+      - name: Build (musl, static)
+        run: cargo build --release -p glass-mcp --target x86_64-unknown-linux-musl --locked
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          pkg() { # <built-binary> <readme> <suffix>
+            local name="glass-mcp-${tag}-$3" dir
+            dir="dist/$name"
+            mkdir -p "$dir"
+            install -m0755 "$1" "$dir/glass-mcp"
+            strip "$dir/glass-mcp"
+            cp "packaging/$2" "$dir/README.md"
+            tar -C dist -czf "dist/$name.tar.gz" "$name"
+          }
+          pkg target/release/glass-mcp                          README-gnu.md  x86_64-linux-gnu
+          pkg target/x86_64-unknown-linux-musl/release/glass-mcp README-musl.md x86_64-linux-musl
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.tar.gz
+
+  windows:
+    name: windows artifact
+    # The shipped glass-mcp.exe statically links the MSVC CRT (.cargo/config.toml,
+    # +crt-static). Cut Windows releases ONLY here (not on a dev box) for consistent build
+    # provenance. Toolchain/CRT redistribution licensing has open questions to confirm
+    # before commercial GA — see /LICENSING.md.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Build
+        run: cargo build --release -p glass-mcp --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $name = "glass-mcp-$tag-x86_64-windows"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/release/glass-mcp.exe "dist/$name/glass-mcp.exe"
+          Copy-Item packaging/README-windows.md  "dist/$name/README.md"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.zip

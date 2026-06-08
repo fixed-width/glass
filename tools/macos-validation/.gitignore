@@ -1,0 +1,7 @@
+# compiled validation binaries (build with the commands in README.md)
+/capture_window
+/capture_on_vdisplay
+/inject_input
+/virtualdisplay
+/window_ops
+*.png

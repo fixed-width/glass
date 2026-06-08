@@ -1,0 +1,30 @@
+[package]
+name = "glass-core"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Don't run the lib's unit-test harness under `cargo bench` — it can't parse
+# criterion args (e.g. --save-baseline) and only the [[bench]] targets matter.
+[lib]
+bench = false
+
+[dependencies]
+thiserror.workspace = true
+image.workspace = true
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion = { workspace = true }
+serde_json.workspace = true
+
+[[bench]]
+name = "diff"
+harness = false
+
+[[bench]]
+name = "image_io"
+harness = false

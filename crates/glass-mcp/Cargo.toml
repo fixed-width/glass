@@ -1,0 +1,63 @@
+[package]
+name = "glass-mcp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["network"]
+network = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tokio-util",
+    "dep:futures",
+    "rmcp/transport-streamable-http-server",
+]
+
+[dependencies]
+glass-core.workspace = true
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+base64 = "0.22"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+tokio-util = { version = "0.7", optional = true }
+# Non-optional: the untrusted-conduit nonce (untrusted.rs, compiled in every build,
+# incl. --no-default-features) needs a CSPRNG, as does network token generation.
+rand = { version = "0.8" }
+futures = { version = "0.3", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+glass-x11 = { path = "../glass-x11" }
+glass-wayland = { path = "../glass-wayland" }
+glass-a11y-linux = { path = "../glass-a11y-linux" }
+glass-sandbox-linux.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+glass-windows = { path = "../glass-windows" }
+glass-a11y-windows = { path = "../glass-a11y-windows" }
+
+[build-dependencies]
+embed-manifest = "1"
+
+# Windows-host builds only: statically link just the VCRuntime, leaving the OS-provided
+# Universal CRT dynamic (so it still gets Windows Update security fixes). Pairs with the
+# `+crt-static` flag in .cargo/config.toml — metabuild() swaps the UCRT back to dynamic.
+[target.'cfg(windows)'.build-dependencies]
+static_vcruntime = "3.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+rmcp = { version = "1.7", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["full"] }
+# Named directly in tests/network_roundtrip.rs (the client transport is generic over
+# the HTTP client). Pinned to rmcp's reqwest line so cargo unifies on one copy; plain
+# loopback HTTP needs no TLS provider, so keep default-features off.
+reqwest = { version = "0.13", default-features = false }

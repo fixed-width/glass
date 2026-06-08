@@ -1,0 +1,141 @@
+//! glass-mcp library root. `main.rs` is a thin binary over this so the serve
+//! path is reachable from integration tests.
+
+pub mod cli;
+pub mod doctor;
+mod env;
+mod params;
+pub(crate) mod server;
+pub(crate) mod shutdown;
+mod tools;
+mod untrusted;
+#[cfg(feature = "network")]
+pub mod serve;
+
+use std::time::Duration;
+
+use anyhow::Context;
+use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
+#[cfg(target_os = "linux")]
+use glass_wayland::WaylandPlatform;
+#[cfg(target_os = "linux")]
+use glass_x11::X11Platform;
+use rmcp::transport::stdio;
+use rmcp::ServiceExt;
+
+use crate::server::GlassServer;
+
+#[cfg(not(any(target_os = "linux", windows)))]
+compile_error!(
+    "glass-mcp has no display backend for this target OS; add one (e.g. a macOS backend) \
+     plus its make_platform + doctor arms"
+);
+
+/// Construct a backend by name. The only place that knows the concrete backends;
+/// passed to `Glass` as a factory so the backend is built per `glass_start`.
+pub fn make_platform(backend: &str) -> Result<Backend> {
+    let platform: Box<dyn Platform + Send> = match backend {
+        #[cfg(target_os = "linux")]
+        "wayland" => Box::new(WaylandPlatform::new()?),
+        #[cfg(target_os = "linux")]
+        "x11" => Box::new(X11Platform::from_env()?),
+        #[cfg(windows)]
+        "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
+        other => {
+            #[cfg(target_os = "linux")]
+            let valid = "\"x11\" or \"wayland\"";
+            #[cfg(windows)]
+            let valid = "\"windows\"";
+            return Err(GlassError::Backend(format!("unknown backend {other:?}; use {valid}")));
+        }
+    };
+    // On Linux, AT-SPI serves both display backends, so the same reader is attached
+    // to each. It connects lazily on first snapshot; an absent a11y bus surfaces as
+    // AccessibilityUnavailable at call time, not here.
+    // Accessibility is per-OS: AT-SPI on Linux, UI Automation on Windows.
+    #[cfg(windows)]
+    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+        Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
+    #[cfg(target_os = "linux")]
+    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+        Some(Box::new(glass_a11y_linux::LinuxA11y::new()));
+    Ok(Backend { platform, accessibility })
+}
+
+/// Default backend name from `GLASS_BACKEND` (case-insensitive `wayland`/`windows`/`x11`).
+/// Unset defaults to the windows backend on a Windows host, else X11.
+pub fn default_backend(env: Option<&str>) -> &'static str {
+    match env {
+        Some(v) if v.eq_ignore_ascii_case("wayland") => "wayland",
+        Some(v) if v.eq_ignore_ascii_case("windows") => "windows",
+        Some(v) if v.eq_ignore_ascii_case("x11") => "x11",
+        None if cfg!(windows) => "windows",
+        _ => "x11",
+    }
+}
+
+/// `glass-mcp env [--json]`: print glass's configuration env vars (secrets redacted).
+pub fn run_env(json: bool) -> ! {
+    let current = |name: &str| env::current_from_env(name);
+    let out = if json { env::render_json(&current) } else { env::render_text(&current) };
+    print!("{out}");
+    std::process::exit(0);
+}
+
+/// Run the `doctor` subcommand and exit.
+pub fn run_doctor(deep: bool, json: bool) -> ! {
+    let backend = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
+    let diag = doctor::diagnose(deep);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diag).expect("serialize diagnosis"));
+    } else {
+        print!("{}", diag.render_text(backend));
+    }
+    std::process::exit(diag.exit_code(backend));
+}
+
+/// Build the `Glass` session manager (backend built lazily per `glass_start`).
+pub fn boot() -> Glass {
+    let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
+    let baselines = BaselineStore::new(".glass/baselines");
+    Glass::new(Box::new(make_platform), default, baselines, 10_000)
+}
+
+/// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
+pub async fn run_stdio(glass: Glass) -> anyhow::Result<()> {
+    let server = GlassServer::new(glass);
+    let sessions = server.sessions();
+    let service = server.serve(stdio()).await.context("starting the MCP stdio service")?;
+
+    let via_signal = tokio::select! {
+        r = service.waiting() => { r.context("serving MCP")?; false }
+        _ = shutdown::shutdown_signal() => {
+            eprintln!("glass: received shutdown signal; tearing down sessions");
+            true
+        }
+    };
+    shutdown::run_shutdown(sessions, Duration::from_secs(3)).await;
+    if via_signal {
+        std::process::exit(0);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_backend;
+
+    #[test]
+    fn defaults_to_x11_unless_wayland() {
+        assert_eq!(default_backend(Some("wayland")), "wayland");
+        assert_eq!(default_backend(Some("WAYLAND")), "wayland");
+        assert_eq!(default_backend(Some("windows")), "windows");
+        assert_eq!(default_backend(Some("WINDOWS")), "windows");
+        assert_eq!(default_backend(Some("x11")), "x11");
+        assert_eq!(default_backend(Some("nonsense")), "x11");
+        #[cfg(not(windows))]
+        assert_eq!(default_backend(None), "x11");
+        #[cfg(windows)]
+        assert_eq!(default_backend(None), "windows");
+    }
+}

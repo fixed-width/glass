@@ -1,0 +1,13 @@
+[package]
+name = "glass-a11y-windows"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+glass-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uiautomation = { version = "0.25", features = ["process"] }

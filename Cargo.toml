@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux"]
+
+[workspace.package]
+edition = "2021"
+# Open core: Apache-2.0 (the patent grant matters for OS-level input/capture).
+# Future moat crates carry FSL-1.1-Apache-2.0; none exist yet.
+# Third-party deps stay permissive (MIT/Apache, no copyleft) per CLAUDE.md.
+# publish = false: open-source but not (yet) pushed to crates.io.
+license = "Apache-2.0"
+repository = "https://github.com/fixed-width/glass"
+publish = false
+
+[workspace.dependencies]
+thiserror = "1"
+image = { version = "0.25", default-features = false, features = ["webp"] }
+tempfile = "3"
+x11rb = { version = "0.13", features = ["xtest"] }
+glass-core = { path = "crates/glass-core" }
+glass-sandbox-linux = { path = "crates/glass-sandbox-linux" }
+glass-wayland = { path = "crates/glass-wayland" }
+glass-a11y-linux = { path = "crates/glass-a11y-linux" }
+atspi = { version = "0.30", features = ["tokio"] }
+atspi-common = "0.14"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# default features pull in `xkbcommon` (C lib) + `calloop` for SCTK's seat/keyboard,
+# which glass-wayland doesn't use (it binds raw wl_seat + zwp_virtual_keyboard and
+# generates its own XKB keymap string). Dropping them removes the libxkbcommon C
+# dependency, keeping the binary free of dynamic C libs (enables fully static musl).
+smithay-client-toolkit = { version = "0.20", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustix = { version = "1", features = ["process", "pipe", "event"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[profile.bench]
+debug = true

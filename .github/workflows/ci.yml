@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A newer push to the same ref supersedes in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build · clippy · test
+    runs-on: ubuntu-latest
+    # The Cargo workspace is at the repo root.
+    steps:
+      - uses: actions/checkout@v6
+      # rustup auto-installs the pinned toolchain + components from
+      # rust-toolchain.toml (single source of truth for the nightly).
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  x11:
+    name: X11 integration (Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Install system deps
+        # bubblewrap: sandbox_* integration tests need unprivileged user namespaces.
+        # Ubuntu 24.04 runners restrict them via AppArmor (bwrap then fails "setting up
+        # uid map: Permission denied"), so re-enable them (no-op on images without the knob).
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: ./scripts/test-x11.sh
+
+  wayland:
+    name: Wayland integration (sway)
+    runs-on: ubuntu-latest
+    # Runs the #[ignore]d Wayland suite (scripts/test-wayland.sh) against a prebuilt
+    # portable sway >=1.12 bundle from the sway-build repo's bundle-latest release
+    # (cage was retired; Ubuntu only ships sway 1.9). The bundle is extracted into the
+    # glass discovery location so test-wayland.sh finds it with zero config.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Install system deps
+        # The sway bundle resolves the Mesa/GL/EGL/gbm/drm stack from the host, so install
+        # the GLVND loaders + Mesa software EGL/DRI (not just libgl1-mesa-dri). Plus Xwayland
+        # for the app, and bubblewrap for sandbox_* — whose unprivileged user namespaces
+        # Ubuntu 24.04 restricts via AppArmor, so re-enable them (no-op if the knob is absent).
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Fetch prebuilt sway bundle
+        run: |
+          mkdir -p ~/.local/share/glass/sway
+          curl -fsSL https://github.com/xxx/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
+            | tar -C ~/.local/share/glass/sway -xz
+          ~/.local/share/glass/sway/bin/sway --version
+      - run: ./scripts/test-wayland.sh
+
+  windows:
+    name: Windows (build · clippy · test)
+    runs-on: windows-latest
+    # The Cargo workspace is at the repo root.
+    steps:
+      - uses: actions/checkout@v6
+      # rustup auto-installs the pinned toolchain from rust-toolchain.toml for the
+      # x86_64-pc-windows-msvc host (MSVC linker ships on the runner).
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # --workspace can't be used: glass-wayland/glass-testapp are Unix-only. Scope to
+      # the Windows crate closure with an explicit -p list (a future Unix-only crate
+      # won't get silently pulled, unlike --exclude). --all-targets compiles the
+      # glass-windows examples natively.
+      - run: cargo build  -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked
+      - run: cargo clippy -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked -- -D warnings
+      - run: cargo test   -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --locked
+
+  coverage:
+    name: coverage (report-only)
+    runs-on: ubuntu-latest
+    # Non-gating: a coverage report, never a merge blocker. The number undercounts
+    # by design (see scripts/coverage.sh): glass-windows Win32 FFI is
+    # cfg(windows) so it isn't measured here, and the Wayland suite needs sway >=1.12
+    # (not packaged on the runner) so it self-skips. Unit + X11 are measured.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Add llvm-tools (required by cargo-llvm-cov)
+        run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Install system deps
+        # xvfb + bubblewrap so the X11 integration suite (incl. sandbox_*) runs under coverage.
+        # Ubuntu 24.04 runners restrict unprivileged user namespaces via AppArmor; re-enable
+        # them for bubblewrap (no-op on images without the knob).
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
+        run: ./scripts/coverage.sh --lcov
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: target/llvm-cov/glass.lcov
+          if-no-files-found: warn

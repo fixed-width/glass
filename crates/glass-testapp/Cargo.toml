@@ -1,0 +1,28 @@
+[package]
+name = "glass-testapp"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+x11rb.workspace = true
+
+[dev-dependencies]
+glass-core.workspace = true
+tempfile.workspace = true
+glass-x11 = { path = "../glass-x11" }
+glass-wayland.workspace = true
+x11rb.workspace = true
+# Network pixel-over-HTTP e2e (tests/network.rs). `glass-mcp`'s `network`
+# feature is default-on. rmcp client transport is generic over the HTTP client;
+# reqwest is pinned to rmcp's line (default-features off; loopback needs no TLS)
+# so cargo unifies on one copy.
+glass-mcp = { path = "../glass-mcp" }
+rmcp = { version = "1.7", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", default-features = false }
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["webp"] }
+serde_json = "1"

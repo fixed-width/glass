@@ -1,0 +1,14 @@
+# Drop the `vcruntime140.dll` dependency from the shipped Windows `glass-mcp.exe`.
+#
+# A default windows-msvc build dynamically links `vcruntime140.dll` (the Visual C++
+# Redistributable piece), so on a clean machine that lacks the redist the binary fails to
+# load *before* `main` runs — and `glass-mcp doctor` can't diagnose its own missing
+# runtime. `+crt-static` here, paired with the `static_vcruntime` build-dependency
+# (glass-mcp/build.rs calls `metabuild()`), statically links *only* the VCRuntime while
+# leaving the Universal CRT (UCRT) DYNAMIC. The UCRT is a Windows 10/11 OS component, so
+# linking it dynamically is correct (no redundant copy; keeps its Windows Update security
+# fixes) — `metabuild()` swaps it back to dynamic on top of `+crt-static`. Net: no redist
+# needed, but the binary still imports the OS-provided `api-ms-win-crt-*` (that's expected).
+# Only affects the windows-msvc target; other targets are unchanged.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

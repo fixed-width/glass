@@ -1,0 +1,18 @@
+# Rust build output (workspace at repo root)
+/target
+**/*.rs.bk
+
+# glass working dir created in target projects
+.glass/
+
+# Profiling output (cargo-flamegraph / perf write these to the CWD)
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Coverage output (cargo-llvm-cov)
+*.profraw
+
+# Editor / OS cruft
+*.swp
+.DS_Store

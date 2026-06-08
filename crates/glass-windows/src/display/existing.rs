@@ -1,0 +1,19 @@
+use super::{DisplayProvider, ProvisionedDisplay};
+use glass_core::Result;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+};
+
+/// Use whatever display the logged-in interactive session already presents (real monitor,
+/// dummy plug, or — in a later plan — a pre-provisioned virtual display). No provisioning.
+pub(crate) struct ExistingDesktop;
+
+impl DisplayProvider for ExistingDesktop {
+    fn ensure(&mut self) -> Result<ProvisionedDisplay> {
+        // SAFETY: GetSystemMetrics is a pure query with no preconditions.
+        let w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(0) as u32;
+        // SAFETY: GetSystemMetrics is a pure query with no preconditions.
+        let h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(0) as u32;
+        Ok(ProvisionedDisplay { width: w, height: h })
+    }
+}

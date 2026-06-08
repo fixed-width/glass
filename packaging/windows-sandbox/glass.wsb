@@ -1,0 +1,31 @@
+<Configuration>
+  <!-- glass on Windows Sandbox — the strong-isolation (VM) tier.
+       The WHOLE stack (glass-mcp AND the target app) runs INSIDE this disposable
+       Hyper-V VM; your AI agent connects from the host over glass's network transport.
+       Edit the placeholders below, then double-click this file.
+       Requires Windows Pro/Enterprise/Education with the "Windows Sandbox" feature. -->
+  <VGpu>Enable</VGpu>
+  <!-- Networking: Enable = the in-VM app has network (like sandbox=default).
+       Set to Disable for a no-egress posture (the Windows Sandbox analog of strict). -->
+  <Networking>Enable</Networking>
+  <MappedFolders>
+    <MappedFolder>
+      <!-- PLACEHOLDER: a host folder holding glass-mcp.exe and a bearer-token file `token`. -->
+      <HostFolder>C:\glass</HostFolder>
+      <SandboxFolder>C:\glass</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <!-- PLACEHOLDER: the host folder with the app (and/or its build) you want glass to drive. -->
+      <HostFolder>C:\app</HostFolder>
+      <SandboxFolder>C:\app</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <!-- Auto-start glass over HTTP inside the VM. Bind 0.0.0.0 ONLY because this is an
+         isolated VM; the token is required for a non-loopback bind. See README.md for how
+         the host-side agent connects and generates the token. -->
+    <Command>cmd /c start "" C:\glass\glass-mcp.exe serve --http --addr 0.0.0.0:7300 --token-file C:\glass\token</Command>
+  </LogonCommand>
+</Configuration>
