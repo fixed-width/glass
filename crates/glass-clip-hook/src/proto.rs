@@ -310,6 +310,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversize_item_count() {
+        // count > 4096 is rejected BEFORE any per-item allocation (no pre-alloc amplification).
+        let mut b = vec![VERSION, 1 /*SetAll*/];
+        b.extend_from_slice(&5000u32.to_le_bytes()); // huge count, no item bytes follow
+        assert!(matches!(Request::decode(&b), Err(ProtoError::TooLarge(_))));
+        // same guard on the Formats response.
+        let mut f = vec![VERSION, 1 /*Formats*/];
+        f.extend_from_slice(&5000u32.to_le_bytes());
+        assert!(matches!(Response::decode(&f), Err(ProtoError::TooLarge(_))));
+    }
+
+    #[test]
+    fn rejects_oversize_name() {
+        // a Named key length over MAX_NAME_BYTES is rejected before the name bytes are read.
+        let mut b = vec![VERSION, 3 /*Get*/, 1 /*Named*/];
+        b.extend_from_slice(&((MAX_NAME_BYTES + 1) as u32).to_le_bytes());
+        assert!(matches!(Request::decode(&b), Err(ProtoError::TooLarge(_))));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // ~96 MiB buffer — too slow under the Miri interpreter
+    fn rejects_oversize_total() {
+        // 3 items each just under MAX_ITEM_BYTES → aggregate exceeds MAX_TOTAL_BYTES.
+        let chunk = MAX_ITEM_BYTES - 1;
+        let mut b = vec![VERSION, 1 /*SetAll*/];
+        b.extend_from_slice(&3u32.to_le_bytes());
+        for _ in 0..3 {
+            b.push(0); // Standard
+            b.extend_from_slice(&1u32.to_le_bytes()); // id
+            b.extend_from_slice(&(chunk as u32).to_le_bytes());
+            b.resize(b.len() + chunk, 0u8);
+        }
+        assert!(matches!(Request::decode(&b), Err(ProtoError::TooLarge(_))));
+    }
+
+    #[test]
     fn frame_then_parse_round_trips() {
         let payload = Request::SetAll(sample()).encode();
         let framed = frame(&payload);
