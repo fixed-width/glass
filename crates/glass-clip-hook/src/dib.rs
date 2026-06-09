@@ -87,6 +87,9 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
 pub(crate) fn parse_dib(b: &[u8]) -> Option<DibInfo> {
     parse_with_header(b, BIH)
 }
+/// Used by the host-side server path (DIBV5→DIB narrowing) and the tests; the DLL hook only ever
+/// widens DIB→DIBV5, so this is dead on a non-test DLL-only build.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_dibv5(b: &[u8]) -> Option<DibInfo> {
     parse_with_header(b, BV5)
 }
@@ -103,6 +106,9 @@ pub(crate) fn dib_to_dibv5(b: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// `CF_DIBV5` → `CF_DIB`: narrow the header back to 40 bytes; keep table + bits verbatim.
+///
+/// Used by the host-side server path + the tests; the DLL hook only ever widens DIB→DIBV5.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dibv5_to_dib(b: &[u8]) -> Option<Vec<u8>> {
     let d = parse_dibv5(b)?;
     let mut out = vec![0u8; BIH];

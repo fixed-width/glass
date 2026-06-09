@@ -16,6 +16,10 @@ pub(crate) fn utf16_nul_to_string(units: &[u16]) -> String {
 
 /// Decode a `CF_TEXT`/`CF_OEMTEXT` block (the whole locked buffer, as bytes) to a `String`, stopping
 /// at the first NUL. v1 treats each byte as ANSI/Latin-1: every byte maps 1:1 to a `char`.
+///
+/// The v2 hook no longer down/up-converts single-byte text in Rust (it defers to the OS code page
+/// via `WideCharToMultiByte`); kept for the tests that pin the pure decode behavior.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn singlebyte_nul_to_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     bytes[..end].iter().map(|&b| b as char).collect()
@@ -30,6 +34,7 @@ pub(crate) fn string_to_utf16_nul(text: &str) -> Vec<u16> {
 /// ASCII-only: any non-ASCII char becomes `'?'` (lossy). NB this is *lossier* than
 /// [`singlebyte_nul_to_string`], which round-trips full Latin-1 — encode and decode are asymmetric
 /// by design in v1 (we only ever populate the store from CF_UNICODETEXT in practice).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn string_to_singlebyte_nul(text: &str) -> Vec<u8> {
     text.chars()
         .map(|c| if (c as u32) < 0x80 { c as u8 } else { b'?' })
