@@ -127,7 +127,8 @@ impl Sandboxie {
         }
         let pipe = config::clip_pipe_name(&self.box_name);
         let store = PrivateClipboard::new();
-        let server = ClipServer::start(&pipe, store.clone()).ok()?;
+        let server =
+            ClipServer::start(&pipe, store.clone(), self.dir.clone(), self.box_name.clone()).ok()?;
         let sbieini = sbieini(&self.dir);
         for (k, v) in config::clip_layer2_lines(&self.box_name, &dll) {
             if self.run_sbie(&sbieini, &["set", &self.box_name, &k, &v]).is_err() {

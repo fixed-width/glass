@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use glass_clip_hook::proto::{self, Request, Response};
 use glass_clip_hook::store::PrivateClipboard;
@@ -18,19 +19,18 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
-/// SDDL for the pipe DACL: Everyone (WD) + SYSTEM generic-all. Everyone is required, not just the
-/// owner: the Sandboxie box runs the client under a **restricted** token (even with
-/// KeepTokenIntegrity=y), whose access check is satisfied only by a SID in its *restricting* set —
-/// an owner-only DACL is denied. The pipe name is per-box and ephemeral and only ever carries this
-/// box's own clipboard text on the local machine, so Everyone-on-a-named-pipe is acceptable for v1
-/// (a local process would also have to guess the per-box name). Tightening to the box SID is a
-/// follow-up.
+/// SDDL for the pipe DACL: Everyone (WD) + SYSTEM generic-all. Everyone is required merely so the
+/// box's client can *connect*: with `KeepTokenIntegrity=y` the Sandboxie token's access check is
+/// satisfied only by a SID in its restricting set, so an owner-only DACL is denied. The DACL is
+/// therefore NOT the authorization boundary — every connection is gated by [`client_in_box`], which
+/// verifies the client PID belongs to THIS Sandboxie box (`Start.exe /listpids`) before a request is
+/// honored. So an ordinary local process that guessed the per-box pipe name is rejected.
 const PIPE_SDDL: &str = "D:(A;;GA;;;WD)(A;;GA;;;SY)";
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -45,15 +45,21 @@ pub(crate) struct ClipServer {
 }
 
 impl ClipServer {
-    /// Start the accept loop for `pipe_name` (e.g. `glass-clip-glass_1234`), serving `store`.
-    pub(crate) fn start(pipe_name: &str, store: PrivateClipboard) -> Result<ClipServer> {
+    /// Start the accept loop for `pipe_name` (e.g. `glass-clip-glass_1234`), serving `store`. `dir`
+    /// + `box_name` identify the Sandboxie box so each connection can be gated to its members.
+    pub(crate) fn start(
+        pipe_name: &str,
+        store: PrivateClipboard,
+        dir: String,
+        box_name: String,
+    ) -> Result<ClipServer> {
         let pipe_path = format!(r"\\.\pipe\{pipe_name}");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
         let path_t = pipe_path.clone();
         let thread = std::thread::Builder::new()
             .name(format!("glass-clip:{pipe_name}"))
-            .spawn(move || accept_loop(&path_t, store, stop_t))
+            .spawn(move || accept_loop(&path_t, store, stop_t, dir, box_name))
             .map_err(|e| GlassError::Backend(format!("spawn clip server: {e}")))?;
         Ok(ClipServer { pipe_path, stop, thread: Some(thread) })
     }
@@ -119,12 +125,22 @@ fn make_security() -> Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
     Ok((sa, psd))
 }
 
-fn accept_loop(pipe_path: &str, store: PrivateClipboard, stop: Arc<AtomicBool>) {
+fn accept_loop(
+    pipe_path: &str,
+    store: PrivateClipboard,
+    stop: Arc<AtomicBool>,
+    dir: String,
+    box_name: String,
+) {
     let wide = to_wide(pipe_path);
     let (sa, psd) = match make_security() {
         Ok(v) => v,
         Err(_) => return, // server unavailable → Layer-1-only (user still protected)
     };
+    // Cache the box's PID set briefly: the gate needs it per connection, but `Start.exe /listpids`
+    // is a subprocess, so refresh at most ~twice a second (clipboard ops are rare; the box's pids
+    // are stable within a session).
+    let mut pids: (Instant, Vec<u32>) = (Instant::now(), Vec::new());
     while !stop.load(Ordering::Relaxed) {
         use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         // SAFETY: classic CreateNamedPipeW; `wide` is NUL-terminated; sa points at a live SD.
@@ -154,7 +170,10 @@ fn accept_loop(pipe_path: &str, store: PrivateClipboard, stop: Arc<AtomicBool>) 
             break;
         }
         if connected {
-            serve_one(pipe, &store);
+            if pids.1.is_empty() || pids.0.elapsed() > Duration::from_millis(500) {
+                pids = (Instant::now(), box_pids(&dir, &box_name));
+            }
+            serve_one(pipe, &store, &pids.1);
         }
         // SAFETY: done with this instance.
         unsafe {
@@ -170,18 +189,54 @@ fn accept_loop(pipe_path: &str, store: PrivateClipboard, stop: Arc<AtomicBool>) 
     }
 }
 
+/// The box's current PID set via `Start.exe /box:<box> /listpids` — the authoritative Sandboxie
+/// membership list (the same call the backend uses for discovery). Empty on any failure, so the
+/// gate fails closed.
+fn box_pids(dir: &str, box_name: &str) -> Vec<u32> {
+    match std::process::Command::new(format!(r"{dir}\Start.exe"))
+        .args([&format!("/box:{box_name}"), "/listpids"])
+        .output()
+    {
+        Ok(out) => super::config::parse_listpids(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Authorization gate: is the connected pipe client a process inside THIS Sandboxie box?
+///
+/// The broad pipe DACL only lets the box connect at all (its `KeepTokenIntegrity` token fails an
+/// owner-only DACL); this membership check is the real boundary. We look up the client PID
+/// (`GetNamedPipeClientProcessId`) and require it to be in the box's `/listpids` set — so an
+/// ordinary local process that guessed the per-box pipe name is rejected. Fail closed on any error.
+fn client_in_box(pipe: HANDLE, box_pids: &[u32]) -> bool {
+    let mut pid = 0u32;
+    // SAFETY: writes the connected client's PID into `pid`; returns Err if there is no client.
+    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.is_err() || pid == 0 {
+        return false;
+    }
+    box_pids.contains(&pid)
+}
+
 /// Read one length-prefixed request, apply it, write the length-prefixed response.
-fn serve_one(pipe: HANDLE, store: &PrivateClipboard) {
+fn serve_one(pipe: HANDLE, store: &PrivateClipboard, box_pids: &[u32]) {
     let Some(body) = read_frame(pipe) else { return };
+    // Authorization: only a process inside our Sandboxie box is served — the DACL merely lets the
+    // box connect; this is the boundary against any other local process (see [`client_in_box`]).
+    if !client_in_box(pipe, box_pids) {
+        return;
+    }
     let resp = match Request::decode(&body) {
         Ok(req) => store.apply(req),
         Err(_) => Response::Text(None), // skew/garbage → empty, never a crash
     };
     let out = proto::frame(&resp.encode());
     let mut written = 0u32;
-    // SAFETY: writing `out` to a connected pipe instance we own.
+    // SAFETY: write the response, then FlushFileBuffers — it blocks until the client has read all
+    // the bytes. Without it, the caller's DisconnectNamedPipe can fire first and DISCARD the unread
+    // response (the read-back then comes back empty), which is timing-dependent and flaky.
     unsafe {
         let _ = WriteFile(pipe, Some(&out), Some(&mut written as *mut u32), None);
+        let _ = FlushFileBuffers(pipe);
     }
 }
 
