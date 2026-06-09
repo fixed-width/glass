@@ -16,6 +16,25 @@ fn spec(run: Vec<String>, timeout_ms: u64) -> AppSpec {
     AppSpec { build: None, run, cwd: None, env: vec![], window_hint: None, timeout_ms, sandbox: glass_core::SandboxLevel::Off }
 }
 
+/// `start_app`, but dump the captured sway/Xwayland/app logs before panicking on
+/// failure. A failed launch otherwise surfaces only as a bare `Timeout(ms)` (the
+/// window never reached sway's tree) with no clue why. The captured buffer holds
+/// sway's and Xwayland's stderr plus the app's own stdout/stderr (all piped through
+/// sway), so a CI flake here names which layer failed instead of being opaque.
+fn start(p: &mut WaylandPlatform, spec: &AppSpec) -> glass_core::WindowGeometry {
+    match p.start_app(spec) {
+        Ok(geom) => geom,
+        Err(e) => {
+            eprintln!("\nstart_app failed: {e}\n--- captured sway/Xwayland/app logs ---");
+            for (stream, line) in p.drain_logs() {
+                eprintln!("  [{stream:?}] {line}");
+            }
+            eprintln!("--- end captured logs ---");
+            panic!("start_app failed: {e}");
+        }
+    }
+}
+
 fn drain_until(p: &mut WaylandPlatform, needle: &str, tries: u32) -> bool {
     for _ in 0..tries {
         for (_s, line) in p.drain_logs() {
@@ -47,9 +66,7 @@ fn list_until(p: &mut WaylandPlatform, n: usize, tries: u32) -> Vec<glass_core::
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn launches_app_and_reports_window_geometry() {
     let mut p = WaylandPlatform::new().unwrap();
-    let geom = p
-        .start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS))
-        .unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    let geom = start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     // Per-window geometry: the floating glass-testapp at its natural 320x240,
     // not the 1280x720 headless output.
     assert_eq!((geom.width, geom.height), (320, 240));
@@ -67,7 +84,7 @@ fn pixel(f: &glass_core::Frame, x: u32, y: u32) -> [u8; 4] {
 fn captures_active_window_pixels() {
     use glass_core::Region;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     std::thread::sleep(std::time::Duration::from_millis(300)); // let the first draw land
 
@@ -98,7 +115,7 @@ fn captures_active_window_pixels() {
 fn click_reaches_the_app() {
     use glass_core::{MouseButton, PointerEvent};
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     p.send_pointer(&PointerEvent::Click { x: 30, y: 40, button: MouseButton::Left, count: 1, modifiers: vec![] })
         .unwrap();
@@ -111,7 +128,7 @@ fn click_reaches_the_app() {
 fn drag_emits_continuous_motion() {
     use glass_core::{MouseButton, PointerEvent};
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     p.send_pointer(&PointerEvent::Drag {
         from_x: 20,
@@ -143,7 +160,7 @@ fn drag_emits_continuous_motion() {
 fn scroll_reaches_the_app() {
     use glass_core::PointerEvent;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // A downward wheel step. Xwayland maps wl_pointer vertical axis to X11 button 5.
     p.send_pointer(&PointerEvent::Scroll { x: 30, y: 40, dx: 0, dy: 1, modifiers: vec![] }).unwrap();
@@ -189,7 +206,7 @@ fn start_app_failure_leaves_no_orphan() {
 fn types_text_reaches_the_app() {
     use glass_core::KeyEvent;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Type 'a' -> keysym 0x61 (97), mirroring the X11 keyboard test.
     p.send_key(&KeyEvent::Text("a".into())).unwrap();
@@ -202,7 +219,7 @@ fn types_text_reaches_the_app() {
 fn chord_reaches_the_app() {
     use glass_core::KeyEvent;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Press the Return chord -> keysym 0xff0d (65293).
     p.send_key(&KeyEvent::Chord("Return".into())).unwrap();
@@ -215,8 +232,7 @@ fn chord_reaches_the_app() {
 fn enumerates_selects_and_captures_multiple_windows() {
     use glass_core::WindowId;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string(), "--windows".into(), "2".into()], APP_TIMEOUT_MS))
-        .unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string(), "--windows".into(), "2".into()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
 
     // The 2nd Xwayland toplevel surfaces in sway's tree asynchronously; poll.
@@ -252,7 +268,7 @@ fn enumerates_selects_and_captures_multiple_windows() {
 fn modified_click_carries_modifier_state() {
     use glass_core::{Modifier, MouseButton, PointerEvent};
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Ctrl held -> the Xwayland app's ButtonPress.state has ControlMask (4).
     p.send_pointer(&PointerEvent::Click {
@@ -267,7 +283,7 @@ fn modified_click_carries_modifier_state() {
 fn resize_and_move_change_geometry() {
     use glass_core::WindowOp;
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
 
     // Resize the (floating) window via sway IPC; geometry reflects the new size.
@@ -290,7 +306,7 @@ fn resize_and_move_change_geometry() {
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn clipboard_set_then_get_roundtrips() {
     let mut p = WaylandPlatform::new().unwrap();
-    p.start_app(&spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS)).unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     p.set_clipboard("glass-wl-clip").unwrap();
     assert_eq!(p.get_clipboard().unwrap(), "glass-wl-clip");
@@ -318,8 +334,7 @@ fn sandbox_default_app_still_runs_and_captures() {
         timeout_ms: APP_TIMEOUT_MS,
         sandbox: glass_core::SandboxLevel::Default,
     };
-    let geom = p.start_app(&sandboxed_spec)
-        .unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
+    let geom = start(&mut p, &sandboxed_spec);
     assert_eq!((geom.width, geom.height), (320, 240), "window geometry");
     assert!(drain_until(&mut p, "READY", READY_TRIES), "never saw READY (sandboxed)");
     std::thread::sleep(std::time::Duration::from_millis(300)); // let the first draw land
@@ -400,9 +415,7 @@ fn wayland_build_step_runs_before_launch() {
         sandbox: glass_core::SandboxLevel::Default,
     };
     let mut p = WaylandPlatform::new().unwrap();
-    let geom = p
-        .start_app(&build_spec)
-        .unwrap_or_else(|e| panic!("start_app with build step failed: {e}"));
+    let geom = start(&mut p, &build_spec);
 
     // Build ran: marker must exist on the host (the tempdir was rw-bound).
     assert!(marker.exists(), "build marker not found — build step did not run before launch");
@@ -459,7 +472,6 @@ fn wayland_strict_blocks_network_in_build_step() {
         sandbox: glass_core::SandboxLevel::Default,
     };
     let mut p2 = WaylandPlatform::new().unwrap();
-    p2.start_app(&default_spec)
-        .unwrap_or_else(|e| panic!("build step with network under Default should succeed: {e}"));
+    start(&mut p2, &default_spec);
     p2.stop_app().unwrap();
 }

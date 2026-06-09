@@ -728,16 +728,30 @@ impl Platform for WaylandPlatform {
             std::thread::sleep(Duration::from_millis(8));
             Ok(())
         };
+        // Position the pointer at a window-relative point so the *next* button/axis
+        // routes to the window under it. sway (re)evaluates pointer focus only on
+        // motion, never on elapsed time: a surface that maps and settles under a
+        // now-stationary cursor never receives `enter`, and a one-shot button/axis
+        // sent to it is then silently dropped. So move there, let the surface settle,
+        // then re-assert with a 1px delta to force a fresh focus evaluation now that
+        // it is ready. Without this, fast back-to-back launch+click on a loaded host
+        // intermittently loses the very first click/scroll (the Wayland flake).
+        let position = |q: &mut EventQueue<State>, s: &mut State, x: i32, y: i32| -> Result<()> {
+            vp.motion_absolute(t, ax(x), ay(y), w, h);
+            vp.frame();
+            settle(q, s)?;
+            vp.motion_absolute(t, ax(x).saturating_sub(1), ay(y), w, h);
+            vp.frame();
+            vp.motion_absolute(t, ax(x), ay(y), w, h);
+            vp.frame();
+            settle(q, s)
+        };
         match *event {
             PointerEvent::Move { x, y } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
             }
             PointerEvent::Click { x, y, button, count, ref modifiers } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -759,9 +773,7 @@ impl Platform for WaylandPlatform {
             PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
                 let b = evdev_button(button);
                 let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
-                vp.motion_absolute(t, ax(path[0].0), ay(path[0].1), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, path[0].0, path[0].1)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -782,9 +794,7 @@ impl Platform for WaylandPlatform {
                 }
             }
             PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
