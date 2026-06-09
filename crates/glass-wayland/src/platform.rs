@@ -81,35 +81,39 @@ impl WaylandPlatform {
             owner.stop();
         }
         if let Some(mut s) = self.active.take() {
-            // sway is its own process-group leader (see build_sway_command), so
-            // its pid is also the pgid. Signal the whole group so Xwayland and
-            // the exec'd app go down with it; a bare child.kill() would SIGKILL
-            // only sway and orphan that subtree.
-            //
-            // SIGTERM first (graceful): sway shuts Xwayland down cleanly, which
-            // removes its /tmp/.X11-unix socket and fully releases its X display
-            // before the next session reuses it. A SIGKILL'd Xwayland leaks the
-            // socket and briefly holds the display in the *global* X namespace,
-            // which intermittently breaks the next Xwayland's window mapping.
-            // Fall back to SIGKILL if the group doesn't exit promptly.
-            if let Some(pgid) = Pid::from_raw(s.child.id() as i32) {
-                let _ = kill_process_group(pgid, Signal::TERM);
-                let deadline = Instant::now() + Duration::from_millis(2000);
-                loop {
-                    match s.child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) if Instant::now() >= deadline => {
-                            let _ = kill_process_group(pgid, Signal::KILL);
-                            break;
-                        }
-                        Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                        Err(_) => break,
-                    }
-                }
-            }
-            let _ = s.child.wait();
+            reap_group(&mut s.child);
         }
     }
+}
+
+/// Tear down a compositor session by its process group and reap the leader.
+///
+/// sway is its own process-group leader (see `build_sway_command`), so its pid is
+/// also the pgid. Signal the whole group so Xwayland and the exec'd app go down
+/// with it; a bare `child.kill()` would SIGKILL only sway and orphan that subtree.
+///
+/// SIGTERM first (graceful): sway shuts Xwayland down cleanly, which removes its
+/// /tmp/.X11-unix socket and fully releases its X display before the next session
+/// reuses it. A SIGKILL'd Xwayland leaks the socket and briefly holds the display
+/// in the *global* X namespace, which intermittently breaks the next Xwayland's
+/// window mapping. Fall back to SIGKILL if the group doesn't exit promptly.
+fn reap_group(child: &mut Child) {
+    if let Some(pgid) = Pid::from_raw(child.id() as i32) {
+        let _ = kill_process_group(pgid, Signal::TERM);
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = kill_process_group(pgid, Signal::KILL);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.wait();
 }
 
 impl Drop for WaylandPlatform {
@@ -450,6 +454,107 @@ fn open_session(
     Ok((conn, queue, state, manager, output, pointer, keyboard, ipc, output_size))
 }
 
+/// Spawn one per-session sway+Xwayland, connect, and discover the app's first
+/// window — the full compositor bring-up for `start_app`, factored out so it can
+/// be retried. On any failure the spawned compositor's process group is reaped, so
+/// a caller that retries never leaves an orphaned (or display-colliding) sway or
+/// Xwayland behind. `spec`'s build step is the caller's responsibility (it must run
+/// once, not per attempt).
+fn bring_up_session(
+    sway: &Path,
+    logs: &LogSink,
+    spec: &AppSpec,
+) -> Result<(ActiveSession, WindowGeometry)> {
+    let runtime_dir =
+        tempfile::Builder::new().prefix("glass-wl.").tempdir().map_err(GlassError::Io)?;
+
+    let config = runtime_dir.path().join("sway.cfg");
+    std::fs::write(&config, sway_config(spec, runtime_dir.path())).map_err(GlassError::Io)?;
+
+    let mut cmd = build_sway_command(sway, &config, spec, runtime_dir.path());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
+    if let Some(out) = child.stdout.take() {
+        spawn_reader(out, Stream::Stdout, logs.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        spawn_reader(err, Stream::Stderr, logs.clone());
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+    let socket = loop {
+        if let Some(s) = find_wayland_socket(runtime_dir.path()) {
+            break s;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = child.wait();
+            return Err(GlassError::AppExited(status.code()));
+        }
+        if Instant::now() >= deadline {
+            reap_group(&mut child);
+            return Err(GlassError::Timeout(spec.timeout_ms));
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    };
+
+    let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
+        match open_session(&socket, runtime_dir.path()) {
+            Ok(v) => v,
+            Err(e) => {
+                reap_group(&mut child);
+                return Err(e);
+            }
+        };
+    let socket_path = socket;
+
+    // Discover the initially-focused window (the app's first toplevel), so
+    // capture/input have an active target before the first list_windows.
+    let mut ids: HashMap<String, WindowId> = HashMap::new();
+    let mut next_id = 0u64;
+    let (active, active_rect) = {
+        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+        loop {
+            let _ = queue.roundtrip(&mut state); // keep the wayland queue serviced
+            let wins = ipc.windows().unwrap_or_default();
+            if let Some(w) = wins.iter().find(|w| w.focused).or_else(|| wins.first()) {
+                mint_id(&mut ids, &mut next_id, &w.identifier);
+                break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                let _ = child.wait();
+                return Err(GlassError::AppExited(status.code()));
+            }
+            if Instant::now() >= deadline {
+                reap_group(&mut child);
+                return Err(GlassError::Timeout(spec.timeout_ms));
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    };
+    let geometry = active_rect.clone();
+    let session = ActiveSession {
+        child,
+        _runtime_dir: runtime_dir,
+        socket_path,
+        conn,
+        queue,
+        state,
+        manager,
+        output,
+        pointer,
+        keyboard,
+        ipc,
+        output_size,
+        ids,
+        next_id,
+        active,
+        active_rect,
+        geometry: geometry.clone(),
+        time: 0,
+    };
+    Ok((session, geometry))
+}
+
 /// Write the keymap to an unlinked temp file and hand its fd to the compositor,
 /// then settle so Xwayland adopts the new mapping before any key events. No
 /// unsafe: tempfile gives a normal, mmap-able fd; XKB_V1 format == 1.
@@ -503,101 +608,36 @@ impl Platform for WaylandPlatform {
 
         // Run the build step (if any) before the compositor starts. The build is
         // sandboxed (bwrap) when sandbox != Off — same semantics as the X11 backend.
+        // Runs once: a retried compositor bring-up must not re-run the build.
         glass_sandbox_linux::run_build(spec)?;
 
-        let runtime_dir =
-            tempfile::Builder::new().prefix("glass-wl.").tempdir().map_err(GlassError::Io)?;
-
-        let config = runtime_dir.path().join("sway.cfg");
-        std::fs::write(&config, sway_config(spec, runtime_dir.path())).map_err(GlassError::Io)?;
-
-        let mut cmd = build_sway_command(&self.sway, &config, spec, runtime_dir.path());
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child =
-            cmd.spawn().map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
-        if let Some(out) = child.stdout.take() {
-            spawn_reader(out, Stream::Stdout, self.logs.clone());
+        // Bring up the per-session compositor, retrying a transient failure once.
+        // A freshly-spawned headless Xwayland occasionally crashes mid-startup
+        // ("failed to read Wayland events: Broken pipe") on the GPU-less CI renderer
+        // — after the app has already mapped its window — leaving sway alive but the
+        // window never stable in its tree, so discovery times out. The crash is rare
+        // and independent per spawn, so re-spawning a fresh compositor makes it
+        // reliable. Only transient bring-up failures retry (Timeout / Backend); a
+        // genuine app exit or a config/sandbox error fails immediately. `bring_up`
+        // reaps its own sway+Xwayland process group on failure, so a retry never
+        // races a leftover compositor.
+        const ATTEMPTS: u32 = 2;
+        let mut last_err = GlassError::Timeout(spec.timeout_ms);
+        for attempt in 0..ATTEMPTS {
+            match bring_up_session(&self.sway, &self.logs, spec) {
+                Ok((session, geometry)) => {
+                    self.active = Some(session);
+                    return Ok(geometry);
+                }
+                Err(e @ (GlassError::Timeout(_) | GlassError::Backend(_)))
+                    if attempt + 1 < ATTEMPTS =>
+                {
+                    last_err = e;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        if let Some(err) = child.stderr.take() {
-            spawn_reader(err, Stream::Stderr, self.logs.clone());
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
-        let socket = loop {
-            if let Some(s) = find_wayland_socket(runtime_dir.path()) {
-                break s;
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                let _ = child.wait();
-                return Err(GlassError::AppExited(status.code()));
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GlassError::Timeout(spec.timeout_ms));
-            }
-            std::thread::sleep(Duration::from_millis(40));
-        };
-
-        let opened = open_session(&socket, runtime_dir.path());
-        let (conn, mut queue, mut state, manager, output, pointer, keyboard, mut ipc, output_size) =
-            match opened {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e);
-                }
-            };
-        let socket_path = socket;
-
-        // Discover the initially-focused window (the app's first toplevel), so
-        // capture/input have an active target before the first list_windows.
-        let mut ids: HashMap<String, WindowId> = HashMap::new();
-        let mut next_id = 0u64;
-        let (active, active_rect) = {
-            let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
-            loop {
-                let _ = queue.roundtrip(&mut state); // keep the wayland queue serviced
-                let wins = ipc.windows().unwrap_or_default();
-                if let Some(w) = wins.iter().find(|w| w.focused).or_else(|| wins.first()) {
-                    mint_id(&mut ids, &mut next_id, &w.identifier);
-                    break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
-                }
-                if let Ok(Some(status)) = child.try_wait() {
-                    let _ = child.wait();
-                    return Err(GlassError::AppExited(status.code()));
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(GlassError::Timeout(spec.timeout_ms));
-                }
-                std::thread::sleep(Duration::from_millis(40));
-            }
-        };
-        let geometry = active_rect.clone();
-        self.active = Some(ActiveSession {
-            child,
-            _runtime_dir: runtime_dir,
-            socket_path,
-            conn,
-            queue,
-            state,
-            manager,
-            output,
-            pointer,
-            keyboard,
-            ipc,
-            output_size,
-            ids,
-            next_id,
-            active,
-            active_rect,
-            geometry: geometry.clone(),
-            time: 0,
-        });
-        Ok(geometry)
+        Err(last_err)
     }
 
     fn stop_app(&mut self) -> Result<()> {
@@ -728,16 +768,30 @@ impl Platform for WaylandPlatform {
             std::thread::sleep(Duration::from_millis(8));
             Ok(())
         };
+        // Position the pointer at a window-relative point so the *next* button/axis
+        // routes to the window under it. sway (re)evaluates pointer focus only on
+        // motion, never on elapsed time: a surface that maps and settles under a
+        // now-stationary cursor never receives `enter`, and a one-shot button/axis
+        // sent to it is then silently dropped. So move there, let the surface settle,
+        // then re-assert with a 1px delta to force a fresh focus evaluation now that
+        // it is ready. Without this, fast back-to-back launch+click on a loaded host
+        // intermittently loses the very first click/scroll (the Wayland flake).
+        let position = |q: &mut EventQueue<State>, s: &mut State, x: i32, y: i32| -> Result<()> {
+            vp.motion_absolute(t, ax(x), ay(y), w, h);
+            vp.frame();
+            settle(q, s)?;
+            vp.motion_absolute(t, ax(x).saturating_sub(1), ay(y), w, h);
+            vp.frame();
+            vp.motion_absolute(t, ax(x), ay(y), w, h);
+            vp.frame();
+            settle(q, s)
+        };
         match *event {
             PointerEvent::Move { x, y } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
             }
             PointerEvent::Click { x, y, button, count, ref modifiers } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -759,9 +813,7 @@ impl Platform for WaylandPlatform {
             PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
                 let b = evdev_button(button);
                 let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
-                vp.motion_absolute(t, ax(path[0].0), ay(path[0].1), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, path[0].0, path[0].1)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -782,9 +834,7 @@ impl Platform for WaylandPlatform {
                 }
             }
             PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
-                vp.motion_absolute(t, ax(x), ay(y), w, h);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
+                position(&mut session.queue, &mut session.state, x, y)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
