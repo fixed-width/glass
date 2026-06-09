@@ -26,9 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use glass_clip_hook::store::PrivateClipboard;
 use glass_core::logbuf::Stream;
 use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
 
+use super::clip_server::ClipServer;
 use super::config;
 use super::imp::LogSink;
 
@@ -107,6 +109,38 @@ pub(crate) struct Sandboxie {
 }
 
 impl Sandboxie {
+    /// Configure the private-clipboard hook for this box (Layer 2). Returns `Some((store, server,
+    /// pipe))` when the hook DLL is resolvable and the pipe server starts; `None` (Layer-1-only)
+    /// otherwise. Never fails the launch — a missing hook leaves the app clipboard-less but the
+    /// user's clipboard safe (Layer 1 already applied via box_settings).
+    fn setup_private_clipboard(&self) -> Option<(PrivateClipboard, ClipServer, String)> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
+        let dll = config::hook_dll_path(
+            std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(),
+            exe_dir.as_deref(),
+        )?;
+        if !Path::new(&dll).exists() {
+            crate::disclose_clip_disabled(&dll);
+            return None;
+        }
+        let pipe = config::clip_pipe_name(&self.box_name);
+        let store = PrivateClipboard::new();
+        let server =
+            ClipServer::start(&pipe, store.clone(), self.dir.clone(), self.box_name.clone()).ok()?;
+        let sbieini = sbieini(&self.dir);
+        for (k, v) in config::clip_layer2_lines(&self.box_name, &dll) {
+            if self.run_sbie(&sbieini, &["set", &self.box_name, &k, &v]).is_err() {
+                return None;
+            }
+        }
+        if self.run_sbie(&start_exe(&self.dir), &["/reload"]).is_err() {
+            return None;
+        }
+        Some((store, server, pipe))
+    }
+
     /// Run a Sandboxie CLI tool, mapping a spawn failure or non-zero exit to `Backend`.
     fn run_sbie(&self, exe: &str, args: &[&str]) -> Result<()> {
         let status = Command::new(exe)
@@ -200,6 +234,12 @@ impl Sandboxie {
     /// Launch the app contained, redirecting its stdio to files in a per-session log dir and
     /// tailing those files into `logs`. Returns the live handle.
     pub(crate) fn launch(&self, spec: &AppSpec, logs: LogSink) -> Result<SandboxieApp> {
+        // Layer-2 clipboard: configure the hook DLL + pipe server (best-effort; None = Layer-1-only).
+        // This writes clipboard ini lines and does a /reload BEFORE the logdir reload below,
+        // so both sets of ini changes land before the app is ever spawned.
+        let clip = self.setup_private_clipboard();
+        let clip_pipe = clip.as_ref().map(|(_, _, p)| p.clone());
+
         let logdir = std::env::temp_dir().join(&self.box_name);
         std::fs::create_dir_all(&logdir).map_err(|e| {
             GlassError::AppNotStarted(format!("create log dir {}: {e}", logdir.display()))
@@ -217,8 +257,9 @@ impl Sandboxie {
         let err_log = logdir.join("err.log");
 
         // Generate launch.cmd: optional cd, then the quoted exe + args with stdio redirected.
+        // Passes the clipboard pipe name (if Layer 2 is active) as GLASS_CLIP_PIPE env.
         let cmd_path = logdir.join("launch.cmd");
-        let script = super::config::build_launch_cmd(spec, &out_log, &err_log)?;
+        let script = super::config::build_launch_cmd_env(spec, &out_log, &err_log, clip_pipe.as_deref())?;
         std::fs::write(&cmd_path, script).map_err(|e| {
             GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display()))
         })?;
@@ -251,6 +292,7 @@ impl Sandboxie {
             inner,
             stop,
             tailers,
+            clip: clip.map(|(store, server, _)| (store, server)),
         })
     }
 }
@@ -332,6 +374,9 @@ pub(crate) struct SandboxieApp {
     inner: crate::process::LaunchedApp,
     stop: Arc<AtomicBool>,
     tailers: Vec<std::thread::JoinHandle<()>>,
+    /// Layer-2 private clipboard: the host store + its pipe server. `None` = Layer-1-only
+    /// (app clipboard disabled, user protected).
+    clip: Option<(PrivateClipboard, ClipServer)>,
 }
 
 impl SandboxieApp {
@@ -367,13 +412,21 @@ impl SandboxieApp {
         Ok(None)
     }
 
+    /// The clipboard routing for this contained app: `Some(store)` when Layer 2 is active,
+    /// `None` when Layer-1-only (the platform turns `None` into the "disabled" error — it must
+    /// never fall back to the user's real clipboard for a contained app).
+    pub(crate) fn private_clipboard(&self) -> Option<PrivateClipboard> {
+        self.clip.as_ref().map(|(store, _)| store.clone())
+    }
+
     /// Tear the box down, ordered so no log line is lost and no tailer outlives teardown:
     /// `/terminate` (stop the box producing output) → signal stop → **join** the tailers
-    /// (each does a final `drain()` of the real log files) → kill+reap the wrapper → remove
-    /// the log dir (only now that the tailers have exited and read everything) → clear the
-    /// box's config section so per-session `glass_<pid>` boxes don't accumulate in
-    /// `Sandboxie.ini` (`SbieIni set <box> * ""` — the maintainer's documented box-clear).
-    pub(crate) fn kill(self) {
+    /// (each does a final `drain()` of the real log files) → kill+reap the wrapper → stop
+    /// the clipboard pipe server → remove the log dir (only now that the tailers have exited
+    /// and read everything) → clear the box's config section so per-session `glass_<pid>`
+    /// boxes don't accumulate in `Sandboxie.ini` (`SbieIni set <box> * ""` — the
+    /// maintainer's documented box-clear).
+    pub(crate) fn kill(mut self) {
         let _ = Command::new(start_exe(&self.dir))
             .args([&format!("/box:{}", self.box_name), "/terminate"])
             .status();
@@ -382,6 +435,9 @@ impl SandboxieApp {
             let _ = h.join();
         }
         self.inner.kill();
+        if let Some((_, server)) = self.clip.take() {
+            server.stop();
+        }
         let _ = std::fs::remove_dir_all(&self.logdir);
         // Best-effort: remove the box's config section from Sandboxie.ini.
         let _ = Command::new(sbieini(&self.dir))

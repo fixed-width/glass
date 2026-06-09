@@ -1,0 +1,29 @@
+[package]
+name = "glass-clip-hook"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# cdylib = the injected DLL (glass_clip_hook.dll); rlib = the pure proto/store
+# modules reused by glass-windows (host side).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# pure modules (proto/store) need nothing beyond std.
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole",
+  "Win32_System_LibraryLoader",
+  # CreateFileW lives behind Win32_Security (SECURITY_ATTRIBUTES in its signature);
+  # ReadFile/WriteFile behind Win32_System_IO (OVERLAPPED) — both needed by the pipe client.
+  "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Security", "Win32_System_IO",
+] }
+# Inline detours. License verified permissive in this task's Step 6 (MIT/BSD); IAT fallback documented.
+# `static-detour` enables the `static_detour!` macro (the type-safe detour table); it pulls in the
+# `nightly` feature — fine, the workspace is pinned to nightly (rust-toolchain.toml).
+retour = { version = "0.3", features = ["static-detour"] }

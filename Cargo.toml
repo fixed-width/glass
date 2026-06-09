@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux"]
+members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux", "crates/glass-clip-hook"]
 
 [workspace.package]
 edition = "2021"

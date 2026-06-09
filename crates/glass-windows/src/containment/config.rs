@@ -99,6 +99,10 @@ pub(crate) fn box_settings(level: SandboxLevel) -> Vec<(&'static str, &'static s
         ("NotifyInternetAccessDenied", "n"),
         ("NotifyStartRunAccessDenied", "n"),
         ("AllowNetworkAccess", if net.allow_network_access { "y" } else { "n" }),
+        // Layer 1 (unconditional): block the boxed app from the user's global clipboard.
+        // A private clipboard is layered back on top by the InjectDll64 hook (Layer 2);
+        // if the hook is unavailable the app simply has no clipboard — the user's is safe.
+        ("OpenClipboard", "n"),
     ]
 }
 
@@ -126,6 +130,36 @@ pub(crate) fn pick_path(
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Per-box pipe name (no namespace prefix; the host opens `\\.\pipe\<name>`, the box reaches it
+/// via `OpenPipePath=\Device\NamedPipe\<name>`). Derived from the box name so it's unique/session.
+pub(crate) fn clip_pipe_name(box_name: &str) -> String {
+    format!("glass-clip-{box_name}")
+}
+
+/// Resolve the injected hook DLL.
+///
+/// Precedence: explicit (`GLASS_CLIP_HOOK_DLL`) > `<exe_dir>/glass_clip_hook.dll` > `None`
+/// (Layer-2 unavailable — Layer-1-only). Mirrors `sandboxie_dir`'s precedence, but returns
+/// `Option`: a missing DLL must NOT fail the launch (clipboard isn't core to running the app).
+pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Option<String> {
+    if let Some(e) = explicit {
+        return Some(e.to_string());
+    }
+    exe_dir.map(|d| format!("{d}/glass_clip_hook.dll"))
+}
+
+/// The Layer-2 SbieIni `(key,value)` lines: inject the hook DLL into every boxed process and let
+/// the box reach the host's clipboard pipe. (`GLASS_CLIP_PIPE` is set separately, in launch.cmd.)
+pub(crate) fn clip_layer2_lines(box_name: &str, dll_path: &str) -> Vec<(String, String)> {
+    vec![
+        ("InjectDll64".to_string(), dll_path.to_string()),
+        (
+            "OpenPipePath".to_string(),
+            format!("\\Device\\NamedPipe\\{}", clip_pipe_name(box_name)),
+        ),
+    ]
+}
+
 /// Characters in a `spec.run` token or `spec.cwd` that cannot be safely emitted into the
 /// generated `launch.cmd`, so a token containing any of them is rejected (fail-closed) rather
 /// than producing a script cmd.exe would mis-parse or that could inject a second command:
@@ -148,14 +182,23 @@ fn reject_unsafe_launch_token(s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the `launch.cmd` body: `@echo off`, an optional `cd /d "<cwd>"`, then the quoted
-/// exe + each quoted arg with stdout/stderr redirected to the log files.
+/// Build the `launch.cmd` body: `@echo off`, an optional leading `set "GLASS_CLIP_PIPE=<name>"`
+/// (when `clip_pipe` is `Some`), an optional `cd /d "<cwd>"`, then the quoted exe + each quoted
+/// arg with stdout/stderr redirected to the log files.
 ///
 /// Every token is wrapped in `"..."`. CMD treats most of its metacharacters (`& | < > ^`)
 /// literally inside a quoted token, so quoting handles those — but `"`, `%`, and embedded
 /// newlines cannot be made safe in this context (see [`FORBIDDEN_LAUNCH_CHARS`]), so any
 /// `spec.run` element or `spec.cwd` containing one is rejected with an honest error.
-pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -> Result<String> {
+///
+/// The pipe name is glass-generated (`glass-clip-<box>`), so it carries no injection risk and
+/// does not need token rejection. `build_launch_cmd` delegates here with `clip_pipe = None`.
+pub(crate) fn build_launch_cmd_env(
+    spec: &AppSpec,
+    out_log: &Path,
+    err_log: &Path,
+    clip_pipe: Option<&str>,
+) -> Result<String> {
     if let Some(cwd) = &spec.cwd {
         reject_unsafe_launch_token(&cwd.to_string_lossy())?;
     }
@@ -163,6 +206,9 @@ pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -
         reject_unsafe_launch_token(part)?;
     }
     let mut s = String::from("@echo off\r\n");
+    if let Some(pipe) = clip_pipe {
+        s.push_str(&format!("set \"GLASS_CLIP_PIPE={pipe}\"\r\n"));
+    }
     if let Some(cwd) = &spec.cwd {
         s.push_str(&format!("cd /d \"{}\"\r\n", cwd.display()));
     }
@@ -203,7 +249,7 @@ mod tests {
     #[test]
     fn launch_cmd_quotes_tokens_and_redirects() {
         let spec = launch_spec(vec!["C:\\Program Files\\app.exe".into(), "--flag".into()], None);
-        let script = build_launch_cmd(&spec, Path::new("out.log"), Path::new("err.log")).unwrap();
+        let script = build_launch_cmd_env(&spec, Path::new("out.log"), Path::new("err.log"), None).unwrap();
         assert!(script.starts_with("@echo off\r\n"), "script: {script:?}");
         assert!(script.contains("\"C:\\Program Files\\app.exe\" \"--flag\""), "script: {script:?}");
         assert!(script.contains("1>\"out.log\" 2>\"err.log\""), "script: {script:?}");
@@ -216,7 +262,7 @@ mod tests {
         for bad in ["a\"b", "a%PATH%b", "a\rb", "a\nb"] {
             let spec = launch_spec(vec!["app.exe".into(), bad.into()], None);
             assert!(
-                build_launch_cmd(&spec, Path::new("o"), Path::new("e")).is_err(),
+                build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).is_err(),
                 "run token {bad:?} must be rejected"
             );
         }
@@ -227,7 +273,7 @@ mod tests {
         for bad in ["C:\\a\"b", "C:\\%TEMP%", "C:\\a\rb", "C:\\a\nb"] {
             let spec = launch_spec(vec!["app.exe".into()], Some(bad));
             assert!(
-                build_launch_cmd(&spec, Path::new("o"), Path::new("e")).is_err(),
+                build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).is_err(),
                 "cwd {bad:?} must be rejected"
             );
         }
@@ -254,6 +300,17 @@ mod tests {
             decide(SandboxLevel::Strict, ProviderChoice::None, true),
             Decision::FailClosed(_)
         ));
+    }
+
+    #[test]
+    fn box_settings_always_blocks_user_clipboard() {
+        // Layer 1: the boxed app can never touch the user's clipboard, at any level.
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            assert!(
+                box_settings(level).contains(&("OpenClipboard", "n")),
+                "OpenClipboard=n must be set at {level:?}"
+            );
+        }
     }
 
     #[test]
@@ -291,5 +348,39 @@ mod tests {
         assert_eq!(pick_path(None, Some("Y"), Some("Z"), "D"), "Y");
         assert_eq!(pick_path(None, None, Some("Z"), "D"), "Z");
         assert_eq!(pick_path(None, None, None, "D"), "D");
+    }
+
+    #[test]
+    fn clip_pipe_name_is_per_box() {
+        assert_eq!(clip_pipe_name("glass_1234"), "glass-clip-glass_1234");
+    }
+
+    #[test]
+    fn hook_dll_path_precedence() {
+        // explicit env wins; else beside the exe; else None (Layer-2 unavailable).
+        assert_eq!(hook_dll_path(Some("X.dll"), Some("/exe/dir")), Some("X.dll".to_string()));
+        assert_eq!(hook_dll_path(None, Some("/exe/dir")), Some("/exe/dir/glass_clip_hook.dll".to_string()));
+        assert_eq!(hook_dll_path(None, None), None);
+    }
+
+    #[test]
+    fn layer2_box_lines_inject_and_open_pipe() {
+        let lines = clip_layer2_lines("glass_7", "C:\\g\\glass_clip_hook.dll");
+        assert!(lines.contains(&("InjectDll64".to_string(), "C:\\g\\glass_clip_hook.dll".to_string())));
+        assert!(lines.contains(&(
+            "OpenPipePath".to_string(),
+            "\\Device\\NamedPipe\\glass-clip-glass_7".to_string()
+        )));
+    }
+
+    #[test]
+    fn launch_cmd_sets_clip_pipe_env_when_present() {
+        let spec = launch_spec(vec!["app.exe".into()], None);
+        let with = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), Some("glass-clip-glass_9")).unwrap();
+        assert!(with.contains("set \"GLASS_CLIP_PIPE=glass-clip-glass_9\"\r\n"), "got: {with:?}");
+        // None → no env line (Layer-1-only), and the exe still runs.
+        let without = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).unwrap();
+        assert!(!without.contains("GLASS_CLIP_PIPE"), "got: {without:?}");
+        assert!(without.contains("\"app.exe\""));
     }
 }

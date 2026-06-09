@@ -4,15 +4,29 @@
 pub(crate) mod config;
 
 #[cfg(windows)]
-mod sandboxie;
+mod clip_server;
 
 #[cfg(windows)]
-pub(crate) use imp::{resolve_containment, Launched, LogSink};
+mod sandboxie;
+
+// On-box (LOTUS) deterministic validation of the private-clipboard hook. Compiled only for the
+// Windows test profile; the single test inside is `#[ignore]`d (needs Sandboxie + the built DLL).
+#[cfg(all(test, windows))]
+mod clip_onbox;
+
+#[cfg(windows)]
+pub(crate) use imp::{resolve_containment, ClipboardRoute, Launched, LogSink};
 
 // Re-export the Sandboxie availability/dir probes so the doctor can report posture
 // without reaching into the private `sandboxie` module path.
 #[cfg(windows)]
 pub(crate) use sandboxie::{available, sandboxie_dir};
+
+/// Resolve the clip hook DLL path the way the launcher does (env > exe dir > None), for doctor.
+#[cfg(windows)]
+pub(crate) fn config_hook_dll_path(exe_dir: Option<&str>) -> Option<String> {
+    config::hook_dll_path(std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(), exe_dir)
+}
 
 #[cfg(windows)]
 mod imp {
@@ -146,6 +160,29 @@ mod imp {
             match self {
                 Launched::Unconfined(a) => a.kill(),
                 Launched::Sandboxie(a) => a.kill(),
+            }
+        }
+    }
+
+    /// How a launched app's clipboard is served. The platform turns this into behavior; a contained
+    /// app must never read/write the user's real clipboard.
+    pub(crate) enum ClipboardRoute {
+        /// Unconfined (`sandbox=off`): the real OS clipboard (today's behavior; the explicit escape hatch).
+        RealOs,
+        /// Sandboxie + hook active: glass's private store.
+        Private(glass_clip_hook::store::PrivateClipboard),
+        /// Sandboxie, hook unavailable (Layer-1-only): clipboard is disabled — error, never the real clipboard.
+        DisabledContained,
+    }
+
+    impl Launched {
+        pub(crate) fn clipboard_route(&self) -> ClipboardRoute {
+            match self {
+                Launched::Unconfined(_) => ClipboardRoute::RealOs,
+                Launched::Sandboxie(a) => match a.private_clipboard() {
+                    Some(store) => ClipboardRoute::Private(store),
+                    None => ClipboardRoute::DisabledContained,
+                },
             }
         }
     }
