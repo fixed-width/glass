@@ -17,5 +17,8 @@ mod hook;
 #[cfg(windows)]
 #[no_mangle]
 pub extern "system" fn InjectDllMain(_h_sbie_dll: isize, _unused: usize) {
-    hook::init();
+    // A panic unwinding across this `extern "system"` frame into the host app would be UB.
+    // `catch_unwind` contains it (member-crate `panic = "abort"` is ignored by Cargo — only the
+    // workspace-root `[profile]` is honored — so we cannot rely on it).
+    let _ = std::panic::catch_unwind(hook::init);
 }

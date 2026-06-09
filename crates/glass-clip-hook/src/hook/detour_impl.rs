@@ -16,8 +16,9 @@ use retour::static_detour;
 use windows::Win32::Foundation::{GlobalFree, BOOL, HANDLE, HGLOBAL, HWND};
 
 use super::{
-    alloc_hglobal_for, is_text_format, read_utf16_from_hglobal, store_empty, store_get, store_seq,
-    store_set, user32_proc, CF_TEXT_ID, CF_UNICODETEXT_ID,
+    alloc_hglobal_for, is_text_format, read_singlebyte_from_hglobal, read_utf16_from_hglobal,
+    store_empty, store_get, store_seq, store_set, user32_proc, CF_OEMTEXT_ID, CF_TEXT_ID,
+    CF_UNICODETEXT_ID,
 };
 
 // Exact raw ABI signatures of the user32 exports (from windows-rs `link!` declarations).
@@ -75,96 +76,137 @@ fn free_cached_handle() {
 }
 
 /// Cache a freshly-allocated handle to be freed on the next open/empty/close.
+///
+/// NOTE: we free the previous handle on the NEXT `GetClipboardData` (via `cache_handle` →
+/// `free_cached_handle`) as well as on open/empty/close — slightly narrower than the Win32
+/// "valid until CloseClipboard" contract, but fine for the lock-copy-unlock pattern apps use.
 fn cache_handle(h: HGLOBAL) {
     free_cached_handle(); // never leak a prior one
     LAST_HANDLE.with(|c| c.set(h.0 as isize));
 }
 
 // ---- detour bodies ---------------------------------------------------------------------------
+//
+// Every detour body is wrapped in `catch_unwind`: a Rust panic unwinding across an `extern
+// "system"` frame into the host app is UB. `catch_unwind` contains it and we return the same
+// fail-soft default the body uses for a down pipe. (A member-crate `panic = "abort"` would NOT
+// help — Cargo only honors `[profile]` at the workspace root, so it is silently ignored.)
+// `AssertUnwindSafe` is sound here: on panic we return a safe default and mutate no shared
+// invariant, even though the closures touch raw pointers / thread-local `Cell`s.
 
 /// `OpenClipboard(hwnd)` → mark open; always succeed. Never touches the real clipboard.
 fn open_clipboard(_hwnd: HWND) -> BOOL {
-    free_cached_handle();
-    CLIP_OPEN.with(|c| c.set(true));
-    BOOL(1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        free_cached_handle();
+        CLIP_OPEN.with(|c| c.set(true));
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
 /// `CloseClipboard()` → mark closed; free the cached handle. Always succeed.
 fn close_clipboard() -> BOOL {
-    CLIP_OPEN.with(|c| c.set(false));
-    free_cached_handle();
-    BOOL(1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CLIP_OPEN.with(|c| c.set(false));
+        free_cached_handle();
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
 /// `EmptyClipboard()` → clear the host store; free the cached handle. Always succeed.
 fn empty_clipboard() -> BOOL {
-    store_empty();
-    free_cached_handle();
-    BOOL(1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store_empty();
+        free_cached_handle();
+        BOOL(1)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
-/// `SetClipboardData(fmt, h)` → for text formats with a non-NULL handle, read the UTF-16 text and
-/// store it. Returns `h` (the contract: the clipboard now "owns" it; we keep the store as the
-/// source of truth). `h == NULL` is delayed rendering — out of scope in v1: return NULL, no change.
-/// Non-text formats are ignored (return the handle unchanged, no store change).
+/// `SetClipboardData(fmt, h)` → for text formats with a non-NULL handle, read the text in the
+/// format's own encoding and store it. Returns `h` (the contract: the clipboard now "owns" it; we
+/// keep the store as the source of truth). `h == NULL` is delayed rendering — out of scope in v1:
+/// return NULL, no change. Non-text formats are ignored (return the handle unchanged).
+///
+/// v1 text-format handling: `CF_UNICODETEXT` reads as UTF-16; `CF_TEXT`/`CF_OEMTEXT` read as
+/// single-byte ANSI (the app's buffer is single-byte — reading it as UTF-16 would garble it).
 fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
-    if h.0.is_null() {
-        return HANDLE::default(); // delayed rendering unsupported (v1)
-    }
-    if is_text_format(fmt) {
-        if let Some(text) = read_utf16_from_hglobal(HGLOBAL(h.0)) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if h.0.is_null() {
+            return HANDLE::default(); // delayed rendering unsupported (v1)
+        }
+        let text = if fmt == CF_UNICODETEXT_ID {
+            read_utf16_from_hglobal(HGLOBAL(h.0))
+        } else if fmt == CF_TEXT_ID || fmt == CF_OEMTEXT_ID {
+            read_singlebyte_from_hglobal(HGLOBAL(h.0))
+        } else {
+            None // non-text format: ignore
+        };
+        if let Some(text) = text {
             store_set(&text);
         }
-    }
-    h
+        h
+    }))
+    .unwrap_or(HANDLE::default())
 }
 
 /// `GetClipboardData(fmt)` → for text formats, allocate a fresh `HGLOBAL` in the requested encoding
 /// from the host store, cache it (so the app needn't free it; we free on next open/empty/close),
 /// and return it. NULL if the store is empty, the format is non-text, or the pipe is down.
 fn get_clipboard_data(fmt: u32) -> HANDLE {
-    if !is_text_format(fmt) {
-        return HANDLE::default();
-    }
-    let Some(text) = store_get() else {
-        return HANDLE::default();
-    };
-    match alloc_hglobal_for(fmt, &text) {
-        Some(h) => {
-            cache_handle(h);
-            HANDLE(h.0)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !is_text_format(fmt) {
+            return HANDLE::default();
         }
-        None => HANDLE::default(),
-    }
+        let Some(text) = store_get() else {
+            return HANDLE::default();
+        };
+        match alloc_hglobal_for(fmt, &text) {
+            Some(h) => {
+                cache_handle(h);
+                HANDLE(h.0)
+            }
+            None => HANDLE::default(),
+        }
+    }))
+    .unwrap_or(HANDLE::default())
 }
 
 /// `IsClipboardFormatAvailable(fmt)` → TRUE iff a text format and the store is non-empty.
 fn is_clipboard_format_available(fmt: u32) -> BOOL {
-    BOOL((is_text_format(fmt) && store_get().is_some()) as i32)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        BOOL((is_text_format(fmt) && store_get().is_some()) as i32)
+    }))
+    .unwrap_or(BOOL(0))
 }
 
 /// `CountClipboardFormats()` → 2 (CF_UNICODETEXT + CF_TEXT) when the store has text, else 0.
 fn count_clipboard_formats() -> i32 {
-    if store_get().is_some() {
-        2
-    } else {
-        0
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if store_get().is_some() {
+            2
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(0)
 }
 
 /// `EnumClipboardFormats(prev)` → enumerate our synthesized text formats:
 /// 0 → CF_UNICODETEXT; CF_UNICODETEXT → CF_TEXT; anything else → 0 (end of list).
 fn enum_clipboard_formats(prev: u32) -> u32 {
-    match prev {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match prev {
         0 => CF_UNICODETEXT_ID,
         CF_UNICODETEXT_ID => CF_TEXT_ID,
         _ => 0,
-    }
+    }))
+    .unwrap_or(0)
 }
 
 /// `GetClipboardSequenceNumber()` → the host store's sequence number (bumps on every set/empty).
 fn get_clipboard_sequence_number() -> u32 {
-    store_seq()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(store_seq)).unwrap_or(0)
 }
 
 // ---- installation ----------------------------------------------------------------------------

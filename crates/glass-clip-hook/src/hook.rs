@@ -12,7 +12,9 @@
 use std::sync::OnceLock;
 
 use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{
+    CloseHandle, GlobalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
 };
@@ -48,8 +50,11 @@ pub(crate) fn init() {
     if name.is_empty() {
         return;
     }
-    let _ = PIPE.set(format!(r"\\.\pipe\{name}"));
-    detour_impl::install();
+    // Only install detours when we newly set the pipe — a second `init()` (re-injection) must not
+    // re-patch already-enabled hooks.
+    if PIPE.set(format!(r"\\.\pipe\{name}")).is_ok() {
+        detour_impl::install();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -161,6 +166,8 @@ pub(crate) fn store_empty() {
 
 pub(crate) fn store_seq() -> u32 {
     match rpc(Request::Seq) {
+        // u64→u32 truncation is fine: this feeds Win32 GetClipboardSequenceNumber (also u32) and
+        // only drives change-detection, so a wrap every 4 billion sets is harmless.
         Some(Response::Seq(n)) => n as u32,
         _ => 0,
     }
@@ -192,6 +199,28 @@ pub(crate) fn read_utf16_from_hglobal(h: HGLOBAL) -> Option<String> {
     }
 }
 
+/// Read a single-byte (`CF_TEXT`/`CF_OEMTEXT`) string out of an app-provided `HGLOBAL`. v1 treats
+/// these as ANSI: each byte maps 1:1 to a `char` (Latin-1-ish), stopping at the first NUL.
+/// `None` if lock fails. Mirrors [`read_utf16_from_hglobal`].
+pub(crate) fn read_singlebyte_from_hglobal(h: HGLOBAL) -> Option<String> {
+    // SAFETY: `h` is the handle the app passed to SetClipboardData; GlobalLock pins it and returns a
+    // pointer valid until GlobalUnlock. GlobalSize bounds the read so we never go out of bounds.
+    unsafe {
+        let ptr = GlobalLock(h) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let bytes = GlobalSize(h);
+        let slice = std::slice::from_raw_parts(ptr, bytes);
+        // Stop at the first NUL terminator if present.
+        let end = slice.iter().position(|&c| c == 0).unwrap_or(bytes);
+        // v1: interpret as ANSI/Latin-1 — each byte is one `char`.
+        let text: String = slice[..end].iter().map(|&b| b as char).collect();
+        let _ = GlobalUnlock(h);
+        Some(text)
+    }
+}
+
 /// Allocate a `GMEM_MOVEABLE` `HGLOBAL` and write `text` into it in the encoding `fmt` requires:
 /// UTF-16 (+ NUL) for `CF_UNICODETEXT`, single-byte (lossy) for `CF_TEXT`/`CF_OEMTEXT`. Returns
 /// the handle the caller must cache + eventually free; `None` on allocation failure.
@@ -207,6 +236,8 @@ pub(crate) fn alloc_hglobal_for(fmt: u32, text: &str) -> Option<HGLOBAL> {
             let h = GlobalAlloc(GMEM_MOVEABLE, bytes).ok()?;
             let dst = GlobalLock(h) as *mut u16;
             if dst.is_null() {
+                // SAFETY: we own `h` (alloc succeeded, not yet handed to caller); free to avoid leak.
+                let _ = GlobalFree(h);
                 return None;
             }
             std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len());
@@ -226,6 +257,8 @@ pub(crate) fn alloc_hglobal_for(fmt: u32, text: &str) -> Option<HGLOBAL> {
             let h = GlobalAlloc(GMEM_MOVEABLE, n).ok()?;
             let dst = GlobalLock(h) as *mut u8;
             if dst.is_null() {
+                // SAFETY: we own `h` (alloc succeeded, not yet handed to caller); free to avoid leak.
+                let _ = GlobalFree(h);
                 return None;
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
