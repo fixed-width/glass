@@ -159,6 +159,7 @@ fn available_ids() -> Vec<u32> {
     crate::synth::available(&store_list())
         .iter()
         .map(id_of)
+        .filter(|&id| id != 0)
         .collect()
 }
 
@@ -198,6 +199,11 @@ fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
     // sized by `info`. GetDC/ReleaseDC are paired.
     unsafe {
         let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            // SAFETY: ReleaseDC on a null/invalid HDC is a safe no-op; bail rather than hand GDI a null DC.
+            ReleaseDC(None, hdc);
+            return None;
+        }
         let bmih = dib.as_ptr() as *const BITMAPINFOHEADER;
         let bits =
             dib.as_ptr().add(info.header_bytes + info.color_table_bytes) as *const core::ffi::c_void;
