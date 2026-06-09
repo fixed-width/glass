@@ -12,7 +12,7 @@ for the full picture: <https://github.com/fixed-width/glass>.
 
 ---
 
-## 1. Install the one prerequisite
+## 1. Install the prerequisites
 
 The default (X11) backend spawns its **own private, headless display** — you don't
 run or configure anything, but the headless X server itself must be installed:
@@ -23,6 +23,19 @@ sudo apt-get update && sudo apt-get install -y xvfb
 
 (Equivalents: Fedora `sudo dnf install xorg-x11-server-Xvfb`; Arch
 `sudo pacman -S xorg-server-xvfb`.)
+
+glass also **sandboxes every launched app by default** (via bubblewrap), and that
+default is *fail-closed*: with no sandbox available it errors rather than running the
+app unconfined. So also install bubblewrap, or set `GLASS_SANDBOX=off` to run apps
+unconfined:
+
+```bash
+sudo apt-get install -y bubblewrap        # Fedora/Arch: bubblewrap
+```
+
+It also needs unprivileged user namespaces enabled; Ubuntu 23.10+ restricts them via
+AppArmor — allow with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+`glass-mcp doctor` checks this and prints the exact remedy.
 
 That's the entire dependency list.
 

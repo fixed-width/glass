@@ -86,13 +86,25 @@ and capture.
 - **Rust**, via [rustup](https://rustup.rs). glass pins a nightly toolchain in
   `rust-toolchain.toml` (needed for the portable-SIMD hot paths); rustup installs it
   automatically on the first build, so there's no toolchain to choose.
-- **One OS dependency**, for the backend you'll run:
+- **A display dependency**, for the backend you'll run:
   - **Linux / X11 (default):** the headless X server — `sudo apt-get install -y xvfb`
     (Debian/Ubuntu; Fedora `xorg-x11-server-Xvfb`, Arch `xorg-server-xvfb`). glass spawns
     its own private display, so this binary is the only thing to install.
   - **Linux / Wayland:** a discoverable `sway ≥ 1.12` plus [Mesa](https://www.mesa3d.org/) software GL — see
     [Running on Wayland](#running-on-wayland-sway).
   - **Windows:** nothing extra; glass uses built-in Windows APIs.
+- **A containment runtime** — launched apps are **sandboxed by default**, and the `default`
+  level is *fail-closed*: with no sandbox available, `glass_start` errors rather than running
+  the app unconfined. So either install the runtime, or set `GLASS_SANDBOX=off` on the server
+  to launch apps unconfined:
+  - **Linux:** [bubblewrap](https://github.com/containers/bubblewrap) — `sudo apt-get install -y bubblewrap`
+    (Fedora/Arch: `bubblewrap`) — **and** unprivileged user namespaces enabled. Ubuntu 23.10+
+    restricts them via AppArmor; allow with
+    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`).
+  - **Windows:** [Sandboxie Classic](https://sandboxie-plus.com/downloads), installed with its service running.
+
+  See [Containment / sandboxing](#containment--sandboxing) for the levels; `glass-mcp doctor`
+  checks availability and prints the exact remedy for your system.
 
 ### Build from source
 

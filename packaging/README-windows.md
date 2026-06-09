@@ -20,6 +20,11 @@ This is the **Windows x86-64** build. See the project README for the full pictur
   the accessibility tree).
 - glass drives apps on the **interactive desktop**, so run it in a normal logged-in
   session (not a non-interactive service / Session 0).
+- **Containment:** glass **sandboxes every launched app by default**, and that default
+  is *fail-closed* — with no in-OS provider available, `glass_start` errors rather than
+  running the app unconfined. Install [Sandboxie Classic](https://sandboxie-plus.com/downloads)
+  (with its service running) for containment, or set `GLASS_SANDBOX=off` to launch apps
+  unconfined. `glass-mcp doctor`'s `sandbox` section reports this posture.
 
 ## 2. Install the binary
 
