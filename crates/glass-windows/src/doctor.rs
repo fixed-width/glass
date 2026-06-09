@@ -168,6 +168,26 @@ pub(crate) fn build_sandbox_checks(
     v
 }
 
+/// Clipboard posture: with the hook DLL the contained app gets a PRIVATE clipboard isolated from
+/// the user's; without it, Layer 1 (`OpenClipboard=n`) still protects the user but the app has no
+/// clipboard. Pure mapping → Linux-tested.
+pub(crate) fn build_clipboard_check(hook_resolvable: bool, dll_path: &str) -> Check {
+    if hook_resolvable {
+        Check::new(
+            "clipboard isolation",
+            CheckStatus::Ok,
+            format!("private clipboard active (hook {dll_path}) — isolated from your clipboard"),
+        )
+    } else {
+        Check::new(
+            "clipboard isolation",
+            CheckStatus::Warn,
+            "contained app clipboard disabled (hook DLL not found); your clipboard is protected",
+        )
+        .with_remedy("set GLASS_CLIP_HOOK_DLL or reinstall so the boxed app gets a private clipboard")
+    }
+}
+
 // ---- Windows fact-gathering (cfg(windows), on-box validated) ----
 #[cfg(windows)]
 pub fn checks(_deep: bool) -> Vec<Check> {
@@ -181,7 +201,17 @@ pub fn sandbox_checks() -> Vec<Check> {
     let avail = crate::containment::available(&dir);
     let prompt = gather_prompt_global(&dir);
     let ws = gather_windows_sandbox();
-    build_sandbox_checks(avail, &dir, prompt, ws)
+    let mut v = build_sandbox_checks(avail, &dir, prompt, ws);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
+    let dll = crate::containment::config_hook_dll_path(exe_dir.as_deref());
+    let resolvable = dll
+        .as_deref()
+        .map(|p| std::path::Path::new(p).exists())
+        .unwrap_or(false);
+    v.push(build_clipboard_check(resolvable, dll.as_deref().unwrap_or("<unset>")));
+    v
 }
 
 /// Read Sandboxie's global `PromptForInternetAccess` via `SbieIni.exe query GlobalSettings
@@ -412,5 +442,16 @@ mod tests {
         let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), true);
         let vm = v.iter().find(|c| c.name == "Windows Sandbox (VM tier)").unwrap();
         assert_eq!(vm.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn clipboard_check_reports_layer() {
+        // hook resolvable → private clipboard active; else Layer-1-only (disabled-for-safety).
+        let ok = build_clipboard_check(true, "C:\\g\\glass_clip_hook.dll");
+        assert_eq!(ok.status, CheckStatus::Ok);
+        assert!(ok.detail.contains("private clipboard"));
+        let warn = build_clipboard_check(false, "C:\\g\\glass_clip_hook.dll");
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.detail.contains("disabled"));
     }
 }

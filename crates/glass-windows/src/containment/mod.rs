@@ -17,6 +17,12 @@ pub(crate) use imp::{resolve_containment, ClipboardRoute, Launched, LogSink};
 #[cfg(windows)]
 pub(crate) use sandboxie::{available, sandboxie_dir};
 
+/// Resolve the clip hook DLL path the way the launcher does (env > exe dir > None), for doctor.
+#[cfg(windows)]
+pub(crate) fn config_hook_dll_path(exe_dir: Option<&str>) -> Option<String> {
+    config::hook_dll_path(std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(), exe_dir)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::io::{BufRead, BufReader};
