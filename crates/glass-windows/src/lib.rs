@@ -13,6 +13,21 @@ pub mod containment; // Windows containment provider seam (pure config is host-t
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box
 
+/// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
+/// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.
+#[cfg(windows)]
+pub(crate) fn disclose_clip_disabled(dll: &str) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "glass: private clipboard unavailable (hook DLL not found at {dll}); the sandboxed \
+             app's clipboard is DISABLED to protect your clipboard. Set GLASS_CLIP_HOOK_DLL or \
+             reinstall to enable it."
+        );
+    });
+}
+
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]

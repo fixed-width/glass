@@ -6,9 +6,6 @@
 //! we [`PrivateClipboard::apply`] and answer. The boxed `glass_clip_hook` DLL is the client.
 //! Sandboxie's `OpenPipePath` lets the box reach this host pipe (always applied).
 
-// Task 8 wires ClipServer into SandboxieApp; until then suppress the dead-code lint.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;

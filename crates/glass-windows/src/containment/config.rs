@@ -132,7 +132,6 @@ pub(crate) fn pick_path(
 
 /// Per-box pipe name (no namespace prefix; the host opens `\\.\pipe\<name>`, the box reaches it
 /// via `OpenPipePath=\Device\NamedPipe\<name>`). Derived from the box name so it's unique/session.
-#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn clip_pipe_name(box_name: &str) -> String {
     format!("glass-clip-{box_name}")
 }
@@ -142,7 +141,6 @@ pub(crate) fn clip_pipe_name(box_name: &str) -> String {
 /// Precedence: explicit (`GLASS_CLIP_HOOK_DLL`) > `<exe_dir>/glass_clip_hook.dll` > `None`
 /// (Layer-2 unavailable — Layer-1-only). Mirrors `sandboxie_dir`'s precedence, but returns
 /// `Option`: a missing DLL must NOT fail the launch (clipboard isn't core to running the app).
-#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Option<String> {
     if let Some(e) = explicit {
         return Some(e.to_string());
@@ -152,7 +150,6 @@ pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Op
 
 /// The Layer-2 SbieIni `(key,value)` lines: inject the hook DLL into every boxed process and let
 /// the box reach the host's clipboard pipe. (`GLASS_CLIP_PIPE` is set separately, in launch.cmd.)
-#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn clip_layer2_lines(box_name: &str, dll_path: &str) -> Vec<(String, String)> {
     vec![
         ("InjectDll64".to_string(), dll_path.to_string()),
@@ -183,10 +180,6 @@ fn reject_unsafe_launch_token(s: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -> Result<String> {
-    build_launch_cmd_env(spec, out_log, err_log, None)
 }
 
 /// Build the `launch.cmd` body: `@echo off`, an optional leading `set "GLASS_CLIP_PIPE=<name>"`
@@ -256,7 +249,7 @@ mod tests {
     #[test]
     fn launch_cmd_quotes_tokens_and_redirects() {
         let spec = launch_spec(vec!["C:\\Program Files\\app.exe".into(), "--flag".into()], None);
-        let script = build_launch_cmd(&spec, Path::new("out.log"), Path::new("err.log")).unwrap();
+        let script = build_launch_cmd_env(&spec, Path::new("out.log"), Path::new("err.log"), None).unwrap();
         assert!(script.starts_with("@echo off\r\n"), "script: {script:?}");
         assert!(script.contains("\"C:\\Program Files\\app.exe\" \"--flag\""), "script: {script:?}");
         assert!(script.contains("1>\"out.log\" 2>\"err.log\""), "script: {script:?}");
@@ -269,7 +262,7 @@ mod tests {
         for bad in ["a\"b", "a%PATH%b", "a\rb", "a\nb"] {
             let spec = launch_spec(vec!["app.exe".into(), bad.into()], None);
             assert!(
-                build_launch_cmd(&spec, Path::new("o"), Path::new("e")).is_err(),
+                build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).is_err(),
                 "run token {bad:?} must be rejected"
             );
         }
@@ -280,7 +273,7 @@ mod tests {
         for bad in ["C:\\a\"b", "C:\\%TEMP%", "C:\\a\rb", "C:\\a\nb"] {
             let spec = launch_spec(vec!["app.exe".into()], Some(bad));
             assert!(
-                build_launch_cmd(&spec, Path::new("o"), Path::new("e")).is_err(),
+                build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).is_err(),
                 "cwd {bad:?} must be rejected"
             );
         }
