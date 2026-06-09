@@ -9,6 +9,11 @@ mod clip_server;
 #[cfg(windows)]
 mod sandboxie;
 
+// On-box (LOTUS) deterministic validation of the private-clipboard hook. Compiled only for the
+// Windows test profile; the single test inside is `#[ignore]`d (needs Sandboxie + the built DLL).
+#[cfg(all(test, windows))]
+mod clip_onbox;
+
 #[cfg(windows)]
 pub(crate) use imp::{resolve_containment, ClipboardRoute, Launched, LogSink};
 
