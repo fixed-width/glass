@@ -108,7 +108,7 @@ fn private_clipboard_isolation() {
     let ambient_after = crate::clipboard::get().unwrap_or_default();
     eprintln!(
         "DIAG host_store={:?} ambient_after={:?} sentinel={:?}",
-        store.as_ref().map(|s| s.get()),
+        store.as_ref().map(|s| s.get_text()),
         ambient_after,
         sentinel
     );
@@ -119,7 +119,7 @@ fn private_clipboard_isolation() {
 
     let store = store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
     assert_eq!(
-        store.get().as_deref(),
+        store.get_text().as_deref(),
         Some("FROM-BOX"),
         "host store did not see the boxed write"
     );
