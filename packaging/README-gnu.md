@@ -27,10 +27,10 @@ is not yet built.) See the project README for the full picture:
   If that prints **2.38 or lower**, this prebuilt binary won't run (you'll get a
   `version 'GLIBC_2.39' not found` error) — use the static build instead.
 
-## 2. Install the prerequisite
+## 2. Install the prerequisites
 
-The default (X11) backend spawns its **own private, headless display** — the only
-thing to install is the headless X server:
+The default (X11) backend spawns its **own private, headless display** — install the
+headless X server:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y xvfb
@@ -38,6 +38,19 @@ sudo apt-get update && sudo apt-get install -y xvfb
 
 (Equivalents: Fedora `sudo dnf install xorg-x11-server-Xvfb`; Arch
 `sudo pacman -S xorg-server-xvfb`.)
+
+glass also **sandboxes every launched app by default** (via bubblewrap), and that
+default is *fail-closed*: with no sandbox available it errors rather than running the
+app unconfined. So also install bubblewrap, or set `GLASS_SANDBOX=off` to run apps
+unconfined:
+
+```bash
+sudo apt-get install -y bubblewrap        # Fedora/Arch: bubblewrap
+```
+
+It also needs unprivileged user namespaces enabled; Ubuntu 23.10+ restricts them via
+AppArmor — allow with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+`glass-mcp doctor` checks this and prints the exact remedy.
 
 ## 3. Install the binary
 
