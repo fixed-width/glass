@@ -99,6 +99,10 @@ pub(crate) fn box_settings(level: SandboxLevel) -> Vec<(&'static str, &'static s
         ("NotifyInternetAccessDenied", "n"),
         ("NotifyStartRunAccessDenied", "n"),
         ("AllowNetworkAccess", if net.allow_network_access { "y" } else { "n" }),
+        // Layer 1 (unconditional): block the boxed app from the user's global clipboard.
+        // A private clipboard is layered back on top by the InjectDll64 hook (Layer 2);
+        // if the hook is unavailable the app simply has no clipboard — the user's is safe.
+        ("OpenClipboard", "n"),
     ]
 }
 
@@ -254,6 +258,17 @@ mod tests {
             decide(SandboxLevel::Strict, ProviderChoice::None, true),
             Decision::FailClosed(_)
         ));
+    }
+
+    #[test]
+    fn box_settings_always_blocks_user_clipboard() {
+        // Layer 1: the boxed app can never touch the user's clipboard, at any level.
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            assert!(
+                box_settings(level).contains(&("OpenClipboard", "n")),
+                "OpenClipboard=n must be set at {level:?}"
+            );
+        }
     }
 
     #[test]
