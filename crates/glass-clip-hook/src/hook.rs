@@ -19,6 +19,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
@@ -79,23 +80,43 @@ fn rpc(req: Request) -> Option<Response> {
     resp
 }
 
-/// `CreateFileW` the named pipe for read+write. Returns `None` if it cannot be opened.
+/// `CreateFileW` the named pipe for read+write, retrying briefly. Returns `None` if it cannot be
+/// opened within the retry budget.
+///
+/// The host runs a single-instance accept loop: after it serves one connection there is a short gap
+/// before it re-creates the next pipe instance. A `Set` immediately followed by a `Get` (as a
+/// clipboard write→read does) races into that gap, so a single `CreateFile` would intermittently
+/// fail. We use the standard named-pipe client pattern: on failure, `WaitNamedPipe` for an instance
+/// (and back off briefly if the pipe is momentarily absent), then retry — bounded so a genuinely
+/// down server still fails soft rather than hanging.
 fn open_pipe(path: &str) -> Option<HANDLE> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; all other args are
-    // plain values. CreateFileW returns a Result (Err on INVALID_HANDLE_VALUE), which we map to None.
-    unsafe {
-        CreateFileW(
-            PCWSTR::from_raw(wide.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            HANDLE::default(),
-        )
-        .ok()
+    for _ in 0..40 {
+        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; all other args
+        // are plain values. CreateFileW returns Err on INVALID_HANDLE_VALUE, which we map to None.
+        let opened = unsafe {
+            CreateFileW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                HANDLE::default(),
+            )
+        };
+        if let Ok(h) = opened {
+            return Some(h);
+        }
+        // Instance busy → WaitNamedPipe blocks until one frees (up to 100ms). Instance momentarily
+        // absent → it returns Err fast, so back off ~10ms to avoid a tight spin, then retry.
+        // SAFETY: `wide` outlives the call; WaitNamedPipeW is a simple blocking wait by name.
+        let waited = unsafe { WaitNamedPipeW(PCWSTR::from_raw(wide.as_ptr()), 100) }.as_bool();
+        if !waited {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
+    None
 }
 
 /// Write the whole buffer, looping over partial writes. `Some(())` on success.

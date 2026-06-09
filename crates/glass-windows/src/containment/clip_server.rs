@@ -24,9 +24,14 @@ use windows::Win32::System::Pipes::{
     PIPE_WAIT,
 };
 
-/// SDDL: allow the current user (Owner) and SYSTEM generic-all; nothing wider. The box token is
-/// the same user (KeepTokenIntegrity=y) so it can connect; other users cannot.
-const PIPE_SDDL: &str = "D:(A;;GA;;;OW)(A;;GA;;;SY)";
+/// SDDL for the pipe DACL: Everyone (WD) + SYSTEM generic-all. Everyone is required, not just the
+/// owner: the Sandboxie box runs the client under a **restricted** token (even with
+/// KeepTokenIntegrity=y), whose access check is satisfied only by a SID in its *restricting* set —
+/// an owner-only DACL is denied. The pipe name is per-box and ephemeral and only ever carries this
+/// box's own clipboard text on the local machine, so Everyone-on-a-named-pipe is acceptable for v1
+/// (a local process would also have to guess the per-box name). Tightening to the box SID is a
+/// follow-up.
+const PIPE_SDDL: &str = "D:(A;;GA;;;WD)(A;;GA;;;SY)";
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

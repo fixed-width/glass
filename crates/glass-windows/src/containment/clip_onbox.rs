@@ -93,9 +93,25 @@ fn private_clipboard_isolation() {
     // The probe writes then reads CF_UNICODETEXT. The box also carries OpenClipboard=n, so the ONLY
     // way the probe can read back what it wrote is via the injected hook → a correct READBACK proves
     // interception, not the real clipboard.
-    let line = wait_for_log(&sink, "READBACK=", Duration::from_secs(12));
+    let line = wait_for_log(&sink, "READBACK=", Duration::from_secs(20));
+    // Diagnostic: dump everything the boxed process emitted (stdout+stderr), so a missing READBACK
+    // tells us whether the probe failed (FAIL: ...), ran silently, or didn't run at all.
+    {
+        let g = sink.lock().unwrap();
+        eprintln!("--- boxed log sink: {} line(s) ---", g.len());
+        for (s, l) in g.iter() {
+            eprintln!("[{s:?}] {l}");
+        }
+        eprintln!("--- end sink ---");
+    }
     let store = app.private_clipboard();
     let ambient_after = crate::clipboard::get().unwrap_or_default();
+    eprintln!(
+        "DIAG host_store={:?} ambient_after={:?} sentinel={:?}",
+        store.as_ref().map(|s| s.get()),
+        ambient_after,
+        sentinel
+    );
     app.kill();
 
     let line = line.expect("probe produced no READBACK= line (hook not intercepting? check the log sink)");
