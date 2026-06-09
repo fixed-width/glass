@@ -18,6 +18,9 @@ mod text;
 #[cfg(any(windows, test))]
 mod dib;
 
+#[cfg(any(windows, test))]
+mod synth;
+
 #[cfg(windows)]
 mod hook;
 
