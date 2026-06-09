@@ -132,6 +132,7 @@ pub(crate) fn pick_path(
 
 /// Per-box pipe name (no namespace prefix; the host opens `\\.\pipe\<name>`, the box reaches it
 /// via `OpenPipePath=\Device\NamedPipe\<name>`). Derived from the box name so it's unique/session.
+#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn clip_pipe_name(box_name: &str) -> String {
     format!("glass-clip-{box_name}")
 }
@@ -141,6 +142,7 @@ pub(crate) fn clip_pipe_name(box_name: &str) -> String {
 /// Precedence: explicit (`GLASS_CLIP_HOOK_DLL`) > `<exe_dir>/glass_clip_hook.dll` > `None`
 /// (Layer-2 unavailable — Layer-1-only). Mirrors `sandboxie_dir`'s precedence, but returns
 /// `Option`: a missing DLL must NOT fail the launch (clipboard isn't core to running the app).
+#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Option<String> {
     if let Some(e) = explicit {
         return Some(e.to_string());
@@ -150,6 +152,7 @@ pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Op
 
 /// The Layer-2 SbieIni `(key,value)` lines: inject the hook DLL into every boxed process and let
 /// the box reach the host's clipboard pipe. (`GLASS_CLIP_PIPE` is set separately, in launch.cmd.)
+#[allow(dead_code)] // consumed in Task 8
 pub(crate) fn clip_layer2_lines(box_name: &str, dll_path: &str) -> Vec<(String, String)> {
     vec![
         ("InjectDll64".to_string(), dll_path.to_string()),

@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 glass-core.workspace = true
+glass-clip-hook = { path = "../glass-clip-hook" }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "1"
@@ -21,6 +22,9 @@ windows = { version = "0.58", features = [
   # doctor: session (RemoteDesktop), WGC support probe, true build via RtlGetVersion
   "Win32_System_RemoteDesktop", "Graphics_Capture",
   "Wdk_System_SystemServices", "Win32_System_SystemInformation",
+  # private clipboard: host named-pipe server + scoped security descriptor
+  "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO",
+  "Win32_Security_Authorization",
 ] }
 
 # Only the on-box validation example (examples/onbox.rs) needs a PNG encoder to save captured

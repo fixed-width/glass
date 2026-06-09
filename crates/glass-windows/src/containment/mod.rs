@@ -4,6 +4,9 @@
 pub(crate) mod config;
 
 #[cfg(windows)]
+mod clip_server;
+
+#[cfg(windows)]
 mod sandboxie;
 
 #[cfg(windows)]
