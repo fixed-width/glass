@@ -202,19 +202,15 @@ pub(crate) fn store_seq() -> u32 {
 /// Reads up to the first NUL (or the whole block if unterminated). `None` if lock fails / empty.
 pub(crate) fn read_utf16_from_hglobal(h: HGLOBAL) -> Option<String> {
     // SAFETY: `h` is the handle the app passed to SetClipboardData; GlobalLock pins it and returns
-    // a pointer valid until GlobalUnlock. GlobalSize gives the block's byte size so we never read
-    // out of bounds. We treat the bytes as UTF-16 code units (CF_UNICODETEXT contract).
+    // a pointer valid until GlobalUnlock. GlobalSize bounds the slice so we never read out of
+    // bounds; the NUL-terminated UTF-16 decode itself is pure + unit-tested (crate::text).
     unsafe {
         let ptr = GlobalLock(h) as *const u16;
         if ptr.is_null() {
             return None;
         }
-        let bytes = GlobalSize(h);
-        let units = bytes / 2;
-        let slice = std::slice::from_raw_parts(ptr, units);
-        // Stop at the first NUL terminator if present.
-        let end = slice.iter().position(|&c| c == 0).unwrap_or(units);
-        let text = String::from_utf16_lossy(&slice[..end]);
+        let units = GlobalSize(h) / 2;
+        let text = crate::text::utf16_nul_to_string(std::slice::from_raw_parts(ptr, units));
         let _ = GlobalUnlock(h);
         Some(text)
     }
@@ -224,19 +220,15 @@ pub(crate) fn read_utf16_from_hglobal(h: HGLOBAL) -> Option<String> {
 /// these as ANSI: each byte maps 1:1 to a `char` (Latin-1-ish), stopping at the first NUL.
 /// `None` if lock fails. Mirrors [`read_utf16_from_hglobal`].
 pub(crate) fn read_singlebyte_from_hglobal(h: HGLOBAL) -> Option<String> {
-    // SAFETY: `h` is the handle the app passed to SetClipboardData; GlobalLock pins it and returns a
-    // pointer valid until GlobalUnlock. GlobalSize bounds the read so we never go out of bounds.
+    // SAFETY: as read_utf16_from_hglobal, single-byte: GlobalLock pins `h`, GlobalSize bounds the
+    // slice; the Latin-1 NUL-terminated decode is pure + unit-tested (crate::text).
     unsafe {
         let ptr = GlobalLock(h) as *const u8;
         if ptr.is_null() {
             return None;
         }
-        let bytes = GlobalSize(h);
-        let slice = std::slice::from_raw_parts(ptr, bytes);
-        // Stop at the first NUL terminator if present.
-        let end = slice.iter().position(|&c| c == 0).unwrap_or(bytes);
-        // v1: interpret as ANSI/Latin-1 — each byte is one `char`.
-        let text: String = slice[..end].iter().map(|&b| b as char).collect();
+        let n = GlobalSize(h);
+        let text = crate::text::singlebyte_nul_to_string(std::slice::from_raw_parts(ptr, n));
         let _ = GlobalUnlock(h);
         Some(text)
     }
@@ -247,8 +239,7 @@ pub(crate) fn read_singlebyte_from_hglobal(h: HGLOBAL) -> Option<String> {
 /// the handle the caller must cache + eventually free; `None` on allocation failure.
 pub(crate) fn alloc_hglobal_for(fmt: u32, text: &str) -> Option<HGLOBAL> {
     if fmt == CF_UNICODETEXT_ID {
-        let mut units: Vec<u16> = text.encode_utf16().collect();
-        units.push(0); // NUL terminator
+        let units = crate::text::string_to_utf16_nul(text);
         let bytes = units.len() * 2;
         // SAFETY: GlobalAlloc(GMEM_MOVEABLE) returns a movable handle; GlobalLock pins it to a
         // writable pointer valid for `bytes`. We copy exactly `units.len()` u16s (== `bytes`) then
@@ -266,12 +257,8 @@ pub(crate) fn alloc_hglobal_for(fmt: u32, text: &str) -> Option<HGLOBAL> {
             Some(h)
         }
     } else {
-        // CF_TEXT / CF_OEMTEXT: down-convert to single-byte. Non-ASCII becomes '?' (lossy, v1).
-        let mut bytes: Vec<u8> = text
-            .chars()
-            .map(|c| if (c as u32) < 0x80 { c as u8 } else { b'?' })
-            .collect();
-        bytes.push(0); // NUL terminator
+        // CF_TEXT / CF_OEMTEXT: down-convert to single-byte (non-ASCII → '?', lossy v1).
+        let bytes = crate::text::string_to_singlebyte_nul(text);
         let n = bytes.len();
         // SAFETY: as above, sized to `n` bytes; we copy exactly `n` bytes then unlock.
         unsafe {

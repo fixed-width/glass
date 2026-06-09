@@ -9,6 +9,12 @@
 pub mod proto;
 pub mod store;
 
+// Pure clipboard text codecs the windows hook defers to. Compiled for windows (the hook) and for
+// test (so the suite runs + Miri-checks on the Linux dev box); unused on a non-test non-windows
+// build, hence the cfg gate.
+#[cfg(any(windows, test))]
+mod text;
+
 #[cfg(windows)]
 mod hook;
 
