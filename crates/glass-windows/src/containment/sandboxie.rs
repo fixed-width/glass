@@ -414,7 +414,6 @@ impl SandboxieApp {
     /// The clipboard routing for this contained app: `Some(store)` when Layer 2 is active,
     /// `None` when Layer-1-only (the platform turns `None` into the "disabled" error — it must
     /// never fall back to the user's real clipboard for a contained app).
-    #[allow(dead_code)] // Task 9 wires this into the Platform get/set_clipboard route
     pub(crate) fn private_clipboard(&self) -> Option<PrivateClipboard> {
         self.clip.as_ref().map(|(store, _)| store.clone())
     }

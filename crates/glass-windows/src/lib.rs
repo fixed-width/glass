@@ -193,11 +193,33 @@ mod backend {
         }
 
         fn get_clipboard(&mut self) -> Result<String> {
-            crate::clipboard::get()
+            use crate::containment::ClipboardRoute;
+            match self.app.as_ref().map(|a| a.clipboard_route()) {
+                // No app yet, or unconfined → today's real-OS clipboard.
+                None | Some(ClipboardRoute::RealOs) => crate::clipboard::get(),
+                Some(ClipboardRoute::Private(store)) => Ok(store.get().unwrap_or_default()),
+                Some(ClipboardRoute::DisabledContained) => Err(GlassError::Unsupported(
+                    "private clipboard for the contained app (hook DLL not active); the app's clipboard \
+                     is disabled to protect yours — set GLASS_CLIP_HOOK_DLL"
+                        .into(),
+                )),
+            }
         }
 
         fn set_clipboard(&mut self, text: &str) -> Result<()> {
-            crate::clipboard::set(text)
+            use crate::containment::ClipboardRoute;
+            match self.app.as_ref().map(|a| a.clipboard_route()) {
+                None | Some(ClipboardRoute::RealOs) => crate::clipboard::set(text),
+                Some(ClipboardRoute::Private(store)) => {
+                    store.set(text.to_string());
+                    Ok(())
+                }
+                Some(ClipboardRoute::DisabledContained) => Err(GlassError::Unsupported(
+                    "private clipboard for the contained app (hook DLL not active); the app's clipboard \
+                     is disabled to protect yours — set GLASS_CLIP_HOOK_DLL"
+                        .into(),
+                )),
+            }
         }
 
         fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
