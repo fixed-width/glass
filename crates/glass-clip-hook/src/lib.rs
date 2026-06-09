@@ -11,3 +11,11 @@ pub mod store;
 
 #[cfg(windows)]
 mod hook;
+
+/// Sandboxie InjectDll entry point (called after SbieDll, before the app's entry). Inert unless
+/// `GLASS_CLIP_PIPE` is set (only the target app's process tree carries it). See [`hook`].
+#[cfg(windows)]
+#[no_mangle]
+pub extern "system" fn InjectDllMain(_h_sbie_dll: isize, _unused: usize) {
+    hook::init();
+}
