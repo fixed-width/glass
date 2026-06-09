@@ -34,6 +34,27 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  miri:
+    name: Miri (UB check · pure crates)
+    runs-on: ubuntu-latest
+    # Miri interprets the MIR to catch undefined behaviour in the byte-level / unsafe-adjacent
+    # logic we own. Scoped to the crates whose tests are Miri-clean: glass-clip-hook (the private-
+    # clipboard wire protocol + store) and glass-windows (pure pixel/dpi/jobpids byte parsing).
+    # Miri cannot execute FFI / foreign functions, so the Win32 named-pipe server and the injected
+    # user32 detours (cfg(windows)) are out of Miri's reach — those are covered on-box + by review.
+    # The `miri` component is added here (not pinned in rust-toolchain.toml) so a future nightly
+    # bump that lacks it fails only this job, not every job's `rustup show`.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned toolchain
+        run: rustup show
+      - name: Add miri component
+        run: rustup component add miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo miri test -p glass-clip-hook -p glass-windows --locked
+
   x11:
     name: X11 integration (Xvfb)
     runs-on: ubuntu-latest
