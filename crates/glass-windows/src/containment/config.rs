@@ -182,14 +182,27 @@ fn reject_unsafe_launch_token(s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the `launch.cmd` body: `@echo off`, an optional `cd /d "<cwd>"`, then the quoted
-/// exe + each quoted arg with stdout/stderr redirected to the log files.
+pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -> Result<String> {
+    build_launch_cmd_env(spec, out_log, err_log, None)
+}
+
+/// Build the `launch.cmd` body: `@echo off`, an optional leading `set "GLASS_CLIP_PIPE=<name>"`
+/// (when `clip_pipe` is `Some`), an optional `cd /d "<cwd>"`, then the quoted exe + each quoted
+/// arg with stdout/stderr redirected to the log files.
 ///
 /// Every token is wrapped in `"..."`. CMD treats most of its metacharacters (`& | < > ^`)
 /// literally inside a quoted token, so quoting handles those — but `"`, `%`, and embedded
 /// newlines cannot be made safe in this context (see [`FORBIDDEN_LAUNCH_CHARS`]), so any
 /// `spec.run` element or `spec.cwd` containing one is rejected with an honest error.
-pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -> Result<String> {
+///
+/// The pipe name is glass-generated (`glass-clip-<box>`), so it carries no injection risk and
+/// does not need token rejection. `build_launch_cmd` delegates here with `clip_pipe = None`.
+pub(crate) fn build_launch_cmd_env(
+    spec: &AppSpec,
+    out_log: &Path,
+    err_log: &Path,
+    clip_pipe: Option<&str>,
+) -> Result<String> {
     if let Some(cwd) = &spec.cwd {
         reject_unsafe_launch_token(&cwd.to_string_lossy())?;
     }
@@ -197,6 +210,9 @@ pub(crate) fn build_launch_cmd(spec: &AppSpec, out_log: &Path, err_log: &Path) -
         reject_unsafe_launch_token(part)?;
     }
     let mut s = String::from("@echo off\r\n");
+    if let Some(pipe) = clip_pipe {
+        s.push_str(&format!("set \"GLASS_CLIP_PIPE={pipe}\"\r\n"));
+    }
     if let Some(cwd) = &spec.cwd {
         s.push_str(&format!("cd /d \"{}\"\r\n", cwd.display()));
     }
@@ -359,5 +375,16 @@ mod tests {
             "OpenPipePath".to_string(),
             "\\Device\\NamedPipe\\glass-clip-glass_7".to_string()
         )));
+    }
+
+    #[test]
+    fn launch_cmd_sets_clip_pipe_env_when_present() {
+        let spec = launch_spec(vec!["app.exe".into()], None);
+        let with = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), Some("glass-clip-glass_9")).unwrap();
+        assert!(with.contains("set \"GLASS_CLIP_PIPE=glass-clip-glass_9\"\r\n"), "got: {with:?}");
+        // None → no env line (Layer-1-only), and the exe still runs.
+        let without = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).unwrap();
+        assert!(!without.contains("GLASS_CLIP_PIPE"), "got: {without:?}");
+        assert!(without.contains("\"app.exe\""));
     }
 }
