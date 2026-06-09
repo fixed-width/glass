@@ -150,8 +150,8 @@ fn accept_loop(
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 4,
-                proto::MAX_TEXT_BYTES as u32 + 64,
-                proto::MAX_TEXT_BYTES as u32 + 64,
+                64 * 1024,
+                64 * 1024,
                 0,
                 Some(&sa),
             )
@@ -227,7 +227,7 @@ fn serve_one(pipe: HANDLE, store: &PrivateClipboard, box_pids: &[u32]) {
     }
     let resp = match Request::decode(&body) {
         Ok(req) => store.apply(req),
-        Err(_) => Response::Text(None), // skew/garbage → empty, never a crash
+        Err(_) => Response::Bytes(None), // skew/garbage → benign empty, never a crash
     };
     let out = proto::frame(&resp.encode());
     let mut written = 0u32;
@@ -247,7 +247,7 @@ fn read_frame(pipe: HANDLE) -> Option<Vec<u8>> {
         return None;
     }
     let n = u32::from_le_bytes(len_buf) as usize;
-    if n > proto::MAX_TEXT_BYTES + 64 {
+    if n > proto::MAX_TOTAL_BYTES + 4096 {
         return None;
     }
     let mut body = vec![0u8; n];

@@ -2,8 +2,10 @@
 //!
 //! Emulates a per-app clipboard backed by the host store. The detours NEVER call the real
 //! clipboard APIs (the box also has `OpenClipboard=n`), so the user's clipboard is untouched.
-//! v1: `CF_UNICODETEXT` (+ `CF_TEXT`/`CF_OEMTEXT` synthesized on read). Eager data only — delayed
-//! rendering (`SetClipboardData(_, NULL)`) and OLE are out of scope (documented limitation).
+//! v2: arbitrary `format → bytes` items captured into a pending set and committed atomically on
+//! `CloseClipboard`; on read we serve any stored format verbatim, or synthesize a derivative from
+//! its canonical stored form (text triad/LOCALE ← CF_UNICODETEXT; CF_BITMAP/DIBV5 ← CF_DIB). Eager
+//! data only — delayed rendering (`SetClipboardData(_, NULL)`) and OLE are out of scope.
 //!
 //! Compile-time verified by cross-compiling to `x86_64-pc-windows-gnu`. Runtime interception is
 //! finalized on a real Windows box (LOTUS); the detour table is authored complete so that on-box
@@ -24,23 +26,12 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 
-use crate::proto::{self, Request, Response};
+use crate::proto::{self, FormatKey, Request, Response};
 
 mod detour_impl;
 
-// CF_UNICODETEXT = 13, CF_TEXT = 1, CF_OEMTEXT = 7 (stable Win32 ABI ids).
-pub(crate) const CF_UNICODETEXT_ID: u32 = 13;
-pub(crate) const CF_TEXT_ID: u32 = 1;
-pub(crate) const CF_OEMTEXT_ID: u32 = 7;
-
 /// Resolved pipe path (`\\.\pipe\<GLASS_CLIP_PIPE>`). `None` ⇒ the DLL is inert.
 static PIPE: OnceLock<String> = OnceLock::new();
-
-/// True iff a text clipboard format. The three synthesized text formats are interchangeable on
-/// read (we down/up-convert UTF-16); only `CF_UNICODETEXT` is stored.
-pub(crate) fn is_text_format(fmt: u32) -> bool {
-    fmt == CF_UNICODETEXT_ID || fmt == CF_TEXT_ID || fmt == CF_OEMTEXT_ID
-}
 
 /// Called from `InjectDllMain`. Inert if `GLASS_CLIP_PIPE` is unset (only the target app's
 /// process tree carries it; every other boxed process loads this DLL but stays dormant).
@@ -141,7 +132,7 @@ fn read_response(h: HANDLE) -> Option<Response> {
     let mut len_buf = [0u8; 4];
     read_exact(h, &mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > proto::MAX_TEXT_BYTES + 16 {
+    if len > proto::MAX_TOTAL_BYTES + 4096 {
         return None; // refuse absurd frames (matches proto::parse_frame's cap)
     }
     let mut body = vec![0u8; len];
@@ -170,15 +161,25 @@ fn read_exact(h: HANDLE, buf: &mut [u8]) -> Option<()> {
 // Host-store view used by the detours. Each is fail-soft (None / no-op on a down pipe).
 // ---------------------------------------------------------------------------------------------
 
-pub(crate) fn store_get() -> Option<String> {
-    match rpc(Request::Get)? {
-        Response::Text(t) => t,
-        _ => None,
+/// Ship one atomic multi-format copy to the host.
+pub(crate) fn store_set_all(items: Vec<(FormatKey, Vec<u8>)>) {
+    let _ = rpc(Request::SetAll(items));
+}
+
+/// The host's stored format keys (canonical only; synthesis is computed locally via `synth`).
+pub(crate) fn store_list() -> Vec<FormatKey> {
+    match rpc(Request::List) {
+        Some(Response::Formats(k)) => k,
+        _ => Vec::new(),
     }
 }
 
-pub(crate) fn store_set(s: &str) {
-    let _ = rpc(Request::Set(s.to_string()));
+/// One stored format's bytes from the host (no synthesis).
+pub(crate) fn store_get_bytes(key: &FormatKey) -> Option<Vec<u8>> {
+    match rpc(Request::Get(key.clone()))? {
+        Response::Bytes(b) => b,
+        _ => None,
+    }
 }
 
 pub(crate) fn store_empty() {
@@ -195,84 +196,58 @@ pub(crate) fn store_seq() -> u32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// HGLOBAL <-> text helpers used by SetClipboardData / GetClipboardData detours.
+// Generic HGLOBAL byte helpers + the one text code-page conversion, used by the detours.
 // ---------------------------------------------------------------------------------------------
 
-/// Read a UTF-16 string out of an app-provided `HGLOBAL` (as handed to `SetClipboardData`).
-/// Reads up to the first NUL (or the whole block if unterminated). `None` if lock fails / empty.
-pub(crate) fn read_utf16_from_hglobal(h: HGLOBAL) -> Option<String> {
-    // SAFETY: `h` is the handle the app passed to SetClipboardData; GlobalLock pins it and returns
-    // a pointer valid until GlobalUnlock. GlobalSize bounds the slice so we never read out of
-    // bounds; the NUL-terminated UTF-16 decode itself is pure + unit-tested (crate::text).
-    unsafe {
-        let ptr = GlobalLock(h) as *const u16;
-        if ptr.is_null() {
-            return None;
-        }
-        let units = GlobalSize(h) / 2;
-        let text = crate::text::utf16_nul_to_string(std::slice::from_raw_parts(ptr, units));
-        let _ = GlobalUnlock(h);
-        Some(text)
-    }
-}
-
-/// Read a single-byte (`CF_TEXT`/`CF_OEMTEXT`) string out of an app-provided `HGLOBAL`. v1 treats
-/// these as ANSI: each byte maps 1:1 to a `char` (Latin-1-ish), stopping at the first NUL.
-/// `None` if lock fails. Mirrors [`read_utf16_from_hglobal`].
-pub(crate) fn read_singlebyte_from_hglobal(h: HGLOBAL) -> Option<String> {
-    // SAFETY: as read_utf16_from_hglobal, single-byte: GlobalLock pins `h`, GlobalSize bounds the
-    // slice; the Latin-1 NUL-terminated decode is pure + unit-tested (crate::text).
+/// Copy the full contents of an app-provided `HGLOBAL` to a `Vec<u8>` (bounded by `GlobalSize`).
+pub(crate) fn read_bytes_from_hglobal(h: HGLOBAL) -> Option<Vec<u8>> {
+    // SAFETY: GlobalLock pins `h`; GlobalSize bounds the slice so we never read OOB; slice→Vec is safe.
     unsafe {
         let ptr = GlobalLock(h) as *const u8;
         if ptr.is_null() {
             return None;
         }
         let n = GlobalSize(h);
-        let text = crate::text::singlebyte_nul_to_string(std::slice::from_raw_parts(ptr, n));
+        let v = std::slice::from_raw_parts(ptr, n).to_vec();
         let _ = GlobalUnlock(h);
-        Some(text)
+        Some(v)
     }
 }
 
-/// Allocate a `GMEM_MOVEABLE` `HGLOBAL` and write `text` into it in the encoding `fmt` requires:
-/// UTF-16 (+ NUL) for `CF_UNICODETEXT`, single-byte (lossy) for `CF_TEXT`/`CF_OEMTEXT`. Returns
-/// the handle the caller must cache + eventually free; `None` on allocation failure.
-pub(crate) fn alloc_hglobal_for(fmt: u32, text: &str) -> Option<HGLOBAL> {
-    if fmt == CF_UNICODETEXT_ID {
-        let units = crate::text::string_to_utf16_nul(text);
-        let bytes = units.len() * 2;
-        // SAFETY: GlobalAlloc(GMEM_MOVEABLE) returns a movable handle; GlobalLock pins it to a
-        // writable pointer valid for `bytes`. We copy exactly `units.len()` u16s (== `bytes`) then
-        // unlock. On any failure we return None without leaking (alloc failed ⇒ nothing to free).
-        unsafe {
-            let h = GlobalAlloc(GMEM_MOVEABLE, bytes).ok()?;
-            let dst = GlobalLock(h) as *mut u16;
-            if dst.is_null() {
-                // SAFETY: we own `h` (alloc succeeded, not yet handed to caller); free to avoid leak.
-                let _ = GlobalFree(h);
-                return None;
-            }
-            std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len());
-            let _ = GlobalUnlock(h);
-            Some(h)
+/// Allocate a `GMEM_MOVEABLE` `HGLOBAL` holding exactly `bytes`. Caller caches + frees it.
+pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
+    // SAFETY: GlobalAlloc(GMEM_MOVEABLE) then GlobalLock to a writable ptr valid for bytes.len();
+    // copy exactly bytes.len(); unlock. Free on lock failure to avoid a leak.
+    unsafe {
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).ok()?;
+        let dst = GlobalLock(h) as *mut u8;
+        if dst.is_null() {
+            let _ = GlobalFree(h);
+            return None;
         }
-    } else {
-        // CF_TEXT / CF_OEMTEXT: down-convert to single-byte (non-ASCII → '?', lossy v1).
-        let bytes = crate::text::string_to_singlebyte_nul(text);
-        let n = bytes.len();
-        // SAFETY: as above, sized to `n` bytes; we copy exactly `n` bytes then unlock.
-        unsafe {
-            let h = GlobalAlloc(GMEM_MOVEABLE, n).ok()?;
-            let dst = GlobalLock(h) as *mut u8;
-            if dst.is_null() {
-                // SAFETY: we own `h` (alloc succeeded, not yet handed to caller); free to avoid leak.
-                let _ = GlobalFree(h);
-                return None;
-            }
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
-            let _ = GlobalUnlock(h);
-            Some(h)
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        let _ = GlobalUnlock(h);
+        Some(h)
+    }
+}
+
+/// CF_UNICODETEXT bytes → CF_TEXT/CF_OEMTEXT bytes via the real code page (ANSI/OEM).
+pub(crate) fn unicode_to_codepage(utf16_bytes: &[u8], oem: bool) -> Vec<u8> {
+    use windows::Win32::Globalization::{WideCharToMultiByte, CP_ACP, CP_OEMCP};
+    let units: Vec<u16> = utf16_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let cp = if oem { CP_OEMCP } else { CP_ACP };
+    // SAFETY: two-call WideCharToMultiByte (size, then fill); `units` outlives both; output sized exactly.
+    unsafe {
+        let len = WideCharToMultiByte(cp, 0, &units, None, PCSTR::null(), None);
+        if len <= 0 {
+            return vec![0];
         }
+        let mut out = vec![0u8; len as usize];
+        WideCharToMultiByte(cp, 0, &units, Some(&mut out), PCSTR::null(), None);
+        out
     }
 }
 

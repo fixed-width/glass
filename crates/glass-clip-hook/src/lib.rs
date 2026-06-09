@@ -15,6 +15,12 @@ pub mod store;
 #[cfg(any(windows, test))]
 mod text;
 
+#[cfg(any(windows, test))]
+mod dib;
+
+#[cfg(any(windows, test))]
+mod synth;
+
 #[cfg(windows)]
 mod hook;
 

@@ -10,15 +10,18 @@
 //! Compile-time verified by cross-compiling to `x86_64-pc-windows-gnu`. Whether the detours
 //! actually intercept at runtime is finalized on a real Windows box (LOTUS).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use retour::static_detour;
 use windows::Win32::Foundation::{GlobalFree, BOOL, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
+use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
+
+use crate::proto::FormatKey;
 
 use super::{
-    alloc_hglobal_for, is_text_format, read_singlebyte_from_hglobal, read_utf16_from_hglobal,
-    store_empty, store_get, store_seq, store_set, user32_proc, CF_OEMTEXT_ID, CF_TEXT_ID,
-    CF_UNICODETEXT_ID,
+    alloc_hglobal_bytes, read_bytes_from_hglobal, store_empty, store_get_bytes, store_list,
+    store_set_all, store_seq, unicode_to_codepage, user32_proc,
 };
 
 // Exact raw ABI signatures of the user32 exports (from windows-rs `link!` declarations).
@@ -45,6 +48,14 @@ static_detour! {
     static GetClipboardSequenceNumberHook: unsafe extern "system" fn() -> u32;
 }
 
+/// What kind of resource the cached handle is, so it is freed via the right Win32 destructor.
+#[derive(Clone, Copy, PartialEq)]
+enum HandleKind {
+    None,
+    Global,
+    Gdi,
+}
+
 thread_local! {
     /// Whether *this thread* currently holds the (emulated) clipboard open. Win32 clipboard
     /// ownership is thread-affine, so per-thread state matches the real semantics and avoids any
@@ -52,37 +63,160 @@ thread_local! {
     /// APIs would, but we stay permissive/fail-soft).
     static CLIP_OPEN: Cell<bool> = const { Cell::new(false) };
 
-    /// The last `HGLOBAL` returned from `GetClipboardData`. The Win32 contract says the *clipboard*
+    /// Formats `SetClipboardData`'d since the last `EmptyClipboard`, shipped as one atomic `SetAll`
+    /// at `CloseClipboard` (a multi-format copy = one transaction / one seq bump).
+    static PENDING: RefCell<Vec<(FormatKey, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+
+    /// The last handle returned from `GetClipboardData`. The Win32 contract says the *clipboard*
     /// owns that memory and the app must not free it; we own it instead and free it on the next
-    /// open/empty/close (whichever comes first). Stored as `isize` (the pointer bits) so the
+    /// open/empty/close (whichever comes first). Tagged by kind so an HGLOBAL is freed via
+    /// `GlobalFree` and a GDI HBITMAP via `DeleteObject`. Stored as `isize` (the handle bits) so the
     /// `thread_local!` needs no `unsafe`-Sync dance. A thread-local (not a global Mutex) because
     /// the handle is only ever produced + consumed on the clipboard-owning thread.
-    static LAST_HANDLE: Cell<isize> = const { Cell::new(0) };
+    static LAST_HANDLE: Cell<(isize, HandleKind)> = const { Cell::new((0, HandleKind::None)) };
 }
 
 /// Free + forget the cached `GetClipboardData` handle, if any. Called on open/empty/close.
 fn free_cached_handle() {
     LAST_HANDLE.with(|c| {
-        let raw = c.replace(0);
-        if raw != 0 {
-            // SAFETY: `raw` is an HGLOBAL we allocated in `alloc_hglobal_for` (GMEM_MOVEABLE) and
-            // handed out exactly once; freeing it here is the agreed ownership transfer. We zero
-            // the cell first so a re-entrant call cannot double-free.
-            unsafe {
+        // Zero the cell first so a re-entrant call cannot double-free.
+        let (raw, kind) = c.replace((0, HandleKind::None));
+        if raw == 0 {
+            return;
+        }
+        match kind {
+            // SAFETY: `raw` is an HGLOBAL we allocated in `alloc_hglobal_bytes` (GMEM_MOVEABLE) and
+            // handed out exactly once; freeing it here is the agreed ownership transfer.
+            HandleKind::Global => unsafe {
                 let _ = GlobalFree(HGLOBAL(raw as *mut _));
-            }
+            },
+            // SAFETY: `raw` is a GDI HBITMAP we created in `make_bitmap_handle` and handed out once;
+            // DeleteObject is the matching destructor.
+            HandleKind::Gdi => unsafe {
+                let _ = DeleteObject(HGDIOBJ(raw as *mut _));
+            },
+            HandleKind::None => {}
         }
     });
 }
 
-/// Cache a freshly-allocated handle to be freed on the next open/empty/close.
+/// Cache a freshly-allocated HGLOBAL to be freed (via `GlobalFree`) on the next open/empty/close.
 ///
-/// NOTE: we free the previous handle on the NEXT `GetClipboardData` (via `cache_handle` →
+/// NOTE: we free the previous handle on the NEXT `GetClipboardData` (via `cache_*` →
 /// `free_cached_handle`) as well as on open/empty/close — slightly narrower than the Win32
 /// "valid until CloseClipboard" contract, but fine for the lock-copy-unlock pattern apps use.
-fn cache_handle(h: HGLOBAL) {
+fn cache_global(h: HGLOBAL) {
     free_cached_handle(); // never leak a prior one
-    LAST_HANDLE.with(|c| c.set(h.0 as isize));
+    LAST_HANDLE.with(|c| c.set((h.0 as isize, HandleKind::Global)));
+}
+
+/// Cache a freshly-created GDI HBITMAP to be freed (via `DeleteObject`) on the next open/empty/close.
+fn cache_bitmap(h: HBITMAP) {
+    free_cached_handle(); // never leak a prior one
+    LAST_HANDLE.with(|c| c.set((h.0 as isize, HandleKind::Gdi)));
+}
+
+// ---- format id <-> FormatKey + synthesis -----------------------------------------------------
+
+// Standard Win32 clipboard format ids (stable ABI).
+const CF_TEXT: u32 = 1;
+const CF_BITMAP: u32 = 2;
+const CF_OEMTEXT: u32 = 7;
+const CF_LOCALE: u32 = 16;
+const CF_DIBV5: u32 = 17;
+
+/// Raw clipboard id → `FormatKey`: a registered (>=0xC000) id resolves to its NAME (portable across
+/// processes), everything else stays a `Standard` id.
+fn key_of(id: u32) -> FormatKey {
+    if id >= 0xC000 {
+        let mut buf = [0u16; 256];
+        // SAFETY: GetClipboardFormatNameW writes up to buf.len() chars into `buf` and returns the
+        // count (0 on failure); the slice bounds the read.
+        let n = unsafe { GetClipboardFormatNameW(id, &mut buf) };
+        if n > 0 {
+            return FormatKey::Named(String::from_utf16_lossy(&buf[..n as usize]));
+        }
+    }
+    FormatKey::Standard(id)
+}
+
+/// `FormatKey` → this process's clipboard id (re-registering named formats so the id is valid here).
+fn id_of(key: &FormatKey) -> u32 {
+    match key {
+        FormatKey::Standard(id) => *id,
+        FormatKey::Named(name) => {
+            let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `w` is a NUL-terminated UTF-16 buffer that outlives the call;
+            // RegisterClipboardFormatW returns this session's id for that name.
+            unsafe { RegisterClipboardFormatW(windows::core::PCWSTR::from_raw(w.as_ptr())) }
+        }
+    }
+}
+
+/// The clipboard ids currently available to the app: the stored canonical set plus locally
+/// synthesizable derivatives (`synth::available`), each mapped to this process's id.
+fn available_ids() -> Vec<u32> {
+    crate::synth::available(&store_list())
+        .iter()
+        .map(id_of)
+        .filter(|&id| id != 0)
+        .collect()
+}
+
+/// Bytes for `fmt`: stored verbatim, or synthesized from the canonical stored format.
+fn resolve_bytes(fmt: u32, key: &FormatKey) -> Option<Vec<u8>> {
+    if let Some(b) = store_get_bytes(key) {
+        return Some(b);
+    }
+    let canon = crate::synth::canonical_for(key)?;
+    let src = store_get_bytes(&canon)?;
+    Some(match fmt {
+        CF_TEXT => unicode_to_codepage(&src, false),
+        CF_OEMTEXT => unicode_to_codepage(&src, true),
+        CF_LOCALE => locale_blob(),
+        CF_DIBV5 => crate::dib::dib_to_dibv5(&src)?,
+        CF_BITMAP => src, // handed to make_bitmap_handle by the caller
+        _ => return None,
+    })
+}
+
+/// The 4-byte `CF_LOCALE` blob: the user's default LCID (little-endian).
+fn locale_blob() -> Vec<u8> {
+    use windows::Win32::Globalization::GetUserDefaultLCID;
+    // SAFETY: GetUserDefaultLCID takes no args and returns the LCID.
+    let lcid = unsafe { GetUserDefaultLCID() };
+    lcid.to_le_bytes().to_vec()
+}
+
+/// Build a GDI `HBITMAP` from a validated `CF_DIB` blob. Cached + freed via `DeleteObject`.
+fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateDIBitmap, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, CBM_INIT, DIB_RGB_COLORS,
+    };
+    let info = crate::dib::parse_dib(dib)?; // validated geometry → bounds-safe offsets
+    // SAFETY: `dib` parsed clean (header + table + bits within bounds). The header ptr is read as a
+    // BITMAPINFOHEADER/BITMAPINFO; `bits` = dib + header_bytes + color_table_bytes is in-bounds and
+    // sized by `info`. GetDC/ReleaseDC are paired.
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            // SAFETY: ReleaseDC on a null/invalid HDC is a safe no-op; bail rather than hand GDI a null DC.
+            ReleaseDC(None, hdc);
+            return None;
+        }
+        let bmih = dib.as_ptr() as *const BITMAPINFOHEADER;
+        let bits =
+            dib.as_ptr().add(info.header_bytes + info.color_table_bytes) as *const core::ffi::c_void;
+        let bmi = dib.as_ptr() as *const BITMAPINFO;
+        let hbm = CreateDIBitmap(hdc, Some(bmih), CBM_INIT as u32, Some(bits), Some(bmi), DIB_RGB_COLORS);
+        ReleaseDC(None, hdc);
+        if hbm.is_invalid() {
+            None
+        } else {
+            cache_bitmap(hbm);
+            Some(HANDLE(hbm.0))
+        }
+    }
 }
 
 // ---- detour bodies ---------------------------------------------------------------------------
@@ -104,19 +238,25 @@ fn open_clipboard(_hwnd: HWND) -> BOOL {
     .unwrap_or(BOOL(0))
 }
 
-/// `CloseClipboard()` → mark closed; free the cached handle. Always succeed.
+/// `CloseClipboard()` → mark closed; commit the pending multi-format copy as one atomic `SetAll`
+/// (one transaction / one seq bump); free the cached handle. Always succeed.
 fn close_clipboard() -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         CLIP_OPEN.with(|c| c.set(false));
+        let items = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if !items.is_empty() {
+            store_set_all(items);
+        }
         free_cached_handle();
         BOOL(1)
     }))
     .unwrap_or(BOOL(0))
 }
 
-/// `EmptyClipboard()` → clear the host store; free the cached handle. Always succeed.
+/// `EmptyClipboard()` → drop any pending copy, clear the host store, free the cached handle.
 fn empty_clipboard() -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PENDING.with(|p| p.borrow_mut().clear());
         store_empty();
         free_cached_handle();
         BOOL(1)
@@ -124,47 +264,43 @@ fn empty_clipboard() -> BOOL {
     .unwrap_or(BOOL(0))
 }
 
-/// `SetClipboardData(fmt, h)` → for text formats with a non-NULL handle, read the text in the
-/// format's own encoding and store it. Returns `h` (the contract: the clipboard now "owns" it; we
-/// keep the store as the source of truth). `h == NULL` is delayed rendering — out of scope in v1:
-/// return NULL, no change. Non-text formats are ignored (return the handle unchanged).
-///
-/// v1 text-format handling: `CF_UNICODETEXT` reads as UTF-16; `CF_TEXT`/`CF_OEMTEXT` read as
-/// single-byte ANSI (the app's buffer is single-byte — reading it as UTF-16 would garble it).
+/// `SetClipboardData(fmt, h)` → capture the format's bytes from the app's `HGLOBAL` into the pending
+/// set (committed atomically on `CloseClipboard`). Returns `h` (the contract: the clipboard now
+/// "owns" it; we keep the store as the source of truth). `h == NULL` is delayed rendering — out of
+/// scope (OLE apps covered separately in 2a-ii): skip, no change.
 fn set_clipboard_data(fmt: u32, h: HANDLE) -> HANDLE {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if h.0.is_null() {
-            return HANDLE::default(); // delayed rendering unsupported (v1)
+            return HANDLE::default(); // delayed rendering unsupported
         }
-        let text = if fmt == CF_UNICODETEXT_ID {
-            read_utf16_from_hglobal(HGLOBAL(h.0))
-        } else if fmt == CF_TEXT_ID || fmt == CF_OEMTEXT_ID {
-            read_singlebyte_from_hglobal(HGLOBAL(h.0))
-        } else {
-            None // non-text format: ignore
-        };
-        if let Some(text) = text {
-            store_set(&text);
+        if let Some(bytes) = read_bytes_from_hglobal(HGLOBAL(h.0)) {
+            let key = key_of(fmt);
+            PENDING.with(|p| {
+                let mut v = p.borrow_mut();
+                v.retain(|(k, _)| *k != key); // last write wins per format
+                v.push((key, bytes));
+            });
         }
         h
     }))
     .unwrap_or(HANDLE::default())
 }
 
-/// `GetClipboardData(fmt)` → for text formats, allocate a fresh `HGLOBAL` in the requested encoding
-/// from the host store, cache it (so the app needn't free it; we free on next open/empty/close),
-/// and return it. NULL if the store is empty, the format is non-text, or the pipe is down.
+/// `GetClipboardData(fmt)` → resolve the format's bytes (stored verbatim or synthesized), then hand
+/// back a handle the app needn't free (we free on next open/empty/close): a GDI `HBITMAP` for
+/// `CF_BITMAP`, otherwise a fresh `HGLOBAL`. NULL if unavailable or the pipe is down.
 fn get_clipboard_data(fmt: u32) -> HANDLE {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if !is_text_format(fmt) {
-            return HANDLE::default();
-        }
-        let Some(text) = store_get() else {
+        let key = key_of(fmt);
+        let Some(bytes) = resolve_bytes(fmt, &key) else {
             return HANDLE::default();
         };
-        match alloc_hglobal_for(fmt, &text) {
+        if fmt == CF_BITMAP {
+            return make_bitmap_handle(&bytes).unwrap_or_default();
+        }
+        match alloc_hglobal_bytes(&bytes) {
             Some(h) => {
-                cache_handle(h);
+                cache_global(h);
                 HANDLE(h.0)
             }
             None => HANDLE::default(),
@@ -173,33 +309,34 @@ fn get_clipboard_data(fmt: u32) -> HANDLE {
     .unwrap_or(HANDLE::default())
 }
 
-/// `IsClipboardFormatAvailable(fmt)` → TRUE iff a text format and the store is non-empty.
+/// `IsClipboardFormatAvailable(fmt)` → TRUE iff `fmt` is among the stored/synthesizable formats.
 fn is_clipboard_format_available(fmt: u32) -> BOOL {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        BOOL((is_text_format(fmt) && store_get().is_some()) as i32)
+        BOOL(available_ids().contains(&fmt) as i32)
     }))
     .unwrap_or(BOOL(0))
 }
 
-/// `CountClipboardFormats()` → 2 (CF_UNICODETEXT + CF_TEXT) when the store has text, else 0.
+/// `CountClipboardFormats()` → the number of stored/synthesizable formats.
 fn count_clipboard_formats() -> i32 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if store_get().is_some() {
-            2
-        } else {
-            0
-        }
-    }))
-    .unwrap_or(0)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| available_ids().len() as i32))
+        .unwrap_or(0)
 }
 
-/// `EnumClipboardFormats(prev)` → enumerate our synthesized text formats:
-/// 0 → CF_UNICODETEXT; CF_UNICODETEXT → CF_TEXT; anything else → 0 (end of list).
+/// `EnumClipboardFormats(prev)` → walk the stored/synthesizable formats in order: `0` yields the
+/// first; otherwise the one after `prev`; `0` again at the end of the list.
 fn enum_clipboard_formats(prev: u32) -> u32 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match prev {
-        0 => CF_UNICODETEXT_ID,
-        CF_UNICODETEXT_ID => CF_TEXT_ID,
-        _ => 0,
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ids = available_ids();
+        match prev {
+            0 => ids.first().copied().unwrap_or(0),
+            _ => ids
+                .iter()
+                .position(|&x| x == prev)
+                .and_then(|i| ids.get(i + 1))
+                .copied()
+                .unwrap_or(0),
+        }
     }))
     .unwrap_or(0)
 }

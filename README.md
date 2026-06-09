@@ -75,7 +75,8 @@ the VM tier (the Windows Sandbox `.wsb` template under `packaging/windows-sandbo
 VM running `glass-mcp serve --http`). ² Windows needs an interactive, logged-in session to render
 and capture. ³ When contained (`sandbox=default`/`strict`), the boxed app gets a private clipboard
 isolated from yours — an injected hook backs its clipboard with glass's own store; `sandbox=off`
-uses the real OS clipboard. Text only in v1 (classic apps; x64).
+uses the real OS clipboard. Carries text, HTML, RTF, and images for apps using the Win32 clipboard
+(x64); rich apps that copy via OLE, and file copy, are in progress.
 
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature
