@@ -134,20 +134,22 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Read the clipboard as text (\"\" if empty). Acts on the app's display — \
-                       isolated from your real clipboard on the private Xvfb/sway backends. Also \
-                       the cheap text-extraction path: glass_do ctrl+a then ctrl+c, then read \
-                       here (beats OCR for selectable text)."
+        description = "Read the clipboard as text (\"\" if empty). Acts on the app's clipboard — \
+                       isolated from your real clipboard on the private Xvfb/sway backends and on \
+                       a contained Windows app (a private boxed clipboard). Also the cheap \
+                       text-extraction path: glass_do ctrl+a then ctrl+c, then read here (beats \
+                       OCR for selectable text)."
     )]
     async fn glass_clipboard_get(&self) -> Result<CallToolResult, McpError> {
         self.run(tools::clipboard_get).await
     }
 
     #[tool(
-        description = "Write text to the clipboard so the app can paste it. Isolated to the \
-                       app's display on private backends; on shared-desktop modes \
-                       (GLASS_DISPLAY=:0, Windows) this writes your real clipboard — snapshot \
-                       with glass_clipboard_get first if needed."
+        description = "Write text to the clipboard so the app can paste it. Isolated from your \
+                       real clipboard on the private Xvfb/sway backends and on a contained Windows \
+                       app (a private boxed clipboard); only shared-desktop modes (GLASS_DISPLAY=:0, \
+                       or the Windows backend with sandbox=off) write your real clipboard — \
+                       snapshot with glass_clipboard_get first if needed."
     )]
     async fn glass_clipboard_set(
         &self,

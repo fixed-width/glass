@@ -67,13 +67,15 @@ tree — for apps with no accessible UI (bare canvas / game UIs), so the agent f
 | | X11 | Wayland | Windows | macOS |
 |---|:--:|:--:|:--:|:--:|
 | Display isolation (app off your desktop) | ✓ private Xvfb | ✓ headless sway | – interactive desktop¹ | 🚧 |
-| Clipboard isolation | ✓ | ✓ | – shared OS clipboard | 🚧 |
+| Clipboard isolation | ✓ | ✓ | ✓ private (contained)³ | 🚧 |
 | Headless (no host desktop needed) | ✓ | ✓ | – needs a session² | 🚧 |
 
 ¹ A Windows VirtualDisplay / headless provider is a planned follow-on; stronger isolation today is
 the VM tier (the Windows Sandbox `.wsb` template under `packaging/windows-sandbox/`, or a managed
 VM running `glass-mcp serve --http`). ² Windows needs an interactive, logged-in session to render
-and capture.
+and capture. ³ When contained (`sandbox=default`/`strict`), the boxed app gets a private clipboard
+isolated from yours — an injected hook backs its clipboard with glass's own store; `sandbox=off`
+uses the real OS clipboard. Text only in v1 (classic apps; x64).
 
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature
@@ -239,9 +241,11 @@ A few capabilities worth knowing:
   that part.
 - **Clipboard get/set.** `glass_clipboard_get` reads the clipboard as text
   (`""` when empty); `glass_clipboard_set` writes text so the app can paste it.
-  Both are isolated to the app's display on the private Xvfb/sway backends —
-  they never touch your real clipboard unless you set `GLASS_DISPLAY=:0` or use
-  the Windows backend. `glass_clipboard_get` is also the cheap text-extraction
+  Both are isolated to the app's display on the private Xvfb/sway backends, and
+  on Windows a sandboxed app gets a **private clipboard** too (an injected hook
+  backs the boxed app's clipboard with glass's own store) — so they never touch
+  your real clipboard unless you set `GLASS_DISPLAY=:0` or run the Windows
+  backend with `sandbox=off`. `glass_clipboard_get` is also the cheap text-extraction
   path: issue `ctrl+a` then `ctrl+c` via `glass_do`, then read here — faster and
   token-free compared to OCR for any app with selectable text.
 - **Real window managers.** On X11, window discovery uses `_NET_WM_PID`, a
