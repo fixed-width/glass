@@ -1006,6 +1006,21 @@ impl Platform for WaylandPlatform {
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         std::mem::take(&mut *self.logs.lock().unwrap())
     }
+
+    /// The app's process subtree. The child we spawn is **sway**, which launches
+    /// the app as an `exec` descendant (under a shell, and `bwrap` when
+    /// sandboxed), so the real app has a different pid. The a11y reader
+    /// correlates the AT-SPI connection pid against this set, so it must include
+    /// the descendants — the inherited single-pid default leaves it empty and the
+    /// reader can't tell apps apart. Mirrors the X11 backend's `app_pids()`.
+    /// (We intentionally don't override `app_pid()`: there is no single
+    /// authoritative app pid here — sway's pid isn't the app's.)
+    fn app_pids(&self) -> Vec<u32> {
+        match &self.active {
+            Some(s) => glass_proc_linux::proc_tree_pids(s.child.id()),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
