@@ -66,7 +66,7 @@ fn run() -> i32 {
         }
         std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, dst as *mut u8, bytes);
         let _ = GlobalUnlock(h);
-        if SetClipboardData(cf, HANDLE(h.0)).is_err() {
+        if SetClipboardData(cf, Some(HANDLE(h.0))).is_err() {
             let _ = CloseClipboard();
             eprintln!("FAIL: SetClipboardData");
             return 1;
@@ -210,7 +210,7 @@ fn run_multi() -> i32 {
                 eprintln!("FAIL: alloc {fmt}");
                 return 1;
             }
-            if SetClipboardData(fmt, HANDLE(h.0)).is_err() {
+            if SetClipboardData(fmt, Some(HANDLE(h.0))).is_err() {
                 let _ = CloseClipboard();
                 eprintln!("FAIL: SetClipboardData {fmt}");
                 return 1;
