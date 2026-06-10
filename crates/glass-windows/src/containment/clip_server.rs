@@ -65,15 +65,23 @@ impl ClipServer {
         Ok(ClipServer { pipe_path, stop, thread: Some(thread) })
     }
 
-    /// Stop the loop: flag, then poke the pipe (a self-connect) to break a blocking
-    /// `ConnectNamedPipe`, then join.
+    /// Stop the loop and join its accept thread. Thin consuming wrapper over
+    /// [`Self::shutdown`]; `Drop` also calls `shutdown`, so a `ClipServer`
+    /// dropped without an explicit `stop()` is reclaimed just the same.
     pub(crate) fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// Flag the loop, poke the pipe (a self-connect) to break a blocking
+    /// `ConnectNamedPipe`, then join the accept thread. Idempotent: the thread
+    /// handle is taken via the `Option`, so calling this twice (e.g. `stop()`
+    /// then `Drop`) joins exactly once.
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let wide = to_wide(&self.pipe_path);
         // SAFETY: opening our own pipe by name to release the accept loop; handle closed immediately.
         unsafe {
-            use windows::Win32::Foundation::GENERIC_READ;
-            use windows::Win32::Foundation::GENERIC_WRITE;
+            use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
             use windows::Win32::Storage::FileSystem::{
                 CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
             };
@@ -97,7 +105,12 @@ impl ClipServer {
 
 impl Drop for ClipServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Full teardown even when stop() was never called — e.g. an early
+        // return in setup_private_clipboard, or a launch() that fails after the
+        // server started — so the accept thread + pipe instance + security
+        // descriptor are never leaked (previously Drop only set the flag, which
+        // a thread parked in ConnectNamedPipe never observes).
+        self.shutdown();
     }
 }
 
