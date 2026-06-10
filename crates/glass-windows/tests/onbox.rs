@@ -225,12 +225,12 @@ fn onbox_handoff_grace() {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    // Win11 Notepad's launcher hands its UI to a broker process and exits, so the window is owned by
-    // neither the launcher nor a Job descendant. With a title hint, discover_window's grace period must
-    // still adopt that broker window — the PR #12 fix. (The no-hint fast-fail path is covered by the
-    // discovery::poll_decision unit tests; it is NOT asserted on-box because Notepad stays "warm" after
-    // a launch — a subsequent no-hint launch then finds the warm instance — making it environment-
-    // dependent rather than a glass invariant.)
+    // Win11 Notepad's launcher hands its UI to a DESCENDANT process and the launcher exits, so the
+    // window is owned by a child in the pid-set (a cold no-hint launch was measured to yield
+    // app_pids=[<descendant>, <root>] and a real window). discover_window's grace period — keep polling
+    // while the pid-set still holds a live descendant — must adopt that window even with NO hint
+    // (the PR #14 behavior; pre-#14 this fast-failed AppExited before the descendant's window mapped).
+    // The no-hint fast-fail-on-true-crash path is covered by the discovery::poll_decision unit tests.
     kill_notepad();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
@@ -238,14 +238,14 @@ fn onbox_handoff_grace() {
         run: vec!["notepad.exe".to_string()],
         cwd: None,
         env: vec![],
-        window_hint: Some(WindowHint { title: Some("Notepad".into()), class: None }),
+        window_hint: None,
         timeout_ms: 8_000,
         sandbox: glass_core::SandboxLevel::Off,
     };
-    let _geo = p.start_app(&spec).expect("with a title hint, start_app must adopt the broker window");
+    let _geo = p.start_app(&spec).expect("notepad's handoff-to-descendant window must be discovered no-hint");
     std::thread::sleep(Duration::from_millis(800));
     let f = p.capture_frame(None).expect("capture the adopted notepad window");
-    assert!(!is_blank(&f.pixels), "the adopted broker window must capture non-blank");
+    assert!(!is_blank(&f.pixels), "the adopted handoff window must capture non-blank");
     let _ = p.stop_app();
     kill_notepad();
 }

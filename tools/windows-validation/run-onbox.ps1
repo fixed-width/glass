@@ -36,7 +36,9 @@ if ($Sha -ne "") {
   cmd /c "git clean -q -fd 2>&1" | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail "git clean failed" }
 }
-if ($DiffPath -ne "" -and (Test-Path $DiffPath)) {
+# Skip an empty diff: a dirty tree with only UNTRACKED files produces a zero-byte `git diff HEAD`,
+# and `git apply` errors on an empty patch ("No valid patches in input").
+if ($DiffPath -ne "" -and (Test-Path $DiffPath) -and (Get-Item $DiffPath).Length -gt 0) {
   Write-Host "== sync: apply working-tree diff =="
   cmd /c "git apply --whitespace=nowarn `"$DiffPath`" 2>&1"
   if ($LASTEXITCODE -ne 0) { Fail "git apply failed" }
