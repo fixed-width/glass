@@ -195,6 +195,19 @@ fn parse_sway_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Pick an output-x one pixel away from `axx` for the focus-reassert nudge.
+/// sway only re-evaluates pointer focus on motion, so the intermediate point
+/// must be a genuine delta. Nudging left (`axx - 1`) is a no-op at the left
+/// edge (`axx == 0`), which silently lost the first click/scroll there — so
+/// nudge right instead, clamped to stay on a `w`-wide output.
+fn nudge_x(axx: u32, w: u32) -> u32 {
+    if axx > 0 {
+        axx - 1
+    } else {
+        (axx + 1).min(w.saturating_sub(1))
+    }
+}
+
 /// Find sway's `wayland-N` socket in the private runtime dir (sway uses
 /// `wayland-1`, not cage's `wayland-0`). Ignores `wayland-N.lock` and `sway-ipc.*`.
 fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
@@ -780,7 +793,7 @@ impl Platform for WaylandPlatform {
             vp.motion_absolute(t, ax(x), ay(y), w, h);
             vp.frame();
             settle(q, s)?;
-            vp.motion_absolute(t, ax(x).saturating_sub(1), ay(y), w, h);
+            vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
             vp.frame();
             vp.motion_absolute(t, ax(x), ay(y), w, h);
             vp.frame();
@@ -991,7 +1004,7 @@ impl Platform for WaylandPlatform {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sway_version;
+    use super::{nudge_x, parse_sway_version};
 
     #[test]
     fn parse_sway_version_handles_real_and_garbage() {
@@ -999,5 +1012,24 @@ mod tests {
         assert_eq!(parse_sway_version("sway version 1.9"), Some((1, 9)));
         assert_eq!(parse_sway_version("not a version"), None);
         assert!((1u32, 12u32) >= (1, 12) && (1u32, 9u32) < (1, 12));
+    }
+
+    #[test]
+    fn nudge_x_always_differs_from_target() {
+        // Interior: nudge one pixel left.
+        assert_eq!(nudge_x(5, 100), 4);
+        assert_eq!(nudge_x(1, 100), 0);
+        // Right edge stays on-output and still differs.
+        assert_eq!(nudge_x(99, 100), 98);
+        // Left edge (output x==0): must NOT be a no-op — nudge right instead.
+        assert_eq!(nudge_x(0, 100), 1);
+        // The core regression property: on any real (>=2px wide) output the
+        // nudge is always a genuine motion delta, so sway re-evaluates focus.
+        for w in 2..=64u32 {
+            for x in 0..w {
+                assert_ne!(nudge_x(x, w), x, "no-op nudge at x={x}, w={w}");
+                assert!(nudge_x(x, w) < w, "nudge off-output at x={x}, w={w}");
+            }
+        }
     }
 }
