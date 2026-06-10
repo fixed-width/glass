@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    DV_E_FORMATETC, E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
+    DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, E_UNEXPECTED, OLE_E_ADVISENOTSUPPORTED, S_FALSE,
+    S_OK,
 };
 use windows::Win32::System::Com::{
     IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
@@ -26,6 +27,17 @@ use super::{
     alloc_hglobal_bytes, id_of, key_of, locale_blob, unicode_to_codepage, CF_DIBV5, CF_LOCALE,
     CF_OEMTEXT, CF_TEXT,
 };
+
+/// Run a vtable-method body, converting a panic (UB across the `extern "system"` COM boundary) into
+/// an error HRESULT. The macro's thunks have no panic guard and member-crate `panic=abort` is
+/// ignored by Cargo, so every `_Impl` method must guard itself (design D7).
+fn guard_hr(f: impl FnOnce() -> HRESULT) -> HRESULT {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(E_UNEXPECTED)
+}
+fn guard_res<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(E_UNEXPECTED.into()))
+}
 
 /// Bytes for `cf` from the baked `entries`: stored verbatim, or byte-synthesized from its canonical.
 fn bytes_for(entries: &[(FormatKey, Vec<u8>)], cf: u16) -> Option<Vec<u8>> {
@@ -65,40 +77,48 @@ struct StoreEnum {
 
 impl IEnumFORMATETC_Impl for StoreEnum_Impl {
     fn Next(&self, celt: u32, rgelt: *mut FORMATETC, pceltfetched: *mut u32) -> HRESULT {
-        let mut n = 0u32;
-        let mut i = self.idx.load(Ordering::Relaxed);
-        while n < celt && i < self.ids.len() {
-            // SAFETY: the caller guarantees rgelt has >= celt slots; write a freshly-built FORMATETC.
-            unsafe { rgelt.add(n as usize).write(formatetc(self.ids[i])) };
-            i += 1;
-            n += 1;
-        }
-        self.idx.store(i, Ordering::Relaxed);
-        if !pceltfetched.is_null() {
-            // SAFETY: caller out-param; may be null (then ignored).
-            unsafe { *pceltfetched = n };
-        }
-        if n == celt {
-            S_OK
-        } else {
-            S_FALSE
-        }
+        guard_hr(|| {
+            let mut n = 0u32;
+            let mut i = self.idx.load(Ordering::Relaxed);
+            while n < celt && i < self.ids.len() {
+                // SAFETY: the caller guarantees rgelt has >= celt slots; write a freshly-built FORMATETC.
+                unsafe { rgelt.add(n as usize).write(formatetc(self.ids[i])) };
+                i += 1;
+                n += 1;
+            }
+            self.idx.store(i, Ordering::Relaxed);
+            if !pceltfetched.is_null() {
+                // SAFETY: caller out-param; may be null (then ignored).
+                unsafe { *pceltfetched = n };
+            }
+            if n == celt {
+                S_OK
+            } else {
+                S_FALSE
+            }
+        })
     }
     fn Skip(&self, celt: u32) -> Result<()> {
-        let i = (self.idx.load(Ordering::Relaxed) + celt as usize).min(self.ids.len());
-        self.idx.store(i, Ordering::Relaxed);
-        Ok(())
+        guard_res(|| {
+            let i = (self.idx.load(Ordering::Relaxed) + celt as usize).min(self.ids.len());
+            self.idx.store(i, Ordering::Relaxed);
+            Ok(())
+        })
     }
     fn Reset(&self) -> Result<()> {
-        self.idx.store(0, Ordering::Relaxed);
-        Ok(())
+        guard_res(|| {
+            self.idx.store(0, Ordering::Relaxed);
+            Ok(())
+        })
     }
     fn Clone(&self) -> Result<IEnumFORMATETC> {
-        Ok(StoreEnum {
-            ids: self.ids.clone(),
-            idx: AtomicUsize::new(self.idx.load(Ordering::Relaxed)),
-        }
-        .into())
+        guard_res(|| {
+            Ok(StoreEnum {
+                ids: self.ids.clone(),
+                idx: AtomicUsize::new(self.idx.load(Ordering::Relaxed)),
+            }
+            .into())
+        })
     }
 }
 
@@ -128,65 +148,73 @@ impl StoreDataObject {
 
 impl IDataObject_Impl for StoreDataObject_Impl {
     fn GetData(&self, pformatetcin: *const FORMATETC) -> Result<STGMEDIUM> {
-        // SAFETY: OLE guarantees a valid FORMATETC pointer for the call.
-        let req = unsafe { &*pformatetcin };
-        if (req.tymed & TYMED_HGLOBAL.0 as u32) == 0 {
-            return Err(Error::from_hresult(DV_E_FORMATETC));
-        }
-        let Some(bytes) = bytes_for(&self.entries, req.cfFormat) else {
-            return Err(Error::from_hresult(DV_E_FORMATETC));
-        };
-        // Hand back a FRESH HGLOBAL — the caller frees it (pUnkForRelease = None).
-        let Some(h) = alloc_hglobal_bytes(&bytes) else {
-            return Err(Error::from_hresult(DV_E_FORMATETC));
-        };
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: h },
-            pUnkForRelease: ManuallyDrop::new(None),
+        guard_res(|| {
+            // SAFETY: OLE guarantees a valid FORMATETC pointer for the call.
+            let req = unsafe { &*pformatetcin };
+            if (req.tymed & TYMED_HGLOBAL.0 as u32) == 0 {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            }
+            let Some(bytes) = bytes_for(&self.entries, req.cfFormat) else {
+                return Err(Error::from_hresult(DV_E_FORMATETC));
+            };
+            // Hand back a FRESH HGLOBAL — the caller frees it (pUnkForRelease = None).
+            let Some(h) = alloc_hglobal_bytes(&bytes) else {
+                return Err(Error::from_hresult(E_OUTOFMEMORY));
+            };
+            Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: h },
+                pUnkForRelease: ManuallyDrop::new(None),
+            })
         })
     }
     fn GetDataHere(&self, _: *const FORMATETC, _: *mut STGMEDIUM) -> Result<()> {
-        Err(Error::from_hresult(DV_E_FORMATETC))
+        guard_res(|| Err(Error::from_hresult(DV_E_FORMATETC)))
     }
     fn QueryGetData(&self, pformatetc: *const FORMATETC) -> HRESULT {
-        // SAFETY: valid for the call.
-        let req = unsafe { &*pformatetc };
-        if (req.tymed & TYMED_HGLOBAL.0 as u32) != 0
-            && bytes_for(&self.entries, req.cfFormat).is_some()
-        {
-            S_OK
-        } else {
-            DV_E_FORMATETC
-        }
+        guard_hr(|| {
+            // SAFETY: valid for the call.
+            let req = unsafe { &*pformatetc };
+            if (req.tymed & TYMED_HGLOBAL.0 as u32) != 0
+                && bytes_for(&self.entries, req.cfFormat).is_some()
+            {
+                S_OK
+            } else {
+                DV_E_FORMATETC
+            }
+        })
     }
     fn GetCanonicalFormatEtc(&self, _: *const FORMATETC, pout: *mut FORMATETC) -> HRESULT {
-        if !pout.is_null() {
-            // SAFETY: caller out-param; ptd=null signals "use the input formatetc".
-            unsafe { (*pout).ptd = std::ptr::null_mut() };
-        }
-        E_NOTIMPL
+        guard_hr(|| {
+            if !pout.is_null() {
+                // SAFETY: caller out-param; ptd=null signals "use the input formatetc".
+                unsafe { (*pout).ptd = std::ptr::null_mut() };
+            }
+            E_NOTIMPL
+        })
     }
     fn SetData(&self, _: *const FORMATETC, _: *const STGMEDIUM, _: BOOL) -> Result<()> {
-        Err(Error::from_hresult(E_NOTIMPL))
+        guard_res(|| Err(Error::from_hresult(E_NOTIMPL)))
     }
     fn EnumFormatEtc(&self, dwdirection: u32) -> Result<IEnumFORMATETC> {
-        if dwdirection != DATADIR_GET.0 as u32 {
-            return Err(Error::from_hresult(E_NOTIMPL));
-        }
-        Ok(StoreEnum {
-            ids: self.ids.clone(),
-            idx: AtomicUsize::new(0),
-        }
-        .into())
+        guard_res(|| {
+            if dwdirection != DATADIR_GET.0 as u32 {
+                return Err(Error::from_hresult(E_NOTIMPL));
+            }
+            Ok(StoreEnum {
+                ids: self.ids.clone(),
+                idx: AtomicUsize::new(0),
+            }
+            .into())
+        })
     }
     fn DAdvise(&self, _: *const FORMATETC, _: u32, _: Ref<IAdviseSink>) -> Result<u32> {
-        Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+        guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
     fn DUnadvise(&self, _: u32) -> Result<()> {
-        Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+        guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
-        Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED))
+        guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
 }
