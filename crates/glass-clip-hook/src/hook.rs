@@ -93,7 +93,7 @@ fn open_pipe(path: &str) -> Option<HANDLE> {
                 None,
                 OPEN_EXISTING,
                 FILE_FLAGS_AND_ATTRIBUTES(0),
-                HANDLE::default(),
+                None,
             )
         };
         if let Ok(h) = opened {
@@ -222,7 +222,7 @@ pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
         let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).ok()?;
         let dst = GlobalLock(h) as *mut u8;
         if dst.is_null() {
-            let _ = GlobalFree(h);
+            let _ = GlobalFree(Some(h));
             return None;
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());

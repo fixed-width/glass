@@ -13,7 +13,8 @@
 use std::cell::{Cell, RefCell};
 
 use retour::static_detour;
-use windows::Win32::Foundation::{GlobalFree, BOOL, HANDLE, HGLOBAL, HWND};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
 use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
 
@@ -88,7 +89,7 @@ fn free_cached_handle() {
             // SAFETY: `raw` is an HGLOBAL we allocated in `alloc_hglobal_bytes` (GMEM_MOVEABLE) and
             // handed out exactly once; freeing it here is the agreed ownership transfer.
             HandleKind::Global => unsafe {
-                let _ = GlobalFree(HGLOBAL(raw as *mut _));
+                let _ = GlobalFree(Some(HGLOBAL(raw as *mut _)));
             },
             // SAFETY: `raw` is a GDI HBITMAP we created in `make_bitmap_handle` and handed out once;
             // DeleteObject is the matching destructor.
