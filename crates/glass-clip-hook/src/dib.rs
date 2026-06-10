@@ -49,14 +49,18 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
     }
     let abs_h = (height as i64).unsigned_abs();
     // color table: for <=8bpp, clr_used (or 2^bpp if 0) entries of 4 bytes.
-    let color_table_bytes = if bpp <= 8 {
+    let color_table_bytes: usize = if bpp <= 8 {
         let entries = if clr_used == 0 { 1u64 << bpp } else { clr_used as u64 };
         if entries > 256 {
             return None; // a palette can't exceed 2^8
         }
         (entries as usize) * 4
     } else {
-        0
+        // High-bpp packed DIBs may carry a biClrUsed optimization palette
+        // (4 bytes/entry) between header and pixels; count it so the pixel
+        // offset stays correct. biClrUsed==0 (the common case) yields 0. Any
+        // absurd value is caught by the buffer-length check below, not here.
+        (clr_used as u64).checked_mul(4)?.try_into().ok()?
     };
     // stride = ((width*bpp + 31)/32)*4, all in u64 to avoid overflow.
     let bits = (width as u64).checked_mul(bpp as u64)?;
@@ -189,6 +193,28 @@ mod tests {
         let mut v = bih_2x2_32(); // declares a 2x2x32 image (16 bytes) but we append only 4
         v.extend_from_slice(&[0u8; 4]);
         assert!(parse_dib(&v).is_none());
+    }
+
+    #[test]
+    fn honors_high_bpp_optimization_palette() {
+        // A 32bpp BI_RGB DIB may legally carry a biClrUsed optimization palette
+        // (4 bytes/entry) between the header and the pixels. It must be counted,
+        // or every consumer mislocates the pixel bits (silent corruption).
+        let mut v = bih_2x2_32();
+        v[8..12].copy_from_slice(&1i32.to_le_bytes()); // height=1 (keep it small)
+        v[4..8].copy_from_slice(&1i32.to_le_bytes()); // width=1 → stride 4, image 4
+        v[32..36].copy_from_slice(&2u32.to_le_bytes()); // biClrUsed = 2 → 8 palette bytes
+        v.extend_from_slice(&[0xAA; 8]); // palette
+        v.extend_from_slice(&[0xBB; 4]); // 1px * 4B pixels
+        let d = parse_dib(&v).expect("valid high-bpp DIB with palette");
+        assert_eq!(d.color_table_bytes, 8, "biClrUsed palette must be counted for bpp>8");
+        assert_eq!(d.image_bytes, 4);
+        // Pixels must be located after header + palette (40 + 8 = 48), not at 40.
+        assert_eq!(
+            &v[d.header_bytes + d.color_table_bytes..][..d.image_bytes],
+            &[0xBB; 4],
+            "pixel offset must skip the palette"
+        );
     }
 
     #[test]
