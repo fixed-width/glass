@@ -27,12 +27,6 @@ windows = { version = "0.62", features = [
   "Win32_Security_Authorization",
 ] }
 
-# Only the on-box validation example (examples/onbox.rs) needs a PNG encoder to save captured
-# frames; the library itself has no image dependency. glass-core's `image` is webp-only, so the
-# example pulls the png feature for itself.
-[dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
-
 # The onbox examples set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
 # onbox_a11y example also drives the UIA reader to validate the accessibility path on the box.
 [target.'cfg(windows)'.dev-dependencies]
