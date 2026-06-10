@@ -23,9 +23,6 @@ mod imp {
     use std::time::{Duration, Instant};
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    const EDGE: &str = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
-    const UDD: &str = r"C:\Users\mpd\glass-a11y-edge";
-
     fn counts(n: &AxNode, total: &mut usize, interactable: &mut usize) {
         *total += 1;
         if n.role.is_interactable() {
@@ -44,7 +41,6 @@ mod imp {
             );
         }
         println!("== glass-a11y-windows multi-process stress test (isolated Edge) ==");
-        let _ = std::fs::remove_dir_all(UDD);
 
         let mut p = match WindowsPlatform::new() {
             Ok(p) => p,
@@ -53,11 +49,20 @@ mod imp {
                 return;
             }
         };
+        let edge = match glass_windows::onbox_support::locate_edge() {
+            Some(e) => e,
+            None => {
+                println!("  FAIL: msedge.exe not found under Program Files (Edge required)");
+                return;
+            }
+        };
+        let udd = glass_windows::onbox_support::scratch_dir("glass-a11y-edge");
+        let _ = std::fs::remove_dir_all(&udd);
         let spec = AppSpec {
             build: None,
             run: vec![
-                EDGE.to_string(),
-                format!("--user-data-dir={UDD}"),
+                edge.clone(),
+                format!("--user-data-dir={udd}"),
                 "--no-first-run".to_string(),
                 "--no-default-browser-check".to_string(),
                 "--new-window".to_string(),
@@ -78,7 +83,7 @@ mod imp {
             }
             Err(e) => {
                 println!("  FAIL  {e}");
-                let _ = std::fs::remove_dir_all(UDD);
+                let _ = std::fs::remove_dir_all(&udd);
                 return;
             }
         };
@@ -132,7 +137,7 @@ mod imp {
 
         println!("\n[stop_app — kill the Edge tree]");
         let _ = p.stop_app();
-        let _ = std::fs::remove_dir_all(UDD);
+        let _ = std::fs::remove_dir_all(&udd);
         println!("\n== done ==");
     }
 }

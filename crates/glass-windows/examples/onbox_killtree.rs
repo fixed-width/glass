@@ -21,8 +21,6 @@ mod imp {
     use glass_windows::WindowsPlatform;
     use std::time::Duration;
 
-    const EDGE: &str = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
-    const UDD: &str = r"C:\Users\mpd\glass-kt-probe";
     const MARKER: &str = "glass-kt-probe";
 
     fn is_blank(px: &[u8]) -> bool {
@@ -56,7 +54,6 @@ mod imp {
             );
         }
         println!("== glass-windows multi-process discovery + Job kill-tree (isolated Edge) ==");
-        let _ = std::fs::remove_dir_all(UDD); // start clean
 
         let mut p = match WindowsPlatform::new() {
             Ok(p) => p,
@@ -65,11 +62,20 @@ mod imp {
                 return;
             }
         };
+        let edge = match glass_windows::onbox_support::locate_edge() {
+            Some(e) => e,
+            None => {
+                println!("  FAIL: msedge.exe not found under Program Files (Edge required)");
+                return;
+            }
+        };
+        let udd = glass_windows::onbox_support::scratch_dir(MARKER);
+        let _ = std::fs::remove_dir_all(&udd); // start clean
         let spec = AppSpec {
             build: None,
             run: vec![
-                EDGE.to_string(),
-                format!("--user-data-dir={UDD}"),
+                edge.clone(),
+                format!("--user-data-dir={udd}"),
                 "--no-first-run".to_string(),
                 "--no-default-browser-check".to_string(),
                 "--new-window".to_string(),
@@ -89,7 +95,7 @@ mod imp {
                 println!("  FAIL discovery: {e}");
                 println!("  (if AppExited: the launched process handed off + exited; see notes)");
                 let _ = p.stop_app();
-                let _ = std::fs::remove_dir_all(UDD);
+                let _ = std::fs::remove_dir_all(&udd);
                 return;
             }
         }
@@ -131,7 +137,7 @@ mod imp {
             }
         );
 
-        let _ = std::fs::remove_dir_all(UDD);
+        let _ = std::fs::remove_dir_all(&udd);
         println!("\n== done ==");
     }
 }
