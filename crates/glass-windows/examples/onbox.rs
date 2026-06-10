@@ -25,7 +25,12 @@ mod imp {
     use glass_windows::WindowsPlatform;
     use std::time::Duration;
 
-    const OUT: &str = "C:\\Users\\mpd";
+    /// Where captured-frame artifacts are written: the running user's profile dir, which is also
+    /// where scripts/test-windows.sh sweeps `*.webp` from. Resolved at runtime (not a hardcoded
+    /// user) so the harness finds the artifacts on any box.
+    fn out_dir() -> String {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string())
+    }
 
     /// True if every pixel is identical (a uniform/blank frame — WGC didn't return real pixels).
     fn is_blank(px: &[u8]) -> bool {
@@ -41,7 +46,7 @@ mod imp {
     /// Encode a captured frame as lossless WebP (glass's production format, via
     /// `frame_to_webp`) and write it next to the other artifacts.
     fn save(name: &str, frame: &Frame) {
-        let path = format!("{OUT}\\{name}");
+        let path = format!("{}\\{}", out_dir(), name);
         match frame_to_webp(frame) {
             Ok(bytes) => match std::fs::write(&path, bytes) {
                 Ok(()) => println!("    saved {path}"),
@@ -187,7 +192,7 @@ mod imp {
 
         println!("\n[drain_logs]");
         let logs = p.drain_logs();
-        println!("  {} line(s) (Notepad is a GUI app → 0 expected)", logs.len());
+        println!("  {} line(s) (charmap is a GUI app — 0 expected)", logs.len());
 
         println!("\n[stop_app — Job kill-tree]");
         let pid = p.app_pid();

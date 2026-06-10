@@ -127,7 +127,7 @@ foreach ($t in $Targets) {
 # --- 6. run ignored tests (optional) ---
 if ($Tests -ne "") {
   Write-Host "`n===== tests: --ignored $Tests ====="
-  cmd /c "cargo test -p glass-windows $relArg -- --ignored $Tests 2>&1" | Tee-Object -Variable tout | Out-Host
+  cmd /c "cargo test -p glass-windows $relArg -- --ignored $Tests 2>&1" | Out-Host
   if ($LASTEXITCODE -ne 0) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }
 }
 
