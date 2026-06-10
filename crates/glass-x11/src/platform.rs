@@ -7,6 +7,7 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
+use glass_proc_linux::proc_tree_pids;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
@@ -502,64 +503,9 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
     });
 }
 
-/// Collect the full set of host PIDs in the process tree rooted at `root_pid`
-/// (inclusive). Reads `/proc/<pid>/status` for each process in `/proc` and
-/// follows `PPid:` links upward to root_pid.
-///
-/// This is needed for sandboxed launches: when `bwrap` is the direct child (and
-/// thus the recorded child PID), the actual app is bwrap's child with a
-/// different PID. `_NET_WM_PID` is set to the app's real host PID, so window
-/// discovery must check all descendants of the spawned process, not just its
-/// own PID.
-///
-/// Returns an empty vec if `/proc` is not available or `root_pid` has no
-/// children yet (the caller polls in a loop so an empty set just means "retry").
-fn proc_tree_pids(root_pid: u32) -> Vec<u32> {
-    // Read all (ppid, pid) pairs from /proc.
-    let proc = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return vec![root_pid],
-    };
-    let mut parent_of: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for entry in proc.flatten() {
-        let name = entry.file_name();
-        let pid_str = name.to_string_lossy();
-        let Ok(pid) = pid_str.parse::<u32>() else { continue };
-        let status_path = format!("/proc/{pid}/status");
-        let Ok(content) = std::fs::read_to_string(&status_path) else { continue };
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("PPid:") {
-                if let Ok(ppid) = rest.trim().parse::<u32>() {
-                    parent_of.insert(pid, ppid);
-                }
-                break;
-            }
-        }
-    }
-    collect_descendants(root_pid, &parent_of)
-}
-
-/// Collect `root` and all its descendants given a child→parent-pid map.
-/// Cycle-safe (a `seen` set guarantees termination even if the map contains a cycle,
-/// e.g. from PID reuse mid-scan).
-fn collect_descendants(root: u32, parent_of: &std::collections::HashMap<u32, u32>) -> Vec<u32> {
-    use std::collections::{HashSet, VecDeque};
-    let mut seen: HashSet<u32> = HashSet::new();
-    let mut out = Vec::new();
-    let mut q = VecDeque::from([root]);
-    while let Some(pid) = q.pop_front() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        out.push(pid);
-        for (&child, &ppid) in parent_of {
-            if ppid == pid && !seen.contains(&child) {
-                q.push_back(child);
-            }
-        }
-    }
-    out
-}
+// The process-tree walk (`/proc`-based) that maps the spawned child to the
+// real app's descendants now lives in the shared `glass-proc-linux` crate
+// (`proc_tree_pids`), used by both the X11 and Wayland backends.
 
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
@@ -771,6 +717,19 @@ impl Platform for X11Platform {
     fn app_pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
     }
+
+    /// The app's full process subtree, not just the spawned child. For a
+    /// sandboxed launch the spawned child is `bwrap` and the real app is a
+    /// descendant with a different pid; the a11y reader correlates the AT-SPI
+    /// connection pid against this set, so it must include descendants — the
+    /// inherited `[app_pid()]` default breaks a11y for every `sandbox != off`
+    /// launch. Mirrors the `proc_tree_pids` set used by window discovery.
+    fn app_pids(&self) -> Vec<u32> {
+        match &self.child {
+            Some(c) => proc_tree_pids(c.id()),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Decide whether a window's fetched `WM_NAME` and `WM_CLASS` satisfy a hint.
@@ -821,42 +780,11 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_descendants, hint_matches};
+    use super::hint_matches;
     use glass_core::WindowHint;
-    use std::collections::HashMap;
 
-    // --- collect_descendants ---
-
-    #[test]
-    fn descendants_normal_tree() {
-        // root 100 → children 200, 201; 200 → child 300
-        let mut parent_of = HashMap::new();
-        parent_of.insert(200u32, 100u32);
-        parent_of.insert(201u32, 100u32);
-        parent_of.insert(300u32, 200u32);
-        let mut result = collect_descendants(100, &parent_of);
-        result.sort();
-        assert_eq!(result, vec![100, 200, 201, 300]);
-    }
-
-    #[test]
-    fn descendants_cycle_terminates() {
-        // Cycle: parent_of[100] = 200, parent_of[200] = 100
-        // (simulates PID-reuse creating a bogus cycle in the map mid-scan)
-        let mut parent_of = HashMap::new();
-        parent_of.insert(100u32, 200u32);
-        parent_of.insert(200u32, 100u32);
-        // Must terminate and include the root.
-        let result = collect_descendants(100, &parent_of);
-        assert!(result.contains(&100), "root must be present even with a cycle");
-        assert!(result.len() <= 2, "cycle must not cause unbounded growth");
-    }
-
-    #[test]
-    fn descendants_root_only() {
-        let parent_of: HashMap<u32, u32> = HashMap::new();
-        assert_eq!(collect_descendants(42, &parent_of), vec![42]);
-    }
+    // proc_tree_pids / collect_descendants moved to the `glass-proc-linux` crate
+    // (tested there).
 
     fn hint(title: Option<&str>, class: Option<&str>) -> WindowHint {
         WindowHint { title: title.map(Into::into), class: class.map(Into::into) }

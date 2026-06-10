@@ -195,6 +195,19 @@ fn parse_sway_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Pick an output-x one pixel away from `axx` for the focus-reassert nudge.
+/// sway only re-evaluates pointer focus on motion, so the intermediate point
+/// must be a genuine delta. Nudging left (`axx - 1`) is a no-op at the left
+/// edge (`axx == 0`), which silently lost the first click/scroll there — so
+/// nudge right instead, clamped to stay on a `w`-wide output.
+fn nudge_x(axx: u32, w: u32) -> u32 {
+    if axx > 0 {
+        axx - 1
+    } else {
+        (axx + 1).min(w.saturating_sub(1))
+    }
+}
+
 /// Find sway's `wayland-N` socket in the private runtime dir (sway uses
 /// `wayland-1`, not cage's `wayland-0`). Ignores `wayland-N.lock` and `sway-ipc.*`.
 fn find_wayland_socket(dir: &Path) -> Option<PathBuf> {
@@ -487,7 +500,11 @@ fn bring_up_session(
             break s;
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let _ = child.wait();
+            // sway exited — but on an *unclean* exit its group children
+            // (Xwayland + the exec'd app) can outlive it. Reap the whole
+            // group, not just the leader, or a leaked Xwayland holds the X
+            // display in the global namespace and breaks the next session.
+            reap_group(&mut child);
             return Err(GlassError::AppExited(status.code()));
         }
         if Instant::now() >= deadline {
@@ -521,7 +538,9 @@ fn bring_up_session(
                 break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
             }
             if let Ok(Some(status)) = child.try_wait() {
-                let _ = child.wait();
+                // Reap the whole group (see the socket-wait loop above): an
+                // unclean sway exit can orphan Xwayland + the app otherwise.
+                reap_group(&mut child);
                 return Err(GlassError::AppExited(status.code()));
             }
             if Instant::now() >= deadline {
@@ -780,7 +799,7 @@ impl Platform for WaylandPlatform {
             vp.motion_absolute(t, ax(x), ay(y), w, h);
             vp.frame();
             settle(q, s)?;
-            vp.motion_absolute(t, ax(x).saturating_sub(1), ay(y), w, h);
+            vp.motion_absolute(t, nudge_x(ax(x), w), ay(y), w, h);
             vp.frame();
             vp.motion_absolute(t, ax(x), ay(y), w, h);
             vp.frame();
@@ -987,11 +1006,26 @@ impl Platform for WaylandPlatform {
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         std::mem::take(&mut *self.logs.lock().unwrap())
     }
+
+    /// The app's process subtree. The child we spawn is **sway**, which launches
+    /// the app as an `exec` descendant (under a shell, and `bwrap` when
+    /// sandboxed), so the real app has a different pid. The a11y reader
+    /// correlates the AT-SPI connection pid against this set, so it must include
+    /// the descendants — the inherited single-pid default leaves it empty and the
+    /// reader can't tell apps apart. Mirrors the X11 backend's `app_pids()`.
+    /// (We intentionally don't override `app_pid()`: there is no single
+    /// authoritative app pid here — sway's pid isn't the app's.)
+    fn app_pids(&self) -> Vec<u32> {
+        match &self.active {
+            Some(s) => glass_proc_linux::proc_tree_pids(s.child.id()),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sway_version;
+    use super::{nudge_x, parse_sway_version};
 
     #[test]
     fn parse_sway_version_handles_real_and_garbage() {
@@ -999,5 +1033,24 @@ mod tests {
         assert_eq!(parse_sway_version("sway version 1.9"), Some((1, 9)));
         assert_eq!(parse_sway_version("not a version"), None);
         assert!((1u32, 12u32) >= (1, 12) && (1u32, 9u32) < (1, 12));
+    }
+
+    #[test]
+    fn nudge_x_always_differs_from_target() {
+        // Interior: nudge one pixel left.
+        assert_eq!(nudge_x(5, 100), 4);
+        assert_eq!(nudge_x(1, 100), 0);
+        // Right edge stays on-output and still differs.
+        assert_eq!(nudge_x(99, 100), 98);
+        // Left edge (output x==0): must NOT be a no-op — nudge right instead.
+        assert_eq!(nudge_x(0, 100), 1);
+        // The core regression property: on any real (>=2px wide) output the
+        // nudge is always a genuine motion delta, so sway re-evaluates focus.
+        for w in 2..=64u32 {
+            for x in 0..w {
+                assert_ne!(nudge_x(x, w), x, "no-op nudge at x={x}, w={w}");
+                assert!(nudge_x(x, w) < w, "nudge off-output at x={x}, w={w}");
+            }
+        }
     }
 }

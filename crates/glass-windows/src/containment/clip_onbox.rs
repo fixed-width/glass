@@ -68,10 +68,7 @@ fn private_clipboard_isolation() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie {
-        dir: dir.clone(),
-        box_name: format!("glass_cliptest_{}", std::process::id()),
-    };
+    let sb = Sandboxie::new(dir.clone(), format!("glass_cliptest_{}", std::process::id()));
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -153,10 +150,7 @@ fn private_clipboard_multiformat() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie {
-        dir: dir.clone(),
-        box_name: format!("glass_clipmulti_{}", std::process::id()),
-    };
+    let sb = Sandboxie::new(dir.clone(), format!("glass_clipmulti_{}", std::process::id()));
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -259,10 +253,7 @@ fn private_clipboard_ole() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie {
-        dir: dir.clone(),
-        box_name: format!("glass_clipole_{}", std::process::id()),
-    };
+    let sb = Sandboxie::new(dir.clone(), format!("glass_clipole_{}", std::process::id()));
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -364,10 +355,7 @@ fn private_clipboard_hdrop() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie {
-        dir: dir.clone(),
-        box_name: format!("glass_cliphdrop_{}", std::process::id()),
-    };
+    let sb = Sandboxie::new(dir.clone(), format!("glass_cliphdrop_{}", std::process::id()));
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {

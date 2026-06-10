@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 glass-core.workspace = true
 glass-sandbox-linux.workspace = true
+glass-proc-linux.workspace = true
 wayland-client.workspace = true
 wayland-protocols-wlr.workspace = true
 wayland-protocols-misc.workspace = true

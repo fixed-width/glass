@@ -10,7 +10,9 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
 use glass_core::{GlassError, Result};
@@ -65,14 +67,20 @@ fn read_clipboard_text() -> Result<String> {
         return Err(GlassError::Backend("GlobalLock failed on clipboard handle".into()));
     }
 
-    // Read the NUL-terminated UTF-16 string.
+    // The clipboard owner is an arbitrary (possibly malicious/buggy) app, so we
+    // can't trust the CF_UNICODETEXT block to actually be NUL-terminated. Bound
+    // the scan by the block's real size (GlobalSize) so a non-terminated buffer
+    // can't read past the allocation (UB) — stop at the first NUL or the cap.
+    // SAFETY: hglobal is the locked clipboard handle; GlobalSize reports its
+    // allocated byte length (0 on error → empty read, still safe).
+    let max_wchars = unsafe { GlobalSize(hglobal) } / std::mem::size_of::<u16>();
     let text = {
-        // SAFETY: `ptr` is valid UTF-16 data locked from the clipboard handle.
-        // We walk until the NUL terminator, which CF_UNICODETEXT data must have.
+        // SAFETY: `ptr` points at the locked block; the loop indexes strictly
+        // less than `max_wchars` u16s, all within the GlobalSize-reported bytes.
         let wchars: *const u16 = ptr as *const u16;
         let mut len = 0usize;
         unsafe {
-            while *wchars.add(len) != 0 {
+            while len < max_wchars && *wchars.add(len) != 0 {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(wchars, len);

@@ -106,9 +106,37 @@ fn service_running(name: &str) -> bool {
 pub(crate) struct Sandboxie {
     pub dir: String,
     pub box_name: String,
+    /// Armed by `configure()` once it begins writing this box's `Sandboxie.ini`
+    /// section; disarmed by a successful `launch()` (which hands the clear to
+    /// [`SandboxieApp::kill`]). While armed, dropping `Sandboxie` clears the
+    /// section, so a failure anywhere between `configure()` and a successful
+    /// `launch()` never orphans a per-session `glass_<pid>` section in the
+    /// shared `Sandboxie.ini`.
+    section_armed: AtomicBool,
+}
+
+/// Remove a box's entire config section from `Sandboxie.ini`
+/// (`SbieIni set <box> * ""` — the maintainer's documented box-clear), so
+/// per-session `glass_<pid>` boxes don't accumulate. Best-effort.
+fn clear_box_section(dir: &str, box_name: &str) {
+    let _ = Command::new(sbieini(dir)).args(["set", box_name, "*", ""]).status();
+}
+
+impl Drop for Sandboxie {
+    fn drop(&mut self) {
+        if self.section_armed.load(Ordering::Relaxed) {
+            clear_box_section(&self.dir, &self.box_name);
+        }
+    }
 }
 
 impl Sandboxie {
+    /// A box handle for `box_name` under install `dir`. The section guard starts
+    /// disarmed; `configure()` arms it.
+    pub(crate) fn new(dir: String, box_name: String) -> Self {
+        Self { dir, box_name, section_armed: AtomicBool::new(false) }
+    }
+
     /// Configure the private-clipboard hook for this box (Layer 2). Returns `Some((store, server,
     /// pipe))` when the hook DLL is resolvable and the pipe server starts; `None` (Layer-1-only)
     /// otherwise. Never fails the launch — a missing hook leaves the app clipboard-less but the
@@ -158,6 +186,9 @@ impl Sandboxie {
     /// Configure the box for `level`: strict global gate first, then the policy `set` pairs,
     /// the compat templates, the strict AFD device close, and a `/reload`.
     pub(crate) fn configure(&self, level: SandboxLevel) -> Result<()> {
+        // This box's persistent ini section is about to exist; arm the guard so
+        // any failure before a successful launch() clears it (see the struct doc).
+        self.section_armed.store(true, Ordering::Relaxed);
         let dir = self.dir.clone();
         let sbieini = sbieini(&dir);
 
@@ -285,6 +316,9 @@ impl Sandboxie {
             spawn_tailer(err_log, Stream::Stderr, logs.clone(), stop.clone()),
         ];
 
+        // Launch succeeded: the box now belongs to SandboxieApp, whose kill()
+        // clears the section. Disarm so our Drop doesn't wipe a live box.
+        self.section_armed.store(false, Ordering::Relaxed);
         Ok(SandboxieApp {
             dir: self.dir.clone(),
             box_name: self.box_name.clone(),
@@ -439,9 +473,6 @@ impl SandboxieApp {
             server.stop();
         }
         let _ = std::fs::remove_dir_all(&self.logdir);
-        // Best-effort: remove the box's config section from Sandboxie.ini.
-        let _ = Command::new(sbieini(&self.dir))
-            .args(["set", self.box_name.as_str(), "*", ""])
-            .status();
+        clear_box_section(&self.dir, &self.box_name);
     }
 }

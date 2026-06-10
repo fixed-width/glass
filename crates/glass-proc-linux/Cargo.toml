@@ -1,0 +1,9 @@
+[package]
+name = "glass-proc-linux"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

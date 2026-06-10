@@ -1021,6 +1021,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-proc-linux"
+version = "0.0.0"
+
+[[package]]
 name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
@@ -1050,6 +1054,7 @@ name = "glass-wayland"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",
  "serde",
@@ -1079,6 +1084,7 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "glass-core",
+ "glass-proc-linux",
  "glass-sandbox-linux",
  "x11rb",
 ]

@@ -97,18 +97,36 @@ fn key_vk(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
-/// Submit a batch of `INPUT`s. A short send (UIPI / foreground-lock blocking some
-/// events) is an environmental best-effort condition, not a hard error — warn like
-/// the probe and return `Ok` (the box-validation step verifies events actually land).
-fn send(inputs: &[INPUT]) {
+/// Submit a batch of `INPUT`s.
+///
+/// A *partial* short send (some events injected, some dropped by UIPI /
+/// foreground-lock) is an environmental best-effort condition, not a hard
+/// error — warn like the probe and return `Ok`. A *total* failure, however —
+/// zero events injected from a non-empty batch (locked input desktop, UIPI,
+/// foreground lock blocking everything) — is indistinguishable from a
+/// successful click/keystroke to the agent, which would then proceed on a
+/// false premise. The no-silent-fallbacks invariant requires that be a
+/// structured error, matching the X11 backend (every XTEST failure → Backend).
+fn send(inputs: &[INPUT]) -> Result<()> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
     // SAFETY: `inputs` is a valid slice and the stride is the real `INPUT` size.
-    let n = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
-    if n as usize != inputs.len() {
+    let n = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) } as usize;
+    if n == 0 {
+        return Err(GlassError::Backend(format!(
+            "SendInput injected 0/{} events — input blocked (UIPI / foreground lock / \
+             locked input desktop); try running elevated",
+            inputs.len()
+        )));
+    }
+    if n != inputs.len() {
         eprintln!(
             "glass: SendInput sent {n}/{} events (UIPI/foreground block? run elevated)",
             inputs.len()
         );
     }
+    Ok(())
 }
 
 /// The `MOUSEEVENTF_*DOWN`/`*UP` flag pair for a button.
@@ -147,7 +165,7 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
     match *event {
         PointerEvent::Move { x, y } => {
             let (nx, ny) = to_norm(x, y);
-            send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)]);
+            send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])?;
         }
         PointerEvent::Click { x, y, button, count, ref modifiers } => {
             let (nx, ny) = to_norm(x, y);
@@ -164,7 +182,7 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             for m in modifiers.iter().rev() {
                 inputs.push(key_vk(modifier_vk(*m), true));
             }
-            send(&inputs);
+            send(&inputs)?;
         }
         PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
             let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
@@ -190,7 +208,7 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             for m in modifiers.iter().rev() {
                 inputs.push(key_vk(modifier_vk(*m), true));
             }
-            send(&inputs);
+            send(&inputs)?;
         }
         PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
             let (nx, ny) = to_norm(x, y);
@@ -208,7 +226,7 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             for m in modifiers.iter().rev() {
                 inputs.push(key_vk(modifier_vk(*m), true));
             }
-            send(&inputs);
+            send(&inputs)?;
         }
     }
     Ok(())
@@ -226,9 +244,8 @@ pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
                 inputs.push(key_unicode(unit, false));
                 inputs.push(key_unicode(unit, true));
             }
-            if !inputs.is_empty() {
-                send(&inputs);
-            }
+            // `send` no-ops an empty batch, so empty text is a clean Ok.
+            send(&inputs)?;
         }
         KeyEvent::Chord(s) => {
             let (mods, keysym) = glass_core::keys::parse_chord(s)?;
@@ -244,7 +261,7 @@ pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
             for &mvk in mod_vks.iter().rev() {
                 inputs.push(key_vk(mvk, true));
             }
-            send(&inputs);
+            send(&inputs)?;
         }
     }
     Ok(())

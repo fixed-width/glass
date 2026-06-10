@@ -17,7 +17,9 @@ use glass_core::{GlassError, Result};
 
 use windows::core::PCWSTR;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
@@ -65,15 +67,23 @@ impl ClipServer {
         Ok(ClipServer { pipe_path, stop, thread: Some(thread) })
     }
 
-    /// Stop the loop: flag, then poke the pipe (a self-connect) to break a blocking
-    /// `ConnectNamedPipe`, then join.
+    /// Stop the loop and join its accept thread. Thin consuming wrapper over
+    /// [`Self::shutdown`]; `Drop` also calls `shutdown`, so a `ClipServer`
+    /// dropped without an explicit `stop()` is reclaimed just the same.
     pub(crate) fn stop(mut self) {
+        self.shutdown();
+    }
+
+    /// Flag the loop, poke the pipe (a self-connect) to break a blocking
+    /// `ConnectNamedPipe`, then join the accept thread. Idempotent: the thread
+    /// handle is taken via the `Option`, so calling this twice (e.g. `stop()`
+    /// then `Drop`) joins exactly once.
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let wide = to_wide(&self.pipe_path);
         // SAFETY: opening our own pipe by name to release the accept loop; handle closed immediately.
         unsafe {
-            use windows::Win32::Foundation::GENERIC_READ;
-            use windows::Win32::Foundation::GENERIC_WRITE;
+            use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
             use windows::Win32::Storage::FileSystem::{
                 CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
             };
@@ -97,7 +107,12 @@ impl ClipServer {
 
 impl Drop for ClipServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // Full teardown even when stop() was never called — e.g. an early
+        // return in setup_private_clipboard, or a launch() that fails after the
+        // server started — so the accept thread + pipe instance + security
+        // descriptor are never leaked (previously Drop only set the flag, which
+        // a thread parked in ConnectNamedPipe never observes).
+        self.shutdown();
     }
 }
 
@@ -161,7 +176,16 @@ fn accept_loop(
             break;
         }
         // SAFETY: blocks until a client connects (or our self-poke in stop()).
-        let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok();
+        // A client that connects in the gap between CreateNamedPipeW and
+        // ConnectNamedPipe makes the call return FALSE + ERROR_PIPE_CONNECTED —
+        // which IS a connected client. windows-rs maps that FALSE to Err, so
+        // `.is_ok()` alone would silently drop the client (its read-back then
+        // comes back empty — the flaky-empty-readback class). Treat it as
+        // connected.
+        let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
+            Ok(()) => true,
+            Err(e) => e.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
+        };
         if stop.load(Ordering::Relaxed) {
             // SAFETY: closing the instance handle we own.
             unsafe {
