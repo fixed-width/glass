@@ -53,9 +53,10 @@ if ($UntarPath -ne "") { Remove-Item -Force -ErrorAction SilentlyContinue $Untar
 # --- 2. resolve target list ---
 $exDir = Join-Path $RepoDir "crates\glass-windows\examples"
 if ($All -or ($Targets.Count -eq 0 -and $Tests -eq "")) {
-  $Targets = Get-ChildItem (Join-Path $exDir "onbox_*.rs") | ForEach-Object { $_.BaseName }
+  # onbox*.rs (not onbox_*.rs): also include the plain `onbox` example, which produces the WebP artifacts.
+  $Targets = Get-ChildItem (Join-Path $exDir "onbox*.rs") | ForEach-Object { $_.BaseName }
 }
-if ($Targets.Count -eq 0 -and $Tests -eq "") { Fail "no onbox_* examples found and no -Tests specified" }
+if ($Targets.Count -eq 0 -and $Tests -eq "") { Fail "no onbox examples found and no -Tests specified" }
 $profile = if ($Release) { "release" } else { "debug" }
 $relArg = if ($Release) { "--release" } else { "" }
 
