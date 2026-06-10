@@ -89,17 +89,3 @@ needed when you want to watch a run live.
 This box is the dev + integration-test machine for `glass-windows`: its `#[ignore]`d on-box suite
 (`crates/glass-windows/tests/onbox.rs`) runs here via `--tests`, exactly like the X11/Wayland
 suites run under Xvfb/sway.
-
-## Gaming-rig notes
-
-- Real GPU + monitor → **capture, input, discovery, kill-tree, and DPI all work immediately**; you
-  also get genuine GPU-accelerated capture coverage (Chrome/Electron/games) for the
-  `PrintWindow`-black vs WGC-handles-it contrast.
-- **Headless capture without unplugging:** install the virtual display, move a target window onto
-  it, and capture it there (e.g. the `onbox` example, which captures + saves WebP).
-- **Coexists with gaming** — glass drives target apps as a black box in the same session;
-  nothing is dedicated or wiped. The `setup-box.ps1` lock/sleep changes are reversible.
-- Game **overlays** (Steam / GeForce Experience / RGB / Discord) inject their own windows and
-  hooks — harmless, but they're the likely culprit if a run ever reports a surprise window.
-- **Recovery:** auto-login means a reboot returns to a usable session unattended; add
-  Wake-on-LAN if the box ever drops off the network.
