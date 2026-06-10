@@ -46,8 +46,15 @@ if [ -z "$HOST" ]; then
 fi
 RUSER="${HOST%@*}"
 [ -n "$REPO" ] || REPO="C:/Users/${RUSER}/glass"
+case "$HOST$REPO" in
+  *[[:space:]]*) echo "error: GLASS_WIN_HOST/GLASS_WIN_REPO must not contain spaces" >&2; exit 2 ;;
+esac
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$BRANCH" = "HEAD" ]; then
+  echo "error: detached HEAD; check out a branch before running test-windows.sh" >&2
+  exit 1
+fi
 SHA="$(git rev-parse HEAD)"
 DIRTY=0
 if ! git diff --quiet HEAD || [ -n "$(git ls-files --others --exclude-standard)" ]; then DIRTY=1; fi
@@ -102,7 +109,7 @@ fi
 echo "== run on box =="
 set +e
 # shellcheck disable=SC2086
-sshx "powershell -NoProfile -ExecutionPolicy Bypass -File $REPO/tools/windows-validation/run-onbox.ps1 ${PS_ARGS[*]}"
+sshx "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REPO/tools/windows-validation/run-onbox.ps1\" ${PS_ARGS[*]}"
 RC=$?
 set -e
 
