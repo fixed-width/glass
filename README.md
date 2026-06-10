@@ -76,7 +76,7 @@ VM running `glass-mcp serve --http`). ² Windows needs an interactive, logged-in
 and capture. ³ When contained (`sandbox=default`/`strict`), the boxed app gets a private clipboard
 isolated from yours — an injected hook backs its clipboard with glass's own store; `sandbox=off`
 uses the real OS clipboard. Carries text, HTML, RTF, and images for apps using either the Win32 or
-the OLE clipboard (so rich apps like Word, Excel, and Chrome work too; x64); file copy is in progress.
+the OLE clipboard (so rich apps like Word, Excel, and Chrome work too; x64); real-file copy via CF_HDROP works; virtual-file drag-out (shell extensions, zip attachments) is deferred.
 
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature
