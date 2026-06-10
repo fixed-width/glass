@@ -46,8 +46,9 @@ if ($UntarPath -ne "" -and (Test-Path $UntarPath)) {
   cmd /c "tar -xf `"$UntarPath`" -C `"$RepoDir`" 2>&1"
   if ($LASTEXITCODE -ne 0) { Fail "untar failed" }
 }
-# Remove the scratch delta files shipped by test-windows.sh so they don't linger in the repo.
-Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $RepoDir ".glass-wip.diff"), (Join-Path $RepoDir ".glass-untracked.tar")
+# Remove the scratch delta files shipped by test-windows.sh (they live outside the repo) after use.
+if ($DiffPath -ne "") { Remove-Item -Force -ErrorAction SilentlyContinue $DiffPath }
+if ($UntarPath -ne "") { Remove-Item -Force -ErrorAction SilentlyContinue $UntarPath }
 
 # --- 2. resolve target list ---
 $exDir = Join-Path $RepoDir "crates\glass-windows\examples"

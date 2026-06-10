@@ -87,35 +87,48 @@ if ! sshx "cmd /c echo ok" >/dev/null 2>&1; then
   exit 1
 fi
 
-# --- sync: push base commit, ship working-tree delta ---
+# Scratch we ship to the box (the bridge + working-tree deltas) must live OUTSIDE the repo: the
+# bridge git-resets and `git clean -fd`s the repo, which would otherwise wipe these before use.
+HOME_REMOTE="C:/Users/${RUSER}"
+BRIDGE_REMOTE="$HOME_REMOTE/.glass-run-onbox.ps1"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# --- sync: push base commit, ship the bridge + any working-tree delta ---
 echo "== push base commit ($BRANCH @ ${SHA:0:8}) =="
 git push -q origin "HEAD:$BRANCH"
 
-DIFF_REMOTE=""; UNTAR_REMOTE=""
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# The bridge can't run from inside the repo it is about to reset, and the target branch may not be
+# checked out on the box yet -- ship the local copy to a stable path and run it from there.
+# shellcheck disable=SC2086
+scp $SSH_OPTS -q tools/windows-validation/run-onbox.ps1 "$HOST:$BRIDGE_REMOTE"
+
 if [ "$DIRTY" -eq 1 ]; then
   echo "== ship working-tree delta =="
   git diff HEAD --binary > "$TMP/wip.diff"
   git ls-files --others --exclude-standard -z | tar --null -cf "$TMP/untracked.tar" --files-from=- 2>/dev/null || : > "$TMP/untracked.tar"
   # shellcheck disable=SC2086
-  scp $SSH_OPTS -q "$TMP/wip.diff" "$HOST:$REPO/.glass-wip.diff"
+  scp $SSH_OPTS -q "$TMP/wip.diff" "$HOST:$HOME_REMOTE/.glass-wip.diff"
   # shellcheck disable=SC2086
-  scp $SSH_OPTS -q "$TMP/untracked.tar" "$HOST:$REPO/.glass-untracked.tar"
-  DIFF_REMOTE="$REPO/.glass-wip.diff"; UNTAR_REMOTE="$REPO/.glass-untracked.tar"
-  PS_ARGS+=( -DiffPath "$DIFF_REMOTE" -UntarPath "$UNTAR_REMOTE" )
+  scp $SSH_OPTS -q "$TMP/untracked.tar" "$HOST:$HOME_REMOTE/.glass-untracked.tar"
+  PS_ARGS+=( -DiffPath "$HOME_REMOTE/.glass-wip.diff" -UntarPath "$HOME_REMOTE/.glass-untracked.tar" )
 fi
 
-# --- invoke the bridge ---
+# --- invoke the bridge. Require its completion marker: PowerShell can exit 0 even when -File
+# fails to load, so a clean exit code alone is not proof the bridge ran (no silent success). ---
 echo "== run on box =="
 set +e
 # shellcheck disable=SC2086
-sshx "powershell -NoProfile -ExecutionPolicy Bypass -File \"$REPO/tools/windows-validation/run-onbox.ps1\" ${PS_ARGS[*]}"
-RC=$?
+sshx "powershell -NoProfile -ExecutionPolicy Bypass -File \"$BRIDGE_REMOTE\" ${PS_ARGS[*]}" 2>&1 | tee "$TMP/out.log"
+RC=${PIPESTATUS[0]}
 set -e
+if ! grep -q '== aggregate:' "$TMP/out.log"; then
+  echo "error: bridge did not complete on the box (no aggregate line); treating as failure" >&2
+  [ "$RC" -eq 0 ] && RC=1
+fi
 
 # --- pull artifacts (best-effort) ---
 mkdir -p ./.windows-artifacts
 # shellcheck disable=SC2086
 scp $SSH_OPTS -q -r "$HOST:$REPO/.windows-artifacts/." ./.windows-artifacts/ 2>/dev/null || true
 echo "artifacts -> ./.windows-artifacts/ (rc=$RC)"
-exit $RC
+exit "$RC"
