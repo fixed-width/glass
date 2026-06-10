@@ -17,8 +17,11 @@ fn main() {
         "roundtrip" => run(),
         "roundtrip-multi" => run_multi(),
         "roundtrip-ole" => run_ole(),
+        "roundtrip-hdrop" => run_hdrop(),
         _ => {
-            eprintln!("usage: clipprobe <roundtrip|roundtrip-multi|roundtrip-ole> [text]");
+            eprintln!(
+                "usage: clipprobe <roundtrip|roundtrip-multi|roundtrip-ole|roundtrip-hdrop> [text]"
+            );
             2
         }
     };
@@ -530,6 +533,159 @@ unsafe fn take_stgmedium_bytes(
     };
     ReleaseStgMedium(medium as *mut _);
     out
+}
+
+// ---------------------------------------------------------------------------
+// CF_HDROP round-trip probe (2b).
+//
+// `clipprobe roundtrip-hdrop` validates that a synthetic `CF_HDROP` blob (DROPFILES header +
+// two wide UTF-16 paths) survives the private-clipboard store on both the user32 and OLE surfaces.
+// No real files are created — this is a pure byte-transport test. Prints:
+//   HDROP-U32-LEN=<n>  (allocated HGLOBAL size; may be rounded up by the heap)
+//   HDROP-U32-OK=<true|false>
+//   HDROP-OLE-OK=<true|false>
+//   PROBE-HDROP-DONE
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic CF_HDROP blob: `DROPFILES` header + two wide NUL-terminated paths, double-NUL
+/// terminated.  No real files are created; this is a byte-transport fixture.
+#[cfg(windows)]
+fn make_hdrop_blob() -> Vec<u8> {
+    let mut hdrop: Vec<u8> = Vec::new();
+    hdrop.extend_from_slice(&20u32.to_le_bytes()); // DROPFILES.pFiles = sizeof(DROPFILES) = 20
+    hdrop.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    hdrop.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    hdrop.extend_from_slice(&0i32.to_le_bytes()); // fNC (BOOL)
+    hdrop.extend_from_slice(&1i32.to_le_bytes()); // fWide = 1 → UTF-16 paths
+    for p in ["C:\\box\\a.txt", "C:\\box\\b.txt"] {
+        for u in p.encode_utf16() {
+            hdrop.extend_from_slice(&u.to_le_bytes());
+        }
+        hdrop.extend_from_slice(&0u16.to_le_bytes()); // NUL terminator per path
+    }
+    hdrop.extend_from_slice(&0u16.to_le_bytes()); // extra NUL → double-NUL list end
+    hdrop
+}
+
+/// CF_HDROP round-trip via user32 and OLE.
+#[cfg(windows)]
+fn run_hdrop() -> i32 {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
+        TYMED_HGLOBAL,
+    };
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, ReleaseStgMedium};
+
+    const CF_HDROP: u32 = 15;
+
+    let hdrop = make_hdrop_blob();
+
+    unsafe {
+        // OLE requires COM init on this STA thread.
+        // SAFETY: standard COM init; we tolerate S_FALSE (already initialized on this thread).
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_err() {
+            eprintln!("FAIL: CoInitializeEx hr={hr:?}");
+            return 1;
+        }
+
+        // ---- user32 round-trip ----
+        // SAFETY: standard user32 clipboard write; the system (or hook) takes ownership of the
+        // HGLOBAL on SetClipboardData success, so we do not free it ourselves.
+        if OpenClipboard(None).is_err() {
+            eprintln!("FAIL: OpenClipboard(u32-write)");
+            return 1;
+        }
+        let _ = EmptyClipboard();
+        let h = alloc_global(&hdrop);
+        if h.0.is_null() {
+            let _ = CloseClipboard();
+            eprintln!("FAIL: alloc_global CF_HDROP");
+            return 1;
+        }
+        if SetClipboardData(CF_HDROP, Some(HANDLE(h.0))).is_err() {
+            let _ = CloseClipboard();
+            eprintln!("FAIL: SetClipboardData CF_HDROP");
+            return 1;
+        }
+        let _ = CloseClipboard();
+
+        // SAFETY: standard user32 clipboard read; the returned handle is owned by the clipboard.
+        if OpenClipboard(None).is_err() {
+            eprintln!("FAIL: OpenClipboard(u32-read)");
+            return 1;
+        }
+        let rb = read_global_bytes(CF_HDROP).unwrap_or_default();
+        let _ = CloseClipboard();
+
+        let u32_ok = rb.len() >= hdrop.len() && rb[..hdrop.len()] == hdrop[..];
+        println!("HDROP-U32-LEN={}", rb.len());
+        println!("HDROP-U32-OK={u32_ok}");
+
+        // ---- OLE round-trip ----
+        let obj: IDataObject = ProbeData {
+            formats: vec![(CF_HDROP as u16, hdrop.clone())],
+        }
+        .into();
+        // SAFETY: a boxed in-process IDataObject; OleSetClipboard takes a borrowed reference.
+        if let Err(e) = OleSetClipboard(&obj) {
+            eprintln!("FAIL: OleSetClipboard CF_HDROP {e:?}");
+            return 1;
+        }
+
+        // SAFETY: OleGetClipboard returns a (possibly proxied) IDataObject; we drive GetData.
+        let got = match OleGetClipboard() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("FAIL: OleGetClipboard {e:?}");
+                return 1;
+            }
+        };
+        let fe = FORMATETC {
+            cfFormat: CF_HDROP as u16,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        // SAFETY: valid FORMATETC; GetData returns a TYMED_HGLOBAL medium we own and must release.
+        let ole_bytes = match got.GetData(&fe) {
+            Ok(mut medium) => {
+                // Read the HGLOBAL directly (mirrors take_stgmedium_bytes but we need the bytes
+                // before releasing, so we inline here for clarity).
+                let h = medium.u.hGlobal;
+                let out = if h.0.is_null() {
+                    None
+                } else {
+                    let p = GlobalLock(h) as *const u8;
+                    if p.is_null() {
+                        None
+                    } else {
+                        let n = GlobalSize(h);
+                        let v = std::slice::from_raw_parts(p, n).to_vec();
+                        let _ = GlobalUnlock(h);
+                        Some(v)
+                    }
+                };
+                ReleaseStgMedium(&mut medium as *mut _);
+                out.unwrap_or_default()
+            }
+            Err(e) => {
+                eprintln!("FAIL: OLE GetData CF_HDROP {e:?}");
+                return 1;
+            }
+        };
+
+        let ole_ok = ole_bytes.len() >= hdrop.len() && ole_bytes[..hdrop.len()] == hdrop[..];
+        println!("HDROP-OLE-OK={ole_ok}");
+        println!("PROBE-HDROP-DONE");
+    }
+    0
 }
 
 /// OLE round-trip probe — see the module-level comment above.
