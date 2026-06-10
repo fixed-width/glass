@@ -67,8 +67,8 @@ tree — for apps with no accessible UI (bare canvas / game UIs), so the agent f
 | | X11 | Wayland | Windows | macOS |
 |---|:--:|:--:|:--:|:--:|
 | Display isolation (app off your desktop) | ✓ private Xvfb | ✓ headless sway | – interactive desktop¹ | 🚧 |
-| Clipboard isolation | ✓ | ✓ | ✓ private (contained)³ | 🚧 |
 | Headless (no host desktop needed) | ✓ | ✓ | – needs a session² | 🚧 |
+| Clipboard isolation | ✓ | ✓ | ✓ private (contained)³ | 🚧 |
 
 ¹ A Windows VirtualDisplay / headless provider is a planned follow-on; stronger isolation today is
 the VM tier (the Windows Sandbox `.wsb` template under `packaging/windows-sandbox/`, or a managed
