@@ -27,7 +27,13 @@ pub struct ScreenshotArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WindowHintArgs {
+    /// Case-insensitive substring matched against window titles. Used to pick the
+    /// right window when several appear, and — since it ignores the process tree —
+    /// to locate a window the launched process hands off to an unrelated process
+    /// (e.g. some packaged Windows apps).
     pub title: Option<String>,
+    /// Exact window-class match. Same purpose as `title` but more stable, since
+    /// class names rarely carry the dynamic prefixes/suffixes that titles do.
     pub class: Option<String>,
 }
 
@@ -48,6 +54,10 @@ pub struct StartArgs {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Optional `{ title?, class? }` to disambiguate which window is the app's when
+    /// more than one appears, or to find a window the launched process hands off to
+    /// an unrelated process (some packaged Windows apps). Omit to take the first
+    /// window owned by the launched process or a descendant it can follow.
     pub window_hint: Option<WindowHintArgs>,
     pub timeout_ms: Option<u64>,
 }

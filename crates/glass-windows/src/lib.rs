@@ -10,6 +10,7 @@ pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is 
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
 pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on the Linux dev box
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
+pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box
 
@@ -103,7 +104,13 @@ mod backend {
             hint: Option<&WindowHint>,
             timeout_ms: u64,
         ) -> Result<WindowGeometry> {
+            use crate::discovery::{poll_decision, PollStep};
+
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            // Latched once the root process is observed exited (its code preserved). A
+            // launcher can exit the instant it hands its UI off, so root-exit is not on
+            // its own fatal — see `poll_decision` for the hint-vs-no-hint policy.
+            let mut root_exit: Option<Option<i32>> = None;
             loop {
                 // Look for the app's window FIRST, then check for exit. A launcher
                 // that hands its UI to a Job-captured child and exits 0 (Chromium/
@@ -121,17 +128,22 @@ mod backend {
                         return Ok(crate::windows::rect_to_geometry(r));
                     }
                 }
-                // No window yet — fail fast if the app died on launch (crash/instant
-                // exit), rather than busy-polling the full timeout and reporting a
-                // misleading Timeout. AppExited only when the root died AND no window
-                // exists.
-                if let Some(app) = self.app.as_mut() {
-                    if let Ok(Some(status)) = app.try_wait() {
-                        return Err(GlassError::AppExited(status.code()));
+                // No window yet. Observe the root's exit once (latched). It's not
+                // necessarily fatal: an app can hand its UI to an *unrelated* process
+                // (some packaged apps activate via a system broker) the pid-set can't
+                // follow, so a title/class hint may still locate that window after the
+                // launcher exits. `poll_decision` encodes the policy.
+                if root_exit.is_none() {
+                    if let Some(app) = self.app.as_mut() {
+                        if let Ok(Some(status)) = app.try_wait() {
+                            root_exit = Some(status.code());
+                        }
                     }
                 }
-                if Instant::now() >= deadline {
-                    return Err(GlassError::Timeout(timeout_ms));
+                match poll_decision(root_exit, hint.is_some(), Instant::now() >= deadline) {
+                    PollStep::FailExited(code) => return Err(GlassError::AppExited(code)),
+                    PollStep::FailTimeout => return Err(GlassError::Timeout(timeout_ms)),
+                    PollStep::KeepPolling => {}
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
