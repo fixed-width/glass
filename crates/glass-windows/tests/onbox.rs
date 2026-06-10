@@ -2,9 +2,11 @@
 //! `scripts/test-windows.sh --tests onbox`. All `#[ignore]d` so plain `cargo test` (Linux/CI) skips
 //! them; only `--ignored` on the box runs them. `#![cfg(windows)]` so the file is empty (0 tests)
 //! off Windows, keeping the dev-box `cargo test`/clippy green. Serialized by the harness
-//! (`--test-threads=1`) since each spawns apps/windows.
+//! (`--test-threads=1`) and by a process-global lock (so a direct `cargo test --ignored` is safe too)
+//! since each spawns apps/windows.
 #![cfg(windows)]
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use glass_a11y_windows::WindowsA11y;
@@ -13,6 +15,11 @@ use glass_core::{
     WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
+
+/// Serialize the on-box tests: each spawns apps and grabs screen/input focus, so they must not run
+/// concurrently even if invoked without `--test-threads=1`. Poison-tolerant so a panicking test does
+/// not wedge the rest.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Per-Monitor-V2 awareness, once per test process (tests carry no manifest; capture/coords need it).
 fn dpi_aware_once() {
@@ -86,6 +93,7 @@ fn our_edge_count(marker: &str) -> i32 {
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_capture_and_input() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let _geo = p.start_app(&charmap_spec()).expect("start charmap");
@@ -109,6 +117,7 @@ fn onbox_capture_and_input() {
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + Edge"]
 fn onbox_isolated_edge_killtree() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let edge = glass_windows::onbox_support::locate_edge()
         .expect("msedge.exe not found under Program Files; Edge is required for this test");
@@ -152,6 +161,7 @@ fn onbox_isolated_edge_killtree() {
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a11y_snapshot_and_click() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let geo = p.start_app(&charmap_spec()).expect("start charmap");

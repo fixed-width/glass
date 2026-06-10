@@ -49,6 +49,9 @@ RUSER="${HOST%@*}"
 case "$HOST$REPO" in
   *[[:space:]]*) echo "error: GLASS_WIN_HOST/GLASS_WIN_REPO must not contain spaces" >&2; exit 2 ;;
 esac
+case "$TESTS" in
+  *[[:space:]]*) echo "error: --tests value must not contain spaces" >&2; exit 2 ;;
+esac
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$BRANCH" = "HEAD" ]; then
