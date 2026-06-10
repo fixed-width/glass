@@ -5,8 +5,15 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use glass_core::{GlassError, Result};
+
+/// How long to wait for Xvfb to report its display before treating it as wedged.
+/// Readiness is normally well under a second; this ceiling is generous so a
+/// slow/loaded host isn't falsely failed, while a hung Xvfb can't block start-up.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Xvfb {
     child: Child,
@@ -36,27 +43,66 @@ impl Xvfb {
             })?;
 
         let stdout = child.stdout.take().expect("piped stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(GlassError::Backend(
-                "Xvfb exited without reporting a display (failed to start)".into(),
-            ));
-        }
-        let num: u32 = match line.trim().parse() {
-            Ok(n) => n,
-            Err(_) => {
+        match read_displayfd(stdout, READY_TIMEOUT) {
+            Ok((num, displayfd)) => Ok(Xvfb { child, display: format!(":{num}"), displayfd }),
+            Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(GlassError::Backend(format!(
-                    "unexpected Xvfb -displayfd output: {line:?}"
-                )));
+                Err(GlassError::Backend(match e {
+                    ReadErr::Closed => {
+                        "Xvfb exited without reporting a display (failed to start)".into()
+                    }
+                    ReadErr::Garbage(line) => {
+                        format!("unexpected Xvfb -displayfd output: {line:?}")
+                    }
+                    ReadErr::TimedOut => format!(
+                        "Xvfb spawned but did not report a display within {}s (wedged); \
+                         not blocking start-up",
+                        READY_TIMEOUT.as_secs()
+                    ),
+                }))
             }
-        };
+        }
+    }
+}
 
-        Ok(Xvfb { child, display: format!(":{num}"), displayfd: reader.into_inner() })
+/// Why reading the `-displayfd` line failed.
+#[derive(Debug)]
+enum ReadErr {
+    /// The pipe closed before a line arrived — Xvfb exited (failed to start).
+    Closed,
+    /// A line arrived but wasn't a display number.
+    Garbage(String),
+    /// No line within the timeout — Xvfb spawned but never became ready.
+    TimedOut,
+}
+
+/// Read the display number Xvfb writes to its `-displayfd` pipe, bounded by
+/// `timeout`. The blocking `read_line` runs on a helper thread so a wedged Xvfb
+/// (alive, stdout open, but never reporting) can't block the caller forever —
+/// the original hang. On success the `ChildStdout` is handed back so the caller
+/// can hold it open for Xvfb's lifetime (closing it would SIGPIPE the server).
+fn read_displayfd(
+    stdout: ChildStdout,
+    timeout: Duration,
+) -> std::result::Result<(u32, ChildStdout), ReadErr> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        // Hand the fd back so the caller keeps it open; ignore a send failure —
+        // the caller timed out and dropped the receiver, the child will be
+        // killed, and this read unblocks and drops the fd here.
+        let _ = tx.send((n, line, reader.into_inner()));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok((0, _, _)) => Err(ReadErr::Closed),
+        Ok((_, line, fd)) => match line.trim().parse::<u32>() {
+            Ok(num) => Ok((num, fd)),
+            Err(_) => Err(ReadErr::Garbage(line.trim().to_string())),
+        },
+        Err(_) => Err(ReadErr::TimedOut),
     }
 }
 
@@ -69,5 +115,54 @@ impl Drop for Xvfb {
             let _ = std::fs::remove_file(format!("/tmp/.X{num}-lock"));
             let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{num}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_displayfd, ReadErr};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    #[test]
+    fn read_displayfd_times_out_on_a_silent_child() {
+        // A child that stays alive and never writes its display (the wedged-Xvfb
+        // case) must NOT block forever — read_displayfd returns TimedOut.
+        let mut child =
+            Command::new("sleep").arg("30").stdout(Stdio::piped()).spawn().expect("spawn sleep");
+        let stdout = child.stdout.take().expect("piped");
+        let r = read_displayfd(stdout, Duration::from_millis(200));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(r, Err(ReadErr::TimedOut)), "expected TimedOut");
+    }
+
+    #[test]
+    fn read_displayfd_parses_a_reported_display() {
+        // Writes "7" then stays alive (Xvfb keeps fd 1 open after reporting).
+        // `exec sleep` keeps the same pid so child.kill() reaps it (no orphan).
+        let mut child = Command::new("sh")
+            .args(["-c", "echo 7; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stdout = child.stdout.take().expect("piped");
+        let r = read_displayfd(stdout, Duration::from_secs(5));
+        let _ = child.kill();
+        let _ = child.wait();
+        match r {
+            Ok((num, _fd)) => assert_eq!(num, 7),
+            Err(e) => panic!("expected display 7, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn read_displayfd_reports_closed_on_immediate_exit() {
+        // Exits without writing — the pipe closes (EOF) → Closed, not a hang.
+        let mut child = Command::new("true").stdout(Stdio::piped()).spawn().expect("spawn true");
+        let stdout = child.stdout.take().expect("piped");
+        let r = read_displayfd(stdout, Duration::from_secs(5));
+        let _ = child.wait();
+        assert!(matches!(r, Err(ReadErr::Closed)), "expected Closed");
     }
 }
