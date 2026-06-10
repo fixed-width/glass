@@ -4,8 +4,7 @@ members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "cra
 
 [workspace.package]
 edition = "2021"
-# Open core: Apache-2.0 (the patent grant matters for OS-level input/capture).
-# Future moat crates carry FSL-1.1-Apache-2.0; none exist yet.
+# Apache-2.0 (the patent grant matters for OS-level input/capture).
 # Third-party deps stay permissive (MIT/Apache, no copyleft) per CLAUDE.md.
 # publish = false: open-source but not (yet) pushed to crates.io.
 license = "Apache-2.0"

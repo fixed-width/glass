@@ -2,6 +2,11 @@
 
 Guidance for Claude Code working in the **glass** open-core Rust workspace.
 
+> **This repository is PUBLIC.** Keep internal business/strategy, licensing-strategy
+> framing, planning and design specs, and the internal security threat model out of this
+> repo — that material lives in the private `fixed-width` repo. Document *what the product
+> does*, never *why it helps the business*.
+
 ## What glass is
 
 A Rust **MCP server** giving an AI agent a closed **build → see → interact → debug** loop
