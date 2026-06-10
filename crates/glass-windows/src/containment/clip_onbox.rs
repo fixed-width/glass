@@ -236,3 +236,108 @@ fn private_clipboard_multiformat() {
     );
     println!("PASS: boxed multi-format (text + HTML + DIB + synthesized CF_BITMAP) served by the private store; ambient untouched");
 }
+
+#[test]
+#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_HOOK_DLL + the clipprobe example"]
+fn private_clipboard_ole() {
+    let dir = sandboxie_dir();
+    assert!(available(&dir), "Sandboxie not available at {dir}");
+
+    let probe = profile_dir().join("examples").join("clipprobe.exe");
+    assert!(
+        probe.exists(),
+        "build the probe first: cargo build -p glass-clip-hook --release --example clipprobe (looked at {})",
+        probe.display()
+    );
+    let dll = std::env::var("GLASS_CLIP_HOOK_DLL")
+        .expect("set GLASS_CLIP_HOOK_DLL to the built glass_clip_hook.dll");
+    assert!(
+        PathBuf::from(&dll).exists(),
+        "GLASS_CLIP_HOOK_DLL points at a missing file: {dll}"
+    );
+
+    let sentinel = format!("SENTINEL-{}", std::process::id());
+    crate::clipboard::set(&sentinel).expect("set ambient clipboard");
+
+    let sb = Sandboxie {
+        dir: dir.clone(),
+        box_name: format!("glass_clipole_{}", std::process::id()),
+    };
+    sb.configure(SandboxLevel::Default).expect("configure box");
+
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            probe.to_string_lossy().into_owned(),
+            "roundtrip-ole".into(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 15000,
+        sandbox: SandboxLevel::Default,
+    };
+    let sink: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let app = sb.launch(&spec, sink.clone()).expect("launch boxed probe");
+
+    // The probe pushes a source IDataObject (text + named HTML) via OleSetClipboard, then reads it
+    // back via OleGetClipboard (glass's proxy) AND via raw user32 GetClipboardData (cross-surface
+    // coherence), ending with `PROBE-OLE-DONE`. Boxed (OpenClipboard=n), every readback is served by
+    // the hook from the private store.
+    let done = wait_for_log(&sink, "PROBE-OLE-DONE", Duration::from_secs(20));
+    let lines: Vec<String> = sink.lock().unwrap().iter().map(|(_, l)| l.clone()).collect();
+    eprintln!("--- boxed log sink: {} line(s) ---", lines.len());
+    for l in &lines {
+        eprintln!("  {l}");
+    }
+    eprintln!("--- end sink ---");
+
+    let store = app.private_clipboard();
+    let ambient_after = crate::clipboard::get().unwrap_or_default();
+    eprintln!(
+        "DIAG host_store_text={:?} keys={:?} ambient_after={:?} sentinel={:?}",
+        store.as_ref().map(|s| s.get_text()),
+        store.as_ref().map(|s| s.list()),
+        ambient_after,
+        sentinel
+    );
+    app.kill();
+
+    done.expect("probe produced no PROBE-OLE-DONE line (OLE detour not intercepting? check the sink)");
+
+    let readback = |prefix: &str| -> String {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
+            .unwrap_or_default()
+    };
+    assert_eq!(readback("OLE-TEXT="), "OLE-FROM-BOX", "OLE text round-trip (OleGet → proxy)");
+    assert_eq!(readback("OLE-HTML="), "<i>ole</i>", "OLE HTML (named format) round-trip by name");
+    assert_eq!(
+        readback("U32-TEXT="),
+        "OLE-FROM-BOX",
+        "cross-surface coherence — OLE copy visible to user32 GetClipboardData"
+    );
+
+    let store = store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+    assert_eq!(
+        store.get_text().as_deref(),
+        Some("OLE-FROM-BOX"),
+        "host store text"
+    );
+    let keys = store.list();
+    assert!(
+        keys.contains(&glass_clip_hook::proto::FormatKey::Named("HTML Format".into())),
+        "host store missing HTML Format: {keys:?}"
+    );
+    assert!(
+        keys.contains(&glass_clip_hook::proto::FormatKey::Standard(13)),
+        "host store missing CF_UNICODETEXT: {keys:?}"
+    );
+
+    assert_eq!(
+        ambient_after, sentinel,
+        "AMBIENT CLIPBOARD WAS TOUCHED — isolation breach"
+    );
+    println!("PASS: boxed OLE copy served by the private store + visible to user32 (coherence); ambient untouched");
+}
