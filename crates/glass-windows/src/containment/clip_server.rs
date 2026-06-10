@@ -17,7 +17,9 @@ use glass_core::{GlassError, Result};
 
 use windows::core::PCWSTR;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
@@ -174,7 +176,16 @@ fn accept_loop(
             break;
         }
         // SAFETY: blocks until a client connects (or our self-poke in stop()).
-        let connected = unsafe { ConnectNamedPipe(pipe, None) }.is_ok();
+        // A client that connects in the gap between CreateNamedPipeW and
+        // ConnectNamedPipe makes the call return FALSE + ERROR_PIPE_CONNECTED —
+        // which IS a connected client. windows-rs maps that FALSE to Err, so
+        // `.is_ok()` alone would silently drop the client (its read-back then
+        // comes back empty — the flaky-empty-readback class). Treat it as
+        // connected.
+        let connected = match unsafe { ConnectNamedPipe(pipe, None) } {
+            Ok(()) => true,
+            Err(e) => e.code() == windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0),
+        };
         if stop.load(Ordering::Relaxed) {
             // SAFETY: closing the instance handle we own.
             unsafe {
