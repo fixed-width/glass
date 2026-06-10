@@ -5,13 +5,16 @@
 //! client while one is live); `close_session` releases it. Every other
 //! [`SessionManager`] method is pure delegation to the inner manager.
 //!
-//! Releasing the slot in `close_session` correctly handles client disconnect:
-//! rmcp's `spawn_session_worker` calls `close_session` both on an explicit HTTP
-//! DELETE *and* when the per-session worker ends (i.e. the client drops), so the
-//! slot is freed in both cases.
+//! The slot is released in `close_session`, but ONLY for the admitted session's
+//! id. rmcp's `handle_delete` forwards the client's `Mcp-Session-Id` header
+//! without validating it (and `LocalSessionManager::close_session` returns `Ok`
+//! for an unknown id), and `spawn_session_worker` calls `close_session` on every
+//! worker end — including a superseded session's. Matching the id ensures a
+//! stale/bogus close can't free a live session's slot (which would let a second
+//! client in alongside the first).
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use futures::Stream;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
@@ -23,6 +26,20 @@ use rmcp::transport::streamable_http_server::session::{SessionId, SessionManager
 // `transport::common::server_side_http`), not from `tower`.
 use rmcp::transport::streamable_http_server::session::ServerSseMessage;
 
+/// The single admission slot.
+#[derive(Debug, Default)]
+enum Slot {
+    /// No session — a `create_session` is admitted.
+    #[default]
+    Empty,
+    /// A `create_session` has claimed the slot but its id isn't known yet (the
+    /// inner `create_session().await` is in flight). A concurrent create is
+    /// rejected; a close (which carries some other id) can't match.
+    Reserving,
+    /// Held by the admitted session; only a close for this id releases it.
+    Active(SessionId),
+}
+
 /// Wraps [`LocalSessionManager`], enforcing at most one concurrent session.
 ///
 /// A second `create_session` while one is live returns an error (surfaced to the
@@ -30,9 +47,11 @@ use rmcp::transport::streamable_http_server::session::ServerSseMessage;
 #[derive(Debug, Default)]
 pub struct SingleSessionManager {
     inner: LocalSessionManager,
-    // Plain `AtomicBool` (not `Arc`): the manager is owned by the HTTP service (the
-    // caller wraps it in an `Arc`); it is never cloned, so no internal sharing is needed.
-    occupied: AtomicBool,
+    // Plain `Mutex` (not `Arc`): the manager is owned by the HTTP service (the
+    // caller wraps it in an `Arc`); it is never cloned, so no internal sharing is
+    // needed. The lock is only ever held for synchronous state transitions, never
+    // across an `.await`.
+    slot: Mutex<Slot>,
 }
 
 /// The error returned when a second client tries to attach while one is live.
@@ -51,15 +70,22 @@ impl SessionManager for SingleSessionManager {
     type Transport = <LocalSessionManager as SessionManager>::Transport;
 
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
-        // Claim the single slot; reject if already taken.
-        if self.occupied.swap(true, Ordering::AcqRel) {
-            return Err(busy_error());
+        // Claim the single slot before the await; reject if already taken.
+        {
+            let mut slot = self.slot.lock().unwrap();
+            if !matches!(*slot, Slot::Empty) {
+                return Err(busy_error());
+            }
+            *slot = Slot::Reserving;
         }
         match self.inner.create_session().await {
-            Ok(v) => Ok(v),
+            Ok((id, transport)) => {
+                *self.slot.lock().unwrap() = Slot::Active(id.clone());
+                Ok((id, transport))
+            }
             Err(e) => {
                 // Release the slot if the inner manager failed to create.
-                self.occupied.store(false, Ordering::Release);
+                *self.slot.lock().unwrap() = Slot::Empty;
                 Err(e)
             }
         }
@@ -67,9 +93,14 @@ impl SessionManager for SingleSessionManager {
 
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
         let r = self.inner.close_session(id).await;
-        // Always release the slot: a close is final whether or not the inner
-        // teardown reported an error.
-        self.occupied.store(false, Ordering::Release);
+        // Release the slot ONLY for the admitted session. A close for a
+        // stale/bogus id (an unvalidated DELETE header, or a superseded session's
+        // late worker-end) must not free a live session's slot — see the module
+        // docs.
+        let mut slot = self.slot.lock().unwrap();
+        if matches!(&*slot, Slot::Active(active) if active == id) {
+            *slot = Slot::Empty;
+        }
         r
     }
 
@@ -134,5 +165,26 @@ mod tests {
             .create_session()
             .await
             .expect("slot reusable after close");
+    }
+
+    #[tokio::test]
+    async fn close_with_foreign_id_does_not_release_the_slot() {
+        use std::sync::Arc;
+        let m = SingleSessionManager::default();
+        let (id, _t) = m.create_session().await.expect("first session admitted");
+        // rmcp's handle_delete forwards the client's Mcp-Session-Id header without
+        // validating it, and LocalSessionManager::close_session returns Ok for an
+        // unknown id — so a DELETE carrying a bogus/stale id (or a superseded
+        // session's late worker-end) must NOT free the live slot.
+        let bogus: SessionId = Arc::from("not-the-active-session");
+        let _ = m.close_session(&bogus).await;
+        assert!(
+            m.create_session().await.is_err(),
+            "slot must stay claimed after a close for a non-active id"
+        );
+        // The admitted session's own close still releases it.
+        m.close_session(&id).await.expect("closing the active session releases");
+        let (_id2, _t2) =
+            m.create_session().await.expect("slot reusable after the real close");
     }
 }
