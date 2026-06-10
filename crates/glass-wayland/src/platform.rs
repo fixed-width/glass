@@ -500,7 +500,11 @@ fn bring_up_session(
             break s;
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let _ = child.wait();
+            // sway exited — but on an *unclean* exit its group children
+            // (Xwayland + the exec'd app) can outlive it. Reap the whole
+            // group, not just the leader, or a leaked Xwayland holds the X
+            // display in the global namespace and breaks the next session.
+            reap_group(&mut child);
             return Err(GlassError::AppExited(status.code()));
         }
         if Instant::now() >= deadline {
@@ -534,7 +538,9 @@ fn bring_up_session(
                 break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
             }
             if let Ok(Some(status)) = child.try_wait() {
-                let _ = child.wait();
+                // Reap the whole group (see the socket-wait loop above): an
+                // unclean sway exit can orphan Xwayland + the app otherwise.
+                reap_group(&mut child);
                 return Err(GlassError::AppExited(status.code()));
             }
             if Instant::now() >= deadline {
