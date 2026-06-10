@@ -38,12 +38,6 @@ mod ole;
 pub(crate) const CF_TEXT: u32 = 1;
 pub(crate) const CF_BITMAP: u32 = 2;
 pub(crate) const CF_OEMTEXT: u32 = 7;
-// CF_DIB and CF_UNICODETEXT are referenced by the OLE serve path (Tasks 3/4) but not yet used;
-// suppress dead-code warnings until those modules are filled in.
-#[allow(dead_code)]
-pub(crate) const CF_DIB: u32 = 8;
-#[allow(dead_code)]
-pub(crate) const CF_UNICODETEXT: u32 = 13;
 pub(crate) const CF_LOCALE: u32 = 16;
 pub(crate) const CF_DIBV5: u32 = 17;
 

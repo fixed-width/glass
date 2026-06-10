@@ -78,7 +78,10 @@ unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
     let Ok(en) = data.EnumFormatEtc(DATADIR_GET.0 as u32) else {
         return out;
     };
-    loop {
+    // Bound the enumeration: a non-conformant boxed `IDataObject` whose enumerator never reports
+    // exhaustion would otherwise spin this detour forever (capture must never hang). A real
+    // clipboard offers a few dozen formats; 256 is generous.
+    for _ in 0..256 {
         let mut fe = [FORMATETC::default()];
         let mut fetched = 0u32;
         // The consuming `IEnumFORMATETC::Next` wrapper takes (&mut [FORMATETC], Option<*mut u32>).
