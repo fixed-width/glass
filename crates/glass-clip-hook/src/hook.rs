@@ -26,9 +26,56 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
 
+use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
+
 use crate::proto::{self, FormatKey, Request, Response};
 
 mod detour_impl;
+mod dataobject;
+mod ole;
+
+// Standard Win32 clipboard format ids (stable ABI).
+pub(crate) const CF_TEXT: u32 = 1;
+pub(crate) const CF_BITMAP: u32 = 2;
+pub(crate) const CF_OEMTEXT: u32 = 7;
+pub(crate) const CF_LOCALE: u32 = 16;
+pub(crate) const CF_DIBV5: u32 = 17;
+
+/// Raw clipboard id → `FormatKey`: a registered (>=0xC000) id resolves to its NAME (portable across
+/// processes), everything else stays a `Standard` id.
+pub(crate) fn key_of(id: u32) -> FormatKey {
+    if id >= 0xC000 {
+        let mut buf = [0u16; 256];
+        // SAFETY: GetClipboardFormatNameW writes up to buf.len() chars and returns the count (0 on
+        // failure); the slice bounds the read.
+        let n = unsafe { GetClipboardFormatNameW(id, &mut buf) };
+        if n > 0 {
+            return FormatKey::Named(String::from_utf16_lossy(&buf[..n as usize]));
+        }
+    }
+    FormatKey::Standard(id)
+}
+
+/// `FormatKey` → this process's clipboard id (re-registering named formats so the id is valid here).
+pub(crate) fn id_of(key: &FormatKey) -> u32 {
+    match key {
+        FormatKey::Standard(id) => *id,
+        FormatKey::Named(name) => {
+            let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `w` is NUL-terminated and outlives the call; RegisterClipboardFormatW returns
+            // this session's id for that name.
+            unsafe { RegisterClipboardFormatW(windows::core::PCWSTR::from_raw(w.as_ptr())) }
+        }
+    }
+}
+
+/// 4-byte `CF_LOCALE` blob = the current input-language LCID.
+pub(crate) fn locale_blob() -> Vec<u8> {
+    use windows::Win32::Globalization::GetUserDefaultLCID;
+    // SAFETY: GetUserDefaultLCID takes no args and returns the LCID.
+    let lcid = unsafe { GetUserDefaultLCID() };
+    lcid.to_le_bytes().to_vec()
+}
 
 /// Resolved pipe path (`\\.\pipe\<GLASS_CLIP_PIPE>`). `None` ⇒ the DLL is inert.
 static PIPE: OnceLock<String> = OnceLock::new();
@@ -195,6 +242,14 @@ pub(crate) fn store_seq() -> u32 {
     }
 }
 
+/// The whole stored snapshot (for the OLE serve path's one-shot bake).
+pub(crate) fn store_get_all() -> Vec<(FormatKey, Vec<u8>)> {
+    match rpc(Request::GetAll) {
+        Some(Response::Items(items)) => items,
+        _ => Vec::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Generic HGLOBAL byte helpers + the one text code-page conversion, used by the detours.
 // ---------------------------------------------------------------------------------------------
@@ -278,4 +333,22 @@ static USER32_W: [u16; 11] = [
     b'l' as u16,
     b'l' as u16,
     0,
+];
+
+/// Resolve an `ole32` export's absolute address (so all call sites are detoured). See `user32_proc`.
+///
+/// # Safety
+/// Caller transmutes the returned address to the export's exact ABI signature.
+pub(crate) unsafe fn ole32_proc(name: &[u8]) -> Option<*const ()> {
+    // SAFETY: "ole32.dll\0" is a valid module name; an OLE-using app has it loaded. We do NOT
+    // LoadLibrary it — if it isn't loaded, the app isn't using OLE and there's nothing to hook.
+    let module = GetModuleHandleW(PCWSTR::from_raw(OLE32_W.as_ptr())).ok()?;
+    let proc = GetProcAddress(module, PCSTR::from_raw(name.as_ptr()));
+    proc.map(|f| f as *const ())
+}
+
+/// `"ole32.dll\0"` as UTF-16.
+static OLE32_W: [u16; 10] = [
+    b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+    b'l' as u16, b'l' as u16, 0,
 ];

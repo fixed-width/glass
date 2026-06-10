@@ -38,6 +38,12 @@ pub(crate) fn available(stored: &[FormatKey]) -> Vec<FormatKey> {
     out
 }
 
+/// The formats the OLE proxy advertises: `available` minus GDI `CF_BITMAP` (the byte-serving proxy
+/// only produces HGLOBAL media; `CF_BITMAP` is a GDI handle served only by the user32 path).
+pub(crate) fn serve_keys(stored: &[FormatKey]) -> Vec<FormatKey> {
+    available(stored).into_iter().filter(|k| *k != Standard(CF_BITMAP)).collect()
+}
+
 /// If `requested` is a synthesizable derivative, the stored canonical key it derives from.
 pub(crate) fn canonical_for(requested: &FormatKey) -> Option<FormatKey> {
     let Standard(id) = requested else { return None };
@@ -88,5 +94,21 @@ mod tests {
     fn already_stored_is_not_duplicated() {
         let avail = available(&[Standard(13), Standard(1)]); // both stored
         assert_eq!(avail.iter().filter(|k| **k == Standard(1)).count(), 1);
+    }
+
+    #[test]
+    fn serve_keys_excludes_cf_bitmap_but_keeps_byte_derivatives() {
+        // CF_DIB stored → serve DIB + DIBV5 (byte) but NOT CF_BITMAP (GDI handle).
+        let keys = serve_keys(&[Standard(8)]);
+        assert!(keys.contains(&Standard(8))); // CF_DIB
+        assert!(keys.contains(&Standard(17))); // CF_DIBV5 (byte rewrite)
+        assert!(!keys.contains(&Standard(2)), "CF_BITMAP must be excluded: {keys:?}");
+        // CF_UNICODETEXT stored → text triad (all byte) kept.
+        let t = serve_keys(&[Standard(13)]);
+        for k in [Standard(13), Standard(1), Standard(7), Standard(16)] {
+            assert!(t.contains(&k), "missing {k:?}");
+        }
+        // Named formats pass through.
+        assert_eq!(serve_keys(&[Named("HTML Format".into())]), vec![Named("HTML Format".into())]);
     }
 }
