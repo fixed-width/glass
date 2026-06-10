@@ -2,7 +2,8 @@
 //! DWM frame bounds / cloaked detection, and the "is this a real app window" filter.
 
 use std::ffi::c_void;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };

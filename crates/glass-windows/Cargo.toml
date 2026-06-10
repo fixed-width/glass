@@ -11,8 +11,8 @@ glass-core.workspace = true
 glass-clip-hook = { path = "../glass-clip-hook" }
 
 [target.'cfg(windows)'.dependencies]
-windows-capture = "1"
-windows = { version = "0.58", features = [
+windows-capture = "2"
+windows = { version = "0.62", features = [
   "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_Graphics_Dwm",
   "Win32_System_Threading",
@@ -36,5 +36,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # The onbox examples set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
 # onbox_a11y example also drives the UIA reader to validate the accessibility path on the box.
 [target.'cfg(windows)'.dev-dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 glass-a11y-windows = { path = "../glass-a11y-windows" }

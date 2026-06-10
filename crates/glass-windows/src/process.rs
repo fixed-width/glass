@@ -297,7 +297,7 @@ pub(crate) fn job_pids(job: HANDLE) -> Vec<u32> {
         // formed over `buf`, so its (byte) alignment is irrelevant.
         let ok = unsafe {
             QueryInformationJobObject(
-                job,
+                Some(job),
                 JobObjectBasicProcessIdList,
                 buf.as_mut_ptr() as *mut c_void,
                 bytes as u32,

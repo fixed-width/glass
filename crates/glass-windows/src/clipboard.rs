@@ -113,7 +113,7 @@ pub fn set(text: &str) -> Result<()> {
             // Free on this error path — we still own the memory.
             // SAFETY: We own hglobal (GlobalAlloc succeeded, SetClipboardData has
             // not been called yet), so GlobalFree is safe.
-            let _ = unsafe { GlobalFree(hglobal) };
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
             return Err(GlassError::Backend("GlobalLock failed on new clipboard handle".into()));
         }
         // SAFETY: `ptr` points to `byte_len` bytes of writable memory; `utf16`
@@ -130,7 +130,7 @@ pub fn set(text: &str) -> Result<()> {
         .map_err(|e| {
             // We still own hglobal — free it before returning.
             // SAFETY: SetClipboardData has not been called, so we still own hglobal.
-            let _ = unsafe { GlobalFree(hglobal) };
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
             GlassError::Backend(format!("OpenClipboard failed: {e}"))
         })?;
 
@@ -139,7 +139,7 @@ pub fn set(text: &str) -> Result<()> {
     let empty_result = unsafe { EmptyClipboard() };
     if let Err(e) = empty_result {
         // SAFETY: We still own hglobal; free it before closing.
-        let _ = unsafe { GlobalFree(hglobal) };
+        let _ = unsafe { GlobalFree(Some(hglobal)) };
         // SAFETY: We successfully opened the clipboard.
         let _ = unsafe { CloseClipboard() };
         return Err(GlassError::Backend(format!("EmptyClipboard failed: {e}")));
@@ -152,7 +152,7 @@ pub fn set(text: &str) -> Result<()> {
     // SAFETY: The clipboard is open and empty.  SetClipboardData transfers ownership
     // of `hmem`/`hglobal` to the system on success — we must NOT free it afterwards.
     // On failure the allocation is still ours and we free it below.
-    let set_result = unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, hmem) };
+    let set_result = unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(hmem)) };
 
     // SAFETY: The clipboard was successfully opened; close it regardless of whether
     // SetClipboardData succeeded.
@@ -164,7 +164,7 @@ pub fn set(text: &str) -> Result<()> {
             // SetClipboardData failed — we still own hglobal; free it.
             // SAFETY: SetClipboardData failed, so ownership did not transfer; we must
             // free to avoid a leak.
-            let _ = unsafe { GlobalFree(hglobal) };
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
             Err(GlassError::Backend(format!("SetClipboardData failed: {e}")))
         }
     }

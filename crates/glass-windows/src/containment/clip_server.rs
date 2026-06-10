@@ -16,7 +16,8 @@ use glass_clip_hook::store::PrivateClipboard;
 use glass_core::{GlassError, Result};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
@@ -185,7 +186,7 @@ fn accept_loop(
     // returned by that API via LocalAlloc and must be freed with LocalFree.
     unsafe {
         use windows::Win32::Foundation::HLOCAL;
-        let _ = windows::Win32::Foundation::LocalFree(HLOCAL(psd.0));
+        let _ = windows::Win32::Foundation::LocalFree(Some(HLOCAL(psd.0)));
     }
 }
 
