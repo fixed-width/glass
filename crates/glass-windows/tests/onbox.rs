@@ -7,7 +7,7 @@
 #![cfg(windows)]
 
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
@@ -218,46 +218,35 @@ fn onbox_handoff_grace() {
 
     fn kill_notepad() {
         // Stop-Process (not `taskkill /IM notepad.exe`) so broker-hosted Win11 Notepad windows are
-        // actually killed — taskkill by image name leaves them alive, which would let [B] below find a
-        // stale window and wrongly succeed.
+        // actually killed — taskkill by image name leaves them alive.
         let _ = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue"])
             .output();
         std::thread::sleep(Duration::from_millis(800));
     }
-    fn notepad_spec(hint: Option<WindowHint>) -> AppSpec {
-        AppSpec {
-            build: None,
-            run: vec!["notepad.exe".to_string()],
-            cwd: None,
-            env: vec![],
-            window_hint: hint,
-            timeout_ms: 8_000,
-            sandbox: glass_core::SandboxLevel::Off,
-        }
-    }
 
-    // [A] WITH a title hint: start_app must adopt the broker/handoff window (the PR #12 grace path).
+    // Win11 Notepad's launcher hands its UI to a broker process and exits, so the window is owned by
+    // neither the launcher nor a Job descendant. With a title hint, discover_window's grace period must
+    // still adopt that broker window — the PR #12 fix. (The no-hint fast-fail path is covered by the
+    // discovery::poll_decision unit tests; it is NOT asserted on-box because Notepad stays "warm" after
+    // a launch — a subsequent no-hint launch then finds the warm instance — making it environment-
+    // dependent rather than a glass invariant.)
     kill_notepad();
-    let mut pa = WindowsPlatform::new().expect("WindowsPlatform::new");
-    let res_a =
-        pa.start_app(&notepad_spec(Some(WindowHint { title: Some("Notepad".into()), class: None })));
-    assert!(res_a.is_ok(), "with a title hint, start_app must adopt the handoff window: {res_a:?}");
-    let _ = pa.stop_app();
-    kill_notepad();
-
-    // [B] WITHOUT a hint: notepad's launcher hands off + exits leaving no Job descendant, so it must
-    // fast-fail AppExited (a stray broker window is not in our pid-set, so it cannot be adopted).
-    let mut pb = WindowsPlatform::new().expect("WindowsPlatform::new");
-    let t = Instant::now();
-    let res_b = pb.start_app(&notepad_spec(None));
-    let elapsed = t.elapsed();
-    assert!(
-        matches!(res_b, Err(GlassError::AppExited(_))),
-        "no-hint notepad must fast-fail AppExited, got {res_b:?}"
-    );
-    assert!(elapsed < Duration::from_secs(5), "no-hint fast-fail must be quick, took {elapsed:?}");
-    let _ = pb.stop_app();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let spec = AppSpec {
+        build: None,
+        run: vec!["notepad.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: Some(WindowHint { title: Some("Notepad".into()), class: None }),
+        timeout_ms: 8_000,
+        sandbox: glass_core::SandboxLevel::Off,
+    };
+    let _geo = p.start_app(&spec).expect("with a title hint, start_app must adopt the broker window");
+    std::thread::sleep(Duration::from_millis(800));
+    let f = p.capture_frame(None).expect("capture the adopted notepad window");
+    assert!(!is_blank(&f.pixels), "the adopted broker window must capture non-blank");
+    let _ = p.stop_app();
     kill_notepad();
 }
 
