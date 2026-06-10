@@ -1,7 +1,7 @@
 //! On-box validation harness for the glass-windows backend (Windows-only).
 //!
 //! Drives [`glass_windows::WindowsPlatform`] through the build → see → interact → debug loop on
-//! Notepad and writes PNGs + a text report to `C:\Users\mpd`. It MUST run in an interactive
+//! charmap.exe and writes WebP frames + a text report to `C:\Users\mpd`. It MUST run in an interactive
 //! desktop session (session 1) — WGC capture and `SendInput` need the active input desktop, so
 //! over SSH (session 0) it is driven via the scheduled-task bridge:
 //!   cargo run -p glass-windows --example onbox
@@ -18,11 +18,19 @@ fn main() {
 
 #[cfg(windows)]
 mod imp {
-    use glass_core::{AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, WindowHint, WindowOp};
+    use glass_core::{
+        frame_to_webp, AppSpec, Frame, KeyEvent, MouseButton, Platform, PointerEvent, WindowHint,
+        WindowOp,
+    };
     use glass_windows::WindowsPlatform;
     use std::time::Duration;
 
-    const OUT: &str = "C:\\Users\\mpd";
+    /// Where captured-frame artifacts are written: the running user's profile dir, which is also
+    /// where scripts/test-windows.sh sweeps `*.webp` from. Resolved at runtime (not a hardcoded
+    /// user) so the harness finds the artifacts on any box.
+    fn out_dir() -> String {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string())
+    }
 
     /// True if every pixel is identical (a uniform/blank frame — WGC didn't return real pixels).
     fn is_blank(px: &[u8]) -> bool {
@@ -35,11 +43,16 @@ mod imp {
     fn changed(a: &[u8], b: &[u8]) -> usize {
         a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
     }
-    fn save(name: &str, w: u32, h: u32, rgba: &[u8]) {
-        let path = format!("{OUT}\\{name}");
-        match image::save_buffer(&path, rgba, w, h, image::ColorType::Rgba8) {
-            Ok(()) => println!("    saved {path}"),
-            Err(e) => println!("    save {path} FAILED: {e}"),
+    /// Encode a captured frame as lossless WebP (glass's production format, via
+    /// `frame_to_webp`) and write it next to the other artifacts.
+    fn save(name: &str, frame: &Frame) {
+        let path = format!("{}\\{}", out_dir(), name);
+        match frame_to_webp(frame) {
+            Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(()) => println!("    saved {path}"),
+                Err(e) => println!("    save {path} FAILED: {e}"),
+            },
+            Err(e) => println!("    encode {path} FAILED: {e}"),
         }
     }
 
@@ -111,7 +124,7 @@ mod imp {
                     f.height,
                     blank
                 );
-                save("onbox_1_capture.png", f.width, f.height, &f.pixels);
+                save("onbox_1_capture.webp", &f);
                 Some(f)
             }
             Err(e) => {
@@ -133,7 +146,7 @@ mod imp {
                 "  after-type changed_px = {ch}  ({})",
                 if ch > 0 { "PASS text rendered" } else { "FAIL no change" }
             );
-            save("onbox_2_typed.png", f2.width, f2.height, &f2.pixels);
+            save("onbox_2_typed.webp", &f2);
         }
 
         println!("\n[list_windows]");
@@ -168,7 +181,7 @@ mod imp {
         }
         std::thread::sleep(Duration::from_millis(600));
         if let Ok(f) = p.capture_frame(None) {
-            save("onbox_3_moved_resized.png", f.width, f.height, &f.pixels);
+            save("onbox_3_moved_resized.webp", &f);
         }
 
         println!("\n[send_pointer Click (50,50)]");
@@ -179,7 +192,7 @@ mod imp {
 
         println!("\n[drain_logs]");
         let logs = p.drain_logs();
-        println!("  {} line(s) (Notepad is a GUI app → 0 expected)", logs.len());
+        println!("  {} line(s) (charmap is a GUI app — 0 expected)", logs.len());
 
         println!("\n[stop_app — Job kill-tree]");
         let pid = p.app_pid();

@@ -62,13 +62,27 @@ nowhere. This is the Windows equivalent of "a bare SSH shell isn't the GUI sessi
 
 ## The dev loop
 
+```bash
+# One command from Linux (set the env once, see below):
+./scripts/test-windows.sh onbox_handoff     # one example
+./scripts/test-windows.sh                    # all onbox_* examples
+./scripts/test-windows.sh --tests clip       # ignored tests matching "clip"
+
+# It pushes your branch (and ships any uncommitted changes), syncs the box, builds, runs each
+# target in the interactive session via the schtasks /it bridge, prints "N PASS / M FAIL", and
+# pulls WebP captures into ./.windows-artifacts/. Exit code is the verdict.
 ```
-edit on Linux ──► git push          (or edit directly via VS Code Remote-SSH)
-              ──► on box: git pull
-              ──► ssh: cargo build --release          # build over SSH is fine
-              ──► Moonlight session: winval <item>     # run where the desktop composes
-              ──► read PASS/FAIL ──► record in the validation plan's results table
+
+Configure the box once (nothing box-specific is committed):
+
+```bash
+export GLASS_WIN_HOST=user@box-ip          # required; unset => the script skips cleanly
+export GLASS_WIN_REPO=C:/Users/user/glass  # optional; defaults to C:/Users/<user>/glass
 ```
+
+Under the hood it still obeys the session rule below — `run-onbox.ps1` uses a `schtasks /it`
+scheduled task to execute in the interactive console session (the manual `winval`-in-Moonlight
+step is only needed for live watching).
 
 Once the make-or-break gate passes, the same box becomes the dev + integration-test machine
 for the real `glass-windows` crate (its `#[ignore]`d E2E suite runs in this mirrored session,
