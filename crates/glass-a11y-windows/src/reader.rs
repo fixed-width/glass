@@ -20,6 +20,13 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds so a pathological tree can't make a snapshot unbounded (tunable; sized on the box).
 const MAX_DEPTH: usize = 30;
 const MAX_NODES: usize = 1500;
+/// Per-level cap on siblings *examined* (on- or off-screen). `MAX_NODES` only counts
+/// nodes entered, and offscreen siblings are skipped without entering — so an
+/// all-offscreen run (a virtualized list of thousands) or a cyclic `get_next_sibling`
+/// would iterate without ever tripping `MAX_NODES`, spinning the worker thread. Cap the
+/// per-level scan so the walk is genuinely bounded regardless of offscreen breadth.
+/// Generous enough not to truncate real UIs; with `MAX_DEPTH` it bounds total work.
+const MAX_SIBLINGS: usize = 4096;
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -158,7 +165,12 @@ fn walk(
     let mut children = Vec::new();
     if depth < MAX_DEPTH && *count < MAX_NODES {
         let mut child = walker.get_first_child(el).ok();
+        let mut siblings = 0usize;
         while let Some(c) = child {
+            siblings += 1;
+            if siblings > MAX_SIBLINGS {
+                break; // bound the per-level scan (offscreen breadth / cyclic sibling chain)
+            }
             if !c.is_offscreen().unwrap_or(false) {
                 children.push(walk(walker, &c, origin, depth + 1, count)?);
             }
@@ -205,7 +217,12 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     } else {
         (None, None)
     };
-    let editable = ct_id == 50004 && readonly.map(|ro| !ro).unwrap_or(false);
+    // Editable iff a writable ValuePattern is present — for ANY value-bearing
+    // control (Edit/ComboBox/Document), not just Edit; otherwise a writable
+    // ComboBox/Document reports editable=false while set_value would succeed on
+    // it. `readonly` is only `Some` for those three types (gated above), so the
+    // match keeps non-value controls non-editable.
+    let editable = matches!(ct_id, 50003 | 50004 | 50030) && readonly.map(|ro| !ro).unwrap_or(false);
     let facts = crate::mapping::StateFacts {
         enabled: el.is_enabled().unwrap_or(false),
         offscreen: el.is_offscreen().unwrap_or(false),
@@ -283,7 +300,12 @@ fn find_nth(
     }
     if depth < MAX_DEPTH && *count < MAX_NODES {
         let mut child = walker.get_first_child(el).ok();
+        let mut siblings = 0usize;
         while let Some(c) = child {
+            siblings += 1;
+            if siblings > MAX_SIBLINGS {
+                break; // same per-level bound as walk(), so find_nth can't spin either
+            }
             if !c.is_offscreen().unwrap_or(false) {
                 if let Some(found) = find_nth(walker, &c, depth + 1, count, target) {
                     return Some(found);
