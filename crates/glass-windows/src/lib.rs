@@ -111,6 +111,9 @@ mod backend {
             // launcher can exit the instant it hands its UI off, so root-exit is not on
             // its own fatal — see `poll_decision` for the hint-vs-no-hint policy.
             let mut root_exit: Option<Option<i32>> = None;
+            // The root's own pid — lets us tell a live Job-captured descendant (keep polling: its
+            // window may still map) from a bare crash (fast-fail) once the root exits.
+            let root_pid = self.app.as_ref().map(|a| a.root_pid());
             loop {
                 // Look for the app's window FIRST, then check for exit. A launcher
                 // that hands its UI to a Job-captured child and exits 0 (Chromium/
@@ -140,7 +143,15 @@ mod backend {
                         }
                     }
                 }
-                match poll_decision(root_exit, hint.is_some(), Instant::now() >= deadline) {
+                // A live process in the set other than the (now-exited) root means a Job-captured
+                // child is up that may still own a window (Chromium/Edge/Electron) — keep polling.
+                let has_live_descendants = root_pid.is_some_and(|rp| pids.iter().any(|&p| p != rp));
+                match poll_decision(
+                    root_exit,
+                    hint.is_some(),
+                    has_live_descendants,
+                    Instant::now() >= deadline,
+                ) {
                     PollStep::FailExited(code) => return Err(GlassError::AppExited(code)),
                     PollStep::FailTimeout => return Err(GlassError::Timeout(timeout_ms)),
                     PollStep::KeepPolling => {}
