@@ -7,12 +7,12 @@
 #![cfg(windows)]
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
-    Accessibility, AppSpec, AxContext, AxNode, KeyEvent, MouseButton, Platform, PointerEvent,
-    WindowHint, WindowOp,
+    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, KeyEvent, Modifier,
+    MouseButton, Platform, PointerEvent, WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
 
@@ -74,6 +74,15 @@ fn first_clickable<'a>(n: &'a AxNode, out: &mut Option<&'a AxNode>) {
     }
     for c in &n.children {
         first_clickable(c, out);
+    }
+}
+
+fn first_role<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a AxNode>) {
+    if out.is_none() && n.role == role {
+        *out = Some(n);
+    }
+    for c in &n.children {
+        first_role(c, role, out);
     }
 }
 
@@ -199,4 +208,206 @@ fn onbox_a11y_snapshot_and_click() {
     assert!(changed(&before.pixels, &after.pixels) > 0, "clicking the element must change the UI");
 
     let _ = p.stop_app();
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_handoff_grace() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+
+    fn kill_notepad() {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "notepad.exe", "/T"])
+            .output();
+        std::thread::sleep(Duration::from_millis(800));
+    }
+    fn notepad_spec(hint: Option<WindowHint>) -> AppSpec {
+        AppSpec {
+            build: None,
+            run: vec!["notepad.exe".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: hint,
+            timeout_ms: 8_000,
+            sandbox: glass_core::SandboxLevel::Off,
+        }
+    }
+
+    // [A] WITH a title hint: start_app must adopt the broker/handoff window (the PR #12 grace path).
+    kill_notepad();
+    let mut pa = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let res_a =
+        pa.start_app(&notepad_spec(Some(WindowHint { title: Some("Notepad".into()), class: None })));
+    assert!(res_a.is_ok(), "with a title hint, start_app must adopt the handoff window: {res_a:?}");
+    let _ = pa.stop_app();
+    kill_notepad();
+
+    // [B] WITHOUT a hint: notepad's launcher hands off + exits leaving no Job descendant, so it must
+    // fast-fail AppExited (a stray broker window is not in our pid-set, so it cannot be adopted).
+    let mut pb = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let t = Instant::now();
+    let res_b = pb.start_app(&notepad_spec(None));
+    let elapsed = t.elapsed();
+    assert!(
+        matches!(res_b, Err(GlassError::AppExited(_))),
+        "no-hint notepad must fast-fail AppExited, got {res_b:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "no-hint fast-fail must be quick, took {elapsed:?}");
+    let _ = pb.stop_app();
+    kill_notepad();
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_modifier_click() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
+    let mut hit = None;
+    first_clickable(&tree.root, &mut hit);
+    let n = hit.expect("an interactable element with on-screen bounds");
+    let (cx, cy) = n
+        .bounds
+        .and_then(|b| b.clamped_center(geo.width, geo.height))
+        .expect("first interactable has a clampable center");
+
+    // A plain click must land (frame changes) — proves clicks reach the window.
+    let before = p.capture_frame(None).expect("capture before click");
+    p.send_pointer(&PointerEvent::Click {
+        x: cx,
+        y: cy,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![],
+    })
+    .expect("plain click");
+    std::thread::sleep(Duration::from_millis(500));
+    let after = p.capture_frame(None).expect("capture after click");
+    assert!(changed(&before.pixels, &after.pixels) > 0, "plain click must change the UI");
+
+    // Modifier-held clicks must submit cleanly (the modifier-VK-down -> mouse -> ups SendInput batch
+    // builds and sends; modifier *delivery* is asserted by the X11/Wayland integration tests).
+    for mods in [vec![Modifier::Control], vec![Modifier::Shift]] {
+        p.send_pointer(&PointerEvent::Click {
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: mods,
+        })
+        .expect("modifier-held click must submit");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = p.stop_app();
+}
+
+#[test]
+#[ignore = "on-box only: runs in the interactive session via the harness"]
+fn onbox_clipboard_roundtrip() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+
+    // Includes non-ASCII to exercise the UTF-16 round-trip.
+    const SENTINEL: &str = "glass-clip-\u{2713}-\u{e9}-\u{4e16}\u{754c}";
+    p.set_clipboard(SENTINEL).expect("set_clipboard");
+    assert_eq!(p.get_clipboard().expect("get_clipboard"), SENTINEL, "clipboard round-trip exact");
+
+    p.set_clipboard("").expect("set empty clipboard");
+    assert!(p.get_clipboard().expect("get empty clipboard").is_empty(), "empty round-trip");
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_set_value() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
+
+    let mut field = None;
+    first_role(&tree.root, AxRole::TextField, &mut field);
+    let field = field.expect("charmap must expose a TextField (Edit)");
+    let target =
+        AxTarget { id: field.id, role: field.role, name: field.name.clone(), bounds: field.bounds };
+
+    const NEW: &str = "GLASSVALUE";
+    a11y.set_value(&ctx, &target, NEW).expect("set_value on the Edit field");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Re-snapshot: the field's value changed (charmap's Edit keeps a trailing CR; compare trimmed).
+    let t2 = a11y.snapshot(&ctx).expect("re-snapshot");
+    let mut f2 = None;
+    first_role(&t2.root, AxRole::TextField, &mut f2);
+    let v = f2.and_then(|n| n.value.as_deref()).expect("TextField has a value after set");
+    assert_eq!(v.trim_end(), NEW, "set_value must change the field value");
+
+    // A non-editable element (Button) must error AxElementNotEditable, never silently succeed.
+    let mut button = None;
+    first_role(&tree.root, AxRole::Button, &mut button);
+    let b = button.expect("charmap must expose at least one Button for the not-editable guard");
+    let bt = AxTarget { id: b.id, role: b.role, name: b.name.clone(), bounds: b.bounds };
+    assert!(
+        matches!(a11y.set_value(&ctx, &bt, "x"), Err(GlassError::AxElementNotEditable(_))),
+        "set_value on a Button must error AxElementNotEditable"
+    );
+
+    let _ = p.stop_app();
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + Edge"]
+fn onbox_a11y_edge_geometry_fallback() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let edge = glass_windows::onbox_support::locate_edge()
+        .expect("msedge.exe not found under Program Files; Edge is required for this test");
+    let udd = glass_windows::onbox_support::scratch_dir("glass-a11y-edge-test");
+    let _ = std::fs::remove_dir_all(&udd);
+
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            edge,
+            format!("--user-data-dir={udd}"),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--new-window".to_string(),
+            "about:blank".to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 25_000,
+        sandbox: glass_core::SandboxLevel::Off,
+    };
+    // Edge's top-level window is owned by a DESCENDANT process, so the a11y reader's exact-pid match
+    // misses and the geometry fallback must recover it — the path charmap can't exercise.
+    let geo = p.start_app(&spec).expect("isolated Edge discovery (Job-child window)");
+    std::thread::sleep(Duration::from_secs(6));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot on multi-process Edge");
+    let (mut total, mut inter) = (0usize, 0usize);
+    counts(&tree.root, &mut total, &mut inter);
+    assert!(tree.count > 20, "Edge's chrome should yield a sizable a11y tree, got {}", tree.count);
+    assert!(inter > 0, "Edge tree must expose interactable elements, got {inter}");
+
+    p.stop_app().expect("stop_app");
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(&udd);
 }
