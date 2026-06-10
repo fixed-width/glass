@@ -75,10 +75,10 @@ mod imp {
         match decide(spec.sandbox, choice, super::sandboxie::available(&dir)) {
             Decision::Unconfined => Ok(Containment::Unconfined),
             Decision::Sandboxie => {
-                let s = super::sandboxie::Sandboxie {
+                let s = super::sandboxie::Sandboxie::new(
                     dir,
-                    box_name: format!("glass_{}", std::process::id()),
-                };
+                    format!("glass_{}", std::process::id()),
+                );
                 s.configure(spec.sandbox)?;
                 Ok(Containment::Sandboxie(s))
             }
