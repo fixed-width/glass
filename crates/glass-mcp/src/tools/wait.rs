@@ -71,9 +71,14 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
     };
     let o = glass.wait_for_region(&params).map_err(|e| e.to_string())?;
+    // `wait_for_region` diffs region-cropped frames, so its bbox originates at
+    // the crop's (0,0). Translate back to window coordinates before returning
+    // (coordinates are window-relative at the tool boundary; this also keeps it
+    // consistent with glass_diff, whose bbox is already window-relative).
+    let (ox, oy) = a.region.as_ref().map_or((0, 0), |r| (r.x, r.y));
     let bbox = o
         .bbox
-        .map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height }));
+        .map(|b| json!({ "x": b.x + ox, "y": b.y + oy, "width": b.width, "height": b.height }));
     let meta = json!({
         "matched": o.matched,
         "changed_pct": o.changed_pct,
@@ -254,6 +259,43 @@ mod tests {
         assert_eq!(out.0.len(), 1, "no include_image -> text only");
         match out.0.last().unwrap() {
             OutContent::Text(t) => assert!(t.contains("\"matched\":true"), "got: {t}"),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn region_bbox_is_window_relative_not_crop_relative() {
+        // A non-zero-origin region must report its change bbox in WINDOW
+        // coordinates, not relative to the crop (the window-relative-at-the-
+        // tool-boundary invariant; also keeps it consistent with glass_diff).
+        // Window 4x4, region {2,2,2,2}; the whole region flips black->white so
+        // the bbox covers the full crop: crop-relative would be (0,0), but
+        // window-relative must be (2,2).
+        let black = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let white = Frame::solid(4, 4, [255, 255, 255, 255]);
+        let mut g = glass_with(FakePlatform::new(4, 4).with_frames(vec![black, white]));
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+        })
+        .unwrap();
+        let mut a = region_args();
+        a.region = Some(RegionArgs { x: 2, y: 2, width: 2, height: 2 });
+        let out = wait_for_region(&mut g, &a).unwrap();
+        match out.0.last().unwrap() {
+            OutContent::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(t).unwrap();
+                assert_eq!(v["matched"], true, "got: {t}");
+                assert_eq!(v["bbox"]["x"], 2, "bbox x must be window-relative; got: {t}");
+                assert_eq!(v["bbox"]["y"], 2, "bbox y must be window-relative; got: {t}");
+                assert_eq!(v["bbox"]["width"], 2, "got: {t}");
+                assert_eq!(v["bbox"]["height"], 2, "got: {t}");
+            }
             _ => panic!("expected text"),
         }
     }
