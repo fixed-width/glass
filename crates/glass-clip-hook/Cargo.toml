@@ -25,6 +25,9 @@ windows = { version = "0.62", features = [
   # Win32_Graphics_Gdi: CreateDIBitmap/DeleteObject for CF_BITMAP synthesis.
   # Win32_Globalization: WideCharToMultiByte/GetUserDefaultLCID for CF_TEXT/CF_LOCALE synthesis.
   "Win32_Graphics_Gdi", "Win32_Globalization",
+  # OLE clipboard hook (2a-ii): Com/StructuredStorage for IDataObject/IEnumFORMATETC/STGMEDIUM/IStream;
+  # Note: #[implement] is re-exported by windows-core (windows::core::implement) without a feature gate.
+  "Win32_System_Com", "Win32_System_Com_StructuredStorage",
 ] }
 # Inline detours. License verified permissive in this task's Step 6 (MIT/BSD); IAT fallback documented.
 # `static-detour` enables the `static_detour!` macro (the type-safe detour table); it pulls in the

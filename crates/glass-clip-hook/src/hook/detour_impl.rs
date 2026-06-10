@@ -16,13 +16,13 @@ use retour::static_detour;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
-use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
 
 use crate::proto::FormatKey;
 
 use super::{
-    alloc_hglobal_bytes, read_bytes_from_hglobal, store_empty, store_get_bytes, store_list,
-    store_set_all, store_seq, unicode_to_codepage, user32_proc,
+    alloc_hglobal_bytes, id_of, key_of, locale_blob, read_bytes_from_hglobal, store_empty,
+    store_get_bytes, store_list, store_set_all, store_seq, unicode_to_codepage, user32_proc,
+    CF_BITMAP, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT,
 };
 
 // Exact raw ABI signatures of the user32 exports (from windows-rs `link!` declarations).
@@ -119,41 +119,6 @@ fn cache_bitmap(h: HBITMAP) {
 
 // ---- format id <-> FormatKey + synthesis -----------------------------------------------------
 
-// Standard Win32 clipboard format ids (stable ABI).
-const CF_TEXT: u32 = 1;
-const CF_BITMAP: u32 = 2;
-const CF_OEMTEXT: u32 = 7;
-const CF_LOCALE: u32 = 16;
-const CF_DIBV5: u32 = 17;
-
-/// Raw clipboard id → `FormatKey`: a registered (>=0xC000) id resolves to its NAME (portable across
-/// processes), everything else stays a `Standard` id.
-fn key_of(id: u32) -> FormatKey {
-    if id >= 0xC000 {
-        let mut buf = [0u16; 256];
-        // SAFETY: GetClipboardFormatNameW writes up to buf.len() chars into `buf` and returns the
-        // count (0 on failure); the slice bounds the read.
-        let n = unsafe { GetClipboardFormatNameW(id, &mut buf) };
-        if n > 0 {
-            return FormatKey::Named(String::from_utf16_lossy(&buf[..n as usize]));
-        }
-    }
-    FormatKey::Standard(id)
-}
-
-/// `FormatKey` → this process's clipboard id (re-registering named formats so the id is valid here).
-fn id_of(key: &FormatKey) -> u32 {
-    match key {
-        FormatKey::Standard(id) => *id,
-        FormatKey::Named(name) => {
-            let w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            // SAFETY: `w` is a NUL-terminated UTF-16 buffer that outlives the call;
-            // RegisterClipboardFormatW returns this session's id for that name.
-            unsafe { RegisterClipboardFormatW(windows::core::PCWSTR::from_raw(w.as_ptr())) }
-        }
-    }
-}
-
 /// The clipboard ids currently available to the app: the stored canonical set plus locally
 /// synthesizable derivatives (`synth::available`), each mapped to this process's id.
 fn available_ids() -> Vec<u32> {
@@ -179,14 +144,6 @@ fn resolve_bytes(fmt: u32, key: &FormatKey) -> Option<Vec<u8>> {
         CF_BITMAP => src, // handed to make_bitmap_handle by the caller
         _ => return None,
     })
-}
-
-/// The 4-byte `CF_LOCALE` blob: the user's default LCID (little-endian).
-fn locale_blob() -> Vec<u8> {
-    use windows::Win32::Globalization::GetUserDefaultLCID;
-    // SAFETY: GetUserDefaultLCID takes no args and returns the LCID.
-    let lcid = unsafe { GetUserDefaultLCID() };
-    lcid.to_le_bytes().to_vec()
 }
 
 /// Build a GDI `HBITMAP` from a validated `CF_DIB` blob. Cached + freed via `DeleteObject`.
@@ -432,4 +389,5 @@ pub(super) fn install() {
             }
         }
     }
+    super::ole::install_ole();
 }
