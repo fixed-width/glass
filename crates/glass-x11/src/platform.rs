@@ -771,6 +771,19 @@ impl Platform for X11Platform {
     fn app_pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
     }
+
+    /// The app's full process subtree, not just the spawned child. For a
+    /// sandboxed launch the spawned child is `bwrap` and the real app is a
+    /// descendant with a different pid; the a11y reader correlates the AT-SPI
+    /// connection pid against this set, so it must include descendants — the
+    /// inherited `[app_pid()]` default breaks a11y for every `sandbox != off`
+    /// launch. Mirrors the `proc_tree_pids` set used by window discovery.
+    fn app_pids(&self) -> Vec<u32> {
+        match &self.child {
+            Some(c) => proc_tree_pids(c.id()),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Decide whether a window's fetched `WM_NAME` and `WM_CLASS` satisfy a hint.
@@ -821,9 +834,37 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_descendants, hint_matches};
+    use super::{collect_descendants, hint_matches, proc_tree_pids};
     use glass_core::WindowHint;
     use std::collections::HashMap;
+
+    // --- proc_tree_pids (the mechanism app_pids() relies on) ---
+
+    #[test]
+    fn proc_tree_pids_includes_a_real_descendant() {
+        // For a sandboxed launch the spawned child is `bwrap` and the real app
+        // is a *descendant* with a different pid. app_pids() must surface that
+        // descendant (so a11y pid-correlation works) — the plain `[app_pid()]`
+        // default never would. Spawn a real child and assert proc_tree_pids
+        // walks down to it.
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id();
+        let pids = proc_tree_pids(std::process::id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(pids.contains(&std::process::id()), "must include the root pid");
+        assert!(
+            pids.contains(&child_pid),
+            "must include the spawned descendant pid {child_pid}; got {pids:?}"
+        );
+    }
 
     // --- collect_descendants ---
 
