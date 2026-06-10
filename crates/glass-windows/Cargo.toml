@@ -27,8 +27,8 @@ windows = { version = "0.62", features = [
   "Win32_Security_Authorization",
 ] }
 
-# The onbox examples set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
-# onbox_a11y example also drives the UIA reader to validate the accessibility path on the box.
+# The onbox examples + tests set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
+# on-box a11y tests (tests/onbox.rs) also drive the UIA reader to validate the accessibility path.
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 glass-a11y-windows = { path = "../glass-a11y-windows" }
