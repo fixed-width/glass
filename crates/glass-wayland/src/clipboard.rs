@@ -7,12 +7,17 @@
 //! the X11 owner-thread pattern.
 
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Cap on how long `get()` waits for the selection owner to finish writing the
+/// transfer pipe. The owner is an arbitrary external app, so a stuck/slow one
+/// must not hang the server (the X11 backend guards the analogous read with 1s).
+const CLIP_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_seat;
@@ -401,15 +406,56 @@ pub fn get(socket: &Path) -> Result<String> {
         .roundtrip(&mut state)
         .map_err(|e| GlassError::Backend(format!("clipboard get: roundtrip3: {e}")))?;
 
-    // Read to EOF from the read end.
-    let mut buf = Vec::new();
-    let mut file = std::fs::File::from(read_end);
-    file.read_to_end(&mut buf)
-        .map_err(|e| GlassError::Backend(format!("clipboard get: read pipe: {e}")))?;
+    // Read to EOF from the read end, bounded by a deadline so a misbehaving
+    // selection owner can't hang us forever (see CLIP_READ_TIMEOUT).
+    let buf = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT)?;
 
     offer.destroy();
 
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read `fd` to EOF, but give up after `timeout`. The selection owner is an
+/// arbitrary external app; one that opens the transfer but never finishes
+/// writing (or never closes its write end) would otherwise block this read —
+/// and, via the session-wide Glass lock, every other tool call. Poll the fd
+/// with the remaining deadline and read when ready; we are the pipe's sole
+/// reader, so a poll-ready read never blocks. Returns `Timeout` on expiry.
+fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut file = std::fs::File::from(fd);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(GlassError::Timeout(timeout.as_millis() as u64));
+        }
+        let remaining = deadline - now;
+        let ts = rustix::event::Timespec {
+            tv_sec: remaining.as_secs() as i64,
+            tv_nsec: remaining.subsec_nanos() as i64,
+        };
+        // The PollFd borrows `file` only for this statement, freeing it before
+        // the read below.
+        let ready = rustix::event::poll(
+            &mut [rustix::event::PollFd::new(&file, rustix::event::PollFlags::IN)],
+            Some(&ts),
+        );
+        match ready {
+            Ok(0) => return Err(GlassError::Timeout(timeout.as_millis() as u64)),
+            Ok(_) => match file.read(&mut chunk) {
+                Ok(0) => return Ok(buf), // EOF
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(GlassError::Backend(format!("clipboard get: read pipe: {e}")))
+                }
+            },
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(GlassError::Backend(format!("clipboard get: poll: {e}"))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,4 +717,32 @@ fn serve_loop(
     // Signal that this owner has stopped so the platform can re-spawn if needed.
     stop.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_to_eof_bounded, CLIP_READ_TIMEOUT};
+    use glass_core::GlassError;
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[test]
+    fn bounded_read_times_out_when_writer_stalls() {
+        // Writer end open but silent — a stuck/slow selection owner that opened
+        // the transfer but never finishes writing. Must NOT hang forever.
+        let (read_end, _write_end) = rustix::pipe::pipe().expect("pipe");
+        let r = read_to_eof_bounded(read_end, Duration::from_millis(200));
+        assert!(matches!(r, Err(GlassError::Timeout(_))), "expected Timeout, got {r:?}");
+        // _write_end stays alive above so no EOF is signalled during the read.
+    }
+
+    #[test]
+    fn bounded_read_collects_until_eof() {
+        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+        let mut w = std::fs::File::from(write_end);
+        w.write_all(b"clip!").expect("write");
+        drop(w); // close the write end → EOF
+        let got = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT).expect("read ok");
+        assert_eq!(got, b"clip!");
+    }
 }
