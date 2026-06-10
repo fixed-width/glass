@@ -105,15 +105,13 @@ mod backend {
         ) -> Result<WindowGeometry> {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             loop {
-                // Fail fast if the app died on launch (crash/instant exit), rather than
-                // busy-polling the full timeout and reporting a misleading Timeout.
-                if let Some(app) = self.app.as_mut() {
-                    if let Ok(Some(status)) = app.try_wait() {
-                        return Err(GlassError::AppExited(status.code()));
-                    }
-                }
-                // Recompute the union each iteration: a launcher-handoff child may only
-                // appear (and own the window) several polls in.
+                // Look for the app's window FIRST, then check for exit. A launcher
+                // that hands its UI to a Job-captured child and exits 0 (Chromium/
+                // Electron-style) must not be reported as AppExited while the child's
+                // window is already up — so a window that exists wins even if the root
+                // has exited. (The X11 backend scans first, exit-checks second, for the
+                // same reason.) Recompute the pid union each iteration: a handoff child
+                // may only appear (and own the window) several polls in.
                 let pids = self.app_pids();
                 if let Some(w) = find_app_window(&pids, hint) {
                     // A window passed the filter but has no DWM frame bounds yet (a transient
@@ -121,6 +119,15 @@ mod backend {
                     if let Some(r) = crate::util::extended_frame_bounds(w.hwnd()) {
                         self.active_hwnd = Some(w.raw);
                         return Ok(crate::windows::rect_to_geometry(r));
+                    }
+                }
+                // No window yet — fail fast if the app died on launch (crash/instant
+                // exit), rather than busy-polling the full timeout and reporting a
+                // misleading Timeout. AppExited only when the root died AND no window
+                // exists.
+                if let Some(app) = self.app.as_mut() {
+                    if let Ok(Some(status)) = app.try_wait() {
+                        return Err(GlassError::AppExited(status.code()));
                     }
                 }
                 if Instant::now() >= deadline {
