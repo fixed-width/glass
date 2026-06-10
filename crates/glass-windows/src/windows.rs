@@ -122,7 +122,7 @@ pub(crate) fn move_window(hwnd: HWND, x: i32, y: i32) -> Result<()> {
     unsafe {
         SetWindowPos(
             hwnd,
-            HWND::default(),
+            None,
             x + dx,
             y + dy,
             0,
@@ -146,7 +146,7 @@ pub(crate) fn resize_window(hwnd: HWND, width: u32, height: u32) -> Result<()> {
     unsafe {
         SetWindowPos(
             hwnd,
-            HWND::default(),
+            None,
             0,
             0,
             width as i32 + extra_w,

@@ -57,10 +57,11 @@ impl GraphicsCaptureApiHandler for OneShot {
         capture_control: InternalCaptureControl,
     ) -> std::result::Result<(), Self::Error> {
         let (w, h) = (frame.width(), frame.height());
-        let mut fb = frame.buffer()?;
-        // Tightly-packed (RowPitch padding removed): width*height*4 BGRA bytes.
-        let bytes = fb.as_nopadding_buffer()?;
-        let owned = bytes.to_vec();
+        let fb = frame.buffer()?;
+        // Tightly-packed (RowPitch padding removed): width*height*4 BGRA bytes. windows-capture 2
+        // writes the de-padded bytes into a caller-provided buffer and returns a borrowed slice.
+        let mut packed = Vec::new();
+        let owned = fb.as_nopadding_buffer(&mut packed).to_vec();
         // If the receiver is gone the caller already bailed; just stop cleanly.
         let _ = self.tx.send((owned, w, h));
         capture_control.stop();
