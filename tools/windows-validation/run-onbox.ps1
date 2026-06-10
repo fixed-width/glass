@@ -102,8 +102,10 @@ function Test-Verdict($r) {
     return @{ ok = $false; why = $why }
   }
   if ($r.result -ne "0" -and $r.result -ne "unknown") { return @{ ok = $false; why = "exit $($r.result)" } }
-  if ($r.text -match "(?m)\bFAIL\b") { return @{ ok = $false; why = "FAIL token" } }
-  if ($r.text -notmatch "(?m)\bPASS\b") { return @{ ok = $false; why = "no PASS token" } }
+  # Case-SENSITIVE (-cmatch): only the uppercase PASS/FAIL status tokens count, so prose like
+  # "fast-fail preserved" does not trip the verdict (-match is case-insensitive by default).
+  if ($r.text -cmatch "(?m)\bFAIL\b") { return @{ ok = $false; why = "FAIL token" } }
+  if ($r.text -cnotmatch "(?m)\bPASS\b") { return @{ ok = $false; why = "no PASS token" } }
   return @{ ok = $true; why = "ok" }
 }
 
