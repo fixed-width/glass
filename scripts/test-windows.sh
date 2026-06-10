@@ -12,7 +12,7 @@
 #
 # Usage:
 #   ./scripts/test-windows.sh                 # all onbox_* examples
-#   ./scripts/test-windows.sh onbox_handoff   # one (or several) named examples
+#   ./scripts/test-windows.sh onbox           # one (or several) named examples
 #   ./scripts/test-windows.sh --all           # explicit all
 #   ./scripts/test-windows.sh --tests clip    # cargo test -- --ignored clip
 #   ./scripts/test-windows.sh --release ...    # release profile
@@ -48,6 +48,9 @@ RUSER="${HOST%@*}"
 [ -n "$REPO" ] || REPO="C:/Users/${RUSER}/glass"
 case "$HOST$REPO" in
   *[[:space:]]*) echo "error: GLASS_WIN_HOST/GLASS_WIN_REPO must not contain spaces" >&2; exit 2 ;;
+esac
+case "$TESTS" in
+  *[[:space:]]*) echo "error: --tests value must not contain spaces" >&2; exit 2 ;;
 esac
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"

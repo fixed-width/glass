@@ -13,6 +13,8 @@ pub mod containment; // Windows containment provider seam (pure config is host-t
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box
+#[doc(hidden)]
+pub mod onbox_support; // env-resolved paths shared by the on-box examples + tests; host-tested
 
 /// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
 /// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.

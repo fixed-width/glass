@@ -64,9 +64,9 @@ nowhere. This is the Windows equivalent of "a bare SSH shell isn't the GUI sessi
 
 ```bash
 # One command from Linux (set the env once, see below):
-./scripts/test-windows.sh onbox_handoff     # one example
-./scripts/test-windows.sh                    # all onbox_* examples
-./scripts/test-windows.sh --tests clip       # ignored tests matching "clip"
+./scripts/test-windows.sh onbox             # one example
+./scripts/test-windows.sh                    # all onbox* examples
+./scripts/test-windows.sh --tests onbox      # the #[ignore]d tests/onbox.rs suite (in session 1)
 
 # It pushes your branch (and ships any uncommitted changes), syncs the box, builds, runs each
 # target in the interactive session via the schtasks /it bridge, prints "N PASS / M FAIL", and

@@ -1,7 +1,7 @@
 //! On-box validation harness for the glass-windows backend (Windows-only).
 //!
 //! Drives [`glass_windows::WindowsPlatform`] through the build → see → interact → debug loop on
-//! charmap.exe and writes WebP frames + a text report to `C:\Users\mpd`. It MUST run in an interactive
+//! charmap.exe and writes WebP frames + a text report to `%USERPROFILE%`. It MUST run in an interactive
 //! desktop session (session 1) — WGC capture and `SendInput` need the active input desktop, so
 //! over SSH (session 0) it is driven via the scheduled-task bridge:
 //!   cargo run -p glass-windows --example onbox
