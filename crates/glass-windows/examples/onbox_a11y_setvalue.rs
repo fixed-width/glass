@@ -97,7 +97,8 @@ mod imp {
             let _ = p.stop_app();
             return;
         };
-        let target = AxTarget { id: field.id, role: field.role, name: field.name.clone() };
+        let target =
+            AxTarget { id: field.id, role: field.role, name: field.name.clone(), bounds: field.bounds };
         println!(
             "\n[set_value]  field #{} {:?} {:?}  value-before = {:?}",
             field.id.0, field.role, field.name, field.value
@@ -137,7 +138,7 @@ mod imp {
         first_role(&tree.root, AxRole::Button, &mut button);
         match button {
             Some(b) => {
-                let bt = AxTarget { id: b.id, role: b.role, name: b.name.clone() };
+                let bt = AxTarget { id: b.id, role: b.role, name: b.name.clone(), bounds: b.bounds };
                 match a11y.set_value(&ctx, &bt, "x") {
                     Err(GlassError::AxElementNotEditable(_)) => {
                         println!("  PASS  button #{} -> AxElementNotEditable", b.id.0)

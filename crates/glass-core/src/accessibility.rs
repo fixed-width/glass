@@ -287,20 +287,45 @@ pub struct AxContext {
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
-/// (pre-order index) plus the role/name the caller saw in the snapshot. The
-/// backend verifies role+name after re-walking to the id, so a stale id errors
+/// (pre-order index), the role/name the caller saw in the snapshot, and the
+/// element's window-relative bounds when known. The backend re-walks to the id
+/// and verifies role+name (and bounds, when present) so a stale id — or tree
+/// drift that lands a *different* same-role+name element on the id — errors
 /// rather than overwriting the wrong element.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxTarget {
     pub id: AxNodeId,
     pub role: AxRole,
     pub name: Option<String>,
+    /// The element's window-relative bounds at snapshot time, when known. An
+    /// extra fingerprint: re-walking to a pre-order id can land on a different
+    /// same-role+name element if the tree drifted, and that element sits
+    /// elsewhere — see [`Self::bounds_consistent`].
+    pub bounds: Option<AxRect>,
 }
 
 impl AxTarget {
     /// Whether a reached node's role + name match this target.
     pub fn matches(&self, role: AxRole, name: Option<&str>) -> bool {
         self.role == role && self.name.as_deref() == name
+    }
+
+    /// Whether a reached element's bounds `got` are consistent with the bounds
+    /// captured for this target, within `tol` px on every edge. `true` when no
+    /// bounds were captured (nothing to verify — role+name still gate). A
+    /// genuinely different element that drift moved onto this id sits elsewhere
+    /// and is rejected; sub-pixel / DWM-border jitter is tolerated.
+    pub fn bounds_consistent(&self, got: Option<AxRect>, tol: i64) -> bool {
+        match (self.bounds, got) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => {
+                (i64::from(a.x) - i64::from(b.x)).abs() <= tol
+                    && (i64::from(a.y) - i64::from(b.y)).abs() <= tol
+                    && (i64::from(a.width) - i64::from(b.width)).abs() <= tol
+                    && (i64::from(a.height) - i64::from(b.height)).abs() <= tol
+            }
+        }
     }
 }
 
@@ -476,15 +501,35 @@ mod tests {
 
     #[test]
     fn ax_target_matches_on_role_and_name() {
-        let t = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: Some("Email".into()) };
+        let t = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: Some("Email".into()), bounds: None };
         assert!(t.matches(AxRole::TextField, Some("Email")));
         assert!(!t.matches(AxRole::Button, Some("Email")), "role must match");
         assert!(!t.matches(AxRole::TextField, Some("Name")), "name must match");
         assert!(!t.matches(AxRole::TextField, None), "missing name must not match a named target");
 
-        let t_unnamed = AxTarget { id: AxNodeId(5), role: AxRole::TextField, name: None };
+        let t_unnamed = AxTarget { id: AxNodeId(5), role: AxRole::TextField, name: None, bounds: None };
         assert!(t_unnamed.matches(AxRole::TextField, None), "unnamed target matches unnamed live node");
         assert!(!t_unnamed.matches(AxRole::TextField, Some("X")), "unnamed target must not match a named live node");
+    }
+
+    #[test]
+    fn ax_target_bounds_consistent_rejects_a_moved_element() {
+        let r = AxRect { x: 100, y: 50, width: 80, height: 20 };
+        let t = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: None, bounds: Some(r) };
+        // Exact and within-tolerance bounds pass.
+        assert!(t.bounds_consistent(Some(r), 8));
+        assert!(
+            t.bounds_consistent(Some(AxRect { x: 104, y: 53, width: 80, height: 20 }), 8),
+            "minor jitter within tolerance is accepted"
+        );
+        // A different element that drift landed on this id sits elsewhere → rejected.
+        assert!(!t.bounds_consistent(Some(AxRect { x: 300, y: 400, width: 120, height: 30 }), 8));
+        // Expected a positioned element but the reached one has none → reject.
+        assert!(!t.bounds_consistent(None, 8));
+        // No fingerprint captured → nothing to verify, accept (role+name still gates).
+        let t_nofp = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: None, bounds: None };
+        assert!(t_nofp.bounds_consistent(Some(r), 8));
+        assert!(t_nofp.bounds_consistent(None, 8));
     }
 
     #[test]

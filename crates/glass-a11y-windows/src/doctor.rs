@@ -31,10 +31,16 @@ fn a11y_checks(uia: std::result::Result<(), String>) -> Vec<Check> {
 
 #[cfg(windows)]
 fn probe_uia() -> std::result::Result<(), String> {
-    match uiautomation::UIAutomation::new() {
+    // UIAutomation::new() initializes COM (MTA) on the calling thread and the
+    // uiautomation crate never uninitializes it — leaving the doctor's own thread
+    // permanently marked MTA. Run the probe on a throwaway thread so that apartment
+    // init is reclaimed at thread exit (mirrors the reader's per-call isolation).
+    std::thread::spawn(|| match uiautomation::UIAutomation::new() {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
-    }
+    })
+    .join()
+    .unwrap_or_else(|_| Err("UI Automation probe thread panicked".into()))
 }
 #[cfg(not(windows))]
 fn probe_uia() -> std::result::Result<(), String> {
