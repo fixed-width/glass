@@ -100,6 +100,13 @@ unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
             let Ok(mut stg) = data.GetData(&req) else {
                 continue;
             };
+            // A non-conformant GetData may return a different medium than requested; reading the
+            // union by the requested tymed would then read the wrong member (UB). Validate first,
+            // releasing the medium so there is no leak before we skip.
+            if stg.tymed != tymed.0 as u32 {
+                ReleaseStgMedium(&mut stg);
+                continue;
+            }
             let bytes = if tymed == TYMED_HGLOBAL {
                 read_bytes_from_hglobal(stg.u.hGlobal)
             } else {
