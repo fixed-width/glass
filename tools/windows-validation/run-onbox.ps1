@@ -10,7 +10,7 @@ param(
   [string]$Sha = "",
   [string]$DiffPath = "",
   [string]$UntarPath = "",
-  [string[]]$Targets = @(),
+  [string]$Targets = "",
   [switch]$All,
   [string]$Tests = "",
   [int]$TimeoutSec = 300,
@@ -52,11 +52,14 @@ if ($UntarPath -ne "") { Remove-Item -Force -ErrorAction SilentlyContinue $Untar
 
 # --- 2. resolve target list ---
 $exDir = Join-Path $RepoDir "crates\glass-windows\examples"
-if ($All -or ($Targets.Count -eq 0 -and $Tests -eq "")) {
+# -Targets arrives as one comma-joined string: PowerShell's -File does not split a command-line value
+# into a [string[]] param, so split it here ourselves.
+$targetList = @($Targets -split ',' | Where-Object { $_ -ne "" })
+if ($All -or ($targetList.Count -eq 0 -and $Tests -eq "")) {
   # onbox*.rs (not onbox_*.rs): also include the plain `onbox` example, which produces the WebP artifacts.
-  $Targets = Get-ChildItem (Join-Path $exDir "onbox*.rs") | ForEach-Object { $_.BaseName }
+  $targetList = @(Get-ChildItem (Join-Path $exDir "onbox*.rs") | ForEach-Object { $_.BaseName })
 }
-if ($Targets.Count -eq 0 -and $Tests -eq "") { Fail "no onbox examples found and no -Tests specified" }
+if ($targetList.Count -eq 0 -and $Tests -eq "") { Fail "no onbox examples found and no -Tests specified" }
 $profile = if ($Release) { "release" } else { "debug" }
 $relArg = if ($Release) { "--release" } else { "" }
 
@@ -111,7 +114,7 @@ function Test-Verdict($r) {
 }
 
 # --- 5. run examples ---
-foreach ($t in $Targets) {
+foreach ($t in $targetList) {
   Write-Host "`n===== example: $t ====="
   cmd /c "cargo build -p glass-windows --example $t $relArg 2>&1" | Select-Object -Last 20
   if ($LASTEXITCODE -ne 0) { Write-Host "${t}: FAIL (build)"; $failures++; continue }
@@ -132,7 +135,7 @@ if ($Tests -ne "") {
 }
 
 # --- 7. aggregate verdict ---
-$total = $Targets.Count + ($(if ($Tests -ne "") { 1 } else { 0 }))
+$total = $targetList.Count + ($(if ($Tests -ne "") { 1 } else { 0 }))
 $passed = $total - $failures
 Write-Host "`n== aggregate: $passed PASS / $failures FAIL =="
 if ($failures -gt 0) { exit 1 } else { exit 0 }
