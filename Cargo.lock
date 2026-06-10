@@ -975,6 +975,7 @@ version = "0.0.0"
 dependencies = [
  "retour",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
