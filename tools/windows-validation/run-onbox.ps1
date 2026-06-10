@@ -68,10 +68,10 @@ if (Test-Path $artifacts) { Remove-Item $artifacts -Recurse -Force }
 New-Item -ItemType Directory -Path $artifacts | Out-Null
 
 # --- 3. helper: run one built exe in the interactive session, return its log text ---
-function Invoke-Interactive($exe, $tag) {
+function Invoke-Interactive($exe, $tag, $exeArgs = "") {
   $log = Join-Path $env:TEMP "glassval-$tag.log"
   if (Test-Path $log) { Remove-Item $log -Force }
-  $cmd = "cmd.exe /c `"`"$exe`" > `"$log`" 2>&1`""
+  $cmd = "cmd.exe /c `"`"$exe`" $exeArgs > `"$log`" 2>&1`""
   schtasks /delete /tn glassval /f 2>$null | Out-Null
   # /tr $cmd (with $cmd's embedded quotes) is validated on PowerShell 5.1 on the box -- PowerShell
   # passes $cmd as one argv element; do NOT "fix" this quoting (it produced correct interactive runs).
@@ -128,10 +128,37 @@ foreach ($t in $targetList) {
 }
 
 # --- 6. run ignored tests (optional) ---
+# cargo test would run them in OUR session (0); on-box tests need session 1. So build the test
+# binaries with --no-run, find their executables from the JSON artifact stream, and bounce each into
+# the interactive session via the same schtasks /it path the examples use.
 if ($Tests -ne "") {
   Write-Host "`n===== tests: --ignored $Tests ====="
-  cmd /c "cargo test -p glass-windows $relArg -- --ignored $Tests 2>&1" | Out-Host
-  if ($LASTEXITCODE -ne 0) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }
+  $json = cmd /c "cargo test -p glass-windows --no-run --message-format=json $relArg 2>&1"
+  if ($LASTEXITCODE -ne 0) {
+    $json | Select-Object -Last 20 | Out-Host
+    Write-Host "tests($Tests): FAIL (build)"; $failures++
+  } else {
+    $exes = @()
+    foreach ($line in $json) {
+      if ($line -notmatch '"reason"') { continue }
+      try { $o = $line | ConvertFrom-Json } catch { continue }
+      if ($o.reason -eq "compiler-artifact" -and $o.executable -and ($o.target.kind -contains "test")) {
+        $exes += $o.executable
+      }
+    }
+    if ($exes.Count -eq 0) {
+      Write-Host "tests($Tests): FAIL (no integration test binary built)"; $failures++
+    } else {
+      $anyFail = $false
+      foreach ($exe in $exes) {
+        $tag = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+        $r = Invoke-Interactive $exe $tag "--ignored --test-threads=1 $Tests"
+        Write-Host $r.text
+        if (-not ($r.ran -and $r.result -eq "0")) { $anyFail = $true }
+      }
+      if ($anyFail) { Write-Host "tests($Tests): FAIL"; $failures++ } else { Write-Host "tests($Tests): PASS" }
+    }
+  }
 }
 
 # --- 7. aggregate verdict ---
