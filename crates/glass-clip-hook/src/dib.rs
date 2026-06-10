@@ -14,10 +14,14 @@ pub(crate) struct DibInfo {
     pub width: i32,
     pub height: i32, // may be negative (top-down); magnitude used for size
     pub bpp: u16,
-    pub header_bytes: usize,      // 40 or 124
-    pub color_table_bytes: usize, // palette size in bytes
-    pub stride: usize,            // DWORD-aligned bytes per scan line
-    pub image_bytes: usize,       // stride * |height|
+    pub compression: u32, // biCompression: 0 = BI_RGB, 3 = BI_BITFIELDS (only these are accepted)
+    pub header_bytes: usize, // 40 or 124
+    // Bytes of the `bmiColors[]` area between header and pixels: an RGBQUAD palette
+    // (BI_RGB), or the 3 DWORD color masks (BI_BITFIELDS on a 40-byte header; on a
+    // 124-byte BITMAPV5HEADER the masks are header fields, so this is 0).
+    pub color_table_bytes: usize,
+    pub stride: usize,      // DWORD-aligned bytes per scan line
+    pub image_bytes: usize, // stride * |height|
 }
 
 fn rd_u16(b: &[u8], o: usize) -> Option<u16> {
@@ -44,23 +48,44 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
     let bpp = rd_u16(b, 14)?;
     let compression = rd_u32(b, 16)?;
     let clr_used = rd_u32(b, 32)?;
-    if width <= 0 || bpp == 0 || compression != 0 {
-        return None; // top-down requires width>0; only BI_RGB (0) handled in v2a-i; reject others
+    if width <= 0 || bpp == 0 {
+        return None; // top-down requires width>0 (negative *height* is fine)
     }
     let abs_h = (height as i64).unsigned_abs();
-    // color table: for <=8bpp, clr_used (or 2^bpp if 0) entries of 4 bytes.
-    let color_table_bytes: usize = if bpp <= 8 {
-        let entries = if clr_used == 0 { 1u64 << bpp } else { clr_used as u64 };
-        if entries > 256 {
-            return None; // a palette can't exceed 2^8
+    // The bmiColors[] area between header and pixels. We accept BI_RGB (0) and
+    // BI_BITFIELDS (3); RLE/JPEG/PNG/ALPHABITFIELDS are rejected.
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+    let color_table_bytes: usize = match compression {
+        BI_RGB if bpp <= 8 => {
+            // Palette: clr_used (or 2^bpp if 0) entries of 4 bytes.
+            let entries = if clr_used == 0 { 1u64 << bpp } else { clr_used as u64 };
+            if entries > 256 {
+                return None; // a palette can't exceed 2^8
+            }
+            (entries as usize) * 4
         }
-        (entries as usize) * 4
-    } else {
-        // High-bpp packed DIBs may carry a biClrUsed optimization palette
-        // (4 bytes/entry) between header and pixels; count it so the pixel
-        // offset stays correct. biClrUsed==0 (the common case) yields 0. Any
-        // absurd value is caught by the buffer-length check below, not here.
-        (clr_used as u64).checked_mul(4)?.try_into().ok()?
+        BI_RGB => {
+            // High-bpp packed DIBs may carry a biClrUsed optimization palette
+            // (4 bytes/entry); count it so the pixel offset stays correct.
+            // biClrUsed==0 (the common case) yields 0; absurd values are caught
+            // by the buffer-length check below, not here.
+            (clr_used as u64).checked_mul(4)?.try_into().ok()?
+        }
+        BI_BITFIELDS => {
+            // 16/32bpp only; the bmiColors[] area holds 3 DWORD color masks. On a
+            // 40-byte BITMAPINFOHEADER they're a 12-byte block before the pixels;
+            // on a 124-byte BITMAPV5HEADER they're header fields, so none follow.
+            if bpp != 16 && bpp != 32 {
+                return None;
+            }
+            if header_bytes == BIH {
+                12
+            } else {
+                0
+            }
+        }
+        _ => return None, // BI_RLE8/4, BI_JPEG, BI_PNG, BI_ALPHABITFIELDS
     };
     // stride = ((width*bpp + 31)/32)*4, all in u64 to avoid overflow.
     let bits = (width as u64).checked_mul(bpp as u64)?;
@@ -81,6 +106,7 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
         width,
         height,
         bpp,
+        compression,
         header_bytes,
         color_table_bytes,
         stride,
@@ -98,18 +124,36 @@ pub(crate) fn parse_dibv5(b: &[u8]) -> Option<DibInfo> {
     parse_with_header(b, BV5)
 }
 
+/// Offsets of the three color-mask fields within a `BITMAPV5HEADER`
+/// (`bV5RedMask`, `bV5GreenMask`, `bV5BlueMask`); the 4th is `bV5AlphaMask` at 52.
+const BV5_MASKS: usize = 40;
+
 /// `CF_DIB` (BITMAPINFOHEADER) → `CF_DIBV5` (BITMAPV5HEADER): widen the header to 124 bytes (zero the
-/// new fields; the OS supplies sRGB defaults when color-space is absent), keep table + bits verbatim.
+/// new fields; the OS supplies sRGB defaults when color-space is absent), keep the pixel bits.
+///
+/// For BI_BITFIELDS the 3 masks that follow a 40-byte header move INTO the V5 header's mask fields
+/// (a verbatim copy would leave them after the header — an invalid V5); BI_RGB palette + bits are
+/// copied verbatim.
 pub(crate) fn dib_to_dibv5(b: &[u8]) -> Option<Vec<u8>> {
     let d = parse_dib(b)?;
     let mut out = vec![0u8; BV5];
     out[..BIH].copy_from_slice(&b[..BIH]);
     out[0..4].copy_from_slice(&(BV5 as u32).to_le_bytes()); // biSize = 124
-    out.extend_from_slice(&b[BIH..BIH + d.color_table_bytes + d.image_bytes]);
+    if d.compression == 3 {
+        // Relocate the 3 RGB masks (b[40..52]) into bV5Red/Green/BlueMask; the
+        // pixels follow the masks in the source, so skip them when copying bits.
+        out[BV5_MASKS..BV5_MASKS + 12].copy_from_slice(&b[BIH..BIH + 12]);
+        out.extend_from_slice(&b[BIH + 12..BIH + 12 + d.image_bytes]);
+    } else {
+        out.extend_from_slice(&b[BIH..BIH + d.color_table_bytes + d.image_bytes]);
+    }
     Some(out)
 }
 
-/// `CF_DIBV5` → `CF_DIB`: narrow the header back to 40 bytes; keep table + bits verbatim.
+/// `CF_DIBV5` → `CF_DIB`: narrow the header back to 40 bytes; keep the pixel bits.
+///
+/// For BI_BITFIELDS the V5 header's mask fields become a 12-byte block after the 40-byte header
+/// (the BITMAPINFOHEADER layout); BI_RGB palette + bits are copied verbatim.
 ///
 /// Used by the host-side server path + the tests; the DLL hook only ever widens DIB→DIBV5.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -118,7 +162,14 @@ pub(crate) fn dibv5_to_dib(b: &[u8]) -> Option<Vec<u8>> {
     let mut out = vec![0u8; BIH];
     out.copy_from_slice(&b[..BIH]);
     out[0..4].copy_from_slice(&(BIH as u32).to_le_bytes());
-    out.extend_from_slice(&b[BV5..BV5 + d.color_table_bytes + d.image_bytes]);
+    if d.compression == 3 {
+        // Masks are header fields in the V5; emit them as the 12-byte block a
+        // BITMAPINFOHEADER expects between header and pixels.
+        out.extend_from_slice(&b[BV5_MASKS..BV5_MASKS + 12]);
+        out.extend_from_slice(&b[BV5..BV5 + d.image_bytes]);
+    } else {
+        out.extend_from_slice(&b[BV5..BV5 + d.color_table_bytes + d.image_bytes]);
+    }
     Some(out)
 }
 
@@ -223,6 +274,77 @@ mod tests {
         h[14..16].copy_from_slice(&8u16.to_le_bytes()); // 8bpp
         h[32..36].copy_from_slice(&u32::MAX.to_le_bytes()); // biClrUsed = 2^32-1 → absurd table
         assert!(parse_dib(&h).is_none());
+    }
+
+    // A 1x1 32bpp BI_BITFIELDS BITMAPINFOHEADER with the 3 RGB DWORD masks that
+    // follow it (no pixels appended).
+    fn bih_bitfields_1x1_32() -> Vec<u8> {
+        let mut v = bih_2x2_32();
+        v[4..8].copy_from_slice(&1i32.to_le_bytes()); // width=1
+        v[8..12].copy_from_slice(&1i32.to_le_bytes()); // height=1
+        v[16..20].copy_from_slice(&3u32.to_le_bytes()); // biCompression = BI_BITFIELDS
+        v.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // red mask
+        v.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // green mask
+        v.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // blue mask
+        v
+    }
+
+    #[test]
+    fn parses_bi_bitfields_with_mask_block() {
+        let mut v = bih_bitfields_1x1_32();
+        v.extend_from_slice(&[0xCC; 4]); // 1px * 4B pixels (stride 4)
+        let d = parse_dib(&v).expect("BITFIELDS DIB");
+        assert_eq!(d.compression, 3);
+        assert_eq!(d.color_table_bytes, 12, "3 DWORD masks sit between header and pixels");
+        assert_eq!(d.image_bytes, 4);
+        assert_eq!(
+            &v[d.header_bytes + d.color_table_bytes..][..4],
+            &[0xCC; 4],
+            "pixels start after the mask block"
+        );
+    }
+
+    #[test]
+    fn rejects_rle_jpeg_png_and_alphabitfields() {
+        for comp in [1u32, 2, 4, 5, 6] {
+            let mut v = bih_2x2_32();
+            v[16..20].copy_from_slice(&comp.to_le_bytes());
+            v.extend_from_slice(&[0u8; 16]);
+            assert!(parse_dib(&v).is_none(), "compression {comp} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_bitfields_at_unsupported_bpp() {
+        let mut v = bih_bitfields_1x1_32();
+        v[14..16].copy_from_slice(&8u16.to_le_bytes()); // 8bpp + BITFIELDS is invalid
+        v.extend_from_slice(&[0u8; 4]);
+        assert!(parse_dib(&v).is_none(), "BITFIELDS is only valid for 16/32bpp");
+    }
+
+    #[test]
+    fn bitfields_round_trips_dib_v5_dib() {
+        let mut dib = bih_bitfields_1x1_32();
+        dib.extend_from_slice(&[0xCC; 4]);
+
+        // Widen: the masks must move INTO the V5 header (offsets 40/44/48), not
+        // be appended after it (which would be an invalid V5).
+        let v5 = dib_to_dibv5(&dib).expect("widen");
+        assert_eq!(&v5[40..44], &0x00FF_0000u32.to_le_bytes(), "bV5RedMask");
+        assert_eq!(&v5[44..48], &0x0000_FF00u32.to_le_bytes(), "bV5GreenMask");
+        assert_eq!(&v5[48..52], &0x0000_00FFu32.to_le_bytes(), "bV5BlueMask");
+        let pv5 = parse_dibv5(&v5).expect("parse v5");
+        assert_eq!(pv5.compression, 3);
+        assert_eq!(pv5.color_table_bytes, 0, "V5 carries the masks in-header");
+        assert_eq!(pv5.image_bytes, 4);
+
+        // Narrow back: masks return to a 12-byte block after the 40-byte header.
+        let back = dibv5_to_dib(&v5).expect("narrow");
+        let pback = parse_dib(&back).expect("parse back");
+        assert_eq!(pback.compression, 3);
+        assert_eq!(pback.color_table_bytes, 12);
+        assert_eq!(&back[40..52], &dib[40..52], "masks survive the round-trip");
+        assert_eq!(pback.image_bytes, 4);
     }
 
     #[test]
