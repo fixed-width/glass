@@ -27,6 +27,11 @@ const MAX_NODES: usize = 1500;
 /// per-level scan so the walk is genuinely bounded regardless of offscreen breadth.
 /// Generous enough not to truncate real UIs; with `MAX_DEPTH` it bounds total work.
 const MAX_SIBLINGS: usize = 4096;
+/// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
+/// bounds are stable for a static element across snapshot→set_value (window moves cancel),
+/// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
+/// the id sits far enough away to be rejected. Generous to avoid false-rejects.
+const SET_VALUE_BOUNDS_TOL: i64 = 12;
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -269,10 +274,17 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let el = find_nth(&walker, &window, 0, &mut count, target.id.0)
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
 
-    // Verify role + name (guards a stale id / mirror drift).
+    // Verify role + name + bounds (guards a stale id / tree drift). role+name
+    // alone isn't unique (many controls share a role and an empty name), so if
+    // drift lands a different same-role+name element on this pre-order id, the
+    // bounds fingerprint — the element sits elsewhere — rejects it. A target
+    // without captured bounds falls back to role+name only.
     let role = crate::mapping::map_role(el.get_control_type().map_err(uia_err)? as i32 as u32);
     let name = nonempty(el.get_name().unwrap_or_default());
-    if !target.matches(role, name.as_deref()) {
+    let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
+    if !target.matches(role, name.as_deref())
+        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+    {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
     let pat = el

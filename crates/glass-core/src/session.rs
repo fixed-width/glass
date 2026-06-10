@@ -367,7 +367,8 @@ impl Glass {
             }
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
-            let target = AxTarget { id, role: node.role, name: node.name.clone() };
+            let target =
+                AxTarget { id, role: node.role, name: node.name.clone(), bounds: node.bounds };
             let ctx = AxContext { pids: s.platform.app_pids(), window: s.geometry.clone() };
             (target, ctx)
         };
@@ -1537,7 +1538,15 @@ mod tests {
         g.set_value(AxNodeId(1), "hello").unwrap();
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, AxTarget { id: AxNodeId(1), role: AxRole::Button, name: Some("Save".into()) });
+        assert_eq!(
+            calls[0].0,
+            AxTarget {
+                id: AxNodeId(1),
+                role: AxRole::Button,
+                name: Some("Save".into()),
+                bounds: Some(AxRect { x: 10, y: 10, width: 20, height: 20 }),
+            }
+        );
         assert_eq!(calls[0].1, "hello");
     }
 
