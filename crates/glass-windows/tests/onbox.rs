@@ -217,8 +217,11 @@ fn onbox_handoff_grace() {
     dpi_aware_once();
 
     fn kill_notepad() {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "notepad.exe", "/T"])
+        // Stop-Process (not `taskkill /IM notepad.exe`) so broker-hosted Win11 Notepad windows are
+        // actually killed — taskkill by image name leaves them alive, which would let [B] below find a
+        // stale window and wrongly succeed.
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue"])
             .output();
         std::thread::sleep(Duration::from_millis(800));
     }
