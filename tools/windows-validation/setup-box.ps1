@@ -7,8 +7,7 @@
 .DESCRIPTION
   Run elevated. Pass -User/-Password to enable auto-login. After this, install a
   console-mirroring viewer (Sunshine, or VNC) for *running* the capture/input tests,
-  and a signed IddCx virtual display driver for the headless test — see REMOTE.md
-  and README.md.
+  and a signed IddCx virtual display driver for the headless test — see REMOTE.md.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\setup-box.ps1 -User glass -Password 'hunter2'
@@ -94,5 +93,5 @@ Write-Host '     (Plain RDP spawns a separate session and breaks capture/input o
 Write-Host '  2. Install a signed IddCx virtual display driver for the headless test:'
 Write-Host '       https://github.com/nomi-san/parsec-vdd            (MIT, signed)'
 Write-Host '  3. Install the Rust MSVC toolchain + "Desktop development with C++".'
-Write-Host '  4. Build over SSH; RUN winval inside the mirrored session (README.md gate table).'
+Write-Host '  4. From Linux, run the on-box suite:  ./scripts/test-windows.sh --tests onbox'
 Write-Host '  5. Reboot to verify auto-login returns to a usable session unattended.'

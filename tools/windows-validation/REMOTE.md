@@ -20,7 +20,7 @@ That splits remote access into two camps:
 |---|---|---|
 | Edit + build + git | **OpenSSH server** (+ optional VS Code **Remote-SSH**) | enabled by `setup-box.ps1`; build with `cargo build` over SSH |
 | **Run + watch tests** | **Sunshine** (host) + **Moonlight** (Linux client) | open-source, low-latency, mirrors the console, survives client disconnect |
-| Headless capture (item 2) | **Parsec VDD** virtual display | no need to unplug the monitor — capture a window placed on the virtual display |
+| Headless capture | **Parsec VDD** virtual display | no need to unplug the monitor — capture a window placed on the virtual display |
 
 ## One-time setup
 
@@ -45,20 +45,22 @@ That splits remote access into two camps:
      or your package manager); add the box, enter the PIN from Sunshine's web UI, then launch
      the **Desktop** entry. You're now looking at the real console session.
 
-4. **Virtual display driver** for item 2 (headless): install **Parsec VDD**
+4. **Virtual display driver** for headless capture: install **Parsec VDD**
    (<https://github.com/nomi-san/parsec-vdd>, MIT/signed).
 
-## The one gotcha: build over SSH, *run probes in the mirrored session*
+## The one gotcha: SSH is session 0, capture/input need session 1
 
 A process launched **over SSH runs non-interactively** (the sshd service's session, not the
-console) — so `winval capture`/`input` started from an SSH shell will capture nothing / inject
-nowhere. This is the Windows equivalent of "a bare SSH shell isn't the GUI session."
+console) — so WGC capture returns nothing and `SendInput` injects nowhere from a bare SSH shell.
+This is the Windows equivalent of "a bare SSH shell isn't the GUI session."
 
-- **`cargo build`** over SSH — fine (session-agnostic). ✅
-- **`winval capture` / `input` / `discover` / `killtree`** — run them from a terminal **inside
-  the Moonlight/VNC view** (the console session). ✅
-- If you must launch from SSH, relaunch into the console session: `PsExec -i 1 -d winval.exe …`
-  (Sysinternals), or a Scheduled Task set to run in the interactive session.
+`scripts/test-windows.sh` handles this for you:
+
+- **`cargo build`** over SSH is fine (session-agnostic). ✅
+- The test/example binary is **bounced into the interactive console session (session 1)** by
+  `run-onbox.ps1` via a `schtasks /it` scheduled task, where capture + input work. ✅
+- So you drive everything from the SSH shell; the mirrored Moonlight/VNC session is only needed to
+  **watch a run live** (or to debug something on the desktop by hand).
 
 ## The dev loop
 
@@ -80,24 +82,24 @@ export GLASS_WIN_HOST=user@box-ip          # required; unset => the script skips
 export GLASS_WIN_REPO=C:/Users/user/glass  # optional; defaults to C:/Users/<user>/glass
 ```
 
-Under the hood it still obeys the session rule below — `run-onbox.ps1` uses a `schtasks /it`
-scheduled task to execute in the interactive console session (the manual `winval`-in-Moonlight
-step is only needed for live watching).
+Under the hood it obeys the session rule above — `run-onbox.ps1` uses a `schtasks /it` scheduled
+task to execute in the interactive console session; the mirrored Moonlight/VNC session is only
+needed when you want to watch a run live.
 
-Once the make-or-break gate passes, the same box becomes the dev + integration-test machine
-for the real `glass-windows` crate (its `#[ignore]`d E2E suite runs in this mirrored session,
-exactly like the X11/Wayland suites run under Xvfb/sway).
+This box is the dev + integration-test machine for `glass-windows`: its `#[ignore]`d on-box suite
+(`crates/glass-windows/tests/onbox.rs`) runs here via `--tests`, exactly like the X11/Wayland
+suites run under Xvfb/sway.
 
 ## Gaming-rig notes
 
-- Real GPU + monitor → items **1, 3, 4, 5, 6, 8 work immediately**; you also get genuine
-  GPU-accelerated capture coverage (Chrome/Electron/games) for the `PrintWindow`-black vs
-  WGC-handles-it contrast.
-- **Item 2 without unplugging:** install the virtual display, move a window onto it, capture
-  it there (`winval displays` shows it; drag the window over; `winval capture <title>`).
+- Real GPU + monitor → **capture, input, discovery, kill-tree, and DPI all work immediately**; you
+  also get genuine GPU-accelerated capture coverage (Chrome/Electron/games) for the
+  `PrintWindow`-black vs WGC-handles-it contrast.
+- **Headless capture without unplugging:** install the virtual display, move a target window onto
+  it, and capture it there (e.g. the `onbox` example, which captures + saves WebP).
 - **Coexists with gaming** — glass drives target apps as a black box in the same session;
   nothing is dedicated or wiped. The `setup-box.ps1` lock/sleep changes are reversible.
 - Game **overlays** (Steam / GeForce Experience / RGB / Discord) inject their own windows and
-  hooks — harmless, but they're the likely culprit if a probe ever reports a surprise window.
+  hooks — harmless, but they're the likely culprit if a run ever reports a surprise window.
 - **Recovery:** auto-login means a reboot returns to a usable session unattended; add
   Wake-on-LAN if the box ever drops off the network.
