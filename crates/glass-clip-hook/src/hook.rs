@@ -249,8 +249,6 @@ pub(crate) fn store_seq() -> u32 {
 }
 
 /// The whole stored snapshot (for the OLE serve path's one-shot bake).
-// Used by the OLE dataobject proxy (Task 3); suppress dead-code until that module is filled in.
-#[allow(dead_code)]
 pub(crate) fn store_get_all() -> Vec<(FormatKey, Vec<u8>)> {
     match rpc(Request::GetAll) {
         Some(Response::Items(items)) => items,
@@ -347,8 +345,6 @@ static USER32_W: [u16; 11] = [
 ///
 /// # Safety
 /// Caller transmutes the returned address to the export's exact ABI signature.
-// Used by the OLE detours (Task 4); suppress dead-code until that module is filled in.
-#[allow(dead_code)]
 pub(crate) unsafe fn ole32_proc(name: &[u8]) -> Option<*const ()> {
     // SAFETY: "ole32.dll\0" is a valid module name; an OLE-using app has it loaded. We do NOT
     // LoadLibrary it — if it isn't loaded, the app isn't using OLE and there's nothing to hook.
@@ -358,7 +354,6 @@ pub(crate) unsafe fn ole32_proc(name: &[u8]) -> Option<*const ()> {
 }
 
 /// `"ole32.dll\0"` as UTF-16.
-#[allow(dead_code)]
 static OLE32_W: [u16; 10] = [
     b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
     b'l' as u16, b'l' as u16, 0,

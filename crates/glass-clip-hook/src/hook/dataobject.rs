@@ -123,15 +123,13 @@ impl IEnumFORMATETC_Impl for StoreEnum_Impl {
 }
 
 /// The proxy data object. Holds the baked snapshot + its precomputed served format ids.
-// Constructed by the OLE detour path (Task 4, `ole.rs`); suppress dead-code until that lands.
-#[allow(dead_code)]
+/// Constructed by the OLE detour path (`ole.rs`'s `OleGetClipboard`).
 #[implement(IDataObject)]
 pub(super) struct StoreDataObject {
     entries: Vec<(FormatKey, Vec<u8>)>,
     ids: Vec<u16>,
 }
 
-#[allow(dead_code)] // removed in Task 4 (ole.rs calls it)
 impl StoreDataObject {
     /// Build from a store snapshot: served ids = `synth::serve_keys` mapped to this session's ids.
     pub(super) fn new(entries: Vec<(FormatKey, Vec<u8>)>) -> Self {
