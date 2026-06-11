@@ -7,7 +7,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use nix::errno::Errno;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 
 use glass_core::{GlassError, Result};
 
@@ -83,11 +87,48 @@ impl PrivateBus {
     }
 }
 
+/// Grace period for a child to exit after SIGTERM before we escalate to SIGKILL.
+const REAP_GRACE: Duration = Duration::from_millis(2000);
+
+/// Tear down the private bus, atspi-launcher FIRST then the session dbus-daemon.
+///
+/// SIGTERM-first (graceful), not SIGKILL: `at-spi-bus-launcher` *forks its own*
+/// accessibility `dbus-daemon` (--config-file=.../at-spi2/accessibility.conf) as a
+/// child, and only tears that grandchild down when it runs its own shutdown. A bare
+/// `child.kill()` (SIGKILL) gives the launcher no chance to do that, so its forked
+/// dbus-daemon reparents to init and leaks on every session teardown. So signal the
+/// launcher with SIGTERM and let it reap its grandchild, then the session bus.
+/// Fall back to SIGKILL per child if it doesn't exit within the grace period.
+/// Order matters: the launcher must shut its grandchild down before we kill the
+/// session bus out from under it.
 fn reap_children(dbus: &mut Child, atspi: &mut Child) {
-    let _ = atspi.kill();
-    let _ = atspi.wait();
-    let _ = dbus.kill();
-    let _ = dbus.wait();
+    reap_graceful(atspi);
+    reap_graceful(dbus);
+}
+
+/// SIGTERM a child, poll for exit until `REAP_GRACE`, SIGKILL as a fallback, then reap.
+fn reap_graceful(child: &mut Child) {
+    // SIGTERM; ESRCH just means it already exited (so nothing to reap-signal).
+    match kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(_) => {
+            // Couldn't signal for some other reason; fall back to SIGKILL.
+            let _ = child.kill();
+        }
+    }
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill(); // SIGKILL fallback if it ignored SIGTERM
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.wait();
 }
 
 impl Drop for PrivateBus {

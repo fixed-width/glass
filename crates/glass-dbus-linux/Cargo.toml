@@ -10,6 +10,7 @@ publish = false
 glass-core.workspace = true
 zbus.workspace = true
 tokio.workspace = true
+nix.workspace = true
 
 [dev-dependencies]
 atspi.workspace = true
