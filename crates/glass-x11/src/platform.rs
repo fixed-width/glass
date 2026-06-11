@@ -488,6 +488,23 @@ impl X11Platform {
         self.tap_keycode(keycode)?;
         self.release_mods(&kcs)
     }
+
+    /// Raise `win` and give it X keyboard focus. XTEST key events are routed by
+    /// the server to the focused window; in the WM-less headless Xvfb there is no
+    /// window manager to assign focus, so glass must do it for synthetic keys to
+    /// land. Used on launch, on select, and by `WindowOp::Focus`.
+    fn focus_window(&self, win: Window) -> Result<()> {
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+            .map_err(|e| GlassError::Backend(format!("raise: {e}")))?;
+        self.conn
+            .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
+            .map_err(|e| GlassError::Backend(format!("set_input_focus: {e}")))?;
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        Ok(())
+    }
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
@@ -645,12 +662,7 @@ impl Platform for X11Platform {
         let win = self.require_window()?;
         match *op {
             WindowOp::Focus => {
-                self.conn
-                    .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
-                    .map_err(|e| GlassError::Backend(format!("raise: {e}")))?;
-                self.conn
-                    .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
-                    .map_err(|e| GlassError::Backend(format!("set_input_focus: {e}")))?;
+                self.focus_window(win)?;
             }
             WindowOp::Resize { width, height } => {
                 self.conn
