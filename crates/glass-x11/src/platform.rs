@@ -208,8 +208,7 @@ impl X11Platform {
     /// a window does not orphan the process.
     fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
         }
         self.window = None;
         if let Some(owner) = self.clipboard_owner.take() {

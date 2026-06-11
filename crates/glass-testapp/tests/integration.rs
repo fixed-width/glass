@@ -818,3 +818,41 @@ fn sandbox_off_bypasses_bwrap_check() {
     p.start_app(&spec).unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
     p.stop_app().unwrap();
 }
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn stop_app_reaps_the_apps_forked_child() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        build: None,
+        run: vec![TESTAPP.to_string(), "--fork-child".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+    };
+    p.start_app(&spec).unwrap();
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..40 {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT child_pid=") {
+                child_pid = rest.trim().parse().ok();
+            }
+        }
+        if child_pid.is_some() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("fixture should report its forked child pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "forked child should be alive while the app runs"
+    );
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "stop_app must reap the app's forked child (pid {child_pid}), not orphan it"
+    );
+}

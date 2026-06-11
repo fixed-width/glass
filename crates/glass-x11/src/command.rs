@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use glass_core::{AppSpec, SandboxLevel};
@@ -17,6 +18,9 @@ pub fn build_command(spec: &AppSpec, display: &str) -> Command {
         SandboxLevel::Off => {
             let mut c = Command::new(&spec.run[0]);
             c.args(&spec.run[1..]);
+            // Make the launched app its own process-group leader (pgid == pid)
+            // so `stop_app` can reap the whole group, not just this one pid.
+            c.process_group(0);
             c
         }
         level => {
@@ -38,6 +42,10 @@ pub fn build_command(spec: &AppSpec, display: &str) -> Command {
             let argv = wrap_argv(&prog, &args, &opts);
             let mut c = Command::new(&argv[0]);
             c.args(&argv[1..]);
+            // Group leader: for a sandboxed launch the leader is `bwrap`, which
+            // is `--die-with-parent`-tied to the app, so the group reap covers
+            // the whole tree.
+            c.process_group(0);
             c
         }
     };
