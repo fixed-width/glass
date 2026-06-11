@@ -83,6 +83,7 @@ fn private_clipboard_isolation() {
         window_hint: None,
         timeout_ms: 15000,
         sandbox: SandboxLevel::Default,
+        a11y: false,
     };
     let sink: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let app = sb.launch(&spec, sink.clone()).expect("launch boxed probe");
@@ -164,6 +165,7 @@ fn private_clipboard_multiformat() {
         window_hint: None,
         timeout_ms: 15000,
         sandbox: SandboxLevel::Default,
+        a11y: false,
     };
     let sink: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let app = sb.launch(&spec, sink.clone()).expect("launch boxed probe");
@@ -267,6 +269,7 @@ fn private_clipboard_ole() {
         window_hint: None,
         timeout_ms: 15000,
         sandbox: SandboxLevel::Default,
+        a11y: false,
     };
     let sink: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let app = sb.launch(&spec, sink.clone()).expect("launch boxed probe");
@@ -369,6 +372,7 @@ fn private_clipboard_hdrop() {
         window_hint: None,
         timeout_ms: 15000,
         sandbox: SandboxLevel::Default,
+        a11y: false,
     };
     let sink: Arc<Mutex<Vec<(Stream, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let app = sb.launch(&spec, sink.clone()).expect("launch boxed probe");

@@ -109,6 +109,10 @@ pub struct AppSpec {
     pub timeout_ms: u64,
     /// How aggressively to contain the launched process tree.
     pub sandbox: SandboxLevel,
+    /// Spawn a private, isolated AT-SPI bus for this launch so the app publishes an
+    /// accessibility tree glass can read. Opt-in: when false, no a11y processes are
+    /// spawned and the a11y tools return a "relaunch with a11y:true" error.
+    pub a11y: bool,
 }
 
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
@@ -224,6 +228,7 @@ mod tests {
             window_hint: Some(WindowHint { title: Some("Demo".into()), class: None }),
             timeout_ms: 5000,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         };
         assert_eq!(spec.run[0], "./app");
     }

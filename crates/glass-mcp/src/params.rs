@@ -60,6 +60,12 @@ pub struct StartArgs {
     /// window owned by the launched process or a descendant it can follow.
     pub window_hint: Option<WindowHintArgs>,
     pub timeout_ms: Option<u64>,
+    /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
+    /// `set_value` / `click_element` / `wait_for_element` work against this app. Opt-in
+    /// (default false) — only set when you need the accessibility tree; it spawns extra
+    /// processes. Linux only.
+    #[serde(default)]
+    pub a11y: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

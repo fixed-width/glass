@@ -13,7 +13,7 @@ const ECHO_TRIES: u32 = 120; //  ~6s: input echoed back once the app is up
 const APP_TIMEOUT_MS: u64 = 15_000; // start_app: wait this long for sway's socket
 
 fn spec(run: Vec<String>, timeout_ms: u64) -> AppSpec {
-    AppSpec { build: None, run, cwd: None, env: vec![], window_hint: None, timeout_ms, sandbox: glass_core::SandboxLevel::Off }
+    AppSpec { build: None, run, cwd: None, env: vec![], window_hint: None, timeout_ms, sandbox: glass_core::SandboxLevel::Off, a11y: false }
 }
 
 /// `start_app`, but dump the captured sway/Xwayland/app logs before panicking on
@@ -333,6 +333,7 @@ fn sandbox_default_app_still_runs_and_captures() {
         window_hint: None,
         timeout_ms: APP_TIMEOUT_MS,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     let geom = start(&mut p, &sandboxed_spec);
     assert_eq!((geom.width, geom.height), (320, 240), "window geometry");
@@ -376,6 +377,7 @@ fn fail_closed_when_bwrap_missing_wayland() {
             window_hint: None,
             timeout_ms: APP_TIMEOUT_MS,
             sandbox: glass_core::SandboxLevel::Default,
+            a11y: false,
         };
         let err = p.start_app(&sandboxed_spec).err();
         // _guard restores PATH here before any panic-able assertion.
@@ -413,6 +415,7 @@ fn wayland_build_step_runs_before_launch() {
         window_hint: None,
         timeout_ms: APP_TIMEOUT_MS,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     let mut p = WaylandPlatform::new().unwrap();
     let geom = start(&mut p, &build_spec);
@@ -452,6 +455,7 @@ fn wayland_strict_blocks_network_in_build_step() {
         window_hint: None,
         timeout_ms: APP_TIMEOUT_MS,
         sandbox: glass_core::SandboxLevel::Strict,
+        a11y: false,
     };
     let mut p = WaylandPlatform::new().unwrap();
     let strict_err = p.start_app(&strict_spec).expect_err("expected build failure under Strict");
@@ -470,6 +474,7 @@ fn wayland_strict_blocks_network_in_build_step() {
         window_hint: None,
         timeout_ms: APP_TIMEOUT_MS,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     let mut p2 = WaylandPlatform::new().unwrap();
     start(&mut p2, &default_spec);

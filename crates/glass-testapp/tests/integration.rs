@@ -18,6 +18,7 @@ fn app_spec() -> AppSpec {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     }
 }
 
@@ -196,6 +197,7 @@ fn discovers_reparented_window_via_net_client_list() {
         window_hint: None,
         timeout_ms: 2000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let geom = p
         .start_app(&spec)
@@ -225,6 +227,7 @@ fn finds_window_by_class_when_no_net_wm_pid() {
         }),
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let geom = p
         .start_app(&spec)
@@ -277,6 +280,7 @@ fn failed_start_kills_the_child_process() {
         window_hint: None,
         timeout_ms: 500,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let err = p.start_app(&spec).unwrap_err();
     assert!(matches!(err, GlassError::Timeout(_)), "expected Timeout, got {err}");
@@ -316,6 +320,7 @@ fn enumerates_and_selects_multiple_windows() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("start_app failed: {e}"));
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
@@ -573,6 +578,7 @@ fn sandbox_default_app_still_runs_and_captures() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     let geom = p.start_app(&spec).unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
     assert_eq!(geom.width, 320);
@@ -606,6 +612,7 @@ fn sandbox_off_build_step_writes_to_real_home() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("off-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
@@ -634,6 +641,7 @@ fn sandbox_default_build_step_cannot_write_real_home() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("default-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
@@ -659,6 +667,7 @@ fn strict_blocks_network_in_build_step() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Strict,
+        a11y: false,
     };
     let err = p.start_app(&spec).expect_err("Strict sandbox should block network in build step");
     assert!(
@@ -683,6 +692,7 @@ fn default_allows_network_in_build_step() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     p.start_app(&spec)
         .unwrap_or_else(|e| panic!("Default sandbox should allow network in build step: {e}"));
@@ -720,6 +730,7 @@ fn fail_closed_when_bwrap_missing() {
             window_hint: None,
             timeout_ms: 5000,
             sandbox: glass_core::SandboxLevel::Default,
+            a11y: false,
         };
         let err = p.start_app(&spec).err();
         // _guard restores PATH here before any panic-able assertion.
@@ -765,6 +776,7 @@ fn sandbox_cwd_equals_home_does_not_expose_real_home() {
             window_hint: None,
             timeout_ms: 8000,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         };
         p.start_app(&spec).unwrap_or_else(|e| {
             let _ = std::fs::remove_file(&sentinel_path);
@@ -785,6 +797,7 @@ fn sandbox_cwd_equals_home_does_not_expose_real_home() {
             window_hint: None,
             timeout_ms: 8000,
             sandbox: glass_core::SandboxLevel::Default,
+            a11y: false,
         };
         let result = p.start_app(&spec);
         let _ = std::fs::remove_file(&sentinel_path);
@@ -817,6 +830,7 @@ fn start_app_focuses_window_so_keys_reach_it() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap();
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
@@ -851,6 +865,7 @@ fn select_window_focuses_the_selected_window() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap();
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
@@ -912,6 +927,7 @@ fn sandbox_off_bypasses_bwrap_check() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
     p.stop_app().unwrap();
@@ -930,6 +946,7 @@ fn stop_app_reaps_the_apps_forked_child() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap();
     let mut child_pid: Option<u32> = None;

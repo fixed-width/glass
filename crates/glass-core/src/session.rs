@@ -840,6 +840,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1000,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         }
     }
 

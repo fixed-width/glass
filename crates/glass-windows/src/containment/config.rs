@@ -243,6 +243,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         }
     }
 

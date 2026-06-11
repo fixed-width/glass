@@ -103,6 +103,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1000,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         }
     }
 

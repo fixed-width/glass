@@ -117,6 +117,7 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     std::fs::write(&config, sway_config(&spec, rt.path())).map_err(|e| e.to_string())?;
     let mut child = build_sway_command(sway, &config, &spec, rt.path())

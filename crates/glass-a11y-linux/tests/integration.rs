@@ -35,6 +35,7 @@ fn snapshot_finds_gtk_widgets() {
             window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
             timeout_ms: 35_000,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
         })
         .expect("launch GTK fixture");
 
@@ -69,6 +70,7 @@ fn snapshot_reads_entry_value() {
         window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
         timeout_ms: 35_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: true,
     }).expect("launch GTK fixture");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
@@ -94,6 +96,7 @@ fn set_value_changes_entry() {
         window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
         timeout_ms: 35_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: true,
     }).expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
@@ -125,6 +128,7 @@ fn set_value_on_button_is_not_editable() {
         window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
         timeout_ms: 35_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: true,
     }).expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
@@ -161,6 +165,7 @@ fn glass_self_provisions_a11y_bus() {
             window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
             timeout_ms: 35_000,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
         })
         .expect("launch GTK fixture");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
