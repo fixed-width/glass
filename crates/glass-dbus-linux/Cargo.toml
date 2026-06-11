@@ -1,0 +1,18 @@
+[package]
+name = "glass-dbus-linux"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+glass-core.workspace = true
+zbus.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+atspi.workspace = true
+
+[lints]
+workspace = true
