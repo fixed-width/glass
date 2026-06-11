@@ -22,6 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let no_wm_pid = std::env::args().any(|a| a == "--no-wm-pid");
     let reparent = std::env::args().any(|a| a == "--reparent");
     let no_self_focus = std::env::args().any(|a| a == "--no-self-focus");
+    // `--fork-child` spawns a long-lived child process (a `sleep`) and prints its
+    // pid as `EVENT child_pid=<n>`, so tests can verify glass reaps the whole
+    // process group on shutdown rather than orphaning the app's children.
+    let fork_child = std::env::args().any(|a| a == "--fork-child");
     // `--windows N` opens N-1 extra plain top-levels (titled glass-testapp-1..)
     // alongside the main quadrant window, each a distinct solid color, so
     // multi-window enumeration can be tested. Default 1 = unchanged behavior.
@@ -168,6 +172,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         extras.push((ewin, extra_color(i)));
     }
     conn.flush()?;
+
+    if fork_child {
+        // A grandchild that a single-pid kill of the fixture would orphan.
+        let kid = std::process::Command::new("sleep").arg("3600").spawn()?;
+        println!("EVENT child_pid={}", kid.id());
+        std::io::stdout().flush()?;
+        std::mem::forget(kid); // don't reap on drop; glass's group-reap must get it
+    }
 
     // Announce readiness on stdout (one line, flushed) so tests can sync.
     println!("READY w={WIDTH} h={HEIGHT}");

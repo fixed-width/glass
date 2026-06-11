@@ -16,6 +16,54 @@
 //! the Windows backend for the same reason — the OS APIs can't share an impl.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::process::Child;
+use std::time::{Duration, Instant};
+
+use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+
+/// Grace period a process gets to exit after SIGTERM before SIGKILL.
+pub const REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// Gracefully reap a single child: SIGTERM, poll for exit up to `grace`, then
+/// SIGKILL as a last resort, then `wait()`. SIGTERM-first lets the process clean
+/// up its own children, sockets, and locks; SIGKILL is the escape hatch only.
+pub fn reap_graceful(child: &mut Child, grace: Duration) {
+    reap(child, grace, false);
+}
+
+/// Like [`reap_graceful`] but signals the child's whole process GROUP, so a
+/// group leader's descendants are reaped too. The child MUST be a group leader
+/// (spawned with `std::os::unix::process::CommandExt::process_group(0)`).
+pub fn reap_group(child: &mut Child, grace: Duration) {
+    reap(child, grace, true);
+}
+
+fn reap(child: &mut Child, grace: Duration, group: bool) {
+    if let Some(pid) = Pid::from_raw(child.id() as i32) {
+        let _ = if group {
+            kill_process_group(pid, Signal::TERM)
+        } else {
+            kill_process(pid, Signal::TERM)
+        };
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    if group {
+                        let _ = kill_process_group(pid, Signal::KILL);
+                    } else {
+                        let _ = child.kill();
+                    }
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.wait();
+}
 
 /// The pid `root_pid` plus every descendant process, read from `/proc`.
 ///
@@ -67,6 +115,68 @@ fn collect_descendants(root: u32, parent_of: &HashMap<u32, u32>) -> Vec<u32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod reap_tests {
+    use super::{reap_graceful, reap_group, REAP_GRACE};
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn reap_graceful_exits_fast_when_sigterm_is_honored() {
+        let mut c = Command::new("sh").args(["-c", "trap 'exit 0' TERM; sleep 30"]).spawn().unwrap();
+        let t = Instant::now();
+        reap_graceful(&mut c, Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(2), "honored SIGTERM should exit promptly");
+    }
+
+    #[test]
+    fn reap_graceful_sigkills_after_grace_when_sigterm_ignored() {
+        // Echo "ready" after the trap is installed so we don't race the signal.
+        let mut c = Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(c.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let grace = Duration::from_millis(300);
+        let t = Instant::now();
+        reap_graceful(&mut c, grace);
+        let el = t.elapsed();
+        assert!(el >= grace, "should wait the full grace before SIGKILL (waited {el:?})");
+        assert!(el < grace + Duration::from_secs(2), "but must not hang (waited {el:?})");
+    }
+
+    #[test]
+    fn reap_group_reaps_a_forked_grandchild() {
+        let mut leader = Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+        assert!(alive(grandchild), "grandchild should be alive before reaping");
+        reap_group(&mut leader, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(grandchild), "reap_group must reap the forked grandchild, not orphan it");
+    }
+
+    #[test]
+    fn grace_constant_is_two_seconds() {
+        assert_eq!(REAP_GRACE, Duration::from_secs(2));
+    }
 }
 
 #[cfg(test)]

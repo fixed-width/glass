@@ -6,8 +6,6 @@ use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process_group, Pid, Signal};
-
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     WindowGeometry, WindowId, WindowInfo, WindowOp,
@@ -81,39 +79,9 @@ impl WaylandPlatform {
             owner.stop();
         }
         if let Some(mut s) = self.active.take() {
-            reap_group(&mut s.child);
+            glass_proc_linux::reap_group(&mut s.child, glass_proc_linux::REAP_GRACE);
         }
     }
-}
-
-/// Tear down a compositor session by its process group and reap the leader.
-///
-/// sway is its own process-group leader (see `build_sway_command`), so its pid is
-/// also the pgid. Signal the whole group so Xwayland and the exec'd app go down
-/// with it; a bare `child.kill()` would SIGKILL only sway and orphan that subtree.
-///
-/// SIGTERM first (graceful): sway shuts Xwayland down cleanly, which removes its
-/// /tmp/.X11-unix socket and fully releases its X display before the next session
-/// reuses it. A SIGKILL'd Xwayland leaks the socket and briefly holds the display
-/// in the *global* X namespace, which intermittently breaks the next Xwayland's
-/// window mapping. Fall back to SIGKILL if the group doesn't exit promptly.
-fn reap_group(child: &mut Child) {
-    if let Some(pgid) = Pid::from_raw(child.id() as i32) {
-        let _ = kill_process_group(pgid, Signal::TERM);
-        let deadline = Instant::now() + Duration::from_millis(2000);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = kill_process_group(pgid, Signal::KILL);
-                    break;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(_) => break,
-            }
-        }
-    }
-    let _ = child.wait();
 }
 
 impl Drop for WaylandPlatform {
@@ -507,11 +475,11 @@ fn bring_up_session(
             // (Xwayland + the exec'd app) can outlive it. Reap the whole
             // group, not just the leader, or a leaked Xwayland holds the X
             // display in the global namespace and breaks the next session.
-            reap_group(&mut child);
+            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
             return Err(GlassError::AppExited(status.code()));
         }
         if Instant::now() >= deadline {
-            reap_group(&mut child);
+            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
             return Err(GlassError::Timeout(spec.timeout_ms));
         }
         std::thread::sleep(Duration::from_millis(40));
@@ -521,7 +489,7 @@ fn bring_up_session(
         match open_session(&socket, runtime_dir.path()) {
             Ok(v) => v,
             Err(e) => {
-                reap_group(&mut child);
+                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
                 return Err(e);
             }
         };
@@ -543,11 +511,11 @@ fn bring_up_session(
             if let Ok(Some(status)) = child.try_wait() {
                 // Reap the whole group (see the socket-wait loop above): an
                 // unclean sway exit can orphan Xwayland + the app otherwise.
-                reap_group(&mut child);
+                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
                 return Err(GlassError::AppExited(status.code()));
             }
             if Instant::now() >= deadline {
-                reap_group(&mut child);
+                glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
                 return Err(GlassError::Timeout(spec.timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(40));
