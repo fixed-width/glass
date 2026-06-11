@@ -869,6 +869,7 @@ fn select_window_focuses_the_selected_window() {
 
     // Pin focus to MAIN deterministically via window(Focus) (works regardless of
     // this fix), so the baseline is known no matter which window start_app picked.
+    // Pin via WindowOp::Focus (not select_window) so the baseline does not depend on the fix under test.
     p.select_window(main).unwrap();
     p.window(&WindowOp::Focus).unwrap();
     p.send_key(&KeyEvent::Text("a".into())).unwrap();
@@ -883,8 +884,8 @@ fn select_window_focuses_the_selected_window() {
     p.select_window(extra).unwrap();
     p.send_key(&KeyEvent::Text("b".into())).unwrap();
     assert!(
-        !wait_for_log(&mut p, "keysym=98", 15),
-        "select_window did not move keyboard focus to the selected window"
+        !wait_for_log(&mut p, "keysym=98", 25),
+        "'b' was echoed after selecting the extra (silent) window — select_window did not move keyboard focus"
     );
 
     // Selecting MAIN again must bring keys back.
