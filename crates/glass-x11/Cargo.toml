@@ -23,3 +23,6 @@ criterion = { workspace = true }
 [[bench]]
 name = "pixels"
 harness = false
+
+[lints]
+workspace = true

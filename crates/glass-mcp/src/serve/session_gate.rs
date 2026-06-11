@@ -72,7 +72,7 @@ impl SessionManager for SingleSessionManager {
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
         // Claim the single slot before the await; reject if already taken.
         {
-            let mut slot = self.slot.lock().unwrap();
+            let mut slot = self.slot.lock().expect("session slot mutex");
             if !matches!(*slot, Slot::Empty) {
                 return Err(busy_error());
             }
@@ -80,12 +80,12 @@ impl SessionManager for SingleSessionManager {
         }
         match self.inner.create_session().await {
             Ok((id, transport)) => {
-                *self.slot.lock().unwrap() = Slot::Active(id.clone());
+                *self.slot.lock().expect("session slot mutex") = Slot::Active(id.clone());
                 Ok((id, transport))
             }
             Err(e) => {
                 // Release the slot if the inner manager failed to create.
-                *self.slot.lock().unwrap() = Slot::Empty;
+                *self.slot.lock().expect("session slot mutex") = Slot::Empty;
                 Err(e)
             }
         }
@@ -97,7 +97,7 @@ impl SessionManager for SingleSessionManager {
         // stale/bogus id (an unvalidated DELETE header, or a superseded session's
         // late worker-end) must not free a live session's slot — see the module
         // docs.
-        let mut slot = self.slot.lock().unwrap();
+        let mut slot = self.slot.lock().expect("session slot mutex");
         if matches!(&*slot, Slot::Active(active) if active == id) {
             *slot = Slot::Empty;
         }

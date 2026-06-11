@@ -32,3 +32,6 @@ windows = { version = "0.62", features = [
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 glass-a11y-windows = { path = "../glass-a11y-windows" }
+
+[lints]
+workspace = true

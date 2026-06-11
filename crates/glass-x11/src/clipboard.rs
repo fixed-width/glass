@@ -214,7 +214,7 @@ impl ClipboardOwner {
         let (lock, cvar) = &*ready;
         let result = cvar
             .wait_timeout_while(
-                lock.lock().unwrap(),
+                lock.lock().expect("clipboard ready mutex"),
                 Duration::from_secs(2),
                 |s| matches!(s, ReadyState::Pending),
             )
@@ -243,7 +243,7 @@ impl ClipboardOwner {
 
     /// Update the text that will be served on the next paste.
     pub fn set_text(&self, text: &str) {
-        *self.text.lock().unwrap() = text.to_string();
+        *self.text.lock().expect("clipboard text mutex") = text.to_string();
     }
 
     /// Returns `true` if the owner thread is still running (i.e. still owns the
@@ -277,7 +277,7 @@ impl Drop for ClipboardOwner {
 /// Signal the ready condvar from the owner thread. Helper to reduce repetition.
 fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     let (lock, cvar) = &**ready;
-    *lock.lock().unwrap() = state;
+    *lock.lock().expect("clipboard ready mutex") = state;
     cvar.notify_one();
 }
 
@@ -438,7 +438,7 @@ fn handle_selection_request(
         )?.check()?;
         reply_prop
     } else if req.target == utf8_string {
-        let data = text.lock().unwrap().clone();
+        let data = text.lock().expect("clipboard text mutex").clone();
         conn.change_property8(
             PropMode::REPLACE,
             req.requestor,

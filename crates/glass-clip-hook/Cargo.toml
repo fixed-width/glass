@@ -38,3 +38,6 @@ windows-core = "0.62"
 # `static-detour` enables the `static_detour!` macro (the type-safe detour table); it pulls in the
 # `nightly` feature — fine, the workspace is pinned to nightly (rust-toolchain.toml).
 retour = { version = "0.3", features = ["static-detour"] }
+
+[lints]
+workspace = true

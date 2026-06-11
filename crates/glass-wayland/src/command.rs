@@ -100,7 +100,7 @@ pub fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
             match line {
-                Ok(text) => sink.lock().unwrap().push((stream, text)),
+                Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
                 Err(_) => break,
             }
         }

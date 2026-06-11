@@ -28,3 +28,6 @@ harness = false
 [[bench]]
 name = "image_io"
 harness = false
+
+[lints]
+workspace = true
