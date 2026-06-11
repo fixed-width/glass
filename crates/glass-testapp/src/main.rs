@@ -16,8 +16,12 @@ const HEIGHT: u16 = 240;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--no-wm-pid` suppresses _NET_WM_PID so tests can exercise glass's
     // fallback window discovery (by title/class) the way Xaw/legacy apps force.
+    // `--no-self-focus` skips the startup self-focus below, so the fixture
+    // behaves like a real toolkit app that does NOT grab focus in a WM-less
+    // session — letting tests verify that glass itself focuses the window.
     let no_wm_pid = std::env::args().any(|a| a == "--no-wm-pid");
     let reparent = std::env::args().any(|a| a == "--reparent");
+    let no_self_focus = std::env::args().any(|a| a == "--no-self-focus");
     // `--windows N` opens N-1 extra plain top-levels (titled glass-testapp-1..)
     // alongside the main quadrant window, each a distinct solid color, so
     // multi-window enumeration can be tested. Default 1 = unchanged behavior.
@@ -104,7 +108,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     conn.map_window(win)?;
-    conn.set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+    if !no_self_focus {
+        conn.set_input_focus(InputFocus::PARENT, win, CURRENT_TIME)?;
+    }
     conn.flush()?;
 
     // Extra windows for multi-window tests: placed side-by-side, each a distinct
