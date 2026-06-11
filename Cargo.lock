@@ -962,7 +962,8 @@ version = "0.0.0"
 dependencies = [
  "atspi",
  "glass-core",
- "rustix",
+ "glass-proc-linux",
+ "tempfile",
  "tokio",
  "zbus",
 ]

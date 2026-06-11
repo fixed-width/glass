@@ -7,9 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
-use rustix::process::{kill_process, Pid, Signal};
+use std::time::Duration;
 
 use glass_core::{GlassError, Result};
 
@@ -23,6 +21,9 @@ pub struct PrivateBus {
     a11y_bus_address: String,
     #[expect(dead_code, reason = "RAII: keep the dbus-daemon stdout pipe open")]
     dbus_stdout: ChildStdout,
+    // at-spi-bus-launcher writes its socket under $XDG_RUNTIME_DIR/at-spi/; a private
+    // dir keeps it off the host's /run/user/UID/at-spi/. Removed on Drop.
+    _runtime_dir: tempfile::TempDir,
 }
 
 impl PrivateBus {
@@ -61,8 +62,14 @@ impl PrivateBus {
                 ));
             }
         };
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("glass-a11y-")
+            .tempdir()
+            .map_err(|e| GlassError::Backend(format!("a11y runtime dir: {e}")))?;
+
         let mut atspi = match Command::new(&launcher)
             .env("DBUS_SESSION_BUS_ADDRESS", &session_bus_address)
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -76,7 +83,14 @@ impl PrivateBus {
         };
 
         match resolve_a11y_address(&session_bus_address) {
-            Ok(a11y_bus_address) => Ok(PrivateBus { dbus, atspi, session_bus_address, a11y_bus_address, dbus_stdout }),
+            Ok(a11y_bus_address) => Ok(PrivateBus {
+                dbus,
+                atspi,
+                session_bus_address,
+                a11y_bus_address,
+                dbus_stdout,
+                _runtime_dir: runtime_dir,
+            }),
             Err(e) => {
                 reap_children(&mut dbus, &mut atspi);
                 Err(e)
@@ -84,9 +98,6 @@ impl PrivateBus {
         }
     }
 }
-
-/// Grace period for a child to exit after SIGTERM before we escalate to SIGKILL.
-const REAP_GRACE: Duration = Duration::from_millis(2000);
 
 /// Tear down the private bus, atspi-launcher FIRST then the session dbus-daemon.
 ///
@@ -100,35 +111,8 @@ const REAP_GRACE: Duration = Duration::from_millis(2000);
 /// Order matters: the launcher must shut its grandchild down before we kill the
 /// session bus out from under it.
 fn reap_children(dbus: &mut Child, atspi: &mut Child) {
-    reap_graceful(atspi);
-    reap_graceful(dbus);
-}
-
-/// SIGTERM a child, poll for exit until `REAP_GRACE`, SIGKILL as a fallback, then reap.
-fn reap_graceful(child: &mut Child) {
-    // SIGTERM; SRCH (ESRCH) just means it already exited (so nothing to reap-signal).
-    if let Some(pid) = Pid::from_raw(child.id() as i32) {
-        match kill_process(pid, Signal::TERM) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
-            Err(_) => {
-                // Couldn't signal for some other reason; fall back to SIGKILL.
-                let _ = child.kill();
-            }
-        }
-    }
-    let deadline = Instant::now() + REAP_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill(); // SIGKILL fallback if it ignored SIGTERM
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => break,
-        }
-    }
-    let _ = child.wait();
+    glass_proc_linux::reap_graceful(atspi, glass_proc_linux::REAP_GRACE);
+    glass_proc_linux::reap_graceful(dbus, glass_proc_linux::REAP_GRACE);
 }
 
 impl Drop for PrivateBus {

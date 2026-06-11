@@ -8,9 +8,10 @@ publish = false
 
 [dependencies]
 glass-core.workspace = true
+glass-proc-linux.workspace = true
 zbus.workspace = true
 tokio.workspace = true
-rustix.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 atspi.workspace = true

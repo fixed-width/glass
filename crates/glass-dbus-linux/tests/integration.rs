@@ -22,3 +22,12 @@ fn starts_yields_addresses_and_reaps() {
     });
     drop(bus);
 }
+
+#[test]
+#[ignore = "needs dbus-daemon + at-spi-bus-launcher"]
+fn a11y_socket_is_private_not_host_runtime_dir() {
+    let bus = glass_dbus_linux::PrivateBus::start().expect("start private bus");
+    let addr = bus.a11y_bus_address();
+    assert!(!addr.contains("/run/user/"), "a11y socket leaked into the host runtime dir: {addr}");
+    assert!(addr.contains("/at-spi/"), "expected an at-spi socket path: {addr}");
+}
