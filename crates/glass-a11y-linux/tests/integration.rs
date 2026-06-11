@@ -140,3 +140,32 @@ fn find_role(node: &glass_core::AxNode, role: glass_core::AxRole) -> Option<&gla
     if node.role == role { return Some(node); }
     node.children.iter().find_map(|c| find_role(c, role))
 }
+
+#[test]
+#[ignore = "needs dbus-daemon + at-spi-bus-launcher + Xvfb + GTK4 fixture, NO external a11y bus; run via scripts/test-a11y-selfbus.sh"]
+fn glass_self_provisions_a11y_bus() {
+    // Unlike the other tests here, this runs WITHOUT an external session/AT-SPI bus —
+    // glass must spawn its own (PrivateBus). The selfbus script runs it with
+    // DBUS_SESSION_BUS_ADDRESS unset.
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+        })
+        .expect("launch GTK fixture");
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let tree = glass.a11y_snapshot().expect("a11y snapshot via glass's own private bus");
+    let outline = tree.to_outline();
+    assert!(outline.contains("Button \"Save\""), "no Save button in:\n{outline}");
+    glass.stop().expect("stop");
+}
