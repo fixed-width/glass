@@ -544,10 +544,11 @@ impl Platform for X11Platform {
             }
         }
         glass_sandbox_linux::run_build(spec)?;
-        // Private, a11y-enabled D-Bus session bus so the launched app publishes an
-        // AT-SPI tree isolated from the host. Best-effort: if it can't start, the app
-        // still launches (a11y tools will report unavailable). Phase 1: sandbox=off only.
-        self.dbus = if spec.sandbox == glass_core::SandboxLevel::Off {
+        // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never touches the
+        // host /run/user/UID/at-spi/) so the launched app publishes an AT-SPI tree. Only
+        // when the caller asked for it (`a11y: true`); best-effort if it can't start.
+        // Phase 1: sandbox=off only (sandboxed a11y needs the socket bound into bwrap).
+        self.dbus = if spec.a11y && spec.sandbox == glass_core::SandboxLevel::Off {
             match glass_dbus_linux::PrivateBus::start() {
                 Ok(b) => Some(b),
                 Err(e) => {
