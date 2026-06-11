@@ -867,9 +867,9 @@ fn select_window_focuses_the_selected_window() {
         .expect("extra window")
         .id;
 
-    // Pin focus to MAIN deterministically via window(Focus) (works regardless of
-    // this fix), so the baseline is known no matter which window start_app picked.
-    // Pin via WindowOp::Focus (not select_window) so the baseline does not depend on the fix under test.
+    // Pin focus to MAIN deterministically via window(Focus), NOT select_window, so
+    // the baseline doesn't depend on the fix under test and is known no matter which
+    // window start_app happened to focus.
     p.select_window(main).unwrap();
     p.window(&WindowOp::Focus).unwrap();
     p.send_key(&KeyEvent::Text("a".into())).unwrap();
