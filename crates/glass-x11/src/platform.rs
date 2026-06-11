@@ -727,6 +727,11 @@ impl Platform for X11Platform {
         let target = id.0 as Window;
         if self.scan_all_windows(&pids)?.contains(&target) {
             self.window = Some(target);
+            // Move keyboard focus to the selected window so subsequent synthetic
+            // keys reach it. Best-effort: a focus failure must not fail selection.
+            if let Err(e) = self.focus_window(target) {
+                eprintln!("glass: focus-on-select failed (keys may not reach the window): {e}");
+            }
             self.geometry_of(target)
         } else {
             Err(GlassError::WindowNotFound)

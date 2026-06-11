@@ -829,6 +829,74 @@ fn start_app_focuses_window_so_keys_reach_it() {
     p.stop_app().unwrap();
 }
 
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn select_window_focuses_the_selected_window() {
+    use glass_core::{KeyEvent, WindowOp};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    // Two windows, neither self-focusing. The MAIN quadrant window echoes key
+    // presses (EVENT keysym=...); the EXTRA window has no KEY_PRESS mask, so it
+    // is SILENT when focused — that silence is how we detect focus moved to it.
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            TESTAPP.to_string(),
+            "--no-self-focus".to_string(),
+            "--windows".to_string(),
+            "2".to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+    };
+    p.start_app(&spec).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+
+    let wins = p.list_windows().unwrap();
+    let main = wins
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("main window")
+        .id;
+    let extra = wins
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp-1"))
+        .expect("extra window")
+        .id;
+
+    // Pin focus to MAIN deterministically via window(Focus) (works regardless of
+    // this fix), so the baseline is known no matter which window start_app picked.
+    p.select_window(main).unwrap();
+    p.window(&WindowOp::Focus).unwrap();
+    p.send_key(&KeyEvent::Text("a".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=97", 40),
+        "baseline: 'a' should reach the focused main window"
+    );
+
+    // Select the EXTRA (silent) window. If select_window focuses it, 'b' lands on
+    // a window with no KEY_PRESS mask and is NOT echoed. If select_window does NOT
+    // focus (the bug), MAIN stays focused and 'b' IS echoed.
+    p.select_window(extra).unwrap();
+    p.send_key(&KeyEvent::Text("b".into())).unwrap();
+    assert!(
+        !wait_for_log(&mut p, "keysym=98", 15),
+        "select_window did not move keyboard focus to the selected window"
+    );
+
+    // Selecting MAIN again must bring keys back.
+    p.select_window(main).unwrap();
+    p.send_key(&KeyEvent::Text("c".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=99", 40),
+        "select_window(main) did not restore keyboard focus"
+    );
+    p.stop_app().unwrap();
+}
+
 /// With `sandbox: Off`, `start_app` never checks for bwrap.
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
