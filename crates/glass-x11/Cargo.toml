@@ -15,6 +15,7 @@ bench = false
 glass-core.workspace = true
 glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
+glass-dbus-linux.workspace = true
 x11rb.workspace = true
 
 [dev-dependencies]

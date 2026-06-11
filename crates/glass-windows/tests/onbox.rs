@@ -177,7 +177,7 @@ fn onbox_a11y_snapshot_and_click() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     assert!(tree.count > 0, "snapshot must have nodes");
     let (mut total, mut inter) = (0usize, 0usize);
@@ -260,7 +260,7 @@ fn onbox_modifier_click() {
     std::thread::sleep(Duration::from_millis(1200));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     let mut hit = None;
     first_clickable(&tree.root, &mut hit);
@@ -326,7 +326,7 @@ fn onbox_a11y_set_value() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
 
     let mut field = None;
@@ -392,7 +392,7 @@ fn onbox_a11y_edge_geometry_fallback() {
     std::thread::sleep(Duration::from_secs(6));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot on multi-process Edge");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);

@@ -37,6 +37,9 @@ pub struct X11Platform {
     logs: LogSink,
     // A private Xvfb we spawned (default path); kept alive so Drop tears it down.
     xvfb: Option<crate::xvfb::Xvfb>,
+    // A private a11y-enabled D-Bus session bus we spawned for the launched app;
+    // kept alive so Drop tears it down. Set on each (sandbox=off) launch.
+    dbus: Option<glass_dbus_linux::PrivateBus>,
     // Background thread that owns the CLIPBOARD selection and serves pastes.
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
 }
@@ -115,6 +118,7 @@ impl X11Platform {
             window: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             xvfb: None,
+            dbus: None,
             clipboard_owner: None,
         })
     }
@@ -188,7 +192,10 @@ impl X11Platform {
     }
 
     fn spawn(&mut self, spec: &AppSpec) -> Result<()> {
-        let mut cmd = build_command(spec, &self.display);
+        // `start_app` sets `self.dbus` before calling `spawn`, so reading it here
+        // injects the private session-bus address into the launched app's env.
+        let dbus_addr = self.dbus.as_ref().map(|b| b.session_bus_address());
+        let mut cmd = build_command(spec, &self.display, dbus_addr);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -211,6 +218,10 @@ impl X11Platform {
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
         }
         self.window = None;
+        // Drop the private a11y bus, reaping its dbus-daemon / at-spi children. Also
+        // covers `start_app`'s failure path (which calls `kill_child`), so a launch
+        // that never finds a window doesn't leave the bus running until Drop.
+        self.dbus = None;
         if let Some(owner) = self.clipboard_owner.take() {
             owner.stop();
         }
@@ -533,7 +544,24 @@ impl Platform for X11Platform {
             }
         }
         glass_sandbox_linux::run_build(spec)?;
-        self.spawn(spec)?;
+        // Private, a11y-enabled D-Bus session bus so the launched app publishes an
+        // AT-SPI tree isolated from the host. Best-effort: if it can't start, the app
+        // still launches (a11y tools will report unavailable). Phase 1: sandbox=off only.
+        self.dbus = if spec.sandbox == glass_core::SandboxLevel::Off {
+            match glass_dbus_linux::PrivateBus::start() {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    eprintln!("glass: private a11y bus unavailable ({e}); a11y tools will be limited");
+                    None
+                }
+            }
+        } else {
+            None // sandboxed launches need the socket bound into bwrap — later phase.
+        };
+        if let Err(e) = self.spawn(spec) {
+            self.kill_child(); // reap the private bus (and any child) on a failed spawn
+            return Err(e);
+        }
         match self.discover_window(spec).and_then(|_| self.window_geometry()) {
             Ok(geo) => {
                 // Give the launched window keyboard focus so synthetic keys reach
@@ -756,6 +784,10 @@ impl Platform for X11Platform {
             Some(c) => proc_tree_pids(c.id()),
             None => Vec::new(),
         }
+    }
+
+    fn a11y_bus_addr(&self) -> Option<String> {
+        self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
     }
 }
 

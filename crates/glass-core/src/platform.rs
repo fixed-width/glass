@@ -170,6 +170,12 @@ pub trait Platform {
     fn app_pids(&self) -> Vec<u32> {
         self.app_pid().into_iter().collect()
     }
+
+    /// The session's private AT-SPI bus address, if this backend spawned one.
+    /// Default `None` (no private bus / non-Linux backends).
+    fn a11y_bus_addr(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

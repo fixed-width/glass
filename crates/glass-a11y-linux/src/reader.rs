@@ -86,11 +86,21 @@ fn bus_err(e: impl std::fmt::Display) -> GlassError {
 /// Returns the app's `ObjectRefOwned` (`'static`) and the connection — NOT a proxy (a
 /// proxy would borrow the connection and can't be returned alongside it).
 async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
-    let conn = AccessibilityConnection::new().await.map_err(|e| {
-        GlassError::AccessibilityUnavailable(format!(
-            "no accessibility bus reachable ({e}); is at-spi2 running and the app a11y-enabled?"
-        ))
-    })?;
+    let conn = match ctx.a11y_bus_addr.as_deref() {
+        Some(addr) => {
+            let parsed = addr
+                .try_into()
+                .map_err(|e| GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}")))?;
+            AccessibilityConnection::from_address(parsed).await.map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("cannot reach the private a11y bus ({e})"))
+            })?
+        }
+        None => AccessibilityConnection::new().await.map_err(|e| {
+            GlassError::AccessibilityUnavailable(format!(
+                "no accessibility bus reachable ({e}); is at-spi2 running and the app a11y-enabled?"
+            ))
+        })?,
+    };
     let zbus_conn = conn.connection().clone();
     let root = conn.root_accessible_on_registry().await.map_err(bus_err)?;
 
