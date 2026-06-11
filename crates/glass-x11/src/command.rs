@@ -118,13 +118,23 @@ mod tests {
         let mut s = spec(&["app"]);
         s.env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/tmp/override".into())];
         let cmd = build_command(&s, ":99", Some("unix:path=/tmp/bus"));
-        // spec.env is applied after the forced default, so the explicit entry wins.
+        // Command stores env as a map: a later .env() for the same key replaces the earlier
+        // one, so a spec.env entry overrides the injected default.
         let addr = cmd
             .get_envs()
             .filter(|(k, _)| *k == OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
             .last()
             .and_then(|(_, v)| v);
         assert_eq!(addr, Some(OsStr::new("unix:path=/tmp/override")));
+    }
+
+    #[test]
+    fn none_dbus_addr_leaves_session_bus_unset() {
+        let cmd = build_command(&spec(&["app"]), ":9", None);
+        assert!(
+            !cmd.get_envs().any(|(k, _)| k == OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            "DBUS_SESSION_BUS_ADDRESS must not be set when dbus_addr is None"
+        );
     }
 
     #[test]

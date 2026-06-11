@@ -542,7 +542,10 @@ impl Platform for X11Platform {
         } else {
             None // sandboxed launches need the socket bound into bwrap — later phase.
         };
-        self.spawn(spec)?;
+        if let Err(e) = self.spawn(spec) {
+            self.kill_child(); // reap the private bus (and any child) on a failed spawn
+            return Err(e);
+        }
         match self.discover_window(spec).and_then(|_| self.window_geometry()) {
             Ok(geo) => Ok(geo),
             Err(e) => {
