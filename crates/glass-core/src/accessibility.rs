@@ -284,6 +284,10 @@ pub struct AxContext {
     /// backend has a process-tree view (Windows' Job set); 1-element on X11/Wayland.
     pub pids: Vec<u32>,
     pub window: WindowGeometry,
+    /// The session's private AT-SPI bus address, if glass spawned one. When `Some`,
+    /// the reader connects to it explicitly (isolated from the host bus); when `None`,
+    /// the reader falls back to the ambient session bus.
+    pub a11y_bus_addr: Option<String>,
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
