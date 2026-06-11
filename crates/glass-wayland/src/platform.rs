@@ -384,7 +384,10 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
 
 /// Connect to `socket`, verify globals, bind screencopy + virtual-input managers,
 /// read the output extent, and connect sway IPC. Returns everything for a session.
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "one-shot session-setup tuple, destructured immediately by the sole caller"
+)]
 fn open_session(
     socket: &Path,
     runtime_dir: &Path,
@@ -1004,7 +1007,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut *self.logs.lock().unwrap())
+        std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
     }
 
     /// The app's process subtree. The child we spawn is **sway**, which launches

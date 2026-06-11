@@ -139,19 +139,28 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
 const MAX_YIQ_DELTA: f32 = 35215.0;
 
 // The canonical pixelmatch YIQ coefficients (kept at full precision for
-// traceability; f32 rounds them, hence the allow).
+// traceability; f32 rounds them, hence the expect).
 #[inline]
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "canonical pixelmatch YIQ coefficients kept at full precision for traceability; f32 narrows them"
+)]
 fn rgb2y(r: f32, g: f32, b: f32) -> f32 {
     r * 0.29889531 + g * 0.58662247 + b * 0.11448223
 }
 #[inline]
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "canonical pixelmatch YIQ coefficients kept at full precision for traceability; f32 narrows them"
+)]
 fn rgb2i(r: f32, g: f32, b: f32) -> f32 {
     r * 0.59597799 - g * 0.27417610 - b * 0.32180189
 }
 #[inline]
-#[allow(clippy::excessive_precision)]
+#[expect(
+    clippy::excessive_precision,
+    reason = "canonical pixelmatch YIQ coefficients kept at full precision for traceability; f32 narrows them"
+)]
 fn rgb2q(r: f32, g: f32, b: f32) -> f32 {
     r * 0.21147017 - g * 0.52261711 + b * 0.31114694
 }
@@ -345,7 +354,10 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
 
 /// Classify the pixel at (x,y) and fold it into the running counters/bbox.
 #[inline]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hot per-pixel classifier; threads counters/bbox by &mut to avoid per-pixel allocation"
+)]
 fn classify_into(
     a: &Frame, b: &Frame, x: u32, y: u32, w: u32, h: u32, max_delta: f32, changed: &mut u64,
     aa_ignored: &mut u64, min_x: &mut u32, min_y: &mut u32, max_x: &mut u32, max_y: &mut u32,

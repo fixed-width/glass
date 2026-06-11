@@ -20,7 +20,7 @@ pub struct Xvfb {
     /// The chosen display, formatted `:N`.
     pub display: String,
     // Held open for the server's lifetime so Xvfb never gets SIGPIPE on the fd.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "RAII: held open for the server's lifetime so the fd never SIGPIPEs")]
     displayfd: ChildStdout,
 }
 

@@ -313,7 +313,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type: _, fd } => {
                 // Write the current text to the fd and close it.
-                let text = state.text.lock().unwrap().clone();
+                let text = state.text.lock().expect("clipboard text mutex").clone();
                 // fd is OwnedFd; wrap in File and write (file closes on drop).
                 let mut file = std::fs::File::from(fd);
                 let _ = file.write_all(text.as_bytes());
@@ -511,7 +511,7 @@ impl ClipboardOwner {
         let (lock, cvar) = &*ready;
         let result = cvar
             .wait_timeout_while(
-                lock.lock().unwrap(),
+                lock.lock().expect("clipboard ready mutex"),
                 Duration::from_secs(2),
                 |s| matches!(s, ReadyState::Pending),
             )
@@ -541,7 +541,7 @@ impl ClipboardOwner {
     /// Update the text being served. If the thread already lost ownership
     /// (`Cancelled`), this is a no-op (caller should re-spawn).
     pub fn set_text(&self, text: &str) {
-        *self.text.lock().unwrap() = text.to_string();
+        *self.text.lock().expect("clipboard text mutex") = text.to_string();
     }
 
     /// True if the serving thread is still running (hasn't stopped itself due
@@ -571,7 +571,7 @@ impl Drop for ClipboardOwner {
 /// Signal the ready condvar. Helper to reduce repetition.
 fn signal_ready(ready: &Arc<(Mutex<ReadyState>, Condvar)>, state: ReadyState) {
     let (lock, cvar) = &**ready;
-    *lock.lock().unwrap() = state;
+    *lock.lock().expect("clipboard ready mutex") = state;
     cvar.notify_one();
 }
 

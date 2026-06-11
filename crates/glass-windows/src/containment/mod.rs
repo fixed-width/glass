@@ -47,7 +47,7 @@ mod imp {
             let buf = BufReader::new(reader);
             for line in buf.lines() {
                 match line {
-                    Ok(text) => sink.lock().unwrap().push((stream, text)),
+                    Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
                     Err(_) => break,
                 }
             }

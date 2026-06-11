@@ -28,7 +28,7 @@ type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 /// target app's top-level window, and drives it via X requests + XTEST.
 pub struct X11Platform {
     conn: RustConnection,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "captured from the X setup for completeness; not currently read")]
     screen_num: usize,
     root: Window,
     display: String,
@@ -36,7 +36,6 @@ pub struct X11Platform {
     window: Option<Window>,
     logs: LogSink,
     // A private Xvfb we spawned (default path); kept alive so Drop tears it down.
-    #[allow(dead_code)]
     xvfb: Option<crate::xvfb::Xvfb>,
     // Background thread that owns the CLIPBOARD selection and serves pastes.
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
@@ -496,7 +495,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
         let buf = BufReader::new(reader);
         for line in buf.lines() {
             match line {
-                Ok(text) => sink.lock().unwrap().push((stream, text)),
+                Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
                 Err(_) => break,
             }
         }
@@ -711,7 +710,7 @@ impl Platform for X11Platform {
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut *self.logs.lock().unwrap())
+        std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
     }
 
     fn app_pid(&self) -> Option<u32> {

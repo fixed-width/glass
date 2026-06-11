@@ -303,7 +303,7 @@ mod backend {
         }
 
         fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-            std::mem::take(&mut *self.logs.lock().unwrap())
+            std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
         }
 
         fn app_pid(&self) -> Option<u32> {

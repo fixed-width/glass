@@ -61,3 +61,6 @@ tokio = { version = "1", features = ["full"] }
 # the HTTP client). Pinned to rmcp's reqwest line so cargo unifies on one copy; plain
 # loopback HTTP needs no TLS provider, so keep default-features off.
 reqwest = { version = "0.13", default-features = false }
+
+[lints]
+workspace = true

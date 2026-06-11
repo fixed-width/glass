@@ -11,6 +11,16 @@ license = "Apache-2.0"
 repository = "https://github.com/fixed-width/glass"
 publish = false
 
+# Lint gate, in-tree so `cargo clippy --workspace` enforces it without extra flags
+# (CI still adds `-D warnings` to also catch rustc warnings). The `all` group sits at
+# priority -1 so any specific lint override below it wins on conflict.
+[workspace.lints.rust]
+future_incompatible = "warn"
+nonstandard_style = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [workspace.dependencies]
 thiserror = "1"
 image = { version = "0.25", default-features = false, features = ["webp"] }

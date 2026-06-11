@@ -8,3 +8,6 @@ publish.workspace = true
 
 [dependencies]
 glass-core.workspace = true
+
+[lints]
+workspace = true
