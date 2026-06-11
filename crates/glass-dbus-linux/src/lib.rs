@@ -59,7 +59,7 @@ impl PrivateBus {
                 ));
             }
         };
-        let atspi = match Command::new(&launcher)
+        let mut atspi = match Command::new(&launcher)
             .env("DBUS_SESSION_BUS_ADDRESS", &session_bus_address)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -74,39 +74,25 @@ impl PrivateBus {
         };
 
         match resolve_a11y_address(&session_bus_address) {
-            Ok(a11y_bus_address) => Ok(PrivateBus {
-                dbus,
-                atspi,
-                session_bus_address,
-                a11y_bus_address,
-                dbus_stdout,
-            }),
+            Ok(a11y_bus_address) => Ok(PrivateBus { dbus, atspi, session_bus_address, a11y_bus_address, dbus_stdout }),
             Err(e) => {
-                let mut bus = PrivateBus {
-                    dbus,
-                    atspi,
-                    session_bus_address,
-                    a11y_bus_address: String::new(),
-                    dbus_stdout,
-                };
-                bus.reap();
-                std::mem::forget(bus);
+                reap_children(&mut dbus, &mut atspi);
                 Err(e)
             }
         }
     }
+}
 
-    fn reap(&mut self) {
-        let _ = self.atspi.kill();
-        let _ = self.atspi.wait();
-        let _ = self.dbus.kill();
-        let _ = self.dbus.wait();
-    }
+fn reap_children(dbus: &mut Child, atspi: &mut Child) {
+    let _ = atspi.kill();
+    let _ = atspi.wait();
+    let _ = dbus.kill();
+    let _ = dbus.wait();
 }
 
 impl Drop for PrivateBus {
     fn drop(&mut self) {
-        self.reap();
+        reap_children(&mut self.dbus, &mut self.atspi);
     }
 }
 
@@ -116,10 +102,13 @@ fn read_first_line(stdout: ChildStdout, timeout: Duration) -> Result<(String, Ch
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let n = reader.read_line(&mut line);
-        let _ = tx.send(n.map(|_| (line, reader.into_inner())));
+        let _ = tx.send(n.map(|count| (count, line, reader.into_inner())));
     });
     match rx.recv_timeout(timeout) {
-        Ok(Ok((line, stdout))) => {
+        Ok(Ok((0, _line, _stdout))) => {
+            Err(GlassError::Backend("dbus-daemon exited without printing an address (failed to start)".into()))
+        }
+        Ok(Ok((_, line, stdout))) => {
             let addr = line.trim().to_string();
             if addr.is_empty() {
                 return Err(GlassError::Backend("dbus-daemon printed an empty address".into()));
@@ -172,16 +161,17 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
             .await
             .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
         let mut last = String::new();
+        let mut last_err: Option<String> = None;
         for _ in 0..50 {
             match proxy.get_address().await {
                 Ok(a) if !a.is_empty() => return Ok(a),
                 Ok(a) => last = a,
-                Err(_) => {}
+                Err(e) => last_err = Some(e.to_string()),
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(GlassError::Backend(format!(
-            "org.a11y.Bus.GetAddress did not yield an address (last: {last:?})"
+            "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
         )))
     })
 }
