@@ -957,6 +957,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-dbus-linux"
+version = "0.0.0"
+dependencies = [
+ "atspi",
+ "glass-core",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "glass-mcp"
 version = "0.0.0"
 dependencies = [
