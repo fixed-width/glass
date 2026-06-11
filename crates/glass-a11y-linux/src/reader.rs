@@ -95,11 +95,13 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
                 GlassError::AccessibilityUnavailable(format!("cannot reach the private a11y bus ({e})"))
             })?
         }
-        None => AccessibilityConnection::new().await.map_err(|e| {
-            GlassError::AccessibilityUnavailable(format!(
-                "no accessibility bus reachable ({e}); is at-spi2 running and the app a11y-enabled?"
-            ))
-        })?,
+        None => {
+            return Err(GlassError::AccessibilityUnavailable(
+                "no accessibility bus for this launch — relaunch the app with a11y:true \
+                 to enable the accessibility tree (Linux)"
+                    .into(),
+            ));
+        }
     };
     let zbus_conn = conn.connection().clone();
     let root = conn.root_accessible_on_registry().await.map_err(bus_err)?;

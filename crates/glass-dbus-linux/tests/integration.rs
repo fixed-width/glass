@@ -1,5 +1,6 @@
-//! `#[ignore]`d — needs `dbus-daemon` + `at-spi-bus-launcher`. Run via
-//! `scripts/test-a11y-selfbus.sh` or directly with those tools installed.
+//! `#[ignore]`d — needs `dbus-daemon` + `at-spi-bus-launcher`. Run directly with
+//! those tools installed:
+//! `cargo test -p glass-dbus-linux --test integration -- --ignored`.
 
 use glass_dbus_linux::PrivateBus;
 
