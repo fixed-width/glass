@@ -536,7 +536,19 @@ impl Platform for X11Platform {
         glass_sandbox_linux::run_build(spec)?;
         self.spawn(spec)?;
         match self.discover_window(spec).and_then(|_| self.window_geometry()) {
-            Ok(geo) => Ok(geo),
+            Ok(geo) => {
+                // Give the launched window keyboard focus so synthetic keys reach
+                // it (no WM in the headless Xvfb assigns focus). Best-effort: a
+                // focus failure must not fail an otherwise-successful launch.
+                if let Some(win) = self.window {
+                    if let Err(e) = self.focus_window(win) {
+                        eprintln!(
+                            "glass: focus-on-launch failed (keys may not reach the window): {e}"
+                        );
+                    }
+                }
+                Ok(geo)
+            }
             Err(e) => {
                 // Window never appeared (or geometry failed): don't orphan the child.
                 self.kill_child();

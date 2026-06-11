@@ -800,6 +800,35 @@ fn sandbox_cwd_equals_home_does_not_expose_real_home() {
     }
 }
 
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn start_app_focuses_window_so_keys_reach_it() {
+    use glass_core::KeyEvent;
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    // --no-self-focus: the fixture does NOT focus itself, so a key reaches it
+    // only if start_app focused it. (The default fixture self-focuses, which
+    // masks this gap — see the spec.)
+    let spec = AppSpec {
+        build: None,
+        run: vec![TESTAPP.to_string(), "--no-self-focus".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+    };
+    p.start_app(&spec).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    // No explicit window(Focus)/select_window: start_app must have focused it.
+    p.send_key(&KeyEvent::Text("a".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=97", 40),
+        "key 'a' did not reach the window — start_app did not focus it"
+    );
+    p.stop_app().unwrap();
+}
+
 /// With `sandbox: Off`, `start_app` never checks for bwrap.
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
