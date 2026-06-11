@@ -9,9 +9,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use nix::errno::Errno;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use rustix::process::{kill_process, Pid, Signal};
 
 use glass_core::{GlassError, Result};
 
@@ -108,12 +106,14 @@ fn reap_children(dbus: &mut Child, atspi: &mut Child) {
 
 /// SIGTERM a child, poll for exit until `REAP_GRACE`, SIGKILL as a fallback, then reap.
 fn reap_graceful(child: &mut Child) {
-    // SIGTERM; ESRCH just means it already exited (so nothing to reap-signal).
-    match kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
-        Ok(()) | Err(Errno::ESRCH) => {}
-        Err(_) => {
-            // Couldn't signal for some other reason; fall back to SIGKILL.
-            let _ = child.kill();
+    // SIGTERM; SRCH (ESRCH) just means it already exited (so nothing to reap-signal).
+    if let Some(pid) = Pid::from_raw(child.id() as i32) {
+        match kill_process(pid, Signal::TERM) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(_) => {
+                // Couldn't signal for some other reason; fall back to SIGKILL.
+                let _ = child.kill();
+            }
         }
     }
     let deadline = Instant::now() + REAP_GRACE;
