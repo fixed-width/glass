@@ -31,6 +31,10 @@ use crate::util::{extended_frame_bounds, raw_to_hwnd};
 /// One mouse-wheel notch in `mouseData` units (Win32 `WHEEL_DELTA`).
 const WHEEL_DELTA: i32 = 120;
 
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`: normalized (0..65535) coordinates
+/// over the whole virtual desktop — what every absolute mouse `INPUT` here uses.
+const ABS: MOUSE_EVENT_FLAGS = MOUSE_EVENT_FLAGS(MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
+
 /// Build a `MOUSEINPUT` `INPUT` carrying `dx`/`dy` (normalized 0..65535 coords for
 /// absolute moves; `mouseData` left 0 — use [`mouse_wheel`] for wheel events).
 fn mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
@@ -138,6 +142,65 @@ fn button_flags(button: MouseButton) -> (MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS) {
     }
 }
 
+/// Lets `glass_core::run_drag` drive a Windows drag through `SendInput`. Unlike the old
+/// single-batch drag, each primitive is its own `SendInput`, so `run_drag` paces the
+/// motion over `duration_ms` and dwells at the endpoint before releasing. With
+/// `MOUSEEVENTF_ABSOLUTE` a button event's coords are authoritative, so the sink presses
+/// and releases at the last position it moved to (the press at the start, the release at
+/// the re-asserted endpoint).
+struct WindowsDragSink<'a> {
+    origin: (i32, i32),
+    v0: (i32, i32),
+    vs: (i32, i32),
+    down: MOUSE_EVENT_FLAGS,
+    up: MOUSE_EVENT_FLAGS,
+    mods: &'a [Modifier],
+    /// Last normalized position emitted by `place`/`move_to`. `button` fires there,
+    /// because with `MOUSEEVENTF_ABSOLUTE` the up/down event's own coords are
+    /// authoritative — releasing without this would snap the cursor to (0,0) and drop
+    /// the drag at the desktop origin. `run_drag` always calls `place` before any
+    /// `button`, so the `(0, 0)` seed is overwritten before it is ever read.
+    last: (i32, i32),
+}
+
+impl WindowsDragSink<'_> {
+    fn norm(&self, x: i32, y: i32) -> (i32, i32) {
+        dpi::screen_to_normalized(self.v0, self.vs, dpi::window_to_screen(self.origin, (x, y)))
+    }
+}
+
+impl glass_core::DragSink for WindowsDragSink<'_> {
+    fn place(&mut self, x: i32, y: i32) -> Result<()> {
+        self.move_to(x, y)
+    }
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        let (nx, ny) = self.norm(x, y);
+        self.last = (nx, ny);
+        send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])
+    }
+    fn button(&mut self, down: bool) -> Result<()> {
+        let (nx, ny) = self.last;
+        let flag = if down { self.down } else { self.up };
+        send(&[mouse(nx, ny, flag | ABS)])
+    }
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if self.mods.is_empty() {
+            return Ok(());
+        }
+        let mut inputs = Vec::with_capacity(self.mods.len());
+        if down {
+            for m in self.mods {
+                inputs.push(key_vk(modifier_vk(*m), false));
+            }
+        } else {
+            for m in self.mods.iter().rev() {
+                inputs.push(key_vk(modifier_vk(*m), true));
+            }
+        }
+        send(&inputs)
+    }
+}
+
 /// Inject a pointer event into the active window. Coordinates are window-relative.
 pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
     let hwnd = raw_to_hwnd(active_hwnd);
@@ -158,9 +221,6 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
     };
     let to_norm =
         |x: i32, y: i32| dpi::screen_to_normalized(v0, vs, dpi::window_to_screen(origin, (x, y)));
-
-    const ABS: MOUSE_EVENT_FLAGS =
-        MOUSE_EVENT_FLAGS(MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
 
     match *event {
         PointerEvent::Move { x, y } => {
@@ -184,31 +244,13 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             }
             send(&inputs)?;
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
-            let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
+        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
+            let gesture =
+                glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
             let (down, up) = button_flags(button);
-            let mut inputs = Vec::with_capacity(path.len() + 2 + modifiers.len() * 2);
-            for m in modifiers {
-                inputs.push(key_vk(modifier_vk(*m), false));
-            }
-            let (nx0, ny0) = to_norm(path[0].0, path[0].1);
-            inputs.push(mouse(nx0, ny0, MOUSEEVENTF_MOVE | ABS));
-            inputs.push(mouse(nx0, ny0, down | ABS));
-            for &(px, py) in &path[1..] {
-                let (nx, ny) = to_norm(px, py);
-                inputs.push(mouse(nx, ny, MOUSEEVENTF_MOVE | ABS));
-            }
-            // Release at the LAST path point, not the origin: the ABSOLUTE flag makes the
-            // UP event's coords authoritative, so reusing nx0/ny0 would snap the cursor back
-            // and drop the drag at (from). drag_path always returns >=1 point; for a
-            // zero-length drag last == path[0], so this is correct in the degenerate case too.
-            let last = path[path.len() - 1];
-            let (nxl, nyl) = to_norm(last.0, last.1);
-            inputs.push(mouse(nxl, nyl, up | ABS));
-            for m in modifiers.iter().rev() {
-                inputs.push(key_vk(modifier_vk(*m), true));
-            }
-            send(&inputs)?;
+            let mut sink =
+                WindowsDragSink { origin, v0, vs, down, up, mods: modifiers, last: (0, 0) };
+            glass_core::run_drag(&mut sink, &gesture)?;
         }
         PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
             let (nx, ny) = to_norm(x, y);
