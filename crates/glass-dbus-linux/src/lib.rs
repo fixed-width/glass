@@ -23,7 +23,7 @@ pub struct PrivateBus {
     dbus_stdout: ChildStdout,
     // at-spi-bus-launcher writes its socket under $XDG_RUNTIME_DIR/at-spi/; a private
     // dir keeps it off the host's /run/user/UID/at-spi/. Removed on Drop.
-    _runtime_dir: tempfile::TempDir,
+    runtime_dir: tempfile::TempDir,
 }
 
 impl PrivateBus {
@@ -33,11 +33,28 @@ impl PrivateBus {
     pub fn a11y_bus_address(&self) -> &str {
         &self.a11y_bus_address
     }
+    /// The private runtime dir holding this bus's sockets (session-bus + at-spi/). Bind this
+    /// into a sandboxed run so the launched app can reach the advertised `unix:path=` sockets.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        self.runtime_dir.path()
+    }
 
     pub fn start() -> Result<PrivateBus> {
         let dbus_bin = glass_core::tool_path("GLASS_DBUS_DAEMON", "dbus-daemon");
+
+        // Create the private runtime dir first so the session socket lives inside it.
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("glass-a11y-")
+            .tempdir()
+            .map_err(|e| GlassError::Backend(format!("a11y runtime dir: {e}")))?;
+
+        let session_sock = runtime_dir.path().join("session-bus");
         let mut dbus = Command::new(&dbus_bin)
-            .args(["--session", "--print-address"])
+            .args([
+                "--session",
+                &format!("--address=unix:path={}", session_sock.display()),
+                "--print-address",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -62,10 +79,6 @@ impl PrivateBus {
                 ));
             }
         };
-        let runtime_dir = tempfile::Builder::new()
-            .prefix("glass-a11y-")
-            .tempdir()
-            .map_err(|e| GlassError::Backend(format!("a11y runtime dir: {e}")))?;
 
         let mut atspi = match Command::new(&launcher)
             .env("DBUS_SESSION_BUS_ADDRESS", &session_bus_address)
@@ -89,7 +102,7 @@ impl PrivateBus {
                 session_bus_address,
                 a11y_bus_address,
                 dbus_stdout,
-                _runtime_dir: runtime_dir,
+                runtime_dir,
             }),
             Err(e) => {
                 reap_children(&mut dbus, &mut atspi);
@@ -199,4 +212,28 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
             "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
         )))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run explicitly"]
+    fn session_bus_is_a_path_socket_in_the_private_dir() {
+        let bus = PrivateBus::start().expect("private bus");
+        let addr = bus.session_bus_address();
+        assert!(addr.starts_with("unix:path="), "session bus must be a path socket, got {addr}");
+        let dir = bus.runtime_dir().to_string_lossy().into_owned();
+        assert!(addr.contains(&dir), "socket {addr} must live in the private runtime dir {dir}");
+    }
+
+    #[test]
+    #[ignore = "spawns two private buses; run explicitly"]
+    fn two_instances_have_distinct_socket_paths() {
+        let a = PrivateBus::start().expect("bus a");
+        let b = PrivateBus::start().expect("bus b");
+        assert_ne!(a.session_bus_address(), b.session_bus_address());
+        assert_ne!(a.runtime_dir(), b.runtime_dir());
+    }
 }
