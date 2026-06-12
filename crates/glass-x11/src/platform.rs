@@ -605,6 +605,47 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
 // real app's descendants now lives in the shared `glass-proc-linux` crate
 // (`proc_tree_pids`), used by both the X11 and Wayland backends.
 
+/// Lets `glass_core::run_drag` drive an X11 drag through the backend's existing
+/// XTEST primitives. Each method self-commits with `XFlush`; modifier keycodes
+/// are held between `modifiers(true)`/`modifiers(false)`.
+struct X11DragSink<'a> {
+    p: &'a X11Platform,
+    ox: i32,
+    oy: i32,
+    b: u8,
+    mods: &'a [glass_core::keys::Modifier],
+    kcs: Vec<u8>,
+}
+
+impl X11DragSink<'_> {
+    fn flush(&self) -> Result<()> {
+        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+}
+
+impl glass_core::DragSink for X11DragSink<'_> {
+    fn place(&mut self, x: i32, y: i32) -> Result<()> {
+        self.move_to(x, y)
+    }
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        self.p.warp(self.ox, self.oy, x, y)?;
+        self.flush()
+    }
+    fn button(&mut self, down: bool) -> Result<()> {
+        let kind = if down { XT_BTN_PRESS } else { XT_BTN_RELEASE };
+        self.p.button(kind, self.b)?;
+        self.flush()
+    }
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if down {
+            self.kcs = self.p.press_mods(self.mods)?;
+        } else {
+            self.p.release_mods(&self.kcs)?;
+        }
+        self.flush()
+    }
+}
+
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         if spec.sandbox != glass_core::SandboxLevel::Off {
@@ -719,19 +760,17 @@ impl Platform for X11Platform {
                 self.release_mods(&kcs)?;
             }
             PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
-                let b = button_number(button);
-                let (waypoints, step) = glass_core::drag_schedule((from_x, from_y), (to_x, to_y), duration_ms);
-                self.warp(ox, oy, waypoints[0].0, waypoints[0].1)?;
-                let kcs = self.press_mods(modifiers)?;
-                self.button(XT_BTN_PRESS, b)?;
-                self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-                for &(px, py) in &waypoints[1..] {
-                    std::thread::sleep(step);
-                    self.warp(ox, oy, px, py)?;
-                    self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-                }
-                self.button(XT_BTN_RELEASE, b)?;
-                self.release_mods(&kcs)?;
+                let gesture =
+                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                let mut sink = X11DragSink {
+                    p: &*self,
+                    ox,
+                    oy,
+                    b: button_number(button),
+                    mods: modifiers.as_slice(),
+                    kcs: Vec::new(),
+                };
+                glass_core::run_drag(&mut sink, &gesture)?;
             }
         }
         self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
