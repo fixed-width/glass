@@ -242,7 +242,9 @@ impl AuditSink for JsonlSink {
     fn record(&self, act: &Actuation, ctx: &ActuationContext, outcome: &AuditOutcome, dur: Duration) {
         let Some((action, args, raw)) = describe(act) else { return };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        st.seq += 1;
+        // Monotonic event counter. `saturating_add` so an (unreachable) overflow can't
+        // panic while the lock is held — `record` must never panic (trait contract).
+        st.seq = st.seq.saturating_add(1);
         if action == "launch" {
             st.session = Some(mint_session());
         }
@@ -258,6 +260,9 @@ impl AuditSink for JsonlSink {
             content: raw.as_deref().and_then(|r| render_content(r, &self.cfg)),
             result: ResultRecord {
                 ok: outcome.ok,
+                // `error` is recorded verbatim and is NOT run through content redaction.
+                // Invariant: backend error messages must never embed actuation content
+                // (e.g. the typed text), or it would leak here regardless of content mode.
                 error: outcome.error.clone(),
                 duration_ms: u64::try_from(dur.as_millis()).unwrap_or(u64::MAX),
             },
@@ -265,6 +270,9 @@ impl AuditSink for JsonlSink {
         if action == "stop" {
             st.session = None;
         }
+        // On write/serialize failure: count it, emit loudly, and continue — `seq` has
+        // already advanced, so a GAP in the persisted seq sequence is the intended
+        // signal that a record was lost. Do NOT renumber to hide a drop.
         match serde_json::to_string(&rec) {
             Ok(mut line) => {
                 line.push('\n');
@@ -283,7 +291,12 @@ impl AuditSink for JsonlSink {
 
 fn mint_session() -> String {
     let mut b = [0u8; 8];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    // `try_fill_bytes`, not `fill_bytes`: `record` must never panic, and `OsRng` can
+    // fail. A session id only distinguishes start→stop cycles (it need not be
+    // unpredictable), so on the astronomically-rare RNG error use a fixed fallback tag.
+    if rand::rngs::OsRng.try_fill_bytes(&mut b).is_err() {
+        return "s-norand".to_string();
+    }
     format!("s-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
 }
 
