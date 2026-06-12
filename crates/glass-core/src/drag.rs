@@ -7,7 +7,7 @@ use std::time::Duration;
 /// linearly interpolated at ~1px along the dominant axis (capped at
 /// `MAX_STEPS`). Endpoints are exact (`path[0] == from`, `path[last] == to`); a
 /// zero-length drag yields a single point.
-pub fn drag_path(from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
+pub(crate) fn drag_path(from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
     const MAX_STEPS: i64 = 512;
     let dx = (to.0 - from.0) as i64;
     let dy = (to.1 - from.1) as i64;

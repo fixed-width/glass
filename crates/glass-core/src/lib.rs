@@ -16,7 +16,7 @@ pub mod frame;
 pub use frame::{Frame, Region};
 
 pub mod drag;
-pub use drag::{drag_path, run_drag, DragGesture, DragSink};
+pub use drag::{run_drag, DragGesture, DragSink};
 
 pub mod keys;
 pub use keys::Modifier;
