@@ -800,10 +800,10 @@ impl Platform for WaylandPlatform {
                     kb.modifiers(0, 0, 0, 0);
                 }
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
+            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
                 let b = evdev_button(button);
-                let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
-                position(&mut session.queue, &mut session.state, path[0].0, path[0].1)?;
+                let (waypoints, step) = glass_core::drag_schedule((from_x, from_y), (to_x, to_y), duration_ms);
+                position(&mut session.queue, &mut session.state, waypoints[0].0, waypoints[0].1)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
                     upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
@@ -812,9 +812,11 @@ impl Platform for WaylandPlatform {
                 vp.button(t, b, ButtonState::Pressed);
                 vp.frame();
                 settle(&mut session.queue, &mut session.state)?;
-                for &(px, py) in &path[1..] {
+                for &(px, py) in &waypoints[1..] {
+                    std::thread::sleep(step);
                     vp.motion_absolute(t, ax(px), ay(py), w, h);
                     vp.frame();
+                    settle(&mut session.queue, &mut session.state)?;
                 }
                 vp.button(t, b, ButtonState::Released);
                 vp.frame();
