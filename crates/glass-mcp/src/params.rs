@@ -146,7 +146,12 @@ pub struct DragArgs {
 pub struct ScrollArgs {
     pub x: i32,
     pub y: i32,
+    /// Horizontal scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
+    /// pixels). Positive `dx` sends wheel-right, negative wheel-left; glass clicks `|dx|` times.
     pub dx: Option<i32>,
+    /// Vertical scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
+    /// pixels). Positive `dy` sends wheel-down, negative wheel-up; glass clicks `|dy|` times. How
+    /// an app maps a wheel notch to its view (lines, pixels, zoom) is the app's choice.
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
