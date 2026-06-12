@@ -973,21 +973,25 @@ fn window_op_on_a_closed_window_reports_window_not_found() {
     // Give the server a moment to reap the now-dead window resource.
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    // A window op against the stale id must surface the friendly WindowNotFound,
-    // not an opaque Backend(... BadWindow/BadDrawable ...).
-    let err = p
-        .window(&WindowOp::Geometry)
-        .expect_err("geometry on a closed window must fail");
+    // Focus on the stale id must surface the friendly WindowNotFound, not an
+    // opaque Backend(... BadWindow/BadDrawable ...). Test Focus first, while the
+    // id is freshly stale: focus_window's raise hits BadWindow/BadDrawable and
+    // translates it (clearing the id), so this exercises that path directly —
+    // once the id is cleared, later ops short-circuit via require_window.
+    let focus_err = p
+        .window(&WindowOp::Focus)
+        .expect_err("focus on a closed window must fail");
     assert!(
-        matches!(err, GlassError::WindowNotFound),
-        "expected WindowNotFound, got {err:?}: {err}"
+        matches!(focus_err, GlassError::WindowNotFound),
+        "expected WindowNotFound from Focus, got {focus_err:?}: {focus_err}"
     );
 
-    // The stored window must have been cleared: the next op also reports
-    // WindowNotFound (a fresh BadWindow here would prove it wasn't reset).
+    // The stored window must have been cleared by the Focus translation above:
+    // the next op also reports WindowNotFound (a fresh BadWindow here would prove
+    // it wasn't reset).
     let again = p
         .window(&WindowOp::Geometry)
-        .expect_err("second geometry must also fail");
+        .expect_err("geometry after a cleared window must also fail");
     assert!(
         matches!(again, GlassError::WindowNotFound),
         "expected WindowNotFound on the follow-up op, got {again:?}: {again}"

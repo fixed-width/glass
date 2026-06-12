@@ -560,10 +560,23 @@ impl X11Platform {
     /// the server to the focused window; in the WM-less headless Xvfb there is no
     /// window manager to assign focus, so glass must do it for synthetic keys to
     /// land. Used on launch, on select, and by `WindowOp::Focus`.
-    fn focus_window(&self, win: Window) -> Result<()> {
-        self.conn
+    ///
+    /// `.check()`s the raise so a closed window's `BadWindow`/`BadDrawable` is
+    /// observed here and translated into `WindowNotFound` (forgetting the stale
+    /// id), consistent with `configure_active`/`window_geometry` — rather than
+    /// surfacing an opaque `Backend(...)`.
+    fn focus_window(&mut self, win: Window) -> Result<()> {
+        let cookie = self
+            .conn
             .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
             .map_err(|e| GlassError::Backend(format!("raise: {e}")))?;
+        cookie.check().map_err(|e| {
+            if is_window_gone(&e) {
+                self.note_window_gone()
+            } else {
+                GlassError::Backend(format!("raise: {e}"))
+            }
+        })?;
         self.conn
             .set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
             .map_err(|e| GlassError::Backend(format!("set_input_focus: {e}")))?;
