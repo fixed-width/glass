@@ -108,6 +108,10 @@ pub struct WaitLogOutcome {
     /// Cursor to resume from: just past the matched line, or the buffer end on timeout.
     pub cursor: u64,
     pub elapsed_ms: u64,
+    /// Set on a timeout when the substring was already in the buffer *before* this call's
+    /// start cursor (the default-cursor footgun: a fast-boot line is otherwise skipped).
+    /// Points the caller at `cursor:0` instead of failing silently.
+    pub note: Option<String>,
 }
 
 struct ActiveSession {
@@ -518,8 +522,31 @@ impl Glass {
                 line: Some(line),
                 matched: true,
                 elapsed_ms: outcome.elapsed_ms,
+                note: None,
             },
-            None => WaitLogOutcome { matched: false, line: None, cursor: end, elapsed_ms: outcome.elapsed_ms },
+            None => {
+                // The default cursor is the buffer end at call start, so a line emitted
+                // *before* this call (e.g. a fast-boot "ready") is skipped and we time out.
+                // If the substring is already in the buffer before our start cursor, say so
+                // rather than failing silently — point the caller at cursor:0.
+                let note = if params.cursor.is_none() {
+                    let (earlier, _) = s.logs.read(0, 1, stream, Some(&contains));
+                    earlier
+                        .into_iter()
+                        .next()
+                        .filter(|l| l.seq < start_cursor)
+                        .map(|l| {
+                            format!(
+                                "{contains:?} was already in the log at seq {} (before this call); \
+                                 pass cursor:0 to match already-buffered lines",
+                                l.seq
+                            )
+                        })
+                } else {
+                    None
+                };
+                WaitLogOutcome { matched: false, line: None, cursor: end, elapsed_ms: outcome.elapsed_ms, note }
+            }
         })
     }
 
@@ -1471,6 +1498,11 @@ mod tests {
             .unwrap();
         assert!(!o.matched);
         assert!(o.line.is_none());
+        // Footgun guard: the line WAS in the buffer (seq 0) before the default start
+        // cursor, so the timeout must say so and point at cursor:0 — not fail silently.
+        let note = o.note.expect("timeout note when the substring was already buffered");
+        assert!(note.contains("cursor:0"), "note should point at cursor:0, got: {note}");
+        assert!(note.contains("seq 0"), "note should cite the buffered seq, got: {note}");
     }
 
     #[test]
