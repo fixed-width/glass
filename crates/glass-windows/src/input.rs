@@ -184,7 +184,7 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             }
             send(&inputs)?;
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
+        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
             let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
             let (down, up) = button_flags(button);
             let mut inputs = Vec::with_capacity(path.len() + 2 + modifiers.len() * 2);

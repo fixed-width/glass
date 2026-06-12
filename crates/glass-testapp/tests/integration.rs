@@ -125,6 +125,7 @@ fn drag_emits_continuous_motion() {
         to_y: 20,
         button: MouseButton::Left,
         modifiers: vec![],
+        duration_ms: 200,
     })
     .unwrap();
     // The fixture echoes "EVENT motion ..." for each button-held motion. A

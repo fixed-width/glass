@@ -53,7 +53,7 @@ pub enum MouseButton {
 pub enum PointerEvent {
     Move { x: i32, y: i32 },
     Click { x: i32, y: i32, button: MouseButton, count: u32, modifiers: Vec<Modifier> },
-    Drag { from_x: i32, from_y: i32, to_x: i32, to_y: i32, button: MouseButton, modifiers: Vec<Modifier> },
+    Drag { from_x: i32, from_y: i32, to_x: i32, to_y: i32, button: MouseButton, modifiers: Vec<Modifier>, duration_ms: u64 },
     Scroll { x: i32, y: i32, dx: i32, dy: i32, modifiers: Vec<Modifier> },
 }
 

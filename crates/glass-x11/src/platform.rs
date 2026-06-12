@@ -643,7 +643,7 @@ impl Platform for X11Platform {
                 }
                 self.release_mods(&kcs)?;
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
+            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
                 let b = button_number(button);
                 let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
                 self.warp(ox, oy, path[0].0, path[0].1)?;

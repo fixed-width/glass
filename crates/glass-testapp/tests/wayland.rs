@@ -137,6 +137,7 @@ fn drag_emits_continuous_motion() {
         to_y: 20,
         button: MouseButton::Left,
         modifiers: vec![],
+        duration_ms: 200,
     })
     .unwrap();
     let mut motions = 0;

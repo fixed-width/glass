@@ -136,6 +136,10 @@ pub struct DragArgs {
     pub button: Option<String>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
+    /// Span the drag's motion over this many milliseconds so a frame-based GUI
+    /// (egui/winit) samples the path across multiple frames (and registers the
+    /// drag even while it repaints). Default 200. Lower = faster but coarser.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

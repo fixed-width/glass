@@ -800,7 +800,7 @@ impl Platform for WaylandPlatform {
                     kb.modifiers(0, 0, 0, 0);
                 }
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers } => {
+            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
                 let b = evdev_button(button);
                 let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
                 position(&mut session.queue, &mut session.state, path[0].0, path[0].1)?;
