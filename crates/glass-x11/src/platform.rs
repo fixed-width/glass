@@ -9,10 +9,11 @@ use glass_core::{
 };
 use glass_proc_linux::proc_tree_pids;
 use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::protocol::ErrorKind;
 use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 
 const XT_MOTION: u8 = 6; // MotionNotify
 const XT_BTN_PRESS: u8 = 4; // ButtonPress
@@ -71,6 +72,17 @@ fn normalize_display(d: &str) -> String {
     }
 }
 
+/// True when an X11 reply error means the target window's resource no longer
+/// exists: `BadWindow` (the id is not a window) or `BadDrawable` (the id is not
+/// a drawable — what `GetGeometry`/`TranslateCoordinates` report for a destroyed
+/// window). Other protocol/connection errors are genuine backend failures.
+fn is_window_gone(err: &ReplyError) -> bool {
+    matches!(
+        err,
+        ReplyError::X11Error(x) if matches!(x.error_kind, ErrorKind::Window | ErrorKind::Drawable)
+    )
+}
+
 impl X11Platform {
     /// Connect using `$DISPLAY`.
     pub fn new() -> Result<Self> {
@@ -127,25 +139,67 @@ impl X11Platform {
         self.window.ok_or(GlassError::WindowNotFound)
     }
 
-    /// Absolute geometry of the active target window (origin in root coords).
-    pub(crate) fn window_geometry(&self) -> Result<WindowGeometry> {
-        self.geometry_of(self.require_window()?)
+    /// The active window's resource is gone (it was closed/destroyed and the X
+    /// server rejected an op against its id). Forget the stale id so the next op
+    /// reports the friendly `WindowNotFound` rather than another raw protocol
+    /// error, and return that error.
+    fn note_window_gone(&mut self) -> GlassError {
+        self.window = None;
+        GlassError::WindowNotFound
     }
 
-    /// Absolute geometry of a specific window (origin in root coordinates).
+    /// Configure the active window and `.check()` the request so the server's
+    /// (asynchronous) reply is observed here: a closed window yields
+    /// `BadWindow`/`BadDrawable`, which we translate into `WindowNotFound` after
+    /// forgetting the stale id. `label` names the op for genuine backend errors.
+    fn configure_active(
+        &mut self,
+        win: Window,
+        aux: &ConfigureWindowAux,
+        label: &str,
+    ) -> Result<()> {
+        let cookie = self
+            .conn
+            .configure_window(win, aux)
+            .map_err(|e| GlassError::Backend(format!("{label}: {e}")))?;
+        cookie.check().map_err(|e| {
+            if is_window_gone(&e) {
+                self.note_window_gone()
+            } else {
+                GlassError::Backend(format!("{label}: {e}"))
+            }
+        })
+    }
+
+    /// Absolute geometry of the active target window (origin in root coords).
+    /// If the active window has been closed, the X server's `BadWindow`/
+    /// `BadDrawable` is translated into `WindowNotFound` and the stale id is
+    /// forgotten (so the next op reports the same friendly error, not a fresh
+    /// raw one).
+    pub(crate) fn window_geometry(&mut self) -> Result<WindowGeometry> {
+        let win = self.require_window()?;
+        self.geometry_of_raw(win).map_err(|e| {
+            if is_window_gone(&e) {
+                self.note_window_gone()
+            } else {
+                GlassError::Backend(format!("get_geometry reply: {e}"))
+            }
+        })
+    }
+
+    /// Absolute geometry of a specific window (origin in root coordinates). Used
+    /// for arbitrary (non-active) windows during enumeration, where a stale id
+    /// is just a backend error rather than a reason to clear the active window.
     fn geometry_of(&self, win: Window) -> Result<WindowGeometry> {
-        let geo = self
-            .conn
-            .get_geometry(win)
-            .map_err(|e| GlassError::Backend(format!("get_geometry: {e}")))?
-            .reply()
-            .map_err(|e| GlassError::Backend(format!("get_geometry reply: {e}")))?;
-        let abs = self
-            .conn
-            .translate_coordinates(win, self.root, 0, 0)
-            .map_err(|e| GlassError::Backend(format!("translate_coordinates: {e}")))?
-            .reply()
-            .map_err(|e| GlassError::Backend(format!("translate reply: {e}")))?;
+        self.geometry_of_raw(win)
+            .map_err(|e| GlassError::Backend(format!("get_geometry reply: {e}")))
+    }
+
+    /// Read a window's absolute geometry, preserving the typed X11 error so
+    /// callers can distinguish "window gone" from other backend failures.
+    fn geometry_of_raw(&self, win: Window) -> std::result::Result<WindowGeometry, ReplyError> {
+        let geo = self.conn.get_geometry(win)?.reply()?;
+        let abs = self.conn.translate_coordinates(win, self.root, 0, 0)?.reply()?;
         Ok(WindowGeometry {
             x: abs.dst_x as i32,
             y: abs.dst_y as i32,
@@ -708,23 +762,18 @@ impl Platform for X11Platform {
                 self.focus_window(win)?;
             }
             WindowOp::Resize { width, height } => {
-                self.conn
-                    .configure_window(
-                        win,
-                        &ConfigureWindowAux::new().width(width).height(height),
-                    )
-                    .map_err(|e| GlassError::Backend(format!("resize: {e}")))?;
+                self.configure_active(
+                    win,
+                    &ConfigureWindowAux::new().width(width).height(height),
+                    "resize",
+                )?;
             }
             WindowOp::Move { x, y } => {
-                self.conn
-                    .configure_window(win, &ConfigureWindowAux::new().x(x).y(y))
-                    .map_err(|e| GlassError::Backend(format!("move: {e}")))?;
+                self.configure_active(win, &ConfigureWindowAux::new().x(x).y(y), "move")?;
             }
             WindowOp::Geometry => {}
         }
         self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
-        // Let the server apply configure requests before reading geometry back.
-        let _ = self.conn.sync();
         self.window_geometry()
     }
 

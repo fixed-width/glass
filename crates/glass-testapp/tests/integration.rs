@@ -1032,3 +1032,53 @@ fn click_with_modifier_reaches_app() {
     assert!(saw_ctrl, "Control modifier (mask 0x04) not reflected on the button event");
     p.stop_app().unwrap();
 }
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn window_op_on_a_closed_window_reports_window_not_found() {
+    use glass_core::{GlassError, WindowOp};
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+
+    // Capture glass's stored window id, then kill it out from under glass via a
+    // separate raw connection so the id goes stale (dead drawable).
+    let win = {
+        let windows = p.list_windows().unwrap();
+        let main = windows.first().expect("at least one window");
+        main.id.0 as u32
+    };
+
+    let (conn, _screen) = x11rb::connect(Some(&xvfb.display)).expect("raw X connection");
+    conn.kill_client(win).unwrap().check().expect("kill_client");
+    conn.destroy_window(win).unwrap().check().ok(); // belt-and-suspenders
+    conn.sync().expect("sync raw connection");
+    // Give the server a moment to reap the now-dead window resource.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // A window op against the stale id must surface the friendly WindowNotFound,
+    // not an opaque Backend(... BadWindow/BadDrawable ...).
+    let err = p
+        .window(&WindowOp::Geometry)
+        .expect_err("geometry on a closed window must fail");
+    assert!(
+        matches!(err, GlassError::WindowNotFound),
+        "expected WindowNotFound, got {err:?}: {err}"
+    );
+
+    // The stored window must have been cleared: the next op also reports
+    // WindowNotFound (a fresh BadWindow here would prove it wasn't reset).
+    let again = p
+        .window(&WindowOp::Geometry)
+        .expect_err("second geometry must also fail");
+    assert!(
+        matches!(again, GlassError::WindowNotFound),
+        "expected WindowNotFound on the follow-up op, got {again:?}: {again}"
+    );
+
+    p.stop_app().ok();
+}
