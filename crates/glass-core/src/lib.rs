@@ -56,6 +56,9 @@ pub use accessibility::{
 pub mod marks;
 pub use marks::Mark;
 
+pub mod audit;
+pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};
+
 pub mod session;
 pub use session::{
     Backend, Glass, PlatformFactory, WaitElementOutcome, WaitElementParams, WaitLogOutcome,
