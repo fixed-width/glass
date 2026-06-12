@@ -1,6 +1,7 @@
 //! glass-mcp library root. `main.rs` is a thin binary over this so the serve
 //! path is reachable from integration tests.
 
+pub mod audit;
 pub mod cli;
 pub mod doctor;
 mod env;

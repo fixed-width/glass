@@ -32,6 +32,9 @@ tokio-util = { version = "0.7", optional = true }
 # Non-optional: the untrusted-conduit nonce (untrusted.rs, compiled in every build,
 # incl. --no-default-features) needs a CSPRNG, as does network token generation.
 rand = { version = "0.8" }
+# Audit log: SHA-256 content digests (redacted by default) + RFC3339 timestamps.
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
