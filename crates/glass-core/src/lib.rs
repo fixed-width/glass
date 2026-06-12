@@ -43,7 +43,7 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 
 pub mod platform;
 pub use platform::{
-    AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
+    A11yBind, AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
     WindowHint, WindowId, WindowInfo, WindowOp,
 };
 

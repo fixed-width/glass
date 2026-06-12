@@ -250,9 +250,11 @@ impl X11Platform {
         // injects the private session-bus address into the launched app's env.
         // For sandboxed launches, also bind the private bus dir into bwrap so the
         // sandboxed app can reach the advertised unix:path= sockets.
-        let dbus_addr = self.dbus.as_ref().map(|b| b.session_bus_address());
-        let a11y_dir = self.dbus.as_ref().map(|b| b.runtime_dir().to_path_buf());
-        let mut cmd = build_command(spec, &self.display, dbus_addr, a11y_dir.as_deref());
+        let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
+            addr: b.session_bus_address(),
+            dir: b.runtime_dir(),
+        });
+        let mut cmd = build_command(spec, &self.display, a11y);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
