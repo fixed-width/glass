@@ -39,7 +39,7 @@ pub struct X11Platform {
     // A private Xvfb we spawned (default path); kept alive so Drop tears it down.
     xvfb: Option<crate::xvfb::Xvfb>,
     // A private a11y-enabled D-Bus session bus we spawned for the launched app;
-    // kept alive so Drop tears it down. Set on each (sandbox=off) launch.
+    // kept alive so Drop tears it down. Set on each a11y-enabled launch (any sandbox level).
     dbus: Option<glass_dbus_linux::PrivateBus>,
     // Background thread that owns the CLIPBOARD selection and serves pastes.
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
@@ -248,8 +248,11 @@ impl X11Platform {
     fn spawn(&mut self, spec: &AppSpec) -> Result<()> {
         // `start_app` sets `self.dbus` before calling `spawn`, so reading it here
         // injects the private session-bus address into the launched app's env.
+        // For sandboxed launches, also bind the private bus dir into bwrap so the
+        // sandboxed app can reach the advertised unix:path= sockets.
         let dbus_addr = self.dbus.as_ref().map(|b| b.session_bus_address());
-        let mut cmd = build_command(spec, &self.display, dbus_addr);
+        let a11y_dir = self.dbus.as_ref().map(|b| b.runtime_dir().to_path_buf());
+        let mut cmd = build_command(spec, &self.display, dbus_addr, a11y_dir.as_deref());
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -601,8 +604,9 @@ impl Platform for X11Platform {
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never touches the
         // host /run/user/UID/at-spi/) so the launched app publishes an AT-SPI tree. Only
         // when the caller asked for it (`a11y: true`); best-effort if it can't start.
-        // Phase 1: sandbox=off only (sandboxed a11y needs the socket bound into bwrap).
-        self.dbus = if spec.a11y && spec.sandbox == glass_core::SandboxLevel::Off {
+        // For sandboxed launches, `spawn` binds the private bus dir into the bwrap run
+        // so the confined app can reach the advertised unix:path= sockets.
+        self.dbus = if spec.a11y {
             match glass_dbus_linux::PrivateBus::start() {
                 Ok(b) => Some(b),
                 Err(e) => {
@@ -611,7 +615,7 @@ impl Platform for X11Platform {
                 }
             }
         } else {
-            None // sandboxed launches need the socket bound into bwrap — later phase.
+            None
         };
         if let Err(e) = self.spawn(spec) {
             self.kill_child(); // reap the private bus (and any child) on a failed spawn
