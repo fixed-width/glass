@@ -92,6 +92,8 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
     Some(match act {
         Actuation::Launch { spec, backend } => {
             let tail: Vec<&String> = spec.run.iter().skip(1).collect();
+            // Deliberately omit spec.env and spec.cwd: env vars commonly carry secrets
+            // (tokens, keys) and must not land in the log. Keep them out if extended.
             (
                 "launch",
                 json!({
