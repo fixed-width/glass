@@ -643,14 +643,17 @@ impl Platform for X11Platform {
                 }
                 self.release_mods(&kcs)?;
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms: _duration_ms } => {
+            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
                 let b = button_number(button);
-                let path = glass_core::drag_path((from_x, from_y), (to_x, to_y));
-                self.warp(ox, oy, path[0].0, path[0].1)?;
+                let (waypoints, step) = glass_core::drag_schedule((from_x, from_y), (to_x, to_y), duration_ms);
+                self.warp(ox, oy, waypoints[0].0, waypoints[0].1)?;
                 let kcs = self.press_mods(modifiers)?;
                 self.button(XT_BTN_PRESS, b)?;
-                for &(px, py) in &path[1..] {
+                self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+                for &(px, py) in &waypoints[1..] {
+                    std::thread::sleep(step);
                     self.warp(ox, oy, px, py)?;
+                    self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
                 }
                 self.button(XT_BTN_RELEASE, b)?;
                 self.release_mods(&kcs)?;

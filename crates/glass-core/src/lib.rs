@@ -16,7 +16,7 @@ pub mod frame;
 pub use frame::{Frame, Region};
 
 pub mod input;
-pub use input::drag_path;
+pub use input::{drag_path, drag_schedule};
 
 pub mod keys;
 pub use keys::Modifier;

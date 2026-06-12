@@ -972,3 +972,25 @@ fn stop_app_reaps_the_apps_forked_child() {
         "stop_app must reap the app's forked child (pid {child_pid}), not orphan it"
     );
 }
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn drag_is_time_paced() {
+    use glass_core::{MouseButton, PointerEvent};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    let t = std::time::Instant::now();
+    p.send_pointer(&PointerEvent::Drag {
+        from_x: 30, from_y: 30, to_x: 200, to_y: 200,
+        button: MouseButton::Left, modifiers: vec![], duration_ms: 200,
+    })
+    .unwrap();
+    let el = t.elapsed();
+    assert!(
+        el >= std::time::Duration::from_millis(150),
+        "a paced 200ms drag should span ~200ms of wall-clock, took {el:?}"
+    );
+    p.stop_app().unwrap();
+}
