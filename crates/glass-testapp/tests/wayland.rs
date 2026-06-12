@@ -436,48 +436,5 @@ fn wayland_build_step_runs_before_launch() {
     drop(tmp); // clean up marker dir
 }
 
-/// With `sandbox = Strict`, the build step must fail when it attempts an outbound
-/// network connection (network namespace unshared). With `sandbox = Default`, the
-/// same build command MUST succeed (network is allowed).
-///
-/// Uses `bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'` — the SAME mechanism the X11
-/// equivalent (`strict_blocks_network_in_build_step`) uses, so the two backends'
-/// network tests stay aligned (no test-level disparity).
-/// NOTE: requires outbound egress to 1.1.1.1:53 (available on GitHub-hosted runners).
-#[test]
-#[ignore = "requires sway + bwrap; run via scripts/test-wayland.sh"]
-fn wayland_strict_blocks_network_in_build_step() {
-    // Strict: outbound TCP must be blocked — start_app returns an error.
-    let strict_spec = AppSpec {
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: APP_TIMEOUT_MS,
-        sandbox: glass_core::SandboxLevel::Strict,
-        a11y: false,
-    };
-    let mut p = WaylandPlatform::new().unwrap();
-    let strict_err = p.start_app(&strict_spec).expect_err("expected build failure under Strict");
-    // A failing build command returns AppNotStarted.
-    assert!(
-        matches!(strict_err, GlassError::AppNotStarted(_)),
-        "expected GlassError::AppNotStarted for strict network block, got {strict_err:?}"
-    );
-
-    // Default: the same build command must succeed (network is available).
-    let default_spec = AppSpec {
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: APP_TIMEOUT_MS,
-        sandbox: glass_core::SandboxLevel::Default,
-        a11y: false,
-    };
-    let mut p2 = WaylandPlatform::new().unwrap();
-    start(&mut p2, &default_spec);
-    p2.stop_app().unwrap();
-}
+// (Build-step network containment tests removed: the build step is unsandboxed by design —
+// only the launched run is contained. See the unsandbox-build change / gap #5.)

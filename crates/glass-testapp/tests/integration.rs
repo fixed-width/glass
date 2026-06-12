@@ -622,11 +622,13 @@ fn sandbox_off_build_step_writes_to_real_home() {
     assert!(exists, "Off sandbox: sentinel {sentinel_path:?} must exist (unconfined write)");
 }
 
-/// Under `Default` the sandbox HOME is an ephemeral tmpfs so a write to `$HOME`
-/// from inside the namespace stays inside and is invisible on the real FS.
+/// The build step is UNSANDBOXED (only the launched run is contained — gap #5), so even at the
+/// `Default` sandbox level the build runs with the full developer environment and writes the real
+/// `$HOME`. (Network access in the build is likewise the host's — no separate test; the run's
+/// containment is covered by the run-step sandbox tests.)
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn sandbox_default_build_step_cannot_write_real_home() {
+fn sandbox_default_build_step_writes_real_home() {
     let sentinel_name = format!("glass-sandbox-test-sentinel-default-{}.tmp", std::process::id());
     let real_home = std::env::var("HOME").expect("$HOME must be set");
     let sentinel_path = std::path::PathBuf::from(&real_home).join(&sentinel_name);
@@ -646,58 +648,12 @@ fn sandbox_default_build_step_cannot_write_real_home() {
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("default-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
+    let exists = sentinel_path.exists();
+    std::fs::remove_file(&sentinel_path).ok();
     assert!(
-        !sentinel_path.exists(),
-        "Default sandbox: sentinel {sentinel_path:?} must NOT exist (ephemeral HOME)"
+        exists,
+        "build is unsandboxed: sentinel {sentinel_path:?} must exist even at Default"
     );
-}
-
-/// Under `Strict` the build step runs with `--unshare-net` and cannot reach the
-/// network (TCP connection attempt fails → non-zero exit → `start_app` errors).
-#[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn strict_blocks_network_in_build_step() {
-    let xvfb = Xvfb::start();
-    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let spec = AppSpec {
-        // Try a TCP connect to 1.1.1.1:53 (Cloudflare DNS); /dev/tcp requires bash.
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: 8000,
-        sandbox: glass_core::SandboxLevel::Strict,
-        a11y: false,
-    };
-    let err = p.start_app(&spec).expect_err("Strict sandbox should block network in build step");
-    assert!(
-        matches!(err, glass_core::GlassError::AppNotStarted(_)),
-        "expected AppNotStarted (build failure), got {err}"
-    );
-}
-
-/// Under `Default` the build step can reach the network.
-// NOTE: this test requires outbound network egress on the host (passes on GitHub-hosted
-// runners which have egress by default; would need adjusting for an egress-restricted runner).
-#[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn default_allows_network_in_build_step() {
-    let xvfb = Xvfb::start();
-    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let spec = AppSpec {
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: 8000,
-        sandbox: glass_core::SandboxLevel::Default,
-        a11y: false,
-    };
-    p.start_app(&spec)
-        .unwrap_or_else(|e| panic!("Default sandbox should allow network in build step: {e}"));
-    p.stop_app().unwrap();
 }
 
 /// When `bwrap` is not on `PATH`, `start_app` with `Default` must return
@@ -741,77 +697,6 @@ fn fail_closed_when_bwrap_missing() {
         matches!(sandboxed_err, Some(glass_core::GlassError::SandboxUnavailable(_))),
         "expected SandboxUnavailable, got {sandboxed_err:?}"
     );
-}
-
-/// Prove that `cwd == real $HOME` no longer re-exposes the real home directory.
-///
-/// We write a uniquely-named sentinel file into the real `$HOME`.  Then we
-/// launch a build step (`cat` the sentinel) with `cwd = real $HOME` under
-/// `SandboxLevel::Default`.  Before the fix, `--bind <cwd> <cwd>` re-mounted
-/// the real HOME over the ephemeral tmpfs; the sentinel was readable and the
-/// build succeeded.  After the fix the bind is skipped, the sentinel is hidden
-/// by the tmpfs, and the build must fail → `start_app` returns an error.
-///
-/// The same build step succeeds under `SandboxLevel::Off` (no sandbox, no
-/// tmpfs), confirming the sentinel itself is readable — we are testing
-/// isolation, not a broken test.
-#[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn sandbox_cwd_equals_home_does_not_expose_real_home() {
-    let real_home = std::env::var("HOME").expect("$HOME must be set");
-    let sentinel_name = format!("glass_cwdhome_probe_{}.tmp", std::process::id());
-    let sentinel_path = std::path::PathBuf::from(&real_home).join(&sentinel_name);
-
-    // Write the sentinel to the real home so we have something to try to read.
-    std::fs::write(&sentinel_path, b"secret").expect("write sentinel");
-
-    // ---- Sanity check: Off sandbox, cwd=home — sentinel IS readable ----------
-    {
-        let xvfb = Xvfb::start();
-        let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-        let spec = AppSpec {
-            build: Some(format!("cat $HOME/{sentinel_name}")),
-            run: vec![TESTAPP.to_string()],
-            cwd: Some(std::path::PathBuf::from(&real_home)),
-            env: vec![],
-            window_hint: None,
-            timeout_ms: 8000,
-            sandbox: glass_core::SandboxLevel::Off,
-            a11y: false,
-        };
-        p.start_app(&spec).unwrap_or_else(|e| {
-            let _ = std::fs::remove_file(&sentinel_path);
-            panic!("Off sandbox: build step should succeed (sentinel visible), got {e}");
-        });
-        p.stop_app().unwrap();
-    }
-
-    // ---- Real test: Default sandbox, cwd=home — sentinel must NOT be readable -
-    {
-        let xvfb = Xvfb::start();
-        let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-        let spec = AppSpec {
-            build: Some(format!("cat $HOME/{sentinel_name}")),
-            run: vec![TESTAPP.to_string()],
-            cwd: Some(std::path::PathBuf::from(&real_home)),
-            env: vec![],
-            window_hint: None,
-            timeout_ms: 8000,
-            sandbox: glass_core::SandboxLevel::Default,
-            a11y: false,
-        };
-        let result = p.start_app(&spec);
-        let _ = std::fs::remove_file(&sentinel_path);
-        assert!(
-            result.is_err(),
-            "Default sandbox with cwd==HOME must NOT expose real home (build step \
-             reading the sentinel should fail); got Ok — containment gap still open!"
-        );
-        assert!(
-            matches!(result.unwrap_err(), glass_core::GlassError::AppNotStarted(_)),
-            "expected AppNotStarted (build-step cat of sentinel failed), got a different error"
-        );
-    }
 }
 
 #[test]
