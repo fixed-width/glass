@@ -699,6 +699,34 @@ fn fail_closed_when_bwrap_missing() {
     );
 }
 
+/// When `a11y: true` is requested but the private a11y bus can't start, the
+/// launch must fail loudly with `AccessibilityUnavailable` rather than silently
+/// degrading. Forces the bus to fail by pointing `GLASS_DBUS_DAEMON` at a
+/// nonexistent binary. Uses a RAII guard to restore the env even on panic;
+/// relies on `--test-threads=1` to avoid races with other tests.
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn a11y_true_fails_launch_when_bus_cannot_start() {
+    struct EnvGuard(Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 { Some(v) => std::env::set_var("GLASS_DBUS_DAEMON", v), None => std::env::remove_var("GLASS_DBUS_DAEMON") }
+        }
+    }
+    let _guard = EnvGuard(std::env::var_os("GLASS_DBUS_DAEMON"));
+    std::env::set_var("GLASS_DBUS_DAEMON", "/nonexistent/glass-no-such-dbus-daemon");
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let mut spec = app_spec();
+    spec.a11y = true;
+    let err = p.start_app(&spec).expect_err("a11y:true with an unstartable bus must fail the launch");
+    assert!(
+        matches!(err, glass_core::GlassError::AccessibilityUnavailable(_)),
+        "expected AccessibilityUnavailable, got {err:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
 fn start_app_focuses_window_so_keys_reach_it() {

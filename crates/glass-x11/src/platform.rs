@@ -603,17 +603,19 @@ impl Platform for X11Platform {
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never touches the
         // host /run/user/UID/at-spi/) so the launched app publishes an AT-SPI tree. Only
-        // when the caller asked for it (`a11y: true`); best-effort if it can't start.
-        // For sandboxed launches, `spawn` binds the private bus dir into the bwrap run
-        // so the confined app can reach the advertised unix:path= sockets.
+        // when the caller asked for it (`a11y: true`). The caller explicitly opted into
+        // a11y, so a bus that can't start now fails the launch with the real cause rather
+        // than silently degrading — nothing is leaked on this early return (`PrivateBus::start`
+        // reaps its own partial children on failure, and no app child / per-launch resource
+        // has been spawned yet at this `?`). For sandboxed launches, `spawn` binds the private
+        // bus dir into the bwrap run so the confined app can reach the advertised
+        // unix:path= sockets.
         self.dbus = if spec.a11y {
-            match glass_dbus_linux::PrivateBus::start() {
-                Ok(b) => Some(b),
-                Err(e) => {
-                    eprintln!("glass: private a11y bus unavailable ({e}); a11y tools will be limited");
-                    None
-                }
-            }
+            Some(glass_dbus_linux::PrivateBus::start().map_err(|e| {
+                glass_core::GlassError::AccessibilityUnavailable(format!(
+                    "a11y:true was requested but the private a11y bus could not start: {e}"
+                ))
+            })?)
         } else {
             None
         };
