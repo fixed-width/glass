@@ -130,6 +130,8 @@ struct ActiveSession {
     last_ax: Option<AxTree>,
     geometry: WindowGeometry,
     logs: LogBuffer,
+    /// Best-effort active window for audit attribution (id from list_windows/select_window).
+    active_window: Option<crate::audit::WindowRef>,
 }
 
 impl ActiveSession {
@@ -171,6 +173,7 @@ pub struct Glass {
     baselines: BaselineStore,
     log_capacity: usize,
     active: Option<ActiveSession>,
+    audit: Option<Box<dyn crate::audit::AuditSink>>,
 }
 
 impl Glass {
@@ -180,7 +183,30 @@ impl Glass {
         baselines: BaselineStore,
         log_capacity: usize,
     ) -> Self {
-        Self { factory, default_backend, baselines, log_capacity: log_capacity.max(1), active: None }
+        Self { factory, default_backend, baselines, log_capacity: log_capacity.max(1), active: None, audit: None }
+    }
+
+    /// Install the audit sink. Every subsequent actuation is recorded through it.
+    pub fn set_audit_sink(&mut self, sink: Box<dyn crate::audit::AuditSink>) {
+        self.audit = Some(sink);
+    }
+
+    fn emit_audit(&self, act: &crate::audit::Actuation, outcome: crate::audit::AuditOutcome, dur: std::time::Duration) {
+        if let Some(sink) = &self.audit {
+            let window = self.active.as_ref().and_then(|s| s.active_window.clone());
+            sink.record(act, &crate::audit::ActuationContext { window }, &outcome, dur);
+        }
+    }
+
+    fn element_ref(&self, id: AxNodeId) -> crate::audit::ElementRef {
+        let (role, name) = self
+            .active
+            .as_ref()
+            .and_then(|s| s.last_ax.as_ref())
+            .and_then(|t| t.find(id))
+            .map(|n| (Some(format!("{:?}", n.role)), n.name.clone()))
+            .unwrap_or((None, None));
+        crate::audit::ElementRef { id: id.0, role, name }
     }
 
     fn require_active(&self) -> Result<&ActiveSession> {
@@ -227,6 +253,17 @@ impl Glass {
 
     /// Start with an explicit backend, constructing it via the factory.
     pub fn start_on(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
+        let t = std::time::Instant::now();
+        let result = self.start_on_inner(backend, spec);
+        self.emit_audit(
+            &crate::audit::Actuation::Launch { spec, backend },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn start_on_inner(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
         // One active session: tear down any current one first.
         if let Some(mut s) = self.active.take() {
             let _ = s.platform.stop_app();
@@ -239,13 +276,38 @@ impl Glass {
             last_ax: None,
             geometry: geometry.clone(),
             logs: LogBuffer::new(self.log_capacity),
+            active_window: None,
         };
         session.pump();
+        session.active_window = session
+            .platform
+            .list_windows()
+            .ok()
+            .and_then(|ws| ws.iter().find(|w| w.active).or_else(|| ws.first()).cloned())
+            .map(|w| crate::audit::WindowRef { id: w.id.0, title: w.title });
         self.active = Some(session);
         Ok(geometry)
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        let t = std::time::Instant::now();
+        // Snapshot the window BEFORE stop_inner, which drops self.active — so this
+        // records on the dedicated path rather than emit_audit (which would see None
+        // after teardown). Keep this ordering if refactoring, or window attribution breaks.
+        let window = self.active.as_ref().and_then(|s| s.active_window.clone());
+        let result = self.stop_inner();
+        if let Some(sink) = &self.audit {
+            sink.record(
+                &crate::audit::Actuation::Stop,
+                &crate::audit::ActuationContext { window },
+                &crate::audit::AuditOutcome::from_result(&result),
+                t.elapsed(),
+            );
+        }
+        result
+    }
+
+    fn stop_inner(&mut self) -> Result<()> {
         let mut s = self.active.take().ok_or(GlassError::NoActiveSession)?;
         s.platform.stop_app()
         // `s` drops here, tearing down the spawned backend (Xvfb/sway).
@@ -281,6 +343,17 @@ impl Glass {
     }
 
     pub fn pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        let t = std::time::Instant::now();
+        let result = self.pointer_inner(event);
+        self.emit_audit(
+            &crate::audit::Actuation::Pointer { event },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn pointer_inner(&mut self, event: &PointerEvent) -> Result<()> {
         self.check_bounds(event)?;
         let s = self.active_mut()?;
         s.platform.send_pointer(event)?;
@@ -289,6 +362,17 @@ impl Glass {
     }
 
     pub fn key(&mut self, event: &KeyEvent) -> Result<()> {
+        let t = std::time::Instant::now();
+        let result = self.key_inner(event);
+        self.emit_audit(
+            &crate::audit::Actuation::Key { event },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn key_inner(&mut self, event: &KeyEvent) -> Result<()> {
         let s = self.active_mut()?;
         s.platform.send_key(event)?;
         s.pump();
@@ -300,10 +384,34 @@ impl Glass {
     }
 
     pub fn set_clipboard(&mut self, text: &str) -> Result<()> {
+        let t = std::time::Instant::now();
+        let result = self.set_clipboard_inner(text);
+        self.emit_audit(
+            &crate::audit::Actuation::ClipboardSet { text },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn set_clipboard_inner(&mut self, text: &str) -> Result<()> {
         self.active_mut()?.platform.set_clipboard(text)
     }
 
     pub fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        let t = std::time::Instant::now();
+        let result = self.window_inner(op);
+        if !matches!(op, WindowOp::Geometry) {
+            self.emit_audit(
+                &crate::audit::Actuation::Window { op },
+                crate::audit::AuditOutcome::from_result(&result),
+                t.elapsed(),
+            );
+        }
+        result
+    }
+
+    fn window_inner(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
         let s = self.active_mut()?;
         let geometry = s.platform.window(op)?;
         s.geometry = geometry.clone();
@@ -322,6 +430,7 @@ impl Glass {
         let s = self.active_mut()?;
         let geometry = s.platform.select_window(id)?;
         s.geometry = geometry.clone();
+        s.active_window = Some(crate::audit::WindowRef { id: id.0, title: None });
         s.pump();
         Ok(geometry)
     }
@@ -354,6 +463,18 @@ impl Glass {
     /// Click the element with id `id` from the most recent `a11y_snapshot`
     /// (clicks the center of its bounds, via the normal pointer path).
     pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
+        let t = std::time::Instant::now();
+        let element = self.element_ref(id);
+        let result = self.click_element_inner(id);
+        self.emit_audit(
+            &crate::audit::Actuation::ClickElement { element },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
         let (x, y) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
@@ -363,7 +484,7 @@ impl Glass {
                 .clamped_center(s.geometry.width, s.geometry.height)
                 .ok_or(GlassError::AxElementNotClickable(id.0))?
         };
-        self.pointer(&PointerEvent::Click { x, y, button: MouseButton::Left, count: 1, modifiers: vec![] })
+        self.pointer_inner(&PointerEvent::Click { x, y, button: MouseButton::Left, count: 1, modifiers: vec![] })
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -371,6 +492,18 @@ impl Glass {
     /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —
     /// `AxElementNotEditable`/`AxElementChanged`.
     pub fn set_value(&mut self, id: AxNodeId, text: &str) -> Result<()> {
+        let t = std::time::Instant::now();
+        let element = self.element_ref(id);
+        let result = self.set_value_inner(id, text);
+        self.emit_audit(
+            &crate::audit::Actuation::SetValue { element, text },
+            crate::audit::AuditOutcome::from_result(&result),
+            t.elapsed(),
+        );
+        result
+    }
+
+    fn set_value_inner(&mut self, id: AxNodeId, text: &str) -> Result<()> {
         let (target, ctx) = {
             let s = self.require_active()?;
             // Check for reader availability before consulting the snapshot, so that
@@ -631,9 +764,11 @@ impl Glass {
 mod tests {
     use super::*;
     use crate::accessibility::{AxNode, AxRect, AxRole, AxStates, AxTarget, ElementCondition};
+    use crate::audit::{Actuation, ActuationContext, AuditOutcome, AuditSink};
     use crate::platform::SandboxLevel;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Scriptable in-memory backend for testing the session manager.
     #[derive(Default)]
@@ -1684,5 +1819,87 @@ mod tests {
         // No session started — both ops should return NoActiveSession.
         assert!(matches!(g.get_clipboard().unwrap_err(), GlassError::NoActiveSession));
         assert!(matches!(g.set_clipboard("x").unwrap_err(), GlassError::NoActiveSession));
+    }
+
+    /// Records `"action:ok"` for each actuation the seam reports.
+    #[derive(Clone, Default)]
+    struct RecordingSink(Arc<Mutex<Vec<String>>>);
+    impl AuditSink for RecordingSink {
+        fn record(&self, act: &Actuation, _ctx: &ActuationContext, o: &AuditOutcome, _d: Duration) {
+            let action = match act {
+                Actuation::Launch { .. } => "launch",
+                Actuation::Stop => "stop",
+                Actuation::Pointer { event } => match event {
+                    PointerEvent::Move { .. } => "move",
+                    PointerEvent::Click { .. } => "click",
+                    PointerEvent::Drag { .. } => "drag",
+                    PointerEvent::Scroll { .. } => "scroll",
+                },
+                Actuation::Key { event } => match event {
+                    KeyEvent::Text(_) => "type",
+                    KeyEvent::Chord(_) => "key",
+                },
+                Actuation::ClipboardSet { .. } => "clipboard_set",
+                Actuation::Window { .. } => "window",
+                Actuation::ClickElement { .. } => "click_element",
+                Actuation::SetValue { .. } => "set_value",
+            };
+            self.0.lock().unwrap().push(format!("{action}:{}", o.ok));
+        }
+    }
+
+    fn first_button(t: &AxTree) -> AxNodeId {
+        fn walk(n: &AxNode) -> Option<AxNodeId> {
+            if n.role == AxRole::Button { return Some(n.id); }
+            n.children.iter().find_map(walk)
+        }
+        walk(&t.root).expect("fake_tree has a Button")
+    }
+
+    #[test]
+    fn seam_records_actuations_skips_reads_and_geometry() {
+        let sink = RecordingSink::default();
+        let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
+        let mut g = glass_with_a11y(
+            FakePlatform::new(100, 100).with_frames(vec![frame.clone(), frame]),
+            fake_tree(),
+        );
+        g.set_audit_sink(Box::new(sink.clone()));
+
+        g.start(&spec()).unwrap();
+        let _ = g.screenshot(None).unwrap();          // read
+        let tree = g.a11y_snapshot().unwrap();        // read (populates last_ax)
+        g.pointer(&PointerEvent::Click { x: 1, y: 2, button: MouseButton::Left, count: 1, modifiers: vec![] }).unwrap();
+        g.key(&KeyEvent::Text("hi".into())).unwrap();
+        let _ = g.window(&WindowOp::Geometry).unwrap(); // read → no record
+        g.window(&WindowOp::Focus).unwrap();            // actuation
+        g.click_element(first_button(&tree)).unwrap();
+        g.stop().unwrap();
+
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["launch:true", "click:true", "type:true", "window:true", "click_element:true", "stop:true"],
+            "reads (screenshot, a11y_snapshot, window-geometry) produce no records; click_element records ONCE (not also as click)"
+        );
+    }
+
+    #[test]
+    fn seam_records_failed_actuation_ok_false() {
+        let sink = RecordingSink::default();
+        let mut g = glass_with(FakePlatform::new(50, 50).with_frames(vec![Frame::solid(50, 50, [0; 4])]));
+        g.set_audit_sink(Box::new(sink.clone()));
+        g.start(&spec()).unwrap();
+        // Out-of-bounds click fails check_bounds → still recorded as ok:false.
+        let _ = g.pointer(&PointerEvent::Click { x: 999, y: 0, button: MouseButton::Left, count: 1, modifiers: vec![] });
+        let got = sink.0.lock().unwrap().clone();
+        assert_eq!(got, vec!["launch:true", "click:false"]);
+    }
+
+    #[test]
+    fn no_sink_means_no_behavior_change() {
+        let mut g = glass_with(FakePlatform::new(10, 10).with_frames(vec![Frame::solid(10, 10, [0; 4])]));
+        g.start(&spec()).unwrap();
+        g.pointer(&PointerEvent::Click { x: 0, y: 0, button: MouseButton::Left, count: 1, modifiers: vec![] }).unwrap();
     }
 }
