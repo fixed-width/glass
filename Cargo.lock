@@ -921,6 +921,7 @@ dependencies = [
  "atspi",
  "atspi-common",
  "glass-core",
+ "glass-wayland",
  "glass-x11",
  "tempfile",
  "tokio",
@@ -1035,6 +1036,7 @@ name = "glass-wayland"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-dbus-linux",
  "glass-proc-linux",
  "glass-sandbox-linux",
  "rustix",

@@ -15,6 +15,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 glass-x11 = { path = "../glass-x11" }
+glass-wayland = { path = "../glass-wayland" }
 tempfile.workspace = true
 
 [lints]

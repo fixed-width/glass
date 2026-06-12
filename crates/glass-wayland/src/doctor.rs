@@ -119,8 +119,8 @@ fn probe_sway(sway: &Path) -> Result<(), String> {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    std::fs::write(&config, sway_config(&spec, rt.path())).map_err(|e| e.to_string())?;
-    let mut child = build_sway_command(sway, &config, &spec, rt.path())
+    std::fs::write(&config, sway_config(&spec, rt.path(), None)).map_err(|e| e.to_string())?;
+    let mut child = build_sway_command(sway, &config, &spec, rt.path(), None)
         .spawn()
         .map_err(|e| format!("spawn sway: {e}"))?;
 

@@ -28,6 +28,17 @@ if ! command -v dbus-daemon >/dev/null 2>&1 \
 fi
 
 TEST_FILTER="${1:-}"
+
+# Hermetic isolation: run the whole suite under a throwaway XDG_RUNTIME_DIR. AT-SPI derives its
+# socket dir from XDG_RUNTIME_DIR, so any at-spi-bus-launcher these tests spawn — through glass's
+# PrivateBus (which already overrides it) OR any other path — writes to this throwaway, NEVER the
+# operator's real /run/user/UID/at-spi. Unconditional belt-and-suspenders: the desktop's own
+# accessibility bus (md-viewer, etc.) cannot be wedged by a test run, regardless of code paths.
+A11Y_TEST_RUNTIME="$(mktemp -d "${TMPDIR:-/tmp}/glass-a11y-test-rt.XXXXXX")"
+chmod 700 "$A11Y_TEST_RUNTIME"
+trap 'rm -rf "$A11Y_TEST_RUNTIME"' EXIT
+export XDG_RUNTIME_DIR="$A11Y_TEST_RUNTIME"
+
 # --test-threads=1: tests share glass's AT-SPI bus per process; parallel launches
 # cause bus instability (fixtures disconnecting race with new connections).
-exec cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "$TEST_FILTER"
+cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "$TEST_FILTER"

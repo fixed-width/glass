@@ -220,3 +220,62 @@ fn a11y_works_under_default_sandbox() {
 fn a11y_works_under_strict_sandbox() {
     sandboxed_a11y_finds_widgets(glass_core::SandboxLevel::Strict);
 }
+
+// ---- Wayland a11y (#1 Phase 3 / #6): same reader, app launched under headless sway ----
+
+fn glass_wayland_with_a11y() -> Glass {
+    let factory: PlatformFactory = Box::new(|_backend| {
+        Ok(Backend {
+            platform: Box::new(glass_wayland::WaylandPlatform::new()?),
+            accessibility: Some(Box::new(glass_a11y_linux::LinuxA11y::new())),
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    Glass::new(factory, "wayland".into(), BaselineStore::new(root), 100)
+}
+
+fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
+    // GTK4's GL renderer fails under headless sway → cairo (software) renderer. Run the script
+    // relative to cwd=fixtures so it's reachable inside the sandbox (its $HOME is tmpfs'd).
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let mut glass = glass_wayland_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), "a11y_fixture.py".into()],
+            cwd: Some(fixtures.into()),
+            env: vec![
+                ("GSK_RENDERER".into(), "cairo".into()),
+                ("GDK_BACKEND".into(), "wayland".into()),
+            ],
+            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            timeout_ms: 35_000,
+            sandbox: level,
+            a11y: true,
+        })
+        .unwrap_or_else(|e| panic!("wayland a11y launch ({level:?}): {e}"));
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let outline = glass.a11y_snapshot().expect("a11y snapshot (wayland)").to_outline();
+    assert!(outline.contains("Button \"Save\""), "no Save button (wayland {level:?}):\n{outline}");
+    glass.stop().expect("stop");
+}
+
+#[test]
+#[ignore = "needs sway + dbus + at-spi + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn wayland_a11y_off() {
+    wayland_a11y_finds_widgets(glass_core::SandboxLevel::Off);
+}
+
+#[test]
+#[ignore = "needs sway + dbus + at-spi + GTK4 fixture + bwrap; run via scripts/test-a11y.sh"]
+fn wayland_a11y_default_sandbox() {
+    wayland_a11y_finds_widgets(glass_core::SandboxLevel::Default);
+}
+
+#[test]
+#[ignore = "needs sway + dbus + at-spi + GTK4 fixture + bwrap; run via scripts/test-a11y.sh"]
+fn wayland_a11y_strict_sandbox() {
+    wayland_a11y_finds_widgets(glass_core::SandboxLevel::Strict);
+}

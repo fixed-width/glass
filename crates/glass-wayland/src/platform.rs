@@ -65,12 +65,19 @@ pub struct WaylandPlatform {
     logs: LogSink,
     active: Option<ActiveSession>,
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
+    dbus: Option<glass_dbus_linux::PrivateBus>,
 }
 
 impl WaylandPlatform {
     pub fn new() -> Result<Self> {
         let sway = resolve_sway()?;
-        Ok(Self { sway, logs: Arc::new(Mutex::new(Vec::new())), active: None, clipboard_owner: None })
+        Ok(Self {
+            sway,
+            logs: Arc::new(Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+        })
     }
 
     fn kill_session(&mut self) {
@@ -81,6 +88,7 @@ impl WaylandPlatform {
         if let Some(mut s) = self.active.take() {
             glass_proc_linux::reap_group(&mut s.child, glass_proc_linux::REAP_GRACE);
         }
+        self.dbus = None;
     }
 }
 
@@ -448,14 +456,15 @@ fn bring_up_session(
     sway: &Path,
     logs: &LogSink,
     spec: &AppSpec,
+    a11y: Option<glass_core::A11yBind>,
 ) -> Result<(ActiveSession, WindowGeometry)> {
     let runtime_dir =
         tempfile::Builder::new().prefix("glass-wl.").tempdir().map_err(GlassError::Io)?;
 
     let config = runtime_dir.path().join("sway.cfg");
-    std::fs::write(&config, sway_config(spec, runtime_dir.path())).map_err(GlassError::Io)?;
-
-    let mut cmd = build_sway_command(sway, &config, spec, runtime_dir.path());
+    std::fs::write(&config, sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir)))
+        .map_err(GlassError::Io)?;
+    let mut cmd = build_sway_command(sway, &config, spec, runtime_dir.path(), a11y.map(|a| a.addr));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
     if let Some(out) = child.stdout.take() {
@@ -611,10 +620,24 @@ impl Platform for WaylandPlatform {
         // genuine app exit or a config/sandbox error fails immediately. `bring_up`
         // reaps its own sway+Xwayland process group on failure, so a retry never
         // races a leftover compositor.
+        self.dbus = if spec.a11y {
+            Some(glass_dbus_linux::PrivateBus::start().map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!(
+                    "a11y:true was requested but the private a11y bus could not start: {e}"
+                ))
+            })?)
+        } else {
+            None
+        };
+
         const ATTEMPTS: u32 = 2;
         let mut last_err = GlassError::Timeout(spec.timeout_ms);
         for attempt in 0..ATTEMPTS {
-            match bring_up_session(&self.sway, &self.logs, spec) {
+            let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
+                addr: b.session_bus_address(),
+                dir: b.runtime_dir(),
+            });
+            match bring_up_session(&self.sway, &self.logs, spec, a11y) {
                 Ok((session, geometry)) => {
                     self.active = Some(session);
                     return Ok(geometry);
@@ -624,9 +647,13 @@ impl Platform for WaylandPlatform {
                 {
                     last_err = e;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.dbus = None; // reap the private bus on a hard failure
+                    return Err(e);
+                }
             }
         }
+        self.dbus = None; // reap the private bus after exhausted retries
         Err(last_err)
     }
 
@@ -993,6 +1020,10 @@ impl Platform for WaylandPlatform {
             Some(s) => glass_proc_linux::proc_tree_pids(s.child.id()),
             None => Vec::new(),
         }
+    }
+
+    fn a11y_bus_addr(&self) -> Option<String> {
+        self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
     }
 }
 

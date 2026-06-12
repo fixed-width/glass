@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 glass-core.workspace = true
+glass-dbus-linux = { path = "../glass-dbus-linux" }
 glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
 wayland-client.workspace = true

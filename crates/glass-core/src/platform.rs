@@ -95,6 +95,16 @@ pub struct WindowHint {
     pub class: Option<String>,
 }
 
+/// The private a11y bus details a sandboxed/launched app needs, kept together so a caller can't
+/// pass the bus address without also binding its socket dir into the sandbox. `addr` is the private
+/// **session** bus address (for `DBUS_SESSION_BUS_ADDRESS`); `dir` is the per-launch runtime dir
+/// holding the session + at-spi sockets (bound into the sandbox).
+#[derive(Clone, Copy, Debug)]
+pub struct A11yBind<'a> {
+    pub addr: &'a str,
+    pub dir: &'a std::path::Path,
+}
+
 /// Everything a backend needs to build, launch, and locate an app's window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSpec {
