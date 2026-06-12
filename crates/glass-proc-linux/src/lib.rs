@@ -133,8 +133,11 @@ mod reap_tests {
     fn reap_graceful_exits_fast_when_sigterm_is_honored() {
         let mut c = Command::new("sh").args(["-c", "trap 'exit 0' TERM; sleep 30"]).spawn().unwrap();
         let t = Instant::now();
-        reap_graceful(&mut c, Duration::from_secs(5));
-        assert!(t.elapsed() < Duration::from_secs(2), "honored SIGTERM should exit promptly");
+        // Large grace so the assertion proves we detected the honored exit *early* rather than
+        // timing out; the bound is generous to tolerate CI scheduling jitter (a honored exit
+        // takes milliseconds — anything well under the grace means we didn't wait it out).
+        reap_graceful(&mut c, Duration::from_secs(10));
+        assert!(t.elapsed() < Duration::from_secs(5), "honored SIGTERM should exit well before the grace");
     }
 
     #[test]
