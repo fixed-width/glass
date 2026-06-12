@@ -12,6 +12,10 @@ use std::time::Duration;
 use glass_core::{GlassError, Result};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard ceiling on the whole a11y-bus resolution (connect → proxy → GetAddress poll). The
+/// per-call bounds below don't cover the connect/proxy await, so without this a stalled
+/// at-spi bring-up can hang glass_start forever; cap it and fail loud instead.
+const A11Y_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A private session bus + AT-SPI registry, torn down on drop.
 pub struct PrivateBus {
@@ -55,6 +59,13 @@ impl PrivateBus {
                 &format!("--address=unix:path={}", session_sock.display()),
                 "--print-address",
             ])
+            // Pin XDG_RUNTIME_DIR to the private dir: when this bus *D-Bus-activates*
+            // org.a11y.Bus (which it does whenever the launcher we spawn directly doesn't
+            // claim the name first), the activated at-spi-bus-launcher inherits this env.
+            // Without it, activation falls back to the ambient XDG_RUNTIME_DIR and attaches
+            // to the *host* accessibility bus — breaking isolation and risking a wedge on
+            // the contended host bus. Keep activation inside the private dir.
+            .env("XDG_RUNTIME_DIR", runtime_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -187,30 +198,38 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
         .build()
         .map_err(|e| GlassError::Backend(format!("runtime: {e}")))?;
     rt.block_on(async {
-        let addr: zbus::Address = session_addr
-            .try_into()
-            .map_err(|e| GlassError::Backend(format!("bad session address: {e}")))?;
-        let conn = zbus::connection::Builder::address(addr)
-            .map_err(|e| GlassError::Backend(format!("session conn builder: {e}")))?
-            .build()
-            .await
-            .map_err(|e| GlassError::Backend(format!("connect session bus: {e}")))?;
-        let proxy = A11yBusProxy::new(&conn)
-            .await
-            .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
-        let mut last = String::new();
-        let mut last_err: Option<String> = None;
-        for _ in 0..50 {
-            match proxy.get_address().await {
-                Ok(a) if !a.is_empty() => return Ok(a),
-                Ok(a) => last = a,
-                Err(e) => last_err = Some(e.to_string()),
+        let resolve = async {
+            let addr: zbus::Address = session_addr
+                .try_into()
+                .map_err(|e| GlassError::Backend(format!("bad session address: {e}")))?;
+            let conn = zbus::connection::Builder::address(addr)
+                .map_err(|e| GlassError::Backend(format!("session conn builder: {e}")))?
+                .build()
+                .await
+                .map_err(|e| GlassError::Backend(format!("connect session bus: {e}")))?;
+            let proxy = A11yBusProxy::new(&conn)
+                .await
+                .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
+            let mut last = String::new();
+            let mut last_err: Option<String> = None;
+            for _ in 0..50 {
+                match proxy.get_address().await {
+                    Ok(a) if !a.is_empty() => return Ok(a),
+                    Ok(a) => last = a,
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(GlassError::Backend(format!(
+                "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
+            )))
+        };
+        match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
+            Ok(result) => result,
+            Err(_) => Err(GlassError::Backend(format!(
+                "a11y bus bring-up did not complete within {A11Y_RESOLVE_TIMEOUT:?} (at-spi-bus-launcher unresponsive)"
+            ))),
         }
-        Err(GlassError::Backend(format!(
-            "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
-        )))
     })
 }
 
@@ -235,5 +254,38 @@ mod tests {
         let b = PrivateBus::start().expect("bus b");
         assert_ne!(a.session_bus_address(), b.session_bus_address());
         assert_ne!(a.runtime_dir(), b.runtime_dir());
+    }
+
+    /// Regression: the private a11y bus must stay inside our private runtime dir even
+    /// when `org.a11y.Bus` is brought up by **D-Bus activation** rather than the launcher
+    /// we spawn directly. We force that path by pointing `GLASS_ATSPI_LAUNCHER` at a no-op
+    /// (`/bin/true` exits without claiming the name — exactly the zombie a dogfood run
+    /// produced), so the session bus must activate the real launcher itself. If the
+    /// activated launcher escapes to the ambient `XDG_RUNTIME_DIR`, it attaches to the
+    /// host accessibility bus — breaking isolation and (as that run showed) wedging on the
+    /// contended host bus. Run this under a throwaway `XDG_RUNTIME_DIR` (test-a11y.sh does)
+    /// so "ambient" is a sacrificial dir, never the operator's real `/run/user/UID`.
+    #[test]
+    #[ignore = "spawns a private dbus-daemon + activates at-spi; run via test-a11y.sh"]
+    fn activation_fallback_stays_in_the_private_runtime_dir() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("GLASS_ATSPI_LAUNCHER");
+            }
+        }
+        // /bin/true is a real file (find_launcher accepts it) that exits 0 immediately,
+        // so it never claims org.a11y.Bus → the session bus must activate the real one.
+        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/bin/true");
+        let _guard = EnvGuard;
+
+        let bus = PrivateBus::start().expect("a11y bring-up via D-Bus activation");
+        let private_dir = bus.runtime_dir().to_string_lossy().into_owned();
+        let a11y = bus.a11y_bus_address();
+        assert!(
+            a11y.contains(&private_dir),
+            "a11y bus {a11y} escaped the private runtime dir {private_dir} \
+             (activation inherited the ambient XDG_RUNTIME_DIR — isolation breach)"
+        );
     }
 }
