@@ -2,6 +2,7 @@
 //! file, redacting content by default. The seam (when/what/completeness) lives in
 //! glass-core; this owns the wire format + redaction policy.
 
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -219,6 +220,20 @@ impl JsonlSink {
             cfg,
         }
     }
+
+    /// Open (create-or-append). Fail-closed: an I/O error is returned to the caller.
+    pub fn open(path: &str, cfg: AuditConfig) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(JsonlSink {
+            state: Mutex::new(SinkState { writer: Box::new(file), seq: 0, session: None, dropped: 0 }),
+            cfg,
+        })
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.state.lock().unwrap().dropped
+    }
 }
 
 impl AuditSink for JsonlSink {
@@ -268,6 +283,43 @@ fn mint_session() -> String {
     let mut b = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut b);
     format!("s-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+/// Audit posture (for `doctor`/`env`).
+#[derive(Debug, Clone)]
+pub struct AuditReport {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub content: ContentMode,
+    pub prefix_len: usize,
+}
+
+fn config_from(cli_path: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> (Option<String>, AuditConfig) {
+    let path = cli_path.map(String::from).or_else(|| env("GLASS_AUDIT_LOG").filter(|p| !p.is_empty()));
+    let content = env("GLASS_AUDIT_CONTENT").map(|s| ContentMode::parse(&s)).unwrap_or(ContentMode::Redacted);
+    let prefix_len = env("GLASS_AUDIT_PREFIX_LEN").and_then(|s| s.trim().parse().ok()).unwrap_or(8);
+    (path, AuditConfig { content, prefix_len })
+}
+
+/// Posture only — used by the `doctor` subcommand (does NOT open the file).
+pub fn report_from_config(cli_path: Option<&str>, env: impl Fn(&str) -> Option<String>) -> AuditReport {
+    let (path, cfg) = config_from(cli_path, &env);
+    AuditReport { enabled: path.is_some(), path, content: cfg.content, prefix_len: cfg.prefix_len }
+}
+
+/// Resolve the sink (opening the file, fail-closed) and the report. `None` sink when
+/// no path is configured.
+pub fn resolve(
+    cli_path: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(Option<Box<dyn AuditSink>>, AuditReport)> {
+    let (path, cfg) = config_from(cli_path, &env);
+    let report = AuditReport { enabled: path.is_some(), path: path.clone(), content: cfg.content, prefix_len: cfg.prefix_len };
+    let sink: Option<Box<dyn AuditSink>> = match path {
+        None => None,
+        Some(p) => Some(Box::new(JsonlSink::open(&p, cfg).map_err(|e| anyhow::anyhow!("cannot open audit log {p:?}: {e}"))?)),
+    };
+    Ok((sink, report))
 }
 
 #[cfg(test)]
@@ -420,5 +472,77 @@ mod tests {
         assert_eq!(r["target"]["element"]["id"], 5);
         assert_eq!(r["target"]["element"]["role"], "PasswordField");
         assert_eq!(r["content"]["len"], 1);
+    }
+
+    #[test]
+    fn seq_monotonic_session_minted_on_launch_cleared_on_stop() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let spec = glass_core::AppSpec { build: None, run: vec!["app".into()], cwd: None, env: vec![], window_hint: None, timeout_ms: 1, sandbox: glass_core::SandboxLevel::Off, a11y: false };
+        s.record(&Actuation::Launch { spec: &spec, backend: "x11" }, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1)); // after stop
+        let r = lines(&buf);
+        assert_eq!(r.iter().map(|x| x["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let sess = r[0]["session"].as_str().unwrap().to_string();
+        assert!(sess.starts_with("s-"));
+        assert_eq!(r[1]["session"], sess, "stop stamps the ending session");
+        assert!(r[2]["session"].is_null(), "no session after stop");
+    }
+
+    #[test]
+    fn errored_actuation_records_ok_false_with_message() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let out = AuditOutcome { ok: false, error: Some("coords out of bounds".into()) };
+        s.record(&Actuation::Pointer { event: &PointerEvent::Click { x: 9, y: 9, button: MouseButton::Left, count: 1, modifiers: vec![] } }, &ActuationContext::default(), &out, Duration::from_millis(1));
+        let r = &lines(&buf)[0];
+        assert_eq!(r["result"]["ok"], false);
+        assert_eq!(r["result"]["error"], "coords out of bounds");
+    }
+
+    #[test]
+    fn write_failure_counts_not_panics() {
+        struct Fail;
+        impl Write for Fail {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::Error::other("full")) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let s = JsonlSink::with_writer(Box::new(Fail), AuditConfig::default());
+        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        assert_eq!(s.dropped(), 1);
+    }
+
+    #[test]
+    fn open_fail_closed_and_append_semantics() {
+        assert!(JsonlSink::open("/nonexistent-xyz/a.jsonl", AuditConfig::default()).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.jsonl");
+        std::fs::write(&p, "PRE\n").unwrap();
+        let s = JsonlSink::open(p.to_str().unwrap(), AuditConfig::default()).unwrap();
+        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.starts_with("PRE\n") && body.lines().count() == 2);
+    }
+
+    #[test]
+    fn resolve_cli_over_env_disabled_when_unset_modes_from_env() {
+        let (sink, rep) = resolve(None, |_| None).unwrap();
+        assert!(sink.is_none() && !rep.enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let envp = dir.path().join("e.jsonl");
+        let clip = dir.path().join("c.jsonl");
+        let env = |k: &str| match k {
+            "GLASS_AUDIT_LOG" => Some(envp.to_str().unwrap().to_string()),
+            "GLASS_AUDIT_CONTENT" => Some("full".into()),
+            "GLASS_AUDIT_PREFIX_LEN" => Some("4".into()),
+            _ => None,
+        };
+        let (sink, rep) = resolve(Some(clip.to_str().unwrap()), env).unwrap();
+        assert!(sink.is_some());
+        assert_eq!(rep.path.as_deref(), Some(clip.to_str().unwrap()), "CLI path wins");
+        assert_eq!(rep.content, ContentMode::Full);
+        assert_eq!(rep.prefix_len, 4);
     }
 }
