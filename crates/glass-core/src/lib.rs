@@ -15,8 +15,8 @@ pub use toolpath::tool_path;
 pub mod frame;
 pub use frame::{Frame, Region};
 
-pub mod input;
-pub use input::{drag_path, drag_schedule};
+pub mod drag;
+pub use drag::{drag_path, run_drag, DragGesture, DragSink};
 
 pub mod keys;
 pub use keys::Modifier;
