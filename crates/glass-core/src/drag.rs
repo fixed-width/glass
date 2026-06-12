@@ -75,10 +75,12 @@ impl DragGesture {
     }
 }
 
-/// The per-backend primitives that `run_drag` sequences. Each method is
-/// **self-committed**: it emits its event(s) and performs the backend's commit
-/// barrier (X11 `XFlush`; Wayland `frame` + roundtrip + settle). `run_drag`
-/// therefore owns only ordering and wall-clock pacing.
+/// The per-backend primitives that `run_drag` sequences. Each method that emits
+/// events is **self-committed**: it performs the backend's commit barrier before
+/// returning (X11 `XFlush`; Wayland `frame` + roundtrip + settle; Windows one
+/// `SendInput` per call). `modifiers` is the exception — it emits and commits
+/// nothing when the gesture carries no modifiers. `run_drag` therefore owns only
+/// ordering and wall-clock pacing.
 pub trait DragSink {
     /// Place the pointer at the start point, ensuring the surface under it will
     /// receive the subsequent press/motion (backends needing a focus-assert nudge
@@ -281,6 +283,29 @@ mod run_drag_tests {
         assert_eq!(
             sink.calls,
             vec![Place(3, 3), Mods(true), Button(true), Move(3, 3), Button(false), Mods(false)],
+        );
+    }
+
+    #[test]
+    fn run_drag_sleeps_the_dwell() {
+        // The dwell is the hold at the destination that makes a frame-based GUI register
+        // the drop at the endpoint. With `step == 0` the dwell is the only wall-clock cost,
+        // so a run that elapses >= dwell proves the hold actually happens (`thread::sleep`
+        // never returns early, so this can't flake on the `>=` side). The `_reassert_`
+        // test pins that the re-assert/release come after it.
+        use std::time::Instant;
+        let g = DragGesture {
+            waypoints: vec![(0, 0), (10, 0)],
+            step: Duration::ZERO,
+            dwell: Duration::from_millis(25),
+        };
+        let mut sink = RecordingSink::default();
+        let started = Instant::now();
+        run_drag(&mut sink, &g).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "run_drag must sleep the dwell (only {:?} elapsed)",
+            started.elapsed()
         );
     }
 }
