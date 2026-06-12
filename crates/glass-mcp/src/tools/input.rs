@@ -43,7 +43,7 @@ pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
             to_y: a.y2,
             button,
             modifiers,
-            duration_ms: a.duration_ms.unwrap_or(200),
+            duration_ms: a.duration_ms.unwrap_or(200).min(10_000),
         })
         .map_err(|e| e.to_string())?;
     Ok(ToolOutput::text("ok"))

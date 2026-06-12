@@ -115,6 +115,13 @@ mod tests {
     }
 
     #[test]
+    fn schedule_more_waypoints_for_longer_duration() {
+        let (short, _) = drag_schedule((0, 0), (1000, 0), 100);
+        let (long, _) = drag_schedule((0, 0), (1000, 0), 400);
+        assert!(long.len() > short.len(), "longer duration must yield more waypoints: {} vs {}", long.len(), short.len());
+    }
+
+    #[test]
     fn schedule_zero_length_single_point_no_delay() {
         let (wp, step) = drag_schedule((2, 2), (2, 2), 200);
         assert_eq!(wp, vec![(2, 2)]);
