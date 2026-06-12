@@ -592,6 +592,90 @@ fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
     })
 }
 
+/// Lets `glass_core::run_drag` drive a Wayland drag through the virtual-pointer
+/// protocol. Each method self-commits (`frame` + roundtrip + 8ms settle) and
+/// advances the event clock so timestamps stay monotonic across the drag.
+struct WaylandDragSink<'a> {
+    s: &'a mut ActiveSession,
+    w: u32,
+    h: u32,
+    ox: i32,
+    oy: i32,
+    b: u32,
+    mask: u32,
+}
+
+impl WaylandDragSink<'_> {
+    fn tick(&mut self) -> u32 {
+        self.s.time = self.s.time.wrapping_add(1);
+        self.s.time
+    }
+    fn ax(&self, x: i32) -> u32 {
+        (self.ox + x).max(0) as u32
+    }
+    fn ay(&self, y: i32) -> u32 {
+        (self.oy + y).max(0) as u32
+    }
+    fn settle(&mut self) -> Result<()> {
+        self.s
+            .queue
+            .roundtrip(&mut self.s.state)
+            .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
+        std::thread::sleep(Duration::from_millis(8));
+        Ok(())
+    }
+}
+
+impl glass_core::DragSink for WaylandDragSink<'_> {
+    fn place(&mut self, x: i32, y: i32) -> Result<()> {
+        let vp = self.s.pointer.clone();
+        let (w, h) = (self.w, self.h);
+        let (axx, ayy) = (self.ax(x), self.ay(y));
+        let t = self.tick();
+        vp.motion_absolute(t, axx, ayy, w, h);
+        vp.frame();
+        self.settle()?;
+        let t = self.tick();
+        vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
+        vp.frame();
+        vp.motion_absolute(t, axx, ayy, w, h);
+        vp.frame();
+        self.settle()
+    }
+    fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
+        let vp = self.s.pointer.clone();
+        let (w, h) = (self.w, self.h);
+        let (axx, ayy) = (self.ax(x), self.ay(y));
+        let t = self.tick();
+        vp.motion_absolute(t, axx, ayy, w, h);
+        vp.frame();
+        self.settle()
+    }
+    fn button(&mut self, down: bool) -> Result<()> {
+        let vp = self.s.pointer.clone();
+        let t = self.tick();
+        let state = if down { ButtonState::Pressed } else { ButtonState::Released };
+        vp.button(t, self.b, state);
+        vp.frame();
+        self.settle()
+    }
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if self.mask == 0 {
+            return Ok(());
+        }
+        let kb = self.s.keyboard.clone();
+        if down {
+            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            kb.modifiers(self.mask, 0, 0, 0);
+        } else {
+            kb.modifiers(0, 0, 0, 0);
+        }
+        // Self-commit so the modifier change reaches the compositor before the
+        // press/release that follows it (matches the X11 sink's flush-per-call).
+        self.settle()
+    }
+}
+
 impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
@@ -828,29 +912,18 @@ impl Platform for WaylandPlatform {
                 }
             }
             PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
-                let b = evdev_button(button);
-                let (waypoints, step) = glass_core::drag_schedule((from_x, from_y), (to_x, to_y), duration_ms);
-                position(&mut session.queue, &mut session.state, waypoints[0].0, waypoints[0].1)?;
-                let mask = modifier_mask(modifiers);
-                if mask != 0 {
-                    upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
-                    kb.modifiers(mask, 0, 0, 0);
-                }
-                vp.button(t, b, ButtonState::Pressed);
-                vp.frame();
-                settle(&mut session.queue, &mut session.state)?;
-                for &(px, py) in &waypoints[1..] {
-                    std::thread::sleep(step);
-                    vp.motion_absolute(t, ax(px), ay(py), w, h);
-                    vp.frame();
-                    settle(&mut session.queue, &mut session.state)?;
-                }
-                vp.button(t, b, ButtonState::Released);
-                vp.frame();
-                if mask != 0 {
-                    settle(&mut session.queue, &mut session.state)?;
-                    kb.modifiers(0, 0, 0, 0);
-                }
+                let gesture =
+                    glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
+                let mut sink = WaylandDragSink {
+                    s: &mut *session,
+                    w,
+                    h,
+                    ox,
+                    oy,
+                    b: evdev_button(button),
+                    mask: modifier_mask(modifiers),
+                };
+                glass_core::run_drag(&mut sink, &gesture)?;
             }
             PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
                 position(&mut session.queue, &mut session.state, x, y)?;
