@@ -25,7 +25,7 @@ pub const OUTPUT_HEIGHT: u32 = 720;
 /// invocation so the launched process runs in a sandboxed user namespace. The
 /// Wayland socket dir (`runtime_dir`) is re-exposed read-write inside the
 /// namespace so the app can still connect to sway.
-pub fn sway_config(spec: &AppSpec, runtime_dir: &Path) -> String {
+pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Path>) -> String {
     let argv: Vec<String> = match spec.sandbox {
         SandboxLevel::Off => spec.run.to_vec(),
         level => {
@@ -34,11 +34,15 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path) -> String {
             // Re-expose the program binary when it is absolute (it may live under
             // $HOME, which the ephemeral tmpfs shadows). PATH-resolved bare names
             // are covered by `--ro-bind / /` and need no extra bind.
+            let mut ro_binds = glass_sandbox_linux::program_ro_binds(&prog);
+            if let Some(dir) = a11y_bind_dir {
+                ro_binds.push(dir.to_path_buf());
+            }
             let opts = WrapOpts {
                 level,
                 home: ephemeral_home(),
                 cwd: spec.cwd.clone(),
-                ro_binds: glass_sandbox_linux::program_ro_binds(&prog),
+                ro_binds,
                 rw_binds: vec![runtime_dir.to_path_buf()],
             };
             let wrapped = wrap_argv(&prog, &args, &opts);
@@ -69,7 +73,13 @@ fn shell_quote(s: &str) -> String {
 /// `XDG_RUNTIME_DIR`. `--unsupported-gpu` is required because sway refuses to
 /// start on proprietary-Nvidia hosts; it is harmless under the headless backend.
 /// `spec.env` is applied last so a caller can still override anything.
-pub fn build_sway_command(sway: &Path, config: &Path, spec: &AppSpec, runtime_dir: &Path) -> Command {
+pub fn build_sway_command(
+    sway: &Path,
+    config: &Path,
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    dbus_addr: Option<&str>,
+) -> Command {
     let mut cmd = Command::new(sway);
     // Run sway as its own process-group leader so the whole compositor subtree
     // it spawns (Xwayland + the exec'd app) can be torn down as a group on stop;
@@ -86,6 +96,11 @@ pub fn build_sway_command(sway: &Path, config: &Path, spec: &AppSpec, runtime_di
     cmd.env_remove("WAYLAND_DISPLAY");
     cmd.env_remove("DISPLAY");
     cmd.env_remove("WAYLAND_SOCKET");
+    if let Some(addr) = dbus_addr {
+        // sway passes its env to the exec'd app (like XDG_RUNTIME_DIR); under a sandbox the
+        // exec's bwrap inherits it too (no --clearenv). spec.env below still overrides.
+        cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -128,7 +143,7 @@ mod tests {
     #[test]
     fn sway_config_has_output_border_and_quoted_exec() {
         // sandbox: Off — exec must be the bare app argv, not wrapped in bwrap.
-        let cfg = sway_config(&spec(&["glass-testapp", "--windows", "2"]), std::path::Path::new("/run/glass-rt"));
+        let cfg = sway_config(&spec(&["glass-testapp", "--windows", "2"]), std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("output HEADLESS-1 resolution 1280x720"), "{cfg}");
         assert!(cfg.contains("default_border none"), "{cfg}");
         assert!(cfg.contains("floating enable"), "{cfg}");
@@ -140,7 +155,7 @@ mod tests {
         use glass_core::SandboxLevel;
         let mut s = spec(&["glass-testapp", "--windows", "2"]);
         s.sandbox = SandboxLevel::Default;
-        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"));
+        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("exec 'bwrap'"), "{cfg}");
         assert!(cfg.contains("'--bind-try' '/run/glass-rt' '/run/glass-rt'"), "{cfg}");
         assert!(cfg.contains("'--' 'glass-testapp' '--windows' '2'"), "{cfg}");
@@ -148,7 +163,7 @@ mod tests {
 
     #[test]
     fn sway_config_exec_unwrapped_when_off() {
-        let cfg = sway_config(&spec(&["app"]), std::path::Path::new("/run/glass-rt"));
+        let cfg = sway_config(&spec(&["app"]), std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("exec 'app'"), "{cfg}");
         assert!(!cfg.contains("bwrap"), "{cfg}");
     }
@@ -160,6 +175,7 @@ mod tests {
             Path::new("/run/x/sway.cfg"),
             &spec(&["app"]),
             Path::new("/run/x"),
+            None,
         );
         assert_eq!(cmd.get_program(), OsStr::new("/opt/glass/sway/bin/sway"));
         let args: Vec<_> = cmd.get_args().collect();
@@ -180,5 +196,35 @@ mod tests {
         for removed in ["WAYLAND_DISPLAY", "DISPLAY", "WAYLAND_SOCKET"] {
             assert_eq!(envs.get(OsStr::new(removed)), Some(&None), "{removed} must be removed");
         }
+    }
+
+    #[test]
+    fn build_sway_command_injects_dbus_addr() {
+        let s = spec(&["app"]);
+        let cmd = build_sway_command(
+            std::path::Path::new("/usr/bin/sway"),
+            std::path::Path::new("/tmp/cfg"),
+            &s,
+            std::path::Path::new("/run/glass-rt"),
+            Some("unix:path=/tmp/glass-a11y/session-bus"),
+        );
+        let dbus = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(dbus.as_deref(), Some("unix:path=/tmp/glass-a11y/session-bus"));
+    }
+
+    #[test]
+    fn sway_config_binds_a11y_dir_when_sandboxed() {
+        let mut s = spec(&["app"]);
+        s.sandbox = glass_core::SandboxLevel::Default;
+        let cfg = sway_config(
+            &s,
+            std::path::Path::new("/run/glass-rt"),
+            Some(std::path::Path::new("/tmp/glass-a11y-xyz")),
+        );
+        assert!(cfg.contains("/tmp/glass-a11y-xyz"), "a11y dir not bound into the exec bwrap:\n{cfg}");
     }
 }
