@@ -526,6 +526,93 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_actuations_logged_reads_not() {
+        use crate::params::*;
+        use crate::tools;
+        use crate::tools::testutil::{glass_with, FakePlatform};
+        use glass_core::Frame;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let (sink, report) = resolve(Some(path.to_str().unwrap()), |k| {
+            // Disable the prefix so the redacted record never contains the plaintext.
+            if k == "GLASS_AUDIT_PREFIX_LEN" { Some("0".into()) } else { None }
+        })
+        .unwrap();
+        assert!(report.enabled);
+
+        // A FakePlatform with several frames so screenshot / settle work.
+        let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
+        let mut g = glass_with(
+            FakePlatform::new(100, 100)
+                .with_frames(vec![frame.clone(), frame.clone(), frame.clone(), frame]),
+        );
+        g.set_audit_sink(sink.unwrap());
+
+        tools::start(
+            &mut g,
+            &StartArgs {
+                build: None,
+                run: vec!["app".into()],
+                backend: None,
+                sandbox: Some("off".into()),
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: None,
+                a11y: None,
+            },
+        )
+        .unwrap();
+        tools::screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap(); // read — not logged
+        tools::type_text(&mut g, &TypeArgs { text: "secret".into() }).unwrap(); // "type"
+        tools::do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![
+                    Action::Click(ClickArgs {
+                        x: 1,
+                        y: 2,
+                        button: None,
+                        count: None,
+                        modifiers: None,
+                    }),
+                    Action::Settle(SettleArgs {
+                        interval_ms: Some(0),
+                        settle_frames: Some(1),
+                        tolerance: None,
+                        timeout_ms: Some(500),
+                        stability_region: None,
+                    }),
+                ],
+                then: None,
+            },
+        )
+        .unwrap(); // click (logged) + settle (read — not logged)
+        tools::window(&mut g, &WindowArgs { op: "geometry".into(), x: None, y: None, width: None, height: None }).unwrap(); // read — not logged
+        tools::window(&mut g, &WindowArgs { op: "focus".into(), x: None, y: None, width: None, height: None }).unwrap(); // "window"
+        tools::stop(&mut g).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let recs: Vec<serde_json::Value> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let actions: Vec<&str> =
+            recs.iter().map(|r| r["action"].as_str().unwrap()).collect();
+        assert_eq!(
+            actions,
+            vec!["launch", "type", "click", "window", "stop"],
+            "reads (screenshot, settle, window-geometry) are not logged; glass_do click IS"
+        );
+        let typ = recs.iter().find(|r| r["action"] == "type").unwrap();
+        assert!(typ["content"].get("text").is_none(), "redacted: no plaintext");
+        assert_eq!(typ["content"]["len"], 6);
+        assert!(!body.contains("secret"), "plaintext must not appear in redacted mode");
+        // launch program is recorded verbatim (structural, not content)
+        let launch = recs.iter().find(|r| r["action"] == "launch").unwrap();
+        assert_eq!(launch["args"]["program"], "app");
+    }
+
+    #[test]
     fn resolve_cli_over_env_disabled_when_unset_modes_from_env() {
         let (sink, rep) = resolve(None, |_| None).unwrap();
         assert!(sink.is_none() && !rep.enabled);
