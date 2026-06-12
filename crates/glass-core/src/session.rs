@@ -32,6 +32,14 @@ pub struct WaitStableParams {
 pub struct WaitStableOutcome {
     pub frame: Frame,
     pub settled: bool,
+    /// Whether any frame-to-frame change was seen while watching. `settled:true` with
+    /// `saw_motion:false` over a short `observed_ms` is a *brief* quiet window — a slow
+    /// animation can still hide under it, so use `wait_for_region {until:"changes"}` to
+    /// positively assert motion. `settled:true` with `saw_motion:true` means it was moving
+    /// and then quieted.
+    pub saw_motion: bool,
+    /// How long (ms) frames were observed before settling or timing out.
+    pub observed_ms: u64,
 }
 
 /// Parameters for [`Glass::wait_for_element`].
@@ -412,7 +420,7 @@ impl Glass {
             Some(_) => self.active_mut()?.platform.capture_frame(None)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
         };
-        Ok(WaitStableOutcome { frame, settled })
+        Ok(WaitStableOutcome { frame, settled, saw_motion: tracker.saw_change(), observed_ms: outcome.elapsed_ms })
     }
 
     /// Block until a precise accessibility-element condition holds, re-snapshotting

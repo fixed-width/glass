@@ -41,12 +41,18 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
     let settled = outcome.settled;
+    // `saw_motion`/`observed_ms` make `settled` non-opaque: settled with saw_motion:false
+    // over a short observed_ms is only a brief quiet window (a slow animation can hide).
+    let saw_motion = outcome.saw_motion;
+    let observed_ms = outcome.observed_ms;
 
     // Text-only: report the settle status + full-frame dims, no WebP. `region`
     // (which only crops the returned image) is intentionally ignored here.
     if !a.include_image.unwrap_or(true) {
         let meta = json!({
             "settled": settled,
+            "saw_motion": saw_motion,
+            "observed_ms": observed_ms,
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
@@ -55,7 +61,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
 
     let frame = crop_frame(outcome.frame, a.region.as_ref())?;
     let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
-    let mut meta = json!({ "settled": settled, "width": frame.width, "height": frame.height });
+    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "width": frame.width, "height": frame.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
