@@ -131,13 +131,20 @@ mod reap_tests {
 
     #[test]
     fn reap_graceful_exits_fast_when_sigterm_is_honored() {
-        let mut c = Command::new("sh").args(["-c", "trap 'exit 0' TERM; sleep 30"]).spawn().unwrap();
+        // Echo "ready" AFTER the trap is installed so we don't race the signal (mirrors the
+        // sibling test). Without this barrier reap_graceful can fire SIGTERM before the trap
+        // exists, the child then rides out the whole grace, and the test flakes on loaded CI.
+        let mut c = Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; echo ready; sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(c.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
         let t = Instant::now();
-        // Large grace so the assertion proves we detected the honored exit *early* rather than
-        // timing out; the bound is generous to tolerate CI scheduling jitter (a honored exit
-        // takes milliseconds — anything well under the grace means we didn't wait it out).
-        reap_graceful(&mut c, Duration::from_secs(10));
-        assert!(t.elapsed() < Duration::from_secs(5), "honored SIGTERM should exit well before the grace");
+        reap_graceful(&mut c, Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(2), "honored SIGTERM should exit promptly, not ride out the grace");
     }
 
     #[test]
