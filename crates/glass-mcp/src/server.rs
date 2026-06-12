@@ -13,9 +13,18 @@ use tokio::sync::Mutex;
 use crate::params::*;
 use crate::tools::{self, OutContent, ToolOutput, ToolResult};
 
+/// A synchronous tool body plus where to send its result — run on the dedicated
+/// `glass-platform` thread (see [`GlassServer::new`]).
+type Job = (
+    Box<dyn FnOnce(&mut Glass) -> ToolResult + Send>,
+    tokio::sync::oneshot::Sender<ToolResult>,
+);
+
 #[derive(Clone)]
 pub struct GlassServer {
     glass: Arc<Mutex<Glass>>,
+    /// Hands tool bodies to the long-lived `glass-platform` thread.
+    jobs: std::sync::mpsc::Sender<Job>,
     tool_router: ToolRouter<GlassServer>,
 }
 
@@ -49,7 +58,31 @@ fn map_tool_result(result: ToolResult) -> CallToolResult {
 #[tool_router]
 impl GlassServer {
     pub fn new(glass: Glass) -> Self {
-        Self { glass: Arc::new(Mutex::new(glass)), tool_router: Self::tool_router() }
+        let glass = Arc::new(Mutex::new(glass));
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        // One long-lived OS thread runs EVERY tool body. Tool bodies that spawn a
+        // long-lived child — a sandboxed app under `bwrap --die-with-parent`, which SIGKILLs
+        // the sandbox on the death of its parent *thread* (PR_SET_PDEATHSIG is thread-scoped
+        // on Linux) — must be parented to a thread that lives for the whole process, NOT an
+        // ephemeral tokio blocking-pool thread. A pool thread, recycled after the launch
+        // call returns, would trigger that kill and the app would vanish right after launch.
+        // Running here also keeps blocking build/launch/wait work off the async executor and
+        // serializes tools (glass has one active session).
+        let worker_glass = glass.clone();
+        std::thread::Builder::new()
+            .name("glass-platform".into())
+            .spawn(move || {
+                while let Ok((job, reply)) = rx.recv() {
+                    let mut g = worker_glass.blocking_lock();
+                    // A panicking tool becomes a loud error AND the thread survives — so it
+                    // keeps serving calls and keeps parenting any still-running sandbox.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
+                        .unwrap_or_else(|_| Err("tool handler panicked".to_string()));
+                    let _ = reply.send(result);
+                }
+            })
+            .expect("spawn glass-platform thread");
+        Self { glass, jobs, tool_router: Self::tool_router() }
     }
 
     /// A clone of the shared session registry, for the process-exit teardown path in
@@ -62,20 +95,20 @@ impl GlassServer {
     where
         F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
-        // Run the synchronous tool body on a blocking thread, not on the async executor:
-        // build/launch/window-wait can block for a while and must not stall a runtime
-        // worker, and a tool's own use of `block_on` (e.g. the a11y bus bring-up) must not
-        // nest inside this runtime. A panic in the body becomes a loud error rather than an
-        // unanswered request that hangs the caller forever.
-        let glass = self.glass.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            // `blocking_lock` is correct here (it would panic on an async worker); this is a
-            // blocking thread. Holding it serializes tools — glass has one active session.
-            let mut g = glass.blocking_lock();
-            f(&mut g)
-        })
-        .await;
-        Ok(map_tool_result(outcome.unwrap_or_else(|e| Err(format!("tool handler panicked: {e}")))))
+        // Hand the (synchronous, possibly slow) tool body to the dedicated glass-platform
+        // thread and await its result. That thread — not an ephemeral blocking-pool thread —
+        // is the parent of any process the body spawns, so a sandboxed app's
+        // `--die-with-parent` only fires when glass itself exits. It also keeps blocking work
+        // off the async executor and serializes tools (glass has one session). A handler
+        // panic comes back as a loud error, never an unanswered request.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.jobs.send((Box::new(f), reply_tx)).is_err() {
+            return Ok(map_tool_result(Err("glass-platform thread is gone".to_string())));
+        }
+        let outcome = reply_rx
+            .await
+            .unwrap_or_else(|_| Err("glass-platform thread dropped the job".to_string()));
+        Ok(map_tool_result(outcome))
     }
 
     #[tool(
