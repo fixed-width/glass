@@ -994,3 +994,41 @@ fn drag_is_time_paced() {
     );
     p.stop_app().unwrap();
 }
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn click_with_modifier_reaches_app() {
+    use glass_core::{Modifier, MouseButton, PointerEvent};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    p.send_pointer(&PointerEvent::Click {
+        x: 50,
+        y: 50,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![Modifier::Control],
+    })
+    .unwrap();
+    // The fixture echoes "EVENT button=<d> x=.. y=.. state=<mask>" on ButtonPress.
+    // X11 ControlMask is 0x04; if glass pressed Control before the button, it's set.
+    let mut saw_ctrl = false;
+    for _ in 0..40 {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT button=") {
+                if let Some(s) = rest.split("state=").nth(1) {
+                    if s.trim().parse::<u16>().unwrap_or(0) & 0x04 != 0 {
+                        saw_ctrl = true;
+                    }
+                }
+            }
+        }
+        if saw_ctrl {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(saw_ctrl, "Control modifier (mask 0x04) not reflected on the button event");
+    p.stop_app().unwrap();
+}
