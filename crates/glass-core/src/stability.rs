@@ -4,25 +4,36 @@ use crate::frame::Frame;
 
 /// Decides when a stream of captured frames has "settled": `settle_frames`
 /// consecutive frames each unchanged (within `tolerance`) from the one before.
+///
+/// Settling means "the last N sampled frames were identical" — NOT "nothing will ever
+/// change." A slow or sub-sampling-rate animation can hold one phase across the sampled
+/// window and read as settled; [`saw_change`](Self::saw_change) records whether any change
+/// was observed during this watch so callers can tell a quiet-the-whole-time settle from
+/// one that simply caught a still moment.
 pub struct StabilityTracker {
     settle_frames: u32,
     tolerance: u8,
     last: Option<Frame>,
     stable_count: u32,
+    saw_change: bool,
 }
 
 impl StabilityTracker {
     pub fn new(settle_frames: u32, tolerance: u8) -> Self {
-        Self { settle_frames: settle_frames.max(1), tolerance, last: None, stable_count: 0 }
+        Self { settle_frames: settle_frames.max(1), tolerance, last: None, stable_count: 0, saw_change: false }
     }
 
     /// Feed the next frame. Returns `true` once the frame stream has settled.
     /// Errors only if frame sizes change mid-stream.
     pub fn observe(&mut self, frame: Frame) -> Result<bool> {
+        let had_prev = self.last.is_some();
         let unchanged = match &self.last {
             None => false,
             Some(prev) => diff(prev, &frame, self.tolerance)?.changed_pixels == 0,
         };
+        if had_prev && !unchanged {
+            self.saw_change = true;
+        }
         self.stable_count = if unchanged { self.stable_count + 1 } else { 0 };
         self.last = Some(frame);
         Ok(self.stable_count >= self.settle_frames)
@@ -31,6 +42,13 @@ impl StabilityTracker {
     /// The most recently observed frame.
     pub fn last(&self) -> Option<&Frame> {
         self.last.as_ref()
+    }
+
+    /// Whether any frame-to-frame change was observed during this watch. `false` after a
+    /// settle means the window was quiet throughout — but a watch shorter than an
+    /// animation's period can still miss it, so this is a hint, not a guarantee of idleness.
+    pub fn saw_change(&self) -> bool {
+        self.saw_change
     }
 }
 
@@ -67,5 +85,24 @@ mod tests {
         t.observe(a).unwrap();
         t.observe(b.clone()).unwrap();
         assert_eq!(t.last(), Some(&b));
+    }
+
+    #[test]
+    fn saw_change_distinguishes_quiet_from_animated_settles() {
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        // Quiet throughout: settles with saw_change == false.
+        let mut quiet = StabilityTracker::new(2, 0);
+        quiet.observe(a.clone()).unwrap();
+        quiet.observe(a.clone()).unwrap();
+        assert!(quiet.observe(a.clone()).unwrap());
+        assert!(!quiet.saw_change(), "no change seen -> saw_change is false");
+        // Moved, then quieted: still settles, but saw_change == true.
+        let mut moved = StabilityTracker::new(2, 0);
+        moved.observe(a.clone()).unwrap();
+        moved.observe(b.clone()).unwrap(); // a change
+        moved.observe(b.clone()).unwrap();
+        assert!(moved.observe(b.clone()).unwrap());
+        assert!(moved.saw_change(), "a change occurred -> saw_change is true");
     }
 }
