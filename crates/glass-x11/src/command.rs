@@ -5,9 +5,10 @@ use std::process::Command;
 use glass_core::{AppSpec, SandboxLevel};
 use glass_sandbox_linux::{ephemeral_home, wrap_argv, WrapOpts};
 
-/// Build the launch command for `spec.run`, forcing `DISPLAY=<display>` (and, when
-/// `a11y.addr` is given, `DBUS_SESSION_BUS_ADDRESS=<addr>` so the child talks to the
-/// private a11y bus) so the child renders on the backend's X server. Entries in
+/// Build the launch command for `spec.run`, forcing `DISPLAY=<display>` (and, when `a11y`
+/// is given, `DBUS_SESSION_BUS_ADDRESS=<addr>` + `XDG_RUNTIME_DIR=<dir>` so the child both
+/// talks to, and resolves its AT-SPI bus within, the private a11y dir — never the host's
+/// `/run/user/UID/at-spi/`) so the child renders on the backend's X server. Entries in
 /// `spec.env` are applied after, so the caller can still override either deliberately.
 ///
 /// When `spec.sandbox` is not `Off`, the command is wrapped in a `bwrap`
@@ -66,6 +67,15 @@ pub fn build_command(
     cmd.env("DISPLAY", display);
     if let Some(addr) = dbus_addr {
         cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
+    }
+    if let Some(dir) = a11y_bind_dir {
+        // Point the app's AT-SPI resolution at the private runtime dir (mirroring the
+        // Wayland path). Without this the app inherits the host XDG_RUNTIME_DIR, so
+        // accesskit/at-spi can fall back to the host's /run/user/UID/at-spi/bus_0 — which
+        // may be wedged/unlinked — and accesskit_unix panics on the missing socket. The
+        // private dir is re-exposed read-only into the sandbox above, so the same absolute
+        // path resolves inside bwrap too. Keeps a11y resolution isolated AND on a live bus.
+        cmd.env("XDG_RUNTIME_DIR", dir);
     }
     // Applied last so an explicit spec.env entry wins over the forced defaults.
     for (k, v) in &spec.env {
@@ -156,6 +166,34 @@ mod tests {
         assert!(
             !cmd.get_envs().any(|(k, _)| k == OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
             "DBUS_SESSION_BUS_ADDRESS must not be set when dbus_addr is None"
+        );
+    }
+
+    #[test]
+    fn a11y_pins_private_xdg_runtime_dir() {
+        // The app must resolve AT-SPI within the private dir, not the host's /run/user/UID
+        // (whose at-spi bus may be wedged → accesskit_unix panic). Mirrors the Wayland path.
+        let cmd = build_command(
+            &spec(&["app"]),
+            ":9",
+            Some(glass_core::A11yBind {
+                addr: "unix:path=/tmp/glass-a11y-xyz/session-bus",
+                dir: std::path::Path::new("/tmp/glass-a11y-xyz"),
+            }),
+        );
+        let xrd = cmd
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new("XDG_RUNTIME_DIR"))
+            .and_then(|(_, v)| v);
+        assert_eq!(xrd, Some(OsStr::new("/tmp/glass-a11y-xyz")));
+    }
+
+    #[test]
+    fn no_a11y_leaves_xdg_runtime_dir_unset() {
+        let cmd = build_command(&spec(&["app"]), ":9", None);
+        assert!(
+            !cmd.get_envs().any(|(k, _)| k == OsStr::new("XDG_RUNTIME_DIR")),
+            "without a11y, XDG_RUNTIME_DIR must be left untouched"
         );
     }
 

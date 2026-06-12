@@ -123,9 +123,11 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
             "text": l.text,
         })
     });
-    let body = json!({ "matched": o.matched, "line": line, "cursor": o.cursor, "elapsed_ms": o.elapsed_ms })
-        .to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    let mut body = json!({ "matched": o.matched, "line": line, "cursor": o.cursor, "elapsed_ms": o.elapsed_ms });
+    if let Some(note) = &o.note {
+        body["note"] = json!(note);
+    }
+    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body.to_string())))
 }
 
 #[cfg(test)]
