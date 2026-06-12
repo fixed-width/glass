@@ -284,9 +284,10 @@ pub struct AxContext {
     /// backend has a process-tree view (Windows' Job set); 1-element on X11/Wayland.
     pub pids: Vec<u32>,
     pub window: WindowGeometry,
-    /// The session's private AT-SPI bus address, if glass spawned one. When `Some`,
-    /// the reader connects to it explicitly (isolated from the host bus); when `None`,
-    /// the reader falls back to the ambient session bus.
+    /// Address of the private a11y bus glass spawned for this launch, if any. `Some` only when the
+    /// caller passed `a11y: true` and the bus started. When `None`, the Linux reader returns
+    /// `AccessibilityUnavailable` (instructing the caller to relaunch with `a11y:true`) — it does
+    /// NOT fall back to any host/ambient bus. Non-Linux backends ignore this field.
     pub a11y_bus_addr: Option<String>,
 }
 
