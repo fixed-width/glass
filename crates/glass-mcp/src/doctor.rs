@@ -12,6 +12,7 @@ pub fn diagnose(deep: bool) -> Diagnosis {
 }
 
 /// Like `diagnose`, plus an "audit" section describing the audit-log posture.
+/// Used by the `doctor` CLI subcommand and the `glass_doctor` MCP tool.
 pub fn diagnose_with_audit(deep: bool, report: &crate::audit::AuditReport) -> Diagnosis {
     diagnose_inner(deep, Some(report))
 }
@@ -103,7 +104,9 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
             crate::audit::ContentMode::Redacted => "redacted",
             crate::audit::ContentMode::Full => "full",
         };
-        (CheckStatus::Ok, format!("on → {} (content: {mode})", report.path.as_deref().unwrap_or("?")))
+        // Invariant (set by audit::resolve/report_from_config): enabled ⇒ path is Some.
+        let path = report.path.as_deref().expect("AuditReport: enabled implies a path");
+        (CheckStatus::Ok, format!("on → {path} (content: {mode})"))
     } else {
         (CheckStatus::Skip, "off (set --audit-log/GLASS_AUDIT_LOG to enable)".to_string())
     };

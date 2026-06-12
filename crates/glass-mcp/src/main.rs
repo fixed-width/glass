@@ -6,6 +6,8 @@ use glass_mcp::{boot, run_doctor, run_env, run_stdio};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let audit_log = cli.audit_log;
+    // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
+    // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
         // No subcommand: serve MCP over stdio (the default).
         None => {

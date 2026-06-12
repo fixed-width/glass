@@ -80,7 +80,9 @@ mod tests {
         fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> { unimplemented!() }
         fn send_key(&mut self, _e: &KeyEvent) -> Result<()> { unimplemented!() }
         fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> { unimplemented!() }
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> { unimplemented!() }
+        // start_on() lists windows (best-effort) to attribute audit records, so this
+        // must answer rather than panic; no windows is fine for the shutdown test.
+        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> { Ok(vec![]) }
         fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> { unimplemented!() }
         fn drain_logs(&mut self) -> Vec<(Stream, String)> { vec![] }
     }
