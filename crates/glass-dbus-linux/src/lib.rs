@@ -193,44 +193,56 @@ trait A11yBus {
 }
 
 fn resolve_a11y_address(session_addr: &str) -> Result<String> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| GlassError::Backend(format!("runtime: {e}")))?;
-    rt.block_on(async {
-        let resolve = async {
-            let addr: zbus::Address = session_addr
-                .try_into()
-                .map_err(|e| GlassError::Backend(format!("bad session address: {e}")))?;
-            let conn = zbus::connection::Builder::address(addr)
-                .map_err(|e| GlassError::Backend(format!("session conn builder: {e}")))?
-                .build()
-                .await
-                .map_err(|e| GlassError::Backend(format!("connect session bus: {e}")))?;
-            let proxy = A11yBusProxy::new(&conn)
-                .await
-                .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
-            let mut last = String::new();
-            let mut last_err: Option<String> = None;
-            for _ in 0..50 {
-                match proxy.get_address().await {
-                    Ok(a) if !a.is_empty() => return Ok(a),
-                    Ok(a) => last = a,
-                    Err(e) => last_err = Some(e.to_string()),
+    // Run on a dedicated OS thread. `PrivateBus::start` is synchronous but is reached (via
+    // `start_app`) from inside the MCP's multi-thread runtime. Building a runtime there
+    // panics ("Cannot start a runtime from within a runtime"), and a `current_thread`
+    // runtime nested in another runtime has a timer that never advances — so the bounds
+    // below would never fire. A fresh thread has no ambient runtime, so `block_on` and its
+    // timer work in every caller context (sync test, async worker, or spawn_blocking task).
+    let session_addr = session_addr.to_string();
+    std::thread::spawn(move || -> Result<String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| GlassError::Backend(format!("runtime: {e}")))?;
+        rt.block_on(async move {
+            let resolve = async {
+                let addr: zbus::Address = session_addr
+                    .as_str()
+                    .try_into()
+                    .map_err(|e| GlassError::Backend(format!("bad session address: {e}")))?;
+                let conn = zbus::connection::Builder::address(addr)
+                    .map_err(|e| GlassError::Backend(format!("session conn builder: {e}")))?
+                    .build()
+                    .await
+                    .map_err(|e| GlassError::Backend(format!("connect session bus: {e}")))?;
+                let proxy = A11yBusProxy::new(&conn)
+                    .await
+                    .map_err(|e| GlassError::Backend(format!("org.a11y.Bus proxy: {e}")))?;
+                let mut last = String::new();
+                let mut last_err: Option<String> = None;
+                for _ in 0..50 {
+                    match proxy.get_address().await {
+                        Ok(a) if !a.is_empty() => return Ok(a),
+                        Ok(a) => last = a,
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(GlassError::Backend(format!(
+                    "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
+                )))
+            };
+            match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
+                Ok(result) => result,
+                Err(_) => Err(GlassError::Backend(format!(
+                    "a11y bus bring-up did not complete within {A11Y_RESOLVE_TIMEOUT:?} (at-spi-bus-launcher unresponsive)"
+                ))),
             }
-            Err(GlassError::Backend(format!(
-                "org.a11y.Bus.GetAddress did not yield an address after 5s (last ok: {last:?}, last err: {last_err:?})"
-            )))
-        };
-        match tokio::time::timeout(A11Y_RESOLVE_TIMEOUT, resolve).await {
-            Ok(result) => result,
-            Err(_) => Err(GlassError::Backend(format!(
-                "a11y bus bring-up did not complete within {A11Y_RESOLVE_TIMEOUT:?} (at-spi-bus-launcher unresponsive)"
-            ))),
-        }
+        })
     })
+    .join()
+    .map_err(|_| GlassError::Backend("a11y resolver thread panicked".into()))?
 }
 
 #[cfg(test)]
