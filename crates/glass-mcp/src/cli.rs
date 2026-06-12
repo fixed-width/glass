@@ -17,6 +17,12 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Append a JSONL audit log of every actuation to PATH (also GLASS_AUDIT_LOG).
+    /// Opt-in; off when unset. Content redacted by default
+    /// (GLASS_AUDIT_CONTENT=none|redacted|full, GLASS_AUDIT_PREFIX_LEN=N).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub audit_log: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -101,6 +107,16 @@ mod tests {
     fn gen_token_subcommand_is_kebab_case() {
         let cli = Cli::try_parse_from(["glass-mcp", "gen-token", "--out", "/p"]).unwrap();
         assert!(matches!(cli.command, Some(Command::GenToken { out: Some(_) })));
+    }
+
+    #[test]
+    fn audit_log_is_global_and_optional() {
+        let c = Cli::try_parse_from(["glass-mcp", "--audit-log", "/p"]).unwrap();
+        assert!(c.command.is_none());
+        assert_eq!(c.audit_log.as_deref(), Some("/p"));
+        let c = Cli::try_parse_from(["glass-mcp", "serve", "--http", "--audit-log", "/q"]).unwrap();
+        assert_eq!(c.audit_log.as_deref(), Some("/q"));
+        assert!(Cli::try_parse_from(["glass-mcp"]).unwrap().audit_log.is_none());
     }
 
     #[test]

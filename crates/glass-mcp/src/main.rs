@@ -4,19 +4,27 @@ use glass_mcp::{boot, run_doctor, run_env, run_stdio};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let audit_log = cli.audit_log;
+    match cli.command {
         // No subcommand: serve MCP over stdio (the default).
-        None => run_stdio(boot()).await,
-        Some(Command::Doctor { deep, json }) => run_doctor(deep, json),
+        None => {
+            let (sink, report) =
+                glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
+            run_stdio(boot(sink), report).await
+        }
+        Some(Command::Doctor { deep, json }) => run_doctor(deep, json, audit_log.as_deref()),
         Some(Command::Env { json }) => run_env(json),
         Some(Command::Serve { http, addr, token_file }) => {
             #[cfg(feature = "network")]
             {
-                glass_mcp::serve::run(http, addr, token_file).await
+                let (sink, report) =
+                    glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
+                glass_mcp::serve::run(http, addr, token_file, sink, report).await
             }
             #[cfg(not(feature = "network"))]
             {
-                let _ = (http, addr, token_file);
+                let _ = (http, addr, token_file, &audit_log);
                 anyhow::bail!(
                     "`serve` (the network transport) is not included in this build; it \
                      requires the default-on `network` feature, which a \

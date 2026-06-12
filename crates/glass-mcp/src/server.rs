@@ -10,6 +10,7 @@ use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
+use crate::audit::AuditReport;
 use crate::params::*;
 use crate::tools::{self, OutContent, ToolOutput, ToolResult};
 
@@ -25,6 +26,8 @@ pub struct GlassServer {
     glass: Arc<Mutex<Glass>>,
     /// Hands tool bodies to the long-lived `glass-platform` thread.
     jobs: std::sync::mpsc::Sender<Job>,
+    /// Audit-log posture, carried for `glass_doctor` display.
+    report: AuditReport,
     tool_router: ToolRouter<GlassServer>,
 }
 
@@ -57,7 +60,7 @@ fn map_tool_result(result: ToolResult) -> CallToolResult {
 
 #[tool_router]
 impl GlassServer {
-    pub fn new(glass: Glass) -> Self {
+    pub fn new(glass: Glass, report: AuditReport) -> Self {
         let glass = Arc::new(Mutex::new(glass));
         let (jobs, rx) = std::sync::mpsc::channel::<Job>();
         // One long-lived OS thread runs EVERY tool body. Tool bodies that spawn a
@@ -82,7 +85,7 @@ impl GlassServer {
                 }
             })
             .expect("spawn glass-platform thread");
-        Self { glass, jobs, tool_router: Self::tool_router() }
+        Self { glass, jobs, report, tool_router: Self::tool_router() }
     }
 
     /// A clone of the shared session registry, for the process-exit teardown path in
@@ -227,7 +230,8 @@ impl GlassServer {
         let deep = a.deep.unwrap_or(false);
         // The probes are blocking (and `deep` spawns a display), so keep them off the
         // stdio reactor thread.
-        let diag = tokio::task::spawn_blocking(move || crate::doctor::diagnose(deep))
+        let report = self.report.clone();
+        let diag = tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
             .await
             .expect("doctor task panicked");
         Ok(to_call_result(ToolOutput::text(diag.render_text(backend))))

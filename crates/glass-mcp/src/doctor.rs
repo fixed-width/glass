@@ -8,6 +8,15 @@ use glass_core::{Check, CheckStatus, Diagnosis, Section};
 /// Build the full environment report. `deep` spawns and tears down the default
 /// backend's headless display to verify it actually starts.
 pub fn diagnose(deep: bool) -> Diagnosis {
+    diagnose_inner(deep, None)
+}
+
+/// Like `diagnose`, plus an "audit" section describing the audit-log posture.
+pub fn diagnose_with_audit(deep: bool, report: &crate::audit::AuditReport) -> Diagnosis {
+    diagnose_inner(deep, Some(report))
+}
+
+fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diagnosis {
     let backend = crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
 
     let backend_detail = match std::env::var("GLASS_BACKEND") {
@@ -80,7 +89,25 @@ pub fn diagnose(deep: bool) -> Diagnosis {
         ));
     }
 
+    if let Some(report) = audit {
+        sections.push(audit_section(report));
+    }
+
     Diagnosis::new(sections)
+}
+
+fn audit_section(report: &crate::audit::AuditReport) -> Section {
+    let (status, detail) = if report.enabled {
+        let mode = match report.content {
+            crate::audit::ContentMode::None => "none",
+            crate::audit::ContentMode::Redacted => "redacted",
+            crate::audit::ContentMode::Full => "full",
+        };
+        (CheckStatus::Ok, format!("on → {} (content: {mode})", report.path.as_deref().unwrap_or("?")))
+    } else {
+        (CheckStatus::Skip, "off (set --audit-log/GLASS_AUDIT_LOG to enable)".to_string())
+    };
+    Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
 
 #[cfg(test)]
@@ -124,5 +151,15 @@ mod tests {
         assert!(!placeholder, "no 'not built into this binary' placeholders when network is compiled in");
         #[cfg(not(feature = "network"))]
         let _ = placeholder; // network shows its own Skip line in the stdio-only build
+    }
+
+    #[test]
+    fn diagnose_with_audit_reports_posture() {
+        let on = crate::audit::AuditReport { enabled: true, path: Some("/v/g.jsonl".into()), content: crate::audit::ContentMode::Redacted, prefix_len: 8 };
+        let t = diagnose_with_audit(false, &on).render_text("x11");
+        assert!(t.contains("audit") && t.contains("/v/g.jsonl") && t.contains("redacted"), "{t}");
+        let off = crate::audit::AuditReport { enabled: false, path: None, content: crate::audit::ContentMode::Redacted, prefix_len: 8 };
+        let t = diagnose_with_audit(false, &off).render_text("x11").to_lowercase();
+        assert!(t.contains("audit") && t.contains("off"), "{t}");
     }
 }

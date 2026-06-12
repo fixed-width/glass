@@ -84,9 +84,10 @@ pub fn run_env(json: bool) -> ! {
 }
 
 /// Run the `doctor` subcommand and exit.
-pub fn run_doctor(deep: bool, json: bool) -> ! {
+pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
     let backend = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
-    let diag = doctor::diagnose(deep);
+    let report = audit::report_from_config(audit_log, |k| std::env::var(k).ok());
+    let diag = doctor::diagnose_with_audit(deep, &report);
     if json {
         println!("{}", serde_json::to_string_pretty(&diag).expect("serialize diagnosis"));
     } else {
@@ -95,16 +96,18 @@ pub fn run_doctor(deep: bool, json: bool) -> ! {
     std::process::exit(diag.exit_code(backend));
 }
 
-/// Build the `Glass` session manager (backend built lazily per `glass_start`).
-pub fn boot() -> Glass {
+/// Build the `Glass` session manager, installing the audit sink if one is configured.
+pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
     let baselines = BaselineStore::new(".glass/baselines");
-    Glass::new(Box::new(make_platform), default, baselines, 10_000)
+    let mut glass = Glass::new(Box::new(make_platform), default, baselines, 10_000);
+    if let Some(sink) = audit { glass.set_audit_sink(sink); }
+    glass
 }
 
 /// Serve MCP over stdio (the default transport) and tear down on EOF or signal.
-pub async fn run_stdio(glass: Glass) -> anyhow::Result<()> {
-    let server = GlassServer::new(glass);
+pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
+    let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
     let service = server.serve(stdio()).await.context("starting the MCP stdio service")?;
 

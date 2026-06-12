@@ -42,6 +42,8 @@ pub async fn run(
     http: bool,
     addr: Option<String>,
     token_file: Option<String>,
+    sink: Option<Box<dyn glass_core::AuditSink>>,
+    report: crate::audit::AuditReport,
 ) -> anyhow::Result<()> {
     // Delegate to the audited resolver (token precedence + exposure rules + its tests stay
     // the single source of truth); just reconstruct its flag form from clap's typed args.
@@ -84,7 +86,7 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(cfg.addr)
         .await
         .with_context(|| format!("binding {}", cfg.addr))?;
-    run_on(listener, cfg, crate::boot()).await
+    run_on(listener, cfg, crate::boot(sink), report).await
 }
 
 /// Serve on an already-bound listener (so tests can bind `127.0.0.1:0`).
@@ -92,8 +94,9 @@ pub async fn run_on(
     listener: tokio::net::TcpListener,
     cfg: ServeConfig,
     glass: glass_core::Glass,
+    report: crate::audit::AuditReport,
 ) -> anyhow::Result<()> {
-    let server = GlassServer::new(glass);
+    let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
 
     let cancel = CancellationToken::new();
