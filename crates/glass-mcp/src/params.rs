@@ -60,6 +60,12 @@ pub struct StartArgs {
     /// window owned by the launched process or a descendant it can follow.
     pub window_hint: Option<WindowHintArgs>,
     pub timeout_ms: Option<u64>,
+    /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
+    /// `set_value` / `click_element` / `wait_for_element` work against this app. Opt-in
+    /// (default false) — only set when you need the accessibility tree; it spawns extra
+    /// processes. Linux only.
+    #[serde(default)]
+    pub a11y: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -130,13 +136,22 @@ pub struct DragArgs {
     pub button: Option<String>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
+    /// Span the drag's motion over this many milliseconds so a frame-based GUI
+    /// (egui/winit) samples the path across multiple frames (and registers the
+    /// drag even while it repaints). Default 200. Lower = faster but coarser.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollArgs {
     pub x: i32,
     pub y: i32,
+    /// Horizontal scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
+    /// pixels). Positive `dx` sends wheel-right, negative wheel-left; glass clicks `|dx|` times.
     pub dx: Option<i32>,
+    /// Vertical scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
+    /// pixels). Positive `dy` sends wheel-down, negative wheel-up; glass clicks `|dy|` times. How
+    /// an app maps a wheel notch to its view (lines, pixels, zoom) is the app's choice.
     pub dy: Option<i32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,

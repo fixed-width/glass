@@ -94,6 +94,7 @@ mod imp {
             window_hint: Some(WindowHint { title: Some("Character Map".into()), class: None }),
             timeout_ms: 12_000,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         };
 
         println!("\n[start_app charmap]");

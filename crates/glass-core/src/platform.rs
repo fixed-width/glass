@@ -53,7 +53,7 @@ pub enum MouseButton {
 pub enum PointerEvent {
     Move { x: i32, y: i32 },
     Click { x: i32, y: i32, button: MouseButton, count: u32, modifiers: Vec<Modifier> },
-    Drag { from_x: i32, from_y: i32, to_x: i32, to_y: i32, button: MouseButton, modifiers: Vec<Modifier> },
+    Drag { from_x: i32, from_y: i32, to_x: i32, to_y: i32, button: MouseButton, modifiers: Vec<Modifier>, duration_ms: u64 },
     Scroll { x: i32, y: i32, dx: i32, dy: i32, modifiers: Vec<Modifier> },
 }
 
@@ -109,6 +109,10 @@ pub struct AppSpec {
     pub timeout_ms: u64,
     /// How aggressively to contain the launched process tree.
     pub sandbox: SandboxLevel,
+    /// Spawn a private, isolated AT-SPI bus for this launch so the app publishes an
+    /// accessibility tree glass can read. Opt-in: when false, no a11y processes are
+    /// spawned and the a11y tools return a "relaunch with a11y:true" error.
+    pub a11y: bool,
 }
 
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
@@ -170,6 +174,12 @@ pub trait Platform {
     fn app_pids(&self) -> Vec<u32> {
         self.app_pid().into_iter().collect()
     }
+
+    /// The session's private AT-SPI bus address, if this backend spawned one.
+    /// Default `None` (no private bus / non-Linux backends).
+    fn a11y_bus_addr(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +228,7 @@ mod tests {
             window_hint: Some(WindowHint { title: Some("Demo".into()), class: None }),
             timeout_ms: 5000,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         };
         assert_eq!(spec.run[0], "./app");
     }

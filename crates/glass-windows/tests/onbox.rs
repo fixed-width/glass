@@ -44,6 +44,7 @@ fn charmap_spec() -> AppSpec {
         window_hint: Some(WindowHint { title: Some("Character Map".into()), class: None }),
         timeout_ms: 15_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     }
 }
 
@@ -150,6 +151,7 @@ fn onbox_isolated_edge_killtree() {
         window_hint: None,
         timeout_ms: 25_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let _geo = p.start_app(&spec).expect("isolated Edge discovery (Job-child window)");
     std::thread::sleep(Duration::from_secs(6)); // let renderer/GPU/utility children spawn
@@ -177,7 +179,7 @@ fn onbox_a11y_snapshot_and_click() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     assert!(tree.count > 0, "snapshot must have nodes");
     let (mut total, mut inter) = (0usize, 0usize);
@@ -241,6 +243,7 @@ fn onbox_handoff_grace() {
         window_hint: None,
         timeout_ms: 8_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let _geo = p.start_app(&spec).expect("notepad's handoff-to-descendant window must be discovered no-hint");
     std::thread::sleep(Duration::from_millis(800));
@@ -260,7 +263,7 @@ fn onbox_modifier_click() {
     std::thread::sleep(Duration::from_millis(1200));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     let mut hit = None;
     first_clickable(&tree.root, &mut hit);
@@ -326,7 +329,7 @@ fn onbox_a11y_set_value() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
 
     let mut field = None;
@@ -385,6 +388,7 @@ fn onbox_a11y_edge_geometry_fallback() {
         window_hint: None,
         timeout_ms: 25_000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     // Edge's top-level window is owned by a DESCENDANT process, so the a11y reader's exact-pid match
     // misses and the geometry fallback must recover it — the path charmap can't exercise.
@@ -392,7 +396,7 @@ fn onbox_a11y_edge_geometry_fallback() {
     std::thread::sleep(Duration::from_secs(6));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone() };
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot on multi-process Edge");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);

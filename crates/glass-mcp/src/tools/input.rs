@@ -43,6 +43,7 @@ pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
             to_y: a.y2,
             button,
             modifiers,
+            duration_ms: a.duration_ms.unwrap_or(200).min(10_000),
         })
         .map_err(|e| e.to_string())?;
     Ok(ToolOutput::text("ok"))
@@ -93,6 +94,7 @@ mod tests {
             env: vec![],
             window_hint: None,
             timeout_ms: None,
+            a11y: None,
         };
         start_tool(&mut g, &a).unwrap();
         g
@@ -136,7 +138,7 @@ mod tests {
     #[test]
     fn drag_and_scroll_ok() {
         let mut g = started();
-        let d = DragArgs { x1: 1, y1: 2, x2: 3, y2: 4, button: None, modifiers: None };
+        let d = DragArgs { x1: 1, y1: 2, x2: 3, y2: 4, button: None, modifiers: None, duration_ms: None };
         assert_eq!(text(&drag(&mut g, &d).unwrap()), "ok");
         let s = ScrollArgs { x: 5, y: 6, dx: None, dy: Some(2), modifiers: None };
         assert_eq!(text(&scroll(&mut g, &s).unwrap()), "ok");

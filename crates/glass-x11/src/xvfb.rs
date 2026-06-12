@@ -46,8 +46,7 @@ impl Xvfb {
         match read_displayfd(stdout, READY_TIMEOUT) {
             Ok((num, displayfd)) => Ok(Xvfb { child, display: format!(":{num}"), displayfd }),
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                glass_proc_linux::reap_graceful(&mut child, glass_proc_linux::REAP_GRACE);
                 Err(GlassError::Backend(match e {
                     ReadErr::Closed => {
                         "Xvfb exited without reporting a display (failed to start)".into()
@@ -108,9 +107,9 @@ fn read_displayfd(
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        // SIGKILL doesn't let Xvfb remove its own lock/socket; clean them up.
+        glass_proc_linux::reap_graceful(&mut self.child, glass_proc_linux::REAP_GRACE);
+        // Fallback: Xvfb removes its own lock/socket on SIGTERM, but if it had to
+        // be SIGKILLed (ignored SIGTERM) they linger; clean them up.
         if let Some(num) = self.display.strip_prefix(':') {
             let _ = std::fs::remove_file(format!("/tmp/.X{num}-lock"));
             let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{num}"));

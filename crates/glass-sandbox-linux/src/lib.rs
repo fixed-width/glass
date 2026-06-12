@@ -165,39 +165,23 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
     v
 }
 
-/// Run `spec.build` (if any) as `sh -c <build>`, bubblewrap-contained when
-/// `spec.sandbox != Off`. Shared by the X11 and Wayland backends so build semantics
-/// cannot diverge. `cwd` is applied; a spawn failure or non-zero exit → `AppNotStarted`.
-pub fn run_build(spec: &AppSpec) -> Result<()> {
-    let Some(build) = &spec.build else { return Ok(()) };
-    let mut cmd = match spec.sandbox {
-        SandboxLevel::Off => {
-            let mut c = Command::new(sh_bin());
-            c.arg("-c").arg(build);
-            c
-        }
-        level => {
-            let opts = WrapOpts {
-                level,
-                home: ephemeral_home(),
-                cwd: spec.cwd.clone(),
-                ro_binds: vec![],
-                rw_binds: vec![],
-            };
-            let shell = sh_bin();
-            let argv = wrap_argv(
-                OsStr::new(&shell),
-                &[OsString::from("-c"), OsString::from(build.as_str())],
-                &opts,
-            );
-            let mut c = Command::new(&argv[0]);
-            c.args(&argv[1..]);
-            c
-        }
-    };
+/// Build the (unsandboxed) command for `spec.build`, or `None` if there's no build step.
+/// The build runs with the full developer environment — only the launched *run* is sandboxed.
+fn build_command_for(spec: &AppSpec) -> Option<Command> {
+    let build = spec.build.as_ref()?;
+    let mut c = Command::new(sh_bin());
+    c.arg("-c").arg(build);
     if let Some(dir) = &spec.cwd {
-        cmd.current_dir(dir);
+        c.current_dir(dir);
     }
+    Some(c)
+}
+
+/// Run `spec.build` (if any) as `sh -c <build>` with the full developer environment — the build
+/// is the developer's own code and is NOT sandboxed; only the launched run is contained. `cwd` is
+/// applied; a spawn failure or non-zero exit → `AppNotStarted`.
+pub fn run_build(spec: &AppSpec) -> Result<()> {
+    let Some(mut cmd) = build_command_for(spec) else { return Ok(()) };
     let status = cmd
         .status()
         .map_err(|e| GlassError::AppNotStarted(format!("build command: {e}")))?;
@@ -448,22 +432,45 @@ mod tests {
         assert!(!g.to_lowercase().contains("apparmor"), "generic remedy must not claim AppArmor: {g}");
     }
 
+    fn make_spec(build: Option<&str>, sandbox: SandboxLevel) -> AppSpec {
+        AppSpec {
+            build: build.map(|s| s.to_string()),
+            run: vec!["unused".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1000,
+            sandbox,
+            a11y: false,
+        }
+    }
+
+    #[test]
+    fn build_is_never_sandboxed() {
+        for level in [SandboxLevel::Off, SandboxLevel::Default, SandboxLevel::Strict] {
+            let s = make_spec(Some("true"), level);
+            let cmd = build_command_for(&s).expect("build present");
+            assert_eq!(
+                cmd.get_program(),
+                std::ffi::OsStr::new(&sh_bin()),
+                "build must run via the shell, never bwrap, at {level:?}"
+            );
+        }
+    }
+
     #[test]
     fn run_build_off_runs_and_reports_status() {
-        use glass_core::{AppSpec, SandboxLevel};
-        fn spec(build: Option<&str>) -> AppSpec {
-            AppSpec {
-                build: build.map(|s| s.to_string()),
-                run: vec!["unused".into()],
-                cwd: None,
-                env: vec![],
-                window_hint: None,
-                timeout_ms: 1000,
-                sandbox: SandboxLevel::Off,
-            }
-        }
-        assert!(run_build(&spec(None)).is_ok(), "no build → Ok");
-        assert!(run_build(&spec(Some("true"))).is_ok(), "successful build → Ok");
-        assert!(run_build(&spec(Some("false"))).is_err(), "failing build → Err");
+        use glass_core::SandboxLevel;
+        assert!(run_build(&make_spec(None, SandboxLevel::Off)).is_ok(), "no build → Ok");
+        assert!(run_build(&make_spec(Some("true"), SandboxLevel::Off)).is_ok(), "successful build → Ok");
+        assert!(run_build(&make_spec(Some("false"), SandboxLevel::Off)).is_err(), "failing build → Err");
+    }
+
+    #[test]
+    fn run_build_default_sandbox_runs_and_reports_status() {
+        use glass_core::SandboxLevel;
+        assert!(run_build(&make_spec(None, SandboxLevel::Default)).is_ok(), "no build → Ok");
+        assert!(run_build(&make_spec(Some("true"), SandboxLevel::Default)).is_ok(), "successful build → Ok");
+        assert!(run_build(&make_spec(Some("false"), SandboxLevel::Default)).is_err(), "failing build → Err");
     }
 }

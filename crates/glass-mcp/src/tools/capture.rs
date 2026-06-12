@@ -161,6 +161,7 @@ mod tests {
             env: vec![],
             window_hint: None,
             timeout_ms: None,
+            a11y: None,
         };
         start_tool(&mut g, &a).unwrap();
         g

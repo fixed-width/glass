@@ -63,6 +63,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         }),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
         sandbox,
+        a11y: a.a11y.unwrap_or(false),
     };
     let geo = match a.backend.as_deref() {
         Some(b) => glass.start_on(b, &spec),
@@ -455,6 +456,7 @@ mod tests {
             env: vec![],
             window_hint: None,
             timeout_ms: None,
+            a11y: None,
         }
     }
 
@@ -542,6 +544,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         let out = a11y_snapshot(&mut g).unwrap();
@@ -567,6 +570,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         let err = a11y_snapshot(&mut g).unwrap_err();
@@ -579,6 +583,7 @@ mod tests {
         g.start(&AppSpec {
             build: None, run: vec!["x".into()], cwd: None, env: vec![],
             window_hint: None, timeout_ms: 1, sandbox: SandboxLevel::Off,
+            a11y: false,
         }).unwrap();
         a11y_snapshot(&mut g).unwrap();
         let out = set_value(&mut g, &SetValueArgs { id: 1, text: "hello".into(), return_: None }).unwrap();
@@ -596,6 +601,7 @@ mod tests {
         let spec = AppSpec {
             build: None, run: vec!["x".into()], cwd: None, env: vec![],
             window_hint: None, timeout_ms: 1, sandbox: SandboxLevel::Off,
+            a11y: false,
         };
         // Backend says the element isn't editable: the tool must surface an error,
         // never the "set value" confirmation (a silent successful-looking no-op is
@@ -625,6 +631,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         a11y_snapshot(&mut g).unwrap();
@@ -647,6 +654,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         let out = a11y_marks(&mut g).unwrap();
@@ -671,6 +679,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         let out = a11y_marks(&mut g).unwrap();
@@ -695,6 +704,7 @@ mod tests {
         g.start(&AppSpec {
             build: None, run: vec!["x".into()], cwd: None, env: vec![],
             window_hint: None, timeout_ms: 1, sandbox: SandboxLevel::Off,
+ a11y: false,
         })
         .unwrap();
         a11y_snapshot(&mut g).unwrap(); // populate last_ax for click_element/set_value
@@ -771,6 +781,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
 

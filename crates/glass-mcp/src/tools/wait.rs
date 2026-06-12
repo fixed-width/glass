@@ -144,6 +144,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         g
@@ -231,6 +232,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         g
@@ -282,6 +284,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         let mut a = region_args();
@@ -330,6 +333,7 @@ mod tests {
             window_hint: None,
             timeout_ms: 1,
             sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
         })
         .unwrap();
         g

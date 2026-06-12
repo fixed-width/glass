@@ -82,15 +82,38 @@ fn bus_err(e: impl std::fmt::Display) -> GlassError {
     GlassError::AccessibilityUnavailable(format!("accessibility bus error: {e}"))
 }
 
+/// Error shown when glass reached the a11y bus but the launched app publishes no accessible
+/// tree — framed for the developer (it's their app's choice), distinct from a glass/bus problem.
+fn no_app_tree_message(pids: &[u32]) -> String {
+    format!(
+        "the launched app (pid {pids:?}) isn't publishing an accessibility tree. If it should, \
+         enable accessibility in your UI toolkit (e.g. AccessKit for egui/winit, or your GTK/Qt \
+         a11y); some apps (games, canvas) intentionally don't — use the pixel loop (screenshot / \
+         click / diff) there instead."
+    )
+}
+
 /// Connect + find the launched app's accessible ref (shared by snapshot and set_value).
 /// Returns the app's `ObjectRefOwned` (`'static`) and the connection — NOT a proxy (a
 /// proxy would borrow the connection and can't be returned alongside it).
 async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
-    let conn = AccessibilityConnection::new().await.map_err(|e| {
-        GlassError::AccessibilityUnavailable(format!(
-            "no accessibility bus reachable ({e}); is at-spi2 running and the app a11y-enabled?"
-        ))
-    })?;
+    let conn = match ctx.a11y_bus_addr.as_deref() {
+        Some(addr) => {
+            let parsed = addr
+                .try_into()
+                .map_err(|e| GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}")))?;
+            AccessibilityConnection::from_address(parsed).await.map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("cannot reach the private a11y bus ({e})"))
+            })?
+        }
+        None => {
+            return Err(GlassError::AccessibilityUnavailable(
+                "no accessibility bus for this launch — relaunch the app with a11y:true \
+                 to enable the accessibility tree (Linux)"
+                    .into(),
+            ));
+        }
+    };
     let zbus_conn = conn.connection().clone();
     let root = conn.root_accessible_on_registry().await.map_err(bus_err)?;
 
@@ -104,13 +127,8 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
             break;
         }
     }
-    let app_ref = chosen.ok_or_else(|| {
-        GlassError::AccessibilityUnavailable(
-            "the app is not on the accessibility bus (it may expose no accessible UI — \
-             fall back to screenshots)"
-                .into(),
-        )
-    })?;
+    let app_ref = chosen
+        .ok_or_else(|| GlassError::AccessibilityUnavailable(no_app_tree_message(&ctx.pids)))?;
     Ok((app_ref, zbus_conn))
 }
 
@@ -317,4 +335,18 @@ async fn read_value(
 
 fn nonempty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_matching_app_message_is_developer_framed() {
+        let msg = no_app_tree_message(&[4321, 4322]);
+        assert!(msg.contains("4321"), "names the PID(s)");
+        assert!(msg.contains("enable accessibility") || msg.contains("AccessKit"));
+        assert!(msg.contains("pixel") || msg.contains("screenshot"), "points at the pixel-loop fallback");
+        assert!(!msg.contains("relaunch with a11y:true"), "distinct from the bus/opt-in error");
+    }
 }

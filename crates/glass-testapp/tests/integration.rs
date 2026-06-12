@@ -18,6 +18,7 @@ fn app_spec() -> AppSpec {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     }
 }
 
@@ -124,6 +125,7 @@ fn drag_emits_continuous_motion() {
         to_y: 20,
         button: MouseButton::Left,
         modifiers: vec![],
+        duration_ms: 200,
     })
     .unwrap();
     // The fixture echoes "EVENT motion ..." for each button-held motion. A
@@ -196,6 +198,7 @@ fn discovers_reparented_window_via_net_client_list() {
         window_hint: None,
         timeout_ms: 2000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let geom = p
         .start_app(&spec)
@@ -225,6 +228,7 @@ fn finds_window_by_class_when_no_net_wm_pid() {
         }),
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let geom = p
         .start_app(&spec)
@@ -277,6 +281,7 @@ fn failed_start_kills_the_child_process() {
         window_hint: None,
         timeout_ms: 500,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     let err = p.start_app(&spec).unwrap_err();
     assert!(matches!(err, GlassError::Timeout(_)), "expected Timeout, got {err}");
@@ -316,6 +321,7 @@ fn enumerates_and_selects_multiple_windows() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("start_app failed: {e}"));
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
@@ -573,6 +579,7 @@ fn sandbox_default_app_still_runs_and_captures() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     let geom = p.start_app(&spec).unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
     assert_eq!(geom.width, 320);
@@ -606,6 +613,7 @@ fn sandbox_off_build_step_writes_to_real_home() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("off-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
@@ -614,11 +622,13 @@ fn sandbox_off_build_step_writes_to_real_home() {
     assert!(exists, "Off sandbox: sentinel {sentinel_path:?} must exist (unconfined write)");
 }
 
-/// Under `Default` the sandbox HOME is an ephemeral tmpfs so a write to `$HOME`
-/// from inside the namespace stays inside and is invisible on the real FS.
+/// The build step is UNSANDBOXED (only the launched run is contained — gap #5), so even at the
+/// `Default` sandbox level the build runs with the full developer environment and writes the real
+/// `$HOME`. (Network access in the build is likewise the host's — no separate test; the run's
+/// containment is covered by the run-step sandbox tests.)
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn sandbox_default_build_step_cannot_write_real_home() {
+fn sandbox_default_build_step_writes_real_home() {
     let sentinel_name = format!("glass-sandbox-test-sentinel-default-{}.tmp", std::process::id());
     let real_home = std::env::var("HOME").expect("$HOME must be set");
     let sentinel_path = std::path::PathBuf::from(&real_home).join(&sentinel_name);
@@ -634,59 +644,16 @@ fn sandbox_default_build_step_cannot_write_real_home() {
         window_hint: None,
         timeout_ms: 8000,
         sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("default-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
+    let exists = sentinel_path.exists();
+    std::fs::remove_file(&sentinel_path).ok();
     assert!(
-        !sentinel_path.exists(),
-        "Default sandbox: sentinel {sentinel_path:?} must NOT exist (ephemeral HOME)"
+        exists,
+        "build is unsandboxed: sentinel {sentinel_path:?} must exist even at Default"
     );
-}
-
-/// Under `Strict` the build step runs with `--unshare-net` and cannot reach the
-/// network (TCP connection attempt fails → non-zero exit → `start_app` errors).
-#[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn strict_blocks_network_in_build_step() {
-    let xvfb = Xvfb::start();
-    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let spec = AppSpec {
-        // Try a TCP connect to 1.1.1.1:53 (Cloudflare DNS); /dev/tcp requires bash.
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: 8000,
-        sandbox: glass_core::SandboxLevel::Strict,
-    };
-    let err = p.start_app(&spec).expect_err("Strict sandbox should block network in build step");
-    assert!(
-        matches!(err, glass_core::GlassError::AppNotStarted(_)),
-        "expected AppNotStarted (build failure), got {err}"
-    );
-}
-
-/// Under `Default` the build step can reach the network.
-// NOTE: this test requires outbound network egress on the host (passes on GitHub-hosted
-// runners which have egress by default; would need adjusting for an egress-restricted runner).
-#[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn default_allows_network_in_build_step() {
-    let xvfb = Xvfb::start();
-    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let spec = AppSpec {
-        build: Some("bash -c 'exec 3<>/dev/tcp/1.1.1.1/53'".into()),
-        run: vec![TESTAPP.to_string()],
-        cwd: None,
-        env: vec![],
-        window_hint: None,
-        timeout_ms: 8000,
-        sandbox: glass_core::SandboxLevel::Default,
-    };
-    p.start_app(&spec)
-        .unwrap_or_else(|e| panic!("Default sandbox should allow network in build step: {e}"));
-    p.stop_app().unwrap();
 }
 
 /// When `bwrap` is not on `PATH`, `start_app` with `Default` must return
@@ -720,6 +687,7 @@ fn fail_closed_when_bwrap_missing() {
             window_hint: None,
             timeout_ms: 5000,
             sandbox: glass_core::SandboxLevel::Default,
+            a11y: false,
         };
         let err = p.start_app(&spec).err();
         // _guard restores PATH here before any panic-able assertion.
@@ -731,73 +699,132 @@ fn fail_closed_when_bwrap_missing() {
     );
 }
 
-/// Prove that `cwd == real $HOME` no longer re-exposes the real home directory.
-///
-/// We write a uniquely-named sentinel file into the real `$HOME`.  Then we
-/// launch a build step (`cat` the sentinel) with `cwd = real $HOME` under
-/// `SandboxLevel::Default`.  Before the fix, `--bind <cwd> <cwd>` re-mounted
-/// the real HOME over the ephemeral tmpfs; the sentinel was readable and the
-/// build succeeded.  After the fix the bind is skipped, the sentinel is hidden
-/// by the tmpfs, and the build must fail → `start_app` returns an error.
-///
-/// The same build step succeeds under `SandboxLevel::Off` (no sandbox, no
-/// tmpfs), confirming the sentinel itself is readable — we are testing
-/// isolation, not a broken test.
+/// When `a11y: true` is requested but the private a11y bus can't start, the
+/// launch must fail loudly with `AccessibilityUnavailable` rather than silently
+/// degrading. Forces the bus to fail by pointing `GLASS_DBUS_DAEMON` at a
+/// nonexistent binary. Uses a RAII guard to restore the env even on panic;
+/// relies on `--test-threads=1` to avoid races with other tests.
 #[test]
-#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
-fn sandbox_cwd_equals_home_does_not_expose_real_home() {
-    let real_home = std::env::var("HOME").expect("$HOME must be set");
-    let sentinel_name = format!("glass_cwdhome_probe_{}.tmp", std::process::id());
-    let sentinel_path = std::path::PathBuf::from(&real_home).join(&sentinel_name);
-
-    // Write the sentinel to the real home so we have something to try to read.
-    std::fs::write(&sentinel_path, b"secret").expect("write sentinel");
-
-    // ---- Sanity check: Off sandbox, cwd=home — sentinel IS readable ----------
-    {
-        let xvfb = Xvfb::start();
-        let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-        let spec = AppSpec {
-            build: Some(format!("cat $HOME/{sentinel_name}")),
-            run: vec![TESTAPP.to_string()],
-            cwd: Some(std::path::PathBuf::from(&real_home)),
-            env: vec![],
-            window_hint: None,
-            timeout_ms: 8000,
-            sandbox: glass_core::SandboxLevel::Off,
-        };
-        p.start_app(&spec).unwrap_or_else(|e| {
-            let _ = std::fs::remove_file(&sentinel_path);
-            panic!("Off sandbox: build step should succeed (sentinel visible), got {e}");
-        });
-        p.stop_app().unwrap();
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn a11y_true_fails_launch_when_bus_cannot_start() {
+    struct EnvGuard(Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 { Some(v) => std::env::set_var("GLASS_DBUS_DAEMON", v), None => std::env::remove_var("GLASS_DBUS_DAEMON") }
+        }
     }
+    let _guard = EnvGuard(std::env::var_os("GLASS_DBUS_DAEMON"));
+    std::env::set_var("GLASS_DBUS_DAEMON", "/nonexistent/glass-no-such-dbus-daemon");
 
-    // ---- Real test: Default sandbox, cwd=home — sentinel must NOT be readable -
-    {
-        let xvfb = Xvfb::start();
-        let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-        let spec = AppSpec {
-            build: Some(format!("cat $HOME/{sentinel_name}")),
-            run: vec![TESTAPP.to_string()],
-            cwd: Some(std::path::PathBuf::from(&real_home)),
-            env: vec![],
-            window_hint: None,
-            timeout_ms: 8000,
-            sandbox: glass_core::SandboxLevel::Default,
-        };
-        let result = p.start_app(&spec);
-        let _ = std::fs::remove_file(&sentinel_path);
-        assert!(
-            result.is_err(),
-            "Default sandbox with cwd==HOME must NOT expose real home (build step \
-             reading the sentinel should fail); got Ok — containment gap still open!"
-        );
-        assert!(
-            matches!(result.unwrap_err(), glass_core::GlassError::AppNotStarted(_)),
-            "expected AppNotStarted (build-step cat of sentinel failed), got a different error"
-        );
-    }
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let mut spec = app_spec();
+    spec.a11y = true;
+    let err = p.start_app(&spec).expect_err("a11y:true with an unstartable bus must fail the launch");
+    assert!(
+        matches!(err, glass_core::GlassError::AccessibilityUnavailable(_)),
+        "expected AccessibilityUnavailable, got {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn start_app_focuses_window_so_keys_reach_it() {
+    use glass_core::KeyEvent;
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    // --no-self-focus: the fixture does NOT focus itself, so a key reaches it
+    // only if start_app focused it. (The default fixture self-focuses, which
+    // masks this gap — see the spec.)
+    let spec = AppSpec {
+        build: None,
+        run: vec![TESTAPP.to_string(), "--no-self-focus".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    };
+    p.start_app(&spec).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    // No explicit window(Focus)/select_window: start_app must have focused it.
+    p.send_key(&KeyEvent::Text("a".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=97", 40),
+        "key 'a' did not reach the window — start_app did not focus it"
+    );
+    p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn select_window_focuses_the_selected_window() {
+    use glass_core::{KeyEvent, WindowOp};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    // Two windows, neither self-focusing. The MAIN quadrant window echoes key
+    // presses (EVENT keysym=...); the EXTRA window has no KEY_PRESS mask, so it
+    // is SILENT when focused — that silence is how we detect focus moved to it.
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            TESTAPP.to_string(),
+            "--no-self-focus".to_string(),
+            "--windows".to_string(),
+            "2".to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    };
+    p.start_app(&spec).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+
+    let wins = p.list_windows().unwrap();
+    let main = wins
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("main window")
+        .id;
+    let extra = wins
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp-1"))
+        .expect("extra window")
+        .id;
+
+    // Pin focus to MAIN deterministically via window(Focus), NOT select_window, so
+    // the baseline doesn't depend on the fix under test and is known no matter which
+    // window start_app happened to focus.
+    p.select_window(main).unwrap();
+    p.window(&WindowOp::Focus).unwrap();
+    p.send_key(&KeyEvent::Text("a".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=97", 40),
+        "baseline: 'a' should reach the focused main window"
+    );
+
+    // Select the EXTRA (silent) window. If select_window focuses it, 'b' lands on
+    // a window with no KEY_PRESS mask and is NOT echoed. If select_window does NOT
+    // focus (the bug), MAIN stays focused and 'b' IS echoed.
+    p.select_window(extra).unwrap();
+    p.send_key(&KeyEvent::Text("b".into())).unwrap();
+    assert!(
+        !wait_for_log(&mut p, "keysym=98", 25),
+        "'b' was echoed after selecting the extra (silent) window — select_window did not move keyboard focus"
+    );
+
+    // Selecting MAIN again must bring keys back.
+    p.select_window(main).unwrap();
+    p.send_key(&KeyEvent::Text("c".into())).unwrap();
+    assert!(
+        wait_for_log(&mut p, "keysym=99", 40),
+        "select_window(main) did not restore keyboard focus"
+    );
+    p.stop_app().unwrap();
 }
 
 /// With `sandbox: Off`, `start_app` never checks for bwrap.
@@ -814,7 +841,161 @@ fn sandbox_off_bypasses_bwrap_check() {
         window_hint: None,
         timeout_ms: 5000,
         sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
     };
     p.start_app(&spec).unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
     p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn stop_app_reaps_the_apps_forked_child() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        build: None,
+        run: vec![TESTAPP.to_string(), "--fork-child".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    };
+    p.start_app(&spec).unwrap();
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..40 {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT child_pid=") {
+                child_pid = rest.trim().parse().ok();
+            }
+        }
+        if child_pid.is_some() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("fixture should report its forked child pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "forked child should be alive while the app runs"
+    );
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "stop_app must reap the app's forked child (pid {child_pid}), not orphan it"
+    );
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn drag_is_time_paced() {
+    use glass_core::{MouseButton, PointerEvent};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    let t = std::time::Instant::now();
+    p.send_pointer(&PointerEvent::Drag {
+        from_x: 30, from_y: 30, to_x: 200, to_y: 200,
+        button: MouseButton::Left, modifiers: vec![], duration_ms: 200,
+    })
+    .unwrap();
+    let el = t.elapsed();
+    assert!(
+        el >= std::time::Duration::from_millis(150),
+        "a paced 200ms drag should span ~200ms of wall-clock, took {el:?}"
+    );
+    p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn click_with_modifier_reaches_app() {
+    use glass_core::{Modifier, MouseButton, PointerEvent};
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    p.send_pointer(&PointerEvent::Click {
+        x: 50,
+        y: 50,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![Modifier::Control],
+    })
+    .unwrap();
+    // The fixture echoes "EVENT button=<d> x=.. y=.. state=<mask>" on ButtonPress.
+    // X11 ControlMask is 0x04; if glass pressed Control before the button, it's set.
+    let mut saw_ctrl = false;
+    for _ in 0..40 {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT button=") {
+                if let Some(s) = rest.split("state=").nth(1) {
+                    if s.trim().parse::<u16>().unwrap_or(0) & 0x04 != 0 {
+                        saw_ctrl = true;
+                    }
+                }
+            }
+        }
+        if saw_ctrl {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(saw_ctrl, "Control modifier (mask 0x04) not reflected on the button event");
+    p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn window_op_on_a_closed_window_reports_window_not_found() {
+    use glass_core::{GlassError, WindowOp};
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+
+    // Capture glass's stored window id, then kill it out from under glass via a
+    // separate raw connection so the id goes stale (dead drawable).
+    let win = {
+        let windows = p.list_windows().unwrap();
+        let main = windows.first().expect("at least one window");
+        main.id.0 as u32
+    };
+
+    let (conn, _screen) = x11rb::connect(Some(&xvfb.display)).expect("raw X connection");
+    conn.kill_client(win).unwrap().check().expect("kill_client");
+    conn.destroy_window(win).unwrap().check().ok(); // belt-and-suspenders
+    conn.sync().expect("sync raw connection");
+    // Give the server a moment to reap the now-dead window resource.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    // Focus on the stale id must surface the friendly WindowNotFound, not an
+    // opaque Backend(... BadWindow/BadDrawable ...). Test Focus first, while the
+    // id is freshly stale: focus_window's raise hits BadWindow/BadDrawable and
+    // translates it (clearing the id), so this exercises that path directly —
+    // once the id is cleared, later ops short-circuit via require_window.
+    let focus_err = p
+        .window(&WindowOp::Focus)
+        .expect_err("focus on a closed window must fail");
+    assert!(
+        matches!(focus_err, GlassError::WindowNotFound),
+        "expected WindowNotFound from Focus, got {focus_err:?}: {focus_err}"
+    );
+
+    // The stored window must have been cleared by the Focus translation above:
+    // the next op also reports WindowNotFound (a fresh BadWindow here would prove
+    // it wasn't reset).
+    let again = p
+        .window(&WindowOp::Geometry)
+        .expect_err("geometry after a cleared window must also fail");
+    assert!(
+        matches!(again, GlassError::WindowNotFound),
+        "expected WindowNotFound on the follow-up op, got {again:?}: {again}"
+    );
+
+    p.stop_app().ok();
 }

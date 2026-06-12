@@ -47,6 +47,7 @@ mod imp {
             }),
             timeout_ms: 15_000,
             sandbox: level,
+            a11y: false,
         }
     }
 
