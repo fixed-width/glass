@@ -180,3 +180,43 @@ fn snapshot_without_a11y_flag_errors() {
     }
     glass.stop().expect("stop");
 }
+
+// Phase 2: a11y must work when the *run* is sandboxed. glass binds its private a11y bus dir
+// (path sockets) into the run's bwrap. The fixture lives under $HOME (shadowed by the sandbox
+// home-tmpfs), so we set cwd to the fixtures dir (a home-descendant → bound rw) and run the
+// script relative to it.
+fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), "a11y_fixture.py".into()],
+            cwd: Some(fixtures.into()),
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            timeout_ms: 35_000,
+            sandbox: level,
+            a11y: true,
+        })
+        .unwrap_or_else(|e| panic!("launch GTK fixture sandboxed ({level:?}): {e}"));
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let outline = glass.a11y_snapshot().expect("a11y snapshot (sandboxed)").to_outline();
+    assert!(outline.contains("Button \"Save\""), "no Save button (sandboxed {level:?}):\n{outline}");
+    glass.stop().expect("stop");
+}
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture + bwrap; run via scripts/test-a11y.sh"]
+fn a11y_works_under_default_sandbox() {
+    sandboxed_a11y_finds_widgets(glass_core::SandboxLevel::Default);
+}
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture + bwrap; run via scripts/test-a11y.sh"]
+fn a11y_works_under_strict_sandbox() {
+    sandboxed_a11y_finds_widgets(glass_core::SandboxLevel::Strict);
+}
