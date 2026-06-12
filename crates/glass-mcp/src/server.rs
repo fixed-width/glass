@@ -60,10 +60,22 @@ impl GlassServer {
 
     async fn run<F>(&self, f: F) -> Result<CallToolResult, McpError>
     where
-        F: FnOnce(&mut Glass) -> ToolResult,
+        F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
-        let mut g = self.glass.lock().await;
-        Ok(map_tool_result(f(&mut g)))
+        // Run the synchronous tool body on a blocking thread, not on the async executor:
+        // build/launch/window-wait can block for a while and must not stall a runtime
+        // worker, and a tool's own use of `block_on` (e.g. the a11y bus bring-up) must not
+        // nest inside this runtime. A panic in the body becomes a loud error rather than an
+        // unanswered request that hangs the caller forever.
+        let glass = self.glass.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            // `blocking_lock` is correct here (it would panic on an async worker); this is a
+            // blocking thread. Holding it serializes tools — glass has one active session.
+            let mut g = glass.blocking_lock();
+            f(&mut g)
+        })
+        .await;
+        Ok(map_tool_result(outcome.unwrap_or_else(|e| Err(format!("tool handler panicked: {e}")))))
     }
 
     #[tool(

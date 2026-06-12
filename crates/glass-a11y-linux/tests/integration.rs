@@ -19,6 +19,42 @@ fn glass_x11_with_a11y() -> Glass {
     Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
 }
 
+/// Regression: the real MCP runs the (blocking) `glass_start` from *inside* its
+/// multi-thread tokio runtime. `PrivateBus::start` must bring up the a11y bus without
+/// nesting a runtime — nesting panics ("Cannot start a runtime from within a runtime"),
+/// which leaves the MCP request unanswered (the app appears to hang forever) and leaks the
+/// bus children. Launch the fixture from inside a multi-thread runtime and require success.
+/// Host-safe under test-a11y.sh's throwaway XDG_RUNTIME_DIR.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut glass = glass_x11_with_a11y();
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["python3".into(), fixture.into()],
+                cwd: None,
+                env: vec![
+                    ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                    ("GDK_BACKEND".into(), "x11".into()),
+                ],
+                window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+                timeout_ms: 35_000,
+                sandbox: glass_core::SandboxLevel::Off,
+                a11y: true,
+            })
+            .expect("a11y launch from within a tokio runtime must not panic/hang");
+        glass.stop().expect("stop");
+    });
+}
+
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_finds_gtk_widgets() {
