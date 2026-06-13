@@ -125,7 +125,8 @@ mod backend {
                 // same reason.) Recompute the pid union each iteration: a handoff child
                 // may only appear (and own the window) several polls in.
                 let pids = self.app_pids();
-                if let Some(w) = find_app_window(&pids, hint) {
+                let class_prefix = self.adoption_class_prefix();
+                if let Some(w) = find_app_window(&pids, hint, class_prefix.as_deref()) {
                     // A window passed the filter but has no DWM frame bounds yet (a transient
                     // splash destroyed mid-startup): don't fail — keep polling for the real one.
                     if let Some(r) = crate::util::extended_frame_bounds(w.hwnd()) {
@@ -160,6 +161,13 @@ mod backend {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        /// The window-class prefix that positively identifies this launch's app windows (e.g.
+        /// `Sandbox:<box>:` under Sandboxie), or `None` when the launch doesn't rename windows.
+        /// Discovery requires it so it adopts the boxed app, not glass's own launcher console.
+        fn adoption_class_prefix(&self) -> Option<String> {
+            self.app.as_ref().and_then(|a| a.adoption_class_prefix())
         }
     }
 

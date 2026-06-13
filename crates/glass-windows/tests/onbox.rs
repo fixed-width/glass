@@ -407,3 +407,34 @@ fn onbox_a11y_edge_geometry_fallback() {
     std::thread::sleep(Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(&udd);
 }
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + Sandboxie"]
+fn onbox_contained_launch_adopts_app_not_console() {
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let spec = AppSpec {
+        build: None,
+        run: vec!["notepad.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None, // the whole point: no hint needed once scaffolding is excluded
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    // Before the fix this "succeeds" by adopting the boxed `cmd /c launch.cmd` launcher console;
+    // the assertions below fail. After the fix, discovery adopts the boxed Notepad window.
+    let _geo = p
+        .start_app(&spec)
+        .expect("contained Notepad must adopt the app window, not the launcher console");
+    let windows = p.list_windows().expect("list_windows");
+    let active = windows.iter().find(|w| w.active).expect("an active adopted window");
+    let class = active.class.clone().unwrap_or_default();
+    assert_ne!(class, "ConsoleWindowClass", "glass_start adopted the Sandboxie launcher console");
+    assert!(
+        class.starts_with("Sandbox:"),
+        "expected a boxed app window class (Sandbox:<box>:...), got {class:?}"
+    );
+    p.stop_app().expect("stop_app");
+}
