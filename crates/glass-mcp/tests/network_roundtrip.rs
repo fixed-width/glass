@@ -16,9 +16,10 @@ async fn start_server(token: Option<&str>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ServeConfig { addr, token: token.map(String::from) };
-    let glass = glass_mcp::boot();
+    let glass = glass_mcp::boot(None);
+    let report = glass_mcp::audit::report_from_config(None, |_| None);
     tokio::spawn(async move {
-        let _ = glass_mcp::serve::run_on(listener, cfg, glass).await;
+        let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });
     // Give the listener a beat to start accepting.
     tokio::time::sleep(Duration::from_millis(50)).await;

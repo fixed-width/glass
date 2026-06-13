@@ -84,6 +84,15 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
+    EnvVarDoc { name: "GLASS_AUDIT_LOG", scope: EnvScope::All,
+        purpose: "Append a JSONL audit log of every actuation to this path (opt-in)",
+        default: "(off)", secret: false },
+    EnvVarDoc { name: "GLASS_AUDIT_CONTENT", scope: EnvScope::All,
+        purpose: "Audit content detail: none | redacted | full",
+        default: "redacted", secret: false },
+    EnvVarDoc { name: "GLASS_AUDIT_PREFIX_LEN", scope: EnvScope::All,
+        purpose: "Chars of plaintext prefix kept in redacted audit content (0 = none)",
+        default: "8", secret: false },
 ];
 
 /// Standard (non-`GLASS_*`) env glass reads at runtime — reference only.
@@ -214,6 +223,7 @@ mod tests {
             "GLASS_BACKEND", "GLASS_SANDBOX", "GLASS_DISPLAY", "GLASS_XVFB_SCREEN",
             "GLASS_XVFB", "GLASS_SWAY", "GLASS_BWRAP", "GLASS_SH",
             "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TOKEN",
+            "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];
         for name in expected {
             let n = GLASS_ENV.iter().filter(|d| d.name == name).count();

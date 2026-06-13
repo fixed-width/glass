@@ -26,10 +26,11 @@ async fn network_screenshot_over_http() {
     // Start serve on an ephemeral loopback port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let glass = glass_mcp::boot();
+    let glass = glass_mcp::boot(None);
+    let report = glass_mcp::audit::report_from_config(None, |_| None);
     tokio::spawn(async move {
         let cfg = ServeConfig { addr, token: Some("e2e".into()) };
-        let _ = glass_mcp::serve::run_on(listener, cfg, glass).await;
+        let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });
     // Give the listener a beat to start accepting.
     tokio::time::sleep(Duration::from_millis(50)).await;

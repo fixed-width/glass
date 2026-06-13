@@ -308,6 +308,27 @@ checked-in Windows Sandbox template under `packaging/windows-sandbox/`, or a man
 glass-mcp doctor   # checks sandbox availability alongside display/compositor deps
 ```
 
+## Audit log (opt-in)
+
+Pass `--audit-log <path>` (or set `GLASS_AUDIT_LOG=<path>`) to append a JSONL record of
+every actuation glass performs — launch/stop, type, key, click, drag, scroll, set_value,
+clipboard writes, element clicks, window focus/resize/move, and each `glass_do`
+sub-action. Reads (screenshots, diffs, accessibility snapshots, log/clipboard reads) are
+not logged. The hook lives in the core actuation path, so no actuation can bypass it. One
+JSON object per line: `seq`, `ts`, `action`, `target`, `args`, `result`, and for
+content-bearing actions a `content` descriptor.
+
+Typed/clipboard/launch content is **redacted by default** to a length + SHA-256 + short
+prefix, so the log is not a secret sink. `GLASS_AUDIT_CONTENT=full` stores verbatim text,
+`none` stores no content, and `GLASS_AUDIT_PREFIX_LEN=<n>` sizes the prefix (`0` disables
+it). `glass-mcp doctor` reports whether auditing is on, the path, and the content mode.
+
+Two things are recorded in plaintext regardless of `GLASS_AUDIT_CONTENT`: the short
+content **prefix** (default 8 chars — set `GLASS_AUDIT_PREFIX_LEN=0` to drop it), and
+**target metadata** (the active window's title and an element's role/name) which is
+attribution, not actuation content. A window title or field label can itself be sensitive,
+so treat the log as confidential. Launch records intentionally omit `env` and `cwd`.
+
 ## External tool paths
 
 glass shells out to a few third-party programs. Each resolves from a `GLASS_*`

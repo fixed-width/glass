@@ -780,9 +780,14 @@ impl Platform for X11Platform {
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         match event {
             KeyEvent::Text(text) => {
-                for c in text.chars() {
-                    let keysym = glass_core::keys::keysym_for_char(c)
-                        .ok_or_else(|| GlassError::InvalidKey(format!("untypable char {c:?}")))?;
+                // Identify an untypable char by its POSITION, never its value: this error
+                // is recorded verbatim in the audit log's `result.error`, which is not
+                // run through content redaction, so embedding the char would leak typed
+                // content. The caller can recover the char from its own input + the index.
+                for (i, c) in text.chars().enumerate() {
+                    let keysym = glass_core::keys::keysym_for_char(c).ok_or_else(|| {
+                        GlassError::InvalidKey(format!("char at index {i} has no X11 keysym"))
+                    })?;
                     self.key_with_mods(keysym, false, &[])?;
                 }
             }
