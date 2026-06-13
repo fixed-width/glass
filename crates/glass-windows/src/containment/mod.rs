@@ -14,6 +14,11 @@ mod sandboxie;
 #[cfg(all(test, windows))]
 mod clip_onbox;
 
+// On-box (LOTUS) validation that the build step runs unconfined even under Sandboxie. `#[ignore]`d
+// (needs Sandboxie); launches no window, so it runs over SSH.
+#[cfg(all(test, windows))]
+mod build_onbox;
+
 #[cfg(windows)]
 pub(crate) use imp::{resolve_containment, ClipboardRoute, Launched, LogSink};
 
@@ -87,11 +92,12 @@ mod imp {
     }
 
     impl Containment {
+        /// The optional build step runs UNCONFINED at every containment level — only the launched
+        /// *run* is the security boundary (`2026-06-11-unsandbox-build-design`; this completes the
+        /// deferred Windows follow-on). Containing the build bought nothing real and made even a
+        /// trivial build stall/fail under Sandboxie (the box isolates the toolchain/cache/network).
         pub(crate) fn run_build(&self, spec: &AppSpec) -> Result<()> {
-            match self {
-                Containment::Unconfined => crate::process::run_build_unconfined(spec),
-                Containment::Sandboxie(s) => s.run_build(spec),
-            }
+            crate::process::run_build_unconfined(spec)
         }
         /// Launch the app and wire its log readers into `logs`; returns the handle.
         pub(crate) fn launch(&self, spec: &AppSpec, logs: LogSink) -> Result<Launched> {
