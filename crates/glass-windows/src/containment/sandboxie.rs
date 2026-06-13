@@ -439,6 +439,13 @@ impl SandboxieApp {
         pids
     }
 
+    /// The class prefix Sandboxie stamps on this box's app windows (`Sandbox:<box>:`). Window
+    /// discovery requires it under containment so it adopts the real boxed app window and skips
+    /// glass's own interposed launcher console (which Sandboxie leaves as `ConsoleWindowClass`).
+    pub(crate) fn adoption_class_prefix(&self) -> String {
+        format!("Sandbox:{}:", self.box_name)
+    }
+
     /// Always `Ok(None)`: the `Start.exe` wrapper exits right after handing off to the box, so
     /// its exit does not signal the app's; and a `std::process::ExitStatus` for the contained
     /// app cannot be synthesized here. Discovery relies on `pids()` / the start timeout instead.

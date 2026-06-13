@@ -48,15 +48,25 @@ pub(crate) fn app_window_infos(pids: &[u32]) -> Vec<WinInfo> {
 }
 
 /// One scan implementing the discovery ladder:
-/// 1. the app's own process-set windows (the common case) — first match;
+/// 1. the app's own process-set windows (the common case) — first match whose class is adoptable
+///    (`class_prefix`: under Sandboxie only the boxed app's `Sandbox:<box>:`-renamed windows
+///    qualify, so glass's own launcher console — which Sandboxie leaves as `ConsoleWindowClass` —
+///    is skipped; `None` accepts any class);
 /// 2. else, if `hint` has a title, an app-like window whose title contains it
 ///    (handles an app that hands its UI to an unrelated process the pid-set misses);
 /// 3. else, if `hint` has a class, an app-like window whose class equals it.
 ///
 /// `pids` is the app's process set (Job list ∪ Toolhelp walk); rungs 2/3 don't use it.
 /// Returns the first match or `None`.
-pub(crate) fn find_app_window(pids: &[u32], hint: Option<&WindowHint>) -> Option<WinInfo> {
-    if let Some(w) = app_window_infos(pids).into_iter().next() {
+pub(crate) fn find_app_window(
+    pids: &[u32],
+    hint: Option<&WindowHint>,
+    class_prefix: Option<&str>,
+) -> Option<WinInfo> {
+    if let Some(w) = app_window_infos(pids)
+        .into_iter()
+        .find(|w| crate::discovery::class_adoptable(&w.class, class_prefix))
+    {
         return Some(w);
     }
     // Hint fallbacks (only reached when the pid-set rung misses — e.g. the app handed its UI

@@ -65,6 +65,18 @@ pub fn poll_decision(
     }
 }
 
+/// Whether a candidate window's class is adoptable, given the optional containment class prefix.
+///
+/// Sandboxie renames a boxed app's top-level window class to `Sandbox:<box>:<orig>`, but leaves
+/// glass's own interposed launcher console as `ConsoleWindowClass` (Sandboxie does not rename
+/// console windows). So under Sandboxie discovery requires the box prefix — that positively
+/// identifies the real app window and skips the launcher console, regardless of process topology
+/// (the boxed shell is reparented to `SbieSvc`, so a wrapper-parent walk can't find it). `None`
+/// (unconfined) accepts any class, since nothing renames windows there.
+pub fn class_adoptable(class: &str, class_prefix: Option<&str>) -> bool {
+    class_prefix.is_none_or(|p| class.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +122,21 @@ mod tests {
         assert_eq!(poll_decision(Some(Some(0)), true, false, true), PollStep::FailExited(Some(0)));
         assert_eq!(poll_decision(Some(Some(3)), false, true, true), PollStep::FailExited(Some(3)));
         assert_eq!(poll_decision(Some(Some(2)), false, false, true), PollStep::FailExited(Some(2)));
+    }
+
+    #[test]
+    fn class_adoptable_requires_box_prefix_under_sandboxie() {
+        let prefix = Some("Sandbox:glass_11128:");
+        assert!(class_adoptable("Sandbox:glass_11128:Notepad", prefix));
+        // glass's interposed launcher console keeps ConsoleWindowClass — not adoptable.
+        assert!(!class_adoptable("ConsoleWindowClass", prefix));
+        // a window from a different Sandboxie box is not ours.
+        assert!(!class_adoptable("Sandbox:other_box:Foo", prefix));
+    }
+
+    #[test]
+    fn class_adoptable_accepts_any_class_when_unconfined() {
+        assert!(class_adoptable("ConsoleWindowClass", None));
+        assert!(class_adoptable("Chrome_WidgetWin_1", None));
     }
 }

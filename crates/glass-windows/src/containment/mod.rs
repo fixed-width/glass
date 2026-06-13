@@ -150,6 +150,15 @@ mod imp {
                 Launched::Sandboxie(a) => a.pids(),
             }
         }
+        /// The window-class prefix that positively identifies this launch's app windows, when the
+        /// containment renames them. `None` for unconfined launches (no renaming); for Sandboxie,
+        /// `Sandbox:<box>:` — so discovery skips glass's own launcher console (left unrenamed).
+        pub(crate) fn adoption_class_prefix(&self) -> Option<String> {
+            match self {
+                Launched::Unconfined(_) => None,
+                Launched::Sandboxie(a) => Some(a.adoption_class_prefix()),
+            }
+        }
         pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             match self {
                 Launched::Unconfined(a) => a.try_wait(),
