@@ -10,7 +10,7 @@
 //! - `strict` additionally gates on the **global** `PromptForInternetAccess`: a `y` there
 //!   would deadlock a no-network box on a UI prompt, so we detect it and fail closed. We
 //!   never write `[GlobalSettings]`.
-//! - Build runs contained (`Start.exe /box:<box> /wait cmd /c <build>`).
+//! - The build step runs UNCONFINED (host) at every level — only the launched run is contained.
 //! - **Logs use a file fallback**: stdio pipes do NOT forward through `Start.exe`
 //!   (gate-proven), so the app is launched via a generated `launch.cmd` that redirects its
 //!   stdout/stderr to files in a per-session log dir glass owns, and reader threads tail
@@ -232,33 +232,6 @@ impl Sandboxie {
 
         // 5. reload so the service picks up the new box config.
         self.run_sbie(&start_exe(&dir), &["/reload"])?;
-        Ok(())
-    }
-
-    /// Run the optional build step contained: `Start.exe /box:<box> /wait cmd /c <build>`.
-    pub(crate) fn run_build(&self, spec: &AppSpec) -> Result<()> {
-        let Some(build) = &spec.build else {
-            return Ok(());
-        };
-        let mut cmd = Command::new(start_exe(&self.dir));
-        cmd.args([
-            &format!("/box:{}", self.box_name),
-            "/wait",
-            "cmd",
-            "/c",
-            build,
-        ]);
-        if let Some(dir) = &spec.cwd {
-            cmd.current_dir(dir);
-        }
-        let status = cmd
-            .status()
-            .map_err(|e| GlassError::AppNotStarted(format!("contained build: {e}")))?;
-        if !status.success() {
-            return Err(GlassError::AppNotStarted(format!(
-                "contained build failed with status {status}"
-            )));
-        }
         Ok(())
     }
 
