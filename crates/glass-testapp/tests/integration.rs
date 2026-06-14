@@ -622,7 +622,7 @@ fn sandbox_off_build_step_writes_to_real_home() {
     assert!(exists, "Off sandbox: sentinel {sentinel_path:?} must exist (unconfined write)");
 }
 
-/// The build step is UNSANDBOXED (only the launched run is contained — gap #5), so even at the
+/// The build step is UNSANDBOXED (only the launched run is contained), so even at the
 /// `Default` sandbox level the build runs with the full developer environment and writes the real
 /// `$HOME`. (Network access in the build is likewise the host's — no separate test; the run's
 /// containment is covered by the run-step sandbox tests.)
@@ -735,7 +735,7 @@ fn start_app_focuses_window_so_keys_reach_it() {
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     // --no-self-focus: the fixture does NOT focus itself, so a key reaches it
     // only if start_app focused it. (The default fixture self-focuses, which
-    // masks this gap — see the spec.)
+    // would mask whether start_app does the focusing.)
     let spec = AppSpec {
         build: None,
         run: vec![TESTAPP.to_string(), "--no-self-focus".to_string()],

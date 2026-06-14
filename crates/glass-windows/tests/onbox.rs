@@ -507,7 +507,7 @@ fn onbox_egui_set_value_honesty() {
 // Uncontained: end-to-end verification that a Windows ctrl+scroll both DELIVERS the wheel with its
 // modifier on the event (`ev_ctrl`) AND holds the modifier across the wheel's frame so the
 // frame-aggregate `i.modifiers.ctrl` (`frame_ctrl`) — the layer a real handler gates on — reads it.
-// The event reaching egui was never the gap; the gap is the frame-aggregate modifier, which a
+// The event reaching egui was never the bug; the bug is the frame-aggregate modifier, which a
 // one-burst modifier+wheel+release drops (the modifier is released in the same frame the wheel
 // lands). run_scroll's hold-dwell-release fixes it. This is the working baseline the Sandboxie repro
 // is measured against.
@@ -539,7 +539,7 @@ fn onbox_scroll_modifier_delivery() {
 }
 
 // The same two assertions across the Sandboxie boundary: the wheel + its event modifier cross into
-// the contained app (never the gap), and the modifier is held across the wheel's frame so a contained
+// the contained app (never the bug), and the modifier is held across the wheel's frame so a contained
 // handler reading `i.modifiers.ctrl` sees it.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + Sandboxie + builds the egui fixture"]
