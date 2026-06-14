@@ -190,6 +190,13 @@ pub trait Platform {
     fn a11y_bus_addr(&self) -> Option<String> {
         None
     }
+
+    /// Raw native handle of the active (adopted) window — a Windows `HWND` as `i64` — for the
+    /// accessibility reader to bind to directly (`AxContext::window_handle`). Default `None`;
+    /// backends that address a11y by bus (Linux) leave it unset.
+    fn active_window_handle(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[cfg(test)]

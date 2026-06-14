@@ -14,11 +14,6 @@ use uiautomation::patterns::{
 };
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-};
 
 /// Hard cap so a hung UIA provider can't block the calling tool forever.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,100 +99,20 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     Ok(tree)
 }
 
-/// Find the launched app's top-level window and bind a UIA element to it.
-///
-/// Enumerates top-level windows with **Win32** (`EnumWindows` + `GetWindowThreadProcessId`) — pure
-/// HWND/kernel calls — then binds the chosen window with `element_from_handle`. The old approach
-/// walked the *desktop's UIA tree*, calling `get_process_id`/`get_bounding_rectangle` on **every**
-/// top-level window, including other apps'. A single foreign window whose UIA provider blocks
-/// cross-process calls on a worker thread (observed on a real desktop) wedged the entire snapshot.
-/// Touching only Win32 here, and the target window's own provider via `element_from_handle`, means
-/// no other app's provider is ever queried — the snapshot can't be held hostage by a misbehaving
-/// peer window.
-///
-/// Prefers a PID match against `ctx.pids` — the launched app's process *set* (root + the descendants
-/// the backend's Job enumerates), so a multi-process app (Electron/Edge) whose top-level window is
-/// owned by a DESCENDANT process still matches by pid. Disambiguates multiple matches, and falls back
-/// when no pid matches, by the rect closest to `ctx.window`. `AccessibilityUnavailable` if nothing
-/// matches.
+/// Bind a UIA element to glass's adopted window via its handle (`AxContext::window_handle`, set by
+/// the backend from its active `HWND`). a11y reads the *exact* window glass drives — the same handle
+/// `send_pointer`/`window` operate on — so it never enumerates the desktop or queries a peer app's
+/// UIA provider (a foreign provider that blocks cross-process calls on the worker thread could
+/// otherwise wedge the whole snapshot). `element_from_handle` touches only the target's provider.
 fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
-    let hwnd = find_app_window_handle(ctx)?;
-    automation
-        .element_from_handle(Handle::from(hwnd))
-        .map_err(uia_err)
-}
-
-/// The Win32 half of [`find_app_window`]: pick the best top-level window's `HWND` (as an `isize`).
-fn find_app_window_handle(ctx: &AxContext) -> Result<isize> {
-    let mut hwnds: Vec<HWND> = Vec::new();
-    // SAFETY: `collect_top_level` receives `&mut hwnds` via the LPARAM and only runs during this
-    // synchronous call, while `hwnds` is live on this stack frame.
-    unsafe {
-        let _ = EnumWindows(
-            Some(collect_top_level),
-            LPARAM(&mut hwnds as *mut Vec<HWND> as isize),
-        );
-    }
-
-    // rect distance to ctx.window (top-left + size), generous because the DWM extended-frame-bounds
-    // glass reports differs from the Win32 window rect by the invisible resize border (~7px/side).
-    let dist_to = |hwnd: HWND| -> Option<i64> {
-        let mut r = RECT::default();
-        // SAFETY: `hwnd` is a live top-level window from EnumWindows; `r` is written by the call.
-        unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        if w <= 0 || h <= 0 {
-            return None; // zero-area / off-screen helper window
-        }
-        Some(
-            (r.left - ctx.window.x).abs() as i64
-                + (r.top - ctx.window.y).abs() as i64
-                + (w - ctx.window.width as i32).abs() as i64
-                + (h - ctx.window.height as i32).abs() as i64,
+    let handle = ctx.window_handle.ok_or_else(|| {
+        GlassError::AccessibilityUnavailable(
+            "no active window handle in the a11y context (the backend adopted no window)".into(),
         )
-    };
-
-    let mut by_pid: Option<(isize, i64)> = None; // closest among pid-matches
-    let mut by_geom: Option<(isize, i64)> = None; // closest visible overall (fallback)
-    for hwnd in hwnds {
-        // SAFETY: `hwnd` is a live top-level window from EnumWindows.
-        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            continue; // skip hidden message-only / helper windows
-        }
-        let Some(dist) = dist_to(hwnd) else { continue };
-        if by_geom.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
-            by_geom = Some((hwnd.0 as isize, dist));
-        }
-        let mut got = 0u32;
-        // SAFETY: `hwnd` is live; `got` receives the owning pid.
-        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut got)) };
-        let pid_ok = ctx.pids.is_empty() || ctx.pids.contains(&got);
-        if pid_ok && by_pid.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
-            by_pid = Some((hwnd.0 as isize, dist));
-        }
-    }
-    if let Some((h, _)) = by_pid {
-        return Ok(h);
-    }
-    // No pid match: accept the geometry-closest window only if it's genuinely close (reject a wrong
-    // window). Tolerance is generous for the border delta; tuned on the box (Task 5).
-    const GEOM_TOLERANCE: i64 = 120;
-    if let Some((h, d)) = by_geom {
-        if d <= GEOM_TOLERANCE {
-            return Ok(h);
-        }
-    }
-    Err(GlassError::AccessibilityUnavailable(
-        "the app exposes no top-level window matching its pid or geometry (custom-drawn? fall back to screenshots)".into(),
-    ))
-}
-
-/// `EnumWindows` callback: append each top-level `HWND` to the `Vec<HWND>` carried in `lparam`.
-unsafe extern "system" fn collect_top_level(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: `lparam` is the `&mut Vec<HWND>` find_app_window_handle passed for this enumeration.
-    let hwnds = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
-    hwnds.push(hwnd);
-    BOOL(1) // keep enumerating
+    })?;
+    automation
+        .element_from_handle(Handle::from(handle as isize))
+        .map_err(uia_err)
 }
 
 /// Recursively build a normalized node, bounded by depth + global node count.

@@ -324,6 +324,12 @@ mod backend {
         fn app_pids(&self) -> Vec<u32> {
             self.app.as_ref().map(|a| a.pids()).unwrap_or_default()
         }
+
+        /// The adopted window's `HWND` (as `i64`), so the a11y reader binds UI Automation straight
+        /// to the exact window glass drives — same handle `send_pointer`/`window` use.
+        fn active_window_handle(&self) -> Option<i64> {
+            self.active_hwnd.map(|h| h as i64)
+        }
     }
 
     impl Drop for WindowsPlatform {

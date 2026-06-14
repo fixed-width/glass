@@ -442,9 +442,10 @@ impl Glass {
         let s = self.active_mut()?;
         let pids = s.platform.app_pids();
         let window = s.geometry.clone();
+        let window_handle = s.platform.active_window_handle();
         let a11y_bus_addr = s.platform.a11y_bus_addr();
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
-        let mut tree = acc.snapshot(&AxContext { pids, window, a11y_bus_addr })?;
+        let mut tree = acc.snapshot(&AxContext { pids, window, window_handle, a11y_bus_addr })?;
         tree.assign_ids();
         s.last_ax = Some(tree.clone());
         s.pump();
@@ -518,6 +519,7 @@ impl Glass {
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
                 window: s.geometry.clone(),
+                window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
             };
             (target, ctx)
