@@ -16,6 +16,8 @@ struct Fixture {
     text: String,
     value: f32,
     announced: bool,
+    frames: u32,
+    copied: bool,
 }
 
 impl eframe::App for Fixture {
@@ -26,6 +28,15 @@ impl eframe::App for Fixture {
         if !self.announced {
             log("[fixture] ready");
             self.announced = true;
+        }
+        // Write the clipboard once via egui (-> arboard -> user32 SetClipboardData), a few frames in
+        // so the host's private-clipboard store/pipe is up. Tests whether a contained app's own
+        // clipboard write is readable by glass.
+        self.frames += 1;
+        if !self.copied && self.frames >= 60 {
+            self.copied = true;
+            ui.ctx().copy_text("GLASS-CLIP-SENTINEL".to_string());
+            log("[fixture] copied sentinel");
         }
         // Report each wheel event with the modifiers egui received ON the event, so on-box tests
         // can verify wheel + modifier delivery. The event's own modifiers are ground truth.
