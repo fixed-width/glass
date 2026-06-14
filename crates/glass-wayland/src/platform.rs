@@ -718,6 +718,89 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
     }
 }
 
+/// Lets `glass_core::run_scroll` drive a Wayland scroll through the virtual pointer + keyboard. The
+/// modifier mask is set in `modifiers(true)` and cleared in `modifiers(false)`; `wheel` positions the
+/// pointer (with the focus-reassert nudge, like the drag sink) then emits the vertical and horizontal
+/// axis. Each method self-commits (frame + roundtrip + 8ms settle) so the modifier is held across the
+/// wheel's frame.
+struct WaylandScrollSink<'a> {
+    s: &'a mut ActiveSession,
+    w: u32,
+    h: u32,
+    ox: i32,
+    oy: i32,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    mask: u32,
+}
+
+impl WaylandScrollSink<'_> {
+    fn tick(&mut self) -> u32 {
+        self.s.time = self.s.time.wrapping_add(1);
+        self.s.time
+    }
+    fn ax(&self, x: i32) -> u32 {
+        (self.ox + x).max(0) as u32
+    }
+    fn ay(&self, y: i32) -> u32 {
+        (self.oy + y).max(0) as u32
+    }
+    fn settle(&mut self) -> Result<()> {
+        self.s
+            .queue
+            .roundtrip(&mut self.s.state)
+            .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
+        std::thread::sleep(Duration::from_millis(8));
+        Ok(())
+    }
+}
+
+impl glass_core::ScrollSink for WaylandScrollSink<'_> {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if self.mask == 0 {
+            return Ok(());
+        }
+        let kb = self.s.keyboard.clone();
+        if down {
+            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[]))?;
+            kb.modifiers(self.mask, 0, 0, 0);
+        } else {
+            kb.modifiers(0, 0, 0, 0);
+        }
+        self.settle()
+    }
+    fn wheel(&mut self) -> Result<()> {
+        let vp = self.s.pointer.clone();
+        let (w, h) = (self.w, self.h);
+        let (axx, ayy) = (self.ax(self.x), self.ay(self.y));
+        // Position with the focus-reassert nudge (sway re-evaluates pointer focus only on motion).
+        let t = self.tick();
+        vp.motion_absolute(t, axx, ayy, w, h);
+        vp.frame();
+        self.settle()?;
+        let t = self.tick();
+        vp.motion_absolute(t, nudge_x(axx, w), ayy, w, h);
+        vp.frame();
+        vp.motion_absolute(t, axx, ayy, w, h);
+        vp.frame();
+        self.settle()?;
+        // Emit the wheel (vertical then horizontal) at that point.
+        if self.dy != 0 {
+            let t = self.tick();
+            vp.axis_discrete(t, Axis::VerticalScroll, self.dy as f64 * 15.0, self.dy);
+            vp.frame();
+        }
+        if self.dx != 0 {
+            let t = self.tick();
+            vp.axis_discrete(t, Axis::HorizontalScroll, self.dx as f64 * 15.0, self.dx);
+            vp.frame();
+        }
+        self.settle()
+    }
+}
+
 impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
@@ -968,24 +1051,21 @@ impl Platform for WaylandPlatform {
                 glass_core::run_drag(&mut sink, &gesture)?;
             }
             PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
-                position(&mut session.queue, &mut session.state, x, y)?;
-                let mask = modifier_mask(modifiers);
-                if mask != 0 {
-                    upload_keymap(session, &kb, &crate::keyboard::build_keymap(&[]))?;
-                    kb.modifiers(mask, 0, 0, 0);
-                }
-                if dy != 0 {
-                    vp.axis_discrete(t, Axis::VerticalScroll, dy as f64 * 15.0, dy);
-                    vp.frame();
-                }
-                if dx != 0 {
-                    vp.axis_discrete(t, Axis::HorizontalScroll, dx as f64 * 15.0, dx);
-                    vp.frame();
-                }
-                if mask != 0 {
-                    settle(&mut session.queue, &mut session.state)?;
-                    kb.modifiers(0, 0, 0, 0);
-                }
+                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
+                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                let mut sink = WaylandScrollSink {
+                    s: &mut *session,
+                    w,
+                    h,
+                    ox,
+                    oy,
+                    x,
+                    y,
+                    dx,
+                    dy,
+                    mask: modifier_mask(modifiers),
+                };
+                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
         }
         session.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;

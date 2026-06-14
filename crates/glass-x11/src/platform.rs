@@ -681,6 +681,45 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
     }
 }
 
+/// Lets `glass_core::run_scroll` drive an X11 scroll through the existing XTEST primitives. The
+/// modifier keycodes are held between `modifiers(true)` and `modifiers(false)`, so a frame-based
+/// client sees the modifier held across the wheel's frame; each method self-commits with `XFlush`.
+struct X11ScrollSink<'a> {
+    p: &'a X11Platform,
+    ox: i32,
+    oy: i32,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    mods: &'a [glass_core::keys::Modifier],
+    kcs: Vec<u8>,
+}
+
+impl X11ScrollSink<'_> {
+    fn flush(&self) -> Result<()> {
+        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+}
+
+impl glass_core::ScrollSink for X11ScrollSink<'_> {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if down {
+            self.kcs = self.p.press_mods(self.mods)?;
+        } else {
+            self.p.release_mods(&self.kcs)?;
+        }
+        self.flush()
+    }
+    fn wheel(&mut self) -> Result<()> {
+        self.p.warp(self.ox, self.oy, self.x, self.y)?;
+        // 4=up,5=down,6=left,7=right; click |delta| times.
+        self.p.scroll_button(5, 4, self.dy)?;
+        self.p.scroll_button(7, 6, self.dx)?;
+        self.flush()
+    }
+}
+
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         if spec.sandbox != glass_core::SandboxLevel::Off {
@@ -777,12 +816,20 @@ impl Platform for X11Platform {
         match *event {
             PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
             PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
-                self.warp(ox, oy, x, y)?;
-                let kcs = self.press_mods(modifiers)?;
-                // 4=up,5=down,6=left,7=right; click |delta| times.
-                self.scroll_button(5, 4, dy)?;
-                self.scroll_button(7, 6, dx)?;
-                self.release_mods(&kcs)?;
+                // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
+                // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
+                let mut sink = X11ScrollSink {
+                    p: &*self,
+                    ox,
+                    oy,
+                    x,
+                    y,
+                    dx,
+                    dy,
+                    mods: modifiers.as_slice(),
+                    kcs: Vec::new(),
+                };
+                glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
             PointerEvent::Click { x, y, button, count, ref modifiers } => {
                 self.warp(ox, oy, x, y)?;
