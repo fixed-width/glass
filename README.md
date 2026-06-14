@@ -418,6 +418,11 @@ Because sway is headless and per-session, there's **nothing to set up or keep
 running** — no persistent display, no `$DISPLAY`/`$WAYLAND_DISPLAY`. sway also
 launches an Xwayland server, so X11-only apps run under this backend too.
 
+Override the headless output size with **`GLASS_WAYLAND_SCREEN`** (default
+`1280x800`, matching the X11 backend). This is the Wayland analog of X11's
+`GLASS_XVFB_SCREEN`, but the format is `WxH` (no depth field) — a headless
+wlroots output has no caller-chosen color depth.
+
 Because the target app runs inside the headless sway that glass spawns (not the
 host's compositor), this backend works on **any** Linux host — **including GNOME and
 KDE** desktops, where the host desktop is simply irrelevant. Driving the user's

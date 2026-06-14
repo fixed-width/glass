@@ -10,12 +10,36 @@ use glass_sandbox_linux::{ephemeral_home, wrap_argv, WrapOpts};
 
 pub type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 
-/// Headless output size for the spawned sway compositor (matches the prior cage
-/// output size, which existing tests assert).
+/// Default headless output size for the spawned sway compositor. Matches the
+/// X11 backend's `GLASS_XVFB_SCREEN` default (1280x800) so both backends present
+/// the same screen unless overridden. Override with `GLASS_WAYLAND_SCREEN` (see
+/// [`output_resolution`]).
 pub const OUTPUT_WIDTH: u32 = 1280;
-pub const OUTPUT_HEIGHT: u32 = 720;
+pub const OUTPUT_HEIGHT: u32 = 800;
 
-/// Render a minimal per-session sway config: one headless output at a fixed size,
+/// Parse a `WxH` screen spec (e.g. `"1920x1080"`) into `(width, height)`.
+/// Returns `None` for anything malformed — missing/extra `x`, non-numeric, or a
+/// zero dimension — so the caller falls back to the default rather than emitting
+/// a broken `output` line. Note the contract differs from X11's
+/// `GLASS_XVFB_SCREEN` (`WxHxDepth`): a headless wlroots output has no
+/// caller-chosen color depth, so the depth field is intentionally rejected.
+fn parse_screen(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once('x')?;
+    let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The headless output resolution: `GLASS_WAYLAND_SCREEN` (`WxH`) when set and
+/// well-formed, otherwise the [`OUTPUT_WIDTH`]×[`OUTPUT_HEIGHT`] default.
+fn output_resolution() -> (u32, u32) {
+    std::env::var("GLASS_WAYLAND_SCREEN")
+        .ok()
+        .and_then(|s| parse_screen(&s))
+        .unwrap_or((OUTPUT_WIDTH, OUTPUT_HEIGHT))
+}
+
+/// Render a minimal per-session sway config: one headless output sized by
+/// [`output_resolution`],
 /// no window borders, every window floating (so toplevels keep their natural size
 /// for true per-window capture/geometry), and an `exec` that launches the target
 /// app. `spec.run` args are shell-quoted because sway runs `exec` through
@@ -56,8 +80,9 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
         }
     };
     let exec = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let (out_w, out_h) = output_resolution();
     format!(
-        "output HEADLESS-1 resolution {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}\n\
+        "output HEADLESS-1 resolution {out_w}x{out_h}\n\
          default_border none\n\
          for_window [title=\".*\"] floating enable\n\
          exec {exec}\n"
@@ -141,10 +166,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_screen_accepts_wxh() {
+        assert_eq!(parse_screen("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_screen("1280x720"), Some((1280, 720)));
+    }
+
+    #[test]
+    fn parse_screen_rejects_malformed_and_falls_back() {
+        // Missing 'x', non-numeric, and zero dimensions are malformed -> None,
+        // so the caller keeps the default rather than emitting a broken output line.
+        for bad in ["1920", "axb", "0x600", "800x0", "", "x", "1280x"] {
+            assert_eq!(parse_screen(bad), None, "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_screen_rejects_xvfb_style_depth() {
+        // Unlike X11's GLASS_XVFB_SCREEN (WxHxDepth), GLASS_WAYLAND_SCREEN is WxH:
+        // a headless wlroots output has no caller-chosen depth. Reject the triple
+        // form loudly instead of silently ignoring the depth field.
+        assert_eq!(parse_screen("1280x800x24"), None);
+    }
+
+    #[test]
     fn sway_config_has_output_border_and_quoted_exec() {
         // sandbox: Off — exec must be the bare app argv, not wrapped in bwrap.
         let cfg = sway_config(&spec(&["glass-testapp", "--windows", "2"]), std::path::Path::new("/run/glass-rt"), None);
-        assert!(cfg.contains("output HEADLESS-1 resolution 1280x720"), "{cfg}");
+        assert!(cfg.contains("output HEADLESS-1 resolution 1280x800"), "{cfg}");
         assert!(cfg.contains("default_border none"), "{cfg}");
         assert!(cfg.contains("floating enable"), "{cfg}");
         assert!(cfg.contains("exec 'glass-testapp' '--windows' '2'"), "{cfg}");

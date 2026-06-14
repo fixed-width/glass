@@ -69,6 +69,9 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_SWAY", scope: EnvScope::Wayland,
         purpose: "sway binary; explicit value skips discovery (fail-closed if wrong)",
         default: "auto-discover (PATH / ~/.local/share/glass/sway / next to glass-mcp)", secret: false },
+    EnvVarDoc { name: "GLASS_WAYLAND_SCREEN", scope: EnvScope::Wayland,
+        purpose: "Headless sway output size (WxH; no depth field, unlike GLASS_XVFB_SCREEN)",
+        default: "1280x800", secret: false },
     EnvVarDoc { name: "GLASS_BWRAP", scope: EnvScope::Linux,
         purpose: "bubblewrap binary (app + build containment)",
         default: "bwrap", secret: false },
@@ -221,7 +224,7 @@ mod tests {
     fn registry_has_all_known_vars_once() {
         let expected = [
             "GLASS_BACKEND", "GLASS_SANDBOX", "GLASS_DISPLAY", "GLASS_XVFB_SCREEN",
-            "GLASS_XVFB", "GLASS_SWAY", "GLASS_BWRAP", "GLASS_SH",
+            "GLASS_XVFB", "GLASS_SWAY", "GLASS_WAYLAND_SCREEN", "GLASS_BWRAP", "GLASS_SH",
             "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TOKEN",
             "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];
