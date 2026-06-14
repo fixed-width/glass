@@ -676,6 +676,48 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
     }
 }
 
+/// Lets `glass_core::run_chord` drive a Wayland key chord through the virtual keyboard. The keymap
+/// (with the chord's key as keycode 1) is uploaded and the modifier mask set in `modifiers(true)`;
+/// each method self-commits (roundtrip + 8ms settle) so the modifier is held across the key's frame.
+struct WaylandChordSink<'a> {
+    s: &'a mut ActiveSession,
+    mask: u32,
+    keysym: u32,
+}
+
+impl WaylandChordSink<'_> {
+    fn settle(&mut self) -> Result<()> {
+        self.s
+            .queue
+            .roundtrip(&mut self.s.state)
+            .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
+        std::thread::sleep(Duration::from_millis(8));
+        Ok(())
+    }
+}
+
+impl glass_core::ChordSink for WaylandChordSink<'_> {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        let kb = self.s.keyboard.clone();
+        if down {
+            // Upload the keymap (chord key = keycode 1) regardless of mask, then set the modifiers.
+            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[self.keysym]))?;
+            if self.mask != 0 {
+                kb.modifiers(self.mask, 0, 0, 0);
+            }
+        } else if self.mask != 0 {
+            kb.modifiers(0, 0, 0, 0);
+        }
+        self.settle()
+    }
+    fn key(&mut self, down: bool) -> Result<()> {
+        let kb = self.s.keyboard.clone();
+        self.s.time = self.s.time.wrapping_add(1);
+        kb.key(self.s.time, 1, u32::from(down)); // keycode 1 = the chord's key; 1=pressed, 0=released
+        self.settle()
+    }
+}
+
 impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
@@ -977,15 +1019,9 @@ impl Platform for WaylandPlatform {
             }
             KeyEvent::Chord(c) => {
                 let (mods, keysym) = parse_chord(c)?; // validates before any traffic
-                upload_keymap(session, &kb, &build_keymap(&[keysym]))?;
-                let mask = modifier_mask(&mods);
-                if mask != 0 {
-                    kb.modifiers(mask, 0, 0, 0);
-                }
-                tap(session, &kb, 1);
-                if mask != 0 {
-                    kb.modifiers(0, 0, 0, 0);
-                }
+                let mut sink =
+                    WaylandChordSink { s: &mut *session, mask: modifier_mask(&mods), keysym };
+                glass_core::run_chord(&mut sink)?;
             }
         }
         session.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;

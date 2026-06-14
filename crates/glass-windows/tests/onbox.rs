@@ -74,7 +74,7 @@ fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
 
 /// Drive a plain wheel then a ctrl+wheel at the window center; return the fixture's "wheel" log lines
 /// for each (the fixture logs every MouseWheel event with the modifiers egui received on it). Used to
-/// verify wheel + modifier delivery across containment levels (G3).
+/// verify wheel + modifier delivery across containment levels.
 fn scroll_evidence(p: &mut WindowsPlatform, geo: &WindowGeometry) -> (Vec<String>, Vec<String>) {
     fn wheel_lines(p: &mut WindowsPlatform) -> Vec<String> {
         p.drain_logs().into_iter().map(|(_, l)| l).filter(|l| l.contains("wheel")).collect()
@@ -449,7 +449,7 @@ fn onbox_egui_set_value_honesty() {
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot of the egui fixture");
 
-    // G2: egui exposes TextEdit as a read-only AccessKit projection — UIA SetValue is accepted
+    // egui exposes TextEdit as a read-only AccessKit projection — UIA SetValue is accepted
     // but never applied. set_value must report that honestly (AxValueNotApplied), not false success.
     let mut field = None;
     first_role(&tree.root, AxRole::TextField, &mut field);
@@ -469,7 +469,7 @@ fn onbox_egui_set_value_honesty() {
 
 // Uncontained: the first end-to-end verification that Windows scroll AND its ctrl modifier reach the
 // app (the existing onbox_modifier_click only checks SendInput submits, never delivery). Proven on
-// the 3x-DPI dogfood host, so this is the working baseline that G3's Sandboxie repro is measured
+// the 3x-DPI dogfood host, so this is the working baseline that the Sandboxie repro is measured
 // against.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
@@ -493,7 +493,7 @@ fn onbox_scroll_modifier_delivery() {
     );
 }
 
-// G3: the dogfood ran glass-paint UNDER SANDBOXIE and concluded ctrl+scroll "delivered nothing to
+// The dogfood ran glass-paint UNDER SANDBOXIE and concluded ctrl+scroll "delivered nothing to
 // egui". Measured directly here with the fixture as ground truth, the synthesized wheel AND its ctrl
 // modifier DO cross the Sandboxie boundary into the contained app — refuting that conclusion (the
 // dogfood had inferred "no wheel" from the app not visibly zooming, conflating delivery with effect).
@@ -516,6 +516,38 @@ fn onbox_scroll_modifier_delivery_sandboxed() {
     assert!(
         ctrl.iter().any(|l| l.contains("ctrl=true")),
         "ctrl+scroll must cross the Sandboxie boundary with ctrl=true, got {ctrl:?}"
+    );
+}
+
+// A synthetic key chord must hold the modifier across the frame the key lands in, so the
+// standard egui hotkey idiom (`key_pressed(K) && i.modifiers.command`) fires — as it does for real
+// hardware that holds the modifier across many frames. If glass injects ctrl-down/Z/ctrl-up in one
+// burst, egui drains them into a single frame and the frame-aggregate modifier is already false.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_chord_modifier_frame() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let _geo = p
+        .start_app(&egui_fixture_spec(glass_core::SandboxLevel::Off))
+        .expect("build + launch the egui fixture");
+    std::thread::sleep(Duration::from_millis(2000));
+    let _ = p.drain_logs(); // discard startup logs
+
+    p.send_key(&KeyEvent::Chord("ctrl+z".to_string())).expect("ctrl+z chord submits");
+    std::thread::sleep(Duration::from_millis(600));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_, l)| l).collect();
+    for l in logs.iter().filter(|l| l.contains("key ") || l.contains("chord Z")) {
+        eprintln!("  {l}");
+    }
+    let _ = p.stop_app();
+
+    let chord = logs.iter().filter(|l| l.contains("chord Z")).cloned().collect::<Vec<_>>();
+    assert!(!chord.is_empty(), "ctrl+z must reach egui as a Z key press, got none");
+    assert!(
+        chord.iter().any(|l| l.contains("undo_idiom=true")),
+        "ctrl+z must let `key_pressed(Z) && modifiers.command` hold in one frame, got {chord:?}"
     );
 }
 

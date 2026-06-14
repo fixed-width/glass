@@ -18,6 +18,9 @@ pub use frame::{Frame, Region};
 pub mod drag;
 pub use drag::{run_drag, DragGesture, DragSink};
 
+pub mod chord;
+pub use chord::{run_chord, ChordSink, CHORD_DWELL};
+
 pub mod keys;
 pub use keys::Modifier;
 
