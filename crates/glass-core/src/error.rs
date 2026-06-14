@@ -63,6 +63,9 @@ pub enum GlassError {
     #[error("element #{0} changed since the snapshot; re-snapshot")]
     AxElementChanged(u32),
 
+    #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
+    AxValueNotApplied(u32),
+
     #[error("accessibility unavailable: {0}")]
     AccessibilityUnavailable(String),
 

@@ -4,7 +4,7 @@
 //! into an `AxTree`. Never returns a stub: failures are `AccessibilityUnavailable`.
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
@@ -12,8 +12,13 @@ use glass_core::{
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UISelectionItemPattern, UITogglePattern, UIValuePattern,
 };
-use uiautomation::types::{ExpandCollapseState, Rect, ToggleState};
+use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+};
 
 /// Hard cap so a hung UIA provider can't block the calling tool forever.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,6 +37,9 @@ const MAX_SIBLINGS: usize = 4096;
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
 /// the id sits far enough away to be rejected. Generous to avoid false-rejects.
 const SET_VALUE_BOUNDS_TOL: i64 = 12;
+/// How long `run_set_value` polls the read-back for the value to change before declaring the
+/// write a no-op. A real numeric set lands within a frame or two; well under the 10s outer cap.
+const SET_VALUE_VERIFY_MS: u64 = 800;
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -86,9 +94,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
     })?;
     let walker = automation.get_control_view_walker().map_err(uia_err)?;
-    let root = automation.get_root_element().map_err(uia_err)?;
-
-    let window = find_app_window(&walker, &root, ctx)?;
+    let window = find_app_window(&automation, ctx)?;
 
     let origin = (ctx.window.x, ctx.window.y);
     let mut count = 0usize;
@@ -98,57 +104,100 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     Ok(tree)
 }
 
-/// Find the launched app's top-level window among the desktop's children. Prefers a PID match
-/// against `ctx.pids` — the launched app's process *set* (root + the descendants the backend's Job
-/// enumerates), so a multi-process app (Electron/Edge) whose top-level window is owned by a
-/// DESCENDANT process still matches by pid. Falls back to the window whose rect best matches
-/// `ctx.window` only when no pid matches (a secondary last resort). `AccessibilityUnavailable`
-/// if nothing matches.
-fn find_app_window(walker: &UITreeWalker, root: &UIElement, ctx: &AxContext) -> Result<UIElement> {
-    // rect distance to ctx.window (top-left + size), generous because the DWM extended-frame-bounds
-    // glass reports differs from the UIA window rect by the invisible resize border (~7px/side).
-    let dist_to = |win: &UIElement| -> i64 {
-        win.get_bounding_rectangle()
-            .ok()
-            .map(|r| {
-                (r.get_left() - ctx.window.x).abs() as i64
-                    + (r.get_top() - ctx.window.y).abs() as i64
-                    + (r.get_width() - ctx.window.width as i32).abs() as i64
-                    + (r.get_height() - ctx.window.height as i32).abs() as i64
-            })
-            .unwrap_or(i64::MAX)
-    };
-    let mut by_pid: Option<(UIElement, i64)> = None; // closest among pid-matches
-    let mut by_geom: Option<(UIElement, i64)> = None; // closest overall (fallback)
-    let mut child = walker.get_first_child(root).ok();
-    while let Some(win) = child {
-        let dist = dist_to(&win);
-        if by_geom.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
-            by_geom = Some((win.clone(), dist));
-        }
-        let pid_ok = match win.get_process_id() {
-            Ok(got) => ctx.pids.is_empty() || ctx.pids.contains(&got),
-            Err(_) => ctx.pids.is_empty(),
-        };
-        if pid_ok && by_pid.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
-            by_pid = Some((win.clone(), dist));
-        }
-        child = walker.get_next_sibling(&win).ok();
+/// Find the launched app's top-level window and bind a UIA element to it.
+///
+/// Enumerates top-level windows with **Win32** (`EnumWindows` + `GetWindowThreadProcessId`) — pure
+/// HWND/kernel calls — then binds the chosen window with `element_from_handle`. The old approach
+/// walked the *desktop's UIA tree*, calling `get_process_id`/`get_bounding_rectangle` on **every**
+/// top-level window, including other apps'. A single foreign window whose UIA provider blocks
+/// cross-process calls on a worker thread (observed on a real desktop) wedged the entire snapshot.
+/// Touching only Win32 here, and the target window's own provider via `element_from_handle`, means
+/// no other app's provider is ever queried — the snapshot can't be held hostage by a misbehaving
+/// peer window.
+///
+/// Prefers a PID match against `ctx.pids` — the launched app's process *set* (root + the descendants
+/// the backend's Job enumerates), so a multi-process app (Electron/Edge) whose top-level window is
+/// owned by a DESCENDANT process still matches by pid. Disambiguates multiple matches, and falls back
+/// when no pid matches, by the rect closest to `ctx.window`. `AccessibilityUnavailable` if nothing
+/// matches.
+fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
+    let hwnd = find_app_window_handle(ctx)?;
+    automation
+        .element_from_handle(Handle::from(hwnd))
+        .map_err(uia_err)
+}
+
+/// The Win32 half of [`find_app_window`]: pick the best top-level window's `HWND` (as an `isize`).
+fn find_app_window_handle(ctx: &AxContext) -> Result<isize> {
+    let mut hwnds: Vec<HWND> = Vec::new();
+    // SAFETY: `collect_top_level` receives `&mut hwnds` via the LPARAM and only runs during this
+    // synchronous call, while `hwnds` is live on this stack frame.
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_top_level),
+            LPARAM(&mut hwnds as *mut Vec<HWND> as isize),
+        );
     }
-    if let Some((w, _)) = by_pid {
-        return Ok(w);
+
+    // rect distance to ctx.window (top-left + size), generous because the DWM extended-frame-bounds
+    // glass reports differs from the Win32 window rect by the invisible resize border (~7px/side).
+    let dist_to = |hwnd: HWND| -> Option<i64> {
+        let mut r = RECT::default();
+        // SAFETY: `hwnd` is a live top-level window from EnumWindows; `r` is written by the call.
+        unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if w <= 0 || h <= 0 {
+            return None; // zero-area / off-screen helper window
+        }
+        Some(
+            (r.left - ctx.window.x).abs() as i64
+                + (r.top - ctx.window.y).abs() as i64
+                + (w - ctx.window.width as i32).abs() as i64
+                + (h - ctx.window.height as i32).abs() as i64,
+        )
+    };
+
+    let mut by_pid: Option<(isize, i64)> = None; // closest among pid-matches
+    let mut by_geom: Option<(isize, i64)> = None; // closest visible overall (fallback)
+    for hwnd in hwnds {
+        // SAFETY: `hwnd` is a live top-level window from EnumWindows.
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            continue; // skip hidden message-only / helper windows
+        }
+        let Some(dist) = dist_to(hwnd) else { continue };
+        if by_geom.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
+            by_geom = Some((hwnd.0 as isize, dist));
+        }
+        let mut got = 0u32;
+        // SAFETY: `hwnd` is live; `got` receives the owning pid.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut got)) };
+        let pid_ok = ctx.pids.is_empty() || ctx.pids.contains(&got);
+        if pid_ok && by_pid.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
+            by_pid = Some((hwnd.0 as isize, dist));
+        }
+    }
+    if let Some((h, _)) = by_pid {
+        return Ok(h);
     }
     // No pid match: accept the geometry-closest window only if it's genuinely close (reject a wrong
     // window). Tolerance is generous for the border delta; tuned on the box (Task 5).
     const GEOM_TOLERANCE: i64 = 120;
-    if let Some((w, d)) = by_geom {
+    if let Some((h, d)) = by_geom {
         if d <= GEOM_TOLERANCE {
-            return Ok(w);
+            return Ok(h);
         }
     }
     Err(GlassError::AccessibilityUnavailable(
-        "the app exposes no top-level UI Automation window matching its pid or geometry (custom-drawn? fall back to screenshots)".into(),
+        "the app exposes no top-level window matching its pid or geometry (custom-drawn? fall back to screenshots)".into(),
     ))
+}
+
+/// `EnumWindows` callback: append each top-level `HWND` to the `Vec<HWND>` carried in `lparam`.
+unsafe extern "system" fn collect_top_level(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: `lparam` is the `&mut Vec<HWND>` find_app_window_handle passed for this enumeration.
+    let hwnds = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+    hwnds.push(hwnd);
+    BOOL(1) // keep enumerating
 }
 
 /// Recursively build a normalized node, bounded by depth + global node count.
@@ -265,8 +314,7 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
     })?;
     let walker = automation.get_control_view_walker().map_err(uia_err)?;
-    let root = automation.get_root_element().map_err(uia_err)?;
-    let window = find_app_window(&walker, &root, ctx)?;
+    let window = find_app_window(&automation, ctx)?;
 
     // Start at 0 so find_nth's pre-order numbering matches snapshot's walk +
     // assign_ids (root id = 0); the role+name verify backstops any drift.
@@ -290,8 +338,22 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let pat = el
         .get_pattern::<UIValuePattern>()
         .map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
+    let before = pat.get_value().unwrap_or_default();
     pat.set_value(text).map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
-    Ok(())
+    // Verify the write took. egui/accesskit read-only editables accept SetValue without error
+    // but never apply it (false success). Poll the value back — a real numeric set lands a frame
+    // later — and require it to change; a no-op never changes → honest error.
+    let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+    loop {
+        let after = pat.get_value().unwrap_or_default();
+        if set_value_took(&before, &after, text) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(GlassError::AxValueNotApplied(target.id.0));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Pre-order walk mirroring `walk`'s traversal (offscreen skip + depth/MAX_NODES
@@ -330,4 +392,38 @@ fn find_nth(
         }
     }
     None
+}
+
+/// Whether a `set_value` write actually took, judged from the value read back. egui-style
+/// read-only editables (`TextEdit`) accept UIA `SetValue` without error but never change the
+/// buffer — a misleading success; a real set (`Slider`/`DragValue`) changes the value, possibly
+/// to a reformatted string. So it took iff the read-back equals the request OR differs from the
+/// pre-set value.
+pub(crate) fn set_value_took(before: &str, after: &str, requested: &str) -> bool {
+    after == requested || after != before
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_value_took;
+
+    #[test]
+    fn noop_is_not_taken() {
+        // read-only TextEdit: value unchanged AND not the requested text.
+        assert!(!set_value_took("#000000", "#000000", "#12AA34"));
+    }
+    #[test]
+    fn exact_match_took() {
+        assert!(set_value_took("#000000", "#12AA34", "#12AA34"));
+    }
+    #[test]
+    fn reformatted_numeric_change_took() {
+        // a slider set to "50" may read back "50.0" — changed from before, so it took.
+        assert!(set_value_took("0", "50.0", "50"));
+    }
+    #[test]
+    fn setting_current_value_is_taken() {
+        // edge: requesting the value it already holds → equals request → taken (acceptable).
+        assert!(set_value_took("50", "50", "50"));
+    }
 }
