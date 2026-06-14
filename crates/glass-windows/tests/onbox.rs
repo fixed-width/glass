@@ -12,7 +12,7 @@ use std::time::Duration;
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, KeyEvent, Modifier,
-    MouseButton, Platform, PointerEvent, WindowHint, WindowOp,
+    MouseButton, Platform, PointerEvent, WindowGeometry, WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
 
@@ -46,6 +46,58 @@ fn charmap_spec() -> AppSpec {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     }
+}
+
+/// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
+/// build location so the spec isn't pinned to one checkout/user. `sandbox` selects containment.
+fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root is two levels above crates/glass-windows")
+        .to_path_buf();
+    let fixture_exe =
+        repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
+    AppSpec {
+        build: Some(
+            "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml".to_string(),
+        ),
+        run: vec![fixture_exe.to_string_lossy().into_owned()],
+        cwd: Some(repo_root),
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 120_000, // first egui build is slow
+        sandbox,
+        a11y: false, // Windows: UIA is ambient
+    }
+}
+
+/// Drive a plain wheel then a ctrl+wheel at the window center; return the fixture's "wheel" log lines
+/// for each (the fixture logs every MouseWheel event with the modifiers egui received on it). Used to
+/// verify wheel + modifier delivery across containment levels (G3).
+fn scroll_evidence(p: &mut WindowsPlatform, geo: &WindowGeometry) -> (Vec<String>, Vec<String>) {
+    fn wheel_lines(p: &mut WindowsPlatform) -> Vec<String> {
+        p.drain_logs().into_iter().map(|(_, l)| l).filter(|l| l.contains("wheel")).collect()
+    }
+    let _ = p.drain_logs(); // discard startup ("ready") logs
+    let (cx, cy) = (geo.width as i32 / 2, geo.height as i32 / 2);
+
+    p.send_pointer(&PointerEvent::Scroll { x: cx, y: cy, dx: 0, dy: -3, modifiers: vec![] })
+        .expect("plain scroll submits");
+    std::thread::sleep(Duration::from_millis(500));
+    let plain = wheel_lines(p);
+
+    p.send_pointer(&PointerEvent::Scroll {
+        x: cx,
+        y: cy,
+        dx: 0,
+        dy: -3,
+        modifiers: vec![Modifier::Control],
+    })
+    .expect("ctrl scroll submits");
+    std::thread::sleep(Duration::from_millis(500));
+    let ctrl = wheel_lines(p);
+    (plain, ctrl)
 }
 
 fn is_blank(px: &[u8]) -> bool {
@@ -368,29 +420,9 @@ fn onbox_egui_set_value_honesty() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
-    // Uncontained, like the existing a11y tests (charmap): the egui set_value no-op is
-    // containment-independent, and UIA a11y across the Sandboxie boundary is a separate question.
-    // Derive fixture paths from the build location so the test isn't pinned to one checkout/user.
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("repo root is two levels above crates/glass-windows")
-        .to_path_buf();
-    let fixture_exe =
-        repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
-    let spec = AppSpec {
-        build: Some(
-            "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml".to_string(),
-        ),
-        run: vec![fixture_exe.to_string_lossy().into_owned()],
-        cwd: Some(repo_root),
-        env: vec![],
-        window_hint: None,
-        timeout_ms: 120_000, // first egui build is slow
-        sandbox: glass_core::SandboxLevel::Off,
-        a11y: false, // Windows: UIA is ambient
-    };
-    let geo = p.start_app(&spec).expect("build + launch the egui fixture");
+    let geo = p
+        .start_app(&egui_fixture_spec(glass_core::SandboxLevel::Off))
+        .expect("build + launch the egui fixture");
     std::thread::sleep(Duration::from_millis(2000));
 
     let mut a11y = WindowsA11y::new();
@@ -413,6 +445,58 @@ fn onbox_egui_set_value_honesty() {
     );
 
     let _ = p.stop_app();
+}
+
+// Uncontained: the first end-to-end verification that Windows scroll AND its ctrl modifier reach the
+// app (the existing onbox_modifier_click only checks SendInput submits, never delivery). Proven on
+// the 3x-DPI dogfood host, so this is the working baseline that G3's Sandboxie repro is measured
+// against.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_scroll_modifier_delivery() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p
+        .start_app(&egui_fixture_spec(glass_core::SandboxLevel::Off))
+        .expect("build + launch the egui fixture");
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let (plain, ctrl) = scroll_evidence(&mut p, &geo);
+    eprintln!("[uncontained] plain={plain:?} ctrl={ctrl:?}");
+    let _ = p.stop_app();
+
+    assert!(!plain.is_empty(), "plain scroll must deliver a wheel event to egui");
+    assert!(
+        ctrl.iter().any(|l| l.contains("ctrl=true")),
+        "ctrl+scroll must deliver a wheel event with ctrl=true to egui, got {ctrl:?}"
+    );
+}
+
+// G3: the dogfood ran glass-paint UNDER SANDBOXIE and concluded ctrl+scroll "delivered nothing to
+// egui". Measured directly here with the fixture as ground truth, the synthesized wheel AND its ctrl
+// modifier DO cross the Sandboxie boundary into the contained app — refuting that conclusion (the
+// dogfood had inferred "no wheel" from the app not visibly zooming, conflating delivery with effect).
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + Sandboxie + builds the egui fixture"]
+fn onbox_scroll_modifier_delivery_sandboxed() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p
+        .start_app(&egui_fixture_spec(glass_core::SandboxLevel::Default))
+        .expect("build + launch the egui fixture under Sandboxie");
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let (plain, ctrl) = scroll_evidence(&mut p, &geo);
+    eprintln!("[sandboxed] plain={plain:?} ctrl={ctrl:?}");
+    let _ = p.stop_app();
+
+    assert!(!plain.is_empty(), "plain scroll must cross the Sandboxie boundary to egui");
+    assert!(
+        ctrl.iter().any(|l| l.contains("ctrl=true")),
+        "ctrl+scroll must cross the Sandboxie boundary with ctrl=true, got {ctrl:?}"
+    );
 }
 
 #[test]
