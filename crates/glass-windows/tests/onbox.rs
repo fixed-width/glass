@@ -231,7 +231,12 @@ fn onbox_a11y_snapshot_and_click() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+    };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     assert!(tree.count > 0, "snapshot must have nodes");
     let (mut total, mut inter) = (0usize, 0usize);
@@ -315,7 +320,12 @@ fn onbox_modifier_click() {
     std::thread::sleep(Duration::from_millis(1200));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+    };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     let mut hit = None;
     first_clickable(&tree.root, &mut hit);
@@ -381,7 +391,12 @@ fn onbox_a11y_set_value() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+    };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
 
     let mut field = None;
@@ -426,7 +441,12 @@ fn onbox_egui_set_value_honesty() {
     std::thread::sleep(Duration::from_millis(2000));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+    };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot of the egui fixture");
 
     // G2: egui exposes TextEdit as a read-only AccessKit projection — UIA SetValue is accepted
@@ -501,7 +521,7 @@ fn onbox_scroll_modifier_delivery_sandboxed() {
 
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + Edge"]
-fn onbox_a11y_edge_geometry_fallback() {
+fn onbox_a11y_edge_multiprocess() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let edge = glass_windows::onbox_support::locate_edge()
@@ -527,13 +547,19 @@ fn onbox_a11y_edge_geometry_fallback() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    // Edge's top-level window is owned by a DESCENDANT process, so the a11y reader's exact-pid match
-    // misses and the geometry fallback must recover it — the path charmap can't exercise.
+    // Edge's top-level window is owned by a DESCENDANT process. glass adopts it as the active window;
+    // the a11y reader reads it via that adopted handle (ctx.window_handle) — verifying a11y on a
+    // multi-process app whose window a single-process target like charmap can't exercise.
     let geo = p.start_app(&spec).expect("isolated Edge discovery (Job-child window)");
     std::thread::sleep(Duration::from_secs(6));
 
     let mut a11y = WindowsA11y::new();
-    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+    };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot on multi-process Edge");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);

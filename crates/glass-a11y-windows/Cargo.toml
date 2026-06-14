@@ -11,7 +11,6 @@ glass-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 uiautomation = { version = "0.25", features = ["process"] }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [lints]
 workspace = true

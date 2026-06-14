@@ -284,6 +284,11 @@ pub struct AxContext {
     /// backend has a process-tree view (Windows' Job set); 1-element on X11/Wayland.
     pub pids: Vec<u32>,
     pub window: WindowGeometry,
+    /// Raw native handle of glass's active (adopted) window — a Windows `HWND` as `i64`. `Some`
+    /// whenever the backend tracks one; the Windows reader binds UI Automation directly to it (no
+    /// desktop re-discovery), so a11y reads the *exact* window glass is driving. `None` on backends
+    /// that address accessibility another way (Linux uses `a11y_bus_addr`); those ignore this field.
+    pub window_handle: Option<i64>,
     /// Address of the private a11y bus glass spawned for this launch, if any. `Some` only when the
     /// caller passed `a11y: true` and the bus started. When `None`, the Linux reader returns
     /// `AccessibilityUnavailable` (instructing the caller to relaunch with `a11y:true`) — it does
