@@ -20,6 +20,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
 };
+use windows::Win32::Security::RevertToSelf;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 use windows::Win32::System::Memory::{
@@ -128,6 +129,17 @@ fn rpc(req: Request) -> Option<Response> {
 /// (and back off briefly if the pipe is momentarily absent), then retry — bounded so a genuinely
 /// down server still fails soft rather than hanging.
 fn open_pipe(path: &str) -> Option<HANDLE> {
+    // Connect to the host as THIS PROCESS, not a thread impersonation. clipboard-win (arboard) wraps
+    // the app's `CloseClipboard` in `ImpersonateAnonymousToken`/`RevertToSelf` (a crbug/441834
+    // mitigation), and our `CloseClipboard` detour — which ships the copy via this pipe — runs inside
+    // it. Without reverting, the connect uses the ANONYMOUS token, which the pipe DACL (grants
+    // `Everyone`, which by Windows default excludes Anonymous) denies (`ERROR_ACCESS_DENIED`) — so an
+    // app's own clipboard write would silently never reach the store. `RevertToSelf` is a harmless
+    // no-op when the thread isn't impersonating (the common case for reads).
+    // SAFETY: drops the calling thread's impersonation token; always sound.
+    unsafe {
+        let _ = RevertToSelf();
+    }
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     for _ in 0..40 {
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; all other args

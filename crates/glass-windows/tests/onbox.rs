@@ -381,6 +381,42 @@ fn onbox_clipboard_roundtrip() {
     assert!(p.get_clipboard().expect("get empty clipboard").is_empty(), "empty round-trip");
 }
 
+// The dogfood found that a CONTAINED app's own clipboard write was invisible to glass: glass set/get
+// round-tripped and glass->app paste worked, but the app's ctx.copy_text (-> arboard -> user32
+// SetClipboardData, detoured into the private store) read back empty. This reproduces it with the
+// fixture auto-copying a sentinel under Sandboxie, and isolates the app-write path from the store
+// itself (glass's own set/get is checked after, on the same private store).
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + Sandboxie + the clip hook + builds the egui fixture"]
+fn onbox_contained_clipboard_app_write() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let _geo = p
+        .start_app(&egui_fixture_spec(glass_core::SandboxLevel::Default))
+        .expect("build + launch the egui fixture under Sandboxie");
+    std::thread::sleep(Duration::from_millis(3000)); // let it start AND auto-copy (frame >= 60)
+
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_, l)| l).collect();
+    let copied = logs.iter().any(|l| l.contains("copied sentinel"));
+    let after_app = p.get_clipboard().unwrap_or_default();
+    // Isolate: does glass's own set/get work on this private store? (Run after, so it can't mask the
+    // app-write result.) after_glass tells real-app-write-lost from store/route-broken.
+    let after_glass = match p.set_clipboard("GLASS-SEEDED") {
+        Ok(()) => p.get_clipboard().unwrap_or_default(),
+        Err(e) => format!("<set_clipboard err: {e}>"),
+    };
+    eprintln!("copied-log={copied} after_app={after_app:?} after_glass={after_glass:?}");
+    let _ = p.stop_app();
+
+    assert!(copied, "the contained app must have run its copy (frame counter reached)");
+    assert_eq!(
+        after_app, "GLASS-CLIP-SENTINEL",
+        "glass must read the contained app's own clipboard write (glass's own set/get on the same \
+         private store = {after_glass:?})"
+    );
+}
+
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a11y_set_value() {
