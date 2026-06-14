@@ -23,7 +23,7 @@ Point an AI coding agent at a GUI app and it runs the whole **build → see → 
 debug** cycle itself:
 
 ```jsonc
-glass_start   { "build": "cargo build --release", "run": ["target/release/my-app"] }  // build + launch (sandboxed)
+glass_start   { "build": "cargo build --release", "run": ["target/release/my-app"] }  // builds, then launches the app (sandboxed)
 glass_screenshot                       // see the window
 glass_click   { "x": 240, "y": 160 }   // interact
 glass_wait_stable                      // let the render settle
@@ -234,7 +234,7 @@ process containment, network on). Three levels are available via `glass_start`'s
 arg or the `GLASS_SANDBOX` environment variable:
 
 - **`default`** — bubblewrap containment, network on (the default).
-- **`strict`** — same as `default` plus `--unshare-net` (no outbound network from the app or build).
+- **`strict`** — same as `default` plus `--unshare-net` (no outbound network from the app).
 - **`off`** — no containment; app runs unconfined.
 
 `default` and `strict` are fail-closed: if `bwrap` is not installed or unprivileged user namespaces
@@ -252,12 +252,17 @@ Linux `bubblewrap`. It is configurable, not hardcoded: `GLASS_WIN_SANDBOX_PROVID
 (default `auto`) and `GLASS_SANDBOXIE_DIR` (default `%ProgramFiles%\Sandboxie`, auto-detected).
 Like Linux, `default`/`strict` are **fail-closed**: if no in-OS provider is available (Sandboxie
 absent / its service not running, or `provider=none`), `glass_start` errors rather than running
-unconfined — `off` is the explicit escape hatch. The build step also runs contained. Native
+unconfined — `off` is the explicit escape hatch. Native
 AppContainer / Low-integrity were evaluated on-box and **rejected** (the integrity-drop makes
 ordinary Win32 apps fail to render; they need per-app tuning, whereas Sandboxie virtualizes
 transparently). For even stronger isolation, the **VM tier** remains the stronger option: the
 checked-in Windows Sandbox template under `packaging/windows-sandbox/`, or a managed VM running
 `glass-mcp serve --http`. `glass_doctor` reports this posture (its Windows `sandbox` section).
+
+On both platforms the `sandbox` level governs the **launched app only**. The optional
+`build` step always runs **unsandboxed**, with your full developer environment — it's your
+own trusted code and needs your toolchain (and, under `strict`, the very network the app is
+denied). Only the launched run is contained.
 
 ```bash
 glass-mcp doctor   # checks sandbox availability alongside display/compositor deps
@@ -292,7 +297,7 @@ environment variable when set, otherwise a sensible default (a bare name found o
 
 | Tool | Env var | Default | Used by |
 |---|---|---|---|
-| bubblewrap | `GLASS_BWRAP` | `bwrap` (on `PATH`) | Linux app + build containment |
+| bubblewrap | `GLASS_BWRAP` | `bwrap` (on `PATH`) | Linux app containment |
 | Xvfb | `GLASS_XVFB` | `Xvfb` (on `PATH`) | X11 private headless display |
 | sway | `GLASS_SWAY` | auto-discovered¹ | Wayland headless compositor |
 | build shell | `GLASS_SH` | `sh` (on `PATH`) | running `spec.build` |
