@@ -17,70 +17,22 @@ SendInput, UI Automation), behind a platform-agnostic core; a **macOS** backend 
 planned. See [`packaging/README-windows.md`](packaging/README-windows.md)
 for the Windows build and setup.
 
-## Platform support
+## The loop in practice
 
-Where glass stands feature-by-feature across backends and OSes. **✓** supported · **–** not
-supported · **🚧** planned.
+Point an AI coding agent at a GUI app and it runs the whole **build → see → interact →
+debug** cycle itself:
 
-<!-- KEEP IN SYNC with the code (and CLAUDE.md) whenever capabilities change. -->
+```jsonc
+glass_start   { "build": "cargo build --release", "run": ["target/release/my-app"] }  // build + launch (sandboxed)
+glass_screenshot                       // see the window
+glass_click   { "x": 240, "y": 160 }   // interact
+glass_wait_stable                      // let the render settle
+glass_diff                             // what changed? changed_pct + bbox, as text — no image
+glass_logs                             // read the app's stderr
+```
 
-### Core capabilities (per backend)
-
-| Capability | X11 | Wayland | Windows | macOS |
-|---|:--:|:--:|:--:|:--:|
-| Screen capture — full + region crop | ✓ | ✓ | ✓ | 🚧 |
-| Click / move | ✓ | ✓ | ✓ | 🚧 |
-| Type text · key chord | ✓ | ✓ | ✓ | 🚧 |
-| Scroll · drag | ✓ | ✓ | ✓ | 🚧 |
-| Modifier-held click / drag / scroll | ✓ | ✓ | ✓ | 🚧 |
-| Window discovery | ✓ | ✓ | ✓ | 🚧 |
-| Multi-window (`glass_list_windows` / `glass_select_window`) | ✓ | ✓ | ✓ | 🚧 |
-| Window move / resize / focus | ✓ | ✓ | ✓ | 🚧 |
-| Log capture (stdout / stderr) | ✓ | ✓ | ✓ | 🚧 |
-| Clipboard get / set | ✓ | ✓ | ✓ | 🚧 |
-
-### Accessibility — semantic addressing (per OS)
-
-| | Linux | Windows | macOS |
-|---|:--:|:--:|:--:|
-| Provider | AT-SPI | UI Automation | AX 🚧 |
-| Serves backends | X11 + Wayland | Windows | — |
-| Tree snapshot · click-by-element | ✓ | ✓ | 🚧 |
-| Set value (`glass_set_value`) | ✓ | ✓ | 🚧 |
-| Value population (text / numeric) | ✓ | ✓ | 🚧 |
-| Set-of-Mark overlay (`glass_a11y_marks`) | ✓ | ✓ | 🚧 |
-
-Accessibility is per-OS (AT-SPI serves both Linux backends). It returns an error — never a fake
-tree — for apps with no accessible UI (bare canvas / game UIs), so the agent falls back to pixels.
-
-### Containment / sandboxing (per OS)
-
-| | Linux | Windows | macOS |
-|---|:--:|:--:|:--:|
-| Engine | bubblewrap | Sandboxie Classic | — 🚧 |
-| `off` / `default` / `strict` | ✓ | ✓ | accepts, not enforced 🚧 |
-| Fail-closed when engine absent | ✓ | ✓ | n/a |
-| Build step contained | ✓ | ✓ | 🚧 |
-
-### Isolation & runtime (per backend)
-
-| | X11 | Wayland | Windows | macOS |
-|---|:--:|:--:|:--:|:--:|
-| Display isolation (app off your desktop) | ✓ private Xvfb | ✓ headless sway | – interactive desktop¹ | 🚧 |
-| Headless (no host desktop needed) | ✓ | ✓ | – needs a session² | 🚧 |
-| Clipboard isolation | ✓ | ✓ | ✓ private (contained)³ | 🚧 |
-
-¹ A Windows VirtualDisplay / headless provider is a planned follow-on; stronger isolation today is
-the VM tier (the Windows Sandbox `.wsb` template under `packaging/windows-sandbox/`, or a managed
-VM running `glass-mcp serve --http`). ² Windows needs an interactive, logged-in session to render
-and capture. ³ When contained (`sandbox=default`/`strict`), the boxed app gets a private clipboard
-isolated from yours — an injected hook backs its clipboard with glass's own store; `sandbox=off`
-uses the real OS clipboard. Carries text, HTML, RTF, and images for apps using either the Win32 or
-the OLE clipboard (so rich apps like Word, Excel, and Chrome work too; x64); real-file copy via CF_HDROP works; virtual-file drag-out (shell extensions, zip attachments) is deferred.
-
-**Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
---http`, all platforms) — the network transport is behind the default-on `network` cargo feature
-(a `--no-default-features` build is stdio-only).
+`glass_diff` and the `glass_wait_for_*` tools return text only, so the routine checks
+between screenshots cost no vision tokens.
 
 ## Install
 
@@ -243,8 +195,11 @@ A few capabilities worth knowing:
 - **Clipboard get/set.** `glass_clipboard_get` reads the clipboard as text
   (`""` when empty); `glass_clipboard_set` writes text so the app can paste it.
   Both are isolated to the app's display on the private Xvfb/sway backends, and
-  on Windows a sandboxed app gets a **private clipboard** too (an injected hook
-  backs the boxed app's clipboard with glass's own store) — so they never touch
+  on Windows a sandboxed app gets a **private clipboard** too — an injected hook
+  backs the boxed app's clipboard with glass's own store, carrying text, HTML, RTF,
+  and images over both the Win32 and OLE clipboards (so rich apps like Word, Excel,
+  and Chrome work too; x64) and real-file copy via `CF_HDROP` (virtual-file drag-out
+  — shell extensions, zip attachments — is deferred). So they never touch
   your real clipboard unless you set `GLASS_DISPLAY=:0` or run the Windows
   backend with `sandbox=off`. `glass_clipboard_get` is also the cheap text-extraction
   path: issue `ctrl+a` then `ctrl+c` via `glass_do`, then read here — faster and
@@ -364,7 +319,8 @@ across backends — only the setup differs:
 - **Wayland (wlroots)** — spawns a private headless `sway` compositor per session,
   so there's no ambient display to set up. See [Running on Wayland](#running-on-wayland-sway).
 - **Windows** (default on a Windows host) — drives the app on the interactive
-  desktop (WGC capture, SendInput, UI Automation). See
+  desktop (WGC capture, SendInput, UI Automation), so it needs an interactive,
+  logged-in session to render and capture. See
   [`packaging/README-windows.md`](packaging/README-windows.md).
 
 ## Running on X11 (the default)
@@ -483,6 +439,27 @@ Profile a hot path as a flamegraph (needs [`cargo install flamegraph`](https://g
 ```bash
 ./scripts/bench.sh diff "identical/1920x1080"   # writes flamegraph.svg
 ```
+
+## Platform support
+
+Where glass stands by OS. **✓** supported · **–** not supported · **🚧** planned.
+
+<!-- KEEP IN SYNC with the code (and CLAUDE.md) whenever capabilities change. -->
+
+| Capability | Linux (X11 + Wayland) | Windows | macOS |
+|---|:--:|:--:|:--:|
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | 🚧 |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | 🚧 AX |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | 🚧 |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | 🚧 |
+
+The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
+lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
+running-on-X11/Wayland sections above.
+
+**Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
+--http`, all platforms) — the network transport is behind the default-on `network` cargo feature
+(a `--no-default-features` build is stdio-only).
 
 ## Status
 
