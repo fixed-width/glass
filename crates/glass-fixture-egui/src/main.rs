@@ -27,6 +27,22 @@ impl eframe::App for Fixture {
             log("[fixture] ready");
             self.announced = true;
         }
+        // Report each wheel event with the modifiers egui received ON the event, so on-box tests
+        // can verify wheel + modifier delivery (G3). The event's own modifiers are ground truth.
+        ui.input(|i| {
+            for ev in &i.raw.events {
+                if let egui::Event::MouseWheel { delta, modifiers, .. } = ev {
+                    // Also report how egui *routed* the wheel: ctrl+wheel becomes a zoom gesture
+                    // (zoom_delta != 1) and leaves smooth_scroll_delta at 0, so a handler that reads
+                    // the scroll delta under a `ctrl &&` gate (as glass-paint did) never sees it.
+                    log(&format!(
+                        "[fixture] wheel delta=({:.1},{:.1}) ctrl={} shift={} | smooth_scroll_y={:.2} zoom_delta={:.4}",
+                        delta.x, delta.y, modifiers.ctrl, modifiers.shift,
+                        i.smooth_scroll_delta.y, i.zoom_delta()
+                    ));
+                }
+            }
+        });
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let label = ui.label("Text:");
             if ui
