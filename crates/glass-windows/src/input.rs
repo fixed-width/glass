@@ -222,6 +222,39 @@ impl glass_core::ChordSink for WindowsChordSink {
     }
 }
 
+/// `ScrollSink` for Windows: one `SendInput` per call (its own commit). `wheel` positions the cursor
+/// then emits the vertical and horizontal wheel in a single batch; `modifiers` presses/releases the
+/// held modifier keys around it, so with `run_scroll`'s dwell the wheel lands in a frame the app reads
+/// the modifier as held (instead of released by a same-frame modifier-up).
+struct WindowsScrollSink {
+    nx: i32,
+    ny: i32,
+    dx: i32,
+    dy: i32,
+    mod_vks: Vec<VIRTUAL_KEY>,
+}
+
+impl glass_core::ScrollSink for WindowsScrollSink {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        let inputs: Vec<_> = if down {
+            self.mod_vks.iter().map(|&m| key_vk(m, false)).collect()
+        } else {
+            self.mod_vks.iter().rev().map(|&m| key_vk(m, true)).collect()
+        };
+        send(&inputs)
+    }
+    fn wheel(&mut self) -> Result<()> {
+        // Scroll sign matches x11 (`scroll_button(5=down,4=up, dy)`): there positive `dy` clicks
+        // button 5 = scroll DOWN. Windows WHEEL is positive=forward/up, so negate `dy`. Horizontal:
+        // positive `dx` = right, and Windows HWHEEL positive = right, so `dx` is used as-is.
+        send(&[
+            mouse(self.nx, self.ny, MOUSEEVENTF_MOVE | ABS),
+            mouse_wheel(-self.dy * WHEEL_DELTA, MOUSEEVENTF_WHEEL),
+            mouse_wheel(self.dx * WHEEL_DELTA, MOUSEEVENTF_HWHEEL),
+        ])
+    }
+}
+
 /// Inject a pointer event into the active window. Coordinates are window-relative.
 pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
     let hwnd = raw_to_hwnd(active_hwnd);
@@ -275,21 +308,11 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
         }
         PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
             let (nx, ny) = to_norm(x, y);
-            // Scroll sign matches x11 (`scroll_button(5=down,4=up, dy)`): there positive
-            // `dy` clicks button 5 = scroll DOWN. Windows WHEEL is positive=forward/up, so
-            // negate `dy`. Horizontal: x11 `scroll_button(7=right,6=left, dx)` => positive
-            // `dx` = right, and Windows HWHEEL positive = right, so `dx` is used as-is.
-            let mut inputs = Vec::new();
-            for m in modifiers {
-                inputs.push(key_vk(modifier_vk(*m), false));
-            }
-            inputs.push(mouse(nx, ny, MOUSEEVENTF_MOVE | ABS));
-            inputs.push(mouse_wheel(-dy * WHEEL_DELTA, MOUSEEVENTF_WHEEL));
-            inputs.push(mouse_wheel(dx * WHEEL_DELTA, MOUSEEVENTF_HWHEEL));
-            for m in modifiers.iter().rev() {
-                inputs.push(key_vk(modifier_vk(*m), true));
-            }
-            send(&inputs)?;
+            let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().map(|&m| modifier_vk(m)).collect();
+            // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead of
+            // bursting modifier+wheel+release into one — see glass_core::run_scroll.
+            let mut sink = WindowsScrollSink { nx, ny, dx, dy, mod_vks };
+            glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
         }
     }
     Ok(())
