@@ -437,4 +437,4 @@ fn wayland_build_step_runs_before_launch() {
 }
 
 // (Build-step network containment tests removed: the build step is unsandboxed by design —
-// only the launched run is contained. See the unsandbox-build change / gap #5.)
+// only the launched run is contained.)
