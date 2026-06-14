@@ -1,0 +1,9 @@
+[package]
+name = "glass-fixture-egui"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+eframe = "0.34" # default features include glow + accesskit
+egui = "0.34"

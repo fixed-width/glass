@@ -363,6 +363,59 @@ fn onbox_a11y_set_value() {
 }
 
 #[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_egui_set_value_honesty() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    // Uncontained, like the existing a11y tests (charmap): the egui set_value no-op is
+    // containment-independent, and UIA a11y across the Sandboxie boundary is a separate question.
+    // Derive fixture paths from the build location so the test isn't pinned to one checkout/user.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root is two levels above crates/glass-windows")
+        .to_path_buf();
+    let fixture_exe =
+        repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
+    let spec = AppSpec {
+        build: Some(
+            "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml".to_string(),
+        ),
+        run: vec![fixture_exe.to_string_lossy().into_owned()],
+        cwd: Some(repo_root),
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 120_000, // first egui build is slow
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false, // Windows: UIA is ambient
+    };
+    let geo = p.start_app(&spec).expect("build + launch the egui fixture");
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext { pids: p.app_pids(), window: geo.clone(), a11y_bus_addr: None };
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot of the egui fixture");
+
+    // G2: egui exposes TextEdit as a read-only AccessKit projection — UIA SetValue is accepted
+    // but never applied. set_value must report that honestly (AxValueNotApplied), not false success.
+    let mut field = None;
+    first_role(&tree.root, AxRole::TextField, &mut field);
+    let field = field.expect("the egui fixture must expose a TextField");
+    let target =
+        AxTarget { id: field.id, role: field.role, name: field.name.clone(), bounds: field.bounds };
+    assert!(
+        matches!(
+            a11y.set_value(&ctx, &target, "hello"),
+            Err(GlassError::AxValueNotApplied(_))
+        ),
+        "set_value on an egui TextEdit must error AxValueNotApplied (read-only projection), not false success"
+    );
+
+    let _ = p.stop_app();
+}
+
+#[test]
 #[ignore = "on-box only: needs the interactive desktop session + Edge"]
 fn onbox_a11y_edge_geometry_fallback() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
