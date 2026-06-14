@@ -201,6 +201,27 @@ impl glass_core::DragSink for WindowsDragSink<'_> {
     }
 }
 
+/// `ChordSink` for Windows: one `SendInput` per call (its own commit), so `run_chord`'s dwell lands
+/// between phases the app actually processes as separate frames. `key_vk(_, true)` is the release.
+struct WindowsChordSink {
+    mod_vks: Vec<VIRTUAL_KEY>,
+    vk: VIRTUAL_KEY,
+}
+
+impl glass_core::ChordSink for WindowsChordSink {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        let inputs: Vec<_> = if down {
+            self.mod_vks.iter().map(|&m| key_vk(m, false)).collect()
+        } else {
+            self.mod_vks.iter().rev().map(|&m| key_vk(m, true)).collect()
+        };
+        send(&inputs)
+    }
+    fn key(&mut self, down: bool) -> Result<()> {
+        send(&[key_vk(self.vk, !down)])
+    }
+}
+
 /// Inject a pointer event into the active window. Coordinates are window-relative.
 pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
     let hwnd = raw_to_hwnd(active_hwnd);
@@ -294,16 +315,10 @@ pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
             let vk = keysym_to_vk(keysym)
                 .ok_or_else(|| GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping")))?;
             let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
-            let mut inputs = Vec::with_capacity(mod_vks.len() * 2 + 2);
-            for &mvk in &mod_vks {
-                inputs.push(key_vk(mvk, false));
-            }
-            inputs.push(key_vk(vk, false));
-            inputs.push(key_vk(vk, true));
-            for &mvk in mod_vks.iter().rev() {
-                inputs.push(key_vk(mvk, true));
-            }
-            send(&inputs)?;
+            // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
+            // bursting the whole chord into one — see glass_core::run_chord.
+            let mut sink = WindowsChordSink { mod_vks, vk };
+            glass_core::run_chord(&mut sink)?;
         }
     }
     Ok(())

@@ -646,6 +646,41 @@ impl glass_core::DragSink for X11DragSink<'_> {
     }
 }
 
+/// Lets `glass_core::run_chord` drive an X11 key chord through the existing XTEST primitives. Each
+/// method self-commits with `XFlush`; the modifier keycodes are held between `modifiers(true)` and
+/// `modifiers(false)`, so a frame-based client sees the modifier held across the key's frame.
+struct X11ChordSink<'a> {
+    p: &'a X11Platform,
+    mods: &'a [glass_core::keys::Modifier],
+    keycode: u8,
+    kcs: Vec<u8>,
+}
+
+impl X11ChordSink<'_> {
+    fn flush(&self) -> Result<()> {
+        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+}
+
+impl glass_core::ChordSink for X11ChordSink<'_> {
+    fn modifiers(&mut self, down: bool) -> Result<()> {
+        if down {
+            self.kcs = self.p.press_mods(self.mods)?;
+        } else {
+            self.p.release_mods(&self.kcs)?;
+        }
+        self.flush()
+    }
+    fn key(&mut self, down: bool) -> Result<()> {
+        let kind = if down { XT_KEY_PRESS } else { XT_KEY_RELEASE };
+        self.p
+            .conn
+            .xtest_fake_input(kind, self.keycode, x11rb::CURRENT_TIME, self.p.root, 0, 0, 0)
+            .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
+        self.flush()
+    }
+}
+
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         if spec.sandbox != glass_core::SandboxLevel::Off {
@@ -793,7 +828,13 @@ impl Platform for X11Platform {
             }
             KeyEvent::Chord(chord) => {
                 let (mods, keysym) = glass_core::keys::parse_chord(chord)?;
-                self.key_with_mods(keysym, false, &mods)?;
+                let (keycode, needs_shift) = self.keycode_for(keysym)?;
+                let mut mods = mods;
+                if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
+                    mods.push(glass_core::keys::Modifier::Shift);
+                }
+                let mut sink = X11ChordSink { p: &*self, mods: &mods, keycode, kcs: Vec::new() };
+                glass_core::run_chord(&mut sink)?;
             }
         }
         self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;

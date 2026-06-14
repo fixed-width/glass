@@ -28,19 +28,34 @@ impl eframe::App for Fixture {
             self.announced = true;
         }
         // Report each wheel event with the modifiers egui received ON the event, so on-box tests
-        // can verify wheel + modifier delivery (G3). The event's own modifiers are ground truth.
+        // can verify wheel + modifier delivery. The event's own modifiers are ground truth.
         ui.input(|i| {
             for ev in &i.raw.events {
-                if let egui::Event::MouseWheel { delta, modifiers, .. } = ev {
-                    // Also report how egui *routed* the wheel: ctrl+wheel becomes a zoom gesture
-                    // (zoom_delta != 1) and leaves smooth_scroll_delta at 0, so a handler that reads
-                    // the scroll delta under a `ctrl &&` gate (as glass-paint did) never sees it.
-                    log(&format!(
+                match ev {
+                    // ctrl+wheel becomes a zoom gesture (zoom_delta != 1) and leaves
+                    // smooth_scroll_delta at 0 — a handler reading the scroll delta under a `ctrl &&`
+                    // gate (as glass-paint did) never sees it.
+                    egui::Event::MouseWheel { delta, modifiers, .. } => log(&format!(
                         "[fixture] wheel delta=({:.1},{:.1}) ctrl={} shift={} | smooth_scroll_y={:.2} zoom_delta={:.4}",
                         delta.x, delta.y, modifiers.ctrl, modifiers.shift,
                         i.smooth_scroll_delta.y, i.zoom_delta()
-                    ));
+                    )),
+                    // Each key event carries its own (event-level) modifiers.
+                    egui::Event::Key { key, pressed, modifiers, .. } => log(&format!(
+                        "[fixture] key {key:?} pressed={pressed} ev_ctrl={} ev_cmd={}",
+                        modifiers.ctrl, modifiers.command
+                    )),
+                    _ => {}
                 }
+            }
+            // The standard egui hotkey idiom reads the FRAME-AGGREGATE modifier alongside
+            // key_pressed. glass_key "ctrl+z" must let `key_pressed(Z) && modifiers.command` hold in
+            // one frame — it can't if glass releases ctrl in the same frame the key arrives.
+            if i.key_pressed(egui::Key::Z) {
+                log(&format!(
+                    "[fixture] chord Z: frame_ctrl={} frame_cmd={} undo_idiom={}",
+                    i.modifiers.ctrl, i.modifiers.command, i.modifiers.command
+                ));
             }
         });
         egui::CentralPanel::default().show_inside(ui, |ui| {
