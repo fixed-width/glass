@@ -73,8 +73,9 @@ fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
 }
 
 /// Drive a plain wheel then a ctrl+wheel at the window center; return the fixture's "wheel" log lines
-/// for each (the fixture logs every MouseWheel event with the modifiers egui received on it). Used to
-/// verify wheel + modifier delivery across containment levels.
+/// for each. Each line carries both `ev_ctrl` (the modifier on the wheel event — delivery) and
+/// `frame_ctrl` (the frame-aggregate `i.modifiers.ctrl` a handler gates on — held across the frame).
+/// Used to verify wheel + modifier delivery AND modifier-hold across containment levels.
 fn scroll_evidence(p: &mut WindowsPlatform, geo: &WindowGeometry) -> (Vec<String>, Vec<String>) {
     fn wheel_lines(p: &mut WindowsPlatform) -> Vec<String> {
         p.drain_logs().into_iter().map(|(_, l)| l).filter(|l| l.contains("wheel")).collect()
@@ -503,10 +504,13 @@ fn onbox_egui_set_value_honesty() {
     let _ = p.stop_app();
 }
 
-// Uncontained: the first end-to-end verification that Windows scroll AND its ctrl modifier reach the
-// app (the existing onbox_modifier_click only checks SendInput submits, never delivery). Proven on
-// the 3x-DPI dogfood host, so this is the working baseline that the Sandboxie repro is measured
-// against.
+// Uncontained: end-to-end verification that a Windows ctrl+scroll both DELIVERS the wheel with its
+// modifier on the event (`ev_ctrl`) AND holds the modifier across the wheel's frame so the
+// frame-aggregate `i.modifiers.ctrl` (`frame_ctrl`) — the layer a real handler gates on — reads it.
+// The event reaching egui was never the gap; the gap is the frame-aggregate modifier, which a
+// one-burst modifier+wheel+release drops (the modifier is released in the same frame the wheel
+// lands). run_scroll's hold-dwell-release fixes it. This is the working baseline the Sandboxie repro
+// is measured against.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
 fn onbox_scroll_modifier_delivery() {
@@ -524,15 +528,19 @@ fn onbox_scroll_modifier_delivery() {
 
     assert!(!plain.is_empty(), "plain scroll must deliver a wheel event to egui");
     assert!(
-        ctrl.iter().any(|l| l.contains("ctrl=true")),
-        "ctrl+scroll must deliver a wheel event with ctrl=true to egui, got {ctrl:?}"
+        ctrl.iter().any(|l| l.contains("ev_ctrl=true")),
+        "ctrl+scroll must deliver a wheel event carrying ctrl to egui, got {ctrl:?}"
+    );
+    assert!(
+        ctrl.iter().any(|l| l.contains("frame_ctrl=true")),
+        "ctrl+scroll must hold ctrl across the wheel's frame (frame-aggregate i.modifiers.ctrl), \
+         got {ctrl:?}"
     );
 }
 
-// The dogfood ran glass-paint UNDER SANDBOXIE and concluded ctrl+scroll "delivered nothing to
-// egui". Measured directly here with the fixture as ground truth, the synthesized wheel AND its ctrl
-// modifier DO cross the Sandboxie boundary into the contained app — refuting that conclusion (the
-// dogfood had inferred "no wheel" from the app not visibly zooming, conflating delivery with effect).
+// The same two assertions across the Sandboxie boundary: the wheel + its event modifier cross into
+// the contained app (never the gap), and the modifier is held across the wheel's frame so a contained
+// handler reading `i.modifiers.ctrl` sees it.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + Sandboxie + builds the egui fixture"]
 fn onbox_scroll_modifier_delivery_sandboxed() {
@@ -550,8 +558,12 @@ fn onbox_scroll_modifier_delivery_sandboxed() {
 
     assert!(!plain.is_empty(), "plain scroll must cross the Sandboxie boundary to egui");
     assert!(
-        ctrl.iter().any(|l| l.contains("ctrl=true")),
-        "ctrl+scroll must cross the Sandboxie boundary with ctrl=true, got {ctrl:?}"
+        ctrl.iter().any(|l| l.contains("ev_ctrl=true")),
+        "ctrl+scroll must cross the Sandboxie boundary carrying ctrl on the event, got {ctrl:?}"
+    );
+    assert!(
+        ctrl.iter().any(|l| l.contains("frame_ctrl=true")),
+        "ctrl+scroll must hold ctrl across the wheel's frame inside the sandbox, got {ctrl:?}"
     );
 }
 

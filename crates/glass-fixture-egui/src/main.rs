@@ -38,17 +38,22 @@ impl eframe::App for Fixture {
             ui.ctx().copy_text("GLASS-CLIP-SENTINEL".to_string());
             log("[fixture] copied sentinel");
         }
-        // Report each wheel event with the modifiers egui received ON the event, so on-box tests
-        // can verify wheel + modifier delivery. The event's own modifiers are ground truth.
+        // Report each wheel event with BOTH the event-level modifiers and the frame-aggregate
+        // modifiers, so on-box tests can verify wheel + modifier delivery AND that the modifier is
+        // held across the wheel's frame (the layer the egui `i.modifiers` handler idiom reads).
         ui.input(|i| {
             for ev in &i.raw.events {
                 match ev {
-                    // ctrl+wheel becomes a zoom gesture (zoom_delta != 1) and leaves
-                    // smooth_scroll_delta at 0 — a handler reading the scroll delta under a `ctrl &&`
-                    // gate (as glass-paint did) never sees it.
+                    // `ev_*` are the modifiers carried ON the wheel event; `frame_*` are the
+                    // frame-aggregate `i.modifiers` a handler actually gates on. They diverge when a
+                    // synthetic ctrl+wheel is injected as one burst: the event carries ctrl, but the
+                    // frame-aggregate reads released because the modifier is pressed and released
+                    // within a single frame — so `i.modifiers.ctrl` is false. (ctrl+wheel also routes
+                    // to a zoom gesture, zeroing smooth_scroll_delta.)
                     egui::Event::MouseWheel { delta, modifiers, .. } => log(&format!(
-                        "[fixture] wheel delta=({:.1},{:.1}) ctrl={} shift={} | smooth_scroll_y={:.2} zoom_delta={:.4}",
+                        "[fixture] wheel delta=({:.1},{:.1}) ev_ctrl={} ev_shift={} frame_ctrl={} frame_shift={} smooth_scroll_y={:.2} zoom_delta={:.4}",
                         delta.x, delta.y, modifiers.ctrl, modifiers.shift,
+                        i.modifiers.ctrl, i.modifiers.shift,
                         i.smooth_scroll_delta.y, i.zoom_delta()
                     )),
                     // Each key event carries its own (event-level) modifiers.
