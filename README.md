@@ -44,7 +44,8 @@ between screenshots cost no vision tokens.
 - **A display dependency**, for the backend you'll run:
   - **Linux / X11 (default):** the headless X server — `sudo apt-get install -y xvfb`
     (Debian/Ubuntu; Fedora `xorg-x11-server-Xvfb`, Arch `xorg-server-xvfb`). glass spawns
-    its own private display, so this binary is the only thing to install.
+    its own private display, so Xvfb is all you need for the display — no desktop or
+    window manager. (You'll still need a containment runtime by default — see below.)
   - **Linux / Wayland:** a discoverable `sway ≥ 1.12` plus [Mesa](https://www.mesa3d.org/) software GL — see
     [Running on Wayland](#running-on-wayland-sway).
   - **Windows:** nothing extra; glass uses built-in Windows APIs.
