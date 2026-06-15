@@ -12,7 +12,7 @@ use crate::build::run_build;
 use crate::input::{Injector, ShellInjector};
 use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
 use crate::logs::{LogSink, LogcatStream};
-use crate::parse::{check_am_start, check_install, parse_pid, parse_pids, parse_window_frame};
+use crate::parse::{check_am_start, check_install, parse_app_windows, parse_pid, parse_pids};
 use crate::screencap::decode_screencap;
 use crate::target::AdbTarget;
 
@@ -21,6 +21,7 @@ struct RunningApp {
     package: String,
     component: String,
     pid: Option<u32>,
+    active_id: WindowId,
     window: WindowGeometry,
     logcat: Option<LogcatStream>,
 }
@@ -54,24 +55,20 @@ impl AndroidPlatform {
         self.app.as_ref().ok_or(GlassError::NoActiveSession)
     }
 
-    /// Poll `dumpsys window windows` until the app's frame appears or `timeout_ms` elapses.
-    fn discover_window(&self, package: &str, timeout_ms: u64) -> Result<WindowGeometry> {
+    /// Poll `dumpsys window windows` until the app has an on-screen window, returning the
+    /// topmost one's id + frame (the default active window).
+    fn discover_window(&self, package: &str, timeout_ms: u64) -> Result<(WindowId, WindowGeometry)> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
             let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
-            if let Ok(geo) = parse_window_frame(&dump, package) {
-                return Ok(geo);
+            if let Some(w) = parse_app_windows(&dump, package).into_iter().next() {
+                return Ok((WindowId(w.id), w.frame));
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::Timeout(timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(150));
         }
-    }
-
-    fn window_id(&self) -> WindowId {
-        // One foreground window; a stable-per-session id is sufficient.
-        WindowId(1)
     }
 }
 
@@ -89,7 +86,7 @@ impl Platform for AndroidPlatform {
         let started = adb.run(launch_args(&target.component).iter().map(String::as_str))?;
         check_am_start(&started)?;
 
-        let window = self.discover_window(&target.package, spec.timeout_ms)?;
+        let (active_id, window) = self.discover_window(&target.package, spec.timeout_ms)?;
 
         let pidof = adb.run(["shell", "pidof", &target.package]).unwrap_or_default();
         let pid = parse_pid(&pidof);
@@ -102,6 +99,7 @@ impl Platform for AndroidPlatform {
             package: target.package,
             component: target.component,
             pid,
+            active_id,
             window: window.clone(),
             logcat,
         });
@@ -162,21 +160,37 @@ impl Platform for AndroidPlatform {
     }
 
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        let app = self.running()?;
-        Ok(vec![WindowInfo {
-            id: self.window_id(),
-            title: Some(app.component.clone()),
-            class: Some(app.package.clone()),
-            geometry: app.window.clone(),
-            active: true,
-        }])
+        let (package, active_id) = {
+            let app = self.running()?;
+            (app.package.clone(), app.active_id)
+        };
+        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        Ok(parse_app_windows(&dump, &package)
+            .into_iter()
+            .map(|w| WindowInfo {
+                id: WindowId(w.id),
+                title: Some(w.title),
+                class: Some(package.clone()),
+                geometry: w.frame,
+                active: WindowId(w.id) == active_id,
+            })
+            .collect())
     }
 
     fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
-        if id == self.window_id() {
-            Ok(self.running()?.window.clone())
-        } else {
-            Err(GlassError::WindowNotFound)
+        let package = self.running()?.package.clone();
+        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let found = parse_app_windows(&dump, &package)
+            .into_iter()
+            .find(|w| WindowId(w.id) == id);
+        match found {
+            Some(w) => {
+                let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
+                app.active_id = id;
+                app.window = w.frame.clone();
+                Ok(w.frame)
+            }
+            None => Err(GlassError::WindowNotFound),
         }
     }
 
