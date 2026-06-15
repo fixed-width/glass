@@ -37,7 +37,9 @@ struct WinBlock {
 }
 
 fn finish_block(b: WinBlock, out: &mut Vec<ParsedWindow>) {
-    if b.pkg_match && b.on_screen {
+    // Skip the transient starting window (title `Splash Screen <pkg>`): a real app-package
+    // window during launch, but not one the agent should drive.
+    if b.pkg_match && b.on_screen && !b.title.starts_with("Splash Screen") {
         if let Some(frame) = b.frame {
             out.push(ParsedWindow { id: b.id, title: b.title, frame });
         }
@@ -72,6 +74,16 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
                 finish_block(b, &mut out);
             }
             cur = Some(WinBlock { id, title, pkg_match: false, on_screen: false, frame: None });
+            continue;
+        }
+        // A non-blank, less-indented line ends the window list / current block, so trailing
+        // dumpsys sections (e.g. the `#0 Window{…}` focus summary, which carries the foreground
+        // app's `package=`) don't leak into the last real window block.
+        let indent = line.len() - t.len();
+        if !t.is_empty() && indent < 4 {
+            if let Some(b) = cur.take() {
+                finish_block(b, &mut out);
+            }
             continue;
         }
         if let Some(b) = cur.as_mut() {
@@ -196,5 +208,40 @@ mod tests {
     #[test]
     fn app_windows_empty_when_package_absent() {
         assert!(parse_app_windows(WINDOWS, "com.nope").is_empty());
+    }
+
+    #[test]
+    fn app_windows_excludes_splash_screen() {
+        let dump = concat!(
+            "  Window #0 Window{ccc333 u0 Splash Screen com.example.app}:\n",
+            "    mOwnerUid=10168 package=com.example.app appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+            "  Window #1 Window{ddd444 u0 com.example.app/com.example.app.MainActivity}:\n",
+            "    mOwnerUid=1000 package=com.example.app appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+        );
+        let ws = parse_app_windows(dump, "com.example.app");
+        assert_eq!(ws.len(), 1, "splash excluded");
+        assert_eq!(ws[0].id, 0xddd444);
+    }
+
+    #[test]
+    fn app_windows_ignores_trailing_focus_summary() {
+        // After the real windows, dumpsys prints a `#0 Window{...}` focus summary carrying the
+        // foreground app's `package=` — it must not leak into the last (non-app) window block.
+        let dump = concat!(
+            "  Window #0 Window{aaa111 u0 com.example.app/com.example.app.MainActivity}:\n",
+            "    mOwnerUid=1000 package=com.example.app appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+            "  Window #1 Window{bbb222 u0 com.android.systemui.wallpapers.ImageWallpaper}:\n",
+            "    mOwnerUid=10168 package=com.android.systemui appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+            "  #0 Window{aaa111 u0 com.example.app/com.example.app.MainActivity}:\n",
+            "    mOwnerUid=1000 package=com.example.app appop=NONE\n",
+            "    isOnScreen=true\n",
+        );
+        let ws = parse_app_windows(dump, "com.example.app");
+        assert_eq!(ws.len(), 1, "wallpaper must not absorb the trailing settings package");
+        assert_eq!(ws[0].id, 0xaaa111);
     }
 }
