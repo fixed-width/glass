@@ -12,8 +12,8 @@ user "does this look right?".
 
 glass drives apps as an external black box, so it works with any native GUI app
 regardless of toolkit or language. It currently has two Linux backends — **X11** and
-**Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — and a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
-SendInput, UI Automation), behind a platform-agnostic core; a **macOS** backend is
+**Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
+SendInput, UI Automation) — and an **Android** backend (drives native apps in an AVD emulator over `adb`), behind a platform-agnostic core; a **macOS** backend is
 planned. See [`packaging/README-windows.md`](packaging/README-windows.md)
 for the Windows build and setup.
 
@@ -213,8 +213,9 @@ A few capabilities worth knowing:
 - **Multiple windows.** `glass_list_windows` enumerates the app's top-level
   windows (id, title, class, geometry, which is active); `glass_select_window`
   makes one active, and subsequent capture/click/type/window ops target it with
-  window-relative coordinates. All three backends enumerate every top-level the app
-  owns (X11 via EWMH, Wayland via sway IPC, Windows via the launched Job's windows).
+  window-relative coordinates. The desktop backends enumerate every top-level the app
+  owns (X11 via EWMH, Wayland via sway IPC, Windows via the launched Job's windows); the
+  Android backend exposes the single foreground app window.
 - **Accessibility tree (semantic addressing).** Where the app exposes an
   accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/Unity/game UIs),
   `glass_a11y_snapshot` returns its elements as compact text — role, name, and
@@ -222,7 +223,7 @@ A few capabilities worth knowing:
   by `#id`. That's deterministic, low-token element addressing that complements the
   pixel loop; it errors (never a fake tree) for apps with no accessible UI, so the
   agent falls back to screenshots. Available on **Linux** (AT-SPI via [`at-spi2-core`](https://gitlab.gnome.org/GNOME/at-spi2-core),
-  serving both X11 and Wayland) and **Windows** ([UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32)); `./scripts/test-a11y.sh`
+  serving both X11 and Wayland), **Windows** ([UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32)), and **Android** (via `uiautomator`); `./scripts/test-a11y.sh`
   exercises the Linux reader end-to-end.
   `glass_a11y_marks` returns the same elements as a numbered Set-of-Mark overlay
   drawn on the screenshot (plus a text legend) for agents that ground visually —
@@ -305,6 +306,7 @@ environment variable when set, otherwise a sensible default (a bare name found o
 | bubblewrap | `GLASS_BWRAP` | `bwrap` (on `PATH`) | Linux app containment |
 | Xvfb | `GLASS_XVFB` | `Xvfb` (on `PATH`) | X11 private headless display |
 | sway | `GLASS_SWAY` | auto-discovered¹ | Wayland headless compositor |
+| adb | `GLASS_ADB` | `adb` (on `PATH`) | Android device/emulator control |
 | build shell | `GLASS_SH` | `sh` (on `PATH`) | running `spec.build` |
 | Sandboxie dir | `GLASS_SANDBOXIE_DIR` | `%ProgramFiles%\Sandboxie` | Windows containment |
 
@@ -316,7 +318,7 @@ forces a specific binary and skips that search (and fails closed if the path is 
 ## Backends
 
 The backend is chosen **per `glass_start`** — the tool takes an optional
-`backend` (`"x11"` or `"wayland"` on Linux, `"windows"` on a Windows host), so the
+`backend` (`"x11"` or `"wayland"` on Linux, `"windows"` on a Windows host, or `"android"` for an emulator on any host), so the
 agent can pick per launch with no server restart. When omitted it falls back to the
 `GLASS_BACKEND` environment variable, then to the host default (**windows** on a
 Windows host, otherwise **x11**). The backend is built on `glass_start` (so the
@@ -334,6 +336,14 @@ across backends — only the setup differs:
   **`GLASS_TYPE_DWELL_MS`** (default `60`) to stay ahead of a fast-injection race in
   the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
   [`packaging/README-windows.md`](packaging/README-windows.md).
+- **Android (AVD)** — drives a native Android app in an emulator over `adb`; **host-OS-agnostic**
+  (it shells out to `adb`, so it runs from a Linux, macOS, or Windows host). Emulator-only for
+  now: it attaches to a running AVD (`GLASS_ANDROID_SERIAL` selects one when several are attached;
+  `GLASS_ADB` points at the `adb` binary). The emulator's VM *is* the sandbox, so there's no
+  separate containment step. The app is built (`spec.build`, e.g. `./gradlew assembleDebug`) on
+  the host, installed, and launched — `glass_start`'s `run` is the launch component
+  `package/.Activity` (plus an optional `.apk` to install). Single foreground window; clipboard,
+  multi-window, and window resize/move are not supported yet.
 
 ## Running on X11 (the default)
 
@@ -459,16 +469,18 @@ Profile a hot path as a flamegraph (needs [`cargo install flamegraph`](https://g
 
 ## Platform support
 
-Where glass stands by OS. **✓** supported · **–** not supported · **🚧** planned.
+Where glass stands by OS. **✓** supported · **◑** partial · **–** not supported · **🚧** planned.
 
 <!-- KEEP IN SYNC with the code (and CLAUDE.md) whenever capabilities change. -->
 
-| Capability | Linux (X11 + Wayland) | Windows | macOS |
-|---|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | 🚧 |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | 🚧 AX |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | 🚧 |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | 🚧 |
+| Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
+|---|:--:|:--:|:--:|:--:|
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ◑ † | 🚧 |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | 🚧 AX |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | ✓ headless emulator | 🚧 |
+
+† **Android** is emulator-only: capture, input, and logs work and the AVD VM is the sandbox; clipboard, multi-window, and window resize/move are not supported yet, and it attaches to a running AVD (no managed-AVD spawn or physical-device support yet).
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
@@ -482,7 +494,10 @@ running-on-X11/Wayland sections above.
 
 The Linux feature set is implemented and tested across **both** Linux backends
 (X11 and Wayland/wlroots), and the **Windows** backend (WGC capture, SendInput, UI
-Automation) is built and CI-tested; **macOS is the one OS backend not yet built**.
+Automation) is built and CI-tested. An **Android** backend drives native apps in an AVD
+emulator over `adb` — capture, input, logcat, and a `uiautomator` accessibility tree, with
+clipboard and multi-window still pending; it's built and unit-tested in CI and validated
+on-device. **macOS is the one OS backend not yet built.**
 
 ## License
 

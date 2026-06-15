@@ -50,9 +50,9 @@ pub fn make_platform(backend: &str) -> Result<Backend> {
         "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
         other => {
             #[cfg(target_os = "linux")]
-            let valid = "\"x11\" or \"wayland\"";
+            let valid = "\"x11\", \"wayland\", or \"android\"";
             #[cfg(windows)]
-            let valid = "\"windows\"";
+            let valid = "\"windows\" or \"android\"";
             return Err(GlassError::Backend(format!("unknown backend {other:?}; use {valid}")));
         }
     };
@@ -69,7 +69,7 @@ pub fn make_platform(backend: &str) -> Result<Backend> {
     Ok(Backend { platform, accessibility })
 }
 
-/// Default backend name from `GLASS_BACKEND` (case-insensitive `wayland`/`windows`/`x11`).
+/// Default backend name from `GLASS_BACKEND` (case-insensitive `wayland`/`windows`/`x11`/`android`).
 /// Unset defaults to the windows backend on a Windows host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
     match env {
