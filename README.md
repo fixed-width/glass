@@ -57,7 +57,7 @@ between screenshots cost no vision tokens.
     (Fedora/Arch: `bubblewrap`) — **and** unprivileged user namespaces enabled. Ubuntu 23.10+
     restricts them via AppArmor; allow with
     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`).
-  - **Windows:** [Sandboxie Classic](https://sandboxie-plus.com/downloads), installed with its service running.
+  - **Windows:** [Sandboxie](https://sandboxie-plus.com/downloads) — Classic or Plus — installed with its service running.
 
   See [Containment / sandboxing](#containment--sandboxing) for the levels; `glass-mcp doctor`
   checks availability and prints the exact remedy for your system.
@@ -246,10 +246,14 @@ On **Windows**, `default`/`strict` give **real in-OS containment via
 Sandboxie Classic** (filesystem/registry virtualization; the boxed app still renders, is
 WGC-captured, and is SendInput-driven on the interactive desktop). `default` = contained,
 network on; `strict` = contained, no network egress; `off` = launched unconfined. The engine
-is Sandboxie **Classic** (cleanly GPLv3 — Plus needs a commercial "Business Certificate"); you
-install it yourself ([sandboxie-plus.com/downloads](https://sandboxie-plus.com/downloads)), and
-glass only *invokes* `Start.exe`/`SbieIni.exe` as subprocesses (no linking) — the same model as
-Linux `bubblewrap`. It is configurable, not hardcoded: `GLASS_WIN_SANDBOX_PROVIDER=auto|sandboxie|none`
+is Sandboxie, **Classic** by default — cleanly GPLv3 and free for every use. Sandboxie **Plus**
+works too, but it installs to a different directory (e.g. `%ProgramFiles%\Sandboxie-Plus`), so
+auto-detection won't find it — set `GLASS_SANDBOXIE_DIR` to its install directory explicitly.
+Plus's commercial "Business Certificate" is required for some use cases. You install whichever
+you prefer
+([sandboxie-plus.com/downloads](https://sandboxie-plus.com/downloads)), and glass only
+*invokes* `Start.exe`/`SbieIni.exe` as subprocesses (no linking) — the same model as Linux
+`bubblewrap`. It is configurable, not hardcoded: `GLASS_WIN_SANDBOX_PROVIDER=auto|sandboxie|none`
 (default `auto`) and `GLASS_SANDBOXIE_DIR` (default `%ProgramFiles%\Sandboxie`, auto-detected).
 Like Linux, `default`/`strict` are **fail-closed**: if no in-OS provider is available (Sandboxie
 absent / its service not running, or `provider=none`), `glass_start` errors rather than running
