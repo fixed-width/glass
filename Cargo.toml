@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux", "crates/glass-proc-linux", "crates/glass-clip-hook", "crates/glass-dbus-linux"]
+members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux", "crates/glass-proc-linux", "crates/glass-clip-hook", "crates/glass-dbus-linux", "crates/glass-android"]
 # glass-fixture-egui is intentionally excluded: heavy egui deps, only exercised by #[ignore]d
 # on-box a11y tests CI can't run. Built on-demand on the box.
 exclude = ["crates/glass-fixture-egui"]
@@ -29,6 +29,7 @@ thiserror = "1"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 tempfile = "3"
 x11rb = { version = "0.13", features = ["xtest"] }
+glass-android = { path = "crates/glass-android" }
 glass-core = { path = "crates/glass-core" }
 glass-sandbox-linux = { path = "crates/glass-sandbox-linux" }
 glass-proc-linux = { path = "crates/glass-proc-linux" }

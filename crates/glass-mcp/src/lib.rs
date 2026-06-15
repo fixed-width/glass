@@ -35,6 +35,11 @@ compile_error!(
 /// Construct a backend by name. The only place that knows the concrete backends;
 /// passed to `Glass` as a factory so the backend is built per `glass_start`.
 pub fn make_platform(backend: &str) -> Result<Backend> {
+    if backend == "android" {
+        let platform: Box<dyn Platform + Send> = Box::new(glass_android::AndroidPlatform::from_env()?);
+        // a11y (uiautomator) arrives in a later phase; until then a11y tools report Unsupported.
+        return Ok(Backend { platform, accessibility: None });
+    }
     let platform: Box<dyn Platform + Send> = match backend {
         #[cfg(target_os = "linux")]
         "wayland" => Box::new(WaylandPlatform::new()?),
@@ -67,6 +72,7 @@ pub fn make_platform(backend: &str) -> Result<Backend> {
 /// Unset defaults to the windows backend on a Windows host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
     match env {
+        Some(v) if v.eq_ignore_ascii_case("android") => "android",
         Some(v) if v.eq_ignore_ascii_case("wayland") => "wayland",
         Some(v) if v.eq_ignore_ascii_case("windows") => "windows",
         Some(v) if v.eq_ignore_ascii_case("x11") => "x11",
@@ -128,6 +134,12 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
 #[cfg(test)]
 mod tests {
     use super::default_backend;
+
+    #[test]
+    fn android_backend_is_selectable_by_name() {
+        assert_eq!(super::default_backend(Some("android")), "android");
+        assert_eq!(super::default_backend(Some("ANDROID")), "android");
+    }
 
     #[test]
     fn defaults_to_x11_unless_wayland() {
