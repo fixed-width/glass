@@ -3,7 +3,9 @@
 //! attach or boot. Pure helpers here; `boot_avd` (subprocess) and the
 //! `EmulatorRegistry` (cleanup) follow in later tasks.
 
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 
@@ -166,6 +168,61 @@ impl EmulatorRegistry {
     pub fn serials(&self) -> Vec<String> {
         self.booted.lock().map(|g| g.clone()).unwrap_or_default()
     }
+}
+
+/// Boot the configured AVD headless and return the serial of the device that came up.
+/// Spawns the emulator detached, waits for a new device + `sys.boot_completed`, and
+/// errors (after killing the half-booted emulator) on timeout or spawn failure.
+pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let bin = resolve_emulator_bin(get);
+    let avds = parse_list_avds(&run_emulator_list(&bin)?);
+    let avd = choose_avd(get("GLASS_AVD").as_deref(), &avds)?;
+    let args = emulator_args(&avd, get("GLASS_EMULATOR_ARGS").as_deref());
+
+    let before = crate::target::parse_devices(&base.run(["devices"])?);
+
+    Command::new(&bin)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| GlassError::Backend(format!("failed to spawn emulator `{bin}`: {e}")))?;
+
+    let timeout_ms: u64 =
+        get("GLASS_EMULATOR_BOOT_TIMEOUT_MS").and_then(|s| s.parse().ok()).unwrap_or(120_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let online = crate::target::parse_devices(&base.run(["devices"])?);
+        if let Some(serial) = new_serial(&before, &online) {
+            let adb = base.with_serial(serial.clone());
+            if adb.run(["shell", "getprop", "sys.boot_completed"])
+                .map(|o| o.trim() == "1")
+                .unwrap_or(false)
+            {
+                return Ok(serial);
+            }
+        }
+        if Instant::now() >= deadline {
+            if let Some(serial) = new_serial(
+                &before,
+                &crate::target::parse_devices(&base.run(["devices"]).unwrap_or_default()),
+            ) {
+                let _ = base.with_serial(serial).run(["emu", "kill"]);
+            }
+            return Err(GlassError::Backend(format!(
+                "emulator did not reach sys.boot_completed within {timeout_ms}ms"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn run_emulator_list(bin: &str) -> Result<String> {
+    let out = Command::new(bin)
+        .arg("-list-avds")
+        .output()
+        .map_err(|e| GlassError::Backend(format!("failed to run `{bin} -list-avds`: {e}")))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
