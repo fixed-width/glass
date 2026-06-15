@@ -144,14 +144,20 @@ impl Platform for AndroidPlatform {
     }
 
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
-        let app = self.running()?;
         match op {
-            WindowOp::Geometry => Ok(app.window.clone()),
+            WindowOp::Geometry => Ok(self.running()?.window.clone()),
             WindowOp::Focus => {
-                let component = app.component.clone();
+                let (component, package) = {
+                    let app = self.running()?;
+                    (app.component.clone(), app.package.clone())
+                };
                 let out = self.adb().run(launch_args(&component).iter().map(String::as_str))?;
                 check_am_start(&out)?;
-                Ok(self.running()?.window.clone())
+                let (active_id, window) = self.discover_window(&package, 5_000)?;
+                let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
+                app.active_id = active_id;
+                app.window = window.clone();
+                Ok(window)
             }
             WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::Unsupported(
                 "window resize/move (Android apps are full-screen)".into(),
@@ -165,14 +171,17 @@ impl Platform for AndroidPlatform {
             (app.package.clone(), app.active_id)
         };
         let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
-        Ok(parse_app_windows(&dump, &package)
+        let parsed = parse_app_windows(&dump, &package);
+        let any_match = parsed.iter().any(|w| WindowId(w.id) == active_id);
+        Ok(parsed
             .into_iter()
-            .map(|w| WindowInfo {
+            .enumerate()
+            .map(|(i, w)| WindowInfo {
                 id: WindowId(w.id),
                 title: Some(w.title),
                 class: Some(package.clone()),
                 geometry: w.frame,
-                active: WindowId(w.id) == active_id,
+                active: if any_match { WindowId(w.id) == active_id } else { i == 0 },
             })
             .collect())
     }

@@ -94,8 +94,8 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
                 b.on_screen = true;
             }
             if b.frame.is_none() {
-                if let Some(idx) = line.find("Frame=").or_else(|| line.find("frame=")) {
-                    b.frame = parse_rect(&line[idx + "Frame=".len()..]);
+                if let Some(idx) = line.find("mFrame=") {
+                    b.frame = parse_rect(&line[idx + "mFrame=".len()..]);
                 }
             }
         }
@@ -243,5 +243,26 @@ mod tests {
         let ws = parse_app_windows(dump, "com.example.app");
         assert_eq!(ws.len(), 1, "wallpaper must not absorb the trailing settings package");
         assert_eq!(ws[0].id, 0xaaa111);
+    }
+
+    #[test]
+    fn app_windows_frame_and_onscreen_on_separate_lines() {
+        let dump = concat!(
+            "  Window #0 Window{abc123 u0 com.example.app/com.example.app.MainActivity}:\n",
+            "    mDisplayId=0 rootTaskId=1 mSession=Session{x}\n",
+            "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
+            "    mActivityRecord=ActivityRecord{y u0 com.example.app/.MainActivity t1}\n",
+            "    mViewVisibility=0x0 mHaveFrame=true\n",
+            "    mFrame=[0,63][1080,2220] mLastFrame=[0,63][1080,2220]\n",
+            "    Frames: containing=[0,0][1080,2400] parent frame=[0,0][1080,2400]\n",
+            "    mForceSeamlesslyRotate=false seamlesslyRotate: pending=null    isOnScreen=true\n",
+        );
+        let ws = parse_app_windows(dump, "com.example.app");
+        assert_eq!(ws.len(), 1);
+        // the window's own mFrame, NOT the containing/parent frame on the Frames: line
+        assert_eq!(
+            ws[0].frame,
+            glass_core::WindowGeometry { x: 0, y: 63, width: 1080, height: 2157 }
+        );
     }
 }
