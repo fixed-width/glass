@@ -29,6 +29,11 @@ impl Adb {
         self.serial.as_deref()
     }
 
+    /// The resolved adb binary, for callers spawning their own long-lived adb process.
+    pub fn bin(&self) -> &str {
+        &self.bin
+    }
+
     /// Run adb with captured text stdout; `Backend` error on spawn failure or non-zero exit.
     pub fn run<'a, I>(&self, args: I) -> Result<String>
     where
