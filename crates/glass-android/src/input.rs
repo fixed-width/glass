@@ -2,7 +2,8 @@
 //! argument vectors, plus the `Injector` seam (`ShellInjector` shells out; a
 //! future on-device agent can replace it for lower latency).
 
-use glass_core::{PointerEvent, WindowGeometry};
+use glass_core::keys::parse_chord;
+use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, WindowGeometry};
 
 /// Pixels of swipe travel per scroll "click" (`Scroll.dx/dy` are wheel clicks —
 /// X11 clicks the wheel `|delta|` times). Tunable.
@@ -50,6 +51,80 @@ fn swipe(x1: i32, y1: i32, x2: i32, y2: i32, ms: u64) -> Vec<String> {
         "shell".into(), "input".into(), "swipe".into(),
         x1.to_string(), y1.to_string(), x2.to_string(), y2.to_string(), ms.to_string(),
     ]
+}
+
+/// Build the `adb shell input …` command(s) for a key event.
+pub fn key_commands(event: &KeyEvent) -> Result<Vec<Vec<String>>> {
+    match event {
+        KeyEvent::Text(s) if s.is_empty() => Ok(vec![]),
+        KeyEvent::Text(s) => Ok(vec![text_command(s)]),
+        KeyEvent::Chord(c) => Ok(vec![chord_command(c)?]),
+    }
+}
+
+/// `input text` of `s`, made safe for the device shell: spaces become `%s`
+/// (input's space escape) and the whole argument is single-quoted so shell
+/// metacharacters are taken literally. We build the remote command string
+/// ourselves to avoid `adb`'s argument re-splitting.
+fn text_command(s: &str) -> Vec<String> {
+    let spaced = s.replace(' ', "%s");
+    let quoted = format!("'{}'", spaced.replace('\'', r"'\''"));
+    vec!["shell".into(), format!("input text {quoted}")]
+}
+
+/// A no-modifier chord → `input keyevent`; a modifier chord → `input
+/// keycombination` (Android 12+/API 31+), which presses the keys together.
+fn chord_command(chord: &str) -> Result<Vec<String>> {
+    let (mods, keysym) = parse_chord(chord)?;
+    let key = android_keycode(keysym)
+        .ok_or_else(|| GlassError::InvalidKey(format!("no Android keycode for the key in '{chord}'")))?;
+    if mods.is_empty() {
+        Ok(vec!["shell".into(), "input".into(), "keyevent".into(), key.to_string()])
+    } else {
+        let mut argv = vec!["shell".into(), "input".into(), "keycombination".into()];
+        argv.extend(mods.iter().map(|m| meta_keycode(*m).to_string()));
+        argv.push(key.to_string());
+        Ok(argv)
+    }
+}
+
+/// X keysym (from `parse_chord`) → Android `KEYCODE_*` numeric value.
+fn android_keycode(keysym: u32) -> Option<u32> {
+    if let Some(c) = char::from_u32(keysym) {
+        if c.is_ascii_alphabetic() {
+            return Some(29 + (c.to_ascii_lowercase() as u32 - 'a' as u32)); // KEYCODE_A = 29
+        }
+        if c.is_ascii_digit() {
+            return Some(7 + (c as u32 - '0' as u32)); // KEYCODE_0 = 7
+        }
+    }
+    let kc = match keysym {
+        0xff0d => 66,  // Return    → ENTER
+        0xff1b => 111, // Escape    → ESCAPE
+        0xff09 => 61,  // Tab       → TAB
+        0xff08 => 67,  // Backspace → DEL
+        0xffff => 112, // Delete    → FORWARD_DEL
+        0x0020 => 62,  // space     → SPACE
+        0xff52 => 19,  // Up        → DPAD_UP
+        0xff54 => 20,  // Down      → DPAD_DOWN
+        0xff51 => 21,  // Left      → DPAD_LEFT
+        0xff53 => 22,  // Right     → DPAD_RIGHT
+        0xff50 => 122, // Home      → MOVE_HOME
+        0xff57 => 123, // End       → MOVE_END
+        0xffbe..=0xffc9 => 131 + (keysym - 0xffbe), // F1..F12 → KEYCODE_F1(131)..F12(142)
+        _ => return None,
+    };
+    Some(kc)
+}
+
+/// Modifier → Android meta `KEYCODE_*_LEFT`.
+fn meta_keycode(m: Modifier) -> u32 {
+    match m {
+        Modifier::Control => 113, // CTRL_LEFT
+        Modifier::Shift => 59,    // SHIFT_LEFT
+        Modifier::Alt => 57,      // ALT_LEFT
+        Modifier::Super => 117,   // META_LEFT
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +187,73 @@ mod pointer_tests {
         let got = pointer_commands(&win(), &ev);
         let end_y = &got[0][6];
         assert_eq!(end_y, "63");
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use glass_core::{GlassError, KeyEvent};
+
+    #[test]
+    fn empty_text_injects_nothing() {
+        assert!(key_commands(&KeyEvent::Text(String::new())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_is_space_escaped_and_quoted() {
+        let got = key_commands(&KeyEvent::Text("hello world".into())).unwrap();
+        assert_eq!(got, vec![vec!["shell".to_string(), "input text 'hello%sworld'".into()]]);
+    }
+
+    #[test]
+    fn text_single_quote_is_shell_escaped() {
+        let got = key_commands(&KeyEvent::Text("it's".into())).unwrap();
+        assert_eq!(got, vec![vec!["shell".to_string(), r"input text 'it'\''s'".into()]]);
+    }
+
+    #[test]
+    fn plain_chord_is_a_keyevent() {
+        let got = key_commands(&KeyEvent::Chord("Enter".into())).unwrap();
+        assert_eq!(got, vec![vec!["shell".to_string(), "input".into(), "keyevent".into(), "66".into()]]);
+    }
+
+    #[test]
+    fn letter_chord_maps_to_keycode_a() {
+        let got = key_commands(&KeyEvent::Chord("a".into())).unwrap();
+        assert_eq!(got, vec![vec!["shell".to_string(), "input".into(), "keyevent".into(), "29".into()]]);
+    }
+
+    #[test]
+    fn modifier_chord_is_a_keycombination() {
+        let got = key_commands(&KeyEvent::Chord("ctrl+a".into())).unwrap();
+        assert_eq!(got, vec![vec![
+            "shell".to_string(), "input".into(), "keycombination".into(), "113".into(), "29".into(),
+        ]]);
+    }
+
+    #[test]
+    fn multi_modifier_chord_lists_each_meta_then_the_key() {
+        let got = key_commands(&KeyEvent::Chord("ctrl+shift+a".into())).unwrap();
+        assert_eq!(got, vec![vec![
+            "shell".to_string(), "input".into(), "keycombination".into(),
+            "113".into(), "59".into(), "29".into(),
+        ]]);
+    }
+
+    #[test]
+    fn function_key_chord_maps_to_f_keycode() {
+        let got = key_commands(&KeyEvent::Chord("alt+F4".into())).unwrap();
+        assert_eq!(got, vec![vec![
+            "shell".to_string(), "input".into(), "keycombination".into(), "57".into(), "134".into(),
+        ]]);
+    }
+
+    #[test]
+    fn unmappable_chord_key_errors() {
+        assert!(matches!(
+            key_commands(&KeyEvent::Chord("ctrl+/".into())),
+            Err(GlassError::InvalidKey(_))
+        ));
     }
 }
