@@ -7,6 +7,7 @@
 mod adb;
 mod build;
 mod cmd;
+mod input;
 mod logs;
 mod parse;
 mod platform;
