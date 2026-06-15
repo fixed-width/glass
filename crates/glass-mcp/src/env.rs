@@ -13,6 +13,7 @@ pub(crate) enum EnvScope {
     Wayland,
     Linux,
     Windows,
+    Android,
     Network,
 }
 
@@ -24,18 +25,20 @@ impl EnvScope {
             EnvScope::Wayland => "wayland",
             EnvScope::Linux => "linux",
             EnvScope::Windows => "windows",
+            EnvScope::Android => "android",
             EnvScope::Network => "network",
         }
     }
 }
 
-/// Fixed group order for output: general → display servers → OS containment → network.
-const SCOPE_ORDER: [EnvScope; 6] = [
+/// Fixed group order for output: general → display servers → OS containment → android → network.
+const SCOPE_ORDER: [EnvScope; 7] = [
     EnvScope::All,
     EnvScope::X11,
     EnvScope::Wayland,
     EnvScope::Linux,
     EnvScope::Windows,
+    EnvScope::Android,
     EnvScope::Network,
 ];
 
@@ -87,6 +90,30 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_TYPE_DWELL_MS", scope: EnvScope::Windows,
         purpose: "Inter-character typing dwell (ms); raise if rapid Unicode injection corrupts, lower for speed",
         default: "60", secret: false },
+    EnvVarDoc { name: "GLASS_ADB", scope: EnvScope::Android,
+        purpose: "adb binary used to drive an Android emulator/device",
+        default: "adb (on PATH)", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_SERIAL", scope: EnvScope::Android,
+        purpose: "adb serial of the device to attach to when several are online",
+        default: "the sole online device", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_LIFECYCLE", scope: EnvScope::Android,
+        purpose: "`auto` (attach to a running emulator, else boot one) or `attach` (never auto-boot)",
+        default: "auto", secret: false },
+    EnvVarDoc { name: "GLASS_EMULATOR", scope: EnvScope::Android,
+        purpose: "emulator binary; overrides $ANDROID_SDK_ROOT/emulator/emulator",
+        default: "resolved from ANDROID_SDK_ROOT/ANDROID_HOME, else emulator on PATH", secret: false },
+    EnvVarDoc { name: "GLASS_AVD", scope: EnvScope::Android,
+        purpose: "which AVD to boot when none is running",
+        default: "the sole AVD", secret: false },
+    EnvVarDoc { name: "GLASS_EMULATOR_ARGS", scope: EnvScope::Android,
+        purpose: "extra flags appended to the headless emulator launch",
+        default: "(none)", secret: false },
+    EnvVarDoc { name: "GLASS_EMULATOR_BOOT_TIMEOUT_MS", scope: EnvScope::Android,
+        purpose: "max wait for the booting emulator to reach sys.boot_completed",
+        default: "120000", secret: false },
+    EnvVarDoc { name: "GLASS_EMULATOR_KEEP", scope: EnvScope::Android,
+        purpose: "leave a glass-booted emulator running at shutdown instead of stopping it",
+        default: "stop it", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -229,6 +256,9 @@ mod tests {
             "GLASS_BACKEND", "GLASS_SANDBOX", "GLASS_DISPLAY", "GLASS_XVFB_SCREEN",
             "GLASS_XVFB", "GLASS_SWAY", "GLASS_WAYLAND_SCREEN", "GLASS_BWRAP", "GLASS_SH",
             "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TYPE_DWELL_MS",
+            "GLASS_ADB", "GLASS_ANDROID_SERIAL", "GLASS_ANDROID_LIFECYCLE",
+            "GLASS_EMULATOR", "GLASS_AVD", "GLASS_EMULATOR_ARGS",
+            "GLASS_EMULATOR_BOOT_TIMEOUT_MS", "GLASS_EMULATOR_KEEP",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];

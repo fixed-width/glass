@@ -97,6 +97,8 @@ pub fn emulator_args(avd: &str, extra: Option<&str>) -> Vec<String> {
 }
 
 /// The serial present in `after` but not `before` (the device glass just booted).
+/// Returns the first such serial; assumes no unrelated emulator boots during glass's
+/// own boot window (otherwise the wrong new device could be picked).
 pub fn new_serial(before: &[Device], after: &[Device]) -> Option<String> {
     after
         .iter()
@@ -181,10 +183,10 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
 
     let before = crate::target::parse_devices(&base.run(["devices"])?);
 
-    Command::new(&bin)
+    let mut child = Command::new(&bin)
         .args(&args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| GlassError::Backend(format!("failed to spawn emulator `{bin}`: {e}")))?;
 
@@ -192,6 +194,17 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
         get("GLASS_EMULATOR_BOOT_TIMEOUT_MS").and_then(|s| s.parse().ok()).unwrap_or(120_000);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut e) = child.stderr.take() {
+                use std::io::Read as _;
+                let _ = e.read_to_string(&mut err);
+            }
+            return Err(GlassError::Backend(format!(
+                "emulator exited before boot (status {status}): {}",
+                err.trim()
+            )));
+        }
         let online = crate::target::parse_devices(&base.run(["devices"])?);
         if let Some(serial) = new_serial(&before, &online) {
             let adb = base.with_serial(serial.clone());
