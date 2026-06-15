@@ -2,6 +2,7 @@
 //! argument vectors, plus the `Injector` seam (`ShellInjector` shells out; a
 //! future on-device agent can replace it for lower latency).
 
+use crate::adb::Adb;
 use glass_core::keys::parse_chord;
 use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, WindowGeometry};
 
@@ -124,6 +125,32 @@ fn meta_keycode(m: Modifier) -> u32 {
         Modifier::Shift => 59,    // SHIFT_LEFT
         Modifier::Alt => 57,      // ALT_LEFT
         Modifier::Super => 117,   // META_LEFT
+    }
+}
+
+/// Pointer/key injection seam. `ShellInjector` shells out via `adb input`; a
+/// future on-device agent can implement this for lower-latency injection.
+pub trait Injector {
+    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()>;
+    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()>;
+}
+
+/// Injects by running `adb shell input …` commands.
+pub struct ShellInjector;
+
+impl Injector for ShellInjector {
+    fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+        for argv in pointer_commands(origin, event) {
+            adb.run(argv.iter().map(String::as_str))?;
+        }
+        Ok(())
+    }
+
+    fn key(&self, adb: &Adb, event: &KeyEvent) -> Result<()> {
+        for argv in key_commands(event)? {
+            adb.run(argv.iter().map(String::as_str))?;
+        }
+        Ok(())
     }
 }
 

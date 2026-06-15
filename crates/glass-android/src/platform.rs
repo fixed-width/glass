@@ -9,6 +9,7 @@ use glass_core::Platform;
 
 use crate::adb::Adb;
 use crate::build::run_build;
+use crate::input::{Injector, ShellInjector};
 use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{check_am_start, check_install, parse_pid, parse_pids, parse_window_frame};
@@ -27,6 +28,7 @@ struct RunningApp {
 /// Drives a native Android app in an AVD over `adb`.
 pub struct AndroidPlatform {
     target: Box<dyn AdbTarget + Send>,
+    injector: Box<dyn Injector + Send>,
     logs: LogSink,
     app: Option<RunningApp>,
 }
@@ -37,7 +39,12 @@ impl AndroidPlatform {
         let base = Adb::from_env();
         let serial = std::env::var("GLASS_ANDROID_SERIAL").ok();
         let target = AttachedDevice::resolve(base, serial.as_deref())?;
-        Ok(Self { target: Box::new(target), logs: Arc::new(Mutex::new(Vec::new())), app: None })
+        Ok(Self {
+            target: Box::new(target),
+            injector: Box::new(ShellInjector),
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app: None,
+        })
     }
 
     fn adb(&self) -> &Adb {
@@ -129,16 +136,14 @@ impl Platform for AndroidPlatform {
         }
     }
 
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "pointer input on the android backend (arrives in P2)".into(),
-        ))
+    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        let origin = self.running()?.window.clone();
+        self.injector.pointer(self.target.adb(), &origin, event)
     }
 
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "keyboard input on the android backend (arrives in P2)".into(),
-        ))
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.running()?; // require an active session
+        self.injector.key(self.target.adb(), event)
     }
 
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
