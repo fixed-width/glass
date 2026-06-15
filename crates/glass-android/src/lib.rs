@@ -5,6 +5,7 @@
 //! sandbox machinery here.
 
 mod adb;
+mod a11y;
 mod axmap;
 mod build;
 mod cmd;
@@ -15,5 +16,6 @@ mod platform;
 mod screencap;
 mod target;
 
+pub use a11y::AndroidA11y;
 pub use platform::AndroidPlatform;
 pub use target::{AdbTarget, AttachedDevice};
