@@ -94,8 +94,16 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
                 b.on_screen = true;
             }
             if b.frame.is_none() {
-                if let Some(idx) = line.find("mFrame=") {
-                    b.frame = parse_rect(&line[idx + "mFrame=".len()..]);
+                // The window's frame is `mFrame=[..]` on older images, or the `frame=[..]`
+                // field of the modern `Frames: parent=.. display=.. frame=.. last=..` line.
+                // Prefer the explicit `mFrame=`; on the `Frames:` line the bare (lowercase)
+                // `frame=` is the window's own frame (parent/display/last use their own keys).
+                let at = line
+                    .find("mFrame=")
+                    .map(|i| i + "mFrame=".len())
+                    .or_else(|| line.find("frame=").map(|i| i + "frame=".len()));
+                if let Some(idx) = at {
+                    b.frame = parse_rect(&line[idx..]);
                 }
             }
         }
@@ -263,6 +271,25 @@ mod tests {
         assert_eq!(
             ws[0].frame,
             glass_core::WindowGeometry { x: 0, y: 63, width: 1080, height: 2157 }
+        );
+    }
+
+    #[test]
+    fn app_windows_reads_frame_from_modern_frames_line() {
+        // Real android-34 format: no `mFrame=`; the window frame is the `frame=` field of the
+        // `Frames:` line (alongside parent=/display=/last=, which use their own keys).
+        let dump = concat!(
+            "  Window #0 Window{f72bd69 u0 com.example.app/com.example.app.MainActivity}:\n",
+            "    mViewVisibility=0x0 mHaveFrame=true mObscured=false\n",
+            "    mOwnerUid=1000 showForAllUsers=false package=com.example.app appop=NONE\n",
+            "    Frames: parent=[0,0][1080,2400] display=[0,0][1080,2400] frame=[0,63][1080,2337] last=[0,63][1080,2337]\n",
+            "    mForceSeamlesslyRotate=false    isOnScreen=true\n",
+        );
+        let ws = parse_app_windows(dump, "com.example.app");
+        assert_eq!(ws.len(), 1);
+        assert_eq!(
+            ws[0].frame,
+            glass_core::WindowGeometry { x: 0, y: 63, width: 1080, height: 2274 }
         );
     }
 }
