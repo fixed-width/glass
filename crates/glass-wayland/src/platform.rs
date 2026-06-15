@@ -570,12 +570,37 @@ fn upload_keymap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, keymap: &str)
     Ok(())
 }
 
-/// Press then release evdev keycode `kc`, bumping the session clock per event.
-fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) {
-    s.time = s.time.wrapping_add(1);
-    kb.key(s.time, kc, 1); // 1 = pressed
-    s.time = s.time.wrapping_add(1);
-    kb.key(s.time, kc, 0); // 0 = released
+/// Press then release evdev keycode `kc`, bumping the session clock per event and
+/// self-committing (roundtrip + settle) after each — so the compositor processes the
+/// press/release individually, like the chord sink. A heavy client (e.g. a browser) ignores
+/// taps that are merely queued and flushed once at the end.
+fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> {
+    for state in [1u32, 0] {
+        s.time = s.time.wrapping_add(1);
+        kb.key(s.time, kc, state);
+        s.queue
+            .roundtrip(&mut s.state)
+            .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    Ok(())
+}
+
+/// `TypeSink` for Wayland: types each character by uploading a one-key keymap (the char's
+/// keysym at keycode 1) and tapping it, self-committed per key — exactly the chord sink's
+/// shape. A heavy client (e.g. a browser) ignores keys tapped under a multi-key keymap it
+/// hasn't adopted, or flushed only once at the end. See glass_core::run_type.
+struct WaylandTypeSink<'a> {
+    s: &'a mut ActiveSession,
+    kb: ZwpVirtualKeyboardV1,
+}
+
+impl glass_core::TypeSink for WaylandTypeSink<'_> {
+    fn character(&mut self, c: char) -> Result<()> {
+        let ks = glass_core::keys::keysym_for_text(c);
+        upload_keymap(&mut *self.s, &self.kb, &crate::keyboard::build_keymap(&[ks]))?;
+        tap(&mut *self.s, &self.kb, 1)
+    }
 }
 
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
@@ -1072,30 +1097,17 @@ impl Platform for WaylandPlatform {
         Ok(())
     }
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
-        use crate::keyboard::build_keymap;
-        use glass_core::keys::{keysym_for_text, parse_chord};
+        use glass_core::keys::parse_chord;
         let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
         let kb = session.keyboard.clone();
         match event {
-            KeyEvent::Text(s) => {
-                let chars: Vec<char> = s.chars().collect();
-                if chars.is_empty() {
-                    return Ok(());
-                }
-                // One keycode per distinct keysym (first-occurrence order).
-                let mut syms: Vec<u32> = Vec::new();
-                for &c in &chars {
-                    let ks = keysym_for_text(c);
-                    if !syms.contains(&ks) {
-                        syms.push(ks);
-                    }
-                }
-                upload_keymap(session, &kb, &build_keymap(&syms))?;
-                for &c in &chars {
-                    let ks = keysym_for_text(c);
-                    let kc = syms.iter().position(|&k| k == ks).unwrap() as u32 + 1;
-                    tap(session, &kb, kc);
-                }
+            KeyEvent::Text(text) => {
+                // Per-character, self-committed typing (a 1-key keymap + tap, roundtripped
+                // per key) so a heavy client receives a long string instead of dropping a
+                // batch — see glass_core::run_type and WaylandTypeSink. The per-key roundtrip
+                // is the pacing, so no extra inter-character dwell is needed.
+                let mut sink = WaylandTypeSink { s: &mut *session, kb };
+                glass_core::run_type(&mut sink, text, std::time::Duration::ZERO)?;
             }
             KeyEvent::Chord(c) => {
                 let (mods, keysym) = parse_chord(c)?; // validates before any traffic
