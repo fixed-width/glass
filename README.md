@@ -326,7 +326,9 @@ across backends — only the setup differs:
   so there's no ambient display to set up. See [Running on Wayland](#running-on-wayland-sway).
 - **Windows** (default on a Windows host) — drives the app on the interactive
   desktop (WGC capture, SendInput, UI Automation), so it needs an interactive,
-  logged-in session to render and capture. See
+  logged-in session to render and capture. Synthetic typing is paced by
+  **`GLASS_TYPE_DWELL_MS`** (default `60`) to stay ahead of a fast-injection race in
+  the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
   [`packaging/README-windows.md`](packaging/README-windows.md).
 
 ## Running on X11 (the default)

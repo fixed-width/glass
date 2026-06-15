@@ -215,6 +215,51 @@ fn types_text_reaches_the_app() {
     p.stop_app().unwrap();
 }
 
+/// Drain logs, collecting every `keysym=N` value in arrival order until `want` of them have
+/// arrived or `tries` polls elapse — so a test can assert the *full* delivered sequence and
+/// catch dropped, reordered, or collapsed keystrokes.
+fn collect_keysyms(p: &mut WaylandPlatform, want: usize, tries: u32) -> Vec<u32> {
+    let mut got = Vec::new();
+    for _ in 0..tries {
+        for (_s, line) in p.drain_logs() {
+            if let Some((_, n)) = line.split_once("keysym=") {
+                if let Ok(ks) = n.trim().parse::<u32>() {
+                    got.push(ks);
+                }
+            }
+        }
+        if got.len() >= want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    got
+}
+
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn typed_multichar_strings_arrive_intact() {
+    use glass_core::KeyEvent;
+    let mut p = WaylandPlatform::new().unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
+    assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
+
+    // The same shapes that broke the Windows backend: runs of adjacent identical characters
+    // and spaces. For ASCII printables the keysym equals the char code, so each character
+    // must arrive exactly once, in order — no drops, no collapse to the last char. Repeated
+    // to shake out any timing race (the Linux analog of the Windows on-box rigor).
+    for _ in 0..3 {
+        for s in ["aaa bbb ccc", "hello world", "the quick brown fox"] {
+            let _ = p.drain_logs(); // clear anything pending before this string
+            let expected: Vec<u32> = s.chars().map(|c| c as u32).collect();
+            p.send_key(&KeyEvent::Text(s.to_string())).unwrap();
+            let got = collect_keysyms(&mut p, expected.len(), ECHO_TRIES);
+            assert_eq!(got, expected, "typing {s:?} did not arrive intact on Wayland");
+        }
+    }
+    p.stop_app().unwrap();
+}
+
 #[test]
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn chord_reaches_the_app() {
