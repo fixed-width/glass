@@ -29,6 +29,7 @@ thiserror = "1"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 tempfile = "3"
 x11rb = { version = "0.13", features = ["xtest"] }
+glass-android = { path = "crates/glass-android" }
 glass-core = { path = "crates/glass-core" }
 glass-sandbox-linux = { path = "crates/glass-sandbox-linux" }
 glass-proc-linux = { path = "crates/glass-proc-linux" }
