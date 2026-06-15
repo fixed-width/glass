@@ -7,6 +7,7 @@
 mod adb;
 mod a11y;
 mod axmap;
+mod avd;
 mod build;
 mod cmd;
 mod input;
