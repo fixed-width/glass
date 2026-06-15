@@ -5,6 +5,7 @@
 //! sandbox machinery here.
 
 mod adb;
+mod axmap;
 mod build;
 mod cmd;
 mod input;
