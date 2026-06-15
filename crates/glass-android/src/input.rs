@@ -33,7 +33,11 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
         }
         PointerEvent::Scroll { x, y, dx, dy, .. } => {
             let (cx, cy) = abs(x, y);
-            // Touch scroll = swipe opposite the wheel direction.
+            // Touch scroll = swipe opposite the wheel direction. The swipe is
+            // anchored at the event point and clamped to the window, so an anchor
+            // within SCROLL_STEP_PX of the relevant edge yields a short/degenerate
+            // swipe — scroll from a mid-content point. A later on-device agent will
+            // fling properly.
             let hi_x = (origin.x + origin.width as i32 - 1).max(origin.x);
             let hi_y = (origin.y + origin.height as i32 - 1).max(origin.y);
             let ex = cx.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX)).clamp(origin.x, hi_x);
@@ -67,6 +71,10 @@ pub fn key_commands(event: &KeyEvent) -> Result<Vec<Vec<String>>> {
 /// (input's space escape) and the whole argument is single-quoted so shell
 /// metacharacters are taken literally. We build the remote command string
 /// ourselves to avoid `adb`'s argument re-splitting.
+///
+/// Known limit: Android's `input text` turns every `%s` into a space, so a
+/// literal `%s` already in `s` round-trips as a space; and only ASCII is
+/// reliable. A later on-device agent handles literals and Unicode faithfully.
 fn text_command(s: &str) -> Vec<String> {
     let spaced = s.replace(' ', "%s");
     let quoted = format!("'{}'", spaced.replace('\'', r"'\''"));
