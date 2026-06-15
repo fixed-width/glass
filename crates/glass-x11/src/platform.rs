@@ -646,6 +646,27 @@ impl glass_core::DragSink for X11DragSink<'_> {
     }
 }
 
+/// `TypeSink` for X11: each character is typed via XTEST and committed with its own `XFlush`
+/// (like the chord sink), so `run_type`'s per-character commit reaches the server before the
+/// next. A heavy client (e.g. a browser) drops a string whose key events are all flushed once
+/// at the end. `idx` tracks position for the untypable-char error, which must never embed the
+/// char value (it would leak typed content into the unredacted audit log).
+struct X11TypeSink<'a> {
+    p: &'a X11Platform,
+    idx: usize,
+}
+
+impl glass_core::TypeSink for X11TypeSink<'_> {
+    fn character(&mut self, c: char) -> Result<()> {
+        let keysym = glass_core::keys::keysym_for_char(c).ok_or_else(|| {
+            GlassError::InvalidKey(format!("char at index {} has no X11 keysym", self.idx))
+        })?;
+        self.idx += 1;
+        self.p.key_with_mods(keysym, false, &[])?;
+        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+    }
+}
+
 /// Lets `glass_core::run_chord` drive an X11 key chord through the existing XTEST primitives. Each
 /// method self-commits with `XFlush`; the modifier keycodes are held between `modifiers(true)` and
 /// `modifiers(false)`, so a frame-based client sees the modifier held across the key's frame.
@@ -862,16 +883,12 @@ impl Platform for X11Platform {
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         match event {
             KeyEvent::Text(text) => {
-                // Identify an untypable char by its POSITION, never its value: this error
-                // is recorded verbatim in the audit log's `result.error`, which is not
-                // run through content redaction, so embedding the char would leak typed
-                // content. The caller can recover the char from its own input + the index.
-                for (i, c) in text.chars().enumerate() {
-                    let keysym = glass_core::keys::keysym_for_char(c).ok_or_else(|| {
-                        GlassError::InvalidKey(format!("char at index {i} has no X11 keysym"))
-                    })?;
-                    self.key_with_mods(keysym, false, &[])?;
-                }
+                // Per-character, self-committed typing (an XFlush per char) so a heavy client
+                // (e.g. a browser) receives a long string instead of dropping events flushed
+                // once at the end — see glass_core::run_type and X11TypeSink. The 8ms dwell
+                // paces between characters (XFlush sends but does not wait).
+                let mut sink = X11TypeSink { p: &*self, idx: 0 };
+                glass_core::run_type(&mut sink, text, std::time::Duration::from_millis(8))?;
             }
             KeyEvent::Chord(chord) => {
                 let (mods, keysym) = glass_core::keys::parse_chord(chord)?;

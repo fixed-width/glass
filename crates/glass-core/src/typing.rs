@@ -1,44 +1,39 @@
 //! Platform-agnostic text-typing model: the `run_type` driver that types a string one
-//! character at a time against any backend's `TypeSink`, pacing each keystroke with a dwell
-//! so a target that processes input asynchronously drains one before the next arrives.
+//! character at a time against any backend's `TypeSink`, committing each keystroke before
+//! the next so a client that processes input asynchronously doesn't miss keys.
 
 use std::time::Duration;
 
-/// Default dwell between consecutive typed characters. On Windows, injecting
-/// `KEYEVENTF_UNICODE` keystrokes faster than the target drains its input queue triggers a
-/// race *downstream* of glass: the OS resolves queued `VK_PACKET` events from a shared slot,
-/// so a backed-up run of characters all collapse to the *last* value written (`"aaa bbb ccc"`
-/// typed as `"aaa ccccccc"`; identical-character runs are unaffected). glass injects the
-/// correct keystrokes with zero drops — the corruption is in the OS/target, and a
-/// per-character dwell long enough for it to keep up avoids it. Tunable per host on Windows
-/// via `GLASS_TYPE_DWELL_MS` (raise on a slow/loaded box, lower for speed). 60ms is the
-/// measured-reliable floor on a Win11 interactive desktop (30ms still dropped a character
-/// ~1/3 of the time on strings with adjacent identical characters).
+/// Default dwell between consecutive typed characters. Used by the Windows backend (tunable
+/// via `GLASS_TYPE_DWELL_MS`): injecting `KEYEVENTF_UNICODE` keystrokes faster than the
+/// target drains its queue races a downstream OS bug that collapses a run of characters to
+/// the last one (`"aaa bbb ccc"` → `"aaa ccccccc"`). 60ms is the measured-reliable floor on
+/// a Win11 desktop. The Linux backends pace by committing each keystroke (X11 `XFlush` /
+/// Wayland roundtrip) rather than by sleeping, so they pass a shorter dwell.
 pub const TYPE_DWELL: Duration = Duration::from_millis(60);
 
-/// The per-backend primitive that [`run_type`] sequences. `character` is **self-committed**
-/// (it performs the backend's commit barrier before returning — Windows one `SendInput` per
-/// call), so `run_type` owns only the per-character ordering and the inter-character dwell.
+/// The per-backend primitive that [`run_type`] sequences. `character` must be
+/// **self-committed**: it performs the backend's commit barrier before returning — Windows
+/// one `SendInput`, X11 `XFlush`, Wayland a compositor roundtrip — so each keystroke is
+/// delivered before the next. A picky or heavy client (e.g. a browser) silently drops
+/// keystrokes that are merely queued and committed once at the end.
 pub trait TypeSink {
-    /// Press and release one character — `code_units` is its UTF-16 encoding (one unit for a
-    /// BMP char, two for a surrogate pair). The pair is committed together so a non-BMP
-    /// character is never split across the dwell.
-    fn character(&mut self, code_units: &[u16]) -> crate::Result<()>;
+    /// Press and release one character, committing before returning.
+    fn character(&mut self, c: char) -> crate::Result<()>;
 }
 
 /// Type `text` against a backend `sink`, one character at a time, sleeping `dwell` *between*
 /// characters (so there are `n-1` dwells — none before the first or after the last). Each
-/// character is emitted as its own committed injection; the dwell is what keeps a string from
-/// being delivered faster than the target can drain it.
+/// character is its own committed keystroke; together with the dwell this keeps a string
+/// from being delivered faster than the target can drain it.
 pub fn run_type<S: TypeSink>(sink: &mut S, text: &str, dwell: Duration) -> crate::Result<()> {
-    let mut buf = [0u16; 2];
     let mut first = true;
     for c in text.chars() {
         if !first {
             std::thread::sleep(dwell);
         }
         first = false;
-        sink.character(c.encode_utf16(&mut buf))?;
+        sink.character(c)?;
     }
     Ok(())
 }
@@ -51,31 +46,31 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        chars: Vec<Vec<u16>>,
+        chars: Vec<char>,
     }
     impl TypeSink for RecordingSink {
-        fn character(&mut self, code_units: &[u16]) -> Result<()> {
-            self.chars.push(code_units.to_vec());
+        fn character(&mut self, c: char) -> Result<()> {
+            self.chars.push(c);
             Ok(())
         }
     }
 
     #[test]
-    fn emits_each_character_individually_including_adjacent_duplicates() {
-        // The bug class: adjacent identical characters. Each must be emitted as its own
-        // character, in order — never collapsed or batched.
+    fn emits_each_character_in_order_including_adjacent_duplicates() {
+        // The bug class: runs of adjacent identical characters (and spaces). Each must be
+        // emitted as its own keystroke, in order — never collapsed or batched.
         let mut sink = RecordingSink::default();
-        run_type(&mut sink, "aab", Duration::ZERO).unwrap();
-        assert_eq!(sink.chars, vec![vec![b'a' as u16], vec![b'a' as u16], vec![b'b' as u16]]);
+        run_type(&mut sink, "aab c", Duration::ZERO).unwrap();
+        assert_eq!(sink.chars, vec!['a', 'a', 'b', ' ', 'c']);
     }
 
     #[test]
-    fn keeps_a_surrogate_pair_in_one_commit() {
-        // U+1D11E (𝄞) is a non-BMP char: two UTF-16 units that must stay in one committed
-        // injection, not be split across the inter-character dwell.
+    fn passes_each_char_whole_including_non_bmp() {
+        // run_type splits on `char`, never bytes/code units — a non-BMP character (U+1D11E)
+        // reaches the sink as a single `char`, so a backend can't split it mid-keystroke.
         let mut sink = RecordingSink::default();
-        run_type(&mut sink, "𝄞", Duration::ZERO).unwrap();
-        assert_eq!(sink.chars, vec![vec![0xD834, 0xDD1E]]);
+        run_type(&mut sink, "a𝄞b", Duration::ZERO).unwrap();
+        assert_eq!(sink.chars, vec!['a', '𝄞', 'b']);
     }
 
     #[test]

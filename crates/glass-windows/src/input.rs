@@ -272,9 +272,12 @@ fn type_dwell() -> std::time::Duration {
 }
 
 impl glass_core::TypeSink for WindowsTypeSink {
-    fn character(&mut self, code_units: &[u16]) -> Result<()> {
-        let mut inputs = Vec::with_capacity(code_units.len() * 2);
-        for &unit in code_units {
+    fn character(&mut self, c: char) -> Result<()> {
+        // All of the char's UTF-16 units (1 for BMP, 2 for a surrogate pair) go in one
+        // SendInput so a non-BMP char is committed as a unit.
+        let mut buf = [0u16; 2];
+        let mut inputs = Vec::with_capacity(4);
+        for unit in c.encode_utf16(&mut buf).iter().copied() {
             inputs.push(key_unicode(unit, false));
             inputs.push(key_unicode(unit, true));
         }
