@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn decodes_16_byte_header() {
-        let px = vec![7u8; 1 * 3 * 4];
+        let px = vec![7u8; 12];
         let f = decode_screencap(&buf(1, 3, 1, true, &px)).unwrap();
         assert_eq!((f.width, f.height), (1, 3));
         assert_eq!(f.pixels, px);
