@@ -24,6 +24,9 @@ pub use chord::{run_chord, ChordSink, CHORD_DWELL};
 pub mod scroll;
 pub use scroll::{run_scroll, ScrollSink, SCROLL_DWELL};
 
+pub mod typing;
+pub use typing::{run_type, TypeSink, TYPE_DWELL};
+
 pub mod keys;
 pub use keys::Modifier;
 

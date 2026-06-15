@@ -84,6 +84,9 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_SANDBOXIE_DIR", scope: EnvScope::Windows,
         purpose: "Sandboxie install directory",
         default: "%ProgramFiles%\\Sandboxie (auto-detected)", secret: false },
+    EnvVarDoc { name: "GLASS_TYPE_DWELL_MS", scope: EnvScope::Windows,
+        purpose: "Inter-character typing dwell (ms); raise if rapid Unicode injection corrupts, lower for speed",
+        default: "60", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -225,7 +228,8 @@ mod tests {
         let expected = [
             "GLASS_BACKEND", "GLASS_SANDBOX", "GLASS_DISPLAY", "GLASS_XVFB_SCREEN",
             "GLASS_XVFB", "GLASS_SWAY", "GLASS_WAYLAND_SCREEN", "GLASS_BWRAP", "GLASS_SH",
-            "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TOKEN",
+            "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TYPE_DWELL_MS",
+            "GLASS_TOKEN",
             "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];
         for name in expected {

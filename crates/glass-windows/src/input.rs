@@ -255,6 +255,33 @@ impl glass_core::ScrollSink for WindowsScrollSink {
     }
 }
 
+/// `TypeSink` for Windows: one `SendInput` per character (its own commit), so `run_type`'s
+/// inter-character dwell lands between keystrokes the app processes separately. Bursting the
+/// whole string into a single `SendInput` corrupts runs of adjacent identical characters (the
+/// tail collapses to the string's last char) — see glass_core::run_type.
+struct WindowsTypeSink;
+
+/// Inter-character typing dwell, overridable via `GLASS_TYPE_DWELL_MS` (milliseconds) for
+/// slow/loaded hosts (raise it) or fast ones (lower it); defaults to `glass_core::TYPE_DWELL`.
+fn type_dwell() -> std::time::Duration {
+    std::env::var("GLASS_TYPE_DWELL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(glass_core::TYPE_DWELL)
+}
+
+impl glass_core::TypeSink for WindowsTypeSink {
+    fn character(&mut self, code_units: &[u16]) -> Result<()> {
+        let mut inputs = Vec::with_capacity(code_units.len() * 2);
+        for &unit in code_units {
+            inputs.push(key_unicode(unit, false));
+            inputs.push(key_unicode(unit, true));
+        }
+        send(&inputs)
+    }
+}
+
 /// Inject a pointer event into the active window. Coordinates are window-relative.
 pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
     let hwnd = raw_to_hwnd(active_hwnd);
@@ -325,13 +352,12 @@ pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
 
     match event {
         KeyEvent::Text(s) => {
-            let mut inputs = Vec::new();
-            for unit in s.encode_utf16() {
-                inputs.push(key_unicode(unit, false));
-                inputs.push(key_unicode(unit, true));
-            }
-            // `send` no-ops an empty batch, so empty text is a clean Ok.
-            send(&inputs)?;
+            // One SendInput per character, paced by an inter-character dwell. Injecting the
+            // whole string faster than the target drains it races a downstream OS bug that
+            // collapses a run of characters to the last one — see glass_core::run_type.
+            // (Empty text is a clean Ok: no characters to emit.)
+            let mut sink = WindowsTypeSink;
+            glass_core::run_type(&mut sink, s, type_dwell())?;
         }
         KeyEvent::Chord(s) => {
             let (mods, keysym) = glass_core::keys::parse_chord(s)?;
