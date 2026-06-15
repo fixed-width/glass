@@ -37,8 +37,9 @@ compile_error!(
 pub fn make_platform(backend: &str) -> Result<Backend> {
     if backend == "android" {
         let platform: Box<dyn Platform + Send> = Box::new(glass_android::AndroidPlatform::from_env()?);
-        // a11y (uiautomator) arrives in a later phase; until then a11y tools report Unsupported.
-        return Ok(Backend { platform, accessibility: None });
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_android::AndroidA11y::new()));
+        return Ok(Backend { platform, accessibility });
     }
     let platform: Box<dyn Platform + Send> = match backend {
         #[cfg(target_os = "linux")]

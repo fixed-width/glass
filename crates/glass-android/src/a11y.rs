@@ -2,10 +2,11 @@
 //! over adb and maps the result via `crate::axmap`. Resolves its own device
 //! lazily, since the `Accessibility` trait is handed only an `AxContext`.
 
-use glass_core::accessibility::{Accessibility, AxContext, AxTree};
-use glass_core::Result;
+use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
+use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
 
 use crate::adb::Adb;
+use crate::input::{key_commands, pointer_commands};
 use crate::axmap::{build_tree, check_dump_status};
 use crate::target::{choose_serial, parse_devices};
 
@@ -52,5 +53,48 @@ impl Accessibility for AndroidA11y {
         check_dump_status(&status)?;
         let xml = adb.run(["shell", "cat", DUMP_PATH])?;
         build_tree(&xml, &window)
+    }
+
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        let window = ctx.window.clone();
+        // Re-snapshot and number nodes to locate the target by its pre-order id.
+        let mut tree = self.snapshot(ctx)?;
+        tree.assign_ids();
+        let node = tree.find(target.id).ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        if !target.matches(node.role, node.name.as_deref())
+            || !target.bounds_consistent(node.bounds, 8)
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+        if !node.states.editable {
+            return Err(GlassError::AxElementNotEditable(target.id.0));
+        }
+        let (cx, cy) = node
+            .bounds
+            .and_then(|b| b.clamped_center(window.width, window.height))
+            .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+
+        let adb = self.ensure_adb()?;
+        // Tap to focus, select-all, delete, type — reusing the P2 input builders.
+        let tap = PointerEvent::Click {
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        };
+        for argv in pointer_commands(&window, &tap) {
+            adb.run(argv.iter().map(String::as_str))?;
+        }
+        for ev in [
+            KeyEvent::Chord("ctrl+a".into()),
+            KeyEvent::Chord("BackSpace".into()),
+            KeyEvent::Text(text.to_string()),
+        ] {
+            for argv in key_commands(&ev)? {
+                adb.run(argv.iter().map(String::as_str))?;
+            }
+        }
+        Ok(())
     }
 }
