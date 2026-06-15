@@ -18,5 +18,6 @@ mod screencap;
 mod target;
 
 pub use a11y::AndroidA11y;
+pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;
 pub use target::{AdbTarget, AttachedDevice};

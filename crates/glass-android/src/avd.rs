@@ -3,8 +3,11 @@
 //! attach or boot. Pure helpers here; `boot_avd` (subprocess) and the
 //! `EmulatorRegistry` (cleanup) follow in later tasks.
 
+use std::sync::{Arc, Mutex};
+
 use glass_core::{GlassError, Result};
 
+use crate::adb::Adb;
 use crate::target::Device;
 
 /// Attach-or-boot policy from `GLASS_ANDROID_LIFECYCLE`.
@@ -129,6 +132,42 @@ pub fn decide(online: &[Device], serial_env: Option<&str>, lifecycle: Lifecycle)
     }
 }
 
+/// Serials of emulators glass booted itself, so they can be stopped on shutdown.
+/// Cloneable + `Send` (shared `Arc`); glass-mcp threads one clone into the platform
+/// factory (to register boots) and another into the `Glass` shutdown hook (to kill).
+#[derive(Clone, Default)]
+pub struct EmulatorRegistry {
+    booted: Arc<Mutex<Vec<String>>>,
+}
+
+impl EmulatorRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an emulator serial glass booted.
+    pub fn register(&self, serial: String) {
+        if let Ok(mut g) = self.booted.lock() {
+            g.push(serial);
+        }
+    }
+
+    /// Stop every registered emulator (`adb -s <serial> emu kill`) and clear the list.
+    /// Best-effort: a device already gone is fine. Resolves adb from env.
+    pub fn kill_all(&self) {
+        let adb = Adb::from_env();
+        let serials = self.booted.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+        for s in serials {
+            let _ = adb.with_serial(s).run(["emu", "kill"]);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn serials(&self) -> Vec<String> {
+        self.booted.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +251,14 @@ mod tests {
         assert_eq!(Lifecycle::from_env(Some("attach")), Lifecycle::Attach);
         assert_eq!(Lifecycle::from_env(Some("AUTO")), Lifecycle::Auto);
         assert_eq!(Lifecycle::from_env(None), Lifecycle::Auto);
+    }
+
+    #[test]
+    fn registry_records_serials() {
+        let r = EmulatorRegistry::new();
+        let r2 = r.clone();
+        r.register("emulator-5554".into());
+        r2.register("emulator-5556".into());
+        assert_eq!(r.serials(), vec!["emulator-5554".to_string(), "emulator-5556".to_string()]);
     }
 }
