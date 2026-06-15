@@ -147,7 +147,8 @@ impl Platform for AndroidPlatform {
             WindowOp::Geometry => Ok(app.window.clone()),
             WindowOp::Focus => {
                 let component = app.component.clone();
-                let _ = self.adb().run(launch_args(&component).iter().map(String::as_str))?;
+                let out = self.adb().run(launch_args(&component).iter().map(String::as_str))?;
+                check_am_start(&out)?;
                 Ok(self.running()?.window.clone())
             }
             WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::Unsupported(

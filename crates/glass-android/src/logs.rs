@@ -63,6 +63,12 @@ impl LogcatStream {
     }
 }
 
+impl Drop for LogcatStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
