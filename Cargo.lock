@@ -975,6 +975,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-android"
+version = "0.0.0"
+dependencies = [
+ "glass-core",
+]
+
+[[package]]
 name = "glass-clip-hook"
 version = "0.0.0"
 dependencies = [
@@ -1020,6 +1027,7 @@ dependencies = [
  "futures",
  "glass-a11y-linux",
  "glass-a11y-windows",
+ "glass-android",
  "glass-core",
  "glass-sandbox-linux",
  "glass-wayland",
