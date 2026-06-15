@@ -23,17 +23,6 @@ pub struct AttachedDevice {
 }
 
 impl AttachedDevice {
-    /// Resolve the target: list devices, pick the serial, verify it has finished booting.
-    pub fn resolve(base: Adb, serial_env: Option<&str>) -> Result<Self> {
-        let listing = base.run(["devices"])?;
-        let online: Vec<Device> =
-            parse_devices(&listing).into_iter().filter(|d| d.state == "device").collect();
-        let serial = choose_serial(serial_env, &online)?;
-        let adb = base.with_serial(serial);
-        ensure_booted(&adb)?;
-        Ok(Self { adb })
-    }
-
     /// Wrap an already-serial-bound adb client.
     pub fn from_adb(adb: Adb) -> Self {
         Self { adb }

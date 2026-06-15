@@ -28,7 +28,8 @@ fn settle() {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn scroll_and_tap_change_the_screen() {
-    let mut p = glass_android::AndroidPlatform::from_env().expect("attach to emulator");
+    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new())
+        .expect("attach to emulator");
     let geo = p.start_app(&settings_spec()).expect("launch settings");
     settle();
 

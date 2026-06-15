@@ -23,7 +23,8 @@ fn settings_spec() -> AppSpec {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL"]
 fn see_loop_launches_and_captures_settings() {
-    let mut p = glass_android::AndroidPlatform::from_env().expect("attach to emulator");
+    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new())
+        .expect("attach to emulator");
     let geo = p.start_app(&settings_spec()).expect("launch settings");
     assert!(geo.width > 0 && geo.height > 0, "non-empty window geometry");
 

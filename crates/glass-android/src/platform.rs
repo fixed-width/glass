@@ -14,7 +14,7 @@ use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{check_am_start, check_install, parse_pid, parse_pids, parse_window_frame};
 use crate::screencap::decode_screencap;
-use crate::target::{AdbTarget, AttachedDevice};
+use crate::target::AdbTarget;
 
 /// The single foreground app this backend drives.
 struct RunningApp {
@@ -34,11 +34,10 @@ pub struct AndroidPlatform {
 }
 
 impl AndroidPlatform {
-    /// Attach to a running emulator (serial from `GLASS_ANDROID_SERIAL`, else the sole device).
-    pub fn from_env() -> Result<Self> {
+    /// Attach to (or boot) an emulator using the attach-or-boot resolver.
+    pub fn from_env(registry: &crate::avd::EmulatorRegistry) -> Result<Self> {
         let base = Adb::from_env();
-        let serial = std::env::var("GLASS_ANDROID_SERIAL").ok();
-        let target = AttachedDevice::resolve(base, serial.as_deref())?;
+        let target = crate::target::resolve(base, registry)?;
         Ok(Self {
             target: Box::new(target),
             injector: Box::new(ShellInjector),
