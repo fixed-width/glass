@@ -24,7 +24,9 @@ fn settings_spec() -> AppSpec {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn snapshot_has_named_role_typed_nodes() {
-    let mut platform = glass_android::AndroidPlatform::from_env().expect("attach");
+    let mut platform =
+        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new())
+            .expect("attach");
     let window = platform.start_app(&settings_spec()).expect("launch settings");
     std::thread::sleep(std::time::Duration::from_millis(1200));
 

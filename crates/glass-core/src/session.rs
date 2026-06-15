@@ -174,6 +174,7 @@ pub struct Glass {
     log_capacity: usize,
     active: Option<ActiveSession>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
+    shutdown_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Glass {
@@ -183,12 +184,18 @@ impl Glass {
         baselines: BaselineStore,
         log_capacity: usize,
     ) -> Self {
-        Self { factory, default_backend, baselines, log_capacity: log_capacity.max(1), active: None, audit: None }
+        Self { factory, default_backend, baselines, log_capacity: log_capacity.max(1), active: None, audit: None, shutdown_hook: None }
     }
 
     /// Install the audit sink. Every subsequent actuation is recorded through it.
     pub fn set_audit_sink(&mut self, sink: Box<dyn crate::audit::AuditSink>) {
         self.audit = Some(sink);
+    }
+
+    /// Install a teardown callback run once at the end of `shutdown()` — used by the host
+    /// (glass-mcp) for resource cleanup it owns (e.g. stopping a glass-booted emulator).
+    pub fn set_shutdown_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.shutdown_hook = Some(hook);
     }
 
     fn emit_audit(&self, act: &crate::audit::Actuation, outcome: crate::audit::AuditOutcome, dur: std::time::Duration) {
@@ -325,6 +332,9 @@ impl Glass {
         if let Some(mut s) = self.active.take() {
             let _ = s.platform.stop_app();
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
+        }
+        if let Some(hook) = self.shutdown_hook.take() {
+            hook();
         }
     }
 
@@ -1285,6 +1295,18 @@ mod tests {
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
         Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+    }
+
+    #[test]
+    fn shutdown_runs_the_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = fired.clone();
+        let mut g = glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
+        g.set_shutdown_hook(Box::new(move || f.store(true, Ordering::SeqCst)));
+        g.shutdown();
+        assert!(fired.load(Ordering::SeqCst), "shutdown should invoke the hook");
     }
 
     #[test]

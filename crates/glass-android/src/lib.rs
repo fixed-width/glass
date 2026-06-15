@@ -7,6 +7,7 @@
 mod adb;
 mod a11y;
 mod axmap;
+mod avd;
 mod build;
 mod cmd;
 mod input;
@@ -17,5 +18,6 @@ mod screencap;
 mod target;
 
 pub use a11y::AndroidA11y;
+pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;
 pub use target::{AdbTarget, AttachedDevice};

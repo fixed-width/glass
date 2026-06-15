@@ -1,6 +1,7 @@
 use glass_core::{GlassError, Result};
 
 use crate::adb::Adb;
+use crate::avd::{boot_avd, decide, Action, EmulatorRegistry, Lifecycle};
 
 /// One row of `adb devices`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,16 +23,35 @@ pub struct AttachedDevice {
 }
 
 impl AttachedDevice {
-    /// Resolve the target: list devices, pick the serial, verify it has finished booting.
-    pub fn resolve(base: Adb, serial_env: Option<&str>) -> Result<Self> {
-        let listing = base.run(["devices"])?;
-        let online: Vec<Device> =
-            parse_devices(&listing).into_iter().filter(|d| d.state == "device").collect();
-        let serial = choose_serial(serial_env, &online)?;
-        let adb = base.with_serial(serial);
-        ensure_booted(&adb)?;
-        Ok(Self { adb })
+    /// Wrap an already-serial-bound adb client.
+    pub fn from_adb(adb: Adb) -> Self {
+        Self { adb }
     }
+}
+
+/// Resolve an adb target: attach to an online device, or (lifecycle `auto`) boot the
+/// configured AVD, register it for cleanup, and attach. Attach-preferred.
+pub fn resolve(base: Adb, registry: &EmulatorRegistry) -> Result<AttachedDevice> {
+    let get = |k: &str| std::env::var(k).ok();
+    let online: Vec<Device> = parse_devices(&base.run(["devices"])?)
+        .into_iter()
+        .filter(|d| d.state == "device")
+        .collect();
+    let lifecycle = Lifecycle::from_env(get("GLASS_ANDROID_LIFECYCLE").as_deref());
+    let serial = match decide(&online, get("GLASS_ANDROID_SERIAL").as_deref(), lifecycle) {
+        Action::Attach(s) => s,
+        Action::Error(msg) => return Err(GlassError::Backend(msg)),
+        Action::Boot => {
+            let s = boot_avd(&base, &get)?;
+            if get("GLASS_EMULATOR_KEEP").filter(|v| !v.is_empty()).is_none() {
+                registry.register(s.clone());
+            }
+            s
+        }
+    };
+    let adb = base.with_serial(serial);
+    ensure_booted(&adb)?;
+    Ok(AttachedDevice::from_adb(adb))
 }
 
 impl AdbTarget for AttachedDevice {
