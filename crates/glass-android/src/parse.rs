@@ -1,27 +1,5 @@
 use glass_core::{GlassError, Result, WindowGeometry};
 
-/// Extract the focused app window frame from `dumpsys window windows`.
-/// Finds the first `Window{...package...}` block, then its first `[l,t][r,b]` frame.
-pub fn parse_window_frame(dump: &str, package: &str) -> Result<WindowGeometry> {
-    let mut in_block = false;
-    for line in dump.lines() {
-        let t = line.trim_start();
-        if t.starts_with("Window #") || t.starts_with("Window{") {
-            in_block = t.contains(package);
-        }
-        if in_block {
-            // Matches both `mFrame=` and `frame=` (the former contains the latter's tail).
-            if let Some(idx) = line.find("Frame=").or_else(|| line.find("frame=")) {
-                let after = &line[idx + "Frame=".len()..];
-                if let Some(geo) = parse_rect(after) {
-                    return Ok(geo);
-                }
-            }
-        }
-    }
-    Err(GlassError::WindowNotFound)
-}
-
 /// Parse a leading `[left,top][right,bottom]` rectangle into a geometry.
 fn parse_rect(s: &str) -> Option<WindowGeometry> {
     let s = s.trim_start().strip_prefix('[')?;
@@ -152,25 +130,7 @@ pub fn parse_pids(output: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::{GlassError, WindowGeometry};
-
-    // Trimmed, representative `dumpsys window windows` excerpt.
-    const DUMP: &str = "  Window #2 Window{abcd u0 com.example.app/com.example.app.MainActivity}:\n\
-                        \x20   mDisplayId=0\n\
-                        \x20   mFrame=[0,63][1080,2220] mLastFrame=[0,63][1080,2220]\n\
-                        \x20 Window #3 Window{ef01 u0 StatusBar}:\n\
-                        \x20   mFrame=[0,0][1080,63]\n";
-
-    #[test]
-    fn window_frame_for_package_is_origin_and_size() {
-        let g = parse_window_frame(DUMP, "com.example.app").unwrap();
-        assert_eq!(g, WindowGeometry { x: 0, y: 63, width: 1080, height: 2157 });
-    }
-
-    #[test]
-    fn window_frame_missing_package_is_window_not_found() {
-        assert!(matches!(parse_window_frame(DUMP, "com.other"), Err(GlassError::WindowNotFound)));
-    }
+    use glass_core::GlassError;
 
     #[test]
     fn install_success_is_ok_else_error() {
