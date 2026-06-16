@@ -84,6 +84,38 @@ impl AndroidPlatform {
         self.app.as_ref().ok_or(GlassError::NoActiveSession)
     }
 
+    /// The resolved, serial-bound adb client — so the a11y reader drives the *same* device
+    /// the platform resolved (possibly a freshly booted AVD `choose_serial` can't disambiguate).
+    pub fn resolved_adb(&self) -> Adb {
+        self.target.adb().clone()
+    }
+
+    /// Re-read the active window's current on-screen frame before capturing — a rotation or
+    /// layout change can move/resize it since it was cached. Best-effort: keeps the cached
+    /// geometry if the window isn't currently listed (mirrors `app_pids`' live re-scan).
+    fn refresh_window(&mut self) -> Result<WindowGeometry> {
+        let (package, active_id) = {
+            let app = self.running()?;
+            (app.package.clone(), app.active_id)
+        };
+        let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
+        let parsed = parse_app_windows(&dump, &package);
+        let fresh = parsed
+            .iter()
+            .find(|w| WindowId(w.id) == active_id)
+            .or_else(|| parsed.first())
+            .map(|w| w.frame.clone());
+        match fresh {
+            Some(frame) => {
+                if let Some(app) = self.app.as_mut() {
+                    app.window = frame.clone();
+                }
+                Ok(frame)
+            }
+            None => Ok(self.running()?.window.clone()),
+        }
+    }
+
     /// Poll `dumpsys window windows` until the app has an on-screen window, returning the
     /// topmost one's id + frame (the default active window).
     fn discover_window(&self, package: &str, timeout_ms: u64) -> Result<(WindowId, WindowGeometry)> {
@@ -99,6 +131,24 @@ impl AndroidPlatform {
             std::thread::sleep(Duration::from_millis(150));
         }
     }
+}
+
+/// Intersect the window rect with the captured display, so a window that extends past a
+/// screen edge (or whose cached geometry is stale-larger after a rotation) yields its
+/// *visible* portion instead of failing `crop`. Errors only when nothing is on-screen.
+fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Result<Region> {
+    let x0 = win.x.max(0) as i64;
+    let y0 = win.y.max(0) as i64;
+    let x1 = (win.x as i64 + win.width as i64).min(disp_w as i64);
+    let y1 = (win.y as i64 + win.height as i64).min(disp_h as i64);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w <= 0 || h <= 0 {
+        return Err(GlassError::CaptureFailed(format!(
+            "window {}x{} at ({},{}) is entirely off the {disp_w}x{disp_h} screen",
+            win.width, win.height, win.x, win.y
+        )));
+    }
+    Ok(Region { x: x0 as u32, y: y0 as u32, width: w as u32, height: h as u32 })
 }
 
 impl Platform for AndroidPlatform {
@@ -146,15 +196,10 @@ impl Platform for AndroidPlatform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let win = self.running()?.window.clone();
+        let win = self.refresh_window()?;
         let bytes = self.adb().run_bytes(["exec-out", "screencap"])?;
         let display = decode_screencap(&bytes)?;
-        let window_region = Region {
-            x: win.x.max(0) as u32,
-            y: win.y.max(0) as u32,
-            width: win.width,
-            height: win.height,
-        };
+        let window_region = visible_window_region(&win, display.width, display.height)?;
         let window_frame = display.crop(&window_region)?;
         match region {
             Some(r) => window_frame.crop(r),
@@ -264,5 +309,38 @@ impl Platform for AndroidPlatform {
             }
         }
         self.app_pid().into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_window_region_full_onscreen_is_identity() {
+        let win = WindowGeometry { x: 0, y: 0, width: 1080, height: 2400 };
+        let r = visible_window_region(&win, 1080, 2400).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 1080, 2400));
+    }
+
+    #[test]
+    fn visible_window_region_clamps_negative_origin() {
+        let win = WindowGeometry { x: -10, y: -20, width: 1080, height: 2400 };
+        let r = visible_window_region(&win, 1080, 2400).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 1070, 2380));
+    }
+
+    #[test]
+    fn visible_window_region_clamps_overhang() {
+        let win = WindowGeometry { x: 1000, y: 0, width: 200, height: 100 };
+        let r = visible_window_region(&win, 1080, 720).unwrap();
+        assert_eq!((r.x, r.width), (1000, 80));
+        assert_eq!((r.y, r.height), (0, 100));
+    }
+
+    #[test]
+    fn visible_window_region_errors_when_fully_offscreen() {
+        let win = WindowGeometry { x: 2000, y: 0, width: 100, height: 100 };
+        assert!(visible_window_region(&win, 1080, 720).is_err());
     }
 }

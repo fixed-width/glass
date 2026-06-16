@@ -40,10 +40,10 @@ pub fn make_platform(
     agents: &glass_android::AgentRegistry,
 ) -> Result<Backend> {
     if backend == "android" {
-        let platform: Box<dyn Platform + Send> =
-            Box::new(glass_android::AndroidPlatform::from_env(registry, agents)?);
+        let platform = glass_android::AndroidPlatform::from_env(registry, agents)?;
         let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-            Some(Box::new(glass_android::AndroidA11y::new()));
+            Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb())));
+        let platform: Box<dyn Platform + Send> = Box::new(platform);
         return Ok(Backend { platform, accessibility });
     }
     let platform: Box<dyn Platform + Send> = match backend {

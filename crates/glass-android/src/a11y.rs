@@ -23,6 +23,12 @@ impl AndroidA11y {
         Self { adb: Adb::from_env(), resolved: false }
     }
 
+    /// Bind directly to an already-resolved (serial-bound) adb client. Used in production so
+    /// the reader talks to the exact device the platform resolved, instead of re-resolving.
+    pub fn for_adb(adb: Adb) -> Self {
+        Self { adb, resolved: true }
+    }
+
     /// Bind the adb client to a device serial on first use (lazy).
     fn ensure_adb(&mut self) -> Result<Adb> {
         if !self.resolved {
@@ -49,6 +55,8 @@ impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let window = ctx.window.clone();
         let adb = self.ensure_adb()?;
+        // Remove any stale dump so a dump that fails to (re)write can't yield a prior tree.
+        let _ = adb.run(["shell", "rm", "-f", DUMP_PATH]);
         let status = adb.run(["shell", "uiautomator", "dump", DUMP_PATH])?;
         check_dump_status(&status)?;
         let xml = adb.run(["shell", "cat", DUMP_PATH])?;
