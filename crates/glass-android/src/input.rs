@@ -2,7 +2,10 @@
 //! argument vectors, plus the `Injector` seam (`ShellInjector` shells out; a
 //! future on-device agent can replace it for lower latency).
 
+use std::sync::Arc;
+
 use crate::adb::Adb;
+use crate::agent::{AgentClient, Pt};
 use glass_core::keys::parse_chord;
 use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, WindowGeometry};
 
@@ -136,6 +139,58 @@ fn meta_keycode(m: Modifier) -> u32 {
     }
 }
 
+/// Map a pointer event to the agent's gesture(s): a list of absolute-display pointer paths
+/// (one path per tap/swipe), mirroring `pointer_commands`' window→display mapping. `Click`
+/// with count N yields N single-point tap paths; `Drag`/`Scroll` yield one 2-point path;
+/// `Move` yields nothing.
+pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Vec<Pt>> {
+    let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
+    match *event {
+        PointerEvent::Move { .. } => vec![],
+        PointerEvent::Click { x, y, count, .. } => {
+            let (ax, ay) = abs(x, y);
+            (0..count.max(1)).map(|_| vec![Pt { x: ax, y: ay, t_ms: 0 }]).collect()
+        }
+        PointerEvent::Drag { from_x, from_y, to_x, to_y, duration_ms, .. } => {
+            let (fx, fy) = abs(from_x, from_y);
+            let (tx, ty) = abs(to_x, to_y);
+            let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
+            vec![vec![Pt { x: fx, y: fy, t_ms: 0 }, Pt { x: tx, y: ty, t_ms: ms }]]
+        }
+        PointerEvent::Scroll { x, y, dx, dy, .. } => {
+            let (cx, cy) = abs(x, y);
+            let hi_x = (origin.x + origin.width as i32 - 1).max(origin.x);
+            let hi_y = (origin.y + origin.height as i32 - 1).max(origin.y);
+            let ex = cx.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX)).clamp(origin.x, hi_x);
+            let ey = cy.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX)).clamp(origin.y, hi_y);
+            vec![vec![Pt { x: cx, y: cy, t_ms: 0 }, Pt { x: ex, y: ey, t_ms: SWIPE_MS }]]
+        }
+    }
+}
+
+/// Injects via the on-device agent (real MotionEvents + faithful keys/Unicode). The `Adb`
+/// argument of the `Injector` methods is unused — the agent is reached over its socket.
+pub struct AgentInjector {
+    pub(crate) agent: Arc<AgentClient>,
+}
+
+impl Injector for AgentInjector {
+    fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+        // One agent request per gesture: a Click{count:N} sends N sequential taps.
+        for gesture in agent_pointer(origin, event) {
+            self.agent.pointer(&gesture, "left")?;
+        }
+        Ok(())
+    }
+    fn key(&self, _adb: &Adb, event: &KeyEvent) -> Result<()> {
+        match event {
+            KeyEvent::Text(s) if s.is_empty() => Ok(()),
+            KeyEvent::Text(s) => self.agent.text(s),
+            KeyEvent::Chord(c) => self.agent.key(c),
+        }
+    }
+}
+
 /// Pointer/key injection seam. `ShellInjector` shells out via `adb input`; a
 /// future on-device agent can implement this for lower-latency injection.
 pub trait Injector {
@@ -159,6 +214,48 @@ impl Injector for ShellInjector {
             adb.run(argv.iter().map(String::as_str))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod agent_inject_tests {
+    use super::*;
+    use crate::agent::Pt;
+    use glass_core::{MouseButton, PointerEvent, WindowGeometry};
+
+    fn origin() -> WindowGeometry { WindowGeometry { x: 100, y: 200, width: 500, height: 800 } }
+
+    #[test]
+    fn click_maps_to_absolute_taps() {
+        let ev = PointerEvent::Click { x: 10, y: 20, button: MouseButton::Left, count: 2, modifiers: vec![] };
+        let g = agent_pointer(&origin(), &ev);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0], vec![Pt { x: 110, y: 220, t_ms: 0 }]);
+        assert_eq!(g[1], vec![Pt { x: 110, y: 220, t_ms: 0 }]);
+    }
+
+    #[test]
+    fn drag_maps_to_two_point_path_with_duration() {
+        let ev = PointerEvent::Drag { from_x: 0, from_y: 0, to_x: 50, to_y: 60, duration_ms: 250, button: MouseButton::Left, modifiers: vec![] };
+        let g = agent_pointer(&origin(), &ev);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0], vec![Pt { x: 100, y: 200, t_ms: 0 }, Pt { x: 150, y: 260, t_ms: 250 }]);
+    }
+
+    #[test]
+    fn move_maps_to_nothing() {
+        let ev = PointerEvent::Move { x: 1, y: 2 };
+        assert!(agent_pointer(&origin(), &ev).is_empty());
+    }
+
+    #[test]
+    fn scroll_maps_to_one_swipe() {
+        let ev = PointerEvent::Scroll { x: 250, y: 400, dx: 0, dy: 1, modifiers: vec![] };
+        let g = agent_pointer(&origin(), &ev);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].len(), 2);
+        assert_eq!(g[0][0], Pt { x: 350, y: 600, t_ms: 0 });
+        assert_eq!(g[0][1], Pt { x: 350, y: 480, t_ms: SWIPE_MS });
     }
 }
 
