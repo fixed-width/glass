@@ -6,7 +6,7 @@
 
 mod adb;
 mod a11y;
-pub mod agent;
+mod agent;
 mod axmap;
 mod avd;
 mod build;
@@ -20,6 +20,7 @@ mod screencap;
 mod target;
 
 pub use a11y::AndroidA11y;
+pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
 pub use input::AgentInjector;
 pub use platform::AndroidPlatform;

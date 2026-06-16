@@ -5,10 +5,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::sync::Mutex;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use glass_core::{GlassError, Result};
 use serde_json::{json, Value};
+
+use crate::adb::Adb;
 
 /// One absolute-display point in a pointer path (the agent's gesture element).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,11 +153,165 @@ impl AgentClient {
     }
 }
 
+/// `GLASS_ANDROID_AGENT_JAR`, if set + non-empty.
+pub fn agent_jar(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    get("GLASS_ANDROID_AGENT_JAR").filter(|s| !s.is_empty())
+}
+
+/// The agent is used when not explicitly `off` and a jar is resolvable.
+#[allow(dead_code)]
+pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    let off = get("GLASS_ANDROID_AGENT").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    !off && agent_jar(get).is_some()
+}
+
+/// Parse the local port `adb forward tcp:0 …` prints on stdout.
+fn parse_forward_port(out: &str) -> Option<u16> {
+    out.trim().lines().next()?.trim().parse().ok()
+}
+
+const REMOTE_JAR: &str = "/data/local/tmp/glass-agent.jar";
+const SOCKET: &str = "glass-agent";
+const MAIN: &str = "com.fixedwidth.glassagent.Main";
+
+/// Owns the device-side agent server's lifecycle: push the jar, launch it via `app_process`,
+/// set up `adb forward`, and tear it all down on shutdown. Shared (cloneable) and threaded
+/// through the platform factory + the `Glass` shutdown hook, like `EmulatorRegistry`.
+#[derive(Clone, Default)]
+pub struct AgentRegistry {
+    state: Arc<Mutex<Option<AgentProc>>>,
+}
+
+/// A launched agent: the backgrounded `adb shell` child (killing it SIGHUPs the device
+/// process — no `pkill`) and the forwarded local port.
+struct AgentProc {
+    child: Child,
+    port: u16,
+}
+
+impl AgentRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure the agent server is running on `adb`'s device and return the forwarded local
+    /// port. Idempotent: a second call returns the cached port. The jar is resolved from env.
+    pub fn ensure(&self, adb: &Adb) -> Result<u16> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| GlassError::Backend("agent registry lock poisoned".into()))?;
+        if let Some(p) = guard.as_ref() {
+            return Ok(p.port);
+        }
+        let get = |k: &str| std::env::var(k).ok();
+        let jar = agent_jar(&get)
+            .ok_or_else(|| GlassError::Backend("GLASS_ANDROID_AGENT_JAR not set".into()))?;
+
+        // Push the jar (idempotent).
+        adb.run(["push", &jar, REMOTE_JAR])?;
+
+        // Launch the server detached. The child is the host-side `adb shell`; killing it on
+        // shutdown closes the connection and the device process exits (SIGHUP).
+        let serial = adb.serial().map(str::to_string);
+        let mut cmd = Command::new(adb.bin());
+        if let Some(s) = &serial {
+            cmd.args(["-s", s]);
+        }
+        cmd.args(["shell", &format!("CLASSPATH={REMOTE_JAR} app_process / {MAIN}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| GlassError::Backend(format!("launch agent: {e}")))?;
+
+        // From here on, any failure must kill + reap the child (Child::drop does NOT kill),
+        // so a failed ensure never leaks the host adb process / device app_process / rule.
+        let out = match adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")]) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        let port = match parse_forward_port(&out) {
+            Some(p) => p,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(GlassError::Backend(format!("adb forward gave no port: {out:?}")));
+            }
+        };
+        // Give the server a moment to bind + connect-check it.
+        if let Err(e) = wait_for_agent(port).and_then(|c| c.ping()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
+            return Err(e);
+        }
+
+        *guard = Some(AgentProc { child, port });
+        Ok(port)
+    }
+
+    /// Kill the device agent (via the host child) and remove the forward. Best-effort.
+    pub fn shutdown(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            if let Some(mut p) = guard.take() {
+                let _ = p.child.kill();
+                let _ = p.child.wait();
+                let adb = Adb::from_env();
+                let _ = adb.run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+            }
+        }
+    }
+}
+
+/// Poll until the agent accepts a connection (it takes ~1s to bind), up to ~5s.
+fn wait_for_agent(port: u16) -> Result<AgentClient> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match AgentClient::connect(port) {
+            Ok(c) => return Ok(c),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(GlassError::Backend(format!("agent never came up on :{port}: {e}")))
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn enabled_unless_off_and_jar_present() {
+        let get = |k: &str| match k {
+            "GLASS_ANDROID_AGENT_JAR" => Some("/x/glass-agent.jar".to_string()),
+            _ => None,
+        };
+        assert!(agent_enabled(&get));
+        let off = |k: &str| match k {
+            "GLASS_ANDROID_AGENT" => Some("off".to_string()),
+            "GLASS_ANDROID_AGENT_JAR" => Some("/x/glass-agent.jar".to_string()),
+            _ => None,
+        };
+        assert!(!agent_enabled(&off));
+        let no_jar = |_: &str| None;
+        assert!(!agent_enabled(&no_jar)); // no jar → disabled
+    }
+
+    #[test]
+    fn parses_forward_port() {
+        assert_eq!(super::parse_forward_port("41234\n"), Some(41234));
+        assert_eq!(super::parse_forward_port(""), None);
+    }
 
     /// Spawn a one-shot fake agent that sends `hello`, then for each request line writes
     /// the matching `responses[i]` (with the request's id spliced in). Returns the port.
