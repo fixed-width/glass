@@ -202,7 +202,10 @@ A few capabilities worth knowing:
   and Chrome work too; x64) and real-file copy via `CF_HDROP` (virtual-file drag-out
   — shell extensions, zip attachments — is deferred). So they never touch
   your real clipboard unless you set `GLASS_DISPLAY=:0` or run the Windows
-  backend with `sandbox=off`. `glass_clipboard_get` is also the cheap text-extraction
+  backend with `sandbox=off`. On **Android**, clipboard get/set works through the
+  optional [on-device agent](#running-on-android-avd) (set `GLASS_ANDROID_AGENT_JAR`) —
+  the system clipboard isn't reachable over plain `adb`, so without the agent these
+  tools report unsupported. `glass_clipboard_get` is also the cheap text-extraction
   path: issue `ctrl+a` then `ctrl+c` via `glass_do`, then read here — faster and
   token-free compared to OCR for any app with selectable text.
 - **Real window managers.** On X11, window discovery uses `_NET_WM_PID`, a
@@ -215,7 +218,9 @@ A few capabilities worth knowing:
   makes one active, and subsequent capture/click/type/window ops target it with
   window-relative coordinates. The desktop backends enumerate every top-level the app
   owns (X11 via EWMH, Wayland via sway IPC, Windows via the launched Job's windows); the
-  Android backend exposes the single foreground app window.
+  Android backend enumerates the app's on-screen windows — its activity plus any
+  dialogs/popups — from `dumpsys window`, and `glass_select_window` retargets capture and
+  input (Android composites, so there's no z-order raise).
 - **Accessibility tree (semantic addressing).** Where the app exposes an
   accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/Unity/game UIs),
   `glass_a11y_snapshot` returns its elements as compact text — role, name, and
@@ -337,13 +342,15 @@ across backends — only the setup differs:
   the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
   [`packaging/README-windows.md`](packaging/README-windows.md).
 - **Android (AVD)** — drives a native Android app in an emulator over `adb`; **host-OS-agnostic**
-  (it shells out to `adb`, so it runs from a Linux, macOS, or Windows host). Emulator-only for
-  now: it attaches to a running AVD (`GLASS_ANDROID_SERIAL` selects one when several are attached;
-  `GLASS_ADB` points at the `adb` binary). The emulator's VM *is* the sandbox, so there's no
-  separate containment step. The app is built (`spec.build`, e.g. `./gradlew assembleDebug`) on
-  the host, installed, and launched — `glass_start`'s `run` is the launch component
-  `package/.Activity` (plus an optional `.apk` to install). Single foreground window; clipboard,
-  multi-window, and window resize/move are not supported yet.
+  (it shells out to `adb`, so it runs from a Linux, macOS, or Windows host). glass manages the
+  AVD — attaching to a running emulator or booting a headless one itself — and the VM *is* the
+  sandbox, so there's no separate containment step. The app is built (`spec.build`, e.g.
+  `./gradlew assembleDebug`) on the host, installed, and launched; `glass_start`'s `run` is the
+  launch component `package/.Activity` (plus an optional `.apk`). Capture, input, logs,
+  multi-window, and a `uiautomator` accessibility tree work over `adb`; clipboard and
+  high-fidelity input come from an optional [on-device agent](#running-on-android-avd). Window
+  resize/move (apps are full-screen) and physical devices are non-goals. See
+  [Running on Android](#running-on-android-avd).
 
 ## Running on X11 (the default)
 
@@ -446,6 +453,42 @@ KDE** desktops, where the host desktop is simply irrelevant. Driving the user's
 — is a separate, deliberate **non-goal**: it requires the XDG-portal path with an
 interactive consent dialog, unsuited to unattended use.
 
+## Running on Android (AVD)
+
+Select it **per launch** with `glass_start`'s `backend: "android"`, or make it the default
+with `GLASS_BACKEND=android`. The backend is **host-OS-agnostic** — it shells out to `adb`,
+so it drives an Android emulator from a Linux, macOS, or Windows host — and the emulator's
+VM *is* the sandbox, so there's no separate containment step.
+
+**Setup.** You need the Android SDK's `adb` and `emulator` plus an AVD. Point glass at `adb`
+with **`GLASS_ADB`** (or put it on `PATH`). `glass_start`'s `run` is the launch component
+`package/.Activity` (optionally with an `.apk` to install first), and `spec.build` (e.g.
+`./gradlew assembleDebug`) builds the app on the host before install.
+
+**Managed AVD (attach-or-boot).** Like Android Studio, glass prefers to attach: if an
+emulator is already online it uses it (**`GLASS_ANDROID_SERIAL`** picks one when several
+are). If none is running, glass boots a **headless** AVD itself and stops it on shutdown —
+choose it with **`GLASS_AVD`** (needed only when you have more than one). Force attach-only
+with **`GLASS_ANDROID_LIFECYCLE=attach`**. The `emulator` binary resolves from
+`GLASS_EMULATOR` / `ANDROID_SDK_ROOT` / `ANDROID_HOME`; pass extra boot flags via
+`GLASS_EMULATOR_ARGS`; keep a glass-booted emulator alive past shutdown with
+`GLASS_EMULATOR_KEEP`.
+
+**Optional on-device agent (clipboard + high-fidelity input).** Over plain `adb`, glass
+types with `input text`/`keyevent` and can't reach the system clipboard. A small companion
+— **[glass-android-agent](https://github.com/fixed-width/glass-android-agent)**, a separate
+Apache-2.0 repo — closes both gaps: it runs on the device as a shell-uid `app_process`
+server and gives glass real `MotionEvent`/`KeyEvent` injection (faithful Unicode) and
+clipboard get/set. Point **`GLASS_ANDROID_AGENT_JAR`** at its `glass-agent.jar` (download the
+prebuilt jar from the agent repo's Releases, or build it with `./gradlew dex`) and glass
+pushes, launches, and tears it down for you. Without it, glass uses the `adb` input path and
+`glass_clipboard_*` report unsupported; set **`GLASS_ANDROID_AGENT=off`** to force the `adb`
+paths even when the jar is present.
+
+**Check the setup.** `glass-mcp doctor` (or the `glass_doctor` tool) under the android backend
+reports `adb`, the emulator + AVDs, the online/attachable device, and the agent (configured,
+or — with `--deep` — launched and pinged); `--deep` also does a real capture + a11y dump.
+
 ## Benchmarking
 
 Per-frame hot-path micro-benchmarks ([criterion](https://github.com/bheisler/criterion.rs)) live in `crates/*/benches/`:
@@ -475,12 +518,12 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
 |---|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ◑ † | 🚧 |
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | 🚧 |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | 🚧 AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | ✓ headless emulator | 🚧 |
 
-† **Android** is emulator-only: capture, input, and logs work and the AVD VM is the sandbox; clipboard, multi-window, and window resize/move are not supported yet, and it attaches to a running AVD (no managed-AVD spawn or physical-device support yet).
+† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard and high-fidelity input** use the optional [on-device agent](#running-on-android-avd) — without it, input falls back to adb's `input` and clipboard is unavailable. Window resize/move (apps are full-screen) and physical devices are non-goals.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
@@ -495,9 +538,10 @@ running-on-X11/Wayland sections above.
 The Linux feature set is implemented and tested across **both** Linux backends
 (X11 and Wayland/wlroots), and the **Windows** backend (WGC capture, SendInput, UI
 Automation) is built and CI-tested. An **Android** backend drives native apps in an AVD
-emulator over `adb` — capture, input, logcat, and a `uiautomator` accessibility tree, with
-clipboard and multi-window still pending; it's built and unit-tested in CI and validated
-on-device. **macOS is the one OS backend not yet built.**
+emulator over `adb` — capture, input, logcat, multi-window, a `uiautomator` accessibility
+tree, a managed AVD (attach-or-boot), and — via an optional
+[on-device agent](#running-on-android-avd) — clipboard and high-fidelity input; it's built and
+unit-tested in CI and validated on-device. **macOS is the one OS backend not yet built.**
 
 ## License
 
