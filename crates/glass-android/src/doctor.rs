@@ -8,6 +8,7 @@ use glass_core::{Check, CheckStatus};
 
 use crate::adb::Adb;
 use crate::avd::{parse_list_avds, resolve_emulator_bin};
+use crate::axmap::check_dump_status;
 use crate::target::parse_devices;
 
 /// Observed host state for the Android doctor checks. Captured by `probe`, consumed
@@ -24,6 +25,18 @@ struct Probe {
     avds: Option<Vec<String>>,
     /// Serials with `adb devices` state `"device"` (online).
     online: Vec<String>,
+    /// Whether `--deep` was requested (so `build_checks` can pick the right Skip reason).
+    deep_requested: bool,
+    /// Deep-probe results; `Some` only when `deep_requested` && adb present && a device is online.
+    deep: Option<DeepProbe>,
+}
+
+/// Result of the deep probes against one online device. `Ok` carries a human detail,
+/// `Err` a failure reason.
+struct DeepProbe {
+    serial: String,
+    screencap: Result<String, String>,
+    uiautomator: Result<String, String>,
 }
 
 /// Build the Android doctor checks by probing the host. `deep` additionally captures a
@@ -32,7 +45,7 @@ pub fn checks(deep: bool) -> Vec<Check> {
     build_checks(&probe(deep))
 }
 
-fn probe(_deep: bool) -> Probe {
+fn probe(deep_requested: bool) -> Probe {
     let get = |k: &str| std::env::var(k).ok();
     let adb = Adb::from_env();
     let adb_bin = adb.bin().to_string();
@@ -48,7 +61,12 @@ fn probe(_deep: bool) -> Probe {
     } else {
         Vec::new()
     };
-    Probe { adb_bin, adb_version, emulator_bin, avds, online }
+    let deep = if deep_requested && adb_version.is_some() {
+        online.first().map(|serial| deep_probe(&adb, serial))
+    } else {
+        None
+    };
+    Probe { adb_bin, adb_version, emulator_bin, avds, online, deep_requested, deep }
 }
 
 fn first_line(s: &str) -> String {
@@ -64,9 +82,68 @@ fn list_avds(bin: &str) -> Option<Vec<String>> {
         .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
 }
 
+/// Deep probe one online device: capture a frame (validated via the real decoder) and
+/// an a11y dump (via `uiautomator dump`, mirroring `AndroidA11y`).
+fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
+    const DUMP_PATH: &str = "/sdcard/glass_doctor_dump.xml";
+    let dev = adb.with_serial(serial);
+
+    let screencap = match dev.run_bytes(["exec-out", "screencap"]) {
+        Ok(bytes) => match crate::screencap::decode_screencap(&bytes) {
+            Ok(f) => Ok(format!("captured {}x{} ({} bytes)", f.width, f.height, bytes.len())),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
+    };
+
+    // Remove any stale dump so a failed `uiautomator dump` can't yield a false positive
+    // from a prior run's file; validate the dump command's own status (parity with
+    // AndroidA11y) before trusting the cat'd XML.
+    let _ = dev.run(["shell", "rm", "-f", DUMP_PATH]);
+    let uiautomator = match dev
+        .run(["shell", "uiautomator", "dump", DUMP_PATH])
+        .and_then(|status| {
+            check_dump_status(&status)?;
+            dev.run(["shell", "cat", DUMP_PATH])
+        }) {
+        Ok(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
+        Ok(_) => Err("uiautomator dump produced no hierarchy".to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+
+    DeepProbe { serial: serial.to_string(), screencap, uiautomator }
+}
+
 /// Build the Android doctor section's checks from observed state. Pure.
 fn build_checks(p: &Probe) -> Vec<Check> {
-    vec![adb_check(p), emulator_check(p), device_check(p)]
+    let (screencap, uiautomator) = deep_checks(p);
+    vec![adb_check(p), emulator_check(p), device_check(p), screencap, uiautomator]
+}
+
+fn deep_checks(p: &Probe) -> (Check, Check) {
+    let skip = |reason: &str| {
+        (
+            Check::new("screencap", CheckStatus::Skip, reason.to_string()),
+            Check::new("uiautomator", CheckStatus::Skip, reason.to_string()),
+        )
+    };
+    // Distinguish the three "nothing to probe" cases (see spec): adb first, then the
+    // missing flag, then the absent device (post-guards, `deep.is_none()` ⟺ no online device).
+    if p.adb_version.is_none() {
+        return skip("skipped — adb unavailable");
+    }
+    if !p.deep_requested {
+        return skip("run with --deep to probe capture");
+    }
+    let Some(d) = &p.deep else {
+        return skip("no online device to probe");
+    };
+    let render = |name: &'static str, res: &Result<String, String>| match res {
+        Ok(detail) => Check::new(name, CheckStatus::Ok, format!("{}: {detail}", d.serial)),
+        Err(e) => Check::new(name, CheckStatus::Fail, format!("{}: {e}", d.serial))
+            .with_remedy("ensure the device is fully booted"),
+    };
+    (render("screencap", &d.screencap), render("uiautomator", &d.uiautomator))
 }
 
 fn device_check(p: &Probe) -> Check {
@@ -143,6 +220,16 @@ mod tests {
             emulator_bin: "/sdk/emulator/emulator".into(),
             avds: Some(vec!["glass".into()]),
             online: vec!["emulator-5554".into()],
+            deep_requested: false,
+            deep: None,
+        }
+    }
+
+    fn deep_ok() -> DeepProbe {
+        DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Ok("captured 1080x2400 (10368016 bytes)".into()),
+            uiautomator: Ok("a11y dump OK".into()),
         }
     }
 
@@ -237,5 +324,71 @@ mod tests {
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Skip);
         assert!(d.detail.contains("adb unavailable"));
+    }
+
+    #[test]
+    fn deep_not_requested_skips_capture_and_a11y() {
+        let c = build_checks(&base_probe()); // deep_requested = false
+        assert_eq!(find(&c, "screencap").status, CheckStatus::Skip);
+        assert!(find(&c, "screencap").detail.contains("--deep"));
+        assert_eq!(find(&c, "uiautomator").status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn deep_requested_no_device_skips() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.online = vec![];
+        p.deep = None;
+        let c = build_checks(&p);
+        assert_eq!(find(&c, "screencap").status, CheckStatus::Skip);
+        assert!(find(&c, "screencap").detail.contains("no online device"));
+    }
+
+    #[test]
+    fn deep_adb_absent_skips_with_adb_reason() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.adb_version = None;
+        p.deep = None;
+        let c = build_checks(&p);
+        assert!(find(&c, "screencap").detail.contains("adb unavailable"));
+    }
+
+    #[test]
+    fn deep_ok_reports_ok() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.deep = Some(deep_ok());
+        let c = build_checks(&p);
+        assert_eq!(find(&c, "screencap").status, CheckStatus::Ok);
+        assert!(find(&c, "screencap").detail.contains("emulator-5554"));
+        assert!(find(&c, "screencap").detail.contains("1080x2400"));
+        assert_eq!(find(&c, "uiautomator").status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn deep_failure_reports_fail_with_remedy() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.deep = Some(DeepProbe {
+            serial: "emulator-5554".into(),
+            screencap: Err("screencap 0x0: FLAG_SECURE?".into()),
+            uiautomator: Err("dump produced no hierarchy".into()),
+        });
+        let c = build_checks(&p);
+        let s = find(&c, "screencap");
+        assert_eq!(s.status, CheckStatus::Fail);
+        assert!(s.detail.contains("FLAG_SECURE"));
+        assert!(s.remedy.as_deref().unwrap().contains("fully booted"));
+        assert_eq!(find(&c, "uiautomator").status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn checks_always_emits_the_five_named_checks() {
+        // Spawns adb/emulator; both fail-fast when absent, so this is host-independent.
+        let c = checks(false);
+        let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["adb", "emulator", "device", "screencap", "uiautomator"]);
     }
 }
