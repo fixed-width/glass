@@ -8,6 +8,7 @@ use glass_core::{Check, CheckStatus};
 
 use crate::adb::Adb;
 use crate::avd::{parse_list_avds, resolve_emulator_bin};
+use crate::target::parse_devices;
 
 /// Observed host state for the Android doctor checks. Captured by `probe`, consumed
 /// by the pure `build_checks` so all branch logic is unit-testable without subprocesses.
@@ -21,6 +22,8 @@ struct Probe {
     /// AVDs from `emulator -list-avds`; `None` when the binary is absent/failed,
     /// `Some(vec![])` when it ran but found none.
     avds: Option<Vec<String>>,
+    /// Serials with `adb devices` state `"device"` (online).
+    online: Vec<String>,
 }
 
 /// Build the Android doctor checks by probing the host. `deep` additionally captures a
@@ -36,7 +39,16 @@ fn probe(_deep: bool) -> Probe {
     let adb_version = adb.run(["version"]).ok().map(|s| first_line(&s)).filter(|s| !s.is_empty());
     let emulator_bin = resolve_emulator_bin(&get);
     let avds = list_avds(&emulator_bin);
-    Probe { adb_bin, adb_version, emulator_bin, avds }
+    let online: Vec<String> = if adb_version.is_some() {
+        parse_devices(&adb.run(["devices"]).unwrap_or_default())
+            .into_iter()
+            .filter(|d| d.state == "device")
+            .map(|d| d.serial)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Probe { adb_bin, adb_version, emulator_bin, avds, online }
 }
 
 fn first_line(s: &str) -> String {
@@ -54,7 +66,31 @@ fn list_avds(bin: &str) -> Option<Vec<String>> {
 
 /// Build the Android doctor section's checks from observed state. Pure.
 fn build_checks(p: &Probe) -> Vec<Check> {
-    vec![adb_check(p), emulator_check(p)]
+    vec![adb_check(p), emulator_check(p), device_check(p)]
+}
+
+fn device_check(p: &Probe) -> Check {
+    if p.adb_version.is_none() {
+        return Check::new("device", CheckStatus::Skip, "skipped — adb unavailable");
+    }
+    if !p.online.is_empty() {
+        return Check::new(
+            "device",
+            CheckStatus::Ok,
+            format!("{} online: {}", p.online.len(), p.online.join(", ")),
+        );
+    }
+    let bootable = matches!(&p.avds, Some(avds) if !avds.is_empty());
+    if bootable {
+        Check::new(
+            "device",
+            CheckStatus::Warn,
+            "none online; glass will boot an AVD on start (auto lifecycle)",
+        )
+    } else {
+        Check::new("device", CheckStatus::Fail, "no online device and no AVD to boot")
+            .with_remedy("start an emulator (`emulator -avd <name>`) or create an AVD")
+    }
 }
 
 fn emulator_check(p: &Probe) -> Check {
@@ -106,6 +142,7 @@ mod tests {
             adb_version: Some("Android Debug Bridge version 1.0.41".into()),
             emulator_bin: "/sdk/emulator/emulator".into(),
             avds: Some(vec!["glass".into()]),
+            online: vec!["emulator-5554".into()],
         }
     }
 
@@ -160,5 +197,45 @@ mod tests {
         let e = find(&e, "emulator");
         assert_eq!(e.status, CheckStatus::Warn);
         assert!(e.detail.contains("no AVDs"));
+    }
+
+    #[test]
+    fn device_online_is_ok() {
+        let d = build_checks(&base_probe());
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Ok);
+        assert!(d.detail.contains("1 online: emulator-5554"));
+    }
+
+    #[test]
+    fn device_none_online_but_bootable_is_warn() {
+        let mut p = base_probe();
+        p.online = vec![];
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Warn);
+        assert!(d.detail.contains("glass will boot"));
+    }
+
+    #[test]
+    fn device_none_online_not_bootable_is_fail() {
+        let mut p = base_probe();
+        p.online = vec![];
+        p.avds = Some(vec![]); // emulator ran, no AVDs => cannot boot
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(d.remedy.as_deref().unwrap().contains("emulator -avd"));
+    }
+
+    #[test]
+    fn device_skipped_when_adb_absent() {
+        let mut p = base_probe();
+        p.adb_version = None;
+        p.online = vec![];
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Skip);
+        assert!(d.detail.contains("adb unavailable"));
     }
 }
