@@ -166,8 +166,9 @@ interactive consent dialog, unsuited to unattended use.
 ## Android on Linux
 
 The Android backend is **host-OS-agnostic** — it shells out to `adb`, so it runs from
-a Linux host as well as Windows or macOS. This section covers what's Linux-specific
-about the setup.
+a Linux host as well as Windows (macOS is planned — glass-mcp doesn't build on macOS
+yet; see [running-on-macos.md](running-on-macos.md)). This section covers what's
+Linux-specific about the setup.
 
 ### Install the Android SDK tools
 

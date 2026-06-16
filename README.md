@@ -303,7 +303,7 @@ across backends — only the setup differs:
   the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
   [docs/running-on-windows.md](docs/running-on-windows.md).
 - **Android (AVD)** — drives a native Android app in an emulator over `adb`; **host-OS-agnostic**
-  (it shells out to `adb`, so it runs from a Linux, macOS, or Windows host). glass manages the
+  (it shells out to `adb`, so it runs from a Linux or Windows host — macOS is planned). glass manages the
   AVD — attaching to a running emulator or booting a headless one itself — and the VM *is* the
   sandbox, so there's no separate containment step. The app is built (`spec.build`, e.g.
   `./gradlew assembleDebug`) on the host, installed, and launched; `glass_start`'s `run` is the
