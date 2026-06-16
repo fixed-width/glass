@@ -33,6 +33,14 @@ struct Probe {
     deep_requested: bool,
     /// Deep-probe results; `Some` only when `deep_requested` && adb present && a device is online.
     deep: Option<DeepProbe>,
+    /// `GLASS_ANDROID_AGENT` is explicitly `off`.
+    agent_off: bool,
+    /// Resolved `GLASS_ANDROID_AGENT_JAR` (non-empty), else `None`.
+    agent_jar: Option<String>,
+    /// The `agent_jar` path is an existing file (false when `agent_jar` is `None`).
+    agent_jar_exists: bool,
+    /// Deep launch+ping result; `Some` only when deep && configured && a device is attachable.
+    agent_deep: Option<Result<(), String>>,
 }
 
 /// Result of the deep probes against one online device. `Ok` carries a human detail,
@@ -77,7 +85,36 @@ fn probe(deep_requested: bool) -> Probe {
         _ => None,
     };
 
-    Probe { adb_bin, adb_version, emulator_bin, avds, online, selection, deep_requested, deep }
+    let agent_off = get("GLASS_ANDROID_AGENT").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    let agent_jar = crate::agent::agent_jar(&get);
+    let agent_jar_exists =
+        agent_jar.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
+    // Deep agent probe: launch the agent on the device glass would attach to, ping it, then
+    // tear it down (reuses the production lifecycle; leak-free — no pkill).
+    let agent_deep = match &selection {
+        Action::Attach(serial) if deep_requested && !agent_off && agent_jar_exists => {
+            let reg = crate::agent::AgentRegistry::new();
+            let r = reg.ensure(&adb.with_serial(serial.clone())).map(|_| ()).map_err(|e| e.to_string());
+            reg.shutdown();
+            Some(r)
+        }
+        _ => None,
+    };
+
+    Probe {
+        adb_bin,
+        adb_version,
+        emulator_bin,
+        avds,
+        online,
+        selection,
+        deep_requested,
+        deep,
+        agent_off,
+        agent_jar,
+        agent_jar_exists,
+        agent_deep,
+    }
 }
 
 fn first_line(s: &str) -> String {
@@ -128,7 +165,49 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
 /// Build the Android doctor section's checks from observed state. Pure.
 fn build_checks(p: &Probe) -> Vec<Check> {
     let (screencap, uiautomator) = deep_checks(p);
-    vec![adb_check(p), emulator_check(p), device_check(p), screencap, uiautomator]
+    vec![adb_check(p), emulator_check(p), device_check(p), agent_check(p), screencap, uiautomator]
+}
+
+fn agent_check(p: &Probe) -> Check {
+    if p.agent_off {
+        return Check::new("agent", CheckStatus::Skip, "disabled (GLASS_ANDROID_AGENT=off)");
+    }
+    let Some(jar) = &p.agent_jar else {
+        return Check::new(
+            "agent",
+            CheckStatus::Skip,
+            "not configured (optional — set GLASS_ANDROID_AGENT_JAR for clipboard + high-fidelity input)",
+        );
+    };
+    if !p.agent_jar_exists {
+        return Check::new(
+            "agent",
+            CheckStatus::Warn,
+            format!("GLASS_ANDROID_AGENT_JAR={jar} but no file there"),
+        )
+        .with_remedy("build the agent (`./gradlew dex` in glass-android-agent), or fix the path");
+    }
+    // agent_deep is Some only when deep was requested (see probe); so None means
+    // either not-deep (Ok configured) or deep-but-no-attachable-device (Skip).
+    match (&p.agent_deep, p.deep_requested) {
+        (Some(Ok(())), _) => {
+            Check::new("agent", CheckStatus::Ok, format!("reachable (launched + ping ok): {jar}"))
+        }
+        (Some(Err(e)), _) => {
+            Check::new("agent", CheckStatus::Fail, format!("agent did not come up: {e}"))
+                .with_remedy("ensure the device allows `app_process` and the jar is a valid dexed build")
+        }
+        (None, false) => Check::new("agent", CheckStatus::Ok, format!("configured: {jar}")),
+        (None, true) => {
+            // agent_deep is Some only when deep + the device is Attach-able, so here the
+            // selection is Boot (no device yet) or Error (devices present but refused).
+            let reason = match &p.selection {
+                Action::Boot => "no online device to probe (glass will boot one on start)",
+                _ => "no attachable device to probe (see the device check)",
+            };
+            Check::new("agent", CheckStatus::Skip, reason)
+        }
+    }
 }
 
 fn deep_checks(p: &Probe) -> (Check, Check) {
@@ -240,6 +319,10 @@ mod tests {
             selection: Action::Attach("emulator-5554".into()),
             deep_requested: false,
             deep: None,
+            agent_off: false,
+            agent_jar: Some("/sdk/glass-agent.jar".into()),
+            agent_jar_exists: true,
+            agent_deep: None,
         }
     }
 
@@ -463,10 +546,78 @@ mod tests {
     }
 
     #[test]
-    fn checks_always_emits_the_five_named_checks() {
+    fn checks_always_emits_the_six_named_checks() {
         // Spawns adb/emulator; both fail-fast when absent, so this is host-independent.
         let c = checks(false);
         let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["adb", "emulator", "device", "screencap", "uiautomator"]);
+        assert_eq!(names, ["adb", "emulator", "device", "agent", "screencap", "uiautomator"]);
+    }
+
+    #[test]
+    fn agent_configured_passive_is_ok() {
+        let c = build_checks(&base_probe());
+        let a = find(&c, "agent");
+        assert_eq!(a.status, CheckStatus::Ok);
+        assert!(a.detail.contains("configured"));
+    }
+
+    #[test]
+    fn agent_off_is_skip() {
+        let mut p = base_probe();
+        p.agent_off = true;
+        assert_eq!(find(&build_checks(&p), "agent").status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn agent_unset_is_skip() {
+        let mut p = base_probe();
+        p.agent_jar = None;
+        p.agent_jar_exists = false;
+        let a = build_checks(&p);
+        let a = find(&a, "agent");
+        assert_eq!(a.status, CheckStatus::Skip);
+        assert!(a.detail.contains("GLASS_ANDROID_AGENT_JAR"));
+    }
+
+    #[test]
+    fn agent_jar_missing_is_warn() {
+        let mut p = base_probe();
+        p.agent_jar = Some("/nope/glass-agent.jar".into());
+        p.agent_jar_exists = false;
+        let a = build_checks(&p);
+        let a = find(&a, "agent");
+        assert_eq!(a.status, CheckStatus::Warn);
+        assert!(a.remedy.as_deref().unwrap().contains("gradlew"));
+    }
+
+    #[test]
+    fn agent_deep_ok_is_ok() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.agent_deep = Some(Ok(()));
+        let a = build_checks(&p);
+        let a = find(&a, "agent");
+        assert_eq!(a.status, CheckStatus::Ok);
+        assert!(a.detail.contains("reachable"));
+    }
+
+    #[test]
+    fn agent_deep_fail_is_fail() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.agent_deep = Some(Err("connect refused".into()));
+        let a = build_checks(&p);
+        let a = find(&a, "agent");
+        assert_eq!(a.status, CheckStatus::Fail);
+        assert!(a.detail.contains("connect refused"));
+    }
+
+    #[test]
+    fn agent_deep_no_device_is_skip() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.selection = Action::Boot; // deep but nothing attachable → agent not probed
+        p.agent_deep = None;
+        assert_eq!(find(&build_checks(&p), "agent").status, CheckStatus::Skip);
     }
 }
