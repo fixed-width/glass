@@ -7,6 +7,8 @@ instead of asking you "does this look right?".
 
 This is the **Windows x86-64** build. See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
+For Windows-specific setup (containment runtime, network transport, Android-on-Windows),
+see [docs/running-on-windows.md](../docs/running-on-windows.md).
 
 ---
 
