@@ -8,13 +8,17 @@ use glass_core::{
 use glass_core::Platform;
 
 use crate::adb::Adb;
+use crate::agent::{AgentClient, AgentRegistry};
 use crate::build::run_build;
-use crate::input::{Injector, ShellInjector};
+use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{check_am_start, check_install, parse_app_windows, parse_pid, parse_pids};
 use crate::screencap::decode_screencap;
 use crate::target::AdbTarget;
+
+const CLIPBOARD_NEEDS_AGENT: &str =
+    "clipboard (needs the on-device agent; set GLASS_ANDROID_AGENT_JAR)";
 
 /// The single foreground app this backend drives.
 struct RunningApp {
@@ -30,18 +34,43 @@ struct RunningApp {
 pub struct AndroidPlatform {
     target: Box<dyn AdbTarget + Send>,
     injector: Box<dyn Injector + Send>,
+    agent: Option<Arc<AgentClient>>,
     logs: LogSink,
     app: Option<RunningApp>,
 }
 
 impl AndroidPlatform {
-    /// Attach to (or boot) an emulator using the attach-or-boot resolver.
-    pub fn from_env(registry: &crate::avd::EmulatorRegistry) -> Result<Self> {
+    /// Attach to (or boot) an emulator, and connect the on-device agent if enabled.
+    pub fn from_env(
+        emulators: &crate::avd::EmulatorRegistry,
+        agents: &AgentRegistry,
+    ) -> Result<Self> {
         let base = Adb::from_env();
-        let target = crate::target::resolve(base, registry)?;
+        let target = crate::target::resolve(base, emulators)?;
+
+        // Best-effort: use the agent when enabled; on any failure, fall back to adb paths.
+        let get = |k: &str| std::env::var(k).ok();
+        let agent = if crate::agent::agent_enabled(&get) {
+            match agents.ensure(target.adb()).and_then(AgentClient::connect) {
+                Ok(client) => Some(Arc::new(client)),
+                Err(e) => {
+                    eprintln!("glass-android: agent unavailable, using adb fallback: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let injector: Box<dyn Injector + Send> = match &agent {
+            Some(a) => Box::new(AgentInjector { agent: a.clone() }),
+            None => Box::new(ShellInjector),
+        };
+
         Ok(Self {
             target: Box::new(target),
-            injector: Box::new(ShellInjector),
+            injector,
+            agent,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
         })
@@ -205,6 +234,20 @@ impl Platform for AndroidPlatform {
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         self.logs.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+    }
+
+    fn get_clipboard(&mut self) -> Result<String> {
+        match &self.agent {
+            Some(a) => a.clipboard_get(),
+            None => Err(GlassError::Unsupported(CLIPBOARD_NEEDS_AGENT.into())),
+        }
+    }
+
+    fn set_clipboard(&mut self, text: &str) -> Result<()> {
+        match &self.agent {
+            Some(a) => a.clipboard_set(text),
+            None => Err(GlassError::Unsupported(CLIPBOARD_NEEDS_AGENT.into())),
+        }
     }
 
     fn app_pid(&self) -> Option<u32> {

@@ -27,12 +27,12 @@ fn boots_reuses_and_cleans_up() {
     let registry = EmulatorRegistry::new();
 
     // First resolve boots the AVD.
-    let mut p1 = glass_android::AndroidPlatform::from_env(&registry).expect("boot+attach");
+    let mut p1 = glass_android::AndroidPlatform::from_env(&registry, &glass_android::AgentRegistry::new()).expect("boot+attach");
     assert_eq!(online_count(), 1, "expected one emulator after boot");
     let _ = &mut p1;
 
     // Second resolve attaches to the same emulator — no second boot.
-    let _p2 = glass_android::AndroidPlatform::from_env(&registry).expect("attach reuse");
+    let _p2 = glass_android::AndroidPlatform::from_env(&registry, &glass_android::AgentRegistry::new()).expect("attach reuse");
     assert_eq!(online_count(), 1, "reuse must not boot a second emulator");
 
     // Cleanup stops the glass-booted emulator.

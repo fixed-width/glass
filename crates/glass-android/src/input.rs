@@ -170,7 +170,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
 
 /// Injects via the on-device agent (real MotionEvents + faithful keys/Unicode). The `Adb`
 /// argument of the `Injector` methods is unused — the agent is reached over its socket.
-pub struct AgentInjector {
+pub(crate) struct AgentInjector {
     pub(crate) agent: Arc<AgentClient>,
 }
 

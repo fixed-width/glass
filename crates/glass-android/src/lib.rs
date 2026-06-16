@@ -22,6 +22,5 @@ mod target;
 pub use a11y::AndroidA11y;
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
-pub use input::AgentInjector;
 pub use platform::AndroidPlatform;
 pub use target::{AdbTarget, AttachedDevice};

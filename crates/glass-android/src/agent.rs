@@ -159,7 +159,6 @@ pub fn agent_jar(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
 }
 
 /// The agent is used when not explicitly `off` and a jar is resolvable.
-#[allow(dead_code)]
 pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
     let off = get("GLASS_ANDROID_AGENT").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
     !off && agent_jar(get).is_some()
