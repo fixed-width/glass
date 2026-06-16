@@ -200,6 +200,8 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
                 use std::io::Read as _;
                 let _ = e.read_to_string(&mut err);
             }
+            // Child already exited — no kill needed, but we must wait to reap it.
+            let _ = child.wait();
             return Err(GlassError::Backend(format!(
                 "emulator exited before boot (status {status}): {}",
                 err.trim()
@@ -216,12 +218,16 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
             }
         }
         if Instant::now() >= deadline {
+            // Belt-and-suspenders: ask the device to shut down gracefully, then kill the
+            // host emulator child so it can't hold the AVD lock after we return an error.
             if let Some(serial) = new_serial(
                 &before,
                 &crate::target::parse_devices(&base.run(["devices"]).unwrap_or_default()),
             ) {
                 let _ = base.with_serial(serial).run(["emu", "kill"]);
             }
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(GlassError::Backend(format!(
                 "emulator did not reach sys.boot_completed within {timeout_ms}ms"
             )));

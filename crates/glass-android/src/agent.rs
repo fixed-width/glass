@@ -36,6 +36,11 @@ impl Conn {
     fn open(port: u16) -> Result<Conn> {
         let stream = TcpStream::connect(("127.0.0.1", port))
             .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
+        // Set read/write timeouts so a stalled agent surfaces as a transport error (which
+        // the existing reconnect path handles) rather than hanging the MCP thread forever.
+        let to = std::time::Duration::from_secs(30);
+        stream.set_read_timeout(Some(to)).ok();
+        stream.set_write_timeout(Some(to)).ok();
         let reader = BufReader::new(
             stream.try_clone().map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?,
         );
@@ -165,8 +170,12 @@ pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 /// Parse the local port `adb forward tcp:0 …` prints on stdout.
+/// Skips blank lines and `* daemon …` noise that adb emits on a cold start.
 fn parse_forward_port(out: &str) -> Option<u16> {
-    out.trim().lines().next()?.trim().parse().ok()
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('*'))
+        .find_map(|l| l.parse().ok())
 }
 
 const REMOTE_JAR: &str = "/data/local/tmp/glass-agent.jar";
@@ -182,10 +191,18 @@ pub struct AgentRegistry {
 }
 
 /// A launched agent: the backgrounded `adb shell` child (killing it SIGHUPs the device
-/// process — no `pkill`) and the forwarded local port.
+/// process — no `pkill`), the forwarded local port, and the device serial it was bound to.
 struct AgentProc {
     child: Child,
     port: u16,
+    serial: Option<String>,
+}
+
+impl Drop for AgentProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl AgentRegistry {
@@ -194,15 +211,33 @@ impl AgentRegistry {
     }
 
     /// Ensure the agent server is running on `adb`'s device and return the forwarded local
-    /// port. Idempotent: a second call returns the cached port. The jar is resolved from env.
+    /// port. Idempotent: a second call returns the cached port when the device serial matches.
+    /// If the serial changed (a different device), the stale agent is torn down first.
+    /// The jar is resolved from env.
     pub fn ensure(&self, adb: &Adb) -> Result<u16> {
         let mut guard = self
             .state
             .lock()
             .map_err(|_| GlassError::Backend("agent registry lock poisoned".into()))?;
+
+        // Cache hit: same serial (or both unset) — reuse the existing port.
         if let Some(p) = guard.as_ref() {
-            return Ok(p.port);
+            if p.serial.as_deref() == adb.serial() {
+                return Ok(p.port);
+            }
         }
+        // Serial changed (or first-ever call with a stale entry): tear down the stale agent.
+        // Taking it out of the guard drops it, which kills + reaps the child via Drop.
+        if let Some(stale) = guard.take() {
+            let stale_adb = Adb::from_env();
+            let stale_adb = match &stale.serial {
+                Some(s) => stale_adb.with_serial(s.clone()),
+                None => stale_adb,
+            };
+            let _ = stale_adb.run(["forward", "--remove", &format!("tcp:{}", stale.port)]);
+            // stale drops here → Drop kills + reaps the child
+        }
+
         let get = |k: &str| std::env::var(k).ok();
         let jar = agent_jar(&get)
             .ok_or_else(|| GlassError::Backend("GLASS_ANDROID_AGENT_JAR not set".into()))?;
@@ -251,18 +286,21 @@ impl AgentRegistry {
             return Err(e);
         }
 
-        *guard = Some(AgentProc { child, port });
+        *guard = Some(AgentProc { child, port, serial });
         Ok(port)
     }
 
     /// Kill the device agent (via the host child) and remove the forward. Best-effort.
     pub fn shutdown(&self) {
         if let Ok(mut guard) = self.state.lock() {
-            if let Some(mut p) = guard.take() {
-                let _ = p.child.kill();
-                let _ = p.child.wait();
+            if let Some(p) = guard.take() {
                 let adb = Adb::from_env();
+                let adb = match &p.serial {
+                    Some(s) => adb.with_serial(s.clone()),
+                    None => adb,
+                };
                 let _ = adb.run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+                // p drops here → Drop kills + reaps the child
             }
         }
     }
@@ -310,6 +348,12 @@ mod tests {
     fn parses_forward_port() {
         assert_eq!(super::parse_forward_port("41234\n"), Some(41234));
         assert_eq!(super::parse_forward_port(""), None);
+        assert_eq!(
+            super::parse_forward_port(
+                "* daemon not running; starting now\n* daemon started successfully\n41234\n"
+            ),
+            Some(41234)
+        );
     }
 
     /// Spawn a one-shot fake agent that sends `hello`, then for each request line writes
