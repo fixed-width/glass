@@ -6,6 +6,7 @@
 
 mod adb;
 mod a11y;
+pub mod agent;
 mod axmap;
 mod avd;
 mod build;
