@@ -7,9 +7,9 @@
 use glass_core::{Check, CheckStatus};
 
 use crate::adb::Adb;
-use crate::avd::{parse_list_avds, resolve_emulator_bin};
+use crate::avd::{decide, parse_list_avds, resolve_emulator_bin, Action, Lifecycle};
 use crate::axmap::check_dump_status;
-use crate::target::parse_devices;
+use crate::target::{parse_devices, Device};
 
 /// Observed host state for the Android doctor checks. Captured by `probe`, consumed
 /// by the pure `build_checks` so all branch logic is unit-testable without subprocesses.
@@ -23,8 +23,12 @@ struct Probe {
     /// AVDs from `emulator -list-avds`; `None` when the binary is absent/failed,
     /// `Some(vec![])` when it ran but found none.
     avds: Option<Vec<String>>,
-    /// Serials with `adb devices` state `"device"` (online).
+    /// Serials with `adb devices` state `"device"` (online), for display.
     online: Vec<String>,
+    /// What `glass_start` would do with these devices — the runtime's own
+    /// `decide(online, GLASS_ANDROID_SERIAL, GLASS_ANDROID_LIFECYCLE)` verdict, so the
+    /// doctor matches the real backend (attach a serial / boot / refuse) by construction.
+    selection: Action,
     /// Whether `--deep` was requested (so `build_checks` can pick the right Skip reason).
     deep_requested: bool,
     /// Deep-probe results; `Some` only when `deep_requested` && adb present && a device is online.
@@ -52,21 +56,28 @@ fn probe(deep_requested: bool) -> Probe {
     let adb_version = adb.run(["version"]).ok().map(|s| first_line(&s)).filter(|s| !s.is_empty());
     let emulator_bin = resolve_emulator_bin(&get);
     let avds = list_avds(&emulator_bin);
-    let online: Vec<String> = if adb_version.is_some() {
+
+    let online_devices: Vec<Device> = if adb_version.is_some() {
         parse_devices(&adb.run(["devices"]).unwrap_or_default())
             .into_iter()
             .filter(|d| d.state == "device")
-            .map(|d| d.serial)
             .collect()
     } else {
         Vec::new()
     };
-    let deep = if deep_requested && adb_version.is_some() {
-        online.first().map(|serial| deep_probe(&adb, serial))
-    } else {
-        None
+    let online: Vec<String> = online_devices.iter().map(|d| d.serial.clone()).collect();
+    // Reuse the runtime's own selection policy so the doctor's verdict matches what
+    // `glass_start` will actually do (attach a specific serial / boot / refuse).
+    let lifecycle = Lifecycle::from_env(get("GLASS_ANDROID_LIFECYCLE").as_deref());
+    let selection = decide(&online_devices, get("GLASS_ANDROID_SERIAL").as_deref(), lifecycle);
+
+    // Deep-probe exactly the device glass would attach to (it never boots one).
+    let deep = match &selection {
+        Action::Attach(serial) if deep_requested => Some(deep_probe(&adb, serial)),
+        _ => None,
     };
-    Probe { adb_bin, adb_version, emulator_bin, avds, online, deep_requested, deep }
+
+    Probe { adb_bin, adb_version, emulator_bin, avds, online, selection, deep_requested, deep }
 }
 
 fn first_line(s: &str) -> String {
@@ -90,7 +101,7 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
 
     let screencap = match dev.run_bytes(["exec-out", "screencap"]) {
         Ok(bytes) => match crate::screencap::decode_screencap(&bytes) {
-            Ok(f) => Ok(format!("captured {}x{} ({} bytes)", f.width, f.height, bytes.len())),
+            Ok(f) => Ok(format!("captured {}x{}, {} bytes raw", f.width, f.height, bytes.len())),
             Err(e) => Err(e.to_string()),
         },
         Err(e) => Err(e.to_string()),
@@ -127,8 +138,9 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
             Check::new("uiautomator", CheckStatus::Skip, reason.to_string()),
         )
     };
-    // Distinguish the three "nothing to probe" cases (see spec): adb first, then the
-    // missing flag, then the absent device (post-guards, `deep.is_none()` ⟺ no online device).
+    // Distinguish the three "nothing to probe" cases: adb first, then the missing flag,
+    // then no selected device (post-guards, `deep.is_none()` ⟺ no device glass would
+    // attach to — none online, or online-but-ambiguous without GLASS_ANDROID_SERIAL).
     if p.adb_version.is_none() {
         return skip("skipped — adb unavailable");
     }
@@ -136,7 +148,7 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
         return skip("run with --deep to probe capture");
     }
     let Some(d) = &p.deep else {
-        return skip("no online device to probe");
+        return skip("no device selected to probe");
     };
     let render = |name: &'static str, res: &Result<String, String>| match res {
         Ok(detail) => Check::new(name, CheckStatus::Ok, format!("{}: {detail}", d.serial)),
@@ -150,23 +162,28 @@ fn device_check(p: &Probe) -> Check {
     if p.adb_version.is_none() {
         return Check::new("device", CheckStatus::Skip, "skipped — adb unavailable");
     }
-    if !p.online.is_empty() {
-        return Check::new(
+    // Mirror the runtime's `decide`: Ok when glass would attach to a specific device,
+    // Warn when it will boot one, Fail (carrying the runtime's own message) when it would
+    // refuse — so a green `device` check guarantees `glass_start` won't reject the host.
+    match &p.selection {
+        Action::Attach(serial) => Check::new(
             "device",
             CheckStatus::Ok,
-            format!("{} online: {}", p.online.len(), p.online.join(", ")),
-        );
-    }
-    let bootable = matches!(&p.avds, Some(avds) if !avds.is_empty());
-    if bootable {
-        Check::new(
-            "device",
-            CheckStatus::Warn,
-            "none online; glass will boot an AVD on start (auto lifecycle)",
-        )
-    } else {
-        Check::new("device", CheckStatus::Fail, "no online device and no AVD to boot")
-            .with_remedy("start an emulator (`emulator -avd <name>`) or create an AVD")
+            format!("{} online; glass will use {serial}", p.online.len()),
+        ),
+        Action::Boot => {
+            if matches!(&p.avds, Some(avds) if !avds.is_empty()) {
+                Check::new(
+                    "device",
+                    CheckStatus::Warn,
+                    "none online; glass will boot an AVD on start (auto lifecycle)",
+                )
+            } else {
+                Check::new("device", CheckStatus::Fail, "no online device and no AVD to boot")
+                    .with_remedy("start an emulator (`emulator -avd <name>`) or create an AVD")
+            }
+        }
+        Action::Error(msg) => Check::new("device", CheckStatus::Fail, msg.clone()),
     }
 }
 
@@ -220,6 +237,7 @@ mod tests {
             emulator_bin: "/sdk/emulator/emulator".into(),
             avds: Some(vec!["glass".into()]),
             online: vec!["emulator-5554".into()],
+            selection: Action::Attach("emulator-5554".into()),
             deep_requested: false,
             deep: None,
         }
@@ -228,13 +246,17 @@ mod tests {
     fn deep_ok() -> DeepProbe {
         DeepProbe {
             serial: "emulator-5554".into(),
-            screencap: Ok("captured 1080x2400 (10368016 bytes)".into()),
+            screencap: Ok("captured 1080x2400, 10368016 bytes raw".into()),
             uiautomator: Ok("a11y dump OK".into()),
         }
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
         checks.iter().find(|c| c.name == name).expect("check present")
+    }
+
+    fn dev(serial: &str) -> Device {
+        Device { serial: serial.into(), state: "device".into() }
     }
 
     #[test]
@@ -291,13 +313,55 @@ mod tests {
         let d = build_checks(&base_probe());
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Ok);
-        assert!(d.detail.contains("1 online: emulator-5554"));
+        assert!(d.detail.contains("glass will use emulator-5554"));
+    }
+
+    #[test]
+    fn device_attaches_to_selected_serial() {
+        // With several online + GLASS_ANDROID_SERIAL set, the runtime attaches that one;
+        // the doctor must report (and deep-probe) the selected serial, not online.first().
+        // Drive `selection` through the real `decide` so the test tracks runtime behavior.
+        let mut p = base_probe();
+        p.online = vec!["emulator-5554".into(), "emulator-5556".into()];
+        p.selection =
+            decide(&[dev("emulator-5554"), dev("emulator-5556")], Some("emulator-5556"), Lifecycle::Auto);
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Ok);
+        assert!(d.detail.contains("glass will use emulator-5556"));
+    }
+
+    #[test]
+    fn device_ambiguous_multi_without_serial_is_fail() {
+        // Matches the runtime: multiple online + no GLASS_ANDROID_SERIAL => glass refuses,
+        // so a green doctor never hides a start that will reject the host. Build the verdict
+        // from the real `decide` so a change to its refusal message can't silently pass.
+        let mut p = base_probe();
+        p.online = vec!["a".into(), "b".into()];
+        p.selection = decide(&[dev("a"), dev("b")], None, Lifecycle::Auto);
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(d.detail.contains("GLASS_ANDROID_SERIAL"));
+    }
+
+    #[test]
+    fn device_attach_lifecycle_no_device_is_fail() {
+        // Matches the runtime: lifecycle=attach + nothing online => glass won't boot.
+        let mut p = base_probe();
+        p.online = vec![];
+        p.selection = decide(&[], None, Lifecycle::Attach);
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(d.detail.contains("GLASS_ANDROID_LIFECYCLE"));
     }
 
     #[test]
     fn device_none_online_but_bootable_is_warn() {
         let mut p = base_probe();
         p.online = vec![];
+        p.selection = decide(&[], None, Lifecycle::Auto);
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Warn);
@@ -308,7 +372,20 @@ mod tests {
     fn device_none_online_not_bootable_is_fail() {
         let mut p = base_probe();
         p.online = vec![];
-        p.avds = Some(vec![]); // emulator ran, no AVDs => cannot boot
+        p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
+        p.avds = Some(vec![]); // ...but emulator ran with no AVDs => cannot boot
+        let d = build_checks(&p);
+        let d = find(&d, "device");
+        assert_eq!(d.status, CheckStatus::Fail);
+        assert!(d.remedy.as_deref().unwrap().contains("emulator -avd"));
+    }
+
+    #[test]
+    fn device_boot_but_no_emulator_binary_is_fail() {
+        let mut p = base_probe();
+        p.online = vec![];
+        p.selection = decide(&[], None, Lifecycle::Auto); // would boot...
+        p.avds = None; // ...but the emulator binary is absent => cannot boot
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Fail);
@@ -339,10 +416,11 @@ mod tests {
         let mut p = base_probe();
         p.deep_requested = true;
         p.online = vec![];
+        p.selection = Action::Boot;
         p.deep = None;
         let c = build_checks(&p);
         assert_eq!(find(&c, "screencap").status, CheckStatus::Skip);
-        assert!(find(&c, "screencap").detail.contains("no online device"));
+        assert!(find(&c, "screencap").detail.contains("no device selected"));
     }
 
     #[test]
