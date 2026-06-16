@@ -980,6 +980,7 @@ version = "0.0.0"
 dependencies = [
  "glass-core",
  "roxmltree",
+ "serde_json",
 ]
 
 [[package]]

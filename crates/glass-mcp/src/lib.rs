@@ -34,10 +34,14 @@ compile_error!(
 
 /// Construct a backend by name. The only place that knows the concrete backends;
 /// passed to `Glass` as a factory so the backend is built per `glass_start`.
-pub fn make_platform(backend: &str, registry: &glass_android::EmulatorRegistry) -> Result<Backend> {
+pub fn make_platform(
+    backend: &str,
+    registry: &glass_android::EmulatorRegistry,
+    agents: &glass_android::AgentRegistry,
+) -> Result<Backend> {
     if backend == "android" {
         let platform: Box<dyn Platform + Send> =
-            Box::new(glass_android::AndroidPlatform::from_env(registry)?);
+            Box::new(glass_android::AndroidPlatform::from_env(registry, agents)?);
         let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
             Some(Box::new(glass_android::AndroidA11y::new()));
         return Ok(Backend { platform, accessibility });
@@ -109,14 +113,19 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
     let baselines = BaselineStore::new(".glass/baselines");
     let registry = glass_android::EmulatorRegistry::new();
+    let agents = glass_android::AgentRegistry::new();
     let reg_factory = registry.clone();
+    let agents_factory = agents.clone();
     let mut glass = Glass::new(
-        Box::new(move |b| make_platform(b, &reg_factory)),
+        Box::new(move |b| make_platform(b, &reg_factory, &agents_factory)),
         default,
         baselines,
         10_000,
     );
-    glass.set_shutdown_hook(Box::new(move || registry.kill_all()));
+    glass.set_shutdown_hook(Box::new(move || {
+        agents.shutdown();
+        registry.kill_all();
+    }));
     if let Some(sink) = audit {
         glass.set_audit_sink(sink);
     }

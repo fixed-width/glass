@@ -114,6 +114,12 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_EMULATOR_KEEP", scope: EnvScope::Android,
         purpose: "leave a glass-booted emulator running at shutdown instead of stopping it",
         default: "stop it", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_AGENT_JAR", scope: EnvScope::Android,
+        purpose: "path to glass-agent.jar; enables the on-device agent (clipboard + high-fidelity input)",
+        default: "(none; pure-adb paths used)", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_AGENT", scope: EnvScope::Android,
+        purpose: "auto|off; default auto when the jar resolves; off forces the pure-adb paths",
+        default: "auto", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -259,6 +265,7 @@ mod tests {
             "GLASS_ADB", "GLASS_ANDROID_SERIAL", "GLASS_ANDROID_LIFECYCLE",
             "GLASS_EMULATOR", "GLASS_AVD", "GLASS_EMULATOR_ARGS",
             "GLASS_EMULATOR_BOOT_TIMEOUT_MS", "GLASS_EMULATOR_KEEP",
+            "GLASS_ANDROID_AGENT_JAR", "GLASS_ANDROID_AGENT",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];
@@ -286,12 +293,13 @@ mod tests {
     fn text_groups_are_in_fixed_scope_order() {
         let out = render_text(&stub);
         let idx = |s: &str| out.find(s).unwrap_or_else(|| panic!("missing {s} in:\n{out}"));
-        // group order: all < x11 < wayland < linux < windows < network
+        // group order: all < x11 < wayland < linux < windows < android < network
         assert!(idx("GLASS_BACKEND") < idx("GLASS_DISPLAY"));
         assert!(idx("GLASS_DISPLAY") < idx("GLASS_SWAY"));
         assert!(idx("GLASS_SWAY") < idx("GLASS_BWRAP"));
         assert!(idx("GLASS_BWRAP") < idx("GLASS_WIN_SANDBOX_PROVIDER"));
-        assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_TOKEN"));
+        assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_ANDROID_AGENT_JAR"));
+        assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
     }
