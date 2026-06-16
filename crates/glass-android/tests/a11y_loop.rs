@@ -24,8 +24,9 @@ fn settings_spec() -> AppSpec {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn snapshot_has_named_role_typed_nodes() {
+    let agents = glass_android::AgentRegistry::new();
     let mut platform =
-        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &glass_android::AgentRegistry::new())
+        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
             .expect("attach");
     let window = platform.start_app(&settings_spec()).expect("launch settings");
     std::thread::sleep(std::time::Duration::from_millis(1200));
@@ -49,4 +50,6 @@ fn snapshot_has_named_role_typed_nodes() {
     assert!(any_named(&tree.root), "expected at least one named node");
 
     platform.stop_app().expect("stop");
+    drop(platform);     // close the platform's agent connection (if any) first
+    agents.shutdown();  // tear down a launched agent — these tests must not leak it
 }

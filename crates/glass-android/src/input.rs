@@ -257,6 +257,28 @@ mod agent_inject_tests {
         assert_eq!(g[0][0], Pt { x: 350, y: 600, t_ms: 0 });
         assert_eq!(g[0][1], Pt { x: 350, y: 480, t_ms: SWIPE_MS });
     }
+
+    /// Drift guard: `pointer_commands` and `agent_pointer` must agree on absolute
+    /// coordinates. A future edit that shifts one mapping without the other will
+    /// fail here.
+    #[test]
+    fn agent_pointer_agrees_with_pointer_commands_coords() {
+        let o = WindowGeometry { x: 100, y: 200, width: 500, height: 800 };
+        // Click → tap: same absolute coord in both representations.
+        let click = PointerEvent::Click { x: 10, y: 20, button: MouseButton::Left, count: 1, modifiers: vec![] };
+        let argv = pointer_commands(&o, &click);
+        let path = agent_pointer(&o, &click);
+        assert_eq!(argv[0], ["shell", "input", "tap", "110", "220"].map(String::from).to_vec());
+        assert_eq!(path[0][0], Pt { x: 110, y: 220, t_ms: 0 });
+        // Scroll → swipe: anchor + end coords agree between argv and the Pt path.
+        let scroll = PointerEvent::Scroll { x: 250, y: 400, dx: 0, dy: 1, modifiers: vec![] };
+        let sargv = pointer_commands(&o, &scroll);
+        let spath = agent_pointer(&o, &scroll);
+        assert_eq!((sargv[0][3].as_str(), sargv[0][4].as_str()), ("350", "600"));
+        assert_eq!(spath[0][0], Pt { x: 350, y: 600, t_ms: 0 });
+        assert_eq!((sargv[0][5].as_str(), sargv[0][6].as_str()), ("350", "480"));
+        assert_eq!((spath[0][1].x, spath[0][1].y), (350, 480));
+    }
 }
 
 #[cfg(test)]

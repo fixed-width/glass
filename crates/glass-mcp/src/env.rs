@@ -293,12 +293,13 @@ mod tests {
     fn text_groups_are_in_fixed_scope_order() {
         let out = render_text(&stub);
         let idx = |s: &str| out.find(s).unwrap_or_else(|| panic!("missing {s} in:\n{out}"));
-        // group order: all < x11 < wayland < linux < windows < network
+        // group order: all < x11 < wayland < linux < windows < android < network
         assert!(idx("GLASS_BACKEND") < idx("GLASS_DISPLAY"));
         assert!(idx("GLASS_DISPLAY") < idx("GLASS_SWAY"));
         assert!(idx("GLASS_SWAY") < idx("GLASS_BWRAP"));
         assert!(idx("GLASS_BWRAP") < idx("GLASS_WIN_SANDBOX_PROVIDER"));
-        assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_TOKEN"));
+        assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_ANDROID_AGENT_JAR"));
+        assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
     }

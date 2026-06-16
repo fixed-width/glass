@@ -23,7 +23,8 @@ fn settings_spec() -> AppSpec {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL"]
 fn see_loop_launches_and_captures_settings() {
-    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &glass_android::AgentRegistry::new())
+    let agents = glass_android::AgentRegistry::new();
+    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
         .expect("attach to emulator");
     let geo = p.start_app(&settings_spec()).expect("launch settings");
     assert!(geo.width > 0 && geo.height > 0, "non-empty window geometry");
@@ -38,4 +39,6 @@ fn see_loop_launches_and_captures_settings() {
     assert!(!logs.is_empty(), "expected some logcat output");
 
     p.stop_app().expect("stop");
+    drop(p);            // close the platform's agent connection (if any) first
+    agents.shutdown();  // tear down a launched agent — these tests must not leak it
 }

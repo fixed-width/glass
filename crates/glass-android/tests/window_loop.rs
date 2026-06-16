@@ -23,7 +23,8 @@ fn settings_spec() -> AppSpec {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn lists_and_selects_app_windows() {
-    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &glass_android::AgentRegistry::new())
+    let agents = glass_android::AgentRegistry::new();
+    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
         .expect("attach");
     let geo = p.start_app(&settings_spec()).expect("launch settings");
     std::thread::sleep(std::time::Duration::from_millis(800));
@@ -45,4 +46,6 @@ fn lists_and_selects_app_windows() {
     ));
 
     p.stop_app().expect("stop");
+    drop(p);            // close the platform's agent connection (if any) first
+    agents.shutdown();  // tear down a launched agent — these tests must not leak it
 }
