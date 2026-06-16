@@ -54,6 +54,8 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // backends (e.g. windows on a Linux build, or macos anywhere today) are omitted
     // rather than listed as "not built into this binary" placeholders. Accessibility is
     // per-OS (AT-SPI on Linux, UIA on Windows), so it ships with whichever OS is built.
+    // Android is the exception: its crate is host-OS-agnostic and always compiled in, so
+    // its section is always emitted, gated at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];
 
     #[cfg(target_os = "linux")]
@@ -90,6 +92,20 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
     }
 
+    // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always
+    // compiled in. Its checks spawn adb/emulator probes, so run them only when android is
+    // the selected backend; otherwise emit a single note on how to enable them.
+    let android_checks = if backend == "android" {
+        glass_android::doctor::checks(deep)
+    } else {
+        vec![Check::new(
+            "android backend",
+            CheckStatus::Skip,
+            "not selected — set GLASS_BACKEND=android to run adb/emulator checks",
+        )]
+    };
+    sections.push(Section::new("android", Some("android".into()), android_checks));
+
     if let Some(report) = audit {
         sections.push(audit_section(report));
     }
@@ -123,13 +139,21 @@ mod tests {
         // is asserted, so it's deterministic regardless of host.
         let d = diagnose(false);
         let titles: Vec<&str> = d.sections.iter().map(|s| s.title.as_str()).collect();
-        // Only backends compiled into THIS binary get a section — no "not built into
+        // Platform-gated backends compiled into THIS binary get a section; android is
+        // always present (host-OS-agnostic crate) via a runtime gate. No "not built into
         // this binary" placeholders. Accessibility is per-OS (AT-SPI on Linux, UIA on
         // Windows). macos has no backend yet, so it never appears.
         #[cfg(target_os = "linux")]
-        assert_eq!(titles, ["general", "network", "x11", "wayland", "sandbox", "accessibility (linux)"]);
+        assert_eq!(titles, ["general", "network", "x11", "wayland", "sandbox", "accessibility (linux)", "android"]);
         #[cfg(windows)]
-        assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)"]);
+        assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
+        // Android's section is always present and non-empty (real checks when it's the
+        // selected backend, else a single "set GLASS_BACKEND=android" Skip note). Asserting
+        // non-empty catches accidental removal of the section or its else-branch, without
+        // depending on which backend the ambient env resolves to.
+        let android = d.sections.iter().find(|s| s.title == "android").expect("android section");
+        assert_eq!(android.backend.as_deref(), Some("android"));
+        assert!(!android.checks.is_empty());
         // The `network` section is always present (Ok when compiled in, else Skip).
         let net = d.sections.iter().find(|s| s.title == "network").expect("network section");
         assert_eq!(net.checks.len(), 1);

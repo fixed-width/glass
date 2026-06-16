@@ -10,6 +10,7 @@ mod axmap;
 mod avd;
 mod build;
 mod cmd;
+pub mod doctor;
 mod input;
 mod logs;
 mod parse;
