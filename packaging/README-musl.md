@@ -9,6 +9,8 @@ This is the **statically-linked Linux x86-64** build: **no glibc version require
 and **no shared-library prerequisites** — it runs on essentially any x86-64 Linux.
 (A Windows build is also available; macOS is not yet built.) See the project README
 for the full picture: <https://github.com/fixed-width/glass>.
+For Linux-specific display/compositor and containment setup, see
+[docs/running-on-linux.md](../docs/running-on-linux.md).
 
 ---
 

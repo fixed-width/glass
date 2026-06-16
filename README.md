@@ -12,10 +12,9 @@ user "does this look right?".
 
 glass drives apps as an external black box, so it works with any native GUI app
 regardless of toolkit or language. It currently has two Linux backends — **X11** and
-**Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — and a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
-SendInput, UI Automation), behind a platform-agnostic core; a **macOS** backend is
-planned. See [`packaging/README-windows.md`](packaging/README-windows.md)
-for the Windows build and setup.
+**Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
+SendInput, UI Automation) — and an **Android** backend (drives native apps in an AVD emulator over `adb`), behind a platform-agnostic core; a **macOS** backend is
+planned. See the per-host setup guides: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
 ## The loop in practice
 
@@ -41,24 +40,9 @@ between screenshots cost no vision tokens.
 - **Rust**, via [rustup](https://rustup.rs). glass pins a nightly toolchain in
   `rust-toolchain.toml` (needed for the portable-SIMD hot paths); rustup installs it
   automatically on the first build, so there's no toolchain to choose.
-- **A display dependency**, for the backend you'll run:
-  - **Linux / X11 (default):** the headless X server — `sudo apt-get install -y xvfb`
-    (Debian/Ubuntu; Fedora `xorg-x11-server-Xvfb`, Arch `xorg-server-xvfb`). glass spawns
-    its own private display, so Xvfb is all you need for the display — no desktop or
-    window manager. (You'll still need a containment runtime by default — see below.)
-  - **Linux / Wayland:** a discoverable `sway ≥ 1.12` plus [Mesa](https://www.mesa3d.org/) software GL — see
-    [Running on Wayland](#running-on-wayland-sway).
-  - **Windows:** nothing extra; glass uses built-in Windows APIs.
-- **A containment runtime** — launched apps are **sandboxed by default**, and the `default`
-  level is *fail-closed*: with no sandbox available, `glass_start` errors rather than running
-  the app unconfined. So either install the runtime, or set `GLASS_SANDBOX=off` on the server
-  to launch apps unconfined:
-  - **Linux:** [bubblewrap](https://github.com/containers/bubblewrap) — `sudo apt-get install -y bubblewrap`
-    (Fedora/Arch: `bubblewrap`) — **and** unprivileged user namespaces enabled. Ubuntu 23.10+
-    restricts them via AppArmor; allow with
-    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`).
-  - **Windows:** [Sandboxie](https://sandboxie-plus.com/downloads) — Classic or Plus — installed with its service running.
-
+- **Display/compositor and containment runtime** — setup depends on your host OS; see
+  the guide for **[Linux](docs/running-on-linux.md)** · **[Windows](docs/running-on-windows.md)** · **[macOS](docs/running-on-macos.md)**.
+  Apps are **sandboxed by default**; set `GLASS_SANDBOX=off` to run unconfined.
   See [Containment / sandboxing](#containment--sandboxing) for the levels; `glass-mcp doctor`
   checks availability and prints the exact remedy for your system.
 
@@ -102,7 +86,7 @@ claude mcp add glass --scope user -- /absolute/path/to/target/release/glass-mcp
 ```
 
 No `env` is needed: on Linux, the default X11 backend spawns its **own private headless
-display** (see [Running on X11](#running-on-x11-the-default)), and the agent picks
+display** (see [Running on X11](docs/running-on-linux.md)), and the agent picks
 the backend per call via `glass_start`'s `backend` argument (see
 [Backends](#backends)). Add an `env` block only to change the defaults —
 `"env": { "GLASS_DISPLAY": ":42" }` to attach to a display *you* manage, or
@@ -202,7 +186,10 @@ A few capabilities worth knowing:
   and Chrome work too; x64) and real-file copy via `CF_HDROP` (virtual-file drag-out
   — shell extensions, zip attachments — is deferred). So they never touch
   your real clipboard unless you set `GLASS_DISPLAY=:0` or run the Windows
-  backend with `sandbox=off`. `glass_clipboard_get` is also the cheap text-extraction
+  backend with `sandbox=off`. On **Android**, clipboard get/set works through the
+  optional on-device agent (set `GLASS_ANDROID_AGENT_JAR`) —
+  the system clipboard isn't reachable over plain `adb`, so without the agent these
+  tools report unsupported. `glass_clipboard_get` is also the cheap text-extraction
   path: issue `ctrl+a` then `ctrl+c` via `glass_do`, then read here — faster and
   token-free compared to OCR for any app with selectable text.
 - **Real window managers.** On X11, window discovery uses `_NET_WM_PID`, a
@@ -213,8 +200,11 @@ A few capabilities worth knowing:
 - **Multiple windows.** `glass_list_windows` enumerates the app's top-level
   windows (id, title, class, geometry, which is active); `glass_select_window`
   makes one active, and subsequent capture/click/type/window ops target it with
-  window-relative coordinates. All three backends enumerate every top-level the app
-  owns (X11 via EWMH, Wayland via sway IPC, Windows via the launched Job's windows).
+  window-relative coordinates. The desktop backends enumerate every top-level the app
+  owns (X11 via EWMH, Wayland via sway IPC, Windows via the launched Job's windows); the
+  Android backend enumerates the app's on-screen windows — its activity plus any
+  dialogs/popups — from `dumpsys window`, and `glass_select_window` retargets capture and
+  input (Android composites, so there's no z-order raise).
 - **Accessibility tree (semantic addressing).** Where the app exposes an
   accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/Unity/game UIs),
   `glass_a11y_snapshot` returns its elements as compact text — role, name, and
@@ -222,7 +212,7 @@ A few capabilities worth knowing:
   by `#id`. That's deterministic, low-token element addressing that complements the
   pixel loop; it errors (never a fake tree) for apps with no accessible UI, so the
   agent falls back to screenshots. Available on **Linux** (AT-SPI via [`at-spi2-core`](https://gitlab.gnome.org/GNOME/at-spi2-core),
-  serving both X11 and Wayland) and **Windows** ([UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32)); `./scripts/test-a11y.sh`
+  serving both X11 and Wayland), **Windows** ([UI Automation](https://learn.microsoft.com/en-us/windows/win32/winauto/entry-uiauto-win32)), and **Android** (via `uiautomator`); `./scripts/test-a11y.sh`
   exercises the Linux reader end-to-end.
   `glass_a11y_marks` returns the same elements as a numbered Set-of-Mark overlay
   drawn on the screenshot (plus a text legend) for agents that ground visually —
@@ -230,44 +220,20 @@ A few capabilities worth knowing:
 
 ## Containment / sandboxing
 
-On Linux, launched apps run inside a **[bubblewrap](https://github.com/containers/bubblewrap) sandbox** by default (filesystem +
-process containment, network on). Three levels are available via `glass_start`'s `sandbox`
-arg or the `GLASS_SANDBOX` environment variable:
+Launched apps run inside a sandbox by default. Three levels are available via `glass_start`'s
+`sandbox` arg or the `GLASS_SANDBOX` environment variable:
 
-- **`default`** — bubblewrap containment, network on (the default).
-- **`strict`** — same as `default` plus `--unshare-net` (no outbound network from the app).
+- **`default`** — containment on, network on (the default).
+- **`strict`** — containment on, no outbound network from the app.
 - **`off`** — no containment; app runs unconfined.
 
-`default` and `strict` are fail-closed: if `bwrap` is not installed or unprivileged user namespaces
-are disabled, `glass_start` returns an error rather than silently falling back to unconfined.
-Install bubblewrap with `sudo apt-get install -y bubblewrap` on Debian/Ubuntu.
+`default` and `strict` are **fail-closed**: if no containment runtime is available,
+`glass_start` errors rather than silently running the app unconfined. `off` is the explicit
+escape hatch. The `sandbox` level governs the **launched app only** — the optional `build`
+step always runs unsandboxed, with your full developer environment.
 
-On **Windows**, `default`/`strict` give **real in-OS containment via
-Sandboxie Classic** (filesystem/registry virtualization; the boxed app still renders, is
-WGC-captured, and is SendInput-driven on the interactive desktop). `default` = contained,
-network on; `strict` = contained, no network egress; `off` = launched unconfined. The engine
-is Sandboxie, **Classic** by default — cleanly GPLv3 and free for every use. Sandboxie **Plus**
-works too, but it installs to a different directory (e.g. `%ProgramFiles%\Sandboxie-Plus`), so
-auto-detection won't find it — set `GLASS_SANDBOXIE_DIR` to its install directory explicitly.
-Plus's commercial "Business Certificate" is required for some use cases. You install whichever
-you prefer
-([sandboxie-plus.com/downloads](https://sandboxie-plus.com/downloads)), and glass only
-*invokes* `Start.exe`/`SbieIni.exe` as subprocesses (no linking) — the same model as Linux
-`bubblewrap`. It is configurable, not hardcoded: `GLASS_WIN_SANDBOX_PROVIDER=auto|sandboxie|none`
-(default `auto`) and `GLASS_SANDBOXIE_DIR` (default `%ProgramFiles%\Sandboxie`, auto-detected).
-Like Linux, `default`/`strict` are **fail-closed**: if no in-OS provider is available (Sandboxie
-absent / its service not running, or `provider=none`), `glass_start` errors rather than running
-unconfined — `off` is the explicit escape hatch. Native
-AppContainer / Low-integrity were evaluated on-box and **rejected** (the integrity-drop makes
-ordinary Win32 apps fail to render; they need per-app tuning, whereas Sandboxie virtualizes
-transparently). For even stronger isolation, the **VM tier** remains the stronger option: the
-checked-in Windows Sandbox template under `packaging/windows-sandbox/`, or a managed VM running
-`glass-mcp serve --http`. `glass_doctor` reports this posture (its Windows `sandbox` section).
-
-On both platforms the `sandbox` level governs the **launched app only**. The optional
-`build` step always runs **unsandboxed**, with your full developer environment — it's your
-own trusted code and needs your toolchain (and, under `strict`, the very network the app is
-denied). Only the launched run is contained.
+Install the containment runtime per your host guide:
+[Linux](docs/running-on-linux.md) (bubblewrap) · [Windows](docs/running-on-windows.md) (Sandboxie).
 
 ```bash
 glass-mcp doctor   # checks sandbox availability alongside display/compositor deps
@@ -305,6 +271,7 @@ environment variable when set, otherwise a sensible default (a bare name found o
 | bubblewrap | `GLASS_BWRAP` | `bwrap` (on `PATH`) | Linux app containment |
 | Xvfb | `GLASS_XVFB` | `Xvfb` (on `PATH`) | X11 private headless display |
 | sway | `GLASS_SWAY` | auto-discovered¹ | Wayland headless compositor |
+| adb | `GLASS_ADB` | `adb` (on `PATH`) | Android device/emulator control |
 | build shell | `GLASS_SH` | `sh` (on `PATH`) | running `spec.build` |
 | Sandboxie dir | `GLASS_SANDBOXIE_DIR` | `%ProgramFiles%\Sandboxie` | Windows containment |
 
@@ -316,7 +283,7 @@ forces a specific binary and skips that search (and fails closed if the path is 
 ## Backends
 
 The backend is chosen **per `glass_start`** — the tool takes an optional
-`backend` (`"x11"` or `"wayland"` on Linux, `"windows"` on a Windows host), so the
+`backend` (`"x11"` or `"wayland"` on Linux, `"windows"` on a Windows host, or `"android"` for an emulator on any host), so the
 agent can pick per launch with no server restart. When omitted it falls back to the
 `GLASS_BACKEND` environment variable, then to the host default (**windows** on a
 Windows host, otherwise **x11**). The backend is built on `glass_start` (so the
@@ -325,116 +292,26 @@ across backends — only the setup differs:
 
 - **X11** (Linux default) — spawns its own private headless `Xvfb` (nothing to set
   up), or attaches to a display you name with `GLASS_DISPLAY`. See
-  [Running on X11](#running-on-x11-the-default).
+  [docs/running-on-linux.md](docs/running-on-linux.md).
 - **Wayland (wlroots)** — spawns a private headless `sway` compositor per session,
-  so there's no ambient display to set up. See [Running on Wayland](#running-on-wayland-sway).
+  so there's no ambient display to set up. See
+  [docs/running-on-linux.md](docs/running-on-linux.md).
 - **Windows** (default on a Windows host) — drives the app on the interactive
   desktop (WGC capture, SendInput, UI Automation), so it needs an interactive,
   logged-in session to render and capture. Synthetic typing is paced by
   **`GLASS_TYPE_DWELL_MS`** (default `60`) to stay ahead of a fast-injection race in
   the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
-  [`packaging/README-windows.md`](packaging/README-windows.md).
-
-## Running on X11 (the default)
-
-The X11 backend chooses its display from **`GLASS_DISPLAY`** — it never reads
-ambient `$DISPLAY`, so the environment you launch from can't accidentally aim
-glass at your live desktop:
-
-- **`GLASS_DISPLAY` unset (default)** — glass spawns its **own private headless
-  `Xvfb`** on a free display, logs the chosen number to stderr (`glass: spawned a
-  private headless X11 display :N`), and tears it down on exit. Zero setup, fully
-  isolated. Requires `Xvfb` installed (`sudo apt-get install -y xvfb`); override
-  the size with `GLASS_XVFB_SCREEN` (default `1280x800x24`).
-- **`GLASS_DISPLAY=:42`** (or bare `42`) — attach to a display *you* manage, e.g.
-  a persistent sandbox you want to keep watching over VNC (see below).
-- **`GLASS_DISPLAY=:0`** — deliberately drive your **real desktop**. The agent
-  moves your actual cursor and pops real windows; useful for driving live apps,
-  but it competes with you for input. This only happens when you ask for it
-  explicitly.
-
-To watch the default headless display live, point a VNC viewer at the logged
-number: `x11vnc -display :N` + any VNC viewer (or `Xephyr` for a window).
-
-### Optional: a persistent display you control
-
-If you'd rather run your own display — to keep a VNC view pinned across server
-restarts, say — start one and set `GLASS_DISPLAY` to it. A helper manages a
-sandbox `Xvfb` (defaults to `:42`; override the number with `GLASS_DISPLAY`, the
-size with `GLASS_XVFB_SCREEN`):
-
-```bash
-./scripts/sandbox-xvfb.sh start      # also: status | stop | restart
-```
-
-Then register glass with `"env": { "GLASS_DISPLAY": ":42" }`. Watch it with
-`x11vnc -display :42` + any VNC viewer, or run a windowed `Xephyr :42`.
-
-#### Make that display persistent (survive logout)
-
-Run the `Xvfb` at login via a **systemd user service**:
-
-```ini
-# ~/.config/systemd/user/glass-xvfb.service
-[Unit]
-Description=glass sandbox Xvfb display :42
-
-[Service]
-ExecStart=/usr/bin/Xvfb :42 -screen 0 1280x800x24
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now glass-xvfb.service
-loginctl enable-linger "$USER"   # optional: keep it up without an active login
-```
-(Adjust the `Xvfb` path to `command -v Xvfb`.) Or, for desktop-only autostart,
-drop an equivalent `Exec=Xvfb :42 -screen 0 1280x800x24` into a
-`~/.config/autostart/glass-xvfb.desktop` entry.
-
-Requires `Xvfb` installed (`sudo apt-get install -y xvfb` on Debian/Ubuntu).
-
-## Running on Wayland (sway)
-
-Select it **per launch** with `glass_start`'s `backend: "wayland"`, or make it the
-default for every launch with `GLASS_BACKEND=wayland` (e.g.
-`"env": { "GLASS_BACKEND": "wayland" }` in the MCP config). Unlike X11, this
-backend doesn't attach to an ambient display — for each session it spawns a
-**private headless [`sway`](https://swaywm.org) instance** (sway is the
-third-party wlroots-based Wayland compositor) and runs the target app inside it. The app's windows float at their natural size;
-`glass_list_windows`/`glass_select_window` enumerate and switch between them over
-sway IPC. Capture goes through `wlr-screencopy` of the active window's output
-region, and input through the `wlr-virtual-pointer` and `zwp_virtual_keyboard`
-protocols.
-
-glass needs a **sway ≥ 1.12 / wlroots ≥ 0.20** it can discover (no env var): on
-`PATH` (once your distro ships one that new), or installed to
-`~/.local/share/glass/sway/` by the [sway-build](https://github.com/fixed-width/sway-build) tool, or in a
-`sway/` dir beside the `glass-mcp` binary. It also needs the host's Mesa software GL so GPU-less hosts can
-render:
-
-```bash
-sudo apt-get install -y libegl1 libgl1-mesa-dri   # Debian/Ubuntu
-```
-
-Because sway is headless and per-session, there's **nothing to set up or keep
-running** — no persistent display, no `$DISPLAY`/`$WAYLAND_DISPLAY`. sway also
-launches an Xwayland server, so X11-only apps run under this backend too.
-
-Override the headless output size with **`GLASS_WAYLAND_SCREEN`** (default
-`1280x800`, matching the X11 backend). This is the Wayland analog of X11's
-`GLASS_XVFB_SCREEN`, but the format is `WxH` (no depth field) — a headless
-wlroots output has no caller-chosen color depth.
-
-Because the target app runs inside the headless sway that glass spawns (not the
-host's compositor), this backend works on **any** Linux host — **including GNOME and
-KDE** desktops, where the host desktop is simply irrelevant. Driving the user's
-**existing live desktop** session — the Wayland analog of X11 `GLASS_DISPLAY=:0`
-— is a separate, deliberate **non-goal**: it requires the XDG-portal path with an
-interactive consent dialog, unsuited to unattended use.
+  [docs/running-on-windows.md](docs/running-on-windows.md).
+- **Android (AVD)** — drives a native Android app in an emulator over `adb`; **host-OS-agnostic**
+  (it shells out to `adb`, so it runs from a Linux or Windows host — macOS is planned). glass manages the
+  AVD — attaching to a running emulator or booting a headless one itself — and the VM *is* the
+  sandbox, so there's no separate containment step. The app is built (`spec.build`, e.g.
+  `./gradlew assembleDebug`) on the host, installed, and launched; `glass_start`'s `run` is the
+  launch component `package/.Activity` (plus an optional `.apk`). Capture, input, logs,
+  multi-window, and a `uiautomator` accessibility tree work over `adb`; clipboard and
+  high-fidelity input come from an optional on-device agent. Window
+  resize/move (apps are full-screen) and physical devices are non-goals. See the Android section
+  of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
 ## Benchmarking
 
@@ -459,20 +336,22 @@ Profile a hot path as a flamegraph (needs [`cargo install flamegraph`](https://g
 
 ## Platform support
 
-Where glass stands by OS. **✓** supported · **–** not supported · **🚧** planned.
+Where glass stands by OS. **✓** supported · **◑** partial · **–** not supported · **🚧** planned.
 
 <!-- KEEP IN SYNC with the code (and CLAUDE.md) whenever capabilities change. -->
 
-| Capability | Linux (X11 + Wayland) | Windows | macOS |
-|---|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | 🚧 |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | 🚧 AX |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | 🚧 |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | 🚧 |
+| Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
+|---|:--:|:--:|:--:|:--:|
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | 🚧 |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | 🚧 AX |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | ✓ headless emulator | 🚧 |
+
+† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard and high-fidelity input** use the optional on-device agent (see the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without it, input falls back to adb's `input` and clipboard is unavailable. Window resize/move (apps are full-screen) and physical devices are non-goals.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
-running-on-X11/Wayland sections above.
+per-host guides ([Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)).
 
 **Transport:** MCP over **stdio** (default, all platforms) or **network HTTP** (`glass-mcp serve
 --http`, all platforms) — the network transport is behind the default-on `network` cargo feature
@@ -482,7 +361,11 @@ running-on-X11/Wayland sections above.
 
 The Linux feature set is implemented and tested across **both** Linux backends
 (X11 and Wayland/wlroots), and the **Windows** backend (WGC capture, SendInput, UI
-Automation) is built and CI-tested; **macOS is the one OS backend not yet built**.
+Automation) is built and CI-tested. An **Android** backend drives native apps in an AVD
+emulator over `adb` — capture, input, logcat, multi-window, a `uiautomator` accessibility
+tree, a managed AVD (attach-or-boot), and — via an optional
+[on-device agent](docs/running-on-linux.md#optional-on-device-agent-clipboard--high-fidelity-input) (Linux) / [on-device agent](docs/running-on-windows.md#optional-on-device-agent-clipboard--high-fidelity-input) (Windows) — clipboard and high-fidelity input; it's built and
+unit-tested in CI and validated on-device. **macOS is the one OS backend not yet built.**
 
 ## License
 

@@ -34,7 +34,18 @@ compile_error!(
 
 /// Construct a backend by name. The only place that knows the concrete backends;
 /// passed to `Glass` as a factory so the backend is built per `glass_start`.
-pub fn make_platform(backend: &str) -> Result<Backend> {
+pub fn make_platform(
+    backend: &str,
+    registry: &glass_android::EmulatorRegistry,
+    agents: &glass_android::AgentRegistry,
+) -> Result<Backend> {
+    if backend == "android" {
+        let platform = glass_android::AndroidPlatform::from_env(registry, agents)?;
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb())));
+        let platform: Box<dyn Platform + Send> = Box::new(platform);
+        return Ok(Backend { platform, accessibility });
+    }
     let platform: Box<dyn Platform + Send> = match backend {
         #[cfg(target_os = "linux")]
         "wayland" => Box::new(WaylandPlatform::new()?),
@@ -44,9 +55,9 @@ pub fn make_platform(backend: &str) -> Result<Backend> {
         "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
         other => {
             #[cfg(target_os = "linux")]
-            let valid = "\"x11\" or \"wayland\"";
+            let valid = "\"x11\", \"wayland\", or \"android\"";
             #[cfg(windows)]
-            let valid = "\"windows\"";
+            let valid = "\"windows\" or \"android\"";
             return Err(GlassError::Backend(format!("unknown backend {other:?}; use {valid}")));
         }
     };
@@ -63,10 +74,11 @@ pub fn make_platform(backend: &str) -> Result<Backend> {
     Ok(Backend { platform, accessibility })
 }
 
-/// Default backend name from `GLASS_BACKEND` (case-insensitive `wayland`/`windows`/`x11`).
+/// Default backend name from `GLASS_BACKEND` (case-insensitive `wayland`/`windows`/`x11`/`android`).
 /// Unset defaults to the windows backend on a Windows host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
     match env {
+        Some(v) if v.eq_ignore_ascii_case("android") => "android",
         Some(v) if v.eq_ignore_ascii_case("wayland") => "wayland",
         Some(v) if v.eq_ignore_ascii_case("windows") => "windows",
         Some(v) if v.eq_ignore_ascii_case("x11") => "x11",
@@ -100,8 +112,23 @@ pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
 pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
     let baselines = BaselineStore::new(".glass/baselines");
-    let mut glass = Glass::new(Box::new(make_platform), default, baselines, 10_000);
-    if let Some(sink) = audit { glass.set_audit_sink(sink); }
+    let registry = glass_android::EmulatorRegistry::new();
+    let agents = glass_android::AgentRegistry::new();
+    let reg_factory = registry.clone();
+    let agents_factory = agents.clone();
+    let mut glass = Glass::new(
+        Box::new(move |b| make_platform(b, &reg_factory, &agents_factory)),
+        default,
+        baselines,
+        10_000,
+    );
+    glass.set_shutdown_hook(Box::new(move || {
+        agents.shutdown();
+        registry.kill_all();
+    }));
+    if let Some(sink) = audit {
+        glass.set_audit_sink(sink);
+    }
     glass
 }
 
@@ -128,6 +155,12 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
 #[cfg(test)]
 mod tests {
     use super::default_backend;
+
+    #[test]
+    fn android_backend_is_selectable_by_name() {
+        assert_eq!(super::default_backend(Some("android")), "android");
+        assert_eq!(super::default_backend(Some("ANDROID")), "android");
+    }
 
     #[test]
     fn defaults_to_x11_unless_wayland() {

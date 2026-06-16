@@ -13,15 +13,20 @@ A Rust **MCP server** giving an AI agent a closed **build → see → interact �
 over external native GUI apps: launch, capture (lossless WebP), inject mouse/keyboard,
 read logs, diff against baselines, wait-until-stable, and read/drive the accessibility
 tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform` seam: X11
-and Wayland (headless sway) on Linux, Windows (WGC/SendInput); macOS planned.
+and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
+emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
+on-device companion agent); macOS planned.
 
 ## Layout
 
 Cargo workspace at the repo root. Crates: `glass-core` (platform-agnostic heart — the
 `Platform`/`Accessibility` seams, session, `Frame`, diff, stability, log buffer), the
-backends (`glass-x11`, `glass-wayland`, `glass-windows`), the a11y readers
-(`glass-a11y-linux`, `glass-a11y-windows`), `glass-sandbox-linux`, the `glass-mcp` server
-binary, and the `glass-testapp` fixture.
+backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`), the a11y readers
+(`glass-a11y-linux`, `glass-a11y-windows`; the Android `uiautomator` reader lives in
+`glass-android`), `glass-sandbox-linux`, the `glass-mcp` server binary, and the
+`glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for the
+optional on-device agent; the agent itself is a separate repo
+(`github.com/fixed-width/glass-android-agent`), driven over `adb forward`.
 
 ## Commands
 

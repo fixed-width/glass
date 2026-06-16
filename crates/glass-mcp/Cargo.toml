@@ -17,6 +17,7 @@ network = [
 ]
 
 [dependencies]
+glass-android.workspace = true
 glass-core.workspace = true
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["full"] }

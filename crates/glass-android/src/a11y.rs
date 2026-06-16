@@ -1,0 +1,108 @@
+//! `AndroidA11y` — the Android accessibility reader. Drives `uiautomator dump`
+//! over adb and maps the result via `crate::axmap`. Resolves its own device
+//! lazily, since the `Accessibility` trait is handed only an `AxContext`.
+
+use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
+use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
+
+use crate::adb::Adb;
+use crate::input::{key_commands, pointer_commands};
+use crate::axmap::{build_tree, check_dump_status};
+use crate::target::{choose_serial, parse_devices};
+
+const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
+
+/// Reads the active window's accessibility tree via `uiautomator`.
+pub struct AndroidA11y {
+    adb: Adb,
+    resolved: bool,
+}
+
+impl AndroidA11y {
+    pub fn new() -> Self {
+        Self { adb: Adb::from_env(), resolved: false }
+    }
+
+    /// Bind directly to an already-resolved (serial-bound) adb client. Used in production so
+    /// the reader talks to the exact device the platform resolved, instead of re-resolving.
+    pub fn for_adb(adb: Adb) -> Self {
+        Self { adb, resolved: true }
+    }
+
+    /// Bind the adb client to a device serial on first use (lazy).
+    fn ensure_adb(&mut self) -> Result<Adb> {
+        if !self.resolved {
+            let listing = self.adb.run(["devices"])?;
+            let online: Vec<_> = parse_devices(&listing)
+                .into_iter()
+                .filter(|d| d.state == "device")
+                .collect();
+            let serial = choose_serial(std::env::var("GLASS_ANDROID_SERIAL").ok().as_deref(), &online)?;
+            self.adb = self.adb.with_serial(serial);
+            self.resolved = true;
+        }
+        Ok(self.adb.clone())
+    }
+}
+
+impl Default for AndroidA11y {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Accessibility for AndroidA11y {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        let window = ctx.window.clone();
+        let adb = self.ensure_adb()?;
+        // Remove any stale dump so a dump that fails to (re)write can't yield a prior tree.
+        let _ = adb.run(["shell", "rm", "-f", DUMP_PATH]);
+        let status = adb.run(["shell", "uiautomator", "dump", DUMP_PATH])?;
+        check_dump_status(&status)?;
+        let xml = adb.run(["shell", "cat", DUMP_PATH])?;
+        build_tree(&xml, &window)
+    }
+
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        let window = ctx.window.clone();
+        // Re-snapshot and number nodes to locate the target by its pre-order id.
+        let mut tree = self.snapshot(ctx)?;
+        tree.assign_ids();
+        let node = tree.find(target.id).ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        if !target.matches(node.role, node.name.as_deref())
+            || !target.bounds_consistent(node.bounds, 8)
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+        if !node.states.editable {
+            return Err(GlassError::AxElementNotEditable(target.id.0));
+        }
+        let (cx, cy) = node
+            .bounds
+            .and_then(|b| b.clamped_center(window.width, window.height))
+            .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+
+        let adb = self.ensure_adb()?;
+        // Tap to focus, select-all, delete, type — reusing the P2 input builders.
+        let tap = PointerEvent::Click {
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        };
+        for argv in pointer_commands(&window, &tap) {
+            adb.run(argv.iter().map(String::as_str))?;
+        }
+        for ev in [
+            KeyEvent::Chord("ctrl+a".into()),
+            KeyEvent::Chord("BackSpace".into()),
+            KeyEvent::Text(text.to_string()),
+        ] {
+            for argv in key_commands(&ev)? {
+                adb.run(argv.iter().map(String::as_str))?;
+            }
+        }
+        Ok(())
+    }
+}

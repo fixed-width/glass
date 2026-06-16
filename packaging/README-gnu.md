@@ -8,6 +8,8 @@ instead of asking you "does this look right?".
 This is the **Linux x86-64 (glibc)** build. (A Windows build is also available; macOS
 is not yet built.) See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
+For Linux-specific display/compositor and containment setup, see
+[docs/running-on-linux.md](../docs/running-on-linux.md).
 
 > **Prefer the static build if you can.** A statically-linked build is also available
 > that needs no glibc version and no shared libs at all — only `xvfb`. Use this glibc
