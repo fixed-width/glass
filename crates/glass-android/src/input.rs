@@ -163,8 +163,8 @@ fn agent_path(fx: i32, fy: i32, tx: i32, ty: i32, ms: u64) -> Vec<Pt> {
 
 /// Map a pointer event to the agent's gesture(s): a list of absolute-display pointer paths
 /// (one path per tap/swipe), mirroring `pointer_commands`' window→display mapping. `Click`
-/// with count N yields N single-point tap paths; `Drag` yields one interpolated multi-point
-/// path; `Scroll` yields one 2-point swipe; `Move` yields nothing.
+/// with count N yields N single-point tap paths; `Drag` and `Scroll` each yield one
+/// interpolated multi-point path (so the swipe has real velocity); `Move` yields nothing.
 pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Vec<Pt>> {
     let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
     match *event {
@@ -185,7 +185,9 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
             let hi_y = (origin.y + origin.height as i32 - 1).max(origin.y);
             let ex = cx.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX)).clamp(origin.x, hi_x);
             let ey = cy.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX)).clamp(origin.y, hi_y);
-            vec![vec![Pt { x: cx, y: cy, t_ms: 0 }, Pt { x: ex, y: ey, t_ms: SWIPE_MS }]]
+            // Interpolate so the swipe carries real velocity (a fling), not a single jump —
+            // a 2-point swipe under-scrolls and stalls on long lists (dogfood #17).
+            vec![agent_path(cx, cy, ex, ey, SWIPE_MS)]
         }
     }
 }
@@ -283,13 +285,16 @@ mod agent_inject_tests {
     }
 
     #[test]
-    fn scroll_maps_to_one_swipe() {
+    fn scroll_interpolates_one_swipe() {
         let ev = PointerEvent::Scroll { x: 250, y: 400, dx: 0, dy: 1, modifiers: vec![] };
         let g = agent_pointer(&origin(), &ev);
         assert_eq!(g.len(), 1);
-        assert_eq!(g[0].len(), 2);
-        assert_eq!(g[0][0], Pt { x: 350, y: 600, t_ms: 0 });
-        assert_eq!(g[0][1], Pt { x: 350, y: 480, t_ms: SWIPE_MS });
+        let path = &g[0];
+        assert_eq!(path.first().copied().unwrap(), Pt { x: 350, y: 600, t_ms: 0 });
+        assert_eq!(path.last().copied().unwrap(), Pt { x: 350, y: 480, t_ms: SWIPE_MS });
+        // Interpolated samples give the swipe real velocity → a fling, so deep scrolls
+        // don't stall. Dogfood finding #17.
+        assert!(path.len() >= 8, "scroll should fling with interpolated samples, got {}", path.len());
     }
 
     /// Drift guard: `pointer_commands` and `agent_pointer` must agree on absolute
@@ -311,7 +316,8 @@ mod agent_inject_tests {
         assert_eq!((sargv[0][3].as_str(), sargv[0][4].as_str()), ("350", "600"));
         assert_eq!(spath[0][0], Pt { x: 350, y: 600, t_ms: 0 });
         assert_eq!((sargv[0][5].as_str(), sargv[0][6].as_str()), ("350", "480"));
-        assert_eq!((spath[0][1].x, spath[0][1].y), (350, 480));
+        let end = spath[0].last().unwrap();
+        assert_eq!((end.x, end.y), (350, 480));
     }
 }
 

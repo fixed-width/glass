@@ -481,9 +481,19 @@ pub fn element_match<'a>(
     value_contains: Option<&str>,
     condition: ElementCondition,
 ) -> ElementMatch<'a> {
+    // Role filter: exact match, OR — when an interactable role is requested — an actable
+    // node that the backend left generically classified. Toolkits like Jetpack Compose
+    // surface a real button as a clickable `Group`/`Other` (the role is lost), so an exact
+    // filter would miss it; matching by name + actability finds it anyway.
+    let role_match = |n: &AxNode, r: AxRole| {
+        n.role == r
+            || (r.is_interactable()
+                && n.states.focusable
+                && matches!(n.role, AxRole::Group | AxRole::Other))
+    };
     let selector_match = |n: &AxNode| -> bool {
         name.is_none_or(|q| n.name.as_deref().is_some_and(|nm| nm.contains(q)))
-            && role.is_none_or(|r| n.role == r)
+            && role.is_none_or(|r| role_match(n, r))
             && value_contains.is_none_or(|v| n.value.as_deref().is_some_and(|val| val.contains(v)))
     };
     if condition == ElementCondition::Disappears {
@@ -694,6 +704,40 @@ mod tests {
             ElementMatch::Satisfied(Some(n)) => assert_eq!(n.name.as_deref(), Some("Save")),
             other => panic!("expected the Button, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn role_button_matches_unclassified_actable_node() {
+        // A Compose button often surfaces as a clickable (focusable) Group with the role
+        // lost — `role:"Button"` should still find it by name + actability.
+        let mut clickable = leaf(AxRole::Group, "Submit");
+        clickable.states = AxStates { focusable: true, enabled: true, ..Default::default() };
+        let inert = leaf(AxRole::Group, "Panel"); // a non-actable Group must NOT match Button
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("App".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![clickable, inert],
+        };
+        let t = AxTree { root, count: 0 };
+        assert!(
+            matches!(
+                element_match(&t, Some("Submit"), Some(AxRole::Button), None, ElementCondition::Appears),
+                ElementMatch::Satisfied(Some(n)) if n.name.as_deref() == Some("Submit")
+            ),
+            "clickable Group should satisfy role:Button"
+        );
+        assert!(
+            matches!(
+                element_match(&t, Some("Panel"), Some(AxRole::Button), None, ElementCondition::Appears),
+                ElementMatch::Pending
+            ),
+            "a non-actable Group must not satisfy role:Button"
+        );
     }
 
     #[test]
