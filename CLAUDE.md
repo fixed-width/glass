@@ -24,9 +24,10 @@ Cargo workspace at the repo root. Crates: `glass-core` (platform-agnostic heart 
 backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`), the a11y readers
 (`glass-a11y-linux`, `glass-a11y-windows`; the Android `uiautomator` reader lives in
 `glass-android`), `glass-sandbox-linux`, the `glass-mcp` server binary, and the
-`glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for the
-optional on-device agent; the agent itself is a separate repo
-(`github.com/fixed-width/glass-android-agent`), driven over `adb forward`.
+`glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for two
+optional on-device companions — an `app_process` agent (clipboard + high-fidelity input) and an
+`AccessibilityService` (Compose-rich a11y tree + high-fidelity `set_value`); both live in the
+separate repo `github.com/fixed-width/glass-android-agent`, driven over `adb forward`.
 
 ## Commands
 

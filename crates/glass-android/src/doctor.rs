@@ -41,6 +41,14 @@ struct Probe {
     agent_jar_exists: bool,
     /// Deep launch+ping result; `Some` only when deep && configured && a device is attachable.
     agent_deep: Option<Result<(), String>>,
+    /// `GLASS_ANDROID_A11Y` is explicitly `off`.
+    a11y_off: bool,
+    /// Resolved `GLASS_ANDROID_A11Y_APK` (non-empty), else `None`.
+    a11y_apk: Option<String>,
+    /// The `a11y_apk` path is an existing file (false when `a11y_apk` is `None`).
+    a11y_apk_exists: bool,
+    /// Deep install+enable+ping result; `Some` only when deep && configured && a device is attachable.
+    a11y_deep: Option<Result<(), String>>,
 }
 
 /// Result of the deep probes against one online device. `Ok` carries a human detail,
@@ -101,6 +109,23 @@ fn probe(deep_requested: bool) -> Probe {
         _ => None,
     };
 
+    let a11y_off = get("GLASS_ANDROID_A11Y").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    let a11y_apk = crate::a11y_service::a11y_apk(&get);
+    let a11y_apk_exists =
+        a11y_apk.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
+    // Deep a11y probe: install + enable the service on the device glass would attach to,
+    // ping it, then tear it down (reuses the production lifecycle; idempotent + clean).
+    let a11y_deep = match &selection {
+        Action::Attach(serial) if deep_requested && !a11y_off && a11y_apk_exists => {
+            let apk = a11y_apk.as_deref().unwrap();
+            let reg = crate::a11y_service::A11yServiceRegistry::new();
+            let r = reg.ensure(&adb.with_serial(serial.clone()), apk).map(|_| ()).map_err(|e| e.to_string());
+            reg.shutdown();
+            Some(r)
+        }
+        _ => None,
+    };
+
     Probe {
         adb_bin,
         adb_version,
@@ -114,6 +139,10 @@ fn probe(deep_requested: bool) -> Probe {
         agent_jar,
         agent_jar_exists,
         agent_deep,
+        a11y_off,
+        a11y_apk,
+        a11y_apk_exists,
+        a11y_deep,
     }
 }
 
@@ -165,7 +194,7 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
 /// Build the Android doctor section's checks from observed state. Pure.
 fn build_checks(p: &Probe) -> Vec<Check> {
     let (screencap, uiautomator) = deep_checks(p);
-    vec![adb_check(p), emulator_check(p), device_check(p), agent_check(p), screencap, uiautomator]
+    vec![adb_check(p), emulator_check(p), device_check(p), agent_check(p), a11y_check(p), screencap, uiautomator]
 }
 
 fn agent_check(p: &Probe) -> Check {
@@ -207,6 +236,40 @@ fn agent_check(p: &Probe) -> Check {
             };
             Check::new("agent", CheckStatus::Skip, reason)
         }
+    }
+}
+
+fn a11y_check(p: &Probe) -> Check {
+    if p.a11y_off {
+        return Check::new("a11y-service", CheckStatus::Skip, "disabled (GLASS_ANDROID_A11Y=off)");
+    }
+    let Some(apk) = &p.a11y_apk else {
+        return Check::new(
+            "a11y-service",
+            CheckStatus::Skip,
+            "not configured (optional — set GLASS_ANDROID_A11Y_APK for a Compose-rich tree + high-fidelity set_value)",
+        );
+    };
+    if !p.a11y_apk_exists {
+        return Check::new(
+            "a11y-service",
+            CheckStatus::Warn,
+            format!("GLASS_ANDROID_A11Y_APK={apk} but no file there"),
+        )
+        .with_remedy("build the APK (`./gradlew :a11y:assembleDebug` in glass-android-agent), or fix the path");
+    }
+    // a11y_deep is Some only when deep was requested (see probe); so None means
+    // either not-deep (Ok configured) or deep-but-no-attachable-device (Skip).
+    match (&p.a11y_deep, p.deep_requested) {
+        (Some(Ok(())), _) => {
+            Check::new("a11y-service", CheckStatus::Ok, format!("reachable (installed + enabled + ping ok): {apk}"))
+        }
+        (Some(Err(e)), _) => {
+            Check::new("a11y-service", CheckStatus::Fail, format!("service did not come up: {e}"))
+                .with_remedy("ensure the device allows enabling an AccessibilityService and the APK is a valid debug build")
+        }
+        (None, false) => Check::new("a11y-service", CheckStatus::Ok, format!("configured: {apk}")),
+        (None, true) => Check::new("a11y-service", CheckStatus::Skip, "no online device to probe"),
     }
 }
 
@@ -323,6 +386,10 @@ mod tests {
             agent_jar: Some("/sdk/glass-agent.jar".into()),
             agent_jar_exists: true,
             agent_deep: None,
+            a11y_off: false,
+            a11y_apk: Some("/sdk/glass-a11y.apk".into()),
+            a11y_apk_exists: true,
+            a11y_deep: None,
         }
     }
 
@@ -546,11 +613,11 @@ mod tests {
     }
 
     #[test]
-    fn checks_always_emits_the_six_named_checks() {
+    fn checks_always_emits_the_seven_named_checks() {
         // Spawns adb/emulator; both fail-fast when absent, so this is host-independent.
         let c = checks(false);
         let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["adb", "emulator", "device", "agent", "screencap", "uiautomator"]);
+        assert_eq!(names, ["adb", "emulator", "device", "agent", "a11y-service", "screencap", "uiautomator"]);
     }
 
     #[test]
@@ -619,5 +686,73 @@ mod tests {
         p.selection = Action::Boot; // deep but nothing attachable → agent not probed
         p.agent_deep = None;
         assert_eq!(find(&build_checks(&p), "agent").status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn a11y_configured_passive_is_ok() {
+        let c = build_checks(&base_probe());
+        let a = find(&c, "a11y-service");
+        assert_eq!(a.status, CheckStatus::Ok);
+        assert!(a.detail.contains("configured"));
+    }
+
+    #[test]
+    fn a11y_off_is_skip() {
+        let mut p = base_probe();
+        p.a11y_off = true;
+        assert_eq!(find(&build_checks(&p), "a11y-service").status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn a11y_unset_is_skip() {
+        let mut p = base_probe();
+        p.a11y_apk = None;
+        p.a11y_apk_exists = false;
+        let a = build_checks(&p);
+        let a = find(&a, "a11y-service");
+        assert_eq!(a.status, CheckStatus::Skip);
+        assert!(a.detail.contains("GLASS_ANDROID_A11Y_APK"));
+    }
+
+    #[test]
+    fn a11y_apk_missing_is_warn() {
+        let mut p = base_probe();
+        p.a11y_apk = Some("/nope.apk".into());
+        p.a11y_apk_exists = false;
+        let a = build_checks(&p);
+        let a = find(&a, "a11y-service");
+        assert_eq!(a.status, CheckStatus::Warn);
+        assert!(a.remedy.as_deref().unwrap().contains("gradlew"));
+    }
+
+    #[test]
+    fn a11y_deep_ok_is_ok() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.a11y_deep = Some(Ok(()));
+        let a = build_checks(&p);
+        let a = find(&a, "a11y-service");
+        assert_eq!(a.status, CheckStatus::Ok);
+        assert!(a.detail.contains("reachable"));
+    }
+
+    #[test]
+    fn a11y_deep_fail_is_fail() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.a11y_deep = Some(Err("connect refused".into()));
+        let a = build_checks(&p);
+        let a = find(&a, "a11y-service");
+        assert_eq!(a.status, CheckStatus::Fail);
+        assert!(a.detail.contains("connect refused"));
+    }
+
+    #[test]
+    fn a11y_deep_no_device_is_skip() {
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.selection = Action::Boot; // deep but nothing attachable → service not probed
+        p.a11y_deep = None;
+        assert_eq!(find(&build_checks(&p), "a11y-service").status, CheckStatus::Skip);
     }
 }

@@ -188,6 +188,16 @@ Set `ANDROID_SDK_ROOT` so glass can find the emulator alongside `adb`:
 $env:ANDROID_SDK_ROOT = "$env:LOCALAPPDATA\Android\Sdk"
 ```
 
+### Create an AVD
+
+If you don't have an emulator image yet, install a system image and create one (named `glass`
+here, which `GLASS_AVD=glass` then selects):
+
+```powershell
+sdkmanager "system-images;android-34;google_apis;x86_64"
+avdmanager create avd -n glass -k "system-images;android-34;google_apis;x86_64" --device pixel_6
+```
+
 ### Managed AVD (attach-or-boot)
 
 Like Android Studio, glass prefers to attach: if an emulator is already online it uses
@@ -217,6 +227,28 @@ glass pushes, launches, and tears the agent down for you. Without it, glass uses
 `adb` input path and `glass_clipboard_*` report unsupported. Set
 **`GLASS_ANDROID_AGENT=off`** to force the `adb` paths even when the jar is present.
 
+### Optional on-device a11y service (Compose-rich tree + high-fidelity `set_value`)
+
+A second optional companion — also from **[glass-android-agent](https://github.com/fixed-width/glass-android-agent)** —
+sharpens semantic addressing. `glass_a11y_snapshot` works over plain `adb` via `uiautomator`,
+but `uiautomator` tends to flatten Jetpack Compose UIs, and `glass_set_value` falls back to
+keystroke simulation. The on-device **AccessibilityService** reads the live
+`AccessibilityNodeInfo` tree (so Compose semantics come through) and sets editable fields via
+the real `ACTION_SET_TEXT`.
+
+Point **`GLASS_ANDROID_A11Y_APK`** at its `glass-a11y.apk`:
+
+- Download the prebuilt APK from the agent repo's [Releases](https://github.com/fixed-width/glass-android-agent/releases).
+- Or build it yourself: `./gradlew :a11y:assembleDebug` in the agent repo.
+
+glass installs the APK, enables the service, connects, and restores the device's prior
+accessibility state on teardown — all automatically. Without it, glass uses the `uiautomator`
+reader. Set **`GLASS_ANDROID_A11Y=off`** to force `uiautomator` even when the APK is present.
+
+Scope: the service backs the **accessibility tree + `glass_set_value`**. Element *clicks* stay
+coordinate taps (precise, using the service's bounds) — Android's `ACTION_CLICK` is unreliable
+on Compose, so glass doesn't route clicks through it.
+
 ### Check the setup
 
 ```powershell
@@ -226,7 +258,7 @@ glass-mcp doctor
 glass-mcp doctor --deep
 ```
 
-Reports `adb`, the emulator + AVDs, the online/attachable device, and the agent status.
+Reports `adb`, the emulator + AVDs, the online/attachable device, and the agent + a11y-service status.
 
 ---
 

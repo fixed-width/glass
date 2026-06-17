@@ -6,11 +6,13 @@
 
 mod adb;
 mod a11y;
+mod a11y_service;
 mod agent;
-mod axmap;
 mod avd;
+mod axmap;
 mod build;
 mod cmd;
+mod conn;
 pub mod doctor;
 mod input;
 mod logs;
@@ -20,6 +22,7 @@ mod screencap;
 mod target;
 
 pub use a11y::AndroidA11y;
+pub use a11y_service::{ServiceA11y, A11yServiceRegistry, a11y_apk};
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;

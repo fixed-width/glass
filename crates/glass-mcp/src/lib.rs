@@ -38,11 +38,24 @@ pub fn make_platform(
     backend: &str,
     registry: &glass_android::EmulatorRegistry,
     agents: &glass_android::AgentRegistry,
+    a11y: &glass_android::A11yServiceRegistry,
 ) -> Result<Backend> {
     if backend == "android" {
         let platform = glass_android::AndroidPlatform::from_env(registry, agents)?;
+        let get = |k: &str| std::env::var(k).ok();
         let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-            Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb())));
+            match glass_android::a11y_apk(&get) {
+                Some(apk) => match a11y.ensure(&platform.resolved_adb(), &apk) {
+                    // The package isn't known until start_app; the device service serves the
+                    // ACTIVE window regardless, so an empty package is correct for the MVP.
+                    Ok(client) => Some(Box::new(glass_android::ServiceA11y::new(client, String::new()))),
+                    Err(e) => {
+                        eprintln!("glass-android: a11y service unavailable, using uiautomator: {e}");
+                        Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb())))
+                    }
+                },
+                None => Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb()))),
+            };
         let platform: Box<dyn Platform + Send> = Box::new(platform);
         return Ok(Backend { platform, accessibility });
     }
@@ -114,15 +127,18 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let baselines = BaselineStore::new(".glass/baselines");
     let registry = glass_android::EmulatorRegistry::new();
     let agents = glass_android::AgentRegistry::new();
+    let a11y = glass_android::A11yServiceRegistry::new();
     let reg_factory = registry.clone();
     let agents_factory = agents.clone();
+    let a11y_factory = a11y.clone();
     let mut glass = Glass::new(
-        Box::new(move |b| make_platform(b, &reg_factory, &agents_factory)),
+        Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory)),
         default,
         baselines,
         10_000,
     );
     glass.set_shutdown_hook(Box::new(move || {
+        a11y.shutdown();
         agents.shutdown();
         registry.kill_all();
     }));
