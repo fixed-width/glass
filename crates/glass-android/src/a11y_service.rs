@@ -14,8 +14,15 @@ use crate::axmap::class_to_role;
 use crate::conn::Conn;
 
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
-/// window-relative. Ids are left at `AxNodeId(0)`; the core assigns them (same pre-order order
-/// as the device's `ref`, so `AxNodeId(n)` == device `ref` n).
+/// window-relative. Ids are left `AxNodeId(0)`; the core's `AxTree::assign_ids` numbers them
+/// pre-order (root = 0).
+///
+/// INVARIANT: `AxNodeId(n)` equals the device's `ref` n. Both sides number the *same* node set in
+/// the *same* pre-order: the device assigns `ref` while walking its adapted tree, sends that tree
+/// as JSON `children` (in order), and this mapper recurses `children` in order without skipping or
+/// reordering — a node with malformed/missing bounds errors the whole snapshot rather than being
+/// dropped (which would shift every later id). So `set_value` can send `target.id.0` as the device
+/// `ref` and hit the right node. Keep both walks pre-order if either side changes.
 fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let text = v.get("text").and_then(Value::as_str);
@@ -23,13 +30,17 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
-    let (x, y, w, h) = (
-        b.get("x").and_then(Value::as_i64).unwrap_or(0) as i32,
-        b.get("y").and_then(Value::as_i64).unwrap_or(0) as i32,
-        b.get("w").and_then(Value::as_i64).unwrap_or(0) as u32,
-        b.get("h").and_then(Value::as_i64).unwrap_or(0) as u32,
-    );
+    let b_i32 = |k: &str| -> Result<i32> {
+        b.get(k).and_then(Value::as_i64).and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| GlassError::AccessibilityUnavailable(format!("node bounds.{k} missing or out of range")))
+    };
+    let b_u32 = |k: &str| -> Result<u32> {
+        b.get(k).and_then(Value::as_i64).and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| GlassError::AccessibilityUnavailable(format!("node bounds.{k} missing or out of range")))
+    };
+    let (x, y, w, h) = (b_i32("x")?, b_i32("y")?, b_u32("w")?, b_u32("h")?);
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    // Recursion depth = a11y tree depth (shallow in practice; not hardened against adversarial nesting).
     let children = match v.get("children").and_then(Value::as_array) {
         Some(arr) => arr.iter().map(|c| json_to_node(c, win)).collect::<Result<Vec<_>>>()?,
         None => vec![],
@@ -38,11 +49,14 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
         id: AxNodeId(0),
         role: class_to_role(cls),
         raw_role: cls.to_string(),
+        // name: the element's own text label, falling back to content-description.
+        // value: editable text content only (content-description is not user-entered text).
         name: text.or(desc).map(str::to_string),
         value: text.map(str::to_string),
         states: AxStates {
             enabled: flag("enabled"),
             editable: flag("editable"),
+            // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,
             ..Default::default()
@@ -54,6 +68,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
 
 /// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
 pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
+    // count stays 0 until the caller runs AxTree::assign_ids (per the Accessibility trait contract).
     Ok(AxTree { root: json_to_node(tree, win)?, count: 0 })
 }
 
