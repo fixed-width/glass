@@ -89,7 +89,7 @@ pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
 
 /// Parse the local port `adb forward tcp:0 …` prints on stdout.
 /// Skips blank lines and `* daemon …` noise that adb emits on a cold start.
-fn parse_forward_port(out: &str) -> Option<u16> {
+pub(crate) fn parse_forward_port(out: &str) -> Option<u16> {
     out.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('*'))

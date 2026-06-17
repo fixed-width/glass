@@ -73,15 +73,12 @@ pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTre
 }
 
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
-pub(crate) struct ServiceClient {
+pub struct ServiceClient {
     conn: Mutex<Conn>,
     port: u16,
 }
 
 impl ServiceClient {
-    // NOTE: connect/ping are not yet called outside this module; will be consumed by Task 5
-    // (A11yServiceRegistry). The allows are temporary and will be removed when that task wires them.
-    #[allow(dead_code)]
     pub fn connect(port: u16) -> Result<ServiceClient> {
         let conn = Conn::open(port)?;
         Ok(ServiceClient { conn: Mutex::new(conn), port })
@@ -120,7 +117,6 @@ impl ServiceClient {
         self.call(req).map(|_| ())
     }
 
-    #[allow(dead_code)]
     pub fn ping(&self) -> Result<()> {
         self.call(json!({"op": "ping"})).map(|_| ())
     }
@@ -165,6 +161,82 @@ impl Accessibility for ServiceA11y {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
         self.client.action(target.id.0, "set_text", Some(text))
+    }
+}
+
+use std::sync::Arc;
+use crate::adb::Adb;
+
+const SERVICE_COMPONENT: &str = "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
+const SOCKET: &str = "glass-a11y";
+
+/// `GLASS_ANDROID_A11Y_APK` (path to the APK) when configured + not disabled.
+pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    if get("GLASS_ANDROID_A11Y").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false) {
+        return None;
+    }
+    get("GLASS_ANDROID_A11Y_APK").filter(|s| !s.is_empty())
+}
+
+struct Active { serial: Option<String>, port: u16, prior_enabled: String }
+
+/// Owns the installed+enabled state so the shutdown hook can restore it. Cloneable (shared
+/// `Arc<Mutex<Option<Active>>>`) like `AgentRegistry`.
+#[derive(Clone, Default)]
+pub struct A11yServiceRegistry { state: Arc<std::sync::Mutex<Option<Active>>> }
+
+impl A11yServiceRegistry {
+    pub fn new() -> Self { Self::default() }
+
+    /// Install + enable the service on `adb`'s device, forward a port, connect, ping. Returns a
+    /// connected `ServiceClient`. The apk path is resolved from env by the caller.
+    pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
+        adb.run(["install", "-r", apk])?;
+        let prior = adb.run(["shell", "settings", "get", "secure", "enabled_accessibility_services"])
+            .unwrap_or_default();
+        let prior = prior.trim();
+        let prior = if prior == "null" { "" } else { prior };
+        let want = if prior.is_empty() { SERVICE_COMPONENT.to_string() }
+                   else if prior.split(':').any(|s| s == SERVICE_COMPONENT) { prior.to_string() }
+                   else { format!("{prior}:{SERVICE_COMPONENT}") };
+        adb.run(["shell", "settings", "put", "secure", "enabled_accessibility_services", &want])?;
+        adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", "1"])?;
+        let out = adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")])?;
+        let port = crate::agent::parse_forward_port(&out)
+            .ok_or_else(|| GlassError::Backend(format!("adb forward gave no port: {out:?}")))?;
+        let client = wait_for_service(port)?; // connect + ping, retry briefly
+        *self.state.lock().unwrap() = Some(Active {
+            serial: adb.serial().map(str::to_string), port, prior_enabled: prior.to_string(),
+        });
+        Ok(client)
+    }
+
+    /// Restore the prior accessibility-services setting and remove the forward. Best-effort,
+    /// idempotent. No process to kill (disabling unbinds the service).
+    pub fn shutdown(&self) {
+        if let Ok(mut g) = self.state.lock() {
+            if let Some(a) = g.take() {
+                let adb = match &a.serial {
+                    Some(s) => Adb::from_env().with_serial(s.clone()),
+                    None => Adb::from_env(),
+                };
+                let _ = adb.run(["shell", "settings", "put", "secure",
+                    "enabled_accessibility_services", &a.prior_enabled]);
+                let _ = adb.run(["forward", "--remove", &format!("tcp:{}", a.port)]);
+            }
+        }
+    }
+}
+
+/// Connect to the forwarded service port, retrying briefly while the service binds + listens.
+pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match ServiceClient::connect(port).and_then(|c| c.ping().map(|_| c)) {
+            Ok(c) => return Ok(c),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(150)),
+        }
     }
 }
 

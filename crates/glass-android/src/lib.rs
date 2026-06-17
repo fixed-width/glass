@@ -22,7 +22,7 @@ mod screencap;
 mod target;
 
 pub use a11y::AndroidA11y;
-pub use a11y_service::ServiceA11y;
+pub use a11y_service::{ServiceA11y, A11yServiceRegistry, a11y_apk};
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;
