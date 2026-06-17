@@ -232,7 +232,7 @@ Over plain `adb`, glass types with `input text`/`keyevent` and can't reach the s
 clipboard. A small companion — **[glass-android-agent](https://github.com/fixed-width/glass-android-agent)**,
 a separate Apache-2.0 repo — closes both gaps: it runs on the device as a shell-uid
 `app_process` server and gives glass real `MotionEvent`/`KeyEvent` injection (faithful
-Unicode) and clipboard get/set.
+Unicode, plus multi-touch gestures via `glass_gesture`) and clipboard get/set.
 
 Point **`GLASS_ANDROID_AGENT_JAR`** at its `glass-agent.jar`:
 
