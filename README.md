@@ -100,6 +100,22 @@ The agent then gets tools like `glass_start`, `glass_screenshot`, `glass_click`,
 `glass_wait_for_log`, `glass_do`, `glass_clipboard_get`, `glass_clipboard_set`, and
 `glass_doctor`.
 
+### Drive it well — the `glass-drive` skill
+
+glass works with any MCP agent as-is, but an agent drives it more reliably with a little
+guidance: verify with cheap text before spending a screenshot, fall back from the a11y tree to
+pixels on a canvas, pace drags, reach for multi-touch. That's packaged as
+**[`glass-drive`](https://github.com/fixed-width/skills)** — an open
+[Agent Skill](https://agentskills.io) that works across agents (Claude Code, Codex, Cursor,
+OpenCode, …):
+
+```bash
+npx skills add fixed-width/skills -s glass-drive
+```
+
+It's optional — glass needs no app integration and no skill to run — but it saves the agent
+rediscovering the driving loop from scratch.
+
 ### Over the network
 
 stdio requires glass-mcp to run on the **same machine** as the agent. When the agent
