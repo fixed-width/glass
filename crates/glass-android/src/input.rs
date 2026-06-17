@@ -139,10 +139,32 @@ fn meta_keycode(m: Modifier) -> u32 {
     }
 }
 
+/// Pixels between interpolated samples along an agent drag path. Small enough that the first
+/// samples clear Android touch-slop near the start, so a drag is recognized at its true origin
+/// rather than its end (a 2-point path injects DOWN+UP only, which touch-slop swallows).
+const AGENT_STEP_PX: i32 = 16;
+
+/// Interpolate a drag path `from`→`to` over `ms` into evenly spaced samples (≥8) so the
+/// on-device agent injects real `ACTION_MOVE` events. First sample `t=0`, last `t=ms`.
+fn agent_path(fx: i32, fy: i32, tx: i32, ty: i32, ms: u64) -> Vec<Pt> {
+    let dist = (tx - fx).abs().max((ty - fy).abs());
+    let steps = (dist / AGENT_STEP_PX).clamp(8, 64) as u64;
+    (0..=steps)
+        .map(|i| {
+            let f = i as f64 / steps as f64;
+            Pt {
+                x: fx + ((tx - fx) as f64 * f).round() as i32,
+                y: fy + ((ty - fy) as f64 * f).round() as i32,
+                t_ms: (ms as f64 * f).round() as u64,
+            }
+        })
+        .collect()
+}
+
 /// Map a pointer event to the agent's gesture(s): a list of absolute-display pointer paths
 /// (one path per tap/swipe), mirroring `pointer_commands`' window→display mapping. `Click`
-/// with count N yields N single-point tap paths; `Drag`/`Scroll` yield one 2-point path;
-/// `Move` yields nothing.
+/// with count N yields N single-point tap paths; `Drag` yields one interpolated multi-point
+/// path; `Scroll` yields one 2-point swipe; `Move` yields nothing.
 pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Vec<Pt>> {
     let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
     match *event {
@@ -155,7 +177,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
             let (fx, fy) = abs(from_x, from_y);
             let (tx, ty) = abs(to_x, to_y);
             let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
-            vec![vec![Pt { x: fx, y: fy, t_ms: 0 }, Pt { x: tx, y: ty, t_ms: ms }]]
+            vec![agent_path(fx, fy, tx, ty, ms)]
         }
         PointerEvent::Scroll { x, y, dx, dy, .. } => {
             let (cx, cy) = abs(x, y);
@@ -235,11 +257,23 @@ mod agent_inject_tests {
     }
 
     #[test]
-    fn drag_maps_to_two_point_path_with_duration() {
+    fn drag_interpolates_intermediate_samples() {
         let ev = PointerEvent::Drag { from_x: 0, from_y: 0, to_x: 50, to_y: 60, duration_ms: 250, button: MouseButton::Left, modifiers: vec![] };
         let g = agent_pointer(&origin(), &ev);
         assert_eq!(g.len(), 1);
-        assert_eq!(g[0], vec![Pt { x: 100, y: 200, t_ms: 0 }, Pt { x: 150, y: 260, t_ms: 250 }]);
+        let path = &g[0];
+        // Endpoints exact: DOWN at abs(from) @ t0, UP at abs(to) @ t=ms.
+        assert_eq!(path.first().copied().unwrap(), Pt { x: 100, y: 200, t_ms: 0 });
+        assert_eq!(path.last().copied().unwrap(), Pt { x: 150, y: 260, t_ms: 250 });
+        // Real ACTION_MOVE samples between DOWN and UP — a 2-point path is swallowed by
+        // Android touch-slop (onDragStart fires at the end coordinate). See dogfood F8.
+        assert!(path.len() >= 8, "expected interpolated samples, got {}", path.len());
+        // Monotonic in time and along the (down-right) path.
+        assert!(path.windows(2).all(|w| w[0].t_ms <= w[1].t_ms), "t_ms not monotonic: {path:?}");
+        assert!(
+            path.windows(2).all(|w| w[0].x <= w[1].x && w[0].y <= w[1].y),
+            "not monotonic along path: {path:?}"
+        );
     }
 
     #[test]
