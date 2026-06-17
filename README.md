@@ -85,12 +85,12 @@ claude mcp add glass --scope user -- /absolute/path/to/target/release/glass-mcp
 }
 ```
 
-No `env` is needed: on Linux, the default X11 backend spawns its **own private headless
-display** (see [Running on X11](docs/running-on-linux.md)), and the agent picks
-the backend per call via `glass_start`'s `backend` argument (see
-[Backends](#backends)). Add an `env` block only to change the defaults —
-`"env": { "GLASS_DISPLAY": ":42" }` to attach to a display *you* manage, or
-`"env": { "GLASS_BACKEND": "wayland" }` to make Wayland the default backend.
+No `env` is needed: glass uses your host's default backend (see [Backends](#backends)) and,
+where the host supports it, gives each session its **own isolated display** with nothing to
+set up — so the app never lands on your desktop. The agent can also choose a backend per call
+via `glass_start`'s `backend` argument. Add an `env` block only to override a default; the
+specific knobs are host-specific — see your host guide:
+**[Linux](docs/running-on-linux.md)** · **[Windows](docs/running-on-windows.md)** · **[macOS](docs/running-on-macos.md)**.
 
 The agent then gets tools like `glass_start`, `glass_screenshot`, `glass_click`,
 `glass_drag`, `glass_scroll`, `glass_type`, `glass_key`, `glass_wait_stable`,
@@ -121,9 +121,9 @@ cargo feature (a `--no-default-features` build is stdio-only).
 
 ### Verify your setup
 
-`glass-mcp doctor` checks that the environment glass needs is in place (Xvfb for X11,
-a discoverable `sway ≥ 1.12` and Mesa software GL for Wayland) and prints how to fix
-anything missing:
+`glass-mcp doctor` checks that the environment glass needs is in place — your backend's
+display dependencies, the containment runtime, and the external tool paths — and prints how
+to fix anything missing:
 
 ```bash
 glass-mcp doctor          # per-check ✓/⚠/✗ with remedies; exits non-zero if the
@@ -236,7 +236,7 @@ Install the containment runtime per your host guide:
 [Linux](docs/running-on-linux.md) (bubblewrap) · [Windows](docs/running-on-windows.md) (Sandboxie).
 
 ```bash
-glass-mcp doctor   # checks sandbox availability alongside display/compositor deps
+glass-mcp doctor   # checks sandbox availability alongside your backend's display deps
 ```
 
 ## Audit log (opt-in)
@@ -290,13 +290,13 @@ Windows host, otherwise **x11**). The backend is built on `glass_start` (so the
 server boots even with no display/compositor), and the MCP tools behave identically
 across backends — only the setup differs:
 
-- **X11** (Linux default) — spawns its own private headless `Xvfb` (nothing to set
+- **X11** (Linux) — spawns its own private headless `Xvfb` (nothing to set
   up), or attaches to a display you name with `GLASS_DISPLAY`. See
   [docs/running-on-linux.md](docs/running-on-linux.md).
 - **Wayland (wlroots)** — spawns a private headless `sway` compositor per session,
   so there's no ambient display to set up. See
   [docs/running-on-linux.md](docs/running-on-linux.md).
-- **Windows** (default on a Windows host) — drives the app on the interactive
+- **Windows** — drives the app on the interactive
   desktop (WGC capture, SendInput, UI Automation), so it needs an interactive,
   logged-in session to render and capture. Synthetic typing is paced by
   **`GLASS_TYPE_DWELL_MS`** (default `60`) to stay ahead of a fast-injection race in
