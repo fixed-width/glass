@@ -143,6 +143,26 @@ pub struct DragArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct PointerArgs {
+    /// Window-relative start point.
+    pub from: PointArg,
+    /// Window-relative end point. Equal to `from` = a finger held in place.
+    pub to: PointArg,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PointArg { pub x: i32, pub y: i32 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GestureArgs {
+    /// 2–10 simultaneous pointers; each a straight from→to segment. Pinch = two pointers
+    /// moving toward/apart; rotate = two on an arc; two-finger swipe = two parallel segments.
+    pub pointers: Vec<PointerArgs>,
+    /// Span the gesture over this many ms (all pointers down at 0, up at duration). Default 250.
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollArgs {
     pub x: i32,
     pub y: i32,

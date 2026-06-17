@@ -53,7 +53,7 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 pub mod platform;
 pub use platform::{
     A11yBind, AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel, Segment,
-    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp, MAX_GESTURE_POINTERS,
 };
 
 pub mod accessibility;

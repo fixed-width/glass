@@ -49,6 +49,25 @@ pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
     Ok(ToolOutput::text("ok"))
 }
 
+pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
+    let n = a.pointers.len();
+    if n < 2 {
+        return Err("glass_gesture needs 2+ pointers; use glass_drag for a single pointer".into());
+    }
+    if n > glass_core::MAX_GESTURE_POINTERS {
+        return Err(format!("too many pointers ({n}); max is {}", glass_core::MAX_GESTURE_POINTERS));
+    }
+    let pointers = a
+        .pointers
+        .iter()
+        .map(|p| glass_core::Segment { from_x: p.from.x, from_y: p.from.y, to_x: p.to.x, to_y: p.to.y })
+        .collect();
+    glass
+        .pointer(&PointerEvent::Gesture { pointers, duration_ms: a.duration_ms.unwrap_or(250).min(10_000) })
+        .map_err(|e| e.to_string())?;
+    Ok(ToolOutput::text("ok"))
+}
+
 pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
     let modifiers = parse_modifiers(a.modifiers.as_deref())?;
     glass
@@ -142,6 +161,29 @@ mod tests {
         assert_eq!(text(&drag(&mut g, &d).unwrap()), "ok");
         let s = ScrollArgs { x: 5, y: 6, dx: None, dy: Some(2), modifiers: None };
         assert_eq!(text(&scroll(&mut g, &s).unwrap()), "ok");
+    }
+
+    #[test]
+    fn gesture_two_pointers_ok() {
+        let mut g = started();
+        let a = GestureArgs {
+            pointers: vec![
+                PointerArgs { from: PointArg { x: 30, y: 40 }, to: PointArg { x: 10, y: 40 } },
+                PointerArgs { from: PointArg { x: 50, y: 40 }, to: PointArg { x: 70, y: 40 } },
+            ],
+            duration_ms: Some(120),
+        };
+        assert_eq!(text(&gesture(&mut g, &a).unwrap()), "ok");
+    }
+
+    #[test]
+    fn gesture_one_pointer_errors() {
+        let mut g = started();
+        let a = GestureArgs {
+            pointers: vec![PointerArgs { from: PointArg { x: 1, y: 1 }, to: PointArg { x: 2, y: 2 } }],
+            duration_ms: None,
+        };
+        assert!(gesture(&mut g, &a).is_err());
     }
 
     #[test]
