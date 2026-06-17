@@ -394,7 +394,8 @@ impl ServerHandler for GlassServer {
                  app — no app integration needed. One active session; tools target it implicitly; \
                  choose a backend (x11 or wayland) at glass_start.\n\n\
                  Loop: glass_start launches the app and captures its logs; glass_screenshot to see \
-                 it; glass_click / glass_type / glass_key / glass_scroll / glass_drag to interact \
+                 it; glass_click / glass_type / glass_key / glass_scroll / glass_drag (and \
+                 glass_gesture for android multi-touch) to interact \
                  (coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left); \
                  glass_wait_stable to let a render settle before you look or compare; glass_logs \
                  for the app's stdout/stderr.\n\n\

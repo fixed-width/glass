@@ -93,7 +93,7 @@ specific knobs are host-specific — see your host guide:
 **[Linux](docs/running-on-linux.md)** · **[Windows](docs/running-on-windows.md)** · **[macOS](docs/running-on-macos.md)**.
 
 The agent then gets tools like `glass_start`, `glass_screenshot`, `glass_click`,
-`glass_drag`, `glass_scroll`, `glass_type`, `glass_key`, `glass_wait_stable`,
+`glass_drag`, `glass_scroll`, `glass_gesture`, `glass_type`, `glass_key`, `glass_wait_stable`,
 `glass_baseline_save`, `glass_diff`, `glass_logs`, `glass_list_windows`,
 `glass_select_window`, `glass_a11y_snapshot`, `glass_click_element`, `glass_set_value`,
 `glass_a11y_marks`, `glass_wait_for_element`, `glass_wait_for_region`,
@@ -171,6 +171,11 @@ A few capabilities worth knowing:
   `glass_scroll` accept an optional `modifiers` array (e.g. `["ctrl"]`,
   `["ctrl","shift"]`) that holds Ctrl/Shift/Alt/Super during the action —
   enabling shift/ctrl-click multi-select, modified drags, and Ctrl+scroll.
+- **Multi-touch gestures (`glass_gesture`, Android only).** Drive 2–10 simultaneous
+  pointers — each a straight `from→to` segment over a shared duration — for pinch-zoom,
+  two-finger rotate, and two-finger swipes. Android-only and requires the on-device
+  agent (`adb`'s `input` has no multi-touch command); the `adb` fallback and the
+  desktop backends refuse with a clear error rather than degrade to a single pointer.
 - **Batched input (`glass_do`).** Run an ordered sequence of input actions
   (click/type/key/move/drag/scroll/settle) in one call with an optional text-first
   `then` observe (settle/diff/screenshot), collapsing per-action round-trips and
@@ -348,7 +353,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | ✓ headless emulator | 🚧 |
 
-† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard and high-fidelity input** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. Window resize/move (apps are full-screen) and physical devices are non-goals.
+† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard, high-fidelity input, and multi-touch gestures (`glass_gesture`)** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` (single-pointer only — no multi-touch) and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. Window resize/move (apps are full-screen) and physical devices are non-goals.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
