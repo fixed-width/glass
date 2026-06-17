@@ -161,6 +161,16 @@ The Android backend is **host-OS-agnostic** — it shells out to `adb.exe`, so i
 from a Windows host just as from Linux (macOS is planned — glass-mcp doesn't build on
 macOS yet; see [running-on-macos.md](running-on-macos.md)).
 
+### Supported Android versions
+
+glass is developed and tested against **Android 14 (API 34)** — use an `android-34` Google
+APIs image (as below) when in doubt. The `adb` backend (capture, input, windows, logs) assumes
+no particular version and runs on older releases too. The optional companions — the agent
+(clipboard, high-fidelity input, multi-touch) and the a11y service — declare an Android 7.0
+(API 24) `minSdk` floor, but API 34 is what's exercised. The agent reaches non-public framework
+internals by reflection, with a fallback for the one that moved at API 34 (input injection), so
+newer releases should keep working; wide cross-API testing isn't done.
+
 ### Install the Android SDK tools
 
 Install `adb.exe` and `emulator.exe` from the Android SDK. Two routes:
