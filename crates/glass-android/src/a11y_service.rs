@@ -30,15 +30,16 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
-    let b_i32 = |k: &str| -> Result<i32> {
-        b.get(k).and_then(Value::as_i64).and_then(|v| i32::try_from(v).ok())
-            .ok_or_else(|| GlassError::AccessibilityUnavailable(format!("node bounds.{k} missing or out of range")))
+    // Clamp rather than error: a live a11y tree legitimately contains degenerate/off-screen rects
+    // (zero or inverted w/h out of `getBoundsInScreen`), so erroring would fail the whole snapshot
+    // on one odd node. Negative w/h clamp to 0; values outside the int range clamp to its bounds.
+    let bi = |k: &str| -> i32 {
+        b.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     };
-    let b_u32 = |k: &str| -> Result<u32> {
-        b.get(k).and_then(Value::as_i64).and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| GlassError::AccessibilityUnavailable(format!("node bounds.{k} missing or out of range")))
+    let bu = |k: &str| -> u32 {
+        b.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32
     };
-    let (x, y, w, h) = (b_i32("x")?, b_i32("y")?, b_u32("w")?, b_u32("h")?);
+    let (x, y, w, h) = (bi("x"), bi("y"), bu("w"), bu("h"));
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     // Recursion depth = a11y tree depth (shallow in practice; not hardened against adversarial nesting).
     let children = match v.get("children").and_then(Value::as_array) {
@@ -217,8 +218,15 @@ impl A11yServiceRegistry {
                     Some(s) => Adb::from_env().with_serial(s.clone()),
                     None => Adb::from_env(),
                 };
-                let _ = adb.run(["shell", "settings", "put", "secure",
-                    "enabled_accessibility_services", &a.prior_enabled]);
+                if a.prior_enabled.is_empty() {
+                    // `settings put ... ""` errors ("Bad arguments"); delete to clear the list and
+                    // turn a11y off (we enabled it; with no prior service nothing else needs it).
+                    let _ = adb.run(["shell", "settings", "delete", "secure", "enabled_accessibility_services"]);
+                    let _ = adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", "0"]);
+                } else {
+                    let _ = adb.run(["shell", "settings", "put", "secure",
+                        "enabled_accessibility_services", &a.prior_enabled]);
+                }
                 let _ = adb.run(["forward", "--remove", &format!("tcp:{}", a.port)]);
             }
         }
@@ -273,5 +281,19 @@ mod tests {
         let save = t.find(AxNodeId(2)).unwrap();
         assert_eq!(save.role, AxRole::Button);
         assert_eq!(save.name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn degenerate_bounds_clamp_instead_of_erroring() {
+        // A live a11y tree legitimately has zero/inverted rects; the mapper must clamp, not fail.
+        let v = json!({
+            "ref": 0, "class": "android.view.View",
+            "bounds": {"x": -5, "y": 10, "w": -3, "h": 0},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false
+        });
+        let t = tree_from_json(&v, &win()).expect("degenerate bounds must not error the snapshot");
+        let b = t.root.bounds.unwrap();
+        assert_eq!((b.width, b.height), (0, 0)); // negative/zero w/h clamp to 0
+        assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
     }
 }
