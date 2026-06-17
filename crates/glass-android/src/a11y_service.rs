@@ -1,0 +1,193 @@
+//! `ServiceA11y` — the on-device-AccessibilityService a11y reader. Talks the `tree`/`action`
+//! line-JSON protocol to `glass-a11y.apk` over an `adb forward`ed socket, and maps the live
+//! `AccessibilityNodeInfo` tree (sent as JSON) into glass's `AxTree`.
+
+use std::sync::Mutex;
+
+use serde_json::{json, Value};
+
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree};
+use glass_core::platform::WindowGeometry;
+use glass_core::{GlassError, Result};
+
+use crate::axmap::class_to_role;
+use crate::conn::Conn;
+
+/// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
+/// window-relative. Ids are left at `AxNodeId(0)`; the core assigns them (same pre-order order
+/// as the device's `ref`, so `AxNodeId(n)` == device `ref` n).
+fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
+    let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
+    let text = v.get("text").and_then(Value::as_str);
+    let desc = v.get("desc").and_then(Value::as_str);
+    let b = v
+        .get("bounds")
+        .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
+    let (x, y, w, h) = (
+        b.get("x").and_then(Value::as_i64).unwrap_or(0) as i32,
+        b.get("y").and_then(Value::as_i64).unwrap_or(0) as i32,
+        b.get("w").and_then(Value::as_i64).unwrap_or(0) as u32,
+        b.get("h").and_then(Value::as_i64).unwrap_or(0) as u32,
+    );
+    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let children = match v.get("children").and_then(Value::as_array) {
+        Some(arr) => arr.iter().map(|c| json_to_node(c, win)).collect::<Result<Vec<_>>>()?,
+        None => vec![],
+    };
+    Ok(AxNode {
+        id: AxNodeId(0),
+        role: class_to_role(cls),
+        raw_role: cls.to_string(),
+        name: text.or(desc).map(str::to_string),
+        value: text.map(str::to_string),
+        states: AxStates {
+            enabled: flag("enabled"),
+            editable: flag("editable"),
+            focusable: flag("clickable"),
+            visible: true,
+            ..Default::default()
+        },
+        bounds: Some(AxRect { x: x - win.x, y: y - win.y, width: w, height: h }),
+        children,
+    })
+}
+
+/// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
+pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
+    Ok(AxTree { root: json_to_node(tree, win)?, count: 0 })
+}
+
+/// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
+pub(crate) struct ServiceClient {
+    conn: Mutex<Conn>,
+    port: u16,
+}
+
+impl ServiceClient {
+    // NOTE: connect/ping are not yet called outside this module; will be consumed by Task 5
+    // (A11yServiceRegistry). The allows are temporary and will be removed when that task wires them.
+    #[allow(dead_code)]
+    pub fn connect(port: u16) -> Result<ServiceClient> {
+        let conn = Conn::open(port)?;
+        Ok(ServiceClient { conn: Mutex::new(conn), port })
+    }
+
+    /// Run a request, transparently reconnecting once if the socket dropped.
+    /// Mirrors `AgentClient::call`: lock, try, reconnect on `(e, true)`, retry.
+    fn call(&self, req: Value) -> Result<Value> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| GlassError::Backend("a11y service client lock poisoned".into()))?;
+        match conn.call(req.clone()) {
+            Ok(v) => Ok(v),
+            Err((e, false)) => Err(e),
+            Err((_, true)) => {
+                // The service's accept loop accepts a fresh connection after a drop.
+                *conn = Conn::open(self.port)?;
+                conn.call(req).map_err(|(e, _)| e)
+            }
+        }
+    }
+
+    fn tree(&self, package: &str) -> Result<Value> {
+        let r = self.call(json!({"op": "tree", "package": package}))?;
+        r.get("tree")
+            .cloned()
+            .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))
+    }
+
+    fn action(&self, ref_id: u32, action: &str, text: Option<&str>) -> Result<()> {
+        let mut req = json!({"op": "action", "ref": ref_id, "action": action});
+        if let Some(t) = text {
+            req["text"] = json!(t);
+        }
+        self.call(req).map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub fn ping(&self) -> Result<()> {
+        self.call(json!({"op": "ping"})).map(|_| ())
+    }
+}
+
+/// The Accessibility reader backed by the on-device service. `package` is the target app.
+pub struct ServiceA11y {
+    client: ServiceClient,
+    package: String,
+}
+
+impl ServiceA11y {
+    // NOTE: new is not yet called outside this module; will be consumed by Task 5
+    // (A11yServiceRegistry). The allow is temporary.
+    #[allow(dead_code)]
+    pub(crate) fn new(client: ServiceClient, package: String) -> Self {
+        Self { client, package }
+    }
+}
+
+impl Accessibility for ServiceA11y {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        let tree = self.client.tree(&self.package)?;
+        tree_from_json(&tree, &ctx.window)
+    }
+
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        // Guard: re-snapshot and verify the ref still points at the same editable element
+        // (role+name+bounds) before acting — the same drift protection as AndroidA11y::set_value.
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
+        let node = tree.find(target.id).ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        if !target.matches(node.role, node.name.as_deref())
+            || !target.bounds_consistent(node.bounds, 8)
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+        if !node.states.editable {
+            return Err(GlassError::AxElementNotEditable(target.id.0));
+        }
+        self.client.action(target.id.0, "set_text", Some(text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glass_core::accessibility::AxRole;
+    use serde_json::json;
+
+    fn win() -> WindowGeometry {
+        WindowGeometry { x: 0, y: 100, width: 1080, height: 2300 }
+    }
+
+    #[test]
+    fn maps_json_tree_to_window_relative_axtree() {
+        let v = json!({
+            "ref": 0, "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [
+                {"ref": 1, "class": "android.widget.EditText", "text": "Email",
+                 "bounds": {"x": 40, "y": 200, "w": 600, "h": 120},
+                 "editable": true, "clickable": true, "enabled": true, "scrollable": false},
+                {"ref": 2, "class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 40, "y": 360, "w": 200, "h": 100},
+                 "editable": false, "clickable": true, "enabled": true, "scrollable": false}
+            ]
+        });
+        let mut t = tree_from_json(&v, &win()).unwrap();
+        t.assign_ids();
+        assert_eq!(t.count, 3);
+        let email = t.find(AxNodeId(1)).unwrap();
+        assert_eq!(email.role, AxRole::TextField);
+        assert_eq!(email.name.as_deref(), Some("Email"));
+        assert!(email.states.editable);
+        assert_eq!(email.bounds.unwrap().y, 100); // window-relative: 200 - win.y 100
+        let save = t.find(AxNodeId(2)).unwrap();
+        assert_eq!(save.role, AxRole::Button);
+        assert_eq!(save.name.as_deref(), Some("Save"));
+    }
+}
