@@ -10,13 +10,12 @@ pub struct Adb {
 }
 
 impl Adb {
-    /// Resolve the `adb` binary from `GLASS_ADB`, else `"adb"` on `PATH`.
+    /// Resolve the `adb` binary: `GLASS_ADB`, else `$SDK/platform-tools/adb` from a
+    /// discovered SDK root (env or a common install location), else `"adb"` on `PATH`.
     /// Serial is unset until a target resolves it.
     pub fn from_env() -> Self {
-        let bin = std::env::var("GLASS_ADB")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "adb".to_string());
+        let get = |k: &str| std::env::var(k).ok();
+        let bin = crate::sdk::resolve_adb(&get, &|p| p.exists()).bin();
         Self { bin, serial: None }
     }
 

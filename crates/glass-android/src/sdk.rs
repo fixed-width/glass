@@ -65,12 +65,89 @@ pub fn resolve_sdk_root(
         .map(|path| SdkRoot { path, source: SdkSource::Default })
 }
 
+/// How `adb` was resolved, for honest diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdbResolution {
+    /// From `GLASS_ADB`.
+    GlassAdb(String),
+    /// `$SDK/platform-tools/adb` under a discovered root.
+    Sdk { bin: String, root: SdkRoot },
+    /// Fell back to `"adb"` on `PATH`.
+    Path,
+}
+
+impl AdbResolution {
+    /// The adb binary to invoke.
+    pub fn bin(&self) -> String {
+        match self {
+            AdbResolution::GlassAdb(p) => p.clone(),
+            AdbResolution::Sdk { bin, .. } => bin.clone(),
+            AdbResolution::Path => "adb".to_string(),
+        }
+    }
+}
+
+fn adb_exe() -> &'static str {
+    #[cfg(windows)]
+    {
+        "adb.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "adb"
+    }
+}
+
+/// Resolve adb: `GLASS_ADB` → `$SDK/platform-tools/adb` (when found + exists) → `"adb"`.
+pub fn resolve_adb(
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> AdbResolution {
+    if let Some(p) = get("GLASS_ADB").filter(|s| !s.is_empty()) {
+        return AdbResolution::GlassAdb(p);
+    }
+    if let Some(root) = resolve_sdk_root(get, exists) {
+        let bin = root.path.join("platform-tools").join(adb_exe());
+        if exists(&bin) {
+            return AdbResolution::Sdk { bin: bin.to_string_lossy().into_owned(), root };
+        }
+    }
+    AdbResolution::Path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn getter(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn adb_glass_override_wins() {
+        let get = getter(&[("GLASS_ADB", "/custom/adb"), ("ANDROID_SDK_ROOT", "/sdk")]);
+        assert_eq!(resolve_adb(&get, &|_| true).bin(), "/custom/adb");
+    }
+
+    #[test]
+    fn adb_from_discovered_sdk() {
+        let get = getter(&[("HOME", "/home/u")]);
+        let exists = |p: &Path| {
+            p == Path::new("/home/u/android-sdk")
+                || p == Path::new("/home/u/android-sdk/platform-tools/adb")
+        };
+        match resolve_adb(&get, &exists) {
+            AdbResolution::Sdk { bin, .. } => {
+                assert_eq!(bin, "/home/u/android-sdk/platform-tools/adb")
+            }
+            other => panic!("expected Sdk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adb_falls_back_to_path() {
+        let get = getter(&[("HOME", "/home/u")]);
+        assert_eq!(resolve_adb(&get, &|_| false).bin(), "adb");
     }
 
     #[test]
