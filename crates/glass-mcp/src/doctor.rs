@@ -92,18 +92,17 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
     }
 
-    // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always
-    // compiled in. Its checks spawn adb/emulator probes, so run them only when android is
-    // the selected backend; otherwise emit a single note on how to enable them.
-    let android_checks = if backend == "android" {
-        glass_android::doctor::checks(deep)
-    } else {
-        vec![Check::new(
-            "android backend",
-            CheckStatus::Skip,
-            "not selected — set GLASS_BACKEND=android to run adb/emulator checks",
-        )]
-    };
+    // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always compiled
+    // in. Run its basic presence checks unconditionally — like the desktop backends — so the
+    // doctor gives android pre-flight regardless of the (launch-frozen) GLASS_BACKEND. Only
+    // the expensive/mutating deep probes (boot AVD, install agent) stay gated to the selected
+    // backend. When android isn't active, soften any Fail to Warn so an irrelevant missing
+    // adb/emulator doesn't fail the overall verdict for a desktop user.
+    let android_selected = backend == "android";
+    let mut android_checks = glass_android::doctor::checks(deep && android_selected);
+    if !android_selected {
+        soften_inactive_android(&mut android_checks);
+    }
     sections.push(Section::new("android", Some("android".into()), android_checks));
 
     if let Some(report) = audit {
@@ -129,9 +128,38 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
     Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
 
+/// When android isn't the active backend, its presence checks are advisory: downgrade any
+/// `Fail` to `Warn` (noting why) so a missing adb/emulator — irrelevant to the current
+/// backend — doesn't fail the overall diagnosis. The actual status is still reported.
+fn soften_inactive_android(checks: &mut [Check]) {
+    for c in checks {
+        if c.status == CheckStatus::Fail {
+            c.status = CheckStatus::Warn;
+            c.detail = format!("{} (only required when the android backend is selected)", c.detail);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_android_fails_soften_to_warn() {
+        let mut checks = vec![
+            Check::new("adb", CheckStatus::Fail, "`adb` not found").with_remedy("install platform-tools"),
+            Check::new("emulator", CheckStatus::Warn, "no AVDs listed"),
+            Check::new("agent", CheckStatus::Skip, "not configured"),
+            Check::new("device", CheckStatus::Ok, "1 online"),
+        ];
+        soften_inactive_android(&mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
+        assert!(checks[0].detail.contains("only required when the android backend is selected"));
+        assert_eq!(checks[0].remedy.as_deref(), Some("install platform-tools")); // remedy preserved
+        assert_eq!(checks[1].status, CheckStatus::Warn); // Warn untouched
+        assert_eq!(checks[2].status, CheckStatus::Skip); // Skip untouched
+        assert_eq!(checks[3].status, CheckStatus::Ok); // Ok untouched
+    }
 
     #[test]
     fn diagnose_lists_only_compiled_in_backends() {
@@ -147,10 +175,10 @@ mod tests {
         assert_eq!(titles, ["general", "network", "x11", "wayland", "sandbox", "accessibility (linux)", "android"]);
         #[cfg(windows)]
         assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
-        // Android's section is always present and non-empty (real checks when it's the
-        // selected backend, else a single "set GLASS_BACKEND=android" Skip note). Asserting
-        // non-empty catches accidental removal of the section or its else-branch, without
-        // depending on which backend the ambient env resolves to.
+        // Android's section is always present and non-empty — its basic presence checks now
+        // run unconditionally (deep probes gated to the selected backend; Fails softened to
+        // Warn when android isn't active). Asserting non-empty catches accidental removal of
+        // the section, without depending on which backend the ambient env resolves to.
         let android = d.sections.iter().find(|s| s.title == "android").expect("android section");
         assert_eq!(android.backend.as_deref(), Some("android"));
         assert!(!android.checks.is_empty());
