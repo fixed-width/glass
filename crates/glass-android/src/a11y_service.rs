@@ -158,7 +158,29 @@ impl Accessibility for ServiceA11y {
         if !node.states.editable {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
-        self.client.action(target.id.0, "set_text", Some(text))
+        self.client.action(target.id.0, "set_text", Some(text))?;
+        // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
+        // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
+        // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
+        // value to land; error honestly only on timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut after = self.snapshot(ctx)?;
+            after.assign_ids();
+            let got = after.find(target.id).and_then(|n| n.value.clone());
+            if got.as_deref() == Some(text) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(GlassError::Backend(format!(
+                    "set_value on element {} did not take (field is {got:?}, wanted {text:?}); a \
+                     Compose field that already holds text can't be replaced via ACTION_SET_TEXT — \
+                     clear it first or unset GLASS_ANDROID_A11Y_APK to use the uiautomator backend",
+                    target.id.0
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
     }
 }
 
