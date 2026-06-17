@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use glass_core::{
-    Actuation, ActuationContext, AuditOutcome, AuditSink, KeyEvent, Modifier, MouseButton,
-    PointerEvent, WindowOp,
+    platform::Segment, Actuation, ActuationContext, AuditOutcome, AuditSink, KeyEvent, Modifier,
+    MouseButton, PointerEvent, WindowOp,
 };
 use rand::RngCore;
 use serde::Serialize;
@@ -140,6 +140,16 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                     "dx": dx,
                     "dy": dy,
                     "modifiers": fmt_mods(modifiers)
+                }),
+                None,
+            ),
+            PointerEvent::Gesture { pointers, duration_ms } => (
+                "gesture",
+                json!({
+                    "pointers": pointers.iter().map(|s: &Segment| json!({
+                        "from_x": s.from_x, "from_y": s.from_y, "to_x": s.to_x, "to_y": s.to_y
+                    })).collect::<Vec<_>>(),
+                    "duration_ms": duration_ms
                 }),
                 None,
             ),

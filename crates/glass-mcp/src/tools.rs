@@ -282,6 +282,11 @@ pub(crate) mod testutil {
             }
         }
         fn send_pointer(&mut self, e: &PointerEvent) -> Result<()> {
+            if let PointerEvent::Gesture { .. } = e {
+                return Err(GlassError::Unsupported(
+                    "multi-touch gestures are only supported on the android backend".into(),
+                ));
+            }
             self.events.lock().unwrap().push(match e {
                 PointerEvent::Click { x, y, .. } => format!("click({x},{y})"),
                 PointerEvent::Move { x, y } => format!("move({x},{y})"),
@@ -289,6 +294,7 @@ pub(crate) mod testutil {
                     format!("drag({from_x},{from_y}->{to_x},{to_y})")
                 }
                 PointerEvent::Scroll { x, y, dx, dy, .. } => format!("scroll({x},{y},{dx},{dy})"),
+                PointerEvent::Gesture { .. } => unreachable!(),
             });
             self.pointer_events.push(e.clone());
             Ok(())

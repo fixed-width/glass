@@ -344,6 +344,11 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             let mut sink = WindowsScrollSink { nx, ny, dx, dy, mod_vks };
             glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
         }
+        PointerEvent::Gesture { .. } => {
+            return Err(GlassError::Unsupported(
+                "multi-touch gestures are only supported on the android backend".into(),
+            ));
+        }
     }
     Ok(())
 }

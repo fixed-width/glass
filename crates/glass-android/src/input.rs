@@ -47,6 +47,7 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
             let ey = cy.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX)).clamp(origin.y, hi_y);
             vec![swipe(cx, cy, ex, ey, SWIPE_MS)]
         }
+        PointerEvent::Gesture { .. } => vec![], // adb has no multi-touch; ShellInjector refuses
     }
 }
 
@@ -189,6 +190,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
             // a 2-point swipe under-scrolls and stalls on long lists (dogfood #17).
             vec![agent_path(cx, cy, ex, ey, SWIPE_MS)]
         }
+        PointerEvent::Gesture { .. } => vec![], // handled by AgentInjector::pointer directly
     }
 }
 
@@ -200,6 +202,11 @@ pub(crate) struct AgentInjector {
 
 impl Injector for AgentInjector {
     fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+        if let PointerEvent::Gesture { .. } = event {
+            return Err(GlassError::Unsupported(
+                "multi-touch requires the on-device agent (not yet wired)".into(),
+            ));
+        }
         // One agent request per gesture: a Click{count:N} sends N sequential taps.
         for gesture in agent_pointer(origin, event) {
             self.agent.pointer(&gesture, "left")?;
@@ -227,6 +234,11 @@ pub struct ShellInjector;
 
 impl Injector for ShellInjector {
     fn pointer(&self, adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
+        if let PointerEvent::Gesture { .. } = event {
+            return Err(GlassError::Unsupported(
+                "multi-touch requires the on-device agent (not yet wired)".into(),
+            ));
+        }
         for argv in pointer_commands(origin, event) {
             adb.run(argv.iter().map(String::as_str))?;
         }
