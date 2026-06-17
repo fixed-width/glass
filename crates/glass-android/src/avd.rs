@@ -287,6 +287,9 @@ mod tests {
         assert_eq!(resolve_emulator_bin(&env, &|_| false), "emulator");
     }
 
+    // Default install locations are OS-specific (Linux paths here); gate so the
+    // cross-platform CI (incl. the Windows job) doesn't run this assertion.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn emulator_from_discovered_default_sdk() {
         // No env at all, but a default SDK location exists on disk.

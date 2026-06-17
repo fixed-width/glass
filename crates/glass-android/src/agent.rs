@@ -76,9 +76,14 @@ impl AgentClient {
     }
 }
 
-/// `GLASS_ANDROID_AGENT_JAR`, if set + non-empty.
+/// `GLASS_ANDROID_AGENT_JAR`, else `glass-agent.jar` dropped in the glass data dir or
+/// next to the `glass-mcp` binary.
 pub fn agent_jar(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    get("GLASS_ANDROID_AGENT_JAR").filter(|s| !s.is_empty())
+    let mut dirs = crate::sdk::artifact_data_dirs(get);
+    dirs.extend(crate::sdk::exe_dir());
+    crate::sdk::resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, get, &|p| {
+        p.is_file()
+    })
 }
 
 /// The agent is used when not explicitly `off` and a jar is resolvable.

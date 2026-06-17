@@ -191,12 +191,17 @@ use crate::adb::Adb;
 const SERVICE_COMPONENT: &str = "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
 const SOCKET: &str = "glass-a11y";
 
-/// `GLASS_ANDROID_A11Y_APK` (path to the APK) when configured + not disabled.
+/// `GLASS_ANDROID_A11Y_APK`, else `glass-a11y.apk` dropped in the glass data dir or next
+/// to the `glass-mcp` binary; `None` when disabled via `GLASS_ANDROID_A11Y=off`.
 pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     if get("GLASS_ANDROID_A11Y").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false) {
         return None;
     }
-    get("GLASS_ANDROID_A11Y_APK").filter(|s| !s.is_empty())
+    let mut dirs = crate::sdk::artifact_data_dirs(get);
+    dirs.extend(crate::sdk::exe_dir());
+    crate::sdk::resolve_artifact("GLASS_ANDROID_A11Y_APK", "glass-a11y.apk", &dirs, get, &|p| {
+        p.is_file()
+    })
 }
 
 struct Active { serial: Option<String>, port: u16, prior_enabled: String, prior_a11y_enabled: String }

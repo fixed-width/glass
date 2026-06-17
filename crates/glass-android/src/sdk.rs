@@ -141,6 +141,57 @@ pub fn sdk_search_trail(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     t
 }
 
+/// The glass per-user data dir(s) where optional on-device artifacts (the agent jar,
+/// the a11y APK) can be dropped so they're found with no env configuration.
+pub fn artifact_data_dirs(get: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    #[cfg(target_os = "windows")]
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(d) = get(var).filter(|s| !s.is_empty()) {
+            v.push(PathBuf::from(d).join("glass"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+        v.push(PathBuf::from(format!("{h}/Library/Application Support/glass")));
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if let Some(x) = get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+            v.push(PathBuf::from(x).join("glass"));
+        } else if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
+            v.push(PathBuf::from(format!("{h}/.local/share/glass")));
+        }
+    }
+    v
+}
+
+/// The directory holding the running executable, for finding artifacts shipped next to
+/// the `glass-mcp` binary. `None` if it can't be determined.
+pub fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from))
+}
+
+/// Resolve an optional artifact (e.g. the agent jar) by `env_var` → the first `dirs`
+/// entry that holds `filename` on disk → `None`. The env path is returned even when it
+/// does not exist, so the caller can still warn "set but missing" rather than silently
+/// discovering a different copy.
+pub fn resolve_artifact(
+    env_var: &str,
+    filename: &str,
+    dirs: &[PathBuf],
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    if let Some(p) = get(env_var).filter(|s| !s.is_empty()) {
+        return Some(p);
+    }
+    dirs.iter()
+        .map(|d| d.join(filename))
+        .find(|cand| exists(cand))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +247,50 @@ mod tests {
         assert!(t.iter().any(|s| s.contains("android-sdk")), "trail: {t:?}");
     }
 
+    // Artifact resolution tests pass `dirs` explicitly, so they're OS-agnostic.
+    #[test]
+    fn artifact_env_override_wins() {
+        let get = getter(&[("GLASS_ANDROID_AGENT_JAR", "/explicit/glass-agent.jar")]);
+        let dirs = [PathBuf::from("/data/glass")];
+        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| true);
+        assert_eq!(r.as_deref(), Some("/explicit/glass-agent.jar"));
+    }
+
+    #[test]
+    fn artifact_found_in_data_dir_when_env_unset() {
+        let get = getter(&[]);
+        let dirs = [PathBuf::from("/data/glass")];
+        let exists = |p: &Path| p == Path::new("/data/glass/glass-agent.jar");
+        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &exists);
+        assert_eq!(r.as_deref(), Some("/data/glass/glass-agent.jar"));
+    }
+
+    #[test]
+    fn artifact_none_when_unset_and_absent() {
+        let get = getter(&[]);
+        let dirs = [PathBuf::from("/data/glass")];
+        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| false);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn artifact_env_set_but_missing_still_returns_the_path() {
+        // So doctor can warn "set but no file there" instead of silently using another copy.
+        let get = getter(&[("GLASS_ANDROID_AGENT_JAR", "/explicit/missing.jar")]);
+        let dirs = [PathBuf::from("/data/glass")];
+        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| false);
+        assert_eq!(r.as_deref(), Some("/explicit/missing.jar"));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn data_dirs_prefer_xdg_then_home() {
+        let get = getter(&[("XDG_DATA_HOME", "/xdg"), ("HOME", "/home/u")]);
+        assert_eq!(artifact_data_dirs(&get)[0], PathBuf::from("/xdg/glass"));
+        let get2 = getter(&[("HOME", "/home/u")]);
+        assert_eq!(artifact_data_dirs(&get2)[0], PathBuf::from("/home/u/.local/share/glass"));
+    }
+
     #[test]
     fn env_root_wins_when_it_exists() {
         let get = getter(&[("ANDROID_SDK_ROOT", "/sdk"), ("HOME", "/home/u")]);
@@ -212,6 +307,9 @@ mod tests {
         assert_eq!(r.source, SdkSource::Env("ANDROID_HOME"));
     }
 
+    // Default install locations are OS-specific (Linux paths here); gate so the
+    // cross-platform CI (incl. the Windows job) doesn't run this assertion.
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn discovers_default_location_with_no_env() {
         let get = getter(&[("HOME", "/home/u")]);

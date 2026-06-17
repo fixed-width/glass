@@ -215,7 +215,7 @@ fn agent_check(p: &Probe) -> Check {
         return Check::new(
             "agent",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_AGENT_JAR for clipboard + high-fidelity input)",
+            "not configured (optional — set GLASS_ANDROID_AGENT_JAR, or drop glass-agent.jar in the glass data dir, for clipboard + high-fidelity input)",
         );
     };
     if !p.agent_jar_exists {
@@ -257,7 +257,7 @@ fn a11y_check(p: &Probe) -> Check {
         return Check::new(
             "a11y-service",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_A11Y_APK for a Compose-rich tree + high-fidelity set_value)",
+            "not configured (optional — set GLASS_ANDROID_A11Y_APK, or drop glass-a11y.apk in the glass data dir, for a Compose-rich tree + high-fidelity set_value)",
         );
     };
     if !p.a11y_apk_exists {
