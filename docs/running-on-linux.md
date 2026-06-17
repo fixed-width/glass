@@ -197,6 +197,16 @@ Point glass at `adb` with **`GLASS_ADB`** (or put it on `PATH`):
 export GLASS_ADB=~/android-sdk/platform-tools/adb
 ```
 
+### Create an AVD
+
+If you don't have an emulator image yet, install a system image and create one (named `glass`
+here, which `GLASS_AVD=glass` then selects):
+
+```bash
+sdkmanager "system-images;android-34;google_apis;x86_64"
+avdmanager create avd -n glass -k "system-images;android-34;google_apis;x86_64" --device pixel_6
+```
+
 ### Managed AVD (attach-or-boot)
 
 Like Android Studio, glass prefers to attach: if an emulator is already online it uses
