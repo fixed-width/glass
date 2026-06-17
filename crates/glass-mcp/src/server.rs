@@ -171,6 +171,17 @@ impl GlassServer {
         self.run(move |g| tools::scroll(g, &a)).await
     }
 
+    #[tool(
+        description = "Perform a multi-touch gesture: 2–10 pointers, each a straight from→to \
+                       segment in window-relative px, all down together at t=0 and up at \
+                       duration_ms. Pinch = two pointers toward/apart; rotate = two on an arc; \
+                       two-finger swipe = two parallel segments; a from==to pointer is held. \
+                       Android backend only (needs the on-device agent)."
+    )]
+    async fn glass_gesture(&self, Parameters(a): Parameters<GestureArgs>) -> Result<CallToolResult, McpError> {
+        self.run(move |g| tools::gesture(g, &a)).await
+    }
+
     #[tool(description = "Type a string of text into the focused window.")]
     async fn glass_type(&self, Parameters(a): Parameters<TypeArgs>) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::type_text(g, &a)).await

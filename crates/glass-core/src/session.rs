@@ -249,6 +249,13 @@ impl Glass {
                 check(from_x, from_y)?;
                 check(to_x, to_y)
             }
+            PointerEvent::Gesture { ref pointers, .. } => {
+                for p in pointers {
+                    check(p.from_x, p.from_y)?;
+                    check(p.to_x, p.to_y)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -777,7 +784,7 @@ mod tests {
     use super::*;
     use crate::accessibility::{AxNode, AxRect, AxRole, AxStates, AxTarget, ElementCondition};
     use crate::audit::{Actuation, ActuationContext, AuditOutcome, AuditSink};
-    use crate::platform::SandboxLevel;
+    use crate::platform::{Segment, SandboxLevel};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1070,6 +1077,20 @@ mod tests {
             modifiers: vec![],
         });
         assert!(matches!(err.unwrap_err(), GlassError::CoordOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn gesture_out_of_bounds_segment_is_rejected() {
+        let mut g = glass_with(FakePlatform::new(100, 80));
+        g.start(&spec()).unwrap();
+        let ev = PointerEvent::Gesture {
+            pointers: vec![
+                Segment { from_x: 10, from_y: 10, to_x: 20, to_y: 20 },
+                Segment { from_x: 10, from_y: 10, to_x: 200, to_y: 20 }, // to_x out of 100-wide window
+            ],
+            duration_ms: 100,
+        };
+        assert!(matches!(g.pointer(&ev), Err(GlassError::CoordOutOfBounds { .. })));
     }
 
     #[test]
@@ -1858,6 +1879,7 @@ mod tests {
                     PointerEvent::Click { .. } => "click",
                     PointerEvent::Drag { .. } => "drag",
                     PointerEvent::Scroll { .. } => "scroll",
+                    PointerEvent::Gesture { .. } => "gesture",
                 },
                 Actuation::Key { event } => match event {
                     KeyEvent::Text(_) => "type",

@@ -289,6 +289,7 @@ pub(crate) mod testutil {
                     format!("drag({from_x},{from_y}->{to_x},{to_y})")
                 }
                 PointerEvent::Scroll { x, y, dx, dy, .. } => format!("scroll({x},{y},{dx},{dy})"),
+                PointerEvent::Gesture { pointers, .. } => format!("gesture({})", pointers.len()),
             });
             self.pointer_events.push(e.clone());
             Ok(())
