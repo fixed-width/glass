@@ -168,7 +168,8 @@ impl Accessibility for ServiceA11y {
             let mut after = self.snapshot(ctx)?;
             after.assign_ids();
             let got = after.find(target.id).and_then(|n| n.value.clone());
-            if got.as_deref() == Some(text) {
+            // An empty field reports no value (None), not Some(""), so compare against "".
+            if got.as_deref().unwrap_or("") == text {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -198,7 +199,7 @@ pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     get("GLASS_ANDROID_A11Y_APK").filter(|s| !s.is_empty())
 }
 
-struct Active { serial: Option<String>, port: u16, prior_enabled: String }
+struct Active { serial: Option<String>, port: u16, prior_enabled: String, prior_a11y_enabled: String }
 
 /// Owns the installed+enabled state so the shutdown hook can restore it. Cloneable (shared
 /// `Arc<Mutex<Option<Active>>>`) like `AgentRegistry`.
@@ -212,10 +213,14 @@ impl A11yServiceRegistry {
     /// connected `ServiceClient`. The apk path is resolved from env by the caller.
     pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
         adb.run(["install", "-r", apk])?;
-        let prior = adb.run(["shell", "settings", "get", "secure", "enabled_accessibility_services"])
-            .unwrap_or_default();
+        let get = |k: &str| adb.run(["shell", "settings", "get", "secure", k]).unwrap_or_default();
+        let prior = get("enabled_accessibility_services");
         let prior = prior.trim();
         let prior = if prior == "null" { "" } else { prior };
+        // Save the global flag too, so teardown restores the device's prior a11y state exactly.
+        let prior_a11y = get("accessibility_enabled");
+        let prior_a11y = prior_a11y.trim();
+        let prior_a11y = if prior_a11y == "null" || prior_a11y.is_empty() { "0" } else { prior_a11y };
         let want = if prior.is_empty() { SERVICE_COMPONENT.to_string() }
                    else if prior.split(':').any(|s| s == SERVICE_COMPONENT) { prior.to_string() }
                    else { format!("{prior}:{SERVICE_COMPONENT}") };
@@ -224,14 +229,25 @@ impl A11yServiceRegistry {
         let out = adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")])?;
         let port = crate::agent::parse_forward_port(&out)
             .ok_or_else(|| GlassError::Backend(format!("adb forward gave no port: {out:?}")))?;
-        let client = wait_for_service(port)?; // connect + ping, retry briefly
+        // From here, a failure must roll back the settings + forward, else a failed `ensure` leaks
+        // an enabled service and a forward slot.
+        let client = match wait_for_service(port) {
+            Ok(c) => c,
+            Err(e) => {
+                restore_a11y(adb, prior, prior_a11y, port);
+                return Err(e);
+            }
+        };
         *self.state.lock().unwrap() = Some(Active {
-            serial: adb.serial().map(str::to_string), port, prior_enabled: prior.to_string(),
+            serial: adb.serial().map(str::to_string),
+            port,
+            prior_enabled: prior.to_string(),
+            prior_a11y_enabled: prior_a11y.to_string(),
         });
         Ok(client)
     }
 
-    /// Restore the prior accessibility-services setting and remove the forward. Best-effort,
+    /// Restore the device's prior accessibility state and remove the forward. Best-effort,
     /// idempotent. No process to kill (disabling unbinds the service).
     pub fn shutdown(&self) {
         if let Ok(mut g) = self.state.lock() {
@@ -240,19 +256,23 @@ impl A11yServiceRegistry {
                     Some(s) => Adb::from_env().with_serial(s.clone()),
                     None => Adb::from_env(),
                 };
-                if a.prior_enabled.is_empty() {
-                    // `settings put ... ""` errors ("Bad arguments"); delete to clear the list and
-                    // turn a11y off (we enabled it; with no prior service nothing else needs it).
-                    let _ = adb.run(["shell", "settings", "delete", "secure", "enabled_accessibility_services"]);
-                    let _ = adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", "0"]);
-                } else {
-                    let _ = adb.run(["shell", "settings", "put", "secure",
-                        "enabled_accessibility_services", &a.prior_enabled]);
-                }
-                let _ = adb.run(["forward", "--remove", &format!("tcp:{}", a.port)]);
+                restore_a11y(&adb, &a.prior_enabled, &a.prior_a11y_enabled, a.port);
             }
         }
     }
+}
+
+/// Restore `enabled_accessibility_services` + `accessibility_enabled` to their prior values and
+/// remove the forwarded port. Shared by `shutdown` and the failed-`ensure` rollback. Best-effort.
+fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: u16) {
+    if prior_enabled.is_empty() {
+        // `settings put ... ""` errors ("Bad arguments"); delete to clear the list instead.
+        let _ = adb.run(["shell", "settings", "delete", "secure", "enabled_accessibility_services"]);
+    } else {
+        let _ = adb.run(["shell", "settings", "put", "secure", "enabled_accessibility_services", prior_enabled]);
+    }
+    let _ = adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", prior_a11y_enabled]);
+    let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
 }
 
 /// Connect to the forwarded service port, retrying briefly while the service binds + listens.
