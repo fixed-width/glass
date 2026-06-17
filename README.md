@@ -308,8 +308,9 @@ across backends — only the setup differs:
   sandbox, so there's no separate containment step. The app is built (`spec.build`, e.g.
   `./gradlew assembleDebug`) on the host, installed, and launched; `glass_start`'s `run` is the
   launch component `package/.Activity` (plus an optional `.apk`). Capture, input, logs,
-  multi-window, and a `uiautomator` accessibility tree work over `adb`; clipboard and
-  high-fidelity input come from an optional on-device agent. Window
+  multi-window, and a `uiautomator` accessibility tree work over `adb`; two optional on-device
+  companions add more — an agent for clipboard + high-fidelity input, and an AccessibilityService
+  for a Compose-rich a11y tree + high-fidelity `set_value`. Window
   resize/move (apps are full-screen) and physical devices are non-goals. See the Android section
   of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
@@ -347,7 +348,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – interactive desktop | ✓ headless emulator | 🚧 |
 
-† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard and high-fidelity input** use the optional on-device agent (see the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without it, input falls back to adb's `input` and clipboard is unavailable. Window resize/move (apps are full-screen) and physical devices are non-goals.
+† **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard and high-fidelity input** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. Window resize/move (apps are full-screen) and physical devices are non-goals.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
@@ -363,9 +364,11 @@ The Linux feature set is implemented and tested across **both** Linux backends
 (X11 and Wayland/wlroots), and the **Windows** backend (WGC capture, SendInput, UI
 Automation) is built and CI-tested. An **Android** backend drives native apps in an AVD
 emulator over `adb` — capture, input, logcat, multi-window, a `uiautomator` accessibility
-tree, a managed AVD (attach-or-boot), and — via an optional
-[on-device agent](docs/running-on-linux.md#optional-on-device-agent-clipboard--high-fidelity-input) (Linux) / [on-device agent](docs/running-on-windows.md#optional-on-device-agent-clipboard--high-fidelity-input) (Windows) — clipboard and high-fidelity input; it's built and
-unit-tested in CI and validated on-device. **macOS is the one OS backend not yet built.**
+tree, a managed AVD (attach-or-boot), and two optional on-device companions — an agent
+(clipboard + high-fidelity input) and an AccessibilityService (Compose-rich a11y tree +
+high-fidelity `set_value`), both set up in the [Linux](docs/running-on-linux.md) /
+[Windows](docs/running-on-windows.md) Android guides; it's built and unit-tested in CI and
+validated on-device. **macOS is the one OS backend not yet built.**
 
 ## License
 
