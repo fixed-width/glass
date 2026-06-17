@@ -85,6 +85,24 @@ impl AdbResolution {
             AdbResolution::Path => "adb".to_string(),
         }
     }
+
+    /// A short human description of how adb was found, for `glass doctor`.
+    pub fn describe(&self) -> String {
+        match self {
+            AdbResolution::GlassAdb(p) => format!("{p} (via GLASS_ADB)"),
+            AdbResolution::Sdk { bin, root } => {
+                format!("{bin} (via {} SDK {})", source_word(&root.source), root.path.display())
+            }
+            AdbResolution::Path => "adb (on PATH)".to_string(),
+        }
+    }
+}
+
+fn source_word(s: &SdkSource) -> &'static str {
+    match s {
+        SdkSource::Env(_) => "configured",
+        SdkSource::Default => "discovered",
+    }
 }
 
 fn adb_exe() -> &'static str {
@@ -113,6 +131,14 @@ pub fn resolve_adb(
         }
     }
     AdbResolution::Path
+}
+
+/// Human labels for the ordered candidates discovery considers — env vars then default
+/// locations — so `glass doctor` can render the search trail on failure.
+pub fn sdk_search_trail(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut t = vec!["ANDROID_SDK_ROOT".to_string(), "ANDROID_HOME".to_string()];
+    t.extend(default_locations(get).into_iter().map(|p| p.display().to_string()));
+    t
 }
 
 #[cfg(test)]
@@ -148,6 +174,26 @@ mod tests {
     fn adb_falls_back_to_path() {
         let get = getter(&[("HOME", "/home/u")]);
         assert_eq!(resolve_adb(&get, &|_| false).bin(), "adb");
+    }
+
+    #[test]
+    fn describe_names_the_discovered_sdk() {
+        let r = AdbResolution::Sdk {
+            bin: "/home/u/android-sdk/platform-tools/adb".into(),
+            root: SdkRoot { path: "/home/u/android-sdk".into(), source: SdkSource::Default },
+        };
+        let d = r.describe();
+        assert!(d.contains("/home/u/android-sdk/platform-tools/adb"), "got {d}");
+        assert!(d.contains("discovered"), "got {d}");
+    }
+
+    #[test]
+    fn trail_lists_env_then_defaults() {
+        let get = getter(&[("HOME", "/home/u")]);
+        let t = sdk_search_trail(&get);
+        assert_eq!(&t[0], "ANDROID_SDK_ROOT");
+        assert_eq!(&t[1], "ANDROID_HOME");
+        assert!(t.iter().any(|s| s.contains("android-sdk")), "trail: {t:?}");
     }
 
     #[test]
