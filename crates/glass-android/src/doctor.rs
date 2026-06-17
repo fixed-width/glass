@@ -14,8 +14,13 @@ use crate::target::{parse_devices, Device};
 /// Observed host state for the Android doctor checks. Captured by `probe`, consumed
 /// by the pure `build_checks` so all branch logic is unit-testable without subprocesses.
 struct Probe {
-    /// Resolved adb path (`GLASS_ADB`, else `"adb"`).
+    /// Resolved adb path (`GLASS_ADB` / discovered SDK / `"adb"` on PATH).
     adb_bin: String,
+    /// Human description of how adb was resolved (path + source), for the OK detail.
+    adb_detail: String,
+    /// Ordered candidates discovery considered (env vars + default locations), for the
+    /// Fail trail.
+    adb_trail: Vec<String>,
     /// First line of `adb version`; `None` when adb is absent/unrunnable.
     adb_version: Option<String>,
     /// Resolved emulator path (`GLASS_EMULATOR`/SDK root/`"emulator"`).
@@ -67,10 +72,13 @@ pub fn checks(deep: bool) -> Vec<Check> {
 
 fn probe(deep_requested: bool) -> Probe {
     let get = |k: &str| std::env::var(k).ok();
+    let adb_resolution = crate::sdk::resolve_adb(&get, &|p| p.exists());
+    let adb_detail = adb_resolution.describe();
+    let adb_trail = crate::sdk::sdk_search_trail(&get);
     let adb = Adb::from_env();
     let adb_bin = adb.bin().to_string();
     let adb_version = adb.run(["version"]).ok().map(|s| first_line(&s)).filter(|s| !s.is_empty());
-    let emulator_bin = resolve_emulator_bin(&get);
+    let emulator_bin = resolve_emulator_bin(&get, &|p| p.exists());
     let avds = list_avds(&emulator_bin);
 
     let online_devices: Vec<Device> = if adb_version.is_some() {
@@ -128,6 +136,8 @@ fn probe(deep_requested: bool) -> Probe {
 
     Probe {
         adb_bin,
+        adb_detail,
+        adb_trail,
         adb_version,
         emulator_bin,
         avds,
@@ -205,7 +215,7 @@ fn agent_check(p: &Probe) -> Check {
         return Check::new(
             "agent",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_AGENT_JAR for clipboard + high-fidelity input)",
+            "not configured (optional — set GLASS_ANDROID_AGENT_JAR, or drop glass-agent.jar in the glass data dir, for clipboard + high-fidelity input)",
         );
     };
     if !p.agent_jar_exists {
@@ -247,7 +257,7 @@ fn a11y_check(p: &Probe) -> Check {
         return Check::new(
             "a11y-service",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_A11Y_APK for a Compose-rich tree + high-fidelity set_value)",
+            "not configured (optional — set GLASS_ANDROID_A11Y_APK, or drop glass-a11y.apk in the glass data dir, for a Compose-rich tree + high-fidelity set_value)",
         );
     };
     if !p.a11y_apk_exists {
@@ -339,7 +349,7 @@ fn emulator_check(p: &Probe) -> Check {
                 p.emulator_bin
             ),
         )
-        .with_remedy("install the Android emulator package, or set GLASS_EMULATOR / ANDROID_SDK_ROOT"),
+        .with_remedy("install the Android emulator at a standard SDK location (auto-found), or set GLASS_EMULATOR / ANDROID_SDK_ROOT"),
         Some(avds) if avds.is_empty() => Check::new(
             "emulator",
             CheckStatus::Warn,
@@ -358,13 +368,19 @@ fn emulator_check(p: &Probe) -> Check {
 
 fn adb_check(p: &Probe) -> Check {
     match &p.adb_version {
-        Some(v) => Check::new("adb", CheckStatus::Ok, format!("{} ({v})", p.adb_bin)),
+        Some(v) => Check::new("adb", CheckStatus::Ok, format!("{} ({v})", p.adb_detail)),
         None => Check::new(
             "adb",
             CheckStatus::Fail,
-            format!("`adb` not found or not runnable ({})", p.adb_bin),
+            format!(
+                "`adb` not found — looked in: {}; resolved `{}`",
+                p.adb_trail.join(", "),
+                p.adb_bin
+            ),
         )
-        .with_remedy("install Android platform-tools, or set GLASS_ADB to the adb binary"),
+        .with_remedy(
+            "install Android platform-tools at any standard SDK location (auto-found), or set GLASS_ADB",
+        ),
     }
 }
 
@@ -375,6 +391,12 @@ mod tests {
     fn base_probe() -> Probe {
         Probe {
             adb_bin: "/sdk/platform-tools/adb".into(),
+            adb_detail: "/sdk/platform-tools/adb (via discovered SDK /home/u/android-sdk)".into(),
+            adb_trail: vec![
+                "ANDROID_SDK_ROOT".into(),
+                "ANDROID_HOME".into(),
+                "/home/u/android-sdk".into(),
+            ],
             adb_version: Some("Android Debug Bridge version 1.0.41".into()),
             emulator_bin: "/sdk/emulator/emulator".into(),
             avds: Some(vec!["glass".into()]),
@@ -427,6 +449,28 @@ mod tests {
         let adb = find(&c, "adb");
         assert_eq!(adb.status, CheckStatus::Fail);
         assert!(adb.remedy.as_deref().unwrap().contains("GLASS_ADB"));
+    }
+
+    #[test]
+    fn adb_ok_detail_shows_resolution_source() {
+        let c = build_checks(&base_probe());
+        let adb = find(&c, "adb");
+        assert_eq!(adb.status, CheckStatus::Ok);
+        assert!(adb.detail.contains("via discovered SDK"), "got {}", adb.detail);
+    }
+
+    #[test]
+    fn adb_fail_detail_shows_search_trail() {
+        let mut p = base_probe();
+        p.adb_version = None;
+        let c = build_checks(&p);
+        let adb = find(&c, "adb");
+        assert_eq!(adb.status, CheckStatus::Fail);
+        assert!(
+            adb.detail.contains("looked in: ANDROID_SDK_ROOT, ANDROID_HOME"),
+            "got {}",
+            adb.detail
+        );
     }
 
     #[test]

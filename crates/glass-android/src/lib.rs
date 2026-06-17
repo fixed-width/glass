@@ -19,6 +19,7 @@ mod logs;
 mod parse;
 mod platform;
 mod screencap;
+mod sdk;
 mod target;
 
 pub use a11y::AndroidA11y;
