@@ -48,6 +48,19 @@ pub enum MouseButton {
     Middle,
 }
 
+/// One pointer's straight path within a multi-touch gesture, in **window-relative** px.
+/// `from == to` is a finger held stationary for the gesture's duration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub from_x: i32,
+    pub from_y: i32,
+    pub to_x: i32,
+    pub to_y: i32,
+}
+
+/// Max simultaneous pointers a `Gesture` may carry (Android tops out around this).
+pub const MAX_GESTURE_POINTERS: usize = 10;
+
 /// A pointer action in **window-relative** coordinates (0,0 = top-left).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PointerEvent {
@@ -55,6 +68,9 @@ pub enum PointerEvent {
     Click { x: i32, y: i32, button: MouseButton, count: u32, modifiers: Vec<Modifier> },
     Drag { from_x: i32, from_y: i32, to_x: i32, to_y: i32, button: MouseButton, modifiers: Vec<Modifier>, duration_ms: u64 },
     Scroll { x: i32, y: i32, dx: i32, dy: i32, modifiers: Vec<Modifier> },
+    /// N simultaneous straight pointer segments, all down at t=0 and up at t=duration_ms.
+    /// Android-only (needs the on-device agent); other paths return `Unsupported`.
+    Gesture { pointers: Vec<Segment>, duration_ms: u64 },
 }
 
 /// A keyboard action: either literal text to type or a chord like `ctrl+s`.
