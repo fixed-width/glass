@@ -38,18 +38,30 @@ pub enum Action {
     Error(String),
 }
 
-/// Resolve the `emulator` binary: `GLASS_EMULATOR`, else `$ANDROID_SDK_ROOT/emulator/emulator`,
-/// else `$ANDROID_HOME/emulator/emulator`, else `emulator` (on `PATH`). `get` reads an env var.
-pub fn resolve_emulator_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
+/// Resolve the `emulator` binary: `GLASS_EMULATOR`, else `$SDK/emulator/emulator` from a
+/// discovered SDK root (env or a common install location), else `"emulator"` (on `PATH`).
+pub fn resolve_emulator_bin(
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> String {
     if let Some(bin) = get("GLASS_EMULATOR").filter(|s| !s.is_empty()) {
         return bin;
     }
-    for root in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
-        if let Some(sdk) = get(root).filter(|s| !s.is_empty()) {
-            return format!("{sdk}/emulator/emulator");
-        }
+    if let Some(root) = crate::sdk::resolve_sdk_root(get, exists) {
+        return root.path.join("emulator").join(emulator_exe()).to_string_lossy().into_owned();
     }
     "emulator".to_string()
+}
+
+fn emulator_exe() -> &'static str {
+    #[cfg(windows)]
+    {
+        "emulator.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "emulator"
+    }
 }
 
 /// Parse `emulator -list-avds` (AVD names, one per line; skip INFO/WARNING noise).
@@ -176,7 +188,7 @@ impl EmulatorRegistry {
 /// Spawns the emulator detached, waits for a new device + `sys.boot_completed`, and
 /// errors (after killing the half-booted emulator) on timeout or spawn failure.
 pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<String> {
-    let bin = resolve_emulator_bin(get);
+    let bin = resolve_emulator_bin(get, &|p| p.exists());
     let avds = parse_list_avds(&run_emulator_list(&bin)?);
     let avd = choose_avd(get("GLASS_AVD").as_deref(), &avds)?;
     let args = emulator_args(&avd, get("GLASS_EMULATOR_ARGS").as_deref());
@@ -257,22 +269,33 @@ mod tests {
             "GLASS_EMULATOR" => Some("/custom/emulator".to_string()),
             _ => None,
         };
-        assert_eq!(resolve_emulator_bin(&env), "/custom/emulator");
+        assert_eq!(resolve_emulator_bin(&env, &|_| true), "/custom/emulator");
 
         let env = |k: &str| match k {
             "ANDROID_SDK_ROOT" => Some("/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(resolve_emulator_bin(&env), "/sdk/emulator/emulator");
+        assert_eq!(resolve_emulator_bin(&env, &|_| true), "/sdk/emulator/emulator");
 
         let env = |k: &str| match k {
             "ANDROID_HOME" => Some("/home/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(resolve_emulator_bin(&env), "/home/sdk/emulator/emulator");
+        assert_eq!(resolve_emulator_bin(&env, &|_| true), "/home/sdk/emulator/emulator");
 
         let env = |_: &str| None;
-        assert_eq!(resolve_emulator_bin(&env), "emulator");
+        assert_eq!(resolve_emulator_bin(&env, &|_| false), "emulator");
+    }
+
+    #[test]
+    fn emulator_from_discovered_default_sdk() {
+        // No env at all, but a default SDK location exists on disk.
+        let env = |k: &str| match k {
+            "HOME" => Some("/home/u".to_string()),
+            _ => None,
+        };
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/home/u/android-sdk");
+        assert_eq!(resolve_emulator_bin(&env, &exists), "/home/u/android-sdk/emulator/emulator");
     }
 
     #[test]

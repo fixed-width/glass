@@ -70,7 +70,7 @@ fn probe(deep_requested: bool) -> Probe {
     let adb = Adb::from_env();
     let adb_bin = adb.bin().to_string();
     let adb_version = adb.run(["version"]).ok().map(|s| first_line(&s)).filter(|s| !s.is_empty());
-    let emulator_bin = resolve_emulator_bin(&get);
+    let emulator_bin = resolve_emulator_bin(&get, &|p| p.exists());
     let avds = list_avds(&emulator_bin);
 
     let online_devices: Vec<Device> = if adb_version.is_some() {
