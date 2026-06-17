@@ -7,10 +7,11 @@
 mod adb;
 mod a11y;
 mod agent;
-mod axmap;
 mod avd;
+mod axmap;
 mod build;
 mod cmd;
+mod conn;
 pub mod doctor;
 mod input;
 mod logs;
