@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::adb::Adb;
 use crate::agent::{AgentClient, Pt};
 use glass_core::keys::parse_chord;
-use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, WindowGeometry};
+use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result, Segment, WindowGeometry};
 
 /// Pixels of swipe travel per scroll "click" (`Scroll.dx/dy` are wheel clicks —
 /// X11 clicks the wheel `|delta|` times). Tunable.
@@ -162,6 +162,37 @@ fn agent_path(fx: i32, fy: i32, tx: i32, ty: i32, ms: u64) -> Vec<Pt> {
         .collect()
 }
 
+/// Build N time-aligned absolute-coord pointer paths from window-relative segments. All paths
+/// share one sample count (from the longest segment, clamped like a drag) and the same `t_ms`
+/// timeline, so the device can emit aligned multi-pointer frames. `from==to` → a constant path.
+fn agent_gesture_paths(origin: &WindowGeometry, segments: &[Segment], duration_ms: u64) -> Vec<Vec<Pt>> {
+    let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
+    let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
+    let longest = segments
+        .iter()
+        .map(|s| (s.to_x - s.from_x).abs().max((s.to_y - s.from_y).abs()))
+        .max()
+        .unwrap_or(0);
+    let steps = (longest / AGENT_STEP_PX).clamp(8, 64) as u64;
+    segments
+        .iter()
+        .map(|s| {
+            let (fx, fy) = abs(s.from_x, s.from_y);
+            let (tx, ty) = abs(s.to_x, s.to_y);
+            (0..=steps)
+                .map(|i| {
+                    let f = i as f64 / steps as f64;
+                    Pt {
+                        x: fx + ((tx - fx) as f64 * f).round() as i32,
+                        y: fy + ((ty - fy) as f64 * f).round() as i32,
+                        t_ms: (ms as f64 * f).round() as u64,
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Map a pointer event to the agent's gesture(s): a list of absolute-display pointer paths
 /// (one path per tap/swipe), mirroring `pointer_commands`' window→display mapping. `Click`
 /// with count N yields N single-point tap paths; `Drag` and `Scroll` each yield one
@@ -202,10 +233,9 @@ pub(crate) struct AgentInjector {
 
 impl Injector for AgentInjector {
     fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
-        if let PointerEvent::Gesture { .. } = event {
-            return Err(GlassError::Unsupported(
-                "multi-touch requires the on-device agent (not yet wired)".into(),
-            ));
+        if let PointerEvent::Gesture { pointers, duration_ms } = event {
+            let paths = agent_gesture_paths(origin, pointers, *duration_ms);
+            return self.agent.gesture(&paths);
         }
         // One agent request per gesture: a Click{count:N} sends N sequential taps.
         for gesture in agent_pointer(origin, event) {
@@ -257,7 +287,7 @@ impl Injector for ShellInjector {
 mod agent_inject_tests {
     use super::*;
     use crate::agent::Pt;
-    use glass_core::{MouseButton, PointerEvent, WindowGeometry};
+    use glass_core::{MouseButton, PointerEvent, Segment, WindowGeometry};
 
     fn origin() -> WindowGeometry { WindowGeometry { x: 100, y: 200, width: 500, height: 800 } }
 
@@ -307,6 +337,23 @@ mod agent_inject_tests {
         // Interpolated samples give the swipe real velocity → a fling, so deep scrolls
         // don't stall. Dogfood finding #17.
         assert!(path.len() >= 8, "scroll should fling with interpolated samples, got {}", path.len());
+    }
+
+    #[test]
+    fn gesture_builds_time_aligned_absolute_paths() {
+        let segments = vec![
+            Segment { from_x: 0, from_y: 0, to_x: 80, to_y: 0 },   // moves right 80px
+            Segment { from_x: 40, from_y: 40, to_x: 40, to_y: 40 }, // held
+        ];
+        let paths = agent_gesture_paths(&origin(), &segments, 250);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].len(), paths[1].len());
+        assert!(paths[0].len() >= 8);
+        assert_eq!(paths[0].iter().map(|p| p.t_ms).collect::<Vec<_>>(),
+                   paths[1].iter().map(|p| p.t_ms).collect::<Vec<_>>());
+        assert_eq!(paths[0].first().copied().unwrap(), Pt { x: 100, y: 200, t_ms: 0 });
+        assert_eq!(paths[0].last().copied().unwrap(), Pt { x: 180, y: 200, t_ms: 250 });
+        assert!(paths[1].iter().all(|p| p.x == 140 && p.y == 240));
     }
 
     /// Drift guard: `pointer_commands` and `agent_pointer` must agree on absolute

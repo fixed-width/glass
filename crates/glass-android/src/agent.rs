@@ -68,6 +68,19 @@ impl AgentClient {
             .collect();
         self.call(json!({"op": "pointer", "gesture": g, "button": button})).map(|_| ())
     }
+    pub fn gesture(&self, paths: &[Vec<Pt>]) -> Result<()> {
+        let pointers: Vec<Value> = paths
+            .iter()
+            .map(|path| {
+                Value::Array(
+                    path.iter()
+                        .map(|p| json!({ "x": p.x, "y": p.y, "t_ms": p.t_ms }))
+                        .collect(),
+                )
+            })
+            .collect();
+        self.call(json!({ "op": "gesture", "pointers": pointers })).map(|_| ())
+    }
     pub fn key(&self, chord: &str) -> Result<()> {
         self.call(json!({"op": "key", "chord": chord})).map(|_| ())
     }
