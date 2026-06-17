@@ -189,7 +189,29 @@ use std::sync::Arc;
 use crate::adb::Adb;
 
 const SERVICE_COMPONENT: &str = "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
+const SERVICE_PACKAGE: &str = "com.fixedwidth.glassa11y";
 const SOCKET: &str = "glass-a11y";
+
+/// True when an `adb install` failure is the "existing package signed differently" case
+/// that only an uninstall can clear (e.g. a release APK over a local debug build).
+fn is_signature_mismatch(err: &str) -> bool {
+    err.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || err.contains("signatures do not match")
+}
+
+/// Install the service APK, recovering from a signature mismatch. glass owns this package
+/// (install → enable → teardown, no meaningful user state), so when a differently-signed
+/// build is already present it removes the stale copy and installs fresh rather than failing.
+fn install_service(adb: &Adb, apk: &str) -> Result<()> {
+    match adb.run(["install", "-r", apk]) {
+        Ok(_) => Ok(()),
+        Err(e) if is_signature_mismatch(&e.to_string()) => {
+            eprintln!("glass-a11y: replacing a differently-signed existing install of {SERVICE_PACKAGE}");
+            adb.run(["uninstall", SERVICE_PACKAGE])?;
+            adb.run(["install", "-r", apk]).map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// `GLASS_ANDROID_A11Y_APK`, else `glass-a11y.apk` dropped in the glass data dir or next
 /// to the `glass-mcp` binary; `None` when disabled via `GLASS_ANDROID_A11Y=off`.
@@ -217,7 +239,7 @@ impl A11yServiceRegistry {
     /// Install + enable the service on `adb`'s device, forward a port, connect, ping. Returns a
     /// connected `ServiceClient`. The apk path is resolved from env by the caller.
     pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
-        adb.run(["install", "-r", apk])?;
+        install_service(adb, apk)?;
         let get = |k: &str| adb.run(["shell", "settings", "get", "secure", k]).unwrap_or_default();
         let prior = get("enabled_accessibility_services");
         let prior = prior.trim();
@@ -300,6 +322,16 @@ mod tests {
 
     fn win() -> WindowGeometry {
         WindowGeometry { x: 0, y: 100, width: 1080, height: 2300 }
+    }
+
+    #[test]
+    fn signature_mismatch_detected() {
+        assert!(is_signature_mismatch(
+            "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match newer version; ignoring!]"
+        ));
+        assert!(is_signature_mismatch("signatures do not match newer version"));
+        assert!(!is_signature_mismatch("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"));
+        assert!(!is_signature_mismatch("error: device offline"));
     }
 
     #[test]
