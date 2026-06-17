@@ -129,10 +129,7 @@ pub struct ServiceA11y {
 }
 
 impl ServiceA11y {
-    // NOTE: new is not yet called outside this module; will be consumed by Task 5
-    // (A11yServiceRegistry). The allow is temporary.
-    #[allow(dead_code)]
-    pub(crate) fn new(client: ServiceClient, package: String) -> Self {
+    pub fn new(client: ServiceClient, package: String) -> Self {
         Self { client, package }
     }
 }

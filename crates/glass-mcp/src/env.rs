@@ -120,6 +120,12 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_ANDROID_AGENT", scope: EnvScope::Android,
         purpose: "auto|off; default auto when the jar resolves; off forces the pure-adb paths",
         default: "auto", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_A11Y_APK", scope: EnvScope::Android,
+        purpose: "path to glass-a11y.apk; enables the on-device AccessibilityService reader (Compose-rich tree + high-fidelity set_value); unset \u{21d2} uiautomator",
+        default: "(none; uiautomator used)", secret: false },
+    EnvVarDoc { name: "GLASS_ANDROID_A11Y", scope: EnvScope::Android,
+        purpose: "auto|off \u{2014} disable the a11y service even when the APK is set",
+        default: "auto", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -266,6 +272,7 @@ mod tests {
             "GLASS_EMULATOR", "GLASS_AVD", "GLASS_EMULATOR_ARGS",
             "GLASS_EMULATOR_BOOT_TIMEOUT_MS", "GLASS_EMULATOR_KEEP",
             "GLASS_ANDROID_AGENT_JAR", "GLASS_ANDROID_AGENT",
+            "GLASS_ANDROID_A11Y_APK", "GLASS_ANDROID_A11Y",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
         ];
@@ -299,7 +306,10 @@ mod tests {
         assert!(idx("GLASS_SWAY") < idx("GLASS_BWRAP"));
         assert!(idx("GLASS_BWRAP") < idx("GLASS_WIN_SANDBOX_PROVIDER"));
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_ANDROID_AGENT_JAR"));
-        assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_TOKEN"));
+        assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_ANDROID_A11Y_APK"));
+        // Use unique purpose snippets to distinguish A11Y_APK from A11Y (prefix-match hazard).
+        assert!(idx("glass-a11y.apk") < idx("disable the a11y service"));
+        assert!(idx("disable the a11y service") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
     }
