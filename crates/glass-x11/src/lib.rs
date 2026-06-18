@@ -1,4 +1,3 @@
-#![feature(portable_simd)]
 //! glass-x11: the Linux/X11 `glass_core::Platform` backend.
 
 // Modules are added task-by-task.

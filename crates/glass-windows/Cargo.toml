@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# Don't run the lib's unit-test harness under `cargo bench` — it can't parse
+# criterion args (e.g. --save-baseline) and only the [[bench]] targets matter.
+[lib]
+bench = false
+
 [dependencies]
 glass-core.workspace = true
 glass-clip-hook = { path = "../glass-clip-hook" }
@@ -32,6 +37,14 @@ windows = { version = "0.62", features = [
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 glass-a11y-windows = { path = "../glass-a11y-windows" }
+
+# The pixel conversion is cross-platform, so its bench builds and runs everywhere.
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "pixels"
+harness = false
 
 [lints]
 workspace = true
