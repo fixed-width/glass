@@ -1,18 +1,13 @@
+use glass_core::pixels::{to_opaque_rgba, SourceOrder};
 use glass_core::{GlassError, Result};
-use std::simd::{simd_swizzle, u8x32};
-
-const LANES: usize = 32; // 8 pixels per SIMD chunk
-// BGRX -> RGBA: within each 4-byte pixel, swap bytes 0 and 2; keep 1 and 3.
-const SWIZZLE: [usize; LANES] = [
-    2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15,
-    18, 17, 16, 19, 22, 21, 20, 23, 26, 25, 24, 27, 30, 29, 28, 31,
-];
 
 /// Convert raw `GetImage` ZPixmap data to tightly packed RGBA8.
 ///
 /// Assumes the common Xvfb/desktop case: depth 24, 32 bits per pixel, LSBFirst
 /// byte order, so each source pixel is `[B, G, R, pad]`. `bytes_per_pixel` must
-/// be 4; anything else errors rather than guessing (no silent fallback).
+/// be 4; anything else errors rather than guessing (no silent fallback). The
+/// per-pixel swizzle (BGRX→RGBA, alpha forced opaque) is the shared SIMD kernel
+/// in [`glass_core::pixels`].
 pub fn xdata_to_rgba(
     data: &[u8],
     width: u32,
@@ -37,27 +32,7 @@ pub fn xdata_to_rgba(
         )));
     }
     let mut out = vec![0u8; needed];
-    // 255 in each pixel's alpha lane, 0 elsewhere. OR forces alpha to 255
-    // (pad_byte | 255 == 255) and leaves R/G/B untouched (x | 0 == x).
-    let alpha_or = u8x32::from_array([
-        0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
-        0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
-    ]);
-    let mut off = 0usize;
-    while off + LANES <= needed {
-        let v = u8x32::from_slice(&data[off..off + LANES]);
-        let res = simd_swizzle!(v, SWIZZLE) | alpha_or;
-        res.copy_to_slice(&mut out[off..off + LANES]);
-        off += LANES;
-    }
-    // Scalar tail (< 8 pixels).
-    while off < needed {
-        out[off] = data[off + 2]; // R
-        out[off + 1] = data[off + 1]; // G
-        out[off + 2] = data[off]; // B
-        out[off + 3] = 255; // A
-        off += 4;
-    }
+    to_opaque_rgba(&data[..needed], &mut out, SourceOrder::Bgr);
     Ok(out)
 }
 

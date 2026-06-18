@@ -1,3 +1,4 @@
+use glass_core::pixels::{to_opaque_rgba, SourceOrder};
 use glass_core::{GlassError, Result};
 use wayland_client::protocol::wl_shm::Format;
 
@@ -7,11 +8,12 @@ use wayland_client::protocol::wl_shm::Format;
 /// - `Xrgb8888`/`Argb8888` are little-endian byte order `[B, G, R, _]` → swap R/B.
 /// - `Xbgr8888`/`Abgr8888` are `[R, G, B, _]` → already in order.
 ///
-/// Errors on any other format.
+/// Stride padding is dropped row-by-row; the per-pixel swizzle is the shared SIMD
+/// kernel in [`glass_core::pixels`]. Errors on any other format.
 pub fn to_rgba(src: &[u8], format: Format, width: u32, height: u32, stride: u32) -> Result<Vec<u8>> {
-    let swap_rb = match format {
-        Format::Xrgb8888 | Format::Argb8888 => true,
-        Format::Xbgr8888 | Format::Abgr8888 => false,
+    let order = match format {
+        Format::Xrgb8888 | Format::Argb8888 => SourceOrder::Bgr,
+        Format::Xbgr8888 | Format::Abgr8888 => SourceOrder::Rgb,
         other => {
             return Err(GlassError::CaptureFailed(format!(
                 "unsupported screencopy format {other:?}"
@@ -31,16 +33,12 @@ pub fn to_rgba(src: &[u8], format: Format, width: u32, height: u32, stride: u32)
             src.len()
         )));
     }
-    let mut out = Vec::with_capacity(w * h * 4);
+    let row = w * 4;
+    let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
-        let row = &src[y * stride..y * stride + w * 4];
-        for px in row.chunks_exact(4) {
-            if swap_rb {
-                out.extend_from_slice(&[px[2], px[1], px[0], 255]);
-            } else {
-                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-        }
+        let s = &src[y * stride..y * stride + row];
+        let d = &mut out[y * row..y * row + row];
+        to_opaque_rgba(s, d, order);
     }
     Ok(out)
 }

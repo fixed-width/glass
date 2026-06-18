@@ -1085,6 +1085,7 @@ dependencies = [
 name = "glass-wayland"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "glass-core",
  "glass-dbus-linux",
  "glass-proc-linux",
@@ -1103,6 +1104,7 @@ dependencies = [
 name = "glass-windows"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "glass-a11y-windows",
  "glass-clip-hook",
  "glass-core",

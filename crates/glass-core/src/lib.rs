@@ -15,6 +15,9 @@ pub use toolpath::tool_path;
 pub mod frame;
 pub use frame::{Frame, Region};
 
+pub mod pixels;
+pub use pixels::{to_opaque_rgba, to_opaque_rgba_in_place, SourceOrder};
+
 pub mod drag;
 pub use drag::{run_drag, DragGesture, DragSink};
 
