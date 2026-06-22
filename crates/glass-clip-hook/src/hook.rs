@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL,
+    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
@@ -23,9 +23,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::Security::RevertToSelf;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
-use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
-};
+
+use crate::hglobal::{HGlobalLock, OwnedHGlobal};
 
 use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClipboardFormatW};
 
@@ -268,34 +267,15 @@ pub(crate) fn store_get_all() -> Vec<(FormatKey, Vec<u8>)> {
 
 /// Copy the full contents of an app-provided `HGLOBAL` to a `Vec<u8>` (bounded by `GlobalSize`).
 pub(crate) fn read_bytes_from_hglobal(h: HGLOBAL) -> Option<Vec<u8>> {
-    // SAFETY: GlobalLock pins `h`; GlobalSize bounds the slice so we never read OOB; slice→Vec is safe.
-    unsafe {
-        let ptr = GlobalLock(h) as *const u8;
-        if ptr.is_null() {
-            return None;
-        }
-        let n = GlobalSize(h);
-        let v = std::slice::from_raw_parts(ptr, n).to_vec();
-        let _ = GlobalUnlock(h);
-        Some(v)
-    }
+    // SAFETY: `h` is an app-provided clipboard data handle, valid for this call.
+    let lock = unsafe { HGlobalLock::new(h) }?;
+    Some(lock.as_bytes().to_vec())
 }
 
 /// Allocate a `GMEM_MOVEABLE` `HGLOBAL` holding exactly `bytes`. Caller caches + frees it.
 pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
-    // SAFETY: GlobalAlloc(GMEM_MOVEABLE) then GlobalLock to a writable ptr valid for bytes.len();
-    // copy exactly bytes.len(); unlock. Free on lock failure to avoid a leak.
-    unsafe {
-        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).ok()?;
-        let dst = GlobalLock(h) as *mut u8;
-        if dst.is_null() {
-            let _ = GlobalFree(Some(h));
-            return None;
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-        let _ = GlobalUnlock(h);
-        Some(h)
-    }
+    // Caller owns + frees the returned handle, so relinquish ownership with `into_raw`.
+    Some(OwnedHGlobal::from_bytes(bytes)?.into_raw())
 }
 
 /// CF_UNICODETEXT bytes → CF_TEXT/CF_OEMTEXT bytes via the real code page (ANSI/OEM).

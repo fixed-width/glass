@@ -11,6 +11,9 @@
 //!   cargo build -p glass-clip-hook --release --example clipprobe
 
 #[cfg(windows)]
+use glass_clip_hook::{HGlobalLock, OwnedHGlobal};
+
+#[cfg(windows)]
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let code = match mode.as_str() {
@@ -34,7 +37,6 @@ fn run() -> i32 {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     let args: Vec<String> = std::env::args().collect();
@@ -57,24 +59,21 @@ fn run() -> i32 {
             return 1;
         }
         let _ = EmptyClipboard();
-        let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) else {
+        let mut buf = Vec::with_capacity(bytes);
+        for unit in &utf16 {
+            buf.extend_from_slice(&unit.to_le_bytes());
+        }
+        let Some(mem) = OwnedHGlobal::from_bytes(&buf) else {
             let _ = CloseClipboard();
             eprintln!("FAIL: GlobalAlloc");
             return 1;
         };
-        let dst = GlobalLock(h);
-        if dst.is_null() {
+        if SetClipboardData(cf, Some(HANDLE(mem.handle().0))).is_err() {
             let _ = CloseClipboard();
-            eprintln!("FAIL: GlobalLock(write)");
+            eprintln!("FAIL: SetClipboardData"); // `mem` drops here -> GlobalFree
             return 1;
         }
-        std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, dst as *mut u8, bytes);
-        let _ = GlobalUnlock(h);
-        if SetClipboardData(cf, Some(HANDLE(h.0))).is_err() {
-            let _ = CloseClipboard();
-            eprintln!("FAIL: SetClipboardData");
-            return 1;
-        }
+        mem.into_raw(); // success: the system (or the hook) owns the handle now
         let _ = CloseClipboard();
 
         // --- read back ---
@@ -85,21 +84,11 @@ fn run() -> i32 {
             return 1;
         }
         let read = match GetClipboardData(cf) {
-            Ok(hr) if !hr.is_invalid() => {
-                let g = HGLOBAL(hr.0);
-                let p = GlobalLock(g) as *const u16;
-                if p.is_null() {
-                    String::new()
-                } else {
-                    let mut len = 0usize;
-                    while *p.add(len) != 0 {
-                        len += 1;
-                    }
-                    let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-                    let _ = GlobalUnlock(g);
-                    s
-                }
-            }
+            // SAFETY: clipboard-owned handle, valid while the clipboard is open.
+            Ok(hr) if !hr.is_invalid() => match HGlobalLock::new(HGLOBAL(hr.0)) {
+                Some(lock) => utf16_to_string(lock.as_bytes()),
+                None => String::new(),
+            },
             _ => String::new(),
         };
         let _ = CloseClipboard();
@@ -112,22 +101,14 @@ fn run() -> i32 {
 /// Allocate a `GMEM_MOVEABLE` `HGLOBAL` holding `data`; null handle on failure.
 ///
 /// # Safety
-/// Standard `GlobalAlloc`/`GlobalLock`/copy/`GlobalUnlock`. The returned handle is handed to
+/// Allocates via [`OwnedHGlobal`] and relinquishes ownership. The returned handle is handed to
 /// `SetClipboardData` (which takes ownership on success); the caller must not free it.
 #[cfg(windows)]
 unsafe fn alloc_global(data: &[u8]) -> windows::Win32::Foundation::HGLOBAL {
     use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, data.len()) else {
-        return HGLOBAL(std::ptr::null_mut());
-    };
-    let dst = GlobalLock(h);
-    if dst.is_null() {
-        return HGLOBAL(std::ptr::null_mut());
-    }
-    std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
-    let _ = GlobalUnlock(h);
-    h
+    OwnedHGlobal::from_bytes(data)
+        .map(|m| m.into_raw()) // caller (STGMEDIUM / SetClipboardData) owns + frees it
+        .unwrap_or(HGLOBAL(std::ptr::null_mut()))
 }
 
 /// `GetClipboardData(fmt)` → the full `HGLOBAL` contents as bytes (bounded by `GlobalSize`). `None`
@@ -139,20 +120,12 @@ unsafe fn alloc_global(data: &[u8]) -> windows::Win32::Foundation::HGLOBAL {
 unsafe fn read_global_bytes(fmt: u32) -> Option<Vec<u8>> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::GetClipboardData;
-    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     let hr = GetClipboardData(fmt).ok()?;
     if hr.is_invalid() {
         return None;
     }
-    let g = HGLOBAL(hr.0);
-    let p = GlobalLock(g) as *const u8;
-    if p.is_null() {
-        return None;
-    }
-    let n = GlobalSize(g);
-    let v = std::slice::from_raw_parts(p, n).to_vec();
-    let _ = GlobalUnlock(g);
-    Some(v)
+    let lock = HGlobalLock::new(HGLOBAL(hr.0))?;
+    Some(lock.as_bytes().to_vec())
 }
 
 /// Multi-format probe: write `CF_UNICODETEXT` + the registered `"HTML Format"` (round-tripped by
@@ -392,8 +365,8 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
                 return Err(Error::from_hresult(DV_E_FORMATETC));
             };
             // Hand back a FRESH HGLOBAL — the caller frees it (pUnkForRelease = None).
-            // SAFETY: `alloc_global` is a standard GlobalAlloc/Lock/copy/Unlock; the handle is then
-            // owned by the returned STGMEDIUM (ReleaseStgMedium frees it).
+            // SAFETY: `alloc_global` allocates an owned HGLOBAL and relinquishes it; the handle is
+            // then owned by the returned STGMEDIUM (ReleaseStgMedium frees it).
             let h = unsafe { alloc_global(bytes) };
             if h.0.is_null() {
                 return Err(Error::from_hresult(E_OUTOFMEMORY));
@@ -515,21 +488,12 @@ fn utf16_to_string(bytes: &[u8]) -> String {
 unsafe fn take_stgmedium_bytes(
     medium: &mut windows::Win32::System::Com::STGMEDIUM,
 ) -> Option<Vec<u8>> {
-    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::ReleaseStgMedium;
     let h = medium.u.hGlobal;
     let out = if h.0.is_null() {
         None
     } else {
-        let p = GlobalLock(h) as *const u8;
-        if p.is_null() {
-            None
-        } else {
-            let n = GlobalSize(h);
-            let v = std::slice::from_raw_parts(p, n).to_vec();
-            let _ = GlobalUnlock(h);
-            Some(v)
-        }
+        HGlobalLock::new(h).map(|lock| lock.as_bytes().to_vec())
     };
     ReleaseStgMedium(medium as *mut _);
     out
@@ -578,7 +542,6 @@ fn run_hdrop() -> i32 {
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, ReleaseStgMedium};
 
     const CF_HDROP: u32 = 15;
@@ -662,15 +625,7 @@ fn run_hdrop() -> i32 {
                 let out = if h.0.is_null() {
                     None
                 } else {
-                    let p = GlobalLock(h) as *const u8;
-                    if p.is_null() {
-                        None
-                    } else {
-                        let n = GlobalSize(h);
-                        let v = std::slice::from_raw_parts(p, n).to_vec();
-                        let _ = GlobalUnlock(h);
-                        Some(v)
-                    }
+                    HGlobalLock::new(h).map(|lock| lock.as_bytes().to_vec())
                 };
                 ReleaseStgMedium(&mut medium as *mut _);
                 out.unwrap_or_default()
@@ -699,7 +654,6 @@ fn run_ole() -> i32 {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
     };
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, CF_UNICODETEXT};
 
     let cf_text = CF_UNICODETEXT.0;
@@ -785,15 +739,8 @@ fn run_ole() -> i32 {
             if let Ok(hr) = GetClipboardData(cf_text as u32) {
                 if !hr.is_invalid() {
                     let g = windows::Win32::Foundation::HGLOBAL(hr.0);
-                    let p = GlobalLock(g) as *const u16;
-                    if !p.is_null() {
-                        let mut len = 0usize;
-                        while *p.add(len) != 0 {
-                            len += 1;
-                        }
-                        u32_text =
-                            String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-                        let _ = GlobalUnlock(g);
+                    if let Some(lock) = HGlobalLock::new(g) {
+                        u32_text = utf16_to_string(lock.as_bytes());
                     }
                 }
             }
