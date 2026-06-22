@@ -24,6 +24,12 @@ mod synth;
 #[cfg(windows)]
 mod hook;
 
+#[cfg(windows)]
+mod hglobal;
+#[cfg(windows)]
+#[doc(hidden)] // intended public API is `proto`/`store`; these are a Win32 util for glass-windows
+pub use hglobal::{HGlobalLock, OwnedHGlobal};
+
 /// Sandboxie InjectDll entry point (called after SbieDll, before the app's entry). Inert unless
 /// `GLASS_CLIP_PIPE` is set (only the target app's process tree carries it). See [`hook`].
 #[cfg(windows)]
