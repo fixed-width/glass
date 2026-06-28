@@ -4,8 +4,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
 };
 
-/// Use whatever display the logged-in interactive session already presents (real monitor,
-/// dummy plug, or — in a later plan — a pre-provisioned virtual display). No provisioning.
+/// Use whatever display the logged-in interactive session already presents — a real monitor,
+/// a dummy plug, or a virtual monitor from an indirect-display driver (e.g. mttvdd) on a
+/// headless box. No provisioning. See docs/running-on-windows.md.
 pub(crate) struct ExistingDesktop;
 
 impl DisplayProvider for ExistingDesktop {
