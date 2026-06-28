@@ -11,7 +11,9 @@ Running glass on a Windows host.
   (Windows.Graphics.Capture for screenshots, SendInput for input, UI Automation for
   the accessibility tree).
 - glass drives apps on the **interactive desktop**, so run it in a normal logged-in
-  session (not a non-interactive service / Session 0).
+  session (not a non-interactive service / Session 0). On a box with **no monitor
+  attached**, add a virtual display driver so that session has a display to capture —
+  see [Headless capture](#headless-capture--a-virtual-display-driver) below.
 
 ## Containment runtime
 
@@ -131,6 +133,38 @@ glass-mcp serve --http
 
 Then point the client at `http://127.0.0.1:7300`. The connection is encrypted by SSH;
 glass itself does not own TLS.
+
+## Headless capture — a virtual display driver
+
+glass captures the **interactive console session** the GPU composes (see above). On a box
+with a physical monitor (or a dummy/headless display plug), that session already has a
+display to capture. A box with **no monitor attached** — a CI runner, a server, a remote
+VM — may have no composited display in that session, so WGC has nothing to grab.
+
+An **indirect-display (IddCx) driver** fixes this by adding a *virtual monitor* to the
+interactive session. The recommended one is the community
+**[Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver)**
+(often called **MttVDD**; MIT, signed): it auto-provisions a monitor from
+`C:\VirtualDisplayDriver\vdd_settings.xml` (`<monitors><count>`) with no holder process to
+keep running.
+
+Install (elevated PowerShell, after trusting the driver's signing certificate per its
+README):
+
+```powershell
+pnputil /add-driver C:\path\to\MttVDD.inf /install
+```
+
+Once installed, the virtual monitor is part of the interactive session, so **glass picks it
+up automatically** — no glass configuration. The app renders on it and WGC captures it like
+any other display; if a real monitor is also attached, place the app on the virtual
+monitor's (off-screen) coordinates.
+
+> **Headless ≠ isolated.** A virtual display driver makes Windows *headless-capable* — it
+> does **not** wall the app off your interactive session the way Linux's private `Xvfb` /
+> `sway` server does. There is still **one** interactive desktop, and the virtual monitor is
+> part of it. For the app fully off your session, use the
+> [VM / strong-isolation tier](#vm--strong-isolation-tier) below.
 
 ## VM / strong-isolation tier
 

@@ -20,7 +20,7 @@ That splits remote access into two camps:
 |---|---|---|
 | Edit + build + git | **OpenSSH server** (+ optional VS Code **Remote-SSH**) | enabled by `setup-box.ps1`; build with `cargo build` over SSH |
 | **Run + watch tests** | **Sunshine** (host) + **Moonlight** (Linux client) | open-source, low-latency, mirrors the console, survives client disconnect |
-| Headless capture | **Parsec VDD** virtual display | no need to unplug the monitor — capture a window placed on the virtual display |
+| Headless capture | **MttVDD** virtual display | a window placed on the virtual monitor is capturable without unplugging the real one (Parsec VDD also works) |
 
 ## One-time setup
 
@@ -45,8 +45,12 @@ That splits remote access into two camps:
      or your package manager); add the box, enter the PIN from Sunshine's web UI, then launch
      the **Desktop** entry. You're now looking at the real console session.
 
-4. **Virtual display driver** for headless capture: install **Parsec VDD**
-   (<https://github.com/nomi-san/parsec-vdd>, MIT/signed).
+4. **Virtual display driver** for headless capture: install the community
+   **[Virtual-Display-Driver / MttVDD](https://github.com/VirtualDrivers/Virtual-Display-Driver)**
+   (MIT, signed) — it auto-provisions a virtual monitor from
+   `C:\VirtualDisplayDriver\vdd_settings.xml` with no holder process. **Parsec VDD**
+   (<https://github.com/nomi-san/parsec-vdd>, MIT/signed) also works, but needs a
+   ping-holder process kept running.
 
 ## The one gotcha: SSH is session 0, capture/input need session 1
 
