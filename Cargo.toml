@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux", "crates/glass-proc-linux", "crates/glass-clip-hook", "crates/glass-dbus-linux", "crates/glass-android"]
+members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "crates/glass-mcp", "crates/glass-wayland", "crates/glass-a11y-linux", "crates/glass-windows", "crates/glass-a11y-windows", "crates/glass-sandbox-linux", "crates/glass-proc-linux", "crates/glass-clip-hook", "crates/glass-dbus-linux", "crates/glass-android", "crates/glass-macos"]
 # glass-fixture-egui is intentionally excluded: heavy egui deps, only exercised by #[ignore]d
 # on-box a11y tests CI can't run. Built on-demand on the box.
 exclude = ["crates/glass-fixture-egui"]
