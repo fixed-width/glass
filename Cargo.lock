@@ -1017,6 +1017,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-macos"
+version = "0.0.0"
+dependencies = [
+ "glass-core",
+]
+
+[[package]]
 name = "glass-mcp"
 version = "0.0.0"
 dependencies = [

@@ -17,15 +17,16 @@ pub fn check_in_bounds(x: i32, y: i32, width: u32, height: u32) -> Result<(), Gl
     Ok(())
 }
 
-/// Clamp a window-relative region to the window rect, returning `(x, y, w, h)` with the
-/// width/height trimmed so the region never exceeds the window. A region fully outside
-/// clamps to zero size at the nearest edge.
+/// Clamp a window-relative region to the window rect, returning `(x, y, w, h)` = the
+/// intersection of the region with the window. A region fully outside clamps to zero
+/// size at the nearest edge. Computed in `i64` so no cast can wrap for any input.
 pub fn clamp_region(rx: i32, ry: i32, rw: u32, rh: u32, width: u32, height: u32) -> (u32, u32, u32, u32) {
-    let x = rx.clamp(0, width as i32) as u32;
-    let y = ry.clamp(0, height as i32) as u32;
-    let w = rw.min(width.saturating_sub(x));
-    let h = rh.min(height.saturating_sub(y));
-    (x, y, w, h)
+    let (w_i, h_i) = (width as i64, height as i64);
+    let left = (rx as i64).clamp(0, w_i);
+    let top = (ry as i64).clamp(0, h_i);
+    let right = (rx as i64 + rw as i64).clamp(0, w_i);
+    let bottom = (ry as i64 + rh as i64).clamp(0, h_i);
+    (left as u32, top as u32, (right - left) as u32, (bottom - top) as u32)
 }
 
 #[cfg(test)]
@@ -51,5 +52,15 @@ mod tests {
         assert_eq!(clamp_region(10, 10, 100, 100, 640, 480), (10, 10, 100, 100));
         assert_eq!(clamp_region(600, 0, 100, 50, 640, 480), (600, 0, 40, 50)); // width trimmed
         assert_eq!(clamp_region(700, 0, 100, 50, 640, 480), (640, 0, 0, 50)); // fully outside → 0 width
+    }
+
+    #[test]
+    fn clamp_region_trims_left_top_overhang() {
+        // fully outside on the left → zero width (mirror of the right-edge case)
+        assert_eq!(clamp_region(-100, 0, 50, 50, 640, 480), (0, 0, 0, 50));
+        // partial left overhang → only the in-window portion's width
+        assert_eq!(clamp_region(-50, 0, 100, 50, 640, 480), (0, 0, 50, 50));
+        // fully outside on the top → zero height
+        assert_eq!(clamp_region(0, -100, 50, 50, 640, 480), (0, 0, 50, 0));
     }
 }
