@@ -10,6 +10,8 @@ pub mod coords; // pure window-relative <-> global math — cross-platform, host
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
 
 #[cfg(target_os = "macos")]
+mod ffi;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod backend;
