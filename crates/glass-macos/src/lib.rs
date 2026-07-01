@@ -33,8 +33,8 @@ pub use backend::MacosPlatform;
 pub use ffi::init_main_thread;
 // `doctor`-facing predicates (glass-mcp's doctor.rs): the two TCC grants (+ the exact
 // remedy text `preflight`'s `PermissionDenied` error also uses, so the two can't drift)
-// and whether the console session's display is locked/asleep.
+// and the console session's three-way state (unlocked/locked/no-session-attached).
 #[cfg(target_os = "macos")]
 pub use permissions::{accessibility_granted, accessibility_remedy, screen_recording_granted, screen_recording_remedy};
 #[cfg(target_os = "macos")]
-pub use session::session_locked;
+pub use session::{session_locked, session_state, SessionState};

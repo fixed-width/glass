@@ -82,9 +82,12 @@ pub fn make_platform(
     // to each. It connects lazily on first snapshot; an absent a11y bus surfaces as
     // AccessibilityUnavailable at call time, not here.
     // Accessibility is per-OS: AT-SPI on Linux, UI Automation on Windows. macOS has no
-    // a11y reader yet (AXUIElement tree reading is its own later plan) — no silent
-    // fallback: glass_a11y_snapshot/click_element/set_value surface
-    // AccessibilityUnavailable rather than pretending a tree exists.
+    // a11y reader yet (AXUIElement tree reading is its own later plan), so
+    // `accessibility` is `None` below — no silent fallback: glass-core's session layer
+    // surfaces `AxUnsupported` for a missing reader (see `glass-core::session`) rather
+    // than pretending a tree exists. That's a different variant from
+    // `AccessibilityUnavailable` above, which is for a *present* reader that fails at
+    // call time (e.g. Linux's AT-SPI bus being unreachable).
     #[cfg(windows)]
     let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
         Some(Box::new(glass_a11y_windows::WindowsA11y::new()));

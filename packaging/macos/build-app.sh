@@ -109,6 +109,10 @@ if [ -n "$build_num" ]; then
 fi
 
 echo "==> codesigning (identity: $sign_identity, bundle id: $bundle_id)"
+# Non-interactive (SSH/CI) runs: if the keychain holding $sign_identity is locked,
+# codesign fails with errSecInternalComponent rather than an obviously-keychain-shaped
+# error — unlock it first with `security unlock-keychain -p <password> <keychain>`
+# (see docs/running-on-macos.md).
 codesign_args=(--force --options runtime -s "$sign_identity")
 if [ -n "$sign_keychain" ]; then
   codesign_args+=(--keychain "$sign_keychain")

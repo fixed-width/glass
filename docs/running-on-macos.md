@@ -158,6 +158,24 @@ Once granted (step 3), the agent has `glass_start`, `glass_screenshot`,
 accessibility-tree tools — `glass_a11y_snapshot`, `glass_click_element` — aren't
 available on macOS yet.
 
+## Troubleshooting: headless / SSH setup
+
+Two gotchas that only show up when you're driving a box over SSH (no one at the
+keyboard), e.g. re-signing after a code change or building the Swift capture-test
+fixture:
+
+- **Non-interactive `codesign` needs the keychain unlocked first.** A keychain
+  created (or last unlocked) in an earlier login session is locked again by the time
+  a bare SSH shell runs `codesign` — you'll see `errSecInternalComponent` rather
+  than an obviously-keychain-shaped error. Unlock it explicitly before signing:
+  `security unlock-keychain -p <password> <keychain>` (the login keychain if you
+  didn't pass `--keychain` to `build-app.sh`). This has nothing to do with TCC/AX
+  grants — it's the code-signing step itself failing to reach the private key.
+- **Any `@main` Swift source (including the `glass-macos` capture-test fixture,
+  `crates/glass-macos/fixture/quadrants.swift`) needs `swiftc -parse-as-library`.**
+  Without it, `swiftc` assumes top-level statements (the `main.swift` convention) and
+  errors on an explicit `@main` entry point.
+
 ---
 
 ## Problems?
