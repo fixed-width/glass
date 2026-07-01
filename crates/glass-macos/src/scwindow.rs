@@ -84,6 +84,42 @@ pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<Wi
     outcome.value.ok_or(GlassError::Timeout(timeout_ms))
 }
 
+/// Find the first on-screen `SCWindow` in `content.windows()` owned by one of `pids`,
+/// returning it alongside its owning pid. Shared by [`query_once`] (which extracts a
+/// [`WindowMatch`] snapshot from the match, since the window itself can't survive the
+/// completion handler's thread boundary — see the module doc) and
+/// `capture::capture_window` (which needs the live `SCWindow` itself, still inside the
+/// same completion-handler callback, to build an `SCContentFilter` from it). Keeping the
+/// filter loop here means the two call sites can't drift apart on what "the target
+/// window" means.
+pub(crate) fn find_on_screen_window(
+    content: &SCShareableContent,
+    pids: &[i32],
+) -> Option<(Retained<SCWindow>, i32)> {
+    // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
+    // preconditions.
+    let windows: Retained<NSArray<SCWindow>> = unsafe { content.windows() };
+
+    for w in windows.iter() {
+        // SAFETY: `w` is a live `SCWindow` yielded by the array (`NSArray::iter` hands
+        // out a fresh, owned `Retained<SCWindow>` per element — see `ffi.rs`'s gotcha
+        // notes); this and the getters below have no preconditions beyond a valid
+        // receiver.
+        if !unsafe { w.isOnScreen() } {
+            continue;
+        }
+        // SAFETY: same as above — a plain property getter.
+        let owning_application = unsafe { w.owningApplication() };
+        let Some(app) = owning_application else { continue };
+        // SAFETY: same as above — a plain property getter.
+        let pid = unsafe { app.processID() };
+        if pids.contains(&pid) {
+            return Some((w, pid));
+        }
+    }
+    None
+}
+
 /// One `SCShareableContent` round trip via the `RcBlock` -> `mpsc` bridge (`ffi.rs`'s
 /// documented pattern): `Ok(Some(_))` on a match, `Ok(None)` if no matching on-screen
 /// window exists yet (the outer poll should retry), `Err` if `SCShareableContent` itself
@@ -113,38 +149,21 @@ fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
         // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
         // points to a live `SCShareableContent` for the duration of this callback.
         let content: &SCShareableContent = unsafe { &*content_ptr };
-        // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
-        // preconditions.
-        let windows: Retained<NSArray<SCWindow>> = unsafe { content.windows() };
 
-        for w in windows.iter() {
-            // SAFETY: `w` is a live `SCWindow` yielded by the array (`NSArray::iter`
-            // hands out a fresh, owned `Retained<SCWindow>` per element — see `ffi.rs`'s
-            // gotcha notes); this and the getters below have no preconditions beyond a
-            // valid receiver.
-            if !unsafe { w.isOnScreen() } {
-                continue;
-            }
-            // SAFETY: same as above — a plain property getter.
-            let owning_application = unsafe { w.owningApplication() };
-            let Some(app) = owning_application else { continue };
-            // SAFETY: same as above — a plain property getter.
-            let pid = unsafe { app.processID() };
-            if !pids_owned.contains(&pid) {
-                continue;
-            }
-            // SAFETY: same as above — plain property getters.
-            let (window_id, frame) = unsafe { (w.windowID(), w.frame()) };
-            let geometry = geometry_from_rect(
-                frame.origin.x,
-                frame.origin.y,
-                frame.size.width,
-                frame.size.height,
-            );
-            let _ = tx.send(QueryReply::Found(WindowMatch { pid, window_id, geometry }));
+        let Some((w, pid)) = find_on_screen_window(content, &pids_owned) else {
+            let _ = tx.send(QueryReply::NotFound);
             return;
-        }
-        let _ = tx.send(QueryReply::NotFound);
+        };
+        // SAFETY: `w` was just resolved live from `content.windows()` above; these are
+        // plain property getters with no other preconditions.
+        let (window_id, frame) = unsafe { (w.windowID(), w.frame()) };
+        let geometry = geometry_from_rect(
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        );
+        let _ = tx.send(QueryReply::Found(WindowMatch { pid, window_id, geometry }));
     });
 
     // SAFETY: `block` matches `getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler`'s
