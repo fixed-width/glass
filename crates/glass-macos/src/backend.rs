@@ -36,12 +36,30 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
-/// whether a `Move`/`Resize` actually took: `Move`'s final vs. requested position, and
-/// `Resize`'s did-anything-happen-at-all check (see [`resize_was_refused`]'s doc — a
-/// legitimate min/max-size clamp is not a refusal). `8`px mirrors `axwindow.rs`'s own
-/// `FALLBACK_TOLERANCE_PX` — generous enough to absorb point<->pixel rounding across a
-/// position/size round trip without masking a real refusal.
+/// whether a `Move`/`Resize`'s read-back position/size actually matches what was requested
+/// (see [`move_took_effect`]/[`resize_was_refused`]'s docs — a legitimate min/max-size clamp
+/// is not a refusal). `8`px mirrors `axwindow.rs`'s own `FALLBACK_TOLERANCE_PX` — generous
+/// enough to absorb point<->pixel rounding across a position/size round trip without masking
+/// a real refusal.
+///
+/// This is deliberately a *separate* constant from [`REQUEST_EPSILON_PX`] (final-review fix
+/// 3): using this same 8px value to also decide "was a change requested at all" let a
+/// fully-refused Move/Resize whose target happened to be within 8px of the window's starting
+/// position report success — the read-back (unchanged, since it was refused) was
+/// coincidentally within 8px of a target that was itself only a few pixels away. Splitting
+/// "was a change requested" (tight, `REQUEST_EPSILON_PX`) from "does the read-back match"
+/// (loose, this constant) closes that hole.
 const WINDOW_OP_TOLERANCE_PX: i32 = 8;
+
+/// Threshold (pixels) [`move_took_effect`]/[`resize_was_refused`] use to decide whether a
+/// `Move`/`Resize` request asked for a genuinely different position/size than the window
+/// already had — as opposed to [`WINDOW_OP_TOLERANCE_PX`], which judges whether the
+/// *read-back* matches the *request*. Kept tight (well under `WINDOW_OP_TOLERANCE_PX`) so a
+/// real (if small) requested change that's totally refused — the read-back stays at the
+/// window's original position/size — is still caught as a refusal rather than waved through
+/// because the unmoved position happens to already sit within `WINDOW_OP_TOLERANCE_PX` of
+/// the target. See both functions' docs for the exact logic.
+const REQUEST_EPSILON_PX: i32 = 2;
 
 /// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
 /// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
@@ -137,15 +155,22 @@ impl MacosPlatform {
     }
 
     /// Resolve the window `capture_frame`/`send_pointer`/`send_key` should target *this*
-    /// call: `scwindow::find_window_by_id(active_window, ..)` once `select_window` (or
-    /// `start_app`'s initial discovery) has set an active `CGWindowID` — the retargeting the
-    /// `Platform` contract requires (see the `active_window` field's doc) — falling back to
-    /// the pre-Plan-4 "first on-screen window for this pid" lookup when nothing is selected
-    /// yet. Always fresh (never cached): mirrors `find_window_for_pids`'s own per-call
-    /// re-resolution, since the window may have moved/resized/closed since the last call.
+    /// call: `scwindow::find_window_by_id(active_window, [pid], ..)` once `select_window`
+    /// (or `start_app`'s initial discovery) has set an active `CGWindowID` — the retargeting
+    /// the `Platform` contract requires (see the `active_window` field's doc) — falling back
+    /// to the pre-Plan-4 "first on-screen window for this pid" lookup when nothing is
+    /// selected yet. Always fresh (never cached): mirrors `find_window_for_pids`'s own
+    /// per-call re-resolution, since the window may have moved/resized/closed since the last
+    /// call.
+    ///
+    /// Passes `&[pid]` to `find_window_by_id` (final-review fix 1): `active_window` is only
+    /// ever set to an id this backend itself resolved for `pid`, but scoping the lookup here
+    /// too means a stale/foreign id can never silently resolve to another app's window — it
+    /// surfaces `GlassError::WindowNotFound` instead, exactly like every other resolution
+    /// path in this module.
     fn resolve_active_window(&self, pid: i32) -> Result<crate::scwindow::WindowMatch> {
         match self.active_window {
-            Some(id) => crate::scwindow::find_window_by_id(id, WINDOW_RESOLVE_TIMEOUT),
+            Some(id) => crate::scwindow::find_window_by_id(id, &[pid], WINDOW_RESOLVE_TIMEOUT),
             None => crate::scwindow::find_window_for_pids(&[pid], WINDOW_RESOLVE_TIMEOUT),
         }
     }
@@ -209,28 +234,47 @@ fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
     Ok(coords::pixel_geometry_from_content_rect(x, y, width, height, scale))
 }
 
-/// True if `geom`'s position is within [`WINDOW_OP_TOLERANCE_PX`] of a `Move { x, y }`
-/// target — the signal `window(op)`'s `Move` branch uses to catch a macOS window that
-/// silently ignores `AXPosition` (the no-silent-no-op contract `window(op)`'s doc
-/// describes). Pure so it's unit-testable without a live `AXUIElement`.
-fn move_took_effect(geom: &WindowGeometry, x: i32, y: i32) -> bool {
-    (geom.x - x).abs() <= WINDOW_OP_TOLERANCE_PX && (geom.y - y).abs() <= WINDOW_OP_TOLERANCE_PX
+/// True if a `Move { x, y }` request succeeded: either `x`/`y` was already (within
+/// [`REQUEST_EPSILON_PX`]) `before`'s own position — no real change was requested, so
+/// whatever `after` reads back as is fine — or `after` is within [`WINDOW_OP_TOLERANCE_PX`]
+/// of the target AND the window actually moved away from `before` (not just coincidentally
+/// unmoved-but-within-tolerance-of-a-nearby-target — see [`WINDOW_OP_TOLERANCE_PX`]/
+/// [`REQUEST_EPSILON_PX`]'s docs for why both checks are needed). The signal `window(op)`'s
+/// `Move` branch uses to catch a macOS window that silently ignores `AXPosition` (the
+/// no-silent-no-op contract `window(op)`'s doc describes). Computed in `i64` before `.abs()`
+/// so no cast can wrap for any input (matches `coords.rs`'s house rule). Pure so it's
+/// unit-testable without a live `AXUIElement`.
+fn move_took_effect(before: &WindowGeometry, after: &WindowGeometry, x: i32, y: i32) -> bool {
+    let requested_a_change = (i64::from(x) - i64::from(before.x)).abs() > i64::from(REQUEST_EPSILON_PX)
+        || (i64::from(y) - i64::from(before.y)).abs() > i64::from(REQUEST_EPSILON_PX);
+    if !requested_a_change {
+        return true;
+    }
+    let reached_target = (i64::from(after.x) - i64::from(x)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX)
+        && (i64::from(after.y) - i64::from(y)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX);
+    let stayed_put = (i64::from(after.x) - i64::from(before.x)).abs() <= i64::from(REQUEST_EPSILON_PX)
+        && (i64::from(after.y) - i64::from(before.y)).abs() <= i64::from(REQUEST_EPSILON_PX);
+    reached_target && !stayed_put
 }
 
 /// True if a `Resize { width, height }` had no visible effect at all: `after` is (within
-/// tolerance) the same size as `before`, even though `width`/`height` was a genuinely
-/// different size than `before`'s own. This is deliberately narrower than "does `after`
-/// exactly match the request": macOS may legitimately clamp to an intermediate size (a
-/// window's min/max content-size constraint), which is expected behavior, not a bug — the
-/// resulting `after` geometry is still returned to the caller in that case (see
-/// `window(op)`'s `Resize` doc). Only a total no-op (the size never moved, despite a real
-/// change being requested) is treated as the "macOS refused the resize" failure. Pure so
-/// it's unit-testable without a live `AXUIElement`.
+/// [`WINDOW_OP_TOLERANCE_PX`]) the same size as `before`, even though `width`/`height` asked
+/// for a genuinely different size than `before`'s own (more than [`REQUEST_EPSILON_PX`]
+/// different — see that constant's doc for why this must be tighter than
+/// `WINDOW_OP_TOLERANCE_PX`, otherwise a small-but-real requested resize that's totally
+/// refused would not even count as "a change was requested"). This is deliberately narrower
+/// than "does `after` exactly match the request": macOS may legitimately clamp to an
+/// intermediate size (a window's min/max content-size constraint), which is expected
+/// behavior, not a bug — the resulting `after` geometry is still returned to the caller in
+/// that case (see `window(op)`'s `Resize` doc). Only a total no-op (the size never moved,
+/// despite a real change being requested) is treated as the "macOS refused the resize"
+/// failure. Computed in `i64` before `.abs()` so no cast can wrap for any input (matches
+/// `coords.rs`'s house rule). Pure so it's unit-testable without a live `AXUIElement`.
 fn resize_was_refused(before: &WindowGeometry, after: &WindowGeometry, width: u32, height: u32) -> bool {
-    let requested_a_change = (width as i32 - before.width as i32).abs() > WINDOW_OP_TOLERANCE_PX
-        || (height as i32 - before.height as i32).abs() > WINDOW_OP_TOLERANCE_PX;
-    let nothing_moved = (after.width as i32 - before.width as i32).abs() <= WINDOW_OP_TOLERANCE_PX
-        && (after.height as i32 - before.height as i32).abs() <= WINDOW_OP_TOLERANCE_PX;
+    let requested_a_change = (i64::from(width) - i64::from(before.width)).abs() > i64::from(REQUEST_EPSILON_PX)
+        || (i64::from(height) - i64::from(before.height)).abs() > i64::from(REQUEST_EPSILON_PX);
+    let nothing_moved = (i64::from(after.width) - i64::from(before.width)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX)
+        && (i64::from(after.height) - i64::from(before.height)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX);
     requested_a_change && nothing_moved
 }
 
@@ -291,14 +335,16 @@ impl Platform for MacosPlatform {
     /// calls).
     ///
     /// NOTE: targets `active_window` when set (`capture::capture_window_by_id`, exact
-    /// `CGWindowID` match) — the retargeting `select_window` (a later task) drives, per the
-    /// `Platform` contract's "implicit target of capture/input" — else falls back to the
-    /// pre-Plan-4 first-on-screen-window-for-this-pid path (`capture::capture_window`).
-    /// `resolve_active_window`'s doc covers the shared decision; capture takes its own
-    /// `capture_window`/`capture_window_by_id` branch (rather than calling
-    /// `resolve_active_window` itself) because capture needs the live `SCWindow` inside a
-    /// single completion-handler callback to build its `SCContentFilter`, not just the
-    /// `WindowMatch` snapshot `resolve_active_window` returns.
+    /// `CGWindowID` match scoped to `&[pid]` — final-review fix 1, same rationale as
+    /// `resolve_active_window`'s doc) — the retargeting `select_window` (a later task)
+    /// drives, per the `Platform` contract's "implicit target of capture/input" — else falls
+    /// back to the pre-Plan-4 first-on-screen-window-for-this-pid path
+    /// (`capture::capture_window`). `resolve_active_window`'s doc covers the shared
+    /// decision; capture takes its own `capture_window`/`capture_window_by_id` branch
+    /// (rather than calling `resolve_active_window` itself) because capture needs the live
+    /// `SCWindow` inside a single completion-handler callback to build its
+    /// `SCContentFilter`, not just the `WindowMatch` snapshot `resolve_active_window`
+    /// returns.
     ///
     /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()`
     /// (via `capture::capture_window`/`capture_window_by_id`) and must run on the true main
@@ -307,7 +353,7 @@ impl Platform for MacosPlatform {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         match self.active_window {
-            Some(id) => crate::capture::capture_window_by_id(id, region),
+            Some(id) => crate::capture::capture_window_by_id(id, &[pid as i32], region),
             None => crate::capture::capture_window(&[pid as i32], region),
         }
     }
@@ -359,13 +405,15 @@ impl Platform for MacosPlatform {
     /// - `Focus` activates the owning app (`input::focus`, the same
     ///   `NSRunningApplication::activate` call `send_pointer`/`send_key` already make),
     ///   then `AXRaise`s and marks the window `AXMain` — CGEvents alone can't target a
-    ///   specific window (see `send_key`'s doc), this is what actually does.
+    ///   specific window (see `send_key`'s doc), this is what actually does. Propagates
+    ///   `input::focus`'s error (final-review fix 4) if the owning app is no longer running
+    ///   rather than silently raising/main-ing an `AXUIElement` for a process that's gone.
     /// - `Move { x, y }` converts the target from global-screen PIXELS to Quartz POINTS
     ///   (`coords::global_pixel_to_point`) and sets `AXPosition`.
     /// - `Resize { width, height }` sets `AXSize`, then re-sets `AXPosition` to its
-    ///   just-read current value, then sets `AXSize` again — the proven
-    ///   `window_ops.swift` workaround for a window that won't grow past its current
-    ///   on-screen bounds via a single `AXSize` set alone.
+    ///   just-read current value, then sets `AXSize` again — the brief-specified workaround
+    ///   (verified by the Task 6 window integration test) for a window that won't grow past
+    ///   its current on-screen bounds via a single `AXSize` set alone.
     /// - `Geometry` performs no mutation.
     ///
     /// Every branch reads back the window's position/size afterward
@@ -380,12 +428,15 @@ impl Platform for MacosPlatform {
         let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
 
-        let m = crate::scwindow::find_window_by_id(id, WINDOW_RESOLVE_TIMEOUT)?;
+        // `&[pid as i32]`-scoped (final-review fix 1): `id` came from this backend's own
+        // `active_window`, but scoping the lookup here too means a stale/foreign id can
+        // never resolve to another app's window.
+        let m = crate::scwindow::find_window_by_id(id, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
         let el = axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
 
         match *op {
             WindowOp::Focus => {
-                crate::input::focus(pid as i32);
+                crate::input::focus(pid as i32)?;
                 axwindow::ax_raise(&el)?;
                 axwindow::ax_set_main(&el)?;
                 read_ax_geometry(&el, m.scale)
@@ -394,7 +445,7 @@ impl Platform for MacosPlatform {
                 let target_pt = coords::global_pixel_to_point((x, y), m.scale);
                 axwindow::ax_set_position(&el, target_pt)?;
                 let geom = read_ax_geometry(&el, m.scale)?;
-                if !move_took_effect(&geom, x, y) {
+                if !move_took_effect(&m.geometry, &geom, x, y) {
                     return Err(GlassError::Backend(format!(
                         "window move to ({x},{y}) px did not take; window is at ({},{})",
                         geom.x, geom.y
@@ -437,32 +488,41 @@ impl Platform for MacosPlatform {
     /// active window, the implicit target of capture/input/window ops" (see
     /// `glass_core::platform`'s doc on this method).
     ///
-    /// First confirms `id` is currently on-screen via `scwindow::find_window_by_id`,
-    /// which already maps a lookup that never turns up `id` before
-    /// `WINDOW_RESOLVE_TIMEOUT` elapses to `GlassError::WindowNotFound` (see that
-    /// function's own doc) — exactly this method's "not currently one of the app's
-    /// windows" contract, so no extra `Timeout` -> `WindowNotFound` mapping is needed
-    /// here. Only after that check succeeds does `active_window` actually change — a
-    /// failed `select_window` must leave the previous target in place, not (say) clear
-    /// it.
+    /// First confirms `id` is currently on-screen AND owned by `self.app_pid` via
+    /// `scwindow::find_window_by_id(id, &[app_pid], ..)` (final-review fix 1 — pid-scoped,
+    /// unlike the pre-fix version which matched any on-screen `CGWindowID` system-wide),
+    /// which already maps a lookup that never turns up `id` before `WINDOW_RESOLVE_TIMEOUT`
+    /// elapses to `GlassError::WindowNotFound` (see that function's own doc) — exactly this
+    /// method's "not currently one of the app's windows" contract, so no extra `Timeout` ->
+    /// `WindowNotFound` mapping is needed here. Only after that check succeeds does
+    /// `active_window` actually change — a failed `select_window` must leave the previous
+    /// target in place, not (say) clear it.
     ///
     /// Then raises and focuses the newly-selected window by delegating to
-    /// `self.window(&WindowOp::Focus)` rather than duplicating its AXUIElement logic:
-    /// that path re-resolves `id`'s `AXUIElement` scoped to `self.app_pid`
-    /// (`axwindow::ax_window_for_cgwindowid`), which doubles as a second, stronger
-    /// validation that `id` genuinely belongs to *this* app (`find_window_by_id` alone
-    /// matches any on-screen `CGWindowID`, not just ones owned by `app_pid`) — a window
-    /// belonging to some other running app would fail here with `WindowNotFound` even
-    /// though the first check passed. `window(Focus)`'s own read-back
-    /// ([`read_ax_geometry`]) supplies the pixel `WindowGeometry` this method returns,
-    /// so the window is queried fresh exactly once more (mirroring every other op's
-    /// no-caching discipline) rather than reusing the first lookup's now-slightly-stale
-    /// geometry.
+    /// `self.window(&WindowOp::Focus)` rather than duplicating its AXUIElement logic: that
+    /// path re-resolves `id`'s `AXUIElement` scoped to `self.app_pid`
+    /// (`axwindow::ax_window_for_cgwindowid`) too, via a completely independent lookup path
+    /// (`SCShareableContent` above vs. `AXUIElementCreateApplication` here) — belt-and-
+    /// suspenders with the pid-scoped check above, not a second layer this method actually
+    /// depends on. `window(Focus)`'s own read-back ([`read_ax_geometry`]) supplies the pixel
+    /// `WindowGeometry` this method returns, so the window is queried fresh exactly once
+    /// more (mirroring every other op's no-caching discipline) rather than reusing the first
+    /// lookup's now-slightly-stale geometry.
+    ///
+    /// If `self.window(&WindowOp::Focus)` fails after `active_window` has already been
+    /// retargeted — e.g. the window closed in the gap between the check above and the
+    /// `AXRaise`/`AXMain` calls — `active_window` is rolled back to its prior value
+    /// (final-review fix 2) rather than left pointing at a window this call never actually
+    /// confirmed glass can operate on. Belt-and-suspenders with the pid-scoped check above:
+    /// that check already rejects a foreign/stale `id` before any mutation, so this rollback
+    /// only matters for the narrower window-closed-mid-call race.
     fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
         permissions::preflight()?;
-        crate::scwindow::find_window_by_id(id.0 as u32, WINDOW_RESOLVE_TIMEOUT)?;
+        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let previous = self.active_window;
+        crate::scwindow::find_window_by_id(id.0 as u32, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
         self.active_window = Some(id.0 as u32);
-        self.window(&WindowOp::Focus)
+        self.window(&WindowOp::Focus).inspect_err(|_| self.active_window = previous)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
@@ -619,20 +679,44 @@ mod tests {
     }
 
     #[test]
-    fn move_took_effect_accepts_exact_and_within_tolerance() {
-        let geom = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        assert!(move_took_effect(&geom, 100, 200), "exact match");
-        assert!(move_took_effect(&geom, 104, 196), "within tolerance");
-        assert!(move_took_effect(&geom, 92, 208), "within tolerance, other direction");
+    fn move_took_effect_accepts_a_genuine_move_that_reached_target() {
+        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let after_exact = WindowGeometry { x: 300, y: 200, width: 640, height: 480 };
+        assert!(move_took_effect(&before, &after_exact, 300, 200), "exact match");
+        let after_tolerance = WindowGeometry { x: 304, y: 196, width: 640, height: 480 };
+        assert!(move_took_effect(&before, &after_tolerance, 300, 200), "within tolerance");
     }
 
     #[test]
-    fn move_took_effect_rejects_a_window_that_did_not_move() {
+    fn move_took_effect_rejects_when_read_back_is_far_from_target() {
         // The refusal case: AXSetAttributeValue(AXPosition) reported success but the
         // window is still sitting wherever it started.
-        let geom = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        assert!(!move_took_effect(&geom, 500, 200), "x off by more than tolerance");
-        assert!(!move_took_effect(&geom, 100, 600), "y off by more than tolerance");
+        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let unmoved = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        assert!(!move_took_effect(&before, &unmoved, 500, 200), "x off by more than tolerance");
+        assert!(!move_took_effect(&before, &unmoved, 100, 600), "y off by more than tolerance");
+    }
+
+    #[test]
+    fn move_took_effect_rejects_a_total_refusal_even_for_a_small_requested_delta() {
+        // Regression test for final-review fix 3: a small (but genuine, > REQUEST_EPSILON_PX)
+        // requested delta that's fully refused must not be reported as success just because
+        // the unmoved position happens to still land within WINDOW_OP_TOLERANCE_PX of the
+        // target — the exact bug this fix closes.
+        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let unmoved = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        // Requested delta is 5px (> REQUEST_EPSILON_PX's 2px) but <= WINDOW_OP_TOLERANCE_PX's
+        // 8px, so the old single-tolerance logic silently accepted this as success.
+        assert!(!move_took_effect(&before, &unmoved, 105, 200));
+    }
+
+    #[test]
+    fn move_took_effect_is_true_when_no_real_change_was_requested() {
+        // Target is within REQUEST_EPSILON_PX of `before` -- essentially a no-op move, so
+        // whatever `after` reads back as is not a refusal to report.
+        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let after = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        assert!(move_took_effect(&before, &after, 101, 201));
     }
 
     #[test]
@@ -668,5 +752,17 @@ mod tests {
         let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
         let after = WindowGeometry { x: 0, y: 0, width: 800, height: 600 };
         assert!(!resize_was_refused(&before, &after, 800, 600));
+    }
+
+    #[test]
+    fn resize_was_refused_catches_a_total_refusal_of_a_small_requested_delta() {
+        // Regression test for final-review fix 3: a small (> REQUEST_EPSILON_PX, but within
+        // the old WINDOW_OP_TOLERANCE_PX-based "was a change requested" threshold) resize
+        // request that's fully refused must now be caught. Before this fix, a 5px delta
+        // wasn't even considered "a change was requested" (5 <= the old 8px threshold), so a
+        // total no-op silently reported success.
+        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 }; // unmoved
+        assert!(resize_was_refused(&before, &after, 645, 480));
     }
 }

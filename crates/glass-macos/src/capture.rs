@@ -52,15 +52,19 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
     capture_resolved(region, move |content| find_on_screen_window(content, &pids_owned))
 }
 
-/// Capture the specific on-screen window whose `CGWindowID == window_id` as an RGBA8
-/// [`Frame`], optionally cropped to a window-relative `region`. Same error mapping as
-/// [`capture_window`]. This is `backend.rs::capture_frame`'s active-window (retargeted)
-/// path: once `MacosPlatform::active_window` is set (by `start_app`, later by
-/// `select_window`), capture must target that *exact* window rather than "first on-screen
-/// window for this pid" — a multi-window app would otherwise silently capture the wrong
-/// window (Plan 4's design decision 2).
-pub(crate) fn capture_window_by_id(window_id: u32, region: Option<&Region>) -> Result<Frame> {
-    capture_resolved(region, move |content| find_on_screen_window_by_id(content, window_id))
+/// Capture the specific on-screen window whose `CGWindowID == window_id` AND
+/// `owningApplication().processID() ∈ pids` as an RGBA8 [`Frame`], optionally cropped to a
+/// window-relative `region`. Same error mapping as [`capture_window`]. This is
+/// `backend.rs::capture_frame`'s active-window (retargeted) path: once
+/// `MacosPlatform::active_window` is set (by `start_app`, later by `select_window`), capture
+/// must target that *exact* window rather than "first on-screen window for this pid" — a
+/// multi-window app would otherwise silently capture the wrong window (Plan 4's design
+/// decision 2). The `pids` scoping (final-review fix 1) additionally guards against a
+/// stale/foreign `active_window` id: without it, `window_id` alone could match a window
+/// owned by a completely different app, silently capturing its pixels instead of erroring.
+pub(crate) fn capture_window_by_id(window_id: u32, pids: &[i32], region: Option<&Region>) -> Result<Frame> {
+    let pids_owned: Vec<i32> = pids.to_vec();
+    capture_resolved(region, move |content| find_on_screen_window_by_id(content, window_id, &pids_owned))
 }
 
 /// Shared nested-async capture body for [`capture_window`]/[`capture_window_by_id`]: resolve

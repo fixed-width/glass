@@ -5,8 +5,10 @@
 //! completion-handler API proven end-to-end in
 //! `.superpowers/sdd/objc2-spike-report.md` Part A — for the first on-screen window
 //! owned by one of a set of pids ([`find_window_for_pids`], the launched app's process
-//! set) or for the specific on-screen window with a given `CGWindowID`
-//! ([`find_window_by_id`], `MacosPlatform`'s active window once `select_window` has run),
+//! set) or for the specific on-screen window with a given `CGWindowID` that is *also* owned
+//! by one of that same pid set ([`find_window_by_id`], `MacosPlatform`'s active window once
+//! `select_window` has run — the pid scoping closes a silent-wrong-target hole a bare
+//! `CGWindowID` match would otherwise open, since window ids are not namespaced per app),
 //! following `ffi.rs`'s documented async-bridge convention.
 //!
 //! ## Why this returns [`WindowMatch`], not `Retained<SCWindow>`
@@ -38,7 +40,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError};
-use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCWindow};
+use objc2_screen_capture_kit::{SCContentFilter, SCRunningApplication, SCShareableContent, SCWindow};
 
 use glass_core::platform::WindowGeometry;
 use glass_core::{poll_until, GlassError, Result};
@@ -49,9 +51,10 @@ use glass_core::{poll_until, GlassError, Result};
 // `geometry`/`scale`/`origin_pt` are read by `start_app` (via `backend.rs::discover_window`
 // -> `query_once`) and by `send_pointer`/`capture_frame`/`send_key` (via `backend.rs`'s
 // per-call `find_window_for_pids`/`find_window_by_id` resolution); `window_id` is read by
-// `start_app` too (to seed `MacosPlatform::active_window`, Plan 4 Task 1). `pid` stays
-// unread outside construction until Plan 4's `list_windows`.
-#[allow(dead_code)]
+// `start_app` too (to seed `MacosPlatform::active_window`, Plan 4 Task 1). `pid` is read by
+// `send_pointer`/`send_key` (via `resolve_active_window`'s per-call resolution) as the
+// CGEvent focus/AX-scoping target, and by every `find_window_by_id` call site's
+// pid-scoping check (Plan 4 final-review fix 1) — every field is read somewhere.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowMatch {
     /// The owning process's pid — one of the `pids` passed to `find_window_for_pids`.
@@ -126,26 +129,35 @@ pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<Wi
 }
 
 /// Poll `SCShareableContent` roughly every 100ms for the on-screen window whose
-/// `windowID() == window_id`, until found or `timeout` elapses. This is Plan 4's
-/// active-window retargeting lookup: `backend.rs` calls it on every `capture_frame`/
-/// `send_pointer`/`send_key` once `select_window` has set an active `CGWindowID`, in place
-/// of [`find_window_for_pids`]'s first-on-screen-by-pid resolution — see its module doc for
-/// why re-resolving fresh per call (rather than caching a `Retained<SCWindow>`) is the only
-/// safe option.
+/// `windowID() == window_id` AND `owningApplication().processID() ∈ pids`, until found or
+/// `timeout` elapses. This is Plan 4's active-window retargeting lookup: `backend.rs` calls
+/// it on every `capture_frame`/`send_pointer`/`send_key` once `select_window` has set an
+/// active `CGWindowID`, in place of [`find_window_for_pids`]'s first-on-screen-by-pid
+/// resolution — see its module doc for why re-resolving fresh per call (rather than caching
+/// a `Retained<SCWindow>`) is the only safe option.
+///
+/// The `pids` filter (final-review fix 1) closes a silent-wrong-target hole: without it, a
+/// stale/foreign `CGWindowID` — e.g. left over in `MacosPlatform::active_window` after the
+/// windowing system recycles an id, or a bug that stores an id from a window that was never
+/// actually confirmed to belong to this app — would happily match *any* on-screen window
+/// system-wide, and every caller would silently capture/click/type into someone else's
+/// window. Scoping the match to `pids` turns that into a loud [`GlassError::WindowNotFound`]
+/// instead.
 ///
 /// Unlike `find_window_for_pids`'s [`GlassError::Timeout`] (appropriate while waiting for a
 /// brand-new window to first appear at launch), a `window_id` that never turns up here means
-/// a *previously known* window is gone — closed, or the id was never valid — so this returns
-/// [`GlassError::WindowNotFound`] instead, matching the `Platform` contract's
-/// `select_window`/window-op error (`glass_core::platform`'s doc) for exactly that case.
+/// a *previously known* window is gone — closed, no longer owned by `pids`, or the id was
+/// never valid — so this returns [`GlassError::WindowNotFound`] instead, matching the
+/// `Platform` contract's `select_window`/window-op error (`glass_core::platform`'s doc) for
+/// exactly that case.
 ///
 /// Returns a classified [`GlassError::PermissionDenied`]/[`GlassError::CaptureFailed`]
 /// immediately on a genuine `SCShareableContent` failure, same as `find_window_for_pids`.
-pub(crate) fn find_window_by_id(window_id: u32, timeout: Duration) -> Result<WindowMatch> {
+pub(crate) fn find_window_by_id(window_id: u32, pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
 
     let timeout_ms = timeout.as_millis() as u64;
-    let outcome = poll_until(100, timeout_ms, || query_once_by_id(window_id))?;
+    let outcome = poll_until(100, timeout_ms, || query_once_by_id(window_id, pids))?;
     outcome.value.ok_or(GlassError::WindowNotFound)
 }
 
@@ -185,18 +197,23 @@ pub(crate) fn find_on_screen_window(
     None
 }
 
-/// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id`,
-/// returning it alongside its owning pid. The `find_window_by_id`-side counterpart of
-/// [`find_on_screen_window`] (which filters by owning pid instead of a specific window):
-/// same on-screen filter, same iteration, so the two lookups can't drift on what "on-screen"
-/// means. Used by [`query_once_by_id`] (which then builds a [`WindowMatch`] snapshot via
-/// [`window_match_from`], the same builder [`query_once`] uses) and by
-/// `capture::capture_window_by_id` (which, like `capture_window`, needs the live `SCWindow`
-/// itself, still inside the same completion-handler callback, to build an
+/// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id` AND
+/// `owningApplication().processID() ∈ pids`, returning it alongside its owning pid. The
+/// `find_window_by_id`-side counterpart of [`find_on_screen_window`] (which filters by
+/// owning pid alone instead of a specific window + pid set): same on-screen filter, same
+/// iteration, so the two lookups can't drift on what "on-screen" means. The `pids` check
+/// (final-review fix 1) is load-bearing, not defensive: `windowID` alone is not scoped to
+/// any particular app, so without it this would match *any* on-screen window system-wide,
+/// letting a stale/foreign `CGWindowID` silently resolve to someone else's window — see
+/// [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] (which then builds a
+/// [`WindowMatch`] snapshot via [`window_match_from`], the same builder [`query_once`] uses)
+/// and by `capture::capture_window_by_id` (which, like `capture_window`, needs the live
+/// `SCWindow` itself, still inside the same completion-handler callback, to build an
 /// `SCContentFilter` — see [`find_on_screen_window`]'s doc).
 pub(crate) fn find_on_screen_window_by_id(
     content: &SCShareableContent,
     window_id: u32,
+    pids: &[i32],
 ) -> Option<(Retained<SCWindow>, i32)> {
     // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
     // preconditions.
@@ -217,6 +234,9 @@ pub(crate) fn find_on_screen_window_by_id(
         let Some(app) = owning_application else { continue };
         // SAFETY: same as above — a plain property getter.
         let pid = unsafe { app.processID() };
+        if !pids.contains(&pid) {
+            continue;
+        }
         return Some((w, pid));
     }
     None
@@ -258,20 +278,25 @@ fn window_match_from(w: &SCWindow, pid: i32) -> WindowMatch {
     WindowMatch { pid, window_id, geometry, scale, origin_pt }
 }
 
-/// Build an [`AppWindow`] snapshot from a live `SCWindow` — [`list_app_windows`]'s
-/// per-window counterpart of [`window_match_from`], reading out title and owning
-/// application name as owned `String`s alongside the same pixel geometry derivation.
-fn app_window_from(w: &SCWindow) -> AppWindow {
+/// Build an [`AppWindow`] snapshot from a live `SCWindow` + its already-resolved owning
+/// `app` — [`list_app_windows`]'s per-window counterpart of [`window_match_from`], reading
+/// out title and owning application name as owned `String`s alongside the same pixel
+/// geometry derivation. Takes `app` rather than re-deriving it via `w.owningApplication()`
+/// (final-review fix M3): `list_app_windows`'s loop has already called that getter once to
+/// filter by pid, so a second call here would be redundant — and since that filter already
+/// guarantees every `w` passed here has an owning application, `application_name` is always
+/// `Some` (the field stays `Option<String>` to match `AppWindow`'s general shape, matching
+/// `WindowInfo::class`'s own `Option<String>`).
+fn app_window_from(w: &SCWindow, app: &SCRunningApplication) -> AppWindow {
     // SAFETY: `w` is live (see `window_geometry_and_scale`'s identical note); these are
     // plain property getters with no other preconditions.
     let window_id = unsafe { w.windowID() };
     // SAFETY: same as above.
     let title = unsafe { w.title() }.map(|t| t.to_string());
-    // SAFETY: same as above.
-    let owning_application = unsafe { w.owningApplication() };
-    // SAFETY: `app` is a live `SCRunningApplication` just handed out by `w.owningApplication()`
-    // above; `applicationName` is a plain property getter with no other preconditions.
-    let application_name = owning_application.map(|app| unsafe { app.applicationName() }.to_string());
+    // SAFETY: `app` is the live `SCRunningApplication` the caller already resolved via
+    // `w.owningApplication()`; `applicationName` is a plain property getter with no other
+    // preconditions.
+    let application_name = Some(unsafe { app.applicationName() }.to_string());
     let (geometry, _scale, _origin_pt) = window_geometry_and_scale(w);
     AppWindow { window_id, geometry, title, application_name }
 }
@@ -332,7 +357,7 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
             if !pids_owned.contains(&pid) {
                 continue;
             }
-            found.push(app_window_from(&w));
+            found.push(app_window_from(&w, &app));
         }
         let _ = tx.send(ListReply::Found(found));
     });
@@ -425,10 +450,11 @@ pub(crate) fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
 
 /// [`find_window_by_id`]'s per-attempt round trip — identical shape to [`query_once`] (same
 /// `RcBlock` -> `mpsc` bridge, same `QUERY_TIMEOUT` cap, same error classification) but
-/// matching on a specific `window_id` via [`find_on_screen_window_by_id`] instead of an
-/// owning-pid set.
-fn query_once_by_id(window_id: u32) -> Result<Option<WindowMatch>> {
+/// matching on a specific `window_id` (scoped to `pids`, final-review fix 1) via
+/// [`find_on_screen_window_by_id`] instead of an owning-pid set alone.
+fn query_once_by_id(window_id: u32, pids: &[i32]) -> Result<Option<WindowMatch>> {
     let (tx, rx) = mpsc::channel::<QueryReply>();
+    let pids_owned: Vec<i32> = pids.to_vec();
 
     // Same completion-handler contract as `query_once`'s block: only ever sends the plain
     // owned `QueryReply`, never a `Retained<SCWindow>` (see module doc).
@@ -445,7 +471,7 @@ fn query_once_by_id(window_id: u32) -> Result<Option<WindowMatch>> {
         // points to a live `SCShareableContent` for the duration of this callback.
         let content: &SCShareableContent = unsafe { &*content_ptr };
 
-        let Some((w, pid)) = find_on_screen_window_by_id(content, window_id) else {
+        let Some((w, pid)) = find_on_screen_window_by_id(content, window_id, &pids_owned) else {
             let _ = tx.send(QueryReply::NotFound);
             return;
         };

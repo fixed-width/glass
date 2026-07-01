@@ -76,13 +76,24 @@ extern "C" {
 }
 
 /// Per-field pixel tolerance for the geometry-match fallback (each of x/y/width/height).
-/// More generous than the proven `window_ops.swift` reference's 4px `close()` (which
-/// compares a before/after read of the *same* AX API): this compares an `AXUIElement`'s
-/// frame against `SCWindow`'s independently-reported geometry, where small window-manager
-/// framing differences are more plausible. Unverified at runtime — this task is
-/// compile-only; Task 6's granted multi-window test is the first real exercise of this
-/// path and may need to retune this constant.
+/// More generous than the brief-specified reference's 4px `close()` (which compares a
+/// before/after read of the *same* AX API): this compares an `AXUIElement`'s frame against
+/// `SCWindow`'s independently-reported geometry, where small window-manager framing
+/// differences are more plausible. Verified at runtime by the Task 6 window integration
+/// test's forced-fallback run (`GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK`, see
+/// [`FORCE_AX_GEOMETRY_FALLBACK_ENV`]), which exercises this path against a real two-window
+/// layout and confirms it resolves the correct (non-first) window.
 const FALLBACK_TOLERANCE_PX: i32 = 8;
+
+/// Test-only diagnostic: when this environment variable is set (to any value), the private
+/// `_AXUIElementGetWindow` correlation is skipped entirely and [`ax_window_for_cgwindowid`]
+/// goes straight to [`geometry_fallback`] — final-review fix 5. Without this hook, the
+/// geometry fallback has zero live coverage on any Mac where the private symbol still works
+/// (which is every Mac observed so far): the fallback only ever engages if Apple breaks or
+/// renames `_AXUIElementGetWindow`, so there is no way to exercise it against a real
+/// multi-window layout without deliberately forcing it. Not read anywhere outside this
+/// module; not a supported way to configure glass in normal use.
+const FORCE_AX_GEOMETRY_FALLBACK_ENV: &str = "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK";
 
 /// Resolve the `AXUIElement` window for `pid` whose `CGWindowID` is `window_id`.
 ///
@@ -93,6 +104,10 @@ const FALLBACK_TOLERANCE_PX: i32 = 8;
 /// are the target window's already-known `SCShareableContent` pixel geometry and
 /// point-per-pixel scale (from `scwindow::WindowMatch`), compared against each AX window's
 /// own position/size. [`GlassError::WindowNotFound`] if neither path finds a match.
+///
+/// If [`FORCE_AX_GEOMETRY_FALLBACK_ENV`] is set, the private call is skipped entirely and
+/// this goes straight to the geometry fallback (test-only diagnostic — see that constant's
+/// doc).
 pub(crate) fn ax_window_for_cgwindowid(
     pid: i32,
     window_id: u32,
@@ -104,6 +119,14 @@ pub(crate) fn ax_window_for_cgwindowid(
     // no aliasing/lifetime preconditions.
     let app = unsafe { AXUIElement::new_application(pid) };
     let windows = ax_windows(&app)?;
+
+    if std::env::var_os(FORCE_AX_GEOMETRY_FALLBACK_ENV).is_some() {
+        eprintln!(
+            "glass-macos: {FORCE_AX_GEOMETRY_FALLBACK_ENV} set; skipping _AXUIElementGetWindow \
+             and forcing the geometry fallback for CGWindowID {window_id} (test-only diagnostic)"
+        );
+        return geometry_fallback(&windows, &geometry_px, scale).ok_or(GlassError::WindowNotFound);
+    }
 
     let mut any_private_call_succeeded = false;
     for w in windows.iter() {
@@ -304,21 +327,26 @@ fn ax_geometry_px(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
     Ok(WindowGeometry { x, y, width: w.max(0) as u32, height: h.max(0) as u32 })
 }
 
-/// True if every field of `a`/`b` is within [`FALLBACK_TOLERANCE_PX`] of the other.
+/// True if every field of `a`/`b` is within [`FALLBACK_TOLERANCE_PX`] of the other. Computed
+/// in `i64` before `.abs()` so no cast can wrap for any input (matches `coords.rs`'s
+/// no-overflow house rule).
 fn within_tolerance(a: &WindowGeometry, b: &WindowGeometry) -> bool {
-    (a.x - b.x).abs() <= FALLBACK_TOLERANCE_PX
-        && (a.y - b.y).abs() <= FALLBACK_TOLERANCE_PX
-        && (a.width as i32 - b.width as i32).abs() <= FALLBACK_TOLERANCE_PX
-        && (a.height as i32 - b.height as i32).abs() <= FALLBACK_TOLERANCE_PX
+    let tolerance = i64::from(FALLBACK_TOLERANCE_PX);
+    (i64::from(a.x) - i64::from(b.x)).abs() <= tolerance
+        && (i64::from(a.y) - i64::from(b.y)).abs() <= tolerance
+        && (i64::from(a.width) - i64::from(b.width)).abs() <= tolerance
+        && (i64::from(a.height) - i64::from(b.height)).abs() <= tolerance
 }
 
 /// Sum of per-field absolute pixel differences between `a`/`b` — used only to rank
-/// candidates that already passed [`within_tolerance`], smallest-first.
+/// candidates that already passed [`within_tolerance`], smallest-first. Computed in `i64`
+/// before `.abs()` so no cast can wrap for any input (matches `coords.rs`'s no-overflow
+/// house rule).
 fn geometry_distance(a: &WindowGeometry, b: &WindowGeometry) -> i64 {
-    i64::from((a.x - b.x).abs())
-        + i64::from((a.y - b.y).abs())
-        + i64::from((a.width as i32 - b.width as i32).abs())
-        + i64::from((a.height as i32 - b.height as i32).abs())
+    (i64::from(a.x) - i64::from(b.x)).abs()
+        + (i64::from(a.y) - i64::from(b.y)).abs()
+        + (i64::from(a.width) - i64::from(b.width)).abs()
+        + (i64::from(a.height) - i64::from(b.height)).abs()
 }
 
 #[cfg(test)]
