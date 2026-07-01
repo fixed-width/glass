@@ -1,14 +1,44 @@
 //! TCC preflight. glass needs two grants on macOS: **Screen Recording** (capture +
 //! window titles) and **Accessibility** (window move/resize/focus + CGEvent input).
 //! Neither can be force-granted (SIP/MDM can't allow Screen Recording); the product
-//! holds them via a stable code-signed identity (see the validation plan). Here we only
-//! *detect* a missing grant and return an actionable error — never a blank frame.
+//! holds them via a stable code-signed identity. Here we only *detect* a missing grant
+//! and return an actionable error — never a blank frame.
 
-use glass_core::{GlassError, Result};
+use glass_core::Result;
+
+/// The two macOS TCC grants glass needs. A local enum keeps the permission names in
+/// one place (no stringly-typed drift) and lets the preflight test assert the specific
+/// missing grant. Converted to a `String` only at the `GlassError` boundary — the shared
+/// `glass-core` error stays platform-agnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Permission {
+    ScreenRecording,
+    Accessibility,
+}
+
+impl Permission {
+    fn label(self) -> &'static str {
+        match self {
+            Permission::ScreenRecording => "Screen Recording",
+            Permission::Accessibility => "Accessibility",
+        }
+    }
+    fn remedy(self) -> &'static str {
+        match self {
+            Permission::ScreenRecording => "enable glass in System Settings > Privacy & Security > Screen Recording (run inside a logged-in session; grant persists for the signed binary)",
+            Permission::Accessibility => "enable glass in System Settings > Privacy & Security > Accessibility",
+        }
+    }
+    fn denied(self) -> glass_core::GlassError {
+        glass_core::GlassError::PermissionDenied { which: self.label().into(), remedy: self.remedy().into() }
+    }
+}
 
 // Both are plain C functions; no objc2 needed for preflight.
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    // Apple declares this post-10.15 API with C99 `bool`, guaranteed to be 0/1 — unlike
+    // the legacy `Boolean`/`u8` ABI on `AXIsProcessTrusted` below.
     fn CGPreflightScreenCaptureAccess() -> bool;
 }
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -20,14 +50,14 @@ extern "C" {
 }
 
 /// True if this process holds the Screen Recording grant.
-pub fn screen_recording_ok() -> bool {
+pub(crate) fn screen_recording_ok() -> bool {
     // SAFETY: `CGPreflightScreenCaptureAccess` is a no-argument C predicate that only
     // reads this process's TCC state; it has no preconditions and no side effects.
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 /// True if this process is trusted for Accessibility (AX APIs + CGEvent posting).
-pub fn accessibility_ok() -> bool {
+pub(crate) fn accessibility_ok() -> bool {
     // SAFETY: `AXIsProcessTrusted` is a no-argument C predicate over this process's
     // trust state; no preconditions, no side effects. It returns `Boolean` (u8); any
     // nonzero value means trusted.
@@ -36,20 +66,12 @@ pub fn accessibility_ok() -> bool {
 
 /// Fail fast with an actionable error if either grant is missing. Called at session
 /// start before any capture/input is attempted.
-pub fn preflight() -> Result<()> {
+pub(crate) fn preflight() -> Result<()> {
     if !screen_recording_ok() {
-        return Err(GlassError::PermissionDenied {
-            which: "Screen Recording".into(),
-            remedy: "enable glass in System Settings > Privacy & Security > Screen Recording \
-                     (run inside a logged-in session; grant persists for the signed binary)"
-                .into(),
-        });
+        return Err(Permission::ScreenRecording.denied());
     }
     if !accessibility_ok() {
-        return Err(GlassError::PermissionDenied {
-            which: "Accessibility".into(),
-            remedy: "enable glass in System Settings > Privacy & Security > Accessibility".into(),
-        });
+        return Err(Permission::Accessibility.denied());
     }
     Ok(())
 }
@@ -57,6 +79,7 @@ pub fn preflight() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::GlassError;
 
     #[test]
     fn preflight_matches_the_two_predicates() {
@@ -68,7 +91,10 @@ mod tests {
             Ok(()) => assert!(sr && ax, "preflight Ok but a predicate was false"),
             Err(GlassError::PermissionDenied { which, .. }) => {
                 assert!(!sr || !ax, "preflight denied but both predicates true");
-                assert!(which == "Screen Recording" || which == "Accessibility", "{which}");
+                // preflight checks Screen Recording first, so the specific predicate
+                // that failed pins which grant the error must name.
+                let expected = if !sr { Permission::ScreenRecording } else { Permission::Accessibility };
+                assert_eq!(which, expected.label());
             }
             Err(e) => panic!("unexpected error: {e}"),
         }

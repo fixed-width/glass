@@ -160,11 +160,6 @@ mod tests {
             "accessibility unavailable: no a11y bus"
         );
     }
-}
-
-#[cfg(test)]
-mod permission_error_tests {
-    use super::GlassError;
 
     #[test]
     fn permission_denied_renders_which_and_remedy() {

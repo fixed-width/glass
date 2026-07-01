@@ -67,12 +67,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drain_logs_is_empty_then_drains() {
+    fn drain_logs_takes_then_empties() {
         // Build without preflight (which would require grants) by constructing the struct
         // directly — `new()` is exercised in the Mac-gated suite.
         let mut p = MacosPlatform { logs: vec![(Stream::Stdout, "hi".into())], app_pid: Some(42) };
-        assert_eq!(p.app_pid(), Some(42));
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
+    }
+
+    #[test]
+    fn app_pid_returns_the_constructed_value() {
+        let p = MacosPlatform { logs: Vec::new(), app_pid: Some(42) };
+        assert_eq!(p.app_pid(), Some(42));
+    }
+
+    #[test]
+    fn new_agrees_with_preflight() {
+        // The central invariant: new() must error iff preflight() errors. Guards against a
+        // future edit that swallows the missing-grant propagation. On an ungranted CI runner
+        // both are Err; on a granted box both are Ok.
+        assert_eq!(crate::permissions::preflight().is_err(), MacosPlatform::new().is_err());
     }
 }
