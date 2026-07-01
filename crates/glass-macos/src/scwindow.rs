@@ -33,8 +33,9 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
+use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError};
-use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
+use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCWindow};
 
 use glass_core::platform::WindowGeometry;
 use glass_core::{poll_until, GlassError, Result};
@@ -42,10 +43,12 @@ use glass_core::{poll_until, GlassError, Result};
 /// A discovered on-screen window: enough to re-find or capture it later without holding
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
-// `geometry` is read by `start_app` (via `backend.rs::discover_window` ->
-// `query_once`); `pid`/`window_id` stay unread until Plan 4's list/select_window.
+// `geometry`/`scale`/`origin_pt` are read by `start_app` (via `backend.rs::discover_window`
+// -> `query_once`) and by `send_pointer` (via `backend.rs`'s direct
+// `find_window_for_pids` call on every pointer event); `pid`/`window_id` stay unread until
+// Plan 4's list/select_window.
 #[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowMatch {
     /// The owning process's pid — one of the `pids` passed to `find_window_for_pids`.
     pub(crate) pid: i32,
@@ -53,7 +56,17 @@ pub(crate) struct WindowMatch {
     /// re-findable via a fresh `SCShareableContent` query
     /// (`content.windows().iter().find(|w| w.windowID() == id)`).
     pub(crate) window_id: u32,
+    /// Window geometry in backing PIXELS (`contentRect.size * scale`, matching the frame
+    /// `capture::capture_window` produces for this window) — the tool boundary's unit;
+    /// see `coords.rs`'s module doc.
     pub(crate) geometry: WindowGeometry,
+    /// `SCContentFilter.pointPixelScale()` for this window (`1.0` on a 1x display, `2.0`
+    /// on 2x Retina) — carried alongside `geometry` so the backend can later map a PIXEL
+    /// click coordinate back to a global POINT via `coords::pixel_to_global_point`.
+    pub(crate) scale: f64,
+    /// `contentRect.origin`, in POINTS (Quartz's global screen space) — the window origin
+    /// `coords::pixel_to_global_point` adds a scaled pixel offset to.
+    pub(crate) origin_pt: (f64, f64),
 }
 
 /// Poll `SCShareableContent` roughly every 100ms for the first on-screen window whose
@@ -68,14 +81,16 @@ pub(crate) struct WindowMatch {
 /// [`GlassError::PermissionDenied`] for a Screen Recording TCC decline,
 /// [`GlassError::CaptureFailed`] for anything else) or [`GlassError::Timeout`] if no
 /// matching window appears before `timeout` elapses.
-// No production caller: `MacosPlatform::start_app` runs its own poll loop
-// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
-// `child.try_wait()` so a crashed launch fails fast with `AppExited` — this function's
-// self-contained `poll_until` has no child handle to race against, so `start_app` can't
-// delegate its whole timeout budget to it. Kept `pub(crate)` + allowed here (not
-// deleted) as a plain "poll until found or timeout" primitive for a future call site
-// with no child to check (e.g. Plan 4 window rediscovery).
-#[allow(dead_code)]
+///
+/// `MacosPlatform::start_app` still can't use this directly: it runs its own poll loop
+/// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
+/// `child.try_wait()` so a crashed launch fails fast with `AppExited`, and this function's
+/// self-contained `poll_until` has no child handle to race against. But
+/// `MacosPlatform::send_pointer` does call this directly on every invocation, to
+/// re-resolve the window's current geometry/scale/origin fresh (the window may have moved
+/// or resized since `start_app`, or since the previous `send_pointer` call) — there's no
+/// child handle to race there either (the session is already established), so this
+/// self-contained poll-until-found-or-timeout is exactly what it needs.
 pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
 
@@ -160,16 +175,24 @@ pub(crate) fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
             let _ = tx.send(QueryReply::NotFound);
             return;
         };
-        // SAFETY: `w` was just resolved live from `content.windows()` above; these are
-        // plain property getters with no other preconditions.
-        let (window_id, frame) = unsafe { (w.windowID(), w.frame()) };
-        let geometry = geometry_from_rect(
-            frame.origin.x,
-            frame.origin.y,
-            frame.size.width,
-            frame.size.height,
+        // SAFETY: `w` is a live `SCWindow` just resolved above; `capture.rs` uses this
+        // same initializer on the same kind of live `SCWindow` — no other preconditions.
+        let filter = unsafe {
+            SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w)
+        };
+        // SAFETY: `w`/`filter` are live; these are plain property getters with no other
+        // preconditions.
+        let (window_id, scale, content_rect) =
+            unsafe { (w.windowID(), filter.pointPixelScale() as f64, filter.contentRect()) };
+        let geometry = crate::coords::pixel_geometry_from_content_rect(
+            content_rect.origin.x,
+            content_rect.origin.y,
+            content_rect.size.width,
+            content_rect.size.height,
+            scale,
         );
-        let _ = tx.send(QueryReply::Found(WindowMatch { pid, window_id, geometry }));
+        let origin_pt = (content_rect.origin.x, content_rect.origin.y);
+        let _ = tx.send(QueryReply::Found(WindowMatch { pid, window_id, geometry, scale, origin_pt }));
     });
 
     // SAFETY: `block` matches `getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler`'s
@@ -201,49 +224,9 @@ enum QueryReply {
     Failed(GlassError),
 }
 
-/// Convert a window frame (points, from `SCWindow.frame()`) to the platform-agnostic
-/// `WindowGeometry`. Pulled out as pure `f64` math (no `CGRect` dependency) so it can
-/// carry its own unit test without needing a live window.
-fn geometry_from_rect(x: f64, y: f64, width: f64, height: f64) -> WindowGeometry {
-    WindowGeometry {
-        x: x.round() as i32,
-        y: y.round() as i32,
-        width: width.round().max(0.0) as u32,
-        height: height.round().max(0.0) as u32,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn geometry_from_rect_rounds_to_nearest() {
-        assert_eq!(
-            geometry_from_rect(10.4, 20.6, 300.49, 200.5),
-            WindowGeometry { x: 10, y: 21, width: 300, height: 201 }
-        );
-    }
-
-    #[test]
-    fn geometry_from_rect_clamps_negative_size_to_zero() {
-        // A real CGRect from SCWindow.frame() never has a negative size, but the
-        // conversion must not panic or wrap on malformed input.
-        assert_eq!(
-            geometry_from_rect(0.0, 0.0, -1.0, -1.0),
-            WindowGeometry { x: 0, y: 0, width: 0, height: 0 }
-        );
-    }
-
-    #[test]
-    fn geometry_from_rect_preserves_negative_origin() {
-        // A window can sit left-of/above the primary display's origin in a multi-monitor
-        // layout; x/y must stay signed rather than clamping like width/height do.
-        assert_eq!(
-            geometry_from_rect(-50.0, -10.0, 100.0, 80.0),
-            WindowGeometry { x: -50, y: -10, width: 100, height: 80 }
-        );
-    }
 
     #[test]
     fn query_reply_is_send() {

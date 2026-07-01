@@ -17,6 +17,13 @@ bench = false
 name = "capture"
 harness = false
 
+# Mac-gated input integration test (crates/glass-macos/tests/input.rs) — same harness=false
+# main-thread requirement as `capture` above (send_key/send_pointer reach AppKit's
+# NSRunningApplication::activate); see that file's module doc.
+[[test]]
+name = "input"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 
@@ -40,6 +47,10 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSResponder",
+    # `NSRunningApplication` — focus-before-inject (`input.rs::focus`); `libc` unlocks its
+    # `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class method.
+    "NSRunningApplication",
+    "libc",
 ] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
     "SCShareableContent",
@@ -56,6 +67,17 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGContext",
     "CGBitmapContext",
     "objc2",
+    # CGEvent mouse + keyboard injection (`input.rs`): `CGEvent` unlocks the `CGEvent`
+    # module (types + constructors/`post`/`set_flags`/etc.); `CGEventSource` the
+    # event-source constructor; `CGEventTypes` the `CGEventType`/`CGMouseButton`/
+    # `CGEventFlags`/`CGEventField`/`CGScrollEventUnit`/`CGEventTapLocation`/
+    # `CGEventSourceStateID` enums every call site here needs; `CGRemoteOperation` gates
+    # `CGEvent::new_keyboard_event` (`CGEventCreateKeyboardEvent`) and its `CGKeyCode`
+    # parameter type — `send_key`'s only addition over Task 2's mouse-only feature set.
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "CFCGTypes",

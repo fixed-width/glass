@@ -113,16 +113,13 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
                     // callback. All work on it happens synchronously right here — the
                     // `CGImage` itself never leaves this block.
                     let image: &CGImage = unsafe { &*image_ptr };
-                    // NOTE: `Frame` is captured in backing PIXELS (`contentRect.size *
-                    // pointPixelScale`, this same `scale`), while `region` is
-                    // window-relative POINTS — the unit the session layer validates it in
-                    // (`WindowGeometry`, from `SCWindow.frame()`; see `scwindow.rs`).
-                    // `crop_to_region` converts it to pixels via `scale` before cropping
-                    // the pixel-space `Frame`. The wider points-vs-pixels reconciliation
-                    // across geometry/frame/click (the other backends use physical pixels
-                    // throughout) is a later coordinate-design item, not solved here.
+                    // `Frame` is captured in backing PIXELS (`contentRect.size *
+                    // pointPixelScale`), and `region` is already window-relative PIXELS
+                    // too — the tool boundary's unit throughout (see `coords.rs`'s module
+                    // doc and `scwindow.rs`'s `WindowMatch::geometry`) — so `crop_to_region`
+                    // crops directly, no unit conversion needed.
                     let result = rgba_frame_from_cgimage(image)
-                        .and_then(|frame| crop_to_region(frame, region_owned.as_ref(), scale));
+                        .and_then(|frame| crop_to_region(frame, region_owned.as_ref()));
                     let _ = tx_img.send(match result {
                         Ok(frame) => CaptureReply::Ok(frame),
                         Err(e) => CaptureReply::Err(e),
@@ -177,18 +174,16 @@ enum CaptureReply {
 /// Crop `frame` to `region`, clamping to the captured frame first via
 /// [`crate::coords::clamp_region`] (defense in depth — the session layer should already
 /// validate the region against the window before it reaches the backend, per
-/// `glass_core::frame::Region::check_fits`'s doc). `region` is window-relative POINTS (see
-/// the NOTE at the call site above); `scale` (`pointPixelScale`) converts it to the PIXELS
-/// `frame` itself is in, via [`crate::coords::scale_region`], before clamping/cropping.
-/// `None` returns `frame` unchanged (no scaling needed for a no-op).
-fn crop_to_region(frame: Frame, region: Option<&Region>, scale: f64) -> Result<Frame> {
+/// `glass_core::frame::Region::check_fits`'s doc). `region` is already window-relative
+/// PIXELS, the same unit `frame` itself is in — no scaling needed. `None` returns `frame`
+/// unchanged.
+fn crop_to_region(frame: Frame, region: Option<&Region>) -> Result<Frame> {
     let Some(r) = region else { return Ok(frame) };
-    let pixel_region = crate::coords::scale_region(r, scale);
     let clamped = crate::coords::clamp_region(
-        pixel_region.x as i32,
-        pixel_region.y as i32,
-        pixel_region.width,
-        pixel_region.height,
+        r.x as i32,
+        r.y as i32,
+        r.width,
+        r.height,
         frame.width,
         frame.height,
     );

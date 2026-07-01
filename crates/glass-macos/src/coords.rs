@@ -1,8 +1,17 @@
 //! Pure window-relative ↔ global coordinate math. Cross-platform → unit-tested on the
-//! Linux dev box. The macOS backend (Plans 2–4) maps window-relative tool coordinates to
-//! global screen coordinates here before posting CGEvents or capturing a sub-region.
+//! Linux dev box.
+//!
+//! The whole glass tool boundary — `WindowGeometry`, the captured `Frame`, and
+//! click/region coordinates — is backing PIXELS on macOS, matching `glass-x11` and
+//! `glass-windows`. Quartz's `CGEvent` APIs, though, address the *global* screen in
+//! POINTS, not pixels — so the macOS backend (Plan 3) uses [`pixel_to_global_point`] to
+//! map a window-relative PIXEL coordinate to a global POINT before posting a CGEvent.
+//! [`pixel_geometry_from_content_rect`] is the mirror-image conversion `scwindow.rs` uses
+//! to turn `SCContentFilter`'s `contentRect` (POINTS) + `pointPixelScale` into the PIXEL
+//! `WindowGeometry` the tool boundary reports.
 
 use glass_core::frame::Region;
+use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
 /// Translate a window-relative point to a global screen point given the window origin.
@@ -30,30 +39,42 @@ pub fn clamp_region(rx: i32, ry: i32, rw: u32, rh: u32, width: u32, height: u32)
     Region { x: left as u32, y: top as u32, width: (right - left) as u32, height: (bottom - top) as u32 }
 }
 
-/// Convert a window-relative `region` from POINTS to backing PIXELS by scaling every field
-/// by `scale` (macOS's `pointPixelScale`: `1.0` on a 1x display, `2.0` on 2x Retina).
+/// Map a window-relative PIXEL coordinate to a global POINT in Quartz's screen space:
+/// `origin_pt + rel_px / scale`. `scale` is the window's `pointPixelScale` (`1.0` on a 1x
+/// display, `2.0` on 2x Retina) and `origin_pt` is the window's `contentRect.origin` in
+/// POINTS (see [`pixel_geometry_from_content_rect`]'s doc for where both come from).
 ///
-/// The macOS capture backend needs this because its two coordinate sources disagree:
-/// `capture::capture_window`'s `Frame` is sized in backing pixels
-/// (`contentRect.size * pointPixelScale`), but the `region` passed to it is window-relative
-/// points — the unit `WindowGeometry` (from `SCWindow.frame()`) and the session layer's
-/// region validation both use. Cropping a points-sized region straight against a
-/// pixels-sized `Frame` silently reads the wrong (quarter-sized, on 2x) sub-image. Pure and
-/// cross-platform so the Retina (2x) math is unit-tested here even on a 1x dev box; the
-/// wider points-vs-pixels reconciliation across geometry/frame/click (the other backends
-/// use physical pixels throughout) is a later coordinate-design item, not solved by this
-/// one conversion.
+/// The macOS backend needs this because CGEvents post into a POINTS-addressed global
+/// space, while every tool-boundary coordinate (click/region, `WindowGeometry`, the
+/// captured `Frame`) is backing PIXELS — matching `glass-x11`/`glass-windows`. This is the
+/// one place a pixel value crosses back into points, right before posting a CGEvent.
+pub fn pixel_to_global_point(rel_px: (i32, i32), scale: f64, origin_pt: (f64, f64)) -> (f64, f64) {
+    (origin_pt.0 + rel_px.0 as f64 / scale, origin_pt.1 + rel_px.1 as f64 / scale)
+}
+
+/// Convert a window's `contentRect` (POINTS, from `SCContentFilter.contentRect()`) plus
+/// its `pointPixelScale` into a `WindowGeometry` in backing PIXELS — the unit the whole
+/// tool boundary uses. `x`/`y` is `contentRect.origin`, `width`/`height` is
+/// `contentRect.size`; each field is independently scaled by `scale` and rounded to the
+/// nearest pixel, matching how `capture::capture_window` sizes the captured `Frame`
+/// (`contentRect.size * pointPixelScale`) — so `scwindow.rs`'s reported geometry and
+/// `capture.rs`'s captured frame always agree on width/height in pixels.
 ///
-/// Each field rounds to the nearest pixel independently (`f64::round`, ties away from
-/// zero) rather than truncating, so a fractional point value doesn't consistently lose a
-/// pixel versus the frame it's cropped against.
-pub fn scale_region(region: &Region, scale: f64) -> Region {
-    let scaled = |v: u32| (v as f64 * scale).round() as u32;
-    Region {
-        x: scaled(region.x),
-        y: scaled(region.y),
-        width: scaled(region.width),
-        height: scaled(region.height),
+/// Pure `f64` math (no `CGRect` dependency) so the Retina (2x) scaling is unit-tested here
+/// even on a 1x dev box — `scwindow.rs` itself only compiles on macOS.
+///
+/// Each field rounds independently (`f64::round`, ties away from zero) rather than
+/// truncating, so a fractional point value doesn't consistently lose a pixel. Width/height
+/// clamp to `0` on a degenerate (negative) input rather than wrapping; `x`/`y` stay signed
+/// (a window can sit left-of/above the primary display's origin in a multi-monitor
+/// layout).
+pub fn pixel_geometry_from_content_rect(x: f64, y: f64, width: f64, height: f64, scale: f64) -> WindowGeometry {
+    let px = |v: f64| (v * scale).round();
+    WindowGeometry {
+        x: px(x) as i32,
+        y: px(y) as i32,
+        width: px(width).max(0.0) as u32,
+        height: px(height).max(0.0) as u32,
     }
 }
 
@@ -95,22 +116,62 @@ mod tests {
     }
 
     #[test]
-    fn scale_region_is_identity_at_1x() {
-        let region = Region { x: 10, y: 20, width: 300, height: 200 };
-        assert_eq!(scale_region(&region, 1.0), region);
+    fn pixel_to_global_point_at_1x() {
+        assert_eq!(pixel_to_global_point((100, 200), 1.0, (10.0, 20.0)), (110.0, 220.0));
     }
 
     #[test]
-    fn scale_region_doubles_at_2x_retina() {
-        let region = Region { x: 10, y: 20, width: 300, height: 200 };
-        assert_eq!(scale_region(&region, 2.0), Region { x: 20, y: 40, width: 600, height: 400 });
+    fn pixel_to_global_point_at_2x_retina() {
+        // pixel 200 / 2 = 100pt + origin 10 = 110; pixel 400 / 2 = 200pt + origin 20 = 220.
+        assert_eq!(pixel_to_global_point((200, 400), 2.0, (10.0, 20.0)), (110.0, 220.0));
     }
 
     #[test]
-    fn scale_region_rounds_to_nearest_pixel() {
+    fn pixel_to_global_point_handles_negative_rel_and_origin() {
+        assert_eq!(pixel_to_global_point((-40, -10), 2.0, (-5.0, 0.0)), (-25.0, -5.0));
+    }
+
+    #[test]
+    fn pixel_geometry_from_content_rect_is_identity_at_1x() {
+        assert_eq!(
+            pixel_geometry_from_content_rect(10.0, 20.0, 300.0, 200.0, 1.0),
+            WindowGeometry { x: 10, y: 20, width: 300, height: 200 }
+        );
+    }
+
+    #[test]
+    fn pixel_geometry_from_content_rect_scales_at_2x_retina() {
+        assert_eq!(
+            pixel_geometry_from_content_rect(10.0, 20.0, 300.0, 200.0, 2.0),
+            WindowGeometry { x: 20, y: 40, width: 600, height: 400 }
+        );
+    }
+
+    #[test]
+    fn pixel_geometry_from_content_rect_rounds_to_nearest_pixel() {
         // 1*1.5=1.5 -> 2, 3*1.5=4.5 -> 5 (round-half-away-from-zero, per f64::round):
         // fields round independently rather than truncating.
-        let region = Region { x: 1, y: 1, width: 3, height: 3 };
-        assert_eq!(scale_region(&region, 1.5), Region { x: 2, y: 2, width: 5, height: 5 });
+        assert_eq!(
+            pixel_geometry_from_content_rect(1.0, 1.0, 3.0, 3.0, 1.5),
+            WindowGeometry { x: 2, y: 2, width: 5, height: 5 }
+        );
+    }
+
+    #[test]
+    fn pixel_geometry_from_content_rect_clamps_negative_size_to_zero() {
+        // A real contentRect from SCContentFilter never has a negative size, but the
+        // conversion must not panic or wrap on malformed input.
+        assert_eq!(
+            pixel_geometry_from_content_rect(0.0, 0.0, -1.0, -1.0, 2.0),
+            WindowGeometry { x: 0, y: 0, width: 0, height: 0 }
+        );
+    }
+
+    #[test]
+    fn pixel_geometry_from_content_rect_preserves_negative_origin() {
+        assert_eq!(
+            pixel_geometry_from_content_rect(-50.0, -10.0, 100.0, 80.0, 2.0),
+            WindowGeometry { x: -100, y: -20, width: 200, height: 160 }
+        );
     }
 }
