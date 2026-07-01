@@ -266,3 +266,14 @@ fn classify_null_result(err_ptr: *mut NSError, fallback_msg: &str) -> GlassError
         GlassError::CaptureFailed(detail)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_reply_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CaptureReply>();
+    }
+}

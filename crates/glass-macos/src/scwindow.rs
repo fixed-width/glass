@@ -242,4 +242,10 @@ mod tests {
             WindowGeometry { x: -50, y: -10, width: 100, height: 80 }
         );
     }
+
+    #[test]
+    fn query_reply_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<QueryReply>();
+    }
 }
