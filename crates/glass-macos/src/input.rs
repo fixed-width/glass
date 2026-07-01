@@ -1,30 +1,38 @@
-//! CGEvent mouse injection: `send_pointer` maps each window-relative PIXEL coordinate to a
-//! global Quartz POINT via `coords::pixel_to_global_point`, raises the target app
-//! (focus-before-inject), then posts `Move`/`Click`/`Drag`/`Scroll` as CGEvents through the
-//! HID event tap. `Gesture` (Android multi-touch) is `Unsupported` — see
-//! `glass_core::platform::PointerEvent`'s doc.
+//! CGEvent mouse + keyboard injection: `send_pointer` maps each window-relative PIXEL
+//! coordinate to a global Quartz POINT via `coords::pixel_to_global_point`, raises the
+//! target app (focus-before-inject), then posts `Move`/`Click`/`Drag`/`Scroll` as CGEvents
+//! through the HID event tap. `Gesture` (Android multi-touch) is `Unsupported` — see
+//! `glass_core::platform::PointerEvent`'s doc. `send_key` does the same focus-before-inject,
+//! then posts `KeyEvent::Text`/`Chord` as keyboard CGEvents.
 //!
 //! Ported from the proven reference `tools/macos-validation/inject_input.swift`'s
-//! `clickGlobal` (mouse down/up via `CGEvent(mouseEventSource:mouseType:...)` +
-//! `.post(tap: .cghidEventTap)`) and its focus-before-inject
-//! (`NSRunningApplication(processIdentifier:).activate()`), onto `objc2-core-graphics`'s
-//! generated bindings — which expose `CGEvent`'s constructors/accessors as **associated**
-//! functions taking `Option<&CGEvent>` (e.g. `CGEvent::post(tap, event)`,
-//! `CGEvent::set_flags(event, flags)`), not Swift's `self`-methods. header-translator marks
-//! all of them (and `NSRunningApplication::activateWithOptions`) as plain safe Rust
-//! functions — their only precondition, a live `CGEvent`/`CGEventSource`/`NSRunningApplication`
-//! reference, is already enforced by the type system — so no `unsafe` block is needed
-//! anywhere in this file.
+//! `clickGlobal`/`postKey`/`typeString` (down/up via `CGEvent(mouseEventSource:...)`/
+//! `CGEvent(keyboardEventSource:virtualKey:keyDown:)` + `.post(tap: .cghidEventTap)`) and its
+//! focus-before-inject (`NSRunningApplication(processIdentifier:).activate()`), onto
+//! `objc2-core-graphics`'s generated bindings — which expose `CGEvent`'s
+//! constructors/accessors as **associated** functions taking `Option<&CGEvent>` (e.g.
+//! `CGEvent::post(tap, event)`, `CGEvent::set_flags(event, flags)`), not Swift's
+//! `self`-methods. header-translator marks all of them (and
+//! `NSRunningApplication::activateWithOptions`) as plain safe Rust functions — their only
+//! precondition, a live `CGEvent`/`CGEventSource`/`NSRunningApplication` reference, is
+//! already enforced by the type system — so no `unsafe` block is needed anywhere in this
+//! file.
 //!
-//! Drag/scroll reuse glass_core's shared, already-unit-tested drivers
-//! ([`glass_core::run_drag`]/[`glass_core::DragGesture`], [`glass_core::run_scroll`]) — the
-//! same ones `glass-windows`/`glass-x11` sequence through their own `DragSink`/`ScrollSink` —
-//! so the waypoint interpolation/pacing/dwell math isn't reimplemented here.
+//! Drag/scroll/text reuse glass_core's shared, already-unit-tested drivers
+//! ([`glass_core::run_drag`]/[`glass_core::DragGesture`], [`glass_core::run_scroll`],
+//! [`glass_core::run_type`]) — the same ones `glass-windows`/`glass-x11` sequence through
+//! their own `DragSink`/`ScrollSink`/`TypeSink` — so the waypoint interpolation/pacing/dwell
+//! math isn't reimplemented here. `KeyEvent::Chord` does not: unlike Windows/X11 (where a
+//! held modifier is a real separate key down/up event, needing `glass_core::run_chord`'s
+//! cross-frame hold-then-release ordering), macOS conveys a held modifier via
+//! `CGEventFlags` stamped directly on the key's own down/up events — the same technique
+//! `to_flags`/`MacDragSink`/`MacScrollSink` already use for pointer modifiers below — so
+//! there is no separate modifier event to sequence.
 //!
 //! **Main-thread affinity:** like `backend.rs`'s `start_app`/`capture_frame`, this is called
-//! from `MacosPlatform::send_pointer`, which glass always drives from the main thread; wiring
-//! that under glass-mcp's worker-thread dispatcher is deferred to Plan 5 (see `backend.rs`'s
-//! module doc).
+//! from `MacosPlatform::send_pointer`/`send_key`, which glass always drives from the main
+//! thread; wiring that under glass-mcp's worker-thread dispatcher is deferred to Plan 5 (see
+//! `backend.rs`'s module doc).
 
 use std::thread;
 use std::time::Duration;
@@ -37,10 +45,13 @@ use objc2_core_graphics::{
 };
 
 use glass_core::keys::Modifier;
-use glass_core::platform::{MouseButton, PointerEvent};
-use glass_core::{run_drag, run_scroll, DragGesture, DragSink, GlassError, Result, ScrollSink};
+use glass_core::platform::{KeyEvent, MouseButton, PointerEvent};
+use glass_core::{
+    run_drag, run_scroll, run_type, DragGesture, DragSink, GlassError, Result, ScrollSink, TypeSink,
+};
 
 use crate::coords::pixel_to_global_point;
+use crate::keymap;
 
 /// Map a window-relative pixel coordinate to a global Quartz point, accounting for the
 /// session's display scale and window origin.
@@ -118,6 +129,117 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
         }
     }
     Ok(())
+}
+
+/// Inter-keystroke delay for `KeyEvent::Text` typing — matches the proven reference
+/// (`inject_input.swift`'s `typeString`'s `usleep(12_000)`), so each keystroke is its own
+/// committed HID post before the next one lands (the same self-committing-per-keystroke
+/// discipline `glass-windows`/`glass-x11`/`glass-wayland` already need — see
+/// `glass_core::run_type`'s doc).
+const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
+
+/// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
+/// best-effort `focus` helper/settle `send_pointer` uses above).
+pub(crate) fn send_key(event: &KeyEvent, pid: i32) -> Result<()> {
+    focus(pid);
+
+    // See `send_pointer`'s doc for why a `None` source is a documented-valid, gracefully
+    // degrading `CGEventCreateKeyboardEvent` argument rather than an error.
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+
+    match event {
+        KeyEvent::Text(s) => {
+            let mut sink = MacTypeSink { source: source.as_deref() };
+            run_type(&mut sink, s, KEY_TYPE_DWELL)
+        }
+        KeyEvent::Chord(s) => send_chord(s, source.as_deref()),
+    }
+}
+
+/// Build a keyboard CGEvent for `keycode` (down or up), tagged with `flags`. Mirrors
+/// `mouse_event`'s shape — `CGEventCreateKeyboardEvent` failing (no observed cause; Apple
+/// documents no failure mode beyond resource exhaustion) maps to the same
+/// `GlassError::Backend` rather than a silent no-op post.
+fn keyboard_event(
+    source: Option<&CGEventSource>,
+    keycode: u16,
+    down: bool,
+    flags: CGEventFlags,
+) -> Result<CFRetained<CGEvent>> {
+    let ev = CGEvent::new_keyboard_event(source, keycode, down)
+        .ok_or_else(|| GlassError::Backend("CGEventCreateKeyboardEvent failed".into()))?;
+    CGEvent::set_flags(Some(&ev), flags);
+    Ok(ev)
+}
+
+/// Post one committed keystroke: a keyDown immediately followed by a keyUp, both carrying
+/// `flags` (e.g. Shift for an uppercase char or a chord's held modifiers).
+fn tap_key(source: Option<&CGEventSource>, keycode: u16, flags: CGEventFlags) -> Result<()> {
+    let down = keyboard_event(source, keycode, true, flags)?;
+    post(&down);
+    let up = keyboard_event(source, keycode, false, flags)?;
+    post(&up);
+    Ok(())
+}
+
+/// `TypeSink` for macOS: one keyDown+keyUp CGEvent pair per character — already a
+/// self-committed HID post (`CGEventPost` delivers synchronously) — so `run_type`'s
+/// inter-character dwell (`KEY_TYPE_DWELL`) lands between keystrokes exactly like the
+/// validated `inject_input.swift` probe. An unmappable char (no US-layout key —
+/// `keymap::key_for` returns `None`) fails the whole call rather than silently skipping it,
+/// per the no-silent-fallback invariant (`inject_input.swift`'s probe skips-and-warns; this
+/// backend does not).
+struct MacTypeSink<'a> {
+    source: Option<&'a CGEventSource>,
+}
+
+impl TypeSink for MacTypeSink<'_> {
+    fn character(&mut self, c: char) -> Result<()> {
+        let (keycode, shift) = keymap::key_for(c).ok_or_else(|| GlassError::InvalidKey(c.to_string()))?;
+        let flags = if shift { CGEventFlags::MaskShift } else { CGEventFlags::empty() };
+        tap_key(self.source, keycode, flags)
+    }
+}
+
+/// Parse and post a chord like `"ctrl+shift+a"` or `"F4"`: every token but the last must be
+/// a modifier `glass_core::keys::Modifier::from_name` recognizes (accumulated into
+/// `CGEventFlags` via the same `to_flags` `send_pointer` uses); the last token is the key,
+/// resolved via `resolve_chord_key`. The whole chord posts as a single keyDown+keyUp pair
+/// with the accumulated flags — see the module doc for why macOS needs no separate
+/// modifier-hold event (unlike `glass_core::run_chord`'s Windows/X11 use).
+fn send_chord(chord: &str, source: Option<&CGEventSource>) -> Result<()> {
+    let parts: Vec<&str> = chord.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let Some((key_token, mod_tokens)) = parts.split_last() else {
+        return Err(GlassError::InvalidKey(chord.to_string()));
+    };
+
+    let mut modifiers = Vec::with_capacity(mod_tokens.len());
+    for m in mod_tokens {
+        modifiers.push(Modifier::from_name(m).ok_or_else(|| GlassError::InvalidKey(chord.to_string()))?);
+    }
+    let (keycode, needs_shift) =
+        resolve_chord_key(key_token).ok_or_else(|| GlassError::InvalidKey(chord.to_string()))?;
+
+    let mut flags = to_flags(&modifiers);
+    if needs_shift {
+        flags |= CGEventFlags::MaskShift;
+    }
+    tap_key(source, keycode, flags)
+}
+
+/// Resolve a chord's final token to `(keycode, needs_shift)`: a single char goes through
+/// [`keymap::key_for`] (which also reports whether that char needs Shift, e.g. `"ctrl+A"`);
+/// anything else goes through [`keymap::keycode_for_keyname`] (a named key has no inherent
+/// shift requirement of its own — any Shift comes from an explicit `shift` token in the
+/// chord instead).
+fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
+    let mut chars = token.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if let Some(mapped) = keymap::key_for(c) {
+            return Some(mapped);
+        }
+    }
+    keymap::keycode_for_keyname(token).map(|code| (code, false))
 }
 
 /// Raise `pid`'s app before injecting input — macOS delivers CGEvents posted at the HID tap
@@ -337,5 +459,40 @@ mod tests {
     fn gesture_is_unsupported() {
         let err = send_pointer(&PointerEvent::Gesture { pointers: vec![], duration_ms: 0 }, 1, 1.0, (0.0, 0.0));
         assert!(matches!(&err, Err(GlassError::Unsupported(_))), "expected Unsupported, got {err:?}");
+    }
+
+    #[test]
+    fn resolve_chord_key_single_char_uses_key_for_and_reports_shift() {
+        // Lowercase needs no Shift; uppercase does — same physical key either way, matching
+        // `keymap::key_for`'s own contract.
+        assert_eq!(resolve_chord_key("a"), Some((0, false)));
+        assert_eq!(resolve_chord_key("A"), Some((0, true)));
+    }
+
+    #[test]
+    fn resolve_chord_key_named_key_has_no_inherent_shift() {
+        assert_eq!(resolve_chord_key("Return"), Some((36, false)));
+        assert_eq!(resolve_chord_key("F4"), Some((118, false)));
+    }
+
+    #[test]
+    fn resolve_chord_key_unknown_is_none() {
+        assert_eq!(resolve_chord_key("nope"), None);
+    }
+
+    #[test]
+    fn mac_type_sink_rejects_unmappable_char() {
+        // Errors before posting anything, so a `None` source is safe here too.
+        let mut sink = MacTypeSink { source: None };
+        assert!(matches!(sink.character('€'), Err(GlassError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn send_chord_rejects_empty_unknown_modifier_and_unknown_key() {
+        // None of these reach `tap_key` (they error before posting anything), so a `None`
+        // event source is safe to pass here.
+        assert!(matches!(send_chord("", None), Err(GlassError::InvalidKey(_))));
+        assert!(matches!(send_chord("hyper+x", None), Err(GlassError::InvalidKey(_))));
+        assert!(matches!(send_chord("ctrl+nope", None), Err(GlassError::InvalidKey(_))));
     }
 }

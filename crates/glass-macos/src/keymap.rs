@@ -38,9 +38,55 @@ pub fn key_for(ch: char) -> Option<(u16, bool)> {
     None
 }
 
+/// Map a named key (as used in a chord's final token, e.g. `"Return"`, `"F4"`) to its
+/// US-layout virtual keycode. Matched case-insensitively against the documented Carbon
+/// `kVK_*` values (validated in `inject_input.swift`'s reference). Falls back to
+/// [`key_for`] for a single ASCII char (dropping the shift bit — callers that need it use
+/// `key_for` directly), so a chord's key token doesn't need two different lookups
+/// depending on whether it's named or literal. Returns `None` for anything else.
+pub fn keycode_for_keyname(name: &str) -> Option<u16> {
+    const NAMED: &[(&str, u16)] = &[
+        ("return", 36),
+        ("tab", 48),
+        ("space", 49),
+        ("delete", 51),
+        ("escape", 53),
+        ("left", 123),
+        ("right", 124),
+        ("down", 125),
+        ("up", 126),
+        ("home", 115),
+        ("end", 119),
+        ("pageup", 116),
+        ("pagedown", 121),
+        ("forwarddelete", 117),
+        ("f1", 122),
+        ("f2", 120),
+        ("f3", 99),
+        ("f4", 118),
+        ("f5", 96),
+        ("f6", 97),
+        ("f7", 98),
+        ("f8", 100),
+        ("f9", 101),
+        ("f10", 109),
+        ("f11", 103),
+        ("f12", 111),
+    ];
+    let lower = name.to_ascii_lowercase();
+    if let Some(&(_, code)) = NAMED.iter().find(|&&(n, _)| n == lower) {
+        return Some(code);
+    }
+    let mut chars = name.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => key_for(c).map(|(code, _)| code),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::key_for;
+    use super::{key_for, keycode_for_keyname};
 
     #[test]
     fn lowercase_letters_unshifted() {
@@ -65,5 +111,48 @@ mod tests {
     fn space_and_unmapped() {
         assert_eq!(key_for(' '), Some((49, false)));
         assert_eq!(key_for('€'), None);
+    }
+
+    #[test]
+    fn named_keys_map_to_their_kvk_codes() {
+        assert_eq!(keycode_for_keyname("Return"), Some(36));
+        assert_eq!(keycode_for_keyname("Escape"), Some(53));
+        assert_eq!(keycode_for_keyname("Tab"), Some(48));
+        assert_eq!(keycode_for_keyname("Delete"), Some(51));
+    }
+
+    #[test]
+    fn named_keys_are_case_insensitive() {
+        assert_eq!(keycode_for_keyname("return"), Some(36));
+        assert_eq!(keycode_for_keyname("ESCAPE"), Some(53));
+        assert_eq!(keycode_for_keyname("EsCaPe"), Some(53));
+    }
+
+    #[test]
+    fn arrow_keys() {
+        assert_eq!(keycode_for_keyname("Left"), Some(123));
+        assert_eq!(keycode_for_keyname("Right"), Some(124));
+        assert_eq!(keycode_for_keyname("Down"), Some(125));
+        assert_eq!(keycode_for_keyname("Up"), Some(126));
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(keycode_for_keyname("F1"), Some(122));
+        assert_eq!(keycode_for_keyname("F5"), Some(96));
+        assert_eq!(keycode_for_keyname("F12"), Some(111));
+    }
+
+    #[test]
+    fn single_char_falls_back_to_key_for() {
+        assert_eq!(keycode_for_keyname("a"), Some(0));
+        assert_eq!(keycode_for_keyname("A"), Some(0)); // shift bit dropped, same physical key
+    }
+
+    #[test]
+    fn unknown_name_is_none() {
+        assert_eq!(keycode_for_keyname("nope"), None);
+        assert_eq!(keycode_for_keyname("F13"), None);
+        assert_eq!(keycode_for_keyname(""), None);
     }
 }

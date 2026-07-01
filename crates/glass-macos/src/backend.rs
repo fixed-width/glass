@@ -13,6 +13,7 @@ use glass_core::platform::{
 };
 use glass_core::{GlassError, Result};
 
+use crate::coords;
 use crate::permissions;
 use crate::process::{self, LogSink};
 
@@ -46,6 +47,13 @@ pub struct MacosPlatform {
     /// screen space), from the last `start_app`'s `WindowMatch`. Defaults to `(0.0, 0.0)`
     /// before any session starts. See `scale`'s doc.
     origin_pt: (f64, f64),
+    /// The active session's window geometry in PIXELS (`WindowMatch::geometry`), from the
+    /// last `start_app`. Defaults to a zero-sized geometry before any session starts.
+    /// `send_pointer` bounds-checks each window-relative coordinate against this before
+    /// mapping it to a global point — see `check_pointer_bounds`'s doc for why the backend
+    /// enforces this itself rather than relying solely on `glass_core::session`'s own
+    /// (session-layer) bounds check.
+    geom: WindowGeometry,
 }
 
 impl MacosPlatform {
@@ -58,6 +66,7 @@ impl MacosPlatform {
             child: None,
             scale: 1.0,
             origin_pt: (0.0, 0.0),
+            geom: WindowGeometry::default(),
         })
     }
 
@@ -116,6 +125,37 @@ impl MacosPlatform {
     }
 }
 
+/// Bounds-check every window-relative coordinate `event` carries against `geom` via
+/// `coords::check_in_bounds`, failing with `GlassError::CoordOutOfBounds` before
+/// `input::send_pointer` ever maps a coordinate to a global point — the "no
+/// silently-wrong click" invariant. `glass_core::session` already runs an equivalent check
+/// (`Session::check_bounds`) above every backend, but that's not a substitute here: this
+/// crate's mac-gated integration tests (Task 6) call `MacosPlatform::send_pointer`
+/// directly, bypassing the session layer entirely, so the backend must not depend on a
+/// caller it can't guarantee sits in front of it. Mirrors `Session::check_bounds`'s own
+/// per-variant coverage (both endpoints of a `Drag`, every pointer of a `Gesture`) even
+/// though `Gesture` itself is `Unsupported` on macOS — bounds-checking still runs first so
+/// an out-of-bounds `Gesture` reports `CoordOutOfBounds`, not `Unsupported`.
+fn check_pointer_bounds(event: &PointerEvent, geom: &WindowGeometry) -> Result<()> {
+    let check = |x: i32, y: i32| coords::check_in_bounds(x, y, geom.width, geom.height);
+    match *event {
+        PointerEvent::Move { x, y } => check(x, y),
+        PointerEvent::Click { x, y, .. } => check(x, y),
+        PointerEvent::Scroll { x, y, .. } => check(x, y),
+        PointerEvent::Drag { from_x, from_y, to_x, to_y, .. } => {
+            check(from_x, from_y)?;
+            check(to_x, to_y)
+        }
+        PointerEvent::Gesture { ref pointers, .. } => {
+            for p in pointers {
+                check(p.from_x, p.from_y)?;
+                check(p.to_x, p.to_y)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 impl Platform for MacosPlatform {
     /// Run the optional build step, spawn the app, then confirm a window appears for its
     /// pid within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent`
@@ -137,6 +177,7 @@ impl Platform for MacosPlatform {
                 self.app_pid = Some(pid);
                 self.scale = m.scale;
                 self.origin_pt = m.origin_pt;
+                self.geom = m.geometry.clone();
                 Ok(m.geometry)
             }
             Err(e) => {
@@ -172,14 +213,20 @@ impl Platform for MacosPlatform {
     }
     /// Map the active session's pid/`scale`/`origin_pt` into `input::send_pointer` — see
     /// `input.rs`'s module doc for the CGEvent details and its main-thread-affinity note
-    /// (shared with `start_app`/`capture_frame` above).
+    /// (shared with `start_app`/`capture_frame` above). Bounds-checked against `self.geom`
+    /// first — see `check_pointer_bounds`'s doc.
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        check_pointer_bounds(event, &self.geom)?;
         crate::input::send_pointer(event, pid as i32, self.scale, self.origin_pt)
     }
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
-        unimplemented!("Plan 3: CGEvent keyboard")
+    /// Map the active session's pid into `input::send_key` — see `input.rs`'s module doc
+    /// for the CGEvent keyboard details.
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        permissions::preflight()?;
+        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        crate::input::send_key(event, pid as i32)
     }
     fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
         unimplemented!("Plan 4: AXUIElement window ops")
@@ -225,6 +272,7 @@ mod tests {
             child: None,
             scale: 1.0,
             origin_pt: (0.0, 0.0),
+            geom: WindowGeometry::default(),
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -238,6 +286,7 @@ mod tests {
             child: None,
             scale: 1.0,
             origin_pt: (0.0, 0.0),
+            geom: WindowGeometry::default(),
         };
         assert_eq!(p.app_pid(), Some(42));
     }
@@ -253,6 +302,7 @@ mod tests {
             child: None,
             scale: 1.0,
             origin_pt: (0.0, 0.0),
+            geom: WindowGeometry::default(),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
@@ -265,5 +315,37 @@ mod tests {
         // future edit that swallows the missing-grant propagation. On an ungranted CI runner
         // both are Err; on a granted box both are Ok.
         assert_eq!(crate::permissions::preflight().is_err(), MacosPlatform::new().is_err());
+    }
+
+    #[test]
+    fn check_pointer_bounds_accepts_inside_rejects_outside() {
+        let geom = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        assert!(check_pointer_bounds(&PointerEvent::Move { x: 0, y: 0 }, &geom).is_ok());
+        assert!(check_pointer_bounds(&PointerEvent::Move { x: 639, y: 479 }, &geom).is_ok());
+        assert!(matches!(
+            check_pointer_bounds(&PointerEvent::Move { x: 640, y: 0 }, &geom),
+            Err(GlassError::CoordOutOfBounds { .. })
+        ));
+        assert!(matches!(
+            check_pointer_bounds(&PointerEvent::Move { x: -1, y: 0 }, &geom),
+            Err(GlassError::CoordOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn check_pointer_bounds_checks_both_drag_endpoints() {
+        use glass_core::platform::MouseButton;
+        let geom = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        // In-bounds `from`, out-of-bounds `to`: must still reject.
+        let ev = PointerEvent::Drag {
+            from_x: 0,
+            from_y: 0,
+            to_x: 700,
+            to_y: 0,
+            button: MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 100,
+        };
+        assert!(matches!(check_pointer_bounds(&ev, &geom), Err(GlassError::CoordOutOfBounds { .. })));
     }
 }
