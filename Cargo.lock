@@ -1066,6 +1066,7 @@ dependencies = [
  "glass-a11y-windows",
  "glass-android",
  "glass-core",
+ "glass-macos",
  "glass-sandbox-linux",
  "glass-wayland",
  "glass-windows",

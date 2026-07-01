@@ -25,7 +25,8 @@ The application glass launches is sandboxed by default, per OS:
   desktop** (display isolation is in progress); for full isolation, run glass inside a VM
   and reach it over the network transport — see
   [`packaging/windows-sandbox/`](packaging/windows-sandbox).
-- **macOS** — planned; the `sandbox` argument is accepted but not yet enforced.
+- **macOS** — the `sandbox` argument is accepted but not yet enforced; glass-macos ships
+  no containment yet.
 
 Choose the level per launch with `glass_start`'s `sandbox` argument, or globally with
 `GLASS_SANDBOX` (`off` / `default` / `strict`). `glass_doctor` reports what's available.

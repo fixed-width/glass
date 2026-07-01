@@ -13,8 +13,10 @@ user "does this look right?".
 glass drives apps as an external black box, so it works with any native GUI app
 regardless of toolkit or language. It currently has two Linux backends — **X11** and
 **Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
-SendInput, UI Automation) — and an **Android** backend (drives native apps in an AVD emulator over `adb`), behind a platform-agnostic core; a **macOS** backend is
-planned. See the per-host setup guides: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
+SendInput, UI Automation) — an **Android** backend (drives native apps in an AVD emulator over `adb`) — and a
+**macOS** backend (ScreenCaptureKit capture, CGEvent input, AXUIElement windows), behind a platform-agnostic
+core; on macOS, accessibility (semantic addressing) and sandboxing are still planned. See the per-host setup
+guides: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
 ## The loop in practice
 
@@ -324,7 +326,7 @@ across backends — only the setup differs:
   the OS input pipeline — raise it on a slow/loaded host, lower it for speed. See
   [docs/running-on-windows.md](docs/running-on-windows.md).
 - **Android (AVD)** — drives a native Android app in an emulator over `adb`; **host-OS-agnostic**
-  (it shells out to `adb`, so it runs from a Linux or Windows host — macOS is planned). glass manages the
+  (it shells out to `adb`, so it runs from a Linux, Windows, or macOS host). glass manages the
   AVD — attaching to a running emulator or booting a headless one itself — and the VM *is* the
   sandbox, so there's no separate containment step. The app is built (`spec.build`, e.g.
   `./gradlew assembleDebug`) on the host, installed, and launched; `glass_start`'s `run` is the
@@ -367,12 +369,14 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
 |---|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | 🚧 |
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ◑ ‡ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | 🚧 AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | 🚧 |
 
 † **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard, high-fidelity input, and multi-touch gestures (`glass_gesture`)** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` (single-pointer only — no multi-touch) and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. glass is developed and tested against **Android 14 (API 34)**; the `adb` backend assumes no particular version and the optional companions declare an Android 7.0 (API 24) floor (details in your host guide). Window resize/move (apps are full-screen) and physical devices are non-goals.
+
+‡ **macOS** capture, input, windows, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Clipboard get/set is not yet wired up on macOS.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
@@ -392,7 +396,9 @@ tree, a managed AVD (attach-or-boot), and two optional on-device companions — 
 (clipboard + high-fidelity input) and an AccessibilityService (Compose-rich a11y tree +
 high-fidelity `set_value`), both set up in the [Linux](docs/running-on-linux.md) /
 [Windows](docs/running-on-windows.md) Android guides; it's built and unit-tested in CI and
-validated on-device. **macOS is the one OS backend not yet built.**
+validated on-device. The **macOS** backend (ScreenCaptureKit capture, CGEvent input,
+AXUIElement windows/logs) is built and CI-tested; accessibility (AX) and sandboxing are
+not yet implemented — see [docs/running-on-macos.md](docs/running-on-macos.md).
 
 ## License
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  gui/<uid> LaunchAgent template that runs the signed GlassMcp.app as
+  `glass-mcp serve --http` — the unattended run model (see
+  docs/running-on-macos.md and packaging/macos/README.md).
+
+  Before loading this, edit the two placeholders below:
+    - /Users/YOU  -> your home directory (also fix the app path if you didn't
+                     install GlassMcp.app to /Applications).
+  The bind address (127.0.0.1:7300) is loopback-only, so no bearer token is
+  required; see docs/running-on-macos.md for reaching it from another machine.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>tech.fixedwidth.glass</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/GlassMcp.app/Contents/MacOS/glass-mcp</string>
+		<string>serve</string>
+		<string>--http</string>
+		<string>--addr</string>
+		<string>127.0.0.1:7300</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>GLASS_BACKEND</key>
+		<string>macos</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/GlassMcp/stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/GlassMcp/stderr.log</string>
+</dict>
+</plist>

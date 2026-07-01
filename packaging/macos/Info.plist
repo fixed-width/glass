@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template Info.plist for GlassMcp.app. build-app.sh copies this file in and can
+  override CFBundleIdentifier / CFBundleShortVersionString / CFBundleVersion (see
+  packaging/macos/README.md); the values below are the production defaults.
+
+  LSBackgroundOnly is set because glass-mcp is a headless agent: it has no windows,
+  no menu bar, and nothing to show in the Dock or the Force Quit list.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>tech.fixedwidth.glass</string>
+	<key>CFBundleExecutable</key>
+	<string>glass-mcp</string>
+	<key>CFBundleName</key>
+	<string>GlassMcp</string>
+	<key>CFBundleDisplayName</key>
+	<string>glass</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.2</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSBackgroundOnly</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Apache-2.0. https://github.com/fixed-width/glass</string>
+</dict>
+</plist>

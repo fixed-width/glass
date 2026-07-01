@@ -51,11 +51,12 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     );
 
     // Only show sections for backends actually compiled into THIS binary — absent
-    // backends (e.g. windows on a Linux build, or macos anywhere today) are omitted
-    // rather than listed as "not built into this binary" placeholders. Accessibility is
-    // per-OS (AT-SPI on Linux, UIA on Windows), so it ships with whichever OS is built.
-    // Android is the exception: its crate is host-OS-agnostic and always compiled in, so
-    // its section is always emitted, gated at runtime (see below) rather than by cfg.
+    // backends (e.g. windows on a Linux build, or macos on a non-macOS build) are
+    // omitted rather than listed as "not built into this binary" placeholders.
+    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS's grants live in
+    // its own "macos" section instead. Android is the exception: its crate is
+    // host-OS-agnostic and always compiled in, so its section is always emitted, gated
+    // at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];
 
     #[cfg(target_os = "linux")]
@@ -90,6 +91,10 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
             None,
             glass_a11y_windows::doctor::checks(deep),
         ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        sections.push(Section::new("macos", Some("macos".into()), macos_checks(backend)));
     }
 
     // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always compiled
@@ -140,6 +145,96 @@ fn soften_inactive_android(checks: &mut [Check]) {
     }
 }
 
+/// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console
+/// session's three-way state (unlocked/locked/nobody-logged-in), and the resolved
+/// backend. Pure — takes already-gathered facts, makes no OS calls itself — so it's
+/// unit-tested without needing real grants or a particular session state;
+/// [`macos_checks`] gathers the real facts via `glass_macos`. A locked/asleep session
+/// is a `Warn`, not a `Fail`: it's recoverable in-place (`caffeinate -d`), unlike a
+/// genuinely missing grant. No account being logged in at the console at all
+/// (`SessionState::NoSession` — see `glass_macos::session`, verified to be a
+/// console-wide fact, not merely "called over SSH") is also a `Warn`: distinct from
+/// both, not fixable by unlocking, but still surfaced without failing the whole
+/// doctor run over what's usually a launch-configuration issue rather than a broken
+/// install.
+#[cfg(target_os = "macos")]
+fn macos_checks_from(
+    resolved_backend: &str,
+    screen_recording: bool,
+    accessibility: bool,
+    session_state: glass_macos::SessionState,
+) -> Vec<Check> {
+    vec![
+        if screen_recording {
+            Check::new("Screen Recording", CheckStatus::Ok, "granted")
+        } else {
+            Check::new(
+                "Screen Recording",
+                CheckStatus::Fail,
+                "not granted — capture will fail with a permission error",
+            )
+            .with_remedy(glass_macos::screen_recording_remedy())
+        },
+        if accessibility {
+            Check::new("Accessibility", CheckStatus::Ok, "granted")
+        } else {
+            Check::new(
+                "Accessibility",
+                CheckStatus::Fail,
+                "not granted — window management and input injection will fail",
+            )
+            .with_remedy(glass_macos::accessibility_remedy())
+        },
+        match session_state {
+            glass_macos::SessionState::Unlocked => Check::new("display awake", CheckStatus::Ok, "session unlocked"),
+            glass_macos::SessionState::Locked => Check::new(
+                "display awake",
+                CheckStatus::Warn,
+                "console session is locked/asleep — capture and input are silently suppressed while it is",
+            )
+            .with_remedy("run `caffeinate -d` in the console session to keep the display awake (no sudo needed)"),
+            glass_macos::SessionState::NoSession => Check::new(
+                "display awake",
+                CheckStatus::Warn,
+                "no account is logged in at the console (or it's sitting at the login window) — capture and \
+                 input need an actual GUI login, not just an unlocked screen; this is NOT about how glass-mcp \
+                 itself was launched (a bare-SSH process still sees a real logged-in console's state fine)",
+            )
+            .with_remedy(
+                "log in at the console for this account, then run glass-mcp as a gui/$(id -u) LaunchAgent: \
+                 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/tech.fixedwidth.glass.plist` \
+                 (see docs/running-on-macos.md)",
+            ),
+        },
+        // The `general` section already prints the resolved default backend
+        // (`default backend`, above); this doesn't re-discover that fact, it just
+        // views it through a macOS-specific lens — is the backend this *macOS*
+        // binary resolved to actually macOS, e.g. flagging a `GLASS_BACKEND`
+        // override that names a backend not even compiled into this build.
+        if resolved_backend == "macos" {
+            Check::new("backend", CheckStatus::Ok, "resolved to macos")
+        } else {
+            Check::new(
+                "backend",
+                CheckStatus::Warn,
+                format!("resolved backend is {resolved_backend}, not macos (GLASS_BACKEND override?)"),
+            )
+        },
+    ]
+}
+
+/// Gather the real macOS facts (TCC grants, session state) and map them via
+/// [`macos_checks_from`].
+#[cfg(target_os = "macos")]
+fn macos_checks(resolved_backend: &str) -> Vec<Check> {
+    macos_checks_from(
+        resolved_backend,
+        glass_macos::screen_recording_granted(),
+        glass_macos::accessibility_granted(),
+        glass_macos::session_state(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,11 +265,14 @@ mod tests {
         // Platform-gated backends compiled into THIS binary get a section; android is
         // always present (host-OS-agnostic crate) via a runtime gate. No "not built into
         // this binary" placeholders. Accessibility is per-OS (AT-SPI on Linux, UIA on
-        // Windows). macos has no backend yet, so it never appears.
+        // Windows); macOS's grants (Screen Recording, Accessibility) live inside its own
+        // "macos" section rather than a separate accessibility section.
         #[cfg(target_os = "linux")]
         assert_eq!(titles, ["general", "network", "x11", "wayland", "sandbox", "accessibility (linux)", "android"]);
         #[cfg(windows)]
         assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
+        #[cfg(target_os = "macos")]
+        assert_eq!(titles, ["general", "network", "macos", "android"]);
         // Android's section is always present and non-empty — its basic presence checks now
         // run unconditionally (deep probes gated to the selected backend; Fails softened to
         // Warn when android isn't active). Asserting non-empty catches accidental removal of
@@ -187,6 +285,7 @@ mod tests {
         assert_eq!(net.checks.len(), 1);
         // No section is a "not built into this binary" placeholder, and absent backends
         // are omitted entirely.
+        #[cfg(not(target_os = "macos"))]
         assert!(!titles.contains(&"macos"));
         #[cfg(target_os = "linux")]
         assert!(!titles.contains(&"windows"));
@@ -194,6 +293,12 @@ mod tests {
         {
             assert!(!titles.contains(&"x11"));
             assert!(!titles.contains(&"wayland"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!titles.contains(&"x11"));
+            assert!(!titles.contains(&"wayland"));
+            assert!(!titles.contains(&"windows"));
         }
         let placeholder = d
             .sections
@@ -216,5 +321,92 @@ mod tests {
         let off = crate::audit::AuditReport { enabled: false, path: None, content: crate::audit::ContentMode::Redacted, prefix_len: 8 };
         let t = diagnose_with_audit(false, &off).render_text("x11").to_lowercase();
         assert!(t.contains("audit") && t.contains("off"), "{t}");
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::*;
+
+        use glass_macos::SessionState;
+
+        #[test]
+        fn all_granted_awake_and_resolved_is_all_ok() {
+            let checks = macos_checks_from("macos", true, true, SessionState::Unlocked);
+            assert!(checks.iter().all(|c| c.status == CheckStatus::Ok), "{checks:?}");
+        }
+
+        #[test]
+        fn missing_screen_recording_fails_with_the_shared_remedy() {
+            let checks = macos_checks_from("macos", false, true, SessionState::Unlocked);
+            let c = checks.iter().find(|c| c.name == "Screen Recording").unwrap();
+            assert_eq!(c.status, CheckStatus::Fail);
+            // Same wording `preflight`'s `PermissionDenied` error uses — no separate,
+            // driftable copy in glass-mcp.
+            assert_eq!(c.remedy.as_deref(), Some(glass_macos::screen_recording_remedy()));
+        }
+
+        #[test]
+        fn missing_accessibility_fails_with_the_shared_remedy() {
+            let checks = macos_checks_from("macos", true, false, SessionState::Unlocked);
+            let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
+            assert_eq!(c.status, CheckStatus::Fail);
+            assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
+        }
+
+        #[test]
+        fn locked_session_warns_and_names_caffeinate() {
+            let checks = macos_checks_from("macos", true, true, SessionState::Locked);
+            let c = checks.iter().find(|c| c.name == "display awake").unwrap();
+            assert_eq!(c.status, CheckStatus::Warn);
+            assert!(c.remedy.as_deref().unwrap().contains("caffeinate -d"), "{c:?}");
+        }
+
+        #[test]
+        fn locked_session_does_not_fail_the_whole_doctor_run() {
+            // The display-awake WARN must not escalate `Diagnosis::overall` to FAIL —
+            // it's recoverable in place, unlike a genuinely missing grant.
+            let checks = macos_checks_from("macos", true, true, SessionState::Locked);
+            let d = Diagnosis::new(vec![Section::new("macos", Some("macos".into()), checks)]);
+            assert_eq!(d.overall("macos"), CheckStatus::Warn);
+            assert_eq!(d.exit_code("macos"), 0);
+        }
+
+        #[test]
+        fn no_session_warns_and_names_launchctl_bootstrap() {
+            // The distinct NULL-dict case — nobody logged in at the console at all
+            // (verified to be a console-wide fact, not "this process happens to be
+            // over SSH" — see `glass_macos::session`'s module docs), not a present-
+            // but-unlocked one. Must not collapse into the `Unlocked` Ok case.
+            let checks = macos_checks_from("macos", true, true, SessionState::NoSession);
+            let c = checks.iter().find(|c| c.name == "display awake").unwrap();
+            assert_eq!(c.status, CheckStatus::Warn);
+            assert!(c.detail.contains("no account is logged in at the console"), "{c:?}");
+            assert!(c.remedy.as_deref().unwrap().contains("launchctl bootstrap gui/"), "{c:?}");
+        }
+
+        #[test]
+        fn no_session_does_not_fail_the_whole_doctor_run() {
+            // Also recoverable (relaunch as a LaunchAgent) rather than a broken
+            // install, so it's a Warn like `Locked`, not escalated to Fail.
+            let checks = macos_checks_from("macos", true, true, SessionState::NoSession);
+            let d = Diagnosis::new(vec![Section::new("macos", Some("macos".into()), checks)]);
+            assert_eq!(d.overall("macos"), CheckStatus::Warn);
+            assert_eq!(d.exit_code("macos"), 0);
+        }
+
+        #[test]
+        fn missing_grant_fails_the_whole_doctor_run_when_macos_is_the_default_backend() {
+            let checks = macos_checks_from("macos", false, true, SessionState::Unlocked);
+            let d = Diagnosis::new(vec![Section::new("macos", Some("macos".into()), checks)]);
+            assert_eq!(d.overall("macos"), CheckStatus::Fail);
+            assert_eq!(d.exit_code("macos"), 1);
+        }
+
+        #[test]
+        fn backend_mismatch_warns_without_naming_it_a_failure() {
+            let checks = macos_checks_from("android", true, true, SessionState::Unlocked);
+            let c = checks.iter().find(|c| c.name == "backend").unwrap();
+            assert_eq!(c.status, CheckStatus::Warn);
+        }
     }
 }

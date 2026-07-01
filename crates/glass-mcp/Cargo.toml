@@ -48,6 +48,9 @@ glass-sandbox-linux.workspace = true
 glass-windows = { path = "../glass-windows" }
 glass-a11y-windows = { path = "../glass-a11y-windows" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+glass-macos = { path = "../glass-macos" }
+
 [build-dependencies]
 embed-manifest = "1"
 
