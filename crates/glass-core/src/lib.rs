@@ -24,6 +24,8 @@ pub use drag::{run_drag, DragGesture, DragSink};
 pub mod chord;
 pub use chord::{run_chord, ChordSink, CHORD_DWELL};
 
+pub mod coords;
+
 pub mod scroll;
 pub use scroll::{run_scroll, ScrollSink, SCROLL_DWELL};
 
