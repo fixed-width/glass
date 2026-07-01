@@ -53,8 +53,10 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // Only show sections for backends actually compiled into THIS binary — absent
     // backends (e.g. windows on a Linux build, or macos on a non-macOS build) are
     // omitted rather than listed as "not built into this binary" placeholders.
-    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS's grants live in
-    // its own "macos" section instead. Android is the exception: its crate is
+    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS instead gets two
+    // sections below — "macos" (the platform backend's own TCC posture) and
+    // "accessibility (macos)" (the a11y-tool reader's readiness) — see the comment there
+    // for why the two aren't merged. Android is the exception: its crate is
     // host-OS-agnostic and always compiled in, so its section is always emitted, gated
     // at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];

@@ -155,8 +155,10 @@ launchctl bootout gui/$(id -u)/tech.fixedwidth.glass
 Once granted (step 3), the agent has `glass_start`, `glass_screenshot`,
 `glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`, `glass_logs`,
 `glass_list_windows`, `glass_select_window`, and `glass_doctor`. The
-accessibility-tree tools — `glass_a11y_snapshot`, `glass_click_element` — aren't
-available on macOS yet.
+accessibility-tree tools — `glass_a11y_snapshot`, `glass_a11y_marks`,
+`glass_click_element`, and `glass_set_value` — also work on macOS, reading and
+driving the AXUIElement tree; they need the same Accessibility grant from step 3
+above (no separate permission).
 
 ## Troubleshooting: headless / SSH setup
 

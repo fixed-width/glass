@@ -14,9 +14,9 @@ glass drives apps as an external black box, so it works with any native GUI app
 regardless of toolkit or language. It currently has two Linux backends — **X11** and
 **Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
 SendInput, UI Automation) — an **Android** backend (drives native apps in an AVD emulator over `adb`) — and a
-**macOS** backend (ScreenCaptureKit capture, CGEvent input, AXUIElement windows), behind a platform-agnostic
-core; on macOS, accessibility (semantic addressing) and sandboxing are still planned. See the per-host setup
-guides: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
+**macOS** backend (ScreenCaptureKit capture, CGEvent input, AXUIElement windows and accessibility tree), behind
+a platform-agnostic core; on macOS, sandboxing is still planned. See the per-host setup guides:
+[Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
 ## The loop in practice
 
@@ -370,7 +370,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
 |---|:--:|:--:|:--:|:--:|
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ◑ ‡ |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | 🚧 AX |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | 🚧 |
 
@@ -397,8 +397,8 @@ tree, a managed AVD (attach-or-boot), and two optional on-device companions — 
 high-fidelity `set_value`), both set up in the [Linux](docs/running-on-linux.md) /
 [Windows](docs/running-on-windows.md) Android guides; it's built and unit-tested in CI and
 validated on-device. The **macOS** backend (ScreenCaptureKit capture, CGEvent input,
-AXUIElement windows/logs) is built and CI-tested; accessibility (AX) and sandboxing are
-not yet implemented — see [docs/running-on-macos.md](docs/running-on-macos.md).
+AXUIElement windows/logs, and an AXUIElement accessibility tree) is built and CI-tested;
+sandboxing is not yet implemented — see [docs/running-on-macos.md](docs/running-on-macos.md).
 
 ## License
 

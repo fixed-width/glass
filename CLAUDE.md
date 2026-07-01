@@ -16,15 +16,15 @@ tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform
 and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
 on-device companion agent), macOS (ScreenCaptureKit capture, CGEvent input, AXUIElement
-windows/logs; accessibility reader + sandboxing still to come).
+windows/logs, accessibility tree; sandboxing still to come).
 
 ## Layout
 
 Cargo workspace at the repo root. Crates: `glass-core` (platform-agnostic heart — the
 `Platform`/`Accessibility` seams, session, `Frame`, diff, stability, log buffer), the
 backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`), the a11y readers
-(`glass-a11y-linux`, `glass-a11y-windows`; the Android `uiautomator` reader lives in
-`glass-android`), `glass-sandbox-linux`, the `glass-mcp` server binary, and the
+(`glass-a11y-linux`, `glass-a11y-windows`, `glass-a11y-macos`; the Android `uiautomator`
+reader lives in `glass-android`), `glass-sandbox-linux`, the `glass-mcp` server binary, and the
 `glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for two
 optional on-device companions — an `app_process` agent (clipboard + high-fidelity input) and an
 `AccessibilityService` (Compose-rich a11y tree + high-fidelity `set_value`); both live in the
