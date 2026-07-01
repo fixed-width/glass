@@ -69,9 +69,13 @@ static APP_KIT_INIT: Once = Once::new();
 /// correct one, from the real main thread — would then panic too with "Once instance
 /// has previously been poisoned"). Checking first means a single off-thread misuse
 /// can't permanently wedge the one-time init for the rest of the process.
-// Not yet called: Task 2 wires this into `MacosPlatform::start_app` before the first
-// capture/provisioning call. Kept `pub(crate)` + allowed here rather than deleted so the
-// Once and its doc land in one place instead of being reintroduced per call site.
+// Called by `scwindow::find_window_for_pids` before the first `SCShareableContent`
+// query; later capture/provisioning call sites (Plan 2's remaining steps) will call it
+// too — safe and cheap to call redundantly, since only the first call does anything.
+// `find_window_for_pids` itself isn't wired into `MacosPlatform::start_app` yet (a later
+// task's job), so this function isn't reachable from any true crate root either; kept
+// `#[allow(dead_code)]` (harmless now that it has a real caller) rather than deleted so
+// the Once and its doc stay in one place instead of being reintroduced per call site.
 #[allow(dead_code)]
 pub(crate) fn app_kit_init() {
     let mtm = MainThreadMarker::new().expect("app_kit_init must run on the main thread");

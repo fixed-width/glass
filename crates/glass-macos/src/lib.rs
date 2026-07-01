@@ -14,6 +14,8 @@ mod ffi;
 #[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
+mod scwindow;
+#[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;

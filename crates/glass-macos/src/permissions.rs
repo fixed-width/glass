@@ -32,6 +32,19 @@ impl Permission {
     fn denied(self) -> glass_core::GlassError {
         glass_core::GlassError::PermissionDenied { which: self.label().into(), remedy: self.remedy().into() }
     }
+
+    /// Like [`Permission::denied`], but appends a caller-supplied diagnostic (e.g. the
+    /// raw `NSError` ScreenCaptureKit reported for a TCC decline) to the remedy text, so
+    /// the agent sees both the actionable fix and the underlying OS-reported reason.
+    /// `pub(crate)` (unlike `denied`) so other modules — e.g. `scwindow`'s
+    /// `SCShareableContent` preflight — can reuse this wording instead of hand-rolling
+    /// their own remedy string.
+    pub(crate) fn denied_with_detail(self, detail: impl std::fmt::Display) -> glass_core::GlassError {
+        glass_core::GlassError::PermissionDenied {
+            which: self.label().into(),
+            remedy: format!("{} (underlying error: {detail})", self.remedy()),
+        }
+    }
 }
 
 // Both are plain C functions; no objc2 needed for preflight.
