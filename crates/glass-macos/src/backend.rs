@@ -35,13 +35,31 @@ pub struct MacosPlatform {
     /// The launched child process, kept so `stop_app`/`Drop` can `process::terminate`
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
+    /// The active session's `pointPixelScale` (`1.0` on a 1x display, `2.0` on 2x
+    /// Retina), from the last `start_app`'s `WindowMatch`. Defaults to `1.0` before any
+    /// session starts. Stored for `send_pointer`/`send_key` (Plan 3) to map a
+    /// window-relative PIXEL coordinate (the tool boundary's unit) to a global POINT via
+    /// `coords::pixel_to_global_point` before posting a CGEvent — not yet read here.
+    #[allow(dead_code)]
+    scale: f64,
+    /// The active session's window `contentRect.origin`, in POINTS (Quartz's global
+    /// screen space), from the last `start_app`'s `WindowMatch`. Defaults to `(0.0, 0.0)`
+    /// before any session starts. See `scale`'s doc — not yet read here.
+    #[allow(dead_code)]
+    origin_pt: (f64, f64),
 }
 
 impl MacosPlatform {
     /// Construct the backend, failing fast if a required TCC grant is missing.
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
-        Ok(Self { logs: Arc::new(Mutex::new(Vec::new())), app_pid: None, child: None })
+        Ok(Self {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: None,
+            child: None,
+            scale: 1.0,
+            origin_pt: (0.0, 0.0),
+        })
     }
 
     /// Run the optional `spec.build` shell step in `spec.cwd`, mirroring the X11/Windows
@@ -74,12 +92,19 @@ impl MacosPlatform {
     /// `glass-x11/src/platform.rs`'s `discover_window`. Can't delegate this to
     /// `scwindow::find_window_for_pids`: that helper owns its *entire* poll loop
     /// internally, with no child handle to race against.
-    fn discover_window(child: &mut Child, pid: u32, timeout_ms: u64) -> Result<WindowGeometry> {
+    ///
+    /// Returns the whole [`crate::scwindow::WindowMatch`] (not just its `geometry`) so
+    /// `start_app` can also stash `scale`/`origin_pt` for the session.
+    fn discover_window(
+        child: &mut Child,
+        pid: u32,
+        timeout_ms: u64,
+    ) -> Result<crate::scwindow::WindowMatch> {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
             if let Some(m) = crate::scwindow::query_once(&[pid as i32])? {
-                return Ok(m.geometry);
+                return Ok(m);
             }
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(GlassError::AppExited(status.code()));
@@ -108,10 +133,12 @@ impl Platform for MacosPlatform {
         let mut child = process::spawn(spec, self.logs.clone())?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
-            Ok(geometry) => {
+            Ok(m) => {
                 self.child = Some(child);
                 self.app_pid = Some(pid);
-                Ok(geometry)
+                self.scale = m.scale;
+                self.origin_pt = m.origin_pt;
+                Ok(m.geometry)
             }
             Err(e) => {
                 // The window never appeared (or discovery otherwise failed): don't leak
@@ -192,6 +219,8 @@ mod tests {
             logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
             app_pid: Some(42),
             child: None,
+            scale: 1.0,
+            origin_pt: (0.0, 0.0),
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -199,8 +228,13 @@ mod tests {
 
     #[test]
     fn app_pid_returns_the_constructed_value() {
-        let p =
-            MacosPlatform { logs: Arc::new(Mutex::new(Vec::new())), app_pid: Some(42), child: None };
+        let p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: Some(42),
+            child: None,
+            scale: 1.0,
+            origin_pt: (0.0, 0.0),
+        };
         assert_eq!(p.app_pid(), Some(42));
     }
 
@@ -209,7 +243,13 @@ mod tests {
         // No child stored: stop_app must not panic (e.g. on an unwrap of a live process
         // handle) and must succeed — this path never touches AppKit, so it's exercisable
         // off the Mac-gated suite's main-thread test.
-        let mut p = MacosPlatform { logs: Arc::new(Mutex::new(Vec::new())), app_pid: None, child: None };
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: None,
+            child: None,
+            scale: 1.0,
+            origin_pt: (0.0, 0.0),
+        };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
         assert_eq!(p.app_pid(), None);
