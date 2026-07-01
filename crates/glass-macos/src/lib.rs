@@ -27,3 +27,5 @@ mod input;
 mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
+#[cfg(target_os = "macos")]
+pub use ffi::init_main_thread;

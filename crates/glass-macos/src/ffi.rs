@@ -70,22 +70,46 @@ const TCC_DECLINE_CODE: isize = -3801;
 /// Touch `NSApplication.shared` exactly once to establish this process's connection to
 /// the window server. Without it, ScreenCaptureKit/CoreGraphics calls from a bare CLI
 /// binary abort with `CGS_REQUIRE_INIT` (proven in the objc2 spike; see the module doc
-/// above). Must be called from the main thread; safe to call repeatedly — only the
-/// first call does anything.
+/// above). The *first* call must happen on the main thread; safe to call repeatedly
+/// (including from any other thread) afterward — only the first call does anything.
 ///
-/// The main-thread check runs *before* `call_once`, not inside its closure: a panic
-/// inside `Once::call_once` poisons the `Once` forever (every later call — even a
-/// correct one, from the real main thread — would then panic too with "Once instance
-/// has previously been poisoned"). Checking first means a single off-thread misuse
-/// can't permanently wedge the one-time init for the rest of the process.
+/// The completed-check runs *before* touching `MainThreadMarker` at all: once the
+/// one-time init has actually happened, this becomes a cheap, thread-agnostic no-op, so
+/// every call site that only cares "has `app_kit_init` run yet" (all of them — see below)
+/// can be reached from a non-main worker thread once startup has called
+/// [`init_main_thread`] once. See `.superpowers/sdd/thread0-research.md` and
+/// `.superpowers/sdd/thread0-spike-report.md` for why this is sound: the WindowServer
+/// connection `NSApplication.sharedApplication` establishes is a process-wide, one-time
+/// resource, not a per-thread one.
+///
+/// The main-thread check (for the first, real call) runs *before* `call_once`, not
+/// inside its closure: a panic inside `Once::call_once` poisons the `Once` forever
+/// (every later call — even a correct one, from the real main thread — would then panic
+/// too with "Once instance has previously been poisoned"). Checking first means a single
+/// off-thread misuse can't permanently wedge the one-time init for the rest of the
+/// process.
+///
 /// Called by `backend.rs`'s `discover_window` (before `start_app`'s window-discovery poll
 /// loop) and by `capture::capture_window` (before every capture) — safe and cheap to call
 /// redundantly, since only the first call does anything.
 pub(crate) fn app_kit_init() {
+    if APP_KIT_INIT.is_completed() {
+        return;
+    }
     let mtm = MainThreadMarker::new().expect("app_kit_init must run on the main thread");
     APP_KIT_INIT.call_once(|| {
         let _app = NSApplication::sharedApplication(mtm);
     });
+}
+
+/// Public entry point for a host process (e.g. `glass-mcp`'s `main()`) to perform the
+/// one-time AppKit/WindowServer init from the process's real main thread at startup,
+/// before spawning any worker thread that will later call into `MacosPlatform`. Thin
+/// wrapper over [`app_kit_init`] — see its doc for the full contract. After this returns,
+/// every subsequent `app_kit_init()` call (transitively, every `MacosPlatform` operation)
+/// is a cheap no-op safe to call from any thread.
+pub fn init_main_thread() {
+    app_kit_init();
 }
 
 /// Classify a `null` async ScreenCaptureKit result's paired `NSError`:

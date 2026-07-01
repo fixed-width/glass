@@ -4,6 +4,20 @@ use glass_mcp::{boot, run_doctor, run_env, run_stdio};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // One-time AppKit/WindowServer init (`NSApplication.sharedApplication`) — must run on
+    // the process's real main thread ("thread 0"), exactly once, before anything spawns the
+    // `glass-platform` worker thread that `GlassServer::new` (server.rs) parents every
+    // `MacosPlatform` call to. This is the FIRST statement of `main()`, with no `.await`
+    // above it: `#[tokio::main]`'s expansion builds the runtime and calls `Runtime::block_on`
+    // on the thread that invoked `main()` (thread 0), and `block_on` polls the async body
+    // itself on that same calling thread — so this line runs synchronously on thread 0
+    // during that first poll, strictly before `boot()`/`run_stdio()` below ever construct a
+    // `GlassServer` and spawn its worker thread. See glass-macos's `ffi::app_kit_init` doc
+    // and `.superpowers/sdd/thread0-spike-report.md` for why one call here is sufficient —
+    // every later `MacosPlatform` call, from any thread, is a cheap no-op after this.
+    #[cfg(target_os = "macos")]
+    glass_macos::init_main_thread();
+
     let cli = Cli::parse();
     let audit_log = cli.audit_log;
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
