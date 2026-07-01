@@ -24,6 +24,14 @@ harness = false
 name = "input"
 harness = false
 
+# Mac-gated window-management integration test (crates/glass-macos/tests/windows.rs) — same
+# harness=false main-thread requirement as `capture`/`input` above (list_windows/
+# select_window/window/capture_frame all reach AppKit's ffi::app_kit_init()); see that
+# file's module doc.
+[[test]]
+name = "windows"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 
@@ -81,6 +89,34 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "CFCGTypes",
+    # axwindow.rs: CFArray for kAXWindowsAttribute's element array (CFArray<AXUIElement>);
+    # CFString for AX attribute/action name literals (CFString::from_str — see
+    # axwindow.rs's module doc for why these aren't sourced from
+    # objc2-application-services's own constants features); CFNumber for
+    # CFBoolean/kCFBooleanTrue (kAXMainAttribute's set value).
+    "CFArray",
+    "CFString",
+    "CFNumber",
+] }
+# axwindow.rs: AXUIElement (window enumeration/attribute get+set/actions), AXValue
+# (position/size as CGPoint/CGSize), AXError (the shared failure type every AX call
+# returns). `HIServices` is the umbrella feature gating the whole generated module tree
+# those three live under (crates.io's per-type features only pick which files *inside*
+# HIServices compile in — the module itself doesn't exist without it; found by reading
+# `src/generated/mod.rs`'s `#[cfg(feature = "HIServices")] pub use self::__HIServices::*;`
+# after `AXUIElement`/`AXValue`/`AXError` alone failed to resolve). `libc` unlocks
+# AXUIElement::new_application(pid: libc::pid_t) — our own `i32` pid coerces to it directly
+# via the type alias, same as objc2-app-kit's `libc` feature above; no direct `libc`
+# dependency needed here. Deliberately NOT AXAttributeConstants/AXActionConstants/
+# AXRoleConstants: reading the generated source shows header-translator produced EMPTY
+# files for all three (no kAX*Attribute/kAX*Action symbols at all) — axwindow.rs declares
+# those attribute/action name strings itself instead (see its module doc).
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "HIServices",
+    "AXUIElement",
+    "AXValue",
+    "AXError",
+    "libc",
 ] }
 block2 = "0.6.2"
 # SIGTERM/SIGKILL for `process::terminate` — already a workspace dep (glass-wayland,

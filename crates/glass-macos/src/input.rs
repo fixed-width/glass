@@ -72,7 +72,15 @@ const FOCUS_SETTLE: Duration = Duration::from_millis(300);
 /// and window `contentRect.origin`, carried by `MacosPlatform` since the last `start_app` —
 /// see `coords.rs`'s module doc).
 pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt: (f64, f64)) -> Result<()> {
-    focus(pid);
+    // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity (see
+    // the `PointerEvent::Gesture` arm below) — checked first, ahead of `focus`, so this
+    // fails fast without the side effect of raising/activating `pid`'s app for an operation
+    // that can never succeed (also keeps `focus`'s now-fallible missing-process check, fix
+    // 4, from masking this call-shape error behind an unrelated `AppExited`).
+    if matches!(event, PointerEvent::Gesture { .. }) {
+        return Err(GlassError::Unsupported("multi-touch gesture is not supported on macOS".into()));
+    }
+    focus(pid)?;
 
     // Passing `None` here is a documented-valid `CGEventCreateMouseEvent`/
     // `CGEventCreateScrollWheelEvent2` argument (falls back to the combined session state),
@@ -125,6 +133,9 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
                 MacScrollSink { source: source.as_deref(), point: to_point(x, y), dx, dy, flags: to_flags(modifiers) };
             run_scroll(&mut sink, !modifiers.is_empty())?;
         }
+        // Already rejected by the early check above (before `focus`); kept here so this
+        // match stays exhaustive over `PointerEvent`'s variants and a future variant added
+        // to the enum still forces an explicit decision at this call site.
         PointerEvent::Gesture { .. } => {
             return Err(GlassError::Unsupported("multi-touch gesture is not supported on macOS".into()));
         }
@@ -142,7 +153,7 @@ const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
 /// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
 /// best-effort `focus` helper/settle `send_pointer` uses above).
 pub(crate) fn send_key(event: &KeyEvent, pid: i32) -> Result<()> {
-    focus(pid);
+    focus(pid)?;
 
     // See `send_pointer`'s doc for why a `None` source is a documented-valid, gracefully
     // degrading `CGEventCreateKeyboardEvent` argument rather than an error.
@@ -248,17 +259,29 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
 
 /// Raise `pid`'s app before injecting input — macOS delivers CGEvents posted at the HID tap
 /// to whatever the window server currently has focused, unlike X11/Windows where glass warps
-/// the pointer into an app it already knows the geometry of. Best-effort: a missing/exited
-/// app (`runningApplicationWithProcessIdentifier` returns `None`) or a declined activation
-/// (`activateWithOptions` returns `false`) doesn't fail the call — the event still posts to
-/// whatever currently has focus, matching `glass-windows::input::send_pointer`'s own
-/// best-effort `focus_window` nudge.
-fn focus(pid: i32) {
-    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
-        return;
-    };
+/// the pointer into an app it already knows the geometry of.
+///
+/// A missing/exited process (`runningApplicationWithProcessIdentifier` returns `None`) is a
+/// hard error (final-review fix 4), not best-effort: silently posting input to "whatever
+/// currently has focus" when the target app is actually gone is exactly the kind of
+/// silent-wrong-target failure the rest of this crate's pid-scoping goes out of its way to
+/// avoid (see `scwindow.rs`'s `find_window_by_id` doc) — an agent driving a dead app should
+/// see `GlassError::AppExited`, not a keystroke/click that silently landed somewhere else. A
+/// *declined* activation (`activateWithOptions` returns `false`, e.g. the OS deprioritizes a
+/// background-app activation request) still doesn't fail the call: the process is
+/// confirmed alive, and the event still posts to whatever currently has focus, matching
+/// `glass-windows::input::send_pointer`'s own best-effort `focus_window` nudge for that
+/// narrower case.
+///
+/// `pub(crate)`: also the `NSRunningApplication(pid).activate()` step of
+/// `backend::MacosPlatform::window`'s `WindowOp::Focus` branch (Plan 4 Task 4), ahead of that
+/// branch's `axwindow::ax_raise`/`ax_set_main` — one activation call site rather than two.
+pub(crate) fn focus(pid: i32) -> Result<()> {
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .ok_or(GlassError::AppExited(None))?;
     app.activateWithOptions(NSApplicationActivationOptions::empty());
     thread::sleep(FOCUS_SETTLE);
+    Ok(())
 }
 
 /// Build a mouse CGEvent of `ty` at global `point`, tagged with `button`/`flags`. Does not
