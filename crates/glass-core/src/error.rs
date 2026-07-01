@@ -77,6 +77,12 @@ pub enum GlassError {
     #[error("{0} is not supported by this backend")]
     Unsupported(String),
 
+    /// A required OS permission is not granted. Carries which permission and how to
+    /// grant it, so the MCP layer can tell the agent exactly what to do. Never paper
+    /// over this with a blank frame (no-silent-fallback invariant).
+    #[error("{which} permission denied: {remedy}")]
+    PermissionDenied { which: String, remedy: String },
+
     #[error("backend error: {0}")]
     Backend(String),
 
@@ -153,5 +159,16 @@ mod tests {
             GlassError::AccessibilityUnavailable("no a11y bus".into()).to_string(),
             "accessibility unavailable: no a11y bus"
         );
+    }
+
+    #[test]
+    fn permission_denied_renders_which_and_remedy() {
+        let e = GlassError::PermissionDenied {
+            which: "Screen Recording".into(),
+            remedy: "grant GlassProbe in System Settings > Privacy & Security".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("Screen Recording"), "{msg}");
+        assert!(msg.contains("System Settings"), "{msg}");
     }
 }

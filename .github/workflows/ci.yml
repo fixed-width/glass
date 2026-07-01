@@ -105,6 +105,28 @@ jobs:
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
 
+  macos:
+    name: macOS (build · clippy · test)
+    runs-on: macos-14   # arm64 hosted runner
+    # Only the glass-macos crate is Mac-specific; the rest of the workspace already
+    # builds/tests on the Linux `check` job. This is the only place the
+    # cfg(target_os = "macos") code gets built + linted + tested — the Linux job can't
+    # compile it. Capture/input integration tests are #[ignore]d (need a granted,
+    # WindowServer-connected TCC context) and run on-box; the runner covers pure +
+    # macOS unit tests.
+    steps:
+      - uses: actions/checkout@v6
+      # rustup auto-installs the pinned toolchain + components from
+      # rust-toolchain.toml (single source of truth for the nightly).
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - run: cargo build  -p glass-macos --locked
+      - run: cargo clippy -p glass-macos --all-targets --locked -- -D warnings
+      - run: ./scripts/test-macos.sh
+
   windows:
     name: Windows (build · clippy · test)
     runs-on: windows-latest
