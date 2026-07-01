@@ -171,6 +171,20 @@ fn check_pointer_bounds(event: &PointerEvent, geom: &WindowGeometry) -> Result<(
     }
 }
 
+/// Map one `scwindow::AppWindow` into the `WindowInfo` [`MacosPlatform::list_windows`]
+/// returns, given the backend's current `active_window`. Factored out of `list_windows` as
+/// a pure step so it's unit-testable without a live `SCShareableContent` query — runtime
+/// enumeration coverage is Task 6's.
+fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -> WindowInfo {
+    WindowInfo {
+        id: WindowId(w.window_id as u64),
+        title: w.title,
+        class: w.application_name,
+        geometry: w.geometry,
+        active: Some(w.window_id) == active_window,
+    }
+}
+
 impl Platform for MacosPlatform {
     /// Run the optional build step, spawn the app, then confirm a window appears for its
     /// pid within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent`
@@ -292,8 +306,18 @@ impl Platform for MacosPlatform {
     fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
         unimplemented!("Plan 4: AXUIElement window ops")
     }
+    /// Enumerate every on-screen window owned by the launched app's pid via
+    /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches — not just
+    /// the active one), mapping each into a `WindowInfo` via [`window_info_from`].
+    ///
+    /// **Main-thread affinity:** like `start_app`/`capture_frame`, reaches
+    /// `ffi::app_kit_init()` (via `scwindow::list_app_windows`) and must run on the true
+    /// main thread; see the note on `start_app`.
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
-        unimplemented!("Plan 4: CGWindowList/SCShareableContent by pid")
+        permissions::preflight()?;
+        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let windows = crate::scwindow::list_app_windows(&[pid as i32])?;
+        Ok(windows.into_iter().map(|w| window_info_from(w, self.active_window)).collect())
     }
     fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
         unimplemented!("Plan 4: raise + focus + activate")
@@ -417,5 +441,38 @@ mod tests {
             duration_ms: 100,
         };
         assert!(matches!(check_pointer_bounds(&ev, &geom), Err(GlassError::CoordOutOfBounds { .. })));
+    }
+
+    #[test]
+    fn window_info_from_marks_the_active_window() {
+        let w = crate::scwindow::AppWindow {
+            window_id: 7,
+            geometry: WindowGeometry { x: 1, y: 2, width: 640, height: 480 },
+            title: Some("Untitled".into()),
+            application_name: Some("TestApp".into()),
+        };
+        let info = window_info_from(w.clone(), Some(7));
+        assert_eq!(info.id, WindowId(7));
+        assert_eq!(info.title, Some("Untitled".into()));
+        assert_eq!(info.class, Some("TestApp".into()));
+        assert_eq!(info.geometry, WindowGeometry { x: 1, y: 2, width: 640, height: 480 });
+        assert!(info.active, "window_id matches active_window");
+
+        let not_active = window_info_from(w, Some(8));
+        assert!(!not_active.active, "window_id does not match a different active_window");
+    }
+
+    #[test]
+    fn window_info_from_is_not_active_when_no_window_is_selected() {
+        let w = crate::scwindow::AppWindow {
+            window_id: 7,
+            geometry: WindowGeometry { x: 0, y: 0, width: 100, height: 100 },
+            title: None,
+            application_name: None,
+        };
+        let info = window_info_from(w, None);
+        assert!(!info.active);
+        assert_eq!(info.title, None);
+        assert_eq!(info.class, None);
     }
 }
