@@ -32,6 +32,14 @@ harness = false
 name = "windows"
 harness = false
 
+# Mac-gated accessibility-reader integration test (crates/glass-macos/tests/a11y.rs) — same
+# harness=false main-thread requirement as `capture`/`input`/`windows` above (start_app
+# reaches AppKit's ffi::app_kit_init()); drives `glass-a11y-macos`'s AXUIElement snapshot
+# against the `a11y_fixture` app. See that file's module doc.
+[[test]]
+name = "a11y"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 
@@ -126,6 +134,12 @@ block2 = "0.6.2"
 # glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
 # and available on macOS too.
 rustix.workspace = true
+
+# Mac-only: the accessibility-reader integration test (tests/a11y.rs) drives the standalone
+# `glass-a11y-macos` snapshot. Kept in the cfg(macos) dev-dep table so the crate still
+# builds/tests on the Linux dev box (where the cfg(macos) test is a bare skip `main`).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+glass-a11y-macos.workspace = true
 
 [lints]
 workspace = true

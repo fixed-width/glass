@@ -1050,6 +1050,7 @@ name = "glass-macos"
 version = "0.0.0"
 dependencies = [
  "block2",
+ "glass-a11y-macos",
  "glass-core",
  "objc2",
  "objc2-app-kit",
