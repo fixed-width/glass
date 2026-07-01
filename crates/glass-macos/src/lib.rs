@@ -16,6 +16,8 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod scwindow;
 #[cfg(target_os = "macos")]
+mod axwindow;
+#[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
 mod process;
