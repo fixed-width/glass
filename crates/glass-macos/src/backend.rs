@@ -7,7 +7,7 @@ use glass_core::logbuf::Stream;
 use glass_core::platform::{
     AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
-use glass_core::{GlassError, Result};
+use glass_core::Result;
 
 use crate::permissions;
 
