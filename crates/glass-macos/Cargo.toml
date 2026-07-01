@@ -24,6 +24,14 @@ harness = false
 name = "input"
 harness = false
 
+# Mac-gated window-management integration test (crates/glass-macos/tests/windows.rs) — same
+# harness=false main-thread requirement as `capture`/`input` above (list_windows/
+# select_window/window/capture_frame all reach AppKit's ffi::app_kit_init()); see that
+# file's module doc.
+[[test]]
+name = "windows"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 

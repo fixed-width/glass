@@ -41,4 +41,13 @@ if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   # .superpowers/sdd/task-6-brief.md).
   echo "GLASS_MACOS_ONBOX=1: building the input integration test binary..."
   cargo test -p glass-macos --test input --no-run
+
+  # Same story again, for crates/glass-macos/tests/windows.rs (the list_windows/
+  # select_window/window(op) end-to-end proof, incl. the private CGWindowID<->AXUIElement
+  # correlation) — building here just confirms it compiles and links; the granted run needs
+  # both TCC grants (same as `input` above) plus an unlocked screen session, so it happens
+  # out-of-band via the same GlassProbe.app LaunchAgent procedure (see
+  # .superpowers/sdd/task-6-brief.md).
+  echo "GLASS_MACOS_ONBOX=1: building the window integration test binary..."
+  cargo test -p glass-macos --test windows --no-run
 fi
