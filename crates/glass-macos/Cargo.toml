@@ -93,10 +93,13 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     # CFString for AX attribute/action name literals (CFString::from_str — see
     # axwindow.rs's module doc for why these aren't sourced from
     # objc2-application-services's own constants features); CFNumber for
-    # CFBoolean/kCFBooleanTrue (kAXMainAttribute's set value).
+    # CFBoolean/kCFBooleanTrue (kAXMainAttribute's set value; also session.rs's
+    # CGSSessionScreenIsLocked reader). CFDictionary: session.rs reads
+    # CGSessionCopyCurrentDictionary's CFDictionary<CFString, CFType>.
     "CFArray",
     "CFString",
     "CFNumber",
+    "CFDictionary",
 ] }
 # axwindow.rs: AXUIElement (window enumeration/attribute get+set/actions), AXValue
 # (position/size as CGPoint/CGSize), AXError (the shared failure type every AX call

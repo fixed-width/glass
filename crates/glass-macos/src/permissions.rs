@@ -62,28 +62,44 @@ extern "C" {
     fn AXIsProcessTrusted() -> u8;
 }
 
-/// True if this process holds the Screen Recording grant.
-pub(crate) fn screen_recording_ok() -> bool {
+/// True if this process holds the Screen Recording grant. `pub` (not just
+/// `pub(crate)`) so `glass-mcp`'s `doctor` can report the grant without duplicating
+/// this FFI call.
+pub fn screen_recording_granted() -> bool {
     // SAFETY: `CGPreflightScreenCaptureAccess` is a no-argument C predicate that only
     // reads this process's TCC state; it has no preconditions and no side effects.
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 /// True if this process is trusted for Accessibility (AX APIs + CGEvent posting).
-pub(crate) fn accessibility_ok() -> bool {
+/// `pub` for the same reason as [`screen_recording_granted`].
+pub fn accessibility_granted() -> bool {
     // SAFETY: `AXIsProcessTrusted` is a no-argument C predicate over this process's
     // trust state; no preconditions, no side effects. It returns `Boolean` (u8); any
     // nonzero value means trusted.
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+/// The exact remedy text for a missing Screen Recording grant — shared by
+/// [`preflight`]'s `PermissionDenied` error and `glass-mcp`'s `doctor`, so the two
+/// never drift apart.
+pub fn screen_recording_remedy() -> &'static str {
+    Permission::ScreenRecording.remedy()
+}
+
+/// The exact remedy text for a missing Accessibility grant — see
+/// [`screen_recording_remedy`].
+pub fn accessibility_remedy() -> &'static str {
+    Permission::Accessibility.remedy()
+}
+
 /// Fail fast with an actionable error if either grant is missing. Called at session
 /// start before any capture/input is attempted.
 pub(crate) fn preflight() -> Result<()> {
-    if !screen_recording_ok() {
+    if !screen_recording_granted() {
         return Err(Permission::ScreenRecording.denied());
     }
-    if !accessibility_ok() {
+    if !accessibility_granted() {
         return Err(Permission::Accessibility.denied());
     }
     Ok(())
@@ -98,8 +114,8 @@ mod tests {
     fn preflight_matches_the_two_predicates() {
         // On a box where grants are present, preflight is Ok; where absent, it errors with
         // the missing permission named. Either way the predicates and preflight agree.
-        let sr = screen_recording_ok();
-        let ax = accessibility_ok();
+        let sr = screen_recording_granted();
+        let ax = accessibility_granted();
         match preflight() {
             Ok(()) => assert!(sr && ax, "preflight Ok but a predicate was false"),
             Err(GlassError::PermissionDenied { which, .. }) => {
