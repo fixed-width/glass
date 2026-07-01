@@ -53,6 +53,17 @@ extern "C" {
         attribute: &CFString,
         settable: *mut u8,
     ) -> AXError;
+    // `AXError AXUIElementSetAttributeValue(AXUIElementRef, CFStringRef, CFTypeRef)` — the
+    // documented way to write an attribute. [`set_string_value`] uses it directly with a
+    // `CFString` value for `AXValue`: a plain string write, unlike `AXPosition`/`AXSize`
+    // (which wrap a `CGPoint`/`CGSize` in an `AXValueCreate`-built `AXValue` — see
+    // `axwindow::set_axvalue` — a step that only applies to those geometry types, not
+    // strings).
+    fn AXUIElementSetAttributeValue(
+        element: &AXUIElement,
+        attribute: &CFString,
+        value: &CFType,
+    ) -> AXError;
 }
 
 /// True if this process holds the Accessibility (AX) TCC grant. The snapshot gate calls
@@ -123,6 +134,24 @@ pub(crate) fn is_settable(el: &AXUIElement, attr_name: &str) -> bool {
     // `Boolean *` parameter.
     let err = unsafe { AXUIElementIsAttributeSettable(el, &attr, &mut settable) };
     err == AXError::Success && settable != 0
+}
+
+/// Write `text` as `el`'s `AXValue` (`AXUIElementSetAttributeValue`). The caller
+/// (`reader::set_value`) gates this on [`is_settable`] first; this only performs the write —
+/// it does not read back to verify the value actually took (that honesty check is the
+/// caller's read-back poll, mirroring the Windows reader's `set_value` contract).
+pub(crate) fn set_string_value(el: &AXUIElement, text: &str) -> Result<()> {
+    let attr = CFString::from_str("AXValue");
+    let value = CFString::from_str(text);
+    // SAFETY: `el` is a live `AXUIElement`; `attr`/`value` are valid `CFString`s. `value`
+    // deref-coerces `CFRetained<CFString>` -> `CFString` -> `CFType` (the same two-hop
+    // coercion `axwindow::set_axvalue` already relies on for its `CFRetained<AXValue>`
+    // argument), matching `AXUIElementSetAttributeValue`'s documented `CFTypeRef` parameter.
+    let err = unsafe { AXUIElementSetAttributeValue(el, &attr, &value) };
+    if err != AXError::Success {
+        return Err(ax_err("AXValue", err));
+    }
+    Ok(())
 }
 
 /// Read `el`'s `AXPosition` (top-left, in points — Quartz's top-left-origin global screen

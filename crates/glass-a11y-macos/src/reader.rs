@@ -13,9 +13,13 @@
 //! [`GlassError::PermissionDenied`]; no matching window (including an empty pid set) is a
 //! [`GlassError::WindowNotFound`]. It never returns an empty/placeholder tree.
 
+use std::time::{Duration, Instant};
+
 use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
-use glass_core::{Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTree, GlassError, Result};
+use glass_core::{
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+};
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
 
@@ -45,6 +49,16 @@ const POSITION_TOLERANCE_PX: i32 = 8;
 /// scale. Position + width already pin the single-window case; this is a secondary guard.
 const HEIGHT_CONSISTENCY_SLACK_PX: f64 = 96.0;
 
+/// Per-edge pixel tolerance for `set_value`'s bounds fingerprint (guards a stale id after
+/// tree drift landing a same-role+name element elsewhere) — same basis as the Windows
+/// reader's `SET_VALUE_BOUNDS_TOL`.
+const SET_VALUE_BOUNDS_TOL: i64 = 12;
+/// How long `set_value` polls the `AXValue` read-back for the write to take before declaring
+/// it a no-op. Mirrors the Windows reader's `SET_VALUE_VERIFY_MS`.
+const SET_VALUE_VERIFY_MS: u64 = 800;
+/// Interval between read-back poll attempts.
+const SET_VALUE_POLL_MS: u64 = 20;
+
 /// Remedy text for a missing Accessibility grant. Kept in sync with `glass-macos`'s
 /// `permissions.rs` wording (this crate can't depend on that private module).
 const ACCESSIBILITY_REMEDY: &str =
@@ -62,20 +76,7 @@ impl MacosA11y {
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        // Grant gate first — fail closed with an actionable error, never a stub tree.
-        if !ffi::accessibility_is_trusted() {
-            return Err(GlassError::PermissionDenied {
-                which: "Accessibility".into(),
-                remedy: ACCESSIBILITY_REMEDY.into(),
-            });
-        }
-
-        let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
-        let app = ffi::app_element(pid as i32);
-        // A failed `AXWindows` read is "no windows" → fall through to `WindowNotFound`.
-        let windows = ffi::app_windows(&app).unwrap_or_default();
-        let (window_el, scale) =
-            select_window(&windows, &ctx.window).ok_or(GlassError::WindowNotFound)?;
+        let (window_el, scale) = resolve_window(ctx)?;
 
         let mut count = 0usize;
         let root = walk(&window_el, &ctx.window, scale, 0, &mut count);
@@ -83,6 +84,72 @@ impl Accessibility for MacosA11y {
         // identical across OS backends.
         Ok(AxTree { root, count: 0 })
     }
+
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        let (window_el, scale) = resolve_window(ctx)?;
+
+        // Start at 0 so `find_nth`'s pre-order numbering matches `snapshot`'s `walk` +
+        // `AxTree::assign_ids` (root id = 0); the role+name+bounds fingerprint below
+        // backstops any residual drift between the snapshot and this re-walk.
+        let mut count = 0usize;
+        let el = find_nth(window_el, 0, &mut count, target.id.0)
+            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
+
+        // Verify role + name + bounds (guards a stale id / tree drift): if drift landed a
+        // different same-role+name element on this pre-order id, its bounds sit elsewhere
+        // and it is rejected here rather than silently overwritten.
+        let ax_role = ffi::attribute_string(&el, "AXRole").unwrap_or_default();
+        let role = mapping::map_role(&ax_role);
+        let name =
+            ffi::attribute_string(&el, "AXTitle").or_else(|| ffi::attribute_string(&el, "AXDescription"));
+        let bounds = window_relative_rect(&el, scale, &ctx.window);
+        if !target.matches(role, name.as_deref())
+            || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+
+        if !ffi::is_settable(&el, "AXValue") {
+            return Err(GlassError::AxElementNotEditable(target.id.0));
+        }
+
+        let before = ffi::attribute_string(&el, "AXValue").unwrap_or_default();
+        ffi::set_string_value(&el, text)?;
+
+        // Read-back poll: some editables accept the AX write without an `AXError` but never
+        // actually change `AXValue` (a misleading success) — require the read-back to show
+        // the change before reporting success, never a silent false-success.
+        let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+        loop {
+            let after = ffi::attribute_string(&el, "AXValue").unwrap_or_default();
+            if set_value_took(&before, &after, text) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(GlassError::AxValueNotApplied(target.id.0));
+            }
+            std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));
+        }
+    }
+}
+
+/// Resolve the `AXWindow` + point→pixel `scale` for `ctx`: the grant gate, pid, app element,
+/// and window selection `snapshot` and `set_value` both need — shared so both address the
+/// identical window.
+fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
+    // Grant gate first — fail closed with an actionable error, never a stub tree.
+    if !ffi::accessibility_is_trusted() {
+        return Err(GlassError::PermissionDenied {
+            which: "Accessibility".into(),
+            remedy: ACCESSIBILITY_REMEDY.into(),
+        });
+    }
+
+    let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
+    let app = ffi::app_element(pid as i32);
+    // A failed `AXWindows` read is "no windows" → fall through to `WindowNotFound`.
+    let windows = ffi::app_windows(&app).unwrap_or_default();
+    select_window(&windows, &ctx.window).ok_or(GlassError::WindowNotFound)
 }
 
 /// Select the `AXWindow` matching the backend's reported `win` and recover its point→pixel
@@ -178,12 +245,51 @@ fn walk(
 
 /// Whether to prune `el` from the walk: it has no positive-area geometry (zero-size /
 /// collapsed / offscreen), so it is neither clickable nor useful in the outline. A named,
-/// reusable predicate so Task 5's `find_nth` prunes identically and its pre-order ids line
-/// up with this walk's. A node whose size can't be read is *kept* (its `bounds` become
-/// `None`) rather than pruned, so an unreadable-geometry container never silently drops its
-/// subtree.
+/// reusable predicate so [`find_nth`] prunes identically and its pre-order ids line up with
+/// this walk's. A node whose size can't be read is *kept* (its `bounds` become `None`)
+/// rather than pruned, so an unreadable-geometry container never silently drops its subtree.
 pub(crate) fn should_skip(el: &AXUIElement) -> bool {
     matches!(ffi::ax_size(el), Ok((w, h)) if w <= 0.0 || h <= 0.0)
+}
+
+/// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
+/// `AXChildren` order, same `MAX_DEPTH`/`MAX_NODES`/`MAX_SIBLINGS` bounds — to locate the
+/// element at pre-order index `target`. That is the same numbering
+/// `glass_core::AxTree::assign_ids` gives the tree `snapshot` returns (root = 0), so a
+/// `target.id` captured from a snapshot lands on the same element here. `count` doubles as
+/// the running id (a node's id is `count`'s value on arrival, before it increments) and the
+/// `MAX_NODES` bound, identically to `walk`. Takes (and, on a mismatch, drops) ownership of
+/// each candidate rather than borrowing, since a matched child must outlive the `Vec` of
+/// siblings `ffi::children` returns.
+fn find_nth(
+    el: CFRetained<AXUIElement>,
+    depth: usize,
+    count: &mut usize,
+    target: u32,
+) -> Option<CFRetained<AXUIElement>> {
+    let my_id = *count as u32;
+    *count += 1;
+    if my_id == target {
+        return Some(el);
+    }
+    if depth < MAX_DEPTH && *count < MAX_NODES {
+        let mut siblings = 0usize;
+        for child in ffi::children(&el).unwrap_or_default() {
+            siblings += 1;
+            if siblings > MAX_SIBLINGS {
+                break; // same per-level bound as walk(), so find_nth can't spin either
+            }
+            if !should_skip(&child) {
+                if let Some(found) = find_nth(child, depth + 1, count, target) {
+                    return Some(found);
+                }
+            }
+            if *count >= MAX_NODES {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// `el`'s window-relative bounds in pixels, or `None` when position/size can't be read or
@@ -210,5 +316,42 @@ fn gather_states(el: &AXUIElement) -> AxStateFacts {
         focusable: ffi::is_settable(el, "AXFocused"),
         editable: ffi::is_settable(el, "AXValue"),
         ..Default::default()
+    }
+}
+
+/// Whether a `set_value` write actually took, judged from the value read back. Some
+/// read-only-in-practice editables accept the AX write without an `AXError` but never change
+/// `AXValue` (a misleading success); a real set changes the value, possibly to a reformatted
+/// string. So it took iff the read-back equals the request OR differs from the pre-set
+/// value. Mirrors the Windows reader's `set_value_took`.
+fn set_value_took(before: &str, after: &str, requested: &str) -> bool {
+    after == requested || after != before
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_value_took;
+
+    #[test]
+    fn noop_is_not_taken() {
+        // A read-only editable: value unchanged AND not the requested text.
+        assert!(!set_value_took("hello", "hello", "world"));
+    }
+
+    #[test]
+    fn exact_match_took() {
+        assert!(set_value_took("hello", "world", "world"));
+    }
+
+    #[test]
+    fn reformatted_change_took() {
+        // The AX field may normalize the written text — changed from before, so it took.
+        assert!(set_value_took("0", "0.0", "0"));
+    }
+
+    #[test]
+    fn setting_current_value_is_taken() {
+        // Edge case: requesting the value it already holds → equals request → taken.
+        assert!(set_value_took("world", "world", "world"));
     }
 }

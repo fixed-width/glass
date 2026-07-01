@@ -1,8 +1,11 @@
 //! Mac-gated accessibility-reader integration test — the first real-AX-tree proof through
-//! the whole `glass-a11y-macos` snapshot path (`MacosPlatform::start_app` -> `AxContext` ->
-//! `MacosA11y::snapshot` -> AXUIElement walk -> `AxTree`), driven against the `a11y_fixture`
-//! Cocoa app (a "Save" button, an "Enable" checkbox, and an editable "Note" field — labeled
-//! "Note" via `setAccessibilityLabel`, holding the content "hello").
+//! the whole `glass-a11y-macos` snapshot + set_value path (`MacosPlatform::start_app` ->
+//! `AxContext` -> `MacosA11y::snapshot`/`set_value` -> AXUIElement walk -> `AxTree`), driven
+//! against the `a11y_fixture` Cocoa app (a "Save" button, an "Enable" checkbox, and an
+//! editable "Note" field — labeled "Note" via `setAccessibilityLabel`, holding the content
+//! "hello"). After the snapshot checks, it round-trips `set_value` on the "Note" field
+//! ("hello" -> "world") and confirms the non-editable "Save" button rejects a write with
+//! `AxElementNotEditable`.
 //!
 //! **`harness = false`** (see `Cargo.toml`'s `[[test]] name = "a11y"` entry): like
 //! `capture.rs`/`input.rs`/`windows.rs`, `MacosPlatform::start_app` reaches
@@ -35,7 +38,10 @@ mod macos_main {
     use std::process::Command;
     use std::time::Duration;
 
-    use glass_core::{Accessibility, AppSpec, AxContext, AxNode, AxRole, Platform, SandboxLevel};
+    use glass_core::{
+        Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, Platform,
+        SandboxLevel,
+    };
     use glass_macos::MacosPlatform;
 
     /// The three elements the fixture exposes, asserted as substrings of the tree outline.
@@ -54,6 +60,15 @@ mod macos_main {
             return Some(node);
         }
         node.children.iter().find_map(find_text_field)
+    }
+
+    /// Pre-order search for the first node whose `name` is exactly `name` — used to build an
+    /// `AxTarget` (id/role/name/bounds) for `set_value`'s round-trip and non-editable checks.
+    fn find_by_name<'a>(node: &'a AxNode, name: &str) -> Option<&'a AxNode> {
+        if node.name.as_deref() == Some(name) {
+            return Some(node);
+        }
+        node.children.iter().find_map(|c| find_by_name(c, name))
     }
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
@@ -163,6 +178,44 @@ mod macos_main {
         if field.value != Some("hello".to_string()) {
             return Err(format!("TextField value = {:?}, want Some(\"hello\"):\n{outline}", field.value));
         }
+
+        // Round-trip an editable field: "hello" -> "world" via set_value, then re-snapshot
+        // and confirm the field's value actually changed (not a silent no-op).
+        let note = match find_by_name(&tree.root, "Note") {
+            Some(n) => n,
+            None => return Err(format!("no \"Note\" field in tree:\n{outline}")),
+        };
+        let note_tgt =
+            AxTarget { id: note.id, role: note.role, name: note.name.clone(), bounds: note.bounds };
+        try_expect(a11y.set_value(&ctx, &note_tgt, "world"), "set_value(Note, \"world\")")?;
+
+        let mut tree2 = try_expect(a11y.snapshot(&ctx), "re-snapshot after set_value")?;
+        tree2.assign_ids();
+        let outline2 = tree2.to_outline();
+        let field2 = match find_text_field(&tree2.root) {
+            Some(n) => n,
+            None => return Err(format!("no TextField node in re-snapshot:\n{outline2}")),
+        };
+        if field2.value != Some("world".to_string()) {
+            return Err(format!(
+                "TextField value after set_value = {:?}, want Some(\"world\"):\n{outline2}",
+                field2.value
+            ));
+        }
+
+        // A button is not editable: set_value must reject it, not silently no-op.
+        let save = match find_by_name(&tree2.root, "Save") {
+            Some(n) => n,
+            None => return Err(format!("no \"Save\" button in re-snapshot:\n{outline2}")),
+        };
+        let save_tgt =
+            AxTarget { id: save.id, role: save.role, name: save.name.clone(), bounds: save.bounds };
+        match a11y.set_value(&ctx, &save_tgt, "x") {
+            Err(GlassError::AxElementNotEditable(_)) => {}
+            other => return Err(format!("expected AxElementNotEditable for Save, got {other:?}")),
+        }
+
+        println!("A11Y_SETVALUE_PASS");
         Ok(())
     }
 
