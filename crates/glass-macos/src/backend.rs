@@ -6,6 +6,8 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use objc2_application_services::AXUIElement;
+
 use glass_core::frame::{Frame, Region};
 use glass_core::logbuf::Stream;
 use glass_core::platform::{
@@ -13,6 +15,7 @@ use glass_core::platform::{
 };
 use glass_core::{GlassError, Result};
 
+use crate::axwindow;
 use crate::coords;
 use crate::permissions;
 use crate::process::{self, LogSink};
@@ -31,6 +34,14 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// existed as of the last successful call, so this only needs to cover the ordinary
 /// query-round-trip latency, not a real "is the app even launching" wait.
 const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
+/// whether a `Move`/`Resize` actually took: `Move`'s final vs. requested position, and
+/// `Resize`'s did-anything-happen-at-all check (see [`resize_was_refused`]'s doc — a
+/// legitimate min/max-size clamp is not a refusal). `8`px mirrors `axwindow.rs`'s own
+/// `FALLBACK_TOLERANCE_PX` — generous enough to absorb point<->pixel rounding across a
+/// position/size round trip without masking a real refusal.
+const WINDOW_OP_TOLERANCE_PX: i32 = 8;
 
 /// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
 /// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
@@ -185,6 +196,44 @@ fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -
     }
 }
 
+/// Read `el`'s current `AXPosition`/`AXSize` (points) and convert to the pixel
+/// `WindowGeometry` [`MacosPlatform::window`] returns for every op — the shared read-back
+/// step after `Focus`/`Move`/`Resize`'s mutation, and the sole step for `Geometry`. Reuses
+/// `coords::pixel_geometry_from_content_rect`'s point->pixel scaling rather than
+/// reimplementing it: an AX position+size pair is exactly that function's `x`/`y`/`width`/
+/// `height` args (see `coords.rs`'s module doc), so this crate keeps one scaling
+/// implementation, not two.
+fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
+    let (x, y) = axwindow::ax_position(el)?;
+    let (width, height) = axwindow::ax_size(el)?;
+    Ok(coords::pixel_geometry_from_content_rect(x, y, width, height, scale))
+}
+
+/// True if `geom`'s position is within [`WINDOW_OP_TOLERANCE_PX`] of a `Move { x, y }`
+/// target — the signal `window(op)`'s `Move` branch uses to catch a macOS window that
+/// silently ignores `AXPosition` (the no-silent-no-op contract `window(op)`'s doc
+/// describes). Pure so it's unit-testable without a live `AXUIElement`.
+fn move_took_effect(geom: &WindowGeometry, x: i32, y: i32) -> bool {
+    (geom.x - x).abs() <= WINDOW_OP_TOLERANCE_PX && (geom.y - y).abs() <= WINDOW_OP_TOLERANCE_PX
+}
+
+/// True if a `Resize { width, height }` had no visible effect at all: `after` is (within
+/// tolerance) the same size as `before`, even though `width`/`height` was a genuinely
+/// different size than `before`'s own. This is deliberately narrower than "does `after`
+/// exactly match the request": macOS may legitimately clamp to an intermediate size (a
+/// window's min/max content-size constraint), which is expected behavior, not a bug — the
+/// resulting `after` geometry is still returned to the caller in that case (see
+/// `window(op)`'s `Resize` doc). Only a total no-op (the size never moved, despite a real
+/// change being requested) is treated as the "macOS refused the resize" failure. Pure so
+/// it's unit-testable without a live `AXUIElement`.
+fn resize_was_refused(before: &WindowGeometry, after: &WindowGeometry, width: u32, height: u32) -> bool {
+    let requested_a_change = (width as i32 - before.width as i32).abs() > WINDOW_OP_TOLERANCE_PX
+        || (height as i32 - before.height as i32).abs() > WINDOW_OP_TOLERANCE_PX;
+    let nothing_moved = (after.width as i32 - before.width as i32).abs() <= WINDOW_OP_TOLERANCE_PX
+        && (after.height as i32 - before.height as i32).abs() <= WINDOW_OP_TOLERANCE_PX;
+    requested_a_change && nothing_moved
+}
+
 impl Platform for MacosPlatform {
     /// Run the optional build step, spawn the app, then confirm a window appears for its
     /// pid within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent`
@@ -303,8 +352,73 @@ impl Platform for MacosPlatform {
         let m = self.resolve_active_window(pid as i32)?;
         crate::input::send_key(event, m.pid)
     }
-    fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
-        unimplemented!("Plan 4: AXUIElement window ops")
+    /// Resolve the active window's `AXUIElement` (fresh every call, same rationale as
+    /// `resolve_active_window`: the window may have moved/resized/closed since the last
+    /// call) and dispatch `op` onto it:
+    ///
+    /// - `Focus` activates the owning app (`input::focus`, the same
+    ///   `NSRunningApplication::activate` call `send_pointer`/`send_key` already make),
+    ///   then `AXRaise`s and marks the window `AXMain` — CGEvents alone can't target a
+    ///   specific window (see `send_key`'s doc), this is what actually does.
+    /// - `Move { x, y }` converts the target from global-screen PIXELS to Quartz POINTS
+    ///   (`coords::global_pixel_to_point`) and sets `AXPosition`.
+    /// - `Resize { width, height }` sets `AXSize`, then re-sets `AXPosition` to its
+    ///   just-read current value, then sets `AXSize` again — the proven
+    ///   `window_ops.swift` workaround for a window that won't grow past its current
+    ///   on-screen bounds via a single `AXSize` set alone.
+    /// - `Geometry` performs no mutation.
+    ///
+    /// Every branch reads back the window's position/size afterward
+    /// ([`read_ax_geometry`]) and returns it in pixels — the tool boundary's unit. `Move`/
+    /// `Resize` additionally check the read-back actually reflects the request
+    /// ([`move_took_effect`]/[`resize_was_refused`]), returning `GlassError::Backend`
+    /// naming what didn't take rather than silently reporting success on a macOS window
+    /// that refused the change; `Focus`/`Geometry` have no such check since they assert
+    /// nothing about position/size.
+    fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
+        permissions::preflight()?;
+        let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+
+        let m = crate::scwindow::find_window_by_id(id, WINDOW_RESOLVE_TIMEOUT)?;
+        let el = axwindow::ax_window_for_cgwindowid(pid as i32, id, m.geometry.clone(), m.scale)?;
+
+        match *op {
+            WindowOp::Focus => {
+                crate::input::focus(pid as i32);
+                axwindow::ax_raise(&el)?;
+                axwindow::ax_set_main(&el)?;
+                read_ax_geometry(&el, m.scale)
+            }
+            WindowOp::Move { x, y } => {
+                let target_pt = coords::global_pixel_to_point((x, y), m.scale);
+                axwindow::ax_set_position(&el, target_pt)?;
+                let geom = read_ax_geometry(&el, m.scale)?;
+                if !move_took_effect(&geom, x, y) {
+                    return Err(GlassError::Backend(format!(
+                        "window move to ({x},{y}) px did not take; window is at ({},{})",
+                        geom.x, geom.y
+                    )));
+                }
+                Ok(geom)
+            }
+            WindowOp::Resize { width, height } => {
+                let target_size_pt = (width as f64 / m.scale, height as f64 / m.scale);
+                axwindow::ax_set_size(&el, target_size_pt)?;
+                let pos = axwindow::ax_position(&el)?;
+                axwindow::ax_set_position(&el, pos)?;
+                axwindow::ax_set_size(&el, target_size_pt)?;
+                let geom = read_ax_geometry(&el, m.scale)?;
+                if resize_was_refused(&m.geometry, &geom, width, height) {
+                    return Err(GlassError::Backend(format!(
+                        "window resize to {width}x{height} px was refused; window remains {}x{}",
+                        geom.width, geom.height
+                    )));
+                }
+                Ok(geom)
+            }
+            WindowOp::Geometry => read_ax_geometry(&el, m.scale),
+        }
     }
     /// Enumerate every on-screen window owned by the launched app's pid via
     /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches — not just
@@ -474,5 +588,57 @@ mod tests {
         assert!(!info.active);
         assert_eq!(info.title, None);
         assert_eq!(info.class, None);
+    }
+
+    #[test]
+    fn move_took_effect_accepts_exact_and_within_tolerance() {
+        let geom = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        assert!(move_took_effect(&geom, 100, 200), "exact match");
+        assert!(move_took_effect(&geom, 104, 196), "within tolerance");
+        assert!(move_took_effect(&geom, 92, 208), "within tolerance, other direction");
+    }
+
+    #[test]
+    fn move_took_effect_rejects_a_window_that_did_not_move() {
+        // The refusal case: AXSetAttributeValue(AXPosition) reported success but the
+        // window is still sitting wherever it started.
+        let geom = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        assert!(!move_took_effect(&geom, 500, 200), "x off by more than tolerance");
+        assert!(!move_took_effect(&geom, 100, 600), "y off by more than tolerance");
+    }
+
+    #[test]
+    fn resize_was_refused_when_size_never_moves() {
+        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        // Requested a real size change (800x600) but the window is still exactly where it
+        // started — the silent-no-op case `window(op)`'s Resize branch must catch.
+        assert!(resize_was_refused(&before, &after, 800, 600));
+    }
+
+    #[test]
+    fn resize_was_refused_is_false_when_nothing_was_requested() {
+        // width/height happen to equal `before`'s own size (e.g. a Resize to the current
+        // size) — no change was requested, so an unchanged `after` is not a refusal.
+        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        assert!(!resize_was_refused(&before, &after, 640, 480));
+    }
+
+    #[test]
+    fn resize_was_refused_is_false_on_a_legitimate_clamp() {
+        // macOS clamped to an intermediate size short of the request (e.g. a min-size
+        // constraint) rather than ignoring the resize outright — expected behavior, not a
+        // refusal; `window(op)` returns this actual geometry rather than erroring.
+        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let after = WindowGeometry { x: 0, y: 0, width: 700, height: 480 };
+        assert!(!resize_was_refused(&before, &after, 1200, 480));
+    }
+
+    #[test]
+    fn resize_was_refused_is_false_when_the_read_back_matches_the_request() {
+        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let after = WindowGeometry { x: 0, y: 0, width: 800, height: 600 };
+        assert!(!resize_was_refused(&before, &after, 800, 600));
     }
 }

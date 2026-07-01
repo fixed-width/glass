@@ -44,14 +44,10 @@
 //! unused-here) `accessibility-sys` crate hardcodes for the same reason, and the values
 //! Apple documents as stable strings, not just opaque symbol names.
 //!
-//! Every fn here is `pub(crate)` per Plan 4 Task 3's interface list, but Task 4
-//! (`window(op)`) and Task 5 (`select_window`) are what wire them into `backend.rs`; until
-//! then nothing in this crate calls the entry points, hence the module-wide
-//! `#![allow(dead_code)]` below (mirrors `process.rs`'s per-fn `#[allow(dead_code)]` on
-//! `spawn`/`terminate` from Plan 2, applied once for the whole file here since virtually
-//! everything in it is only reachable from those still-unwired entry points).
-
-#![allow(dead_code)]
+//! Every fn here is `pub(crate)` per Plan 4 Task 3's interface list; `backend.rs`'s
+//! `MacosPlatform::window` (Task 4) is what wires them in, calling
+//! [`ax_window_for_cgwindowid`] plus every getter/setter/action below. Task 5
+//! (`select_window`) reuses the same entry points rather than adding new ones.
 
 use std::ptr::NonNull;
 

@@ -253,7 +253,11 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
 /// (`activateWithOptions` returns `false`) doesn't fail the call — the event still posts to
 /// whatever currently has focus, matching `glass-windows::input::send_pointer`'s own
 /// best-effort `focus_window` nudge.
-fn focus(pid: i32) {
+///
+/// `pub(crate)`: also the `NSRunningApplication(pid).activate()` step of
+/// `backend::MacosPlatform::window`'s `WindowOp::Focus` branch (Plan 4 Task 4), ahead of that
+/// branch's `axwindow::ax_raise`/`ax_set_main` — one activation call site rather than two.
+pub(crate) fn focus(pid: i32) {
     let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
         return;
     };
