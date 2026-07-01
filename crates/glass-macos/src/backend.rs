@@ -174,6 +174,7 @@ impl Platform for MacosPlatform {
     /// `input.rs`'s module doc for the CGEvent details and its main-thread-affinity note
     /// (shared with `start_app`/`capture_frame` above).
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         crate::input::send_pointer(event, pid as i32, self.scale, self.origin_pt)
     }

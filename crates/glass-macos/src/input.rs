@@ -42,11 +42,18 @@ use glass_core::{run_drag, run_scroll, DragGesture, DragSink, GlassError, Result
 
 use crate::coords::pixel_to_global_point;
 
+/// Map a window-relative pixel coordinate to a global Quartz point, accounting for the
+/// session's display scale and window origin.
+fn to_cgpoint(x: i32, y: i32, scale: f64, origin_pt: (f64, f64)) -> CGPoint {
+    let (gx, gy) = pixel_to_global_point((x, y), scale, origin_pt);
+    CGPoint { x: gx, y: gy }
+}
+
 /// Settle after raising the target app before the first event, so the window server has
 /// finished the activation before input lands. The validated probe (`inject_input.swift`)
 /// used 300ms after `activate()`; glass's own activation call is otherwise identical, so this
-/// clears the same race with margin.
-const FOCUS_SETTLE: Duration = Duration::from_millis(150);
+/// uses the same 300ms settle time to clear the focus-before-inject race.
+const FOCUS_SETTLE: Duration = Duration::from_millis(300);
 
 /// Inject `event` (already window-relative PIXELS) as CGEvents targeting the app at `pid`,
 /// mapping coordinates through `scale`/`origin_pt` (the active session's `pointPixelScale`
@@ -60,10 +67,7 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
     // so a `None` source (state-allocation failure — not observed in practice) degrades
     // gracefully rather than erroring the whole call.
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
-    let to_point = |x: i32, y: i32| -> CGPoint {
-        let (gx, gy) = pixel_to_global_point((x, y), scale, origin_pt);
-        CGPoint { x: gx, y: gy }
-    };
+    let to_point = |x: i32, y: i32| to_cgpoint(x, y, scale, origin_pt);
 
     match *event {
         PointerEvent::Move { x, y } => {
@@ -216,8 +220,7 @@ struct MacDragSink<'a> {
 
 impl MacDragSink<'_> {
     fn to_point(&self, x: i32, y: i32) -> CGPoint {
-        let (gx, gy) = pixel_to_global_point((x, y), self.scale, self.origin_pt);
-        CGPoint { x: gx, y: gy }
+        to_cgpoint(x, y, self.scale, self.origin_pt)
     }
 }
 
