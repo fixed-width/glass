@@ -39,15 +39,11 @@ use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
 use glass_core::platform::WindowGeometry;
 use glass_core::{poll_until, GlassError, Result};
 
-use crate::permissions::Permission;
-
 /// A discovered on-screen window: enough to re-find or capture it later without holding
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
-// Fields aren't read yet: no call site consumes `find_window_for_pids`'s result until a
-// later task wires it into `MacosPlatform` (capture / `start_app`). Allowed here rather
-// than deleted so the type and its fields land in one place instead of being
-// reintroduced per call site — same convention as `ffi.rs`'s `app_kit_init`.
+// `geometry` is read by `start_app` (via `backend.rs::discover_window` ->
+// `query_once`); `pid`/`window_id` stay unread until Plan 4's list/select_window.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WindowMatch {
@@ -67,14 +63,18 @@ pub(crate) struct WindowMatch {
 ///
 /// Calls [`crate::ffi::app_kit_init`] first to establish the window-server connection —
 /// required before any ScreenCaptureKit call from a bare CLI process (see `ffi.rs`).
-/// Returns [`GlassError::PermissionDenied`] immediately (no point polling — the grant
-/// isn't going to appear mid-poll) if `SCShareableContent` itself reports a TCC decline,
-/// or [`GlassError::Timeout`] if no matching window appears before `timeout` elapses.
-// Not yet called: a later task wires this into `MacosPlatform::start_app`/capture (per
-// the task brief, Task 3/5 re-discovers the window per capture). Kept `pub(crate)` +
-// allowed here rather than deleted, mirroring `ffi.rs`'s `app_kit_init` convention, so
-// the discovery logic and its tests land in one place instead of being reintroduced per
-// call site.
+/// Returns a classified error immediately (no point polling on a genuine
+/// `SCShareableContent` failure — see [`crate::ffi::classify_null_result`]:
+/// [`GlassError::PermissionDenied`] for a Screen Recording TCC decline,
+/// [`GlassError::CaptureFailed`] for anything else) or [`GlassError::Timeout`] if no
+/// matching window appears before `timeout` elapses.
+// No production caller: `MacosPlatform::start_app` runs its own poll loop
+// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
+// `child.try_wait()` so a crashed launch fails fast with `AppExited` — this function's
+// self-contained `poll_until` has no child handle to race against, so `start_app` can't
+// delegate its whole timeout budget to it. Kept `pub(crate)` + allowed here (not
+// deleted) as a plain "poll until found or timeout" primitive for a future call site
+// with no child to check (e.g. Plan 4 window rediscovery).
 #[allow(dead_code)]
 pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
@@ -120,11 +120,22 @@ pub(crate) fn find_on_screen_window(
     None
 }
 
+/// Cap on a single [`query_once`] attempt's wait for its `SCShareableContent` completion
+/// handler. A query resolves in well under a second in the spike's observations, so this
+/// is a wedged-handler backstop, not normal latency; kept small (rather than the old 5s)
+/// so it can't itself eat much of the outer poll loop's `timeout_ms`/deadline budget on a
+/// single bad tick — that budget is owned by the caller (`find_window_for_pids`'s
+/// `poll_until`, or `backend.rs::discover_window`'s own loop), which retries (or times
+/// out) regardless of this cap.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// One `SCShareableContent` round trip via the `RcBlock` -> `mpsc` bridge (`ffi.rs`'s
 /// documented pattern): `Ok(Some(_))` on a match, `Ok(None)` if no matching on-screen
 /// window exists yet (the outer poll should retry), `Err` if `SCShareableContent` itself
-/// failed (e.g. a TCC decline — not worth retrying).
-fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
+/// failed — classified via [`crate::ffi::classify_null_result`] (TCC decline ->
+/// `PermissionDenied`, anything else -> `CaptureFailed`) rather than assumed to always be
+/// a permission decline; not worth retrying either way.
+pub(crate) fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
     let (tx, rx) = mpsc::channel::<QueryReply>();
     let pids_owned: Vec<i32> = pids.to_vec();
 
@@ -134,16 +145,11 @@ fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
     // it — never a `Retained<SCWindow>` (see module doc).
     let block = RcBlock::new(move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
         if content_ptr.is_null() {
-            let msg = if err_ptr.is_null() {
-                "SCShareableContent completion handler returned null content and null error"
-                    .to_string()
-            } else {
-                // SAFETY: the framework guarantees a non-null, valid `NSError` whenever
-                // it hands back null content (proven in the spike's TCC-declined run).
-                let err: &NSError = unsafe { &*err_ptr };
-                format!("{err:?}")
-            };
-            let _ = tx.send(QueryReply::Failed(msg));
+            let err = crate::ffi::classify_null_result(
+                err_ptr,
+                "SCShareableContent completion handler returned null content and null error",
+            );
+            let _ = tx.send(QueryReply::Failed(err));
             return;
         }
         // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
@@ -176,14 +182,10 @@ fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
         );
     }
 
-    // A single query resolves in well under a second in the spike's observations; cap it
-    // generously so a wedged completion handler can't block this attempt forever. The
-    // outer `poll_until` in `find_window_for_pids` owns the real timeout budget and will
-    // retry (or surface `GlassError::Timeout`) regardless of this cap.
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    match rx.recv_timeout(QUERY_TIMEOUT) {
         Ok(QueryReply::Found(m)) => Ok(Some(m)),
         Ok(QueryReply::NotFound) => Ok(None),
-        Ok(QueryReply::Failed(msg)) => Err(Permission::ScreenRecording.denied_with_detail(msg)),
+        Ok(QueryReply::Failed(e)) => Err(e),
         Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
             "SCShareableContent completion handler was dropped without replying".into(),
@@ -196,7 +198,7 @@ fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
 enum QueryReply {
     Found(WindowMatch),
     NotFound,
-    Failed(String),
+    Failed(GlassError),
 }
 
 /// Convert a window frame (points, from `SCWindow.frame()`) to the platform-agnostic

@@ -40,11 +40,6 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// [`SandboxLevel::Off`] is honored. `Default`/`Strict` return
 /// [`GlassError::Unsupported`] *before* launching anything — no silent downgrade to an
 /// unsandboxed run (the no-silent-fallback invariant).
-// Not yet called outside this module's tests: `MacosPlatform::start_app` wires this in
-// (Task 5). Kept `pub(crate)` + allowed here rather than deleted, mirroring
-// `scwindow.rs`'s `find_window_for_pids` and `capture.rs`'s `capture_window` convention,
-// so the spawn logic lands in one place instead of being reintroduced per call site.
-#[allow(dead_code)]
 pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
     if spec.sandbox != SandboxLevel::Off {
         return Err(GlassError::Unsupported(
@@ -94,9 +89,6 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
 /// SIGKILL, then reap. Safe to call on an already-exited (or already-terminated) child —
 /// `try_wait` is checked first so a second call never re-signals a pid the kernel may have
 /// since recycled.
-// Not yet called outside this module's tests — `MacosPlatform::stop_app` (and
-// `start_app`'s failure-cleanup path) wire this in (Task 5). See `spawn`'s comment above.
-#[allow(dead_code)]
 pub(crate) fn terminate(child: &mut Child) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;

@@ -269,7 +269,15 @@ mod macos_main {
                 println!("CAPTURE_INTEGRATION_PASS");
                 std::process::exit(0);
             }
-            Err(msg) => fail(msg),
+            Err(msg) => {
+                // stop_app is infallible today (always Ok), but surface a future failure
+                // here too rather than silently dropping it — this is the last point
+                // before the process exits, so it's the only chance to report it.
+                if let Err(e) = stop_result {
+                    eprintln!("(additionally) stop_app failed: {e}");
+                }
+                fail(msg);
+            }
         }
     }
 }

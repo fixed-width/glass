@@ -61,7 +61,6 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFCGTypes",
 ] }
 block2 = "0.6.2"
-dispatch2 = "0.3.1"
 # SIGTERM/SIGKILL for `process::terminate` — already a workspace dep (glass-wayland,
 # glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
 # and available on macOS too.

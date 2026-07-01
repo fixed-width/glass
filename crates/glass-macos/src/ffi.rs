@@ -55,8 +55,17 @@ use std::sync::Once;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSApplication;
+use objc2_foundation::NSError;
+
+use glass_core::GlassError;
+
+use crate::permissions::Permission;
 
 static APP_KIT_INIT: Once = Once::new();
+
+/// `SCStreamErrorDomain`'s code for a declined Screen Recording TCC grant — observed
+/// verbatim in the spike's TCC-declined run (`.superpowers/sdd/objc2-spike-report.md`).
+const TCC_DECLINE_CODE: isize = -3801;
 
 /// Touch `NSApplication.shared` exactly once to establish this process's connection to
 /// the window server. Without it, ScreenCaptureKit/CoreGraphics calls from a bare CLI
@@ -69,19 +78,48 @@ static APP_KIT_INIT: Once = Once::new();
 /// correct one, from the real main thread — would then panic too with "Once instance
 /// has previously been poisoned"). Checking first means a single off-thread misuse
 /// can't permanently wedge the one-time init for the rest of the process.
-// Called by `scwindow::find_window_for_pids` before the first `SCShareableContent`
-// query; later capture/provisioning call sites (Plan 2's remaining steps) will call it
-// too — safe and cheap to call redundantly, since only the first call does anything.
-// `find_window_for_pids` itself isn't wired into `MacosPlatform::start_app` yet (a later
-// task's job), so this function isn't reachable from any true crate root either; kept
-// `#[allow(dead_code)]` (harmless now that it has a real caller) rather than deleted so
-// the Once and its doc stay in one place instead of being reintroduced per call site.
-#[allow(dead_code)]
+/// Called by `backend.rs`'s `discover_window` (before `start_app`'s window-discovery poll
+/// loop) and by `capture::capture_window` (before every capture) — safe and cheap to call
+/// redundantly, since only the first call does anything.
 pub(crate) fn app_kit_init() {
     let mtm = MainThreadMarker::new().expect("app_kit_init must run on the main thread");
     APP_KIT_INIT.call_once(|| {
         let _app = NSApplication::sharedApplication(mtm);
     });
+}
+
+/// Classify a `null` async ScreenCaptureKit result's paired `NSError`:
+/// [`GlassError::PermissionDenied`] for a Screen Recording TCC decline (domain
+/// `SCStreamErrorDomain`, code `-3801`, and/or a "declined" description — the spike
+/// observed all three together, but any one is treated as authoritative since Apple
+/// doesn't document which fields are stable across OS versions), [`GlassError::CaptureFailed`]
+/// otherwise. `fallback_msg` covers the (framework-contract-violating, but defensively
+/// handled) case where both the result and the error came back null.
+///
+/// Shared by every completion handler in this crate that can hand back a null result —
+/// `scwindow.rs`'s discovery query and `capture.rs`'s content/image queries — per this
+/// module's async-bridge convention, so a TCC decline is classified identically everywhere
+/// instead of each call site rolling its own (partial) version of this check.
+pub(crate) fn classify_null_result(err_ptr: *mut NSError, fallback_msg: &str) -> GlassError {
+    if err_ptr.is_null() {
+        return GlassError::CaptureFailed(fallback_msg.to_string());
+    }
+    // SAFETY: the framework guarantees a non-null, valid `NSError` whenever it hands back
+    // a null content/image — proven in the spike's TCC-declined run.
+    let err: &NSError = unsafe { &*err_ptr };
+    let domain = err.domain().to_string();
+    let code = err.code();
+    let description = err.localizedDescription().to_string();
+    let detail = format!("{domain} (code {code}): {description}");
+
+    let is_tcc_decline = domain.contains("SCStreamErrorDomain")
+        || code == TCC_DECLINE_CODE
+        || description.to_lowercase().contains("declined");
+    if is_tcc_decline {
+        Permission::ScreenRecording.denied_with_detail(detail)
+    } else {
+        GlassError::CaptureFailed(detail)
+    }
 }
 
 #[cfg(test)]

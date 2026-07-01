@@ -29,7 +29,6 @@ use objc2_screen_capture_kit::{
 use glass_core::frame::{Frame, Region};
 use glass_core::{GlassError, Result};
 
-use crate::permissions::Permission;
 use crate::scwindow::find_on_screen_window;
 
 /// Max wait for one capture round trip (`SCShareableContent` + `SCScreenshotManager`
@@ -37,21 +36,11 @@ use crate::scwindow::find_on_screen_window;
 /// covers a wedged completion handler, not normal latency.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `SCStreamErrorDomain`'s code for a declined Screen Recording TCC grant — observed
-/// verbatim in the spike's TCC-declined run (`.superpowers/sdd/objc2-spike-report.md`).
-const TCC_DECLINE_CODE: isize = -3801;
-
 /// Capture the first on-screen window owned by one of `pids` as an RGBA8 [`Frame`],
 /// optionally cropped to a window-relative `region`. Returns
 /// [`GlassError::WindowNotFound`] if no on-screen window is owned by `pids`,
 /// [`GlassError::PermissionDenied`] on a Screen Recording TCC decline, or
 /// [`GlassError::CaptureFailed`] for any other ScreenCaptureKit failure.
-// Not yet called: `MacosPlatform::capture_frame` still `unimplemented!()` until a later
-// task wires `start_app`/`capture_frame` to `process::spawn` + this function. Kept
-// `pub(crate)` + allowed here rather than deleted, mirroring `ffi.rs`'s `app_kit_init`
-// and `scwindow.rs`'s `find_window_for_pids` convention, so the capture logic lands in
-// one place instead of being reintroduced per call site.
-#[allow(dead_code)]
 pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Frame> {
     crate::ffi::app_kit_init();
 
@@ -62,7 +51,7 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
     let content_block = RcBlock::new(
         move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
             if content_ptr.is_null() {
-                let err = classify_null_result(
+                let err = crate::ffi::classify_null_result(
                     err_ptr,
                     "SCShareableContent completion handler returned null content and null error",
                 );
@@ -91,8 +80,15 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
             // SAFETY: plain property getters on the freshly constructed `filter`.
             let (scale, content_rect) =
                 unsafe { (filter.pointPixelScale() as f64, filter.contentRect()) };
-            let width = ((content_rect.size.width * scale) as usize).max(1);
-            let height = ((content_rect.size.height * scale) as usize).max(1);
+            if content_rect.size.width <= 0.0 || content_rect.size.height <= 0.0 {
+                let _ = tx.send(CaptureReply::Err(GlassError::CaptureFailed(format!(
+                    "window content rect is degenerate ({}x{} pts)",
+                    content_rect.size.width, content_rect.size.height
+                ))));
+                return;
+            }
+            let width = (content_rect.size.width * scale) as usize;
+            let height = (content_rect.size.height * scale) as usize;
             // SAFETY: plain property setters on the freshly constructed, uniquely-owned
             // `config`; no other preconditions.
             unsafe {
@@ -105,7 +101,7 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
             let image_block =
                 RcBlock::new(move |image_ptr: *mut CGImage, err_ptr: *mut NSError| {
                     if image_ptr.is_null() {
-                        let err = classify_null_result(
+                        let err = crate::ffi::classify_null_result(
                             err_ptr,
                             "SCScreenshotManager.captureImage returned null image and null error",
                         );
@@ -117,8 +113,16 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
                     // callback. All work on it happens synchronously right here — the
                     // `CGImage` itself never leaves this block.
                     let image: &CGImage = unsafe { &*image_ptr };
+                    // NOTE: `Frame` is captured in backing PIXELS (`contentRect.size *
+                    // pointPixelScale`, this same `scale`), while `region` is
+                    // window-relative POINTS — the unit the session layer validates it in
+                    // (`WindowGeometry`, from `SCWindow.frame()`; see `scwindow.rs`).
+                    // `crop_to_region` converts it to pixels via `scale` before cropping
+                    // the pixel-space `Frame`. The wider points-vs-pixels reconciliation
+                    // across geometry/frame/click (the other backends use physical pixels
+                    // throughout) is a later coordinate-design item, not solved here.
                     let result = rgba_frame_from_cgimage(image)
-                        .and_then(|frame| crop_to_region(frame, region_owned.as_ref()));
+                        .and_then(|frame| crop_to_region(frame, region_owned.as_ref(), scale));
                     let _ = tx_img.send(match result {
                         Ok(frame) => CaptureReply::Ok(frame),
                         Err(e) => CaptureReply::Err(e),
@@ -170,17 +174,21 @@ enum CaptureReply {
     Err(GlassError),
 }
 
-/// Crop `frame` to `region` (window-relative), clamping the region to the captured frame
-/// first via [`crate::coords::clamp_region`] (defense in depth — the session layer should
-/// already validate the region against the window before it reaches the backend, per
-/// `glass_core::frame::Region::check_fits`'s doc). `None` returns `frame` unchanged.
-fn crop_to_region(frame: Frame, region: Option<&Region>) -> Result<Frame> {
+/// Crop `frame` to `region`, clamping to the captured frame first via
+/// [`crate::coords::clamp_region`] (defense in depth — the session layer should already
+/// validate the region against the window before it reaches the backend, per
+/// `glass_core::frame::Region::check_fits`'s doc). `region` is window-relative POINTS (see
+/// the NOTE at the call site above); `scale` (`pointPixelScale`) converts it to the PIXELS
+/// `frame` itself is in, via [`crate::coords::scale_region`], before clamping/cropping.
+/// `None` returns `frame` unchanged (no scaling needed for a no-op).
+fn crop_to_region(frame: Frame, region: Option<&Region>, scale: f64) -> Result<Frame> {
     let Some(r) = region else { return Ok(frame) };
+    let pixel_region = crate::coords::scale_region(r, scale);
     let clamped = crate::coords::clamp_region(
-        r.x as i32,
-        r.y as i32,
-        r.width,
-        r.height,
+        pixel_region.x as i32,
+        pixel_region.y as i32,
+        pixel_region.width,
+        pixel_region.height,
         frame.width,
         frame.height,
     );
@@ -235,36 +243,6 @@ fn rgba_frame_from_cgimage(image: &CGImage) -> Result<Frame> {
     CGContext::draw_image(Some(&ctx), rect, Some(image));
 
     Frame::new(w as u32, h as u32, buf)
-}
-
-/// Classify a `null` ScreenCaptureKit result's paired `NSError`: [`GlassError::PermissionDenied`]
-/// for a Screen Recording TCC decline (domain `SCStreamErrorDomain`, code `-3801`, and/or
-/// a "declined" description — the spike observed all three together, but any one is
-/// treated as authoritative since Apple doesn't document which fields are stable across
-/// OS versions), [`GlassError::CaptureFailed`] otherwise. `fallback_msg` covers the
-/// (framework-contract-violating, but defensively handled) case where both the result and
-/// the error came back null.
-fn classify_null_result(err_ptr: *mut NSError, fallback_msg: &str) -> GlassError {
-    if err_ptr.is_null() {
-        return GlassError::CaptureFailed(fallback_msg.to_string());
-    }
-    // SAFETY: the framework guarantees a non-null, valid `NSError` whenever it hands back
-    // a null content/image — proven in the spike's TCC-declined run (see `scwindow.rs`'s
-    // identical precondition).
-    let err: &NSError = unsafe { &*err_ptr };
-    let domain = err.domain().to_string();
-    let code = err.code();
-    let description = err.localizedDescription().to_string();
-    let detail = format!("{domain} (code {code}): {description}");
-
-    let is_tcc_decline = domain.contains("SCStreamErrorDomain")
-        || code == TCC_DECLINE_CODE
-        || description.to_lowercase().contains("declined");
-    if is_tcc_decline {
-        Permission::ScreenRecording.denied_with_detail(detail)
-    } else {
-        GlassError::CaptureFailed(detail)
-    }
 }
 
 #[cfg(test)]

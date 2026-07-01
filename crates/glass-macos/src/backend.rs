@@ -4,7 +4,7 @@
 
 use std::process::Child;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::frame::{Frame, Region};
 use glass_core::logbuf::Stream;
@@ -15,6 +15,12 @@ use glass_core::{GlassError, Result};
 
 use crate::permissions;
 use crate::process::{self, LogSink};
+
+/// Poll interval between discovery attempts in [`MacosPlatform::discover_window`] —
+/// matches `scwindow::find_window_for_pids`'s own poll cadence
+/// (`poll_until(100, ..)`), which that loop takes over here so it can also race
+/// against `child.try_wait()`.
+const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
 /// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
@@ -60,27 +66,52 @@ impl MacosPlatform {
         }
         Ok(())
     }
+
+    /// Poll for `child`'s window, alternating a single [`crate::scwindow::query_once`]
+    /// discovery attempt with `child.try_wait()` so a crashed launch fails fast with
+    /// [`GlassError::AppExited`] instead of riding out the whole `timeout_ms` budget
+    /// waiting for a window that will never appear — mirrors
+    /// `glass-x11/src/platform.rs`'s `discover_window`. Can't delegate this to
+    /// `scwindow::find_window_for_pids`: that helper owns its *entire* poll loop
+    /// internally, with no child handle to race against.
+    fn discover_window(child: &mut Child, pid: u32, timeout_ms: u64) -> Result<WindowGeometry> {
+        crate::ffi::app_kit_init();
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        loop {
+            if let Some(m) = crate::scwindow::query_once(&[pid as i32])? {
+                return Ok(m.geometry);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(GlassError::AppExited(status.code()));
+            }
+            if Instant::now() >= deadline {
+                return Err(GlassError::Timeout(timeout_ms));
+            }
+            std::thread::sleep(DISCOVERY_POLL_INTERVAL);
+        }
+    }
 }
 
 impl Platform for MacosPlatform {
     /// Run the optional build step, spawn the app, then confirm a window appears for its
     /// pid within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent`
-    /// enumeration.
+    /// enumeration — alternated with `child.try_wait()` so a crashed launch fails fast
+    /// with `GlassError::AppExited` instead of riding out the whole timeout (see
+    /// `discover_window`).
     ///
-    /// **Main-thread affinity:** `scwindow::find_window_for_pids` calls
-    /// `ffi::app_kit_init()`, which requires the true main thread (`MainThreadMarker`
-    /// panics off it). In Plan 2 this is exercised only by Task 6's `harness=false`
-    /// main-thread test; wiring it under glass-mcp's worker-thread dispatcher
-    /// (main-thread marshaling) is deferred to Plan 5.
+    /// **Main-thread affinity:** `discover_window` calls `ffi::app_kit_init()`, which
+    /// requires the true main thread (`MainThreadMarker` panics off it). In Plan 2 this is
+    /// exercised only by Task 6's `harness=false` main-thread test; wiring it under
+    /// glass-mcp's worker-thread dispatcher (main-thread marshaling) is deferred to Plan 5.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         Self::run_build(spec)?;
         let mut child = process::spawn(spec, self.logs.clone())?;
         let pid = child.id();
-        match crate::scwindow::find_window_for_pids(&[pid as i32], Duration::from_millis(spec.timeout_ms)) {
-            Ok(m) => {
+        match Self::discover_window(&mut child, pid, spec.timeout_ms) {
+            Ok(geometry) => {
                 self.child = Some(child);
                 self.app_pid = Some(pid);
-                Ok(m.geometry)
+                Ok(geometry)
             }
             Err(e) => {
                 // The window never appeared (or discovery otherwise failed): don't leak
