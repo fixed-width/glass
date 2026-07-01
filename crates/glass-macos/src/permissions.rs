@@ -13,7 +13,10 @@ extern "C" {
 }
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    // Apple declares this `Boolean` (= `unsigned char`), NOT C99 `_Bool`. Binding it as
+    // `u8` and comparing `!= 0` avoids the Rust-`bool` validity invariant (only 0/1 are
+    // legal bit patterns; any other byte would be instant UB), matching `accessibility-sys`.
+    fn AXIsProcessTrusted() -> u8;
 }
 
 /// True if this process holds the Screen Recording grant.
@@ -26,8 +29,9 @@ pub fn screen_recording_ok() -> bool {
 /// True if this process is trusted for Accessibility (AX APIs + CGEvent posting).
 pub fn accessibility_ok() -> bool {
     // SAFETY: `AXIsProcessTrusted` is a no-argument C predicate over this process's
-    // trust state; no preconditions, no side effects.
-    unsafe { AXIsProcessTrusted() }
+    // trust state; no preconditions, no side effects. It returns `Boolean` (u8); any
+    // nonzero value means trusted.
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 /// Fail fast with an actionable error if either grant is missing. Called at session
