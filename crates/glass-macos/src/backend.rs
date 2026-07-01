@@ -433,8 +433,36 @@ impl Platform for MacosPlatform {
         let windows = crate::scwindow::list_app_windows(&[pid as i32])?;
         Ok(windows.into_iter().map(|w| window_info_from(w, self.active_window)).collect())
     }
-    fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
-        unimplemented!("Plan 4: raise + focus + activate")
+    /// Retarget `active_window` to `id` — the `Platform` contract's "make `id` the
+    /// active window, the implicit target of capture/input/window ops" (see
+    /// `glass_core::platform`'s doc on this method).
+    ///
+    /// First confirms `id` is currently on-screen via `scwindow::find_window_by_id`,
+    /// which already maps a lookup that never turns up `id` before
+    /// `WINDOW_RESOLVE_TIMEOUT` elapses to `GlassError::WindowNotFound` (see that
+    /// function's own doc) — exactly this method's "not currently one of the app's
+    /// windows" contract, so no extra `Timeout` -> `WindowNotFound` mapping is needed
+    /// here. Only after that check succeeds does `active_window` actually change — a
+    /// failed `select_window` must leave the previous target in place, not (say) clear
+    /// it.
+    ///
+    /// Then raises and focuses the newly-selected window by delegating to
+    /// `self.window(&WindowOp::Focus)` rather than duplicating its AXUIElement logic:
+    /// that path re-resolves `id`'s `AXUIElement` scoped to `self.app_pid`
+    /// (`axwindow::ax_window_for_cgwindowid`), which doubles as a second, stronger
+    /// validation that `id` genuinely belongs to *this* app (`find_window_by_id` alone
+    /// matches any on-screen `CGWindowID`, not just ones owned by `app_pid`) — a window
+    /// belonging to some other running app would fail here with `WindowNotFound` even
+    /// though the first check passed. `window(Focus)`'s own read-back
+    /// ([`read_ax_geometry`]) supplies the pixel `WindowGeometry` this method returns,
+    /// so the window is queried fresh exactly once more (mirroring every other op's
+    /// no-caching discipline) rather than reusing the first lookup's now-slightly-stale
+    /// geometry.
+    fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+        permissions::preflight()?;
+        crate::scwindow::find_window_by_id(id.0 as u32, WINDOW_RESOLVE_TIMEOUT)?;
+        self.active_window = Some(id.0 as u32);
+        self.window(&WindowOp::Focus)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
