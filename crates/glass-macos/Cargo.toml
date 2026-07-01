@@ -9,6 +9,14 @@ publish.workspace = true
 [lib]
 bench = false
 
+# Mac-gated capture integration test (crates/glass-macos/tests/capture.rs): harness =
+# false because it defines its own `fn main()` that must run on the process's true main
+# thread (AppKit's `MainThreadMarker` requirement — see the file's module doc), which
+# libtest's per-test worker threads can't provide.
+[[test]]
+name = "capture"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 
