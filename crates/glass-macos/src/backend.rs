@@ -2,6 +2,8 @@
 //! window-server methods stubbed; Plan 2 fills capture + display provisioning, Plan 3
 //! input, Plan 4 windows. `new()` runs the TCC preflight so a missing grant fails fast.
 
+use std::sync::{Arc, Mutex};
+
 use glass_core::frame::{Frame, Region};
 use glass_core::logbuf::Stream;
 use glass_core::platform::{
@@ -10,13 +12,16 @@ use glass_core::platform::{
 use glass_core::Result;
 
 use crate::permissions;
+use crate::process::LogSink;
 
 /// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
 /// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
 pub struct MacosPlatform {
-    /// Logs drained by `drain_logs`, filled by the per-stream readers once `start_app`
-    /// exists (Plan 2). Empty until then.
-    logs: Vec<(Stream, String)>,
+    /// Logs drained by `drain_logs`, filled by `process::spawn`'s per-stream reader
+    /// threads once `start_app` exists (Plan 2). `Arc<Mutex<_>>` because those threads
+    /// push into it concurrently with `drain_logs` reading it here. Empty until
+    /// `start_app` launches a child.
+    logs: LogSink,
     /// The launched app's root pid; `None` until `start_app`.
     app_pid: Option<u32>,
 }
@@ -25,7 +30,7 @@ impl MacosPlatform {
     /// Construct the backend, failing fast if a required TCC grant is missing.
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
-        Ok(Self { logs: Vec::new(), app_pid: None })
+        Ok(Self { logs: Arc::new(Mutex::new(Vec::new())), app_pid: None })
     }
 }
 
@@ -55,7 +60,7 @@ impl Platform for MacosPlatform {
         unimplemented!("Plan 4: raise + focus + activate")
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut self.logs)
+        std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
     }
     fn app_pid(&self) -> Option<u32> {
         self.app_pid
@@ -70,14 +75,17 @@ mod tests {
     fn drain_logs_takes_then_empties() {
         // Build without preflight (which would require grants) by constructing the struct
         // directly — `new()` is exercised in the Mac-gated suite.
-        let mut p = MacosPlatform { logs: vec![(Stream::Stdout, "hi".into())], app_pid: Some(42) };
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
+            app_pid: Some(42),
+        };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
     }
 
     #[test]
     fn app_pid_returns_the_constructed_value() {
-        let p = MacosPlatform { logs: Vec::new(), app_pid: Some(42) };
+        let p = MacosPlatform { logs: Arc::new(Mutex::new(Vec::new())), app_pid: Some(42) };
         assert_eq!(p.app_pid(), Some(42));
     }
 

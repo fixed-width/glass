@@ -29,6 +29,10 @@ objc2-core-foundation = "0.3.2"
 objc2-image-io = "0.3.2"
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
+# SIGTERM/SIGKILL for `process::terminate` — already a workspace dep (glass-wayland,
+# glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
+# and available on macOS too.
+rustix.workspace = true
 
 [lints]
 workspace = true

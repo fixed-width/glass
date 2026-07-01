@@ -1051,6 +1051,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-image-io",
  "objc2-screen-capture-kit",
+ "rustix",
 ]
 
 [[package]]

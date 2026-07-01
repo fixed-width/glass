@@ -18,6 +18,8 @@ mod scwindow;
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
+mod process;
+#[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
