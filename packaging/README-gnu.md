@@ -5,8 +5,8 @@ launches an app, screenshots what's on screen, clicks and types into it, reads i
 logs, and detects visual changes — so the agent can build and debug a GUI on its own
 instead of asking you "does this look right?".
 
-This is the **Linux x86-64 (glibc)** build. (A Windows build is also available; macOS
-is not yet built.) See the project README for the full picture:
+This is the **Linux x86-64 (glibc)** build. (Windows and macOS builds are also available
+— see [docs/running-on-macos.md](../docs/running-on-macos.md).) See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
 For Linux-specific display/compositor and containment setup, see
 [docs/running-on-linux.md](../docs/running-on-linux.md).

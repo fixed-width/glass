@@ -192,8 +192,8 @@ Both reuse glass's network transport — no glass code changes required.
 ## Android on Windows
 
 The Android backend is **host-OS-agnostic** — it shells out to `adb.exe`, so it runs
-from a Windows host just as from Linux (macOS is planned — glass-mcp doesn't build on
-macOS yet; see [running-on-macos.md](running-on-macos.md)).
+from a Windows host just as from Linux and macOS (see
+[running-on-macos.md](running-on-macos.md) for the macOS host guide).
 
 ### Supported Android versions
 

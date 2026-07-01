@@ -96,6 +96,13 @@ pub(crate) fn app_kit_init() {
     if APP_KIT_INIT.is_completed() {
         return;
     }
+    // TOCTOU between the check above and `MainThreadMarker::new()` below is
+    // theoretical-only under the current call graph: every call site reaches this after
+    // `init_main_thread()` has already run on the process's real main thread before any
+    // worker thread is spawned (see this fn's and `init_main_thread`'s docs), so by the
+    // time a second/concurrent call could race the check, `is_completed()` is already
+    // `true`. A future call site that violated "init before spawning workers" would
+    // surface as a loud panic here (below), not silent UB.
     let mtm = MainThreadMarker::new().expect("app_kit_init must run on the main thread");
     APP_KIT_INIT.call_once(|| {
         let _app = NSApplication::sharedApplication(mtm);

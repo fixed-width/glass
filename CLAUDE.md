@@ -15,7 +15,8 @@ read logs, diff against baselines, wait-until-stable, and read/drive the accessi
 tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform` seam: X11
 and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
-on-device companion agent); macOS planned.
+on-device companion agent), macOS (ScreenCaptureKit capture, CGEvent input, AXUIElement
+windows/logs; accessibility reader + sandboxing still to come).
 
 ## Layout
 

@@ -102,7 +102,11 @@ fn copy_session_dictionary() -> Option<CFRetained<CFDictionary<CFString, CFType>
 /// docs) — everything else means *some* window-server session is attached, so it's
 /// `Locked`/`Unlocked` depending on the key. Apple's documented type for the key is
 /// `CFBoolean`; a `CFNumber` fallback costs nothing and keeps this robust if that ever
-/// changes.
+/// changes. A value of neither type is indeterminate — fail safe as `Locked` rather than
+/// silently reporting `Unlocked`, since `doctor` treats `Unlocked` as "capture/input
+/// should work" and a false-negative there just means a redundant "recover with
+/// `caffeinate -d`" hint, while a false-positive `Unlocked` would hide a real capture/
+/// input failure behind a clean bill of health.
 fn dict_reports_state(dict: Option<&CFDictionary<CFString, CFType>>) -> SessionState {
     let Some(dict) = dict else { return SessionState::NoSession };
     let key = CFString::from_str(SCREEN_IS_LOCKED_KEY);
@@ -112,7 +116,7 @@ fn dict_reports_state(dict: Option<&CFDictionary<CFString, CFType>>) -> SessionS
     } else if let Some(n) = value.downcast_ref::<CFNumber>() {
         n.as_i64().unwrap_or(0) != 0
     } else {
-        false
+        true
     };
     if locked { SessionState::Locked } else { SessionState::Unlocked }
 }
@@ -161,6 +165,20 @@ mod tests {
         let v: &CFType = unsafe { kCFBooleanTrue }.expect("kCFBooleanTrue");
         let d = dict_with("SomeOtherSessionKey", v);
         assert_eq!(dict_reports_state(Some(&d)), SessionState::Unlocked);
+    }
+
+    #[test]
+    fn unrecognized_value_type_fails_safe_as_locked() {
+        // If the key's value is ever neither `CFBoolean` nor `CFNumber` (Apple's
+        // documented type, plus our defensive fallback), that's an indeterminate read —
+        // not evidence the session is unlocked. Fail safe as `Locked` rather than
+        // silently reporting `Unlocked`, which would tell `doctor` capture/input should
+        // work when it's genuinely unknown whether they will. A `CFString` stands in for
+        // "some type we don't recognize" (`CFString` derefs to `CFType`, same as every
+        // other CF type here).
+        let v = CFString::from_str("not a bool or a number");
+        let d = dict_with(SCREEN_IS_LOCKED_KEY, &v);
+        assert_eq!(dict_reports_state(Some(&d)), SessionState::Locked);
     }
 
     #[test]
