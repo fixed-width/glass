@@ -4,7 +4,9 @@
 //! held across calls or across the completion-handler's thread boundary (see
 //! `scwindow.rs`'s module doc) — via the nested async flow proven end-to-end in the objc2
 //! spike (`.superpowers/sdd/objc2-spike-report.md` Part A):
-//! `SCShareableContent` → [`crate::scwindow::find_on_screen_window`] →
+//! `SCShareableContent` → [`crate::scwindow::find_on_screen_window`]/
+//! [`crate::scwindow::find_on_screen_window_by_id`] (pid-set lookup for `capture_window`,
+//! exact-`CGWindowID` lookup for `capture_window_by_id` — see [`capture_resolved`]) →
 //! `SCContentFilter::initWithDesktopIndependentWindow` → `SCStreamConfiguration` →
 //! `SCScreenshotManager::captureImageWithFilter_configuration_completionHandler` →
 //! `CGImage`, drawn into a tightly-packed RGBA8 bitmap context inside the innermost
@@ -16,6 +18,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use block2::RcBlock;
+use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -23,13 +26,13 @@ use objc2_core_graphics::{
 };
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration,
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
 };
 
 use glass_core::frame::{Frame, Region};
 use glass_core::{GlassError, Result};
 
-use crate::scwindow::find_on_screen_window;
+use crate::scwindow::{find_on_screen_window, find_on_screen_window_by_id};
 
 /// Max wait for one capture round trip (`SCShareableContent` + `SCScreenshotManager`
 /// both completing). Generous relative to the spike's sub-second observations — this
@@ -41,11 +44,40 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`GlassError::WindowNotFound`] if no on-screen window is owned by `pids`,
 /// [`GlassError::PermissionDenied`] on a Screen Recording TCC decline, or
 /// [`GlassError::CaptureFailed`] for any other ScreenCaptureKit failure.
+///
+/// `backend.rs::capture_frame`'s fallback path for when `MacosPlatform::active_window` is
+/// unset — see [`capture_window_by_id`] for its active-window (retargeted) counterpart.
 pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Frame> {
+    let pids_owned: Vec<i32> = pids.to_vec();
+    capture_resolved(region, move |content| find_on_screen_window(content, &pids_owned))
+}
+
+/// Capture the specific on-screen window whose `CGWindowID == window_id` as an RGBA8
+/// [`Frame`], optionally cropped to a window-relative `region`. Same error mapping as
+/// [`capture_window`]. This is `backend.rs::capture_frame`'s active-window (retargeted)
+/// path: once `MacosPlatform::active_window` is set (by `start_app`, later by
+/// `select_window`), capture must target that *exact* window rather than "first on-screen
+/// window for this pid" — a multi-window app would otherwise silently capture the wrong
+/// window (Plan 4's design decision 2).
+pub(crate) fn capture_window_by_id(window_id: u32, region: Option<&Region>) -> Result<Frame> {
+    capture_resolved(region, move |content| find_on_screen_window_by_id(content, window_id))
+}
+
+/// Shared nested-async capture body for [`capture_window`]/[`capture_window_by_id`]: resolve
+/// the target `SCWindow` via `resolve` (the only thing that differs between a pid-set lookup
+/// and an exact-`CGWindowID` lookup), then build the `SCContentFilter`/`SCStreamConfiguration`
+/// and run `SCScreenshotManager`'s capture — identical for both callers, so this is the one
+/// place that logic lives (no risk of the two paths drifting on filter/config/crop
+/// handling). `resolve` runs inside the `SCShareableContent` completion block, so it must be
+/// `Send` (queue-hopped, like every other closure this module posts across the FFI
+/// boundary — see `ffi.rs`'s async-bridge doc) but does not need to be `Sync` (called once).
+fn capture_resolved(
+    region: Option<&Region>,
+    resolve: impl Fn(&SCShareableContent) -> Option<(Retained<SCWindow>, i32)> + Send + 'static,
+) -> Result<Frame> {
     crate::ffi::app_kit_init();
 
     let (tx, rx) = mpsc::channel::<CaptureReply>();
-    let pids_owned: Vec<i32> = pids.to_vec();
     let region_owned = region.copied();
 
     let content_block = RcBlock::new(
@@ -62,7 +94,7 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
             // it points to a live `SCShareableContent` for the duration of this callback.
             let content: &SCShareableContent = unsafe { &*content_ptr };
 
-            let Some((window, _pid)) = find_on_screen_window(content, &pids_owned) else {
+            let Some((window, _pid)) = resolve(content) else {
                 let _ = tx.send(CaptureReply::Err(GlassError::WindowNotFound));
                 return;
             };

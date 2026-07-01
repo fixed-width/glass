@@ -9,6 +9,11 @@
 //! [`pixel_geometry_from_content_rect`] is the mirror-image conversion `scwindow.rs` uses
 //! to turn `SCContentFilter`'s `contentRect` (POINTS) + `pointPixelScale` into the PIXEL
 //! `WindowGeometry` the tool boundary reports.
+//!
+//! [`global_pixel_to_point`]/[`point_to_global_pixel`] are Plan 4's ABSOLUTE (no
+//! window-origin offset) counterparts, for window `Move`/`Resize`/`Geometry` ops that
+//! address the global screen directly via `AXUIElement` rather than a window-relative
+//! click.
 
 use glass_core::frame::Region;
 use glass_core::platform::WindowGeometry;
@@ -50,6 +55,24 @@ pub fn clamp_region(rx: i32, ry: i32, rw: u32, rh: u32, width: u32, height: u32)
 /// one place a pixel value crosses back into points, right before posting a CGEvent.
 pub fn pixel_to_global_point(rel_px: (i32, i32), scale: f64, origin_pt: (f64, f64)) -> (f64, f64) {
     (origin_pt.0 + rel_px.0 as f64 / scale, origin_pt.1 + rel_px.1 as f64 / scale)
+}
+
+/// Map an ABSOLUTE global-screen PIXEL coordinate to Quartz's global POINT space:
+/// `px / scale`. Unlike [`pixel_to_global_point`] (which is window-RELATIVE and adds a
+/// window's `origin_pt`), this has no origin term — it's for Plan 4's window
+/// Move/Resize/Geometry ops, which address the global screen directly (a `WindowOp::Move`
+/// target, or an `AXUIElement` position/size already in global points), not a click
+/// relative to a window's top-left.
+pub fn global_pixel_to_point(px: (i32, i32), scale: f64) -> (f64, f64) {
+    (px.0 as f64 / scale, px.1 as f64 / scale)
+}
+
+/// The inverse of [`global_pixel_to_point`]: map an ABSOLUTE global POINT (e.g. read back
+/// from `AXUIElement`'s position/size) to a global PIXEL coordinate: `pt * scale`, rounded
+/// to the nearest pixel (ties away from zero, matching
+/// [`pixel_geometry_from_content_rect`]'s rounding).
+pub fn point_to_global_pixel(pt: (f64, f64), scale: f64) -> (i32, i32) {
+    ((pt.0 * scale).round() as i32, (pt.1 * scale).round() as i32)
 }
 
 /// Convert a window's `contentRect` (POINTS, from `SCContentFilter.contentRect()`) plus
@@ -129,6 +152,46 @@ mod tests {
     #[test]
     fn pixel_to_global_point_handles_negative_rel_and_origin() {
         assert_eq!(pixel_to_global_point((-40, -10), 2.0, (-5.0, 0.0)), (-25.0, -5.0));
+    }
+
+    #[test]
+    fn global_pixel_to_point_is_identity_at_1x() {
+        assert_eq!(global_pixel_to_point((100, 200), 1.0), (100.0, 200.0));
+    }
+
+    #[test]
+    fn global_pixel_to_point_halves_at_2x_retina() {
+        assert_eq!(global_pixel_to_point((200, 400), 2.0), (100.0, 200.0));
+    }
+
+    #[test]
+    fn global_pixel_to_point_handles_negative_pixels() {
+        assert_eq!(global_pixel_to_point((-200, -3), 2.0), (-100.0, -1.5));
+    }
+
+    #[test]
+    fn point_to_global_pixel_is_identity_at_1x() {
+        assert_eq!(point_to_global_pixel((100.0, 200.0), 1.0), (100, 200));
+    }
+
+    #[test]
+    fn point_to_global_pixel_doubles_at_2x_retina() {
+        assert_eq!(point_to_global_pixel((100.0, 200.0), 2.0), (200, 400));
+    }
+
+    #[test]
+    fn point_to_global_pixel_rounds_to_nearest_pixel() {
+        // 1.25 * 2 = 2.5 -> 3 (round-half-away-from-zero, per f64::round).
+        assert_eq!(point_to_global_pixel((1.25, 1.25), 2.0), (3, 3));
+    }
+
+    #[test]
+    fn global_pixel_point_round_trip_at_1x_and_2x() {
+        for scale in [1.0, 2.0] {
+            let px = (137, -42);
+            let pt = global_pixel_to_point(px, scale);
+            assert_eq!(point_to_global_pixel(pt, scale), px);
+        }
     }
 
     #[test]
