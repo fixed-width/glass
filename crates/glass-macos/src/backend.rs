@@ -37,15 +37,14 @@ pub struct MacosPlatform {
     child: Option<Child>,
     /// The active session's `pointPixelScale` (`1.0` on a 1x display, `2.0` on 2x
     /// Retina), from the last `start_app`'s `WindowMatch`. Defaults to `1.0` before any
-    /// session starts. Stored for `send_pointer`/`send_key` (Plan 3) to map a
-    /// window-relative PIXEL coordinate (the tool boundary's unit) to a global POINT via
-    /// `coords::pixel_to_global_point` before posting a CGEvent — not yet read here.
-    #[allow(dead_code)]
+    /// session starts. Read by `send_pointer` (Plan 3 Task 2) to map a window-relative
+    /// PIXEL coordinate (the tool boundary's unit) to a global POINT via
+    /// `coords::pixel_to_global_point` before posting a CGEvent; `send_key` (Plan 3 Task 3)
+    /// doesn't need it.
     scale: f64,
     /// The active session's window `contentRect.origin`, in POINTS (Quartz's global
     /// screen space), from the last `start_app`'s `WindowMatch`. Defaults to `(0.0, 0.0)`
-    /// before any session starts. See `scale`'s doc — not yet read here.
-    #[allow(dead_code)]
+    /// before any session starts. See `scale`'s doc.
     origin_pt: (f64, f64),
 }
 
@@ -171,8 +170,12 @@ impl Platform for MacosPlatform {
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         crate::capture::capture_window(&[pid as i32], region)
     }
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
-        unimplemented!("Plan 3: CGEvent pointer")
+    /// Map the active session's pid/`scale`/`origin_pt` into `input::send_pointer` — see
+    /// `input.rs`'s module doc for the CGEvent details and its main-thread-affinity note
+    /// (shared with `start_app`/`capture_frame` above).
+    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        crate::input::send_pointer(event, pid as i32, self.scale, self.origin_pt)
     }
     fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
         unimplemented!("Plan 3: CGEvent keyboard")

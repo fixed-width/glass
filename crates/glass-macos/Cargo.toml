@@ -40,6 +40,10 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSResponder",
+    # `NSRunningApplication` — focus-before-inject (`input.rs::focus`); `libc` unlocks its
+    # `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class method.
+    "NSRunningApplication",
+    "libc",
 ] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
     "SCShareableContent",
@@ -56,6 +60,14 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
     "CGContext",
     "CGBitmapContext",
     "objc2",
+    # CGEvent mouse injection (`input.rs`): `CGEvent` unlocks the `CGEvent` module (types +
+    # constructors/`post`/`set_flags`/etc.); `CGEventSource` the event-source constructor;
+    # `CGEventTypes` the `CGEventType`/`CGMouseButton`/`CGEventFlags`/`CGEventField`/
+    # `CGScrollEventUnit`/`CGEventTapLocation`/`CGEventSourceStateID` enums every call site
+    # here needs.
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "CFCGTypes",
