@@ -39,7 +39,10 @@ const MAX_NODES: usize = 1500;
 const MAX_SIBLINGS: usize = 4096;
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
-/// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback.
+/// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
+/// an already-snapped-to-integer `scale` (see [`select_window`]); the raw width ratio can be
+/// off by a few points from border/content-vs-frame insets, which is why the scale is
+/// snapped before this tolerance is applied rather than folded into a larger tolerance here.
 const POSITION_TOLERANCE_PX: i32 = 8;
 /// Slack (pixels) allowed between the backend's reported window height and the height the
 /// width-derived `scale` predicts for the `AXWindow`. The scale is taken from *width*
@@ -153,28 +156,45 @@ fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
 }
 
 /// Select the `AXWindow` matching the backend's reported `win` and recover its point→pixel
-/// `scale`. The scale comes from *width* (`win.width / ax_width_pts`); the window matches
-/// when its `AXPosition` (scaled to pixels) lands within [`POSITION_TOLERANCE_PX`] of
-/// `win`'s origin AND its height is consistent with that scale (within
-/// [`HEIGHT_CONSISTENCY_SLACK_PX`]). Among candidates, the closest origin wins. `None` when
-/// nothing matches (fail closed).
+/// `scale`. The scale is derived from *width* (`win.width / ax_width_pts`) then snapped to
+/// the nearest integer, floored at `1.0`: macOS backing scale is always an integer (1x or
+/// 2x Retina), so a fractional raw ratio (e.g. `396 / 400 = 0.99`, from a `win` that is the
+/// window's *content* rect vs. the `AXWindow`'s *frame* rect) is border/inset noise, not a
+/// real scale — snapping it removes that noise before the position gate below runs. The
+/// window matches when its `AXPosition` (scaled to pixels) lands within
+/// [`POSITION_TOLERANCE_PX`] of `win`'s origin AND its height is consistent with that scale
+/// (within [`HEIGHT_CONSISTENCY_SLACK_PX`]). Among candidates, the closest origin wins.
+/// `None` when nothing matches (fail closed); logs each candidate's geometry to stderr in
+/// that case so a `WindowNotFound` is diagnosable without re-instrumenting.
 fn select_window(
     windows: &[CFRetained<AXUIElement>],
     win: &WindowGeometry,
 ) -> Option<(CFRetained<AXUIElement>, f64)> {
     let mut best: Option<(i32, CFRetained<AXUIElement>, f64)> = None;
+    let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
-        let Ok((ax_w, ax_h)) = ffi::ax_size(w) else { continue };
+        let Ok((ax_w, ax_h)) = ffi::ax_size(w) else {
+            diagnostics.push("<AXSize unreadable>".into());
+            continue;
+        };
         if ax_w <= 0.0 || ax_h <= 0.0 {
+            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} <non-positive size>"));
             continue;
         }
-        let scale = win.width as f64 / ax_w;
+        // macOS backing scale is always an integer; snap out the border/content-vs-frame
+        // inset noise in the raw width ratio (see doc comment above).
+        let scale = (win.width as f64 / ax_w).round().max(1.0);
         if !scale.is_finite() || scale <= 0.0 {
+            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>"));
             continue;
         }
-        let Ok((ax_x, ax_y)) = ffi::ax_position(w) else { continue };
+        let Ok((ax_x, ax_y)) = ffi::ax_position(w) else {
+            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable>"));
+            continue;
+        };
         let dx = ((ax_x * scale).round() as i32 - win.x).abs();
         let dy = ((ax_y * scale).round() as i32 - win.y).abs();
+        diagnostics.push(format!("ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}"));
         if dx > POSITION_TOLERANCE_PX || dy > POSITION_TOLERANCE_PX {
             continue;
         }
@@ -185,6 +205,15 @@ fn select_window(
         if best.as_ref().is_none_or(|(best_dist, _, _)| dist < *best_dist) {
             best = Some((dist, w.clone(), scale));
         }
+    }
+    if best.is_none() {
+        // Fail-closed dev-tool diagnostic (stderr only, no new error variant): a
+        // `WindowNotFound` with no clue why is much harder to debug than one that shows
+        // exactly how close (or not) each candidate came.
+        eprintln!(
+            "glass-a11y-macos: select_window found no match for ctx.window={win:?}; candidates: [{}]",
+            diagnostics.join(", ")
+        );
     }
     best.map(|(_, w, scale)| (w, scale))
 }
