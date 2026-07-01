@@ -17,6 +17,13 @@ bench = false
 name = "capture"
 harness = false
 
+# Mac-gated input integration test (crates/glass-macos/tests/input.rs) — same harness=false
+# main-thread requirement as `capture` above (send_key/send_pointer reach AppKit's
+# NSRunningApplication::activate); see that file's module doc.
+[[test]]
+name = "input"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 

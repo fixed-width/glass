@@ -33,4 +33,12 @@ cargo test -p glass-macos --lib "${1:-}"
 if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   echo "GLASS_MACOS_ONBOX=1: building the capture integration test binary..."
   cargo test -p glass-macos --test capture --no-run
+
+  # Same story as `capture` above, for crates/glass-macos/tests/input.rs (the send_key/
+  # send_pointer end-to-end proof) — building here just confirms it compiles and links; the
+  # granted run needs both Screen Recording and Accessibility TCC grants, so it happens
+  # out-of-band via the same GlassProbe.app LaunchAgent procedure (see
+  # .superpowers/sdd/task-6-brief.md).
+  echo "GLASS_MACOS_ONBOX=1: building the input integration test binary..."
+  cargo test -p glass-macos --test input --no-run
 fi
