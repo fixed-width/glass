@@ -139,12 +139,11 @@ fn walk(
     // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to
     // the raw AX role string so `raw_role` is never empty.
     let raw_role = ffi::attribute_string(el, "AXRoleDescription").unwrap_or(ax_role);
+    // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
+    // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
+    // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
+    let name = ffi::attribute_string(el, "AXTitle").or_else(|| ffi::attribute_string(el, "AXDescription"));
     let value = ffi::attribute_string(el, "AXValue");
-    // Name = title, else the current value (a titleless text field surfaces its content as
-    // its name — the only string `AxTree::to_outline` renders), else the description.
-    let name = ffi::attribute_string(el, "AXTitle")
-        .or_else(|| value.clone())
-        .or_else(|| ffi::attribute_string(el, "AXDescription"));
     let bounds = window_relative_rect(el, scale, win);
     let states = mapping::map_states(&gather_states(el));
 

@@ -1,8 +1,8 @@
 //! Mac-gated accessibility-reader integration test — the first real-AX-tree proof through
 //! the whole `glass-a11y-macos` snapshot path (`MacosPlatform::start_app` -> `AxContext` ->
 //! `MacosA11y::snapshot` -> AXUIElement walk -> `AxTree`), driven against the `a11y_fixture`
-//! Cocoa app (a "Save" button, an "Enable" checkbox, and an editable "Note" field holding
-//! "hello").
+//! Cocoa app (a "Save" button, an "Enable" checkbox, and an editable "Note" field — labeled
+//! "Note" via `setAccessibilityLabel`, holding the content "hello").
 //!
 //! **`harness = false`** (see `Cargo.toml`'s `[[test]] name = "a11y"` entry): like
 //! `capture.rs`/`input.rs`/`windows.rs`, `MacosPlatform::start_app` reaches
@@ -35,14 +35,26 @@ mod macos_main {
     use std::process::Command;
     use std::time::Duration;
 
-    use glass_core::{Accessibility, AppSpec, AxContext, Platform, SandboxLevel};
+    use glass_core::{Accessibility, AppSpec, AxContext, AxNode, AxRole, Platform, SandboxLevel};
     use glass_macos::MacosPlatform;
 
     /// The three elements the fixture exposes, asserted as substrings of the tree outline.
-    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, so the button and
-    /// checkbox match `Role "name"` and the editable field matches its value surfaced as the
-    /// node name (`"hello"`).
-    const NEEDLES: [&str; 3] = ["Button \"Save\"", "CheckBox \"Enable\"", "\"hello\""];
+    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, using only `name` (never
+    /// `value`) — so the editable field's stable label (`setAccessibilityLabel("Note")`,
+    /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
+    /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
+    const NEEDLES: [&str; 3] = ["Button \"Save\"", "CheckBox \"Enable\"", "TextField \"Note\""];
+
+    /// Pre-order search for the first `TextField` node — the fixture's editable "Note" field.
+    /// Separate from the [`NEEDLES`] outline check because `to_outline` only ever renders
+    /// `name`; this reaches `AxNode::value` directly to prove content is read independently of
+    /// the (stable) label.
+    fn find_text_field(node: &AxNode) -> Option<&AxNode> {
+        if node.role == AxRole::TextField {
+            return Some(node);
+        }
+        node.children.iter().find_map(find_text_field)
+    }
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
     /// libtest to format a panic for us). Mirrors `capture.rs`.
@@ -140,6 +152,16 @@ mod macos_main {
             if !outline.contains(needle) {
                 return Err(format!("missing {needle} in outline:\n{outline}"));
             }
+        }
+
+        // The outline only proves `name`; confirm `value` is read separately, straight off
+        // the field's content — not folded into `name` (that was the bug this test guards).
+        let field = match find_text_field(&tree.root) {
+            Some(n) => n,
+            None => return Err(format!("no TextField node in tree:\n{outline}")),
+        };
+        if field.value != Some("hello".to_string()) {
+            return Err(format!("TextField value = {:?}, want Some(\"hello\"):\n{outline}", field.value));
         }
         Ok(())
     }
