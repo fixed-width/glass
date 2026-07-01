@@ -33,37 +33,21 @@ use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CG
 
 use glass_core::{GlassError, Result};
 
-// Plain C predicates/queries not surfaced (or not surfaced in the shape we want) by the
-// objc2 bindings, declared with the same contained `extern "C"` pattern `permissions.rs`
-// (`AXIsProcessTrusted`) and `axwindow.rs` (`_AXUIElementGetWindow`) use. Both are public,
-// documented, stable AX APIs (unlike `axwindow`'s private symbol), so no version-fragility
-// caveat applies.
+// `AXIsProcessTrusted` is a plain C predicate not surfaced by the objc2 bindings, declared
+// with the same contained `extern "C"` pattern `permissions.rs` uses. It is a public,
+// documented, stable AX API (unlike `axwindow.rs`'s `_AXUIElementGetWindow`, a private
+// symbol that carries its own version-fragility caveat, which doesn't apply here).
+// `AXUIElementIsAttributeSettable`/`AXUIElementSetAttributeValue` are *not* declared this
+// way — `AXUIElement` already exposes them as safe-shaped methods
+// (`is_attribute_settable`/`set_attribute_value`, both gated behind the `AXError` feature
+// this crate already enables), so [`is_settable`]/[`set_string_value`] call those directly
+// instead of duplicating the raw externs.
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     // Apple declares this `Boolean` (= `unsigned char`), NOT C99 `_Bool`. Binding it as
     // `u8` and comparing `!= 0` avoids Rust-`bool`'s validity invariant (only 0/1 are legal
     // bit patterns), matching `permissions.rs`.
     fn AXIsProcessTrusted() -> u8;
-    // `AXError AXUIElementIsAttributeSettable(AXUIElementRef, CFStringRef, Boolean*)` — the
-    // documented way to tell whether an attribute (e.g. `AXValue`) can be written, which is
-    // how the reader derives `editable`/`focusable`. `Boolean` out-param is `u8` for the
-    // same reason as above.
-    fn AXUIElementIsAttributeSettable(
-        element: &AXUIElement,
-        attribute: &CFString,
-        settable: *mut u8,
-    ) -> AXError;
-    // `AXError AXUIElementSetAttributeValue(AXUIElementRef, CFStringRef, CFTypeRef)` — the
-    // documented way to write an attribute. [`set_string_value`] uses it directly with a
-    // `CFString` value for `AXValue`: a plain string write, unlike `AXPosition`/`AXSize`
-    // (which wrap a `CGPoint`/`CGSize` in an `AXValueCreate`-built `AXValue` — see
-    // `axwindow::set_axvalue` — a step that only applies to those geometry types, not
-    // strings).
-    fn AXUIElementSetAttributeValue(
-        element: &AXUIElement,
-        attribute: &CFString,
-        value: &CFType,
-    ) -> AXError;
 }
 
 /// True if this process holds the Accessibility (AX) TCC grant. The snapshot gate calls
@@ -123,20 +107,20 @@ pub(crate) fn attribute_bool(el: &AXUIElement, attr_name: &str) -> Option<bool> 
     value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)
 }
 
-/// Whether `attr_name` is writable on `el` (`AXUIElementIsAttributeSettable`). `false` on
-/// any AX error, including the attribute being absent — the reader uses this for `editable`
-/// (settable `AXValue`) and `focusable` (settable `AXFocused`).
+/// Whether `attr_name` is writable on `el` (`AXUIElement::is_attribute_settable`). `false`
+/// on any AX error, including the attribute being absent — the reader uses this for
+/// `editable` (settable `AXValue`) and `focusable` (settable `AXFocused`).
 pub(crate) fn is_settable(el: &AXUIElement, attr_name: &str) -> bool {
     let attr = CFString::from_str(attr_name);
     let mut settable: u8 = 0;
     // SAFETY: `el` is a live `AXUIElement`; `attr` is a valid `CFString`; `settable` is a
-    // valid local out-param matching `AXUIElementIsAttributeSettable`'s documented
-    // `Boolean *` parameter.
-    let err = unsafe { AXUIElementIsAttributeSettable(el, &attr, &mut settable) };
+    // valid local out-param matching `is_attribute_settable`'s documented `Boolean *`
+    // parameter (mirrors `copy_attribute`'s `NonNull`-out-param pattern above).
+    let err = unsafe { el.is_attribute_settable(&attr, NonNull::from(&mut settable)) };
     err == AXError::Success && settable != 0
 }
 
-/// Write `text` as `el`'s `AXValue` (`AXUIElementSetAttributeValue`). The caller
+/// Write `text` as `el`'s `AXValue` (`AXUIElement::set_attribute_value`). The caller
 /// (`reader::set_value`) gates this on [`is_settable`] first; this only performs the write —
 /// it does not read back to verify the value actually took (that honesty check is the
 /// caller's read-back poll, mirroring the Windows reader's `set_value` contract).
@@ -146,8 +130,8 @@ pub(crate) fn set_string_value(el: &AXUIElement, text: &str) -> Result<()> {
     // SAFETY: `el` is a live `AXUIElement`; `attr`/`value` are valid `CFString`s. `value`
     // deref-coerces `CFRetained<CFString>` -> `CFString` -> `CFType` (the same two-hop
     // coercion `axwindow::set_axvalue` already relies on for its `CFRetained<AXValue>`
-    // argument), matching `AXUIElementSetAttributeValue`'s documented `CFTypeRef` parameter.
-    let err = unsafe { AXUIElementSetAttributeValue(el, &attr, &value) };
+    // argument), matching `set_attribute_value`'s documented `CFTypeRef` parameter.
+    let err = unsafe { el.set_attribute_value(&attr, &value) };
     if err != AXError::Success {
         return Err(ax_err("AXValue", err));
     }
