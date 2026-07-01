@@ -8,6 +8,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 0
 fi
 
+# Run from the repo root so `cargo -p` resolves regardless of the caller's cwd
+# (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
+cd "$(dirname "$0")/.."
+
 # Pure + macOS unit tests. (Capture/input integration tests are #[ignore]d and added in
 # later plans; they need a granted, WindowServer-connected context — a gui/501 LaunchAgent.)
 cargo test -p glass-macos "${1:-}"
