@@ -9,12 +9,62 @@ publish.workspace = true
 [lib]
 bench = false
 
+# Mac-gated capture integration test (crates/glass-macos/tests/capture.rs): harness =
+# false because it defines its own `fn main()` that must run on the process's true main
+# thread (AppKit's `MainThreadMarker` requirement — see the file's module doc), which
+# libtest's per-test worker threads can't provide.
+[[test]]
+name = "capture"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 
-# macOS-only FFI deps land in Plan 2 (objc2 family). Kept empty here so the
-# crate's pure modules build on the Linux dev box with zero macOS deps.
+# macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
+# modules still build on the Linux dev box with zero macOS deps. Versions pinned to
+# exactly what `.superpowers/sdd/objc2-spike-report.md` proved compiles + runs cleanly
+# (zero warnings) against the real frameworks on mini. Each `objc2-*` framework crate
+# gates its ObjC types behind per-type Cargo features; `default-features = false` +
+# an explicit minimal `features` list keeps unused framework bindings (AVFoundation,
+# Metal, CoreData, CloudKit, etc. — pulled in wholesale by each crate's `default`
+# feature set) out of the build entirely. See `.superpowers/sdd/feature-trim-report.md`
+# for how each list was derived and verified empirically on mini.
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSArray",
+    "NSEnumerator",
+    "NSError",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSResponder",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+    "SCShareableContent",
+    "SCScreenshotManager",
+    "SCStream",
+    "block2",
+    "libc",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "CGImage",
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+    "objc2",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "CFCGTypes",
+] }
+block2 = "0.6.2"
+# SIGTERM/SIGKILL for `process::terminate` — already a workspace dep (glass-wayland,
+# glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
+# and available on macOS too.
+rustix.workspace = true
 
 [lints]
 workspace = true

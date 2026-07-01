@@ -30,6 +30,33 @@ pub fn clamp_region(rx: i32, ry: i32, rw: u32, rh: u32, width: u32, height: u32)
     Region { x: left as u32, y: top as u32, width: (right - left) as u32, height: (bottom - top) as u32 }
 }
 
+/// Convert a window-relative `region` from POINTS to backing PIXELS by scaling every field
+/// by `scale` (macOS's `pointPixelScale`: `1.0` on a 1x display, `2.0` on 2x Retina).
+///
+/// The macOS capture backend needs this because its two coordinate sources disagree:
+/// `capture::capture_window`'s `Frame` is sized in backing pixels
+/// (`contentRect.size * pointPixelScale`), but the `region` passed to it is window-relative
+/// points — the unit `WindowGeometry` (from `SCWindow.frame()`) and the session layer's
+/// region validation both use. Cropping a points-sized region straight against a
+/// pixels-sized `Frame` silently reads the wrong (quarter-sized, on 2x) sub-image. Pure and
+/// cross-platform so the Retina (2x) math is unit-tested here even on a 1x dev box; the
+/// wider points-vs-pixels reconciliation across geometry/frame/click (the other backends
+/// use physical pixels throughout) is a later coordinate-design item, not solved by this
+/// one conversion.
+///
+/// Each field rounds to the nearest pixel independently (`f64::round`, ties away from
+/// zero) rather than truncating, so a fractional point value doesn't consistently lose a
+/// pixel versus the frame it's cropped against.
+pub fn scale_region(region: &Region, scale: f64) -> Region {
+    let scaled = |v: u32| (v as f64 * scale).round() as u32;
+    Region {
+        x: scaled(region.x),
+        y: scaled(region.y),
+        width: scaled(region.width),
+        height: scaled(region.height),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +92,25 @@ mod tests {
         assert_eq!(clamp_region(-50, 0, 100, 50, 640, 480), Region { x: 0, y: 0, width: 50, height: 50 });
         // fully outside on the top → zero height
         assert_eq!(clamp_region(0, -100, 50, 50, 640, 480), Region { x: 0, y: 0, width: 50, height: 0 });
+    }
+
+    #[test]
+    fn scale_region_is_identity_at_1x() {
+        let region = Region { x: 10, y: 20, width: 300, height: 200 };
+        assert_eq!(scale_region(&region, 1.0), region);
+    }
+
+    #[test]
+    fn scale_region_doubles_at_2x_retina() {
+        let region = Region { x: 10, y: 20, width: 300, height: 200 };
+        assert_eq!(scale_region(&region, 2.0), Region { x: 20, y: 40, width: 600, height: 400 });
+    }
+
+    #[test]
+    fn scale_region_rounds_to_nearest_pixel() {
+        // 1*1.5=1.5 -> 2, 3*1.5=4.5 -> 5 (round-half-away-from-zero, per f64::round):
+        // fields round independently rather than truncating.
+        let region = Region { x: 1, y: 1, width: 3, height: 3 };
+        assert_eq!(scale_region(&region, 1.5), Region { x: 2, y: 2, width: 5, height: 5 });
     }
 }
