@@ -126,6 +126,27 @@ jobs:
       - run: cargo build  -p glass-macos --locked
       - run: cargo clippy -p glass-macos --all-targets --locked -- -D warnings
       - run: ./scripts/test-macos.sh
+      # glass-mcp is the shipped binary; only this job can build/lint/run its
+      # cfg(target_os = "macos") wiring (Cargo.toml's macos dep, lib.rs's "macos" backend
+      # arm + default_backend). Capture/input tools need a granted, WindowServer-connected
+      # session the runner doesn't have, so this stays at build/lint/headless-boot — the
+      # granted checks run on-box (see docs/running-on-macos.md).
+      - run: cargo build  -p glass-mcp --locked
+      - run: cargo clippy -p glass-mcp --all-targets --locked -- -D warnings
+      - name: glass-mcp doctor sees the macos backend (TCC grants are absent on the runner)
+        # `doctor` exits non-zero without the Screen Recording/Accessibility grants, which
+        # the runner never has — expected, and NOT gated here (a hard exit-code gate would
+        # permanently red this job). What IS gated: the default backend must still resolve
+        # to "macos", proving the glass-macos wiring actually links and runs.
+        run: |
+          out="$(cargo run -p glass-mcp --locked -- doctor || true)"
+          echo "$out"
+          echo "$out" | grep -q "default backend: macos" || {
+            echo "::error::glass-mcp doctor did not resolve the default backend to macos"
+            exit 1
+          }
+      - name: glass-mcp headless stdio smoke (initialize + tools/list; no grants needed)
+        run: ./scripts/test-macos-mcp.sh
 
   windows:
     name: Windows (build · clippy · test)
