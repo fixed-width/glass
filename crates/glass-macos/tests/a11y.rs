@@ -7,6 +7,16 @@
 //! ("hello" -> "world") and confirms the non-editable "Save" button rejects a write with
 //! `AxElementNotEditable`.
 //!
+//! Finally, a **bounds-agreement drift guard**: it clamped-centers the "Save" node's
+//! a11y-reported `bounds` into window-relative pixels and dispatches a real
+//! `MacosPlatform::send_pointer(Click)` there (the exact same input path `tests/input.rs`
+//! exercises), then confirms the fixture's *own* button handler — not the a11y layer —
+//! printed `SAVE_CLICKED`. `MacosA11y::snapshot`'s bounds (AXUIElement's `kAXPositionAttribute`/
+//! `kAXSizeAttribute`, converted to window-relative pixels) and `MacosPlatform::send_pointer`'s
+//! injection (window-relative pixel -> global point -> `CGEvent`) are two independent
+//! coordinate pipelines; this is the end-to-end proof they agree, closing the loop the unit
+//! tests around each side can only assert in isolation.
+//!
 //! **`harness = false`** (see `Cargo.toml`'s `[[test]] name = "a11y"` entry): like
 //! `capture.rs`/`input.rs`/`windows.rs`, `MacosPlatform::start_app` reaches
 //! `ffi::app_kit_init()` -> `NSApplication::sharedApplication(mtm)`, which requires the
@@ -38,11 +48,18 @@ mod macos_main {
     use std::process::Command;
     use std::time::Duration;
 
+    use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
         Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, Platform,
-        SandboxLevel,
+        SandboxLevel, Stream,
     };
     use glass_macos::MacosPlatform;
+
+    /// Settle after the a11y-bounds click before draining logs, mirroring `input.rs`'s
+    /// `ACTION_SETTLE` — generous relative to `send_pointer`'s own internal focus-settle so
+    /// the fixture's `fflush`ed `SAVE_CLICKED` line has definitely been read by the
+    /// platform's background log reader before we drain.
+    const CLICK_SETTLE: Duration = Duration::from_millis(400);
 
     /// The three elements the fixture exposes, asserted as substrings of the tree outline.
     /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, using only `name` (never
@@ -69,6 +86,14 @@ mod macos_main {
             return Some(node);
         }
         node.children.iter().find_map(|c| find_by_name(c, name))
+    }
+
+    /// True if any captured stdout line in `lines` contains `needle` — used by the
+    /// bounds-agreement check to confirm the fixture's own `onSave` handler (not the a11y
+    /// layer) observed the click. Mirrors `input.rs`'s `find_reported`, simplified to a
+    /// substring test since the fixture's marker line has no variable payload to parse out.
+    fn logs_contain(lines: &[(Stream, String)], needle: &str) -> bool {
+        lines.iter().any(|(stream, line)| *stream == Stream::Stdout && line.contains(needle))
     }
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
@@ -216,6 +241,37 @@ mod macos_main {
         }
 
         println!("A11Y_SETVALUE_PASS");
+
+        // --- Bounds-agreement drift guard: clamped-center Save's a11y bounds into
+        // window-relative pixels, click there through the real input path, and confirm
+        // the fixture's OWN click handler (not the a11y layer) saw it. This proves
+        // `MacosA11y::snapshot`'s bounds and `MacosPlatform::send_pointer`'s coordinate
+        // system agree end-to-end, not just that each is internally self-consistent. ---
+        let save_bounds = match save.bounds {
+            Some(b) => b,
+            None => return Err(format!("\"Save\" node has no bounds in re-snapshot:\n{outline2}")),
+        };
+        let (cx, cy) = match save_bounds.clamped_center(ctx.window.width, ctx.window.height) {
+            Some(p) => p,
+            None => {
+                return Err(format!(
+                    "\"Save\" bounds {save_bounds:?} have zero area against window {:?}",
+                    ctx.window
+                ))
+            }
+        };
+        let click_event =
+            PointerEvent::Click { x: cx, y: cy, button: MouseButton::Left, count: 1, modifiers: vec![] };
+        try_expect(platform.send_pointer(&click_event), "send_pointer(Click) on Save's a11y bounds")?;
+        std::thread::sleep(CLICK_SETTLE);
+        let click_logs = platform.drain_logs();
+        if !logs_contain(&click_logs, "SAVE_CLICKED") {
+            return Err(format!(
+                "click via a11y bounds ({cx},{cy}) did not hit Save (fixture stdout: {click_logs:?})"
+            ));
+        }
+        println!("A11Y_BOUNDS_PASS");
+
         Ok(())
     }
 

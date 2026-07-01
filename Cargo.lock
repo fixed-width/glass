@@ -1074,6 +1074,7 @@ dependencies = [
  "embed-manifest",
  "futures",
  "glass-a11y-linux",
+ "glass-a11y-macos",
  "glass-a11y-windows",
  "glass-android",
  "glass-core",

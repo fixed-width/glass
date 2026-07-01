@@ -50,6 +50,7 @@ glass-a11y-windows = { path = "../glass-a11y-windows" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 glass-macos = { path = "../glass-macos" }
+glass-a11y-macos = { path = "../glass-a11y-macos" }
 
 [build-dependencies]
 embed-manifest = "1"
