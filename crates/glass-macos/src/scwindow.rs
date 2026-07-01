@@ -44,7 +44,9 @@ use glass_core::{poll_until, GlassError, Result};
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
 // `geometry`/`scale`/`origin_pt` are read by `start_app` (via `backend.rs::discover_window`
-// -> `query_once`); `pid`/`window_id` stay unread until Plan 4's list/select_window.
+// -> `query_once`) and by `send_pointer` (via `backend.rs`'s direct
+// `find_window_for_pids` call on every pointer event); `pid`/`window_id` stay unread until
+// Plan 4's list/select_window.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowMatch {
@@ -79,14 +81,16 @@ pub(crate) struct WindowMatch {
 /// [`GlassError::PermissionDenied`] for a Screen Recording TCC decline,
 /// [`GlassError::CaptureFailed`] for anything else) or [`GlassError::Timeout`] if no
 /// matching window appears before `timeout` elapses.
-// No production caller: `MacosPlatform::start_app` runs its own poll loop
-// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
-// `child.try_wait()` so a crashed launch fails fast with `AppExited` — this function's
-// self-contained `poll_until` has no child handle to race against, so `start_app` can't
-// delegate its whole timeout budget to it. Kept `pub(crate)` + allowed here (not
-// deleted) as a plain "poll until found or timeout" primitive for a future call site
-// with no child to check (e.g. Plan 4 window rediscovery).
-#[allow(dead_code)]
+///
+/// `MacosPlatform::start_app` still can't use this directly: it runs its own poll loop
+/// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
+/// `child.try_wait()` so a crashed launch fails fast with `AppExited`, and this function's
+/// self-contained `poll_until` has no child handle to race against. But
+/// `MacosPlatform::send_pointer` does call this directly on every invocation, to
+/// re-resolve the window's current geometry/scale/origin fresh (the window may have moved
+/// or resized since `start_app`, or since the previous `send_pointer` call) — there's no
+/// child handle to race there either (the session is already established), so this
+/// self-contained poll-until-found-or-timeout is exactly what it needs.
 pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
 

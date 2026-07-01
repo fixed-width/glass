@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! CGEvent mouse + keyboard injection: `send_pointer` maps each window-relative PIXEL
 //! coordinate to a global Quartz POINT via `coords::pixel_to_global_point`, raises the
 //! target app (focus-before-inject), then posts `Move`/`Click`/`Drag`/`Scroll` as CGEvents
@@ -210,15 +211,18 @@ impl TypeSink for MacTypeSink<'_> {
 fn send_chord(chord: &str, source: Option<&CGEventSource>) -> Result<()> {
     let parts: Vec<&str> = chord.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
     let Some((key_token, mod_tokens)) = parts.split_last() else {
-        return Err(GlassError::InvalidKey(chord.to_string()));
+        return Err(GlassError::InvalidKey(format!("empty chord (no key token): '{chord}'")));
     };
 
     let mut modifiers = Vec::with_capacity(mod_tokens.len());
     for m in mod_tokens {
-        modifiers.push(Modifier::from_name(m).ok_or_else(|| GlassError::InvalidKey(chord.to_string()))?);
+        modifiers.push(
+            Modifier::from_name(m)
+                .ok_or_else(|| GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'")))?,
+        );
     }
-    let (keycode, needs_shift) =
-        resolve_chord_key(key_token).ok_or_else(|| GlassError::InvalidKey(chord.to_string()))?;
+    let (keycode, needs_shift) = resolve_chord_key(key_token)
+        .ok_or_else(|| GlassError::InvalidKey(format!("unknown key '{key_token}' in '{chord}'")))?;
 
     let mut flags = to_flags(&modifiers);
     if needs_shift {
@@ -490,9 +494,26 @@ mod tests {
     #[test]
     fn send_chord_rejects_empty_unknown_modifier_and_unknown_key() {
         // None of these reach `tap_key` (they error before posting anything), so a `None`
-        // event source is safe to pass here.
-        assert!(matches!(send_chord("", None), Err(GlassError::InvalidKey(_))));
-        assert!(matches!(send_chord("hyper+x", None), Err(GlassError::InvalidKey(_))));
-        assert!(matches!(send_chord("ctrl+nope", None), Err(GlassError::InvalidKey(_))));
+        // event source is safe to pass here. Each also asserts the message names the
+        // specific bad token — mirroring `glass_core::keys::parse_chord`'s specificity —
+        // so a regression that flattens these back to a bare `chord.to_string()` is caught.
+        match send_chord("", None) {
+            Err(GlassError::InvalidKey(msg)) => {
+                assert!(msg.contains("empty"), "expected an 'empty chord' message, got {msg:?}");
+            }
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        match send_chord("hyper+x", None) {
+            Err(GlassError::InvalidKey(msg)) => {
+                assert!(msg.contains("hyper"), "message should name the bad modifier, got {msg:?}");
+            }
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
+        match send_chord("ctrl+nope", None) {
+            Err(GlassError::InvalidKey(msg)) => {
+                assert!(msg.contains("nope"), "message should name the bad key, got {msg:?}");
+            }
+            other => panic!("expected InvalidKey, got {other:?}"),
+        }
     }
 }

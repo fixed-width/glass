@@ -2,11 +2,14 @@
 //! `send_pointer` land at the right place: a real `NSView` reports back the characters it
 //! received and the pixel it was clicked at, closing the loop on the whole
 //! pixel -> point -> global -> CGEvent -> AppKit -> app round trip. It also records the
-//! scroll-wheel sign question `input.rs`'s `MacScrollSink::wheel` left UNVERIFIED (see that
-//! file's module doc): a positive `dy` is sent and the fixture's raw, verbatim
-//! `NSEvent.scrollingDeltaY` is printed so a real granted run can confirm which sign macOS
-//! actually delivers — see the scroll leg's comment in `run_checks` below for why that sign
-//! is only recorded, not yet hard-asserted (no granted run has reached it for real yet).
+//! scroll-wheel sign `input.rs`'s `MacScrollSink::wheel` produces: a positive `dy` is sent
+//! and the fixture's raw, verbatim `NSEvent.scrollingDeltaY` is printed. A granted run has
+//! confirmed this leg passes end-to-end, but the observed sign is intentionally left
+//! unasserted here — see the scroll leg's comment in `run_checks` below — because it
+//! depends on the target Mac's **natural-scrolling** system setting
+//! (`com.apple.swipescrolldirection`), not just `input.rs`'s own `wheel1 = -dy` mapping, so
+//! hard-asserting one fixed sign here would be machine-specific rather than a real
+//! regression check.
 //!
 //! **`harness = false`** (see `Cargo.toml`'s `[[test]] name = "input"` entry) for the exact
 //! same reason as `tests/capture.rs`: `send_key`/`send_pointer` reach AppKit
@@ -255,19 +258,19 @@ mod macos_main {
         assert_click_near(&click_logs, CLICK_TARGET, CLICK_TOLERANCE)?;
         println!("send_pointer(Click) OK");
 
-        // --- send_pointer(Scroll): settle the scroll-wheel sign question. dy=5 is glass's
-        // "scroll the content DOWN" convention (see input.rs's module doc / glass-x11's
-        // `scroll_button(5=down,4=up, dy)`). `MacScrollSink::wheel` currently posts
-        // `wheel1 = -dy`; this call is what proves whether that's the right sign on real
-        // hardware, since `wheel1`'s effect on `NSEvent.scrollingDeltaY` was UNVERIFIED
-        // (input.rs's own doc comment) until a real granted run gets this far. Only
-        // `read_scroll`'s non-zero check is asserted here — the SIGN itself is recorded via
-        // `println!` rather than hard-asserted, because no run has yet reached this point
-        // for real (see this file's module doc: every granted run so far was blocked earlier,
-        // by `mini`'s screen being locked, before reaching the scroll leg at all). Once a
-        // real run reports the observed sign here, replace this comment + the println with a
-        // real assertion (flipping `input.rs`'s `wheel1 = -dy` first if the recorded sign
-        // shows glass's dy>0 does NOT produce the intended "scroll down" effect). ---
+        // --- send_pointer(Scroll): record the scroll-wheel sign. dy=5 is glass's "scroll
+        // the content DOWN" convention (see input.rs's module doc / glass-x11's
+        // `scroll_button(5=down,4=up, dy)`). `MacScrollSink::wheel` posts `wheel1 = -dy`, but
+        // what `NSEvent.scrollingDeltaY` the window server ultimately delivers to the fixture
+        // also depends on `mini`'s **natural-scrolling** system setting
+        // (`com.apple.swipescrolldirection`), which inverts the effective on-screen direction
+        // independent of anything `input.rs` controls. So only `read_scroll`'s non-zero check
+        // is hard-asserted here — the SIGN itself is recorded via `println!` rather than
+        // asserted against one fixed expectation, since a fixed expectation would be
+        // machine-specific rather than a portable regression check. Follow-up: read
+        // `com.apple.swipescrolldirection` (e.g. via `defaults read -g
+        // com.apple.swipescrolldirection`) and fold it into the expectation so this can
+        // become a real, machine-independent assertion. ---
         let scroll_event = PointerEvent::Scroll { x: 200, y: 200, dx: 0, dy: 5, modifiers: vec![] };
         try_expect(platform.send_pointer(&scroll_event), "send_pointer(Scroll)")?;
         std::thread::sleep(ACTION_SETTLE);
@@ -275,8 +278,8 @@ mod macos_main {
         let (reported_dx, reported_dy) = read_scroll(&scroll_logs)?;
         println!(
             "send_pointer(Scroll) OK: sent dx=0,dy=5 (glass 'scroll down') -> fixture reported \
-             scrollingDeltaX={reported_dx},scrollingDeltaY={reported_dy} (SIGN NOT YET ASSERTED — \
-             see this file's module doc)"
+             scrollingDeltaX={reported_dx},scrollingDeltaY={reported_dy} (sign depends on \
+             mini's natural-scrolling setting — see this file's module doc)"
         );
 
         Ok(())

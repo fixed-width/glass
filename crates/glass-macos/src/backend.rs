@@ -23,6 +23,13 @@ use crate::process::{self, LogSink};
 /// against `child.try_wait()`.
 const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Timeout for the fresh window re-resolution [`MacosPlatform::send_pointer`] does on every
+/// call via `scwindow::find_window_for_pids`. Short (unlike `start_app`'s `spec.timeout_ms`,
+/// which waits for a brand-new window to first appear): the window is already known to have
+/// existed as of the last successful call, so this only needs to cover the ordinary
+/// query-round-trip latency, not a real "is the app even launching" wait.
+const POINTER_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 /// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
 /// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
 pub struct MacosPlatform {
@@ -36,38 +43,13 @@ pub struct MacosPlatform {
     /// The launched child process, kept so `stop_app`/`Drop` can `process::terminate`
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
-    /// The active session's `pointPixelScale` (`1.0` on a 1x display, `2.0` on 2x
-    /// Retina), from the last `start_app`'s `WindowMatch`. Defaults to `1.0` before any
-    /// session starts. Read by `send_pointer` (Plan 3 Task 2) to map a window-relative
-    /// PIXEL coordinate (the tool boundary's unit) to a global POINT via
-    /// `coords::pixel_to_global_point` before posting a CGEvent; `send_key` (Plan 3 Task 3)
-    /// doesn't need it.
-    scale: f64,
-    /// The active session's window `contentRect.origin`, in POINTS (Quartz's global
-    /// screen space), from the last `start_app`'s `WindowMatch`. Defaults to `(0.0, 0.0)`
-    /// before any session starts. See `scale`'s doc.
-    origin_pt: (f64, f64),
-    /// The active session's window geometry in PIXELS (`WindowMatch::geometry`), from the
-    /// last `start_app`. Defaults to a zero-sized geometry before any session starts.
-    /// `send_pointer` bounds-checks each window-relative coordinate against this before
-    /// mapping it to a global point — see `check_pointer_bounds`'s doc for why the backend
-    /// enforces this itself rather than relying solely on `glass_core::session`'s own
-    /// (session-layer) bounds check.
-    geom: WindowGeometry,
 }
 
 impl MacosPlatform {
     /// Construct the backend, failing fast if a required TCC grant is missing.
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
-        Ok(Self {
-            logs: Arc::new(Mutex::new(Vec::new())),
-            app_pid: None,
-            child: None,
-            scale: 1.0,
-            origin_pt: (0.0, 0.0),
-            geom: WindowGeometry::default(),
-        })
+        Ok(Self { logs: Arc::new(Mutex::new(Vec::new())), app_pid: None, child: None })
     }
 
     /// Run the optional `spec.build` shell step in `spec.cwd`, mirroring the X11/Windows
@@ -101,8 +83,11 @@ impl MacosPlatform {
     /// `scwindow::find_window_for_pids`: that helper owns its *entire* poll loop
     /// internally, with no child handle to race against.
     ///
-    /// Returns the whole [`crate::scwindow::WindowMatch`] (not just its `geometry`) so
-    /// `start_app` can also stash `scale`/`origin_pt` for the session.
+    /// Returns the whole [`crate::scwindow::WindowMatch`] (not just its `geometry`), even
+    /// though `start_app` only reads `geometry` from it today — `send_pointer` does its own
+    /// independent, fresh `scwindow::find_window_for_pids` resolution per call rather than
+    /// reusing anything cached here (see its doc), so this return type is just the natural
+    /// shape of a `query_once` result, not evidence of caching elsewhere.
     fn discover_window(
         child: &mut Child,
         pid: u32,
@@ -175,9 +160,10 @@ impl Platform for MacosPlatform {
             Ok(m) => {
                 self.child = Some(child);
                 self.app_pid = Some(pid);
-                self.scale = m.scale;
-                self.origin_pt = m.origin_pt;
-                self.geom = m.geometry.clone();
+                // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
+                // window fresh on every call instead (see its doc) since it may move/resize
+                // after this initial discovery. Only the initial geometry is returned to the
+                // caller, matching every other backend's `start_app` contract.
                 Ok(m.geometry)
             }
             Err(e) => {
@@ -211,15 +197,22 @@ impl Platform for MacosPlatform {
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         crate::capture::capture_window(&[pid as i32], region)
     }
-    /// Map the active session's pid/`scale`/`origin_pt` into `input::send_pointer` — see
-    /// `input.rs`'s module doc for the CGEvent details and its main-thread-affinity note
-    /// (shared with `start_app`/`capture_frame` above). Bounds-checked against `self.geom`
-    /// first — see `check_pointer_bounds`'s doc.
+    /// Map the active session's pid into `input::send_pointer` — see `input.rs`'s module
+    /// doc for the CGEvent details and its main-thread-affinity note (shared with
+    /// `start_app`/`capture_frame` above).
+    ///
+    /// NOTE: re-resolves the window fresh via `scwindow::find_window_for_pids` on every
+    /// call, mirroring `capture_frame`'s per-call resolution above — the window may have
+    /// moved or resized since `start_app` (or any earlier `send_pointer` call), so a
+    /// `scale`/`origin_pt`/geometry cached once at `start_app` would go stale. Both the
+    /// bounds check (`check_pointer_bounds`, see its doc) and the coordinate mapping use
+    /// this freshly-resolved geometry/scale/origin.
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
-        check_pointer_bounds(event, &self.geom)?;
-        crate::input::send_pointer(event, pid as i32, self.scale, self.origin_pt)
+        let m = crate::scwindow::find_window_for_pids(&[pid as i32], POINTER_RESOLVE_TIMEOUT)?;
+        check_pointer_bounds(event, &m.geometry)?;
+        crate::input::send_pointer(event, pid as i32, m.scale, m.origin_pt)
     }
     /// Map the active session's pid into `input::send_key` — see `input.rs`'s module doc
     /// for the CGEvent keyboard details.
@@ -270,9 +263,6 @@ mod tests {
             logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
             app_pid: Some(42),
             child: None,
-            scale: 1.0,
-            origin_pt: (0.0, 0.0),
-            geom: WindowGeometry::default(),
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -280,14 +270,7 @@ mod tests {
 
     #[test]
     fn app_pid_returns_the_constructed_value() {
-        let p = MacosPlatform {
-            logs: Arc::new(Mutex::new(Vec::new())),
-            app_pid: Some(42),
-            child: None,
-            scale: 1.0,
-            origin_pt: (0.0, 0.0),
-            geom: WindowGeometry::default(),
-        };
+        let p = MacosPlatform { logs: Arc::new(Mutex::new(Vec::new())), app_pid: Some(42), child: None };
         assert_eq!(p.app_pid(), Some(42));
     }
 
@@ -296,14 +279,7 @@ mod tests {
         // No child stored: stop_app must not panic (e.g. on an unwrap of a live process
         // handle) and must succeed — this path never touches AppKit, so it's exercisable
         // off the Mac-gated suite's main-thread test.
-        let mut p = MacosPlatform {
-            logs: Arc::new(Mutex::new(Vec::new())),
-            app_pid: None,
-            child: None,
-            scale: 1.0,
-            origin_pt: (0.0, 0.0),
-            geom: WindowGeometry::default(),
-        };
+        let mut p = MacosPlatform { logs: Arc::new(Mutex::new(Vec::new())), app_pid: None, child: None };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
         assert_eq!(p.app_pid(), None);
