@@ -206,10 +206,18 @@ item written to the private pasteboard) before routing to it, so an injection th
 failed doesn't get mistaken for a working bridge.
 
 If the target runs under Apple's **hardened runtime**, `DYLD_INSERT_LIBRARIES` injection is
-stripped by the OS and the swizzle can't take. For those apps (and for any injectable app
-whose shim confirmation didn't arrive), the profile also denies the real pasteboard service
-(`com.apple.pasteboard.1`) outright, and `glass_clipboard_get`/`glass_clipboard_set` return
-`Unsupported` — fail-closed, rather than silently falling back to the shared system clipboard.
+stripped by the OS and the swizzle can't take. Such apps aren't injectable, so the Seatbelt
+profile denies them the real pasteboard service (`com.apple.pasteboard.1`) outright and
+`glass_clipboard_get`/`glass_clipboard_set` return `Unsupported` — fail-closed at the profile
+level, not a silent fall-back to the shared system clipboard.
+
+For an *injectable* app whose shim confirmation doesn't arrive (injection silently failed),
+`glass_clipboard_get`/`glass_clipboard_set` also return `Unsupported`: glass decides that
+route after launch, from the missing sentinel, and never bridges to the real clipboard. Note
+this is a glass-side gate — the profile *does* allow the pasteboard service for an injectable
+target (that decision is made before launch, before confirmation is possible), so a silently-
+failed injection leaves the app itself still able to reach the real pasteboard directly. In
+practice injection either takes or the launch fails loudly, so this window is rare.
 At `sandbox: off` clipboard access works normally against the real pasteboard (see
 [Tools available on macOS](#tools-available-on-macos) above).
 
