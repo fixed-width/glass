@@ -24,15 +24,14 @@ mod imp {
     /// The sentinel pasteboard-item type glass looks for to confirm the swizzle took.
     const SENTINEL_TYPE: &str = "tech.fixedwidth.glass.clip-shim";
 
-    /// The private pasteboard name, read once from `GLASS_CLIP_PASTEBOARD` and cached for
-    /// the replacement IMP — which, as a bare Objective-C method implementation, has no
-    /// other way to reach this process's environment context each time it's invoked.
-    fn name() -> &'static NSString {
-        static NAME: OnceLock<Retained<NSString>> = OnceLock::new();
-        NAME.get_or_init(|| {
-            let raw = std::env::var("GLASS_CLIP_PASTEBOARD").unwrap_or_default();
-            NSString::from_str(&raw)
-        })
+    /// The private pasteboard name, read once from `GLASS_CLIP_PASTEBOARD` and cached as a
+    /// plain `String` — the replacement IMP, as a bare Objective-C method implementation, has
+    /// no other way to reach this process's environment each time it's invoked. Cached as a
+    /// `String` (not a `Retained<NSString>`) because an `NSString` is not `Sync` and so cannot
+    /// live in a `static OnceLock`; the cheap `NSString` is rebuilt at each use site.
+    fn name() -> &'static str {
+        static NAME: OnceLock<String> = OnceLock::new();
+        NAME.get_or_init(|| std::env::var("GLASS_CLIP_PASTEBOARD").unwrap_or_default())
     }
 
     /// Replacement implementation for `+[NSPasteboard generalPasteboard]`: returns the
@@ -45,7 +44,8 @@ mod imp {
     /// [`Retained::autorelease_return`] — the pattern `objc2` itself documents for
     /// returning an object from a hand-written method implementation.
     extern "C-unwind" fn glass_general_pasteboard(_cls: &AnyClass, _cmd: Sel) -> *mut NSPasteboard {
-        let pb = NSPasteboard::pasteboardWithName(name());
+        let pb_name = NSString::from_str(name());
+        let pb = NSPasteboard::pasteboardWithName(&pb_name);
         Retained::autorelease_return(pb)
     }
 
@@ -84,7 +84,8 @@ mod imp {
         // Prove the injection took: write a sentinel item to the private pasteboard so
         // glass can read it back from the host side and confirm the swizzle is live before
         // trusting anything the contained app writes to "the clipboard".
-        let pb = NSPasteboard::pasteboardWithName(name());
+        let pb_name = NSString::from_str(name());
+        let pb = NSPasteboard::pasteboardWithName(&pb_name);
         pb.clearContents();
         let sentinel_type = NSString::from_str(SENTINEL_TYPE);
         let sentinel_value = NSString::from_str("1");
