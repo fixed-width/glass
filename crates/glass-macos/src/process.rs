@@ -14,11 +14,13 @@
 //! Clip-shim injection: a contained launch whose target is not hardened-runtime signed
 //! ([`target_is_injectable`]) gets `glass-clip-shim-macos`'s built dylib
 //! ([`shim_dylib_path`]) loaded via `DYLD_INSERT_LIBRARIES`, plus a per-spawn private
-//! pasteboard name in `GLASS_CLIP_PASTEBOARD` — both set on the `Command` before the fork
-//! in [`spawn`], so they're already part of the child's environment when `pre_exec`'s
-//! `sandbox_init` call runs. [`ClipLaunch`] carries those facts back to `start_app`, which
-//! holds them until the launched window is confirmed and the clipboard route can be
-//! decided (a later step; not this module's concern).
+//! pasteboard name in `GLASS_CLIP_PASTEBOARD` — both set on the `Command` before
+//! `cmd.spawn()` in [`spawn`]. `Command`'s envp is applied at the `exec` that follows
+//! `pre_exec`'s `sandbox_init` call (not at fork/`pre_exec` time), so both vars are present
+//! in the launched app's environment, having survived the sandbox. [`ClipLaunch`] carries
+//! those facts back to `start_app`, which holds them until the launched window is
+//! confirmed and the clipboard route can be decided (a later step; not this module's
+//! concern).
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
@@ -96,16 +98,21 @@ const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 /// ["cdylib"]` compiles to `lib<crate name, underscored>.dylib` on macOS.
 const SHIM_DYLIB_NAME: &str = "libglass_clip_shim_macos.dylib";
 
-/// Resolve the injected clip shim's dylib: [`SHIM_DYLIB_ENV`] (trusted as given, no
-/// existence check — an explicit override is the caller's own responsibility) → next to the
-/// running executable → the cargo target dir one level up from it (`current_exe` is
+/// Resolve the injected clip shim's dylib: [`SHIM_DYLIB_ENV`] → next to the running
+/// executable → the cargo target dir one level up from it (`current_exe` is
 /// `target/<profile>/<bin>` for a normal build, or `target/<profile>/deps/<bin>-<hash>`
 /// under `cargo test`, one directory deeper than the shim's own build output — hence the
-/// second candidate). `None` if none of these exist: callers treat that as "not
+/// second candidate). Every tier, including the env override, is existence-checked
+/// (`.is_file()`) before being returned — a bad override (stale/typo'd path) falls through
+/// to the remaining tiers rather than being trusted blind, same fail-closed discipline as
+/// the rest of this resolution. `None` if none of these exist: callers treat that as "not
 /// injectable" (fail-closed — no resolvable shim, no injection).
 fn shim_dylib_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var(SHIM_DYLIB_ENV) {
-        return Some(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
     }
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let next_to_exe = exe_dir.join(SHIM_DYLIB_NAME);
@@ -166,15 +173,26 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
         let dylib_path = shim_dylib_path();
         let injectable = target_is_injectable(&program) && dylib_path.is_some();
         let allow_pasteboard = injectable;
+        // The shim dylib's parent dir, re-allowed for read in the profile below when
+        // injecting (`None` — no re-allow — otherwise, matching unchanged pre-injection
+        // behavior).
+        let mut shim_dir: Option<PathBuf> = None;
         if injectable {
             let token = CLIP_TOKEN.fetch_add(1, Ordering::Relaxed);
             let name = crate::clipboard_route::session_pasteboard_name(token);
             let dylib = dylib_path.expect("checked Some above");
-            // Set BEFORE the fork below: `Command::env` populates the child's environment at
-            // exec time, so both vars are already present when `pre_exec`'s `sandbox_init`
-            // call runs, and survive it into the launched app — same timing guarantee the
-            // profile CString relies on.
-            cmd.env("DYLD_INSERT_LIBRARIES", dylib);
+            // The shim dylib lives in glass's own `target/<profile>/` tree, typically under
+            // $HOME — which the profile below denies by default (see `build_profile`'s
+            // `/Users` deny). dyld loads the shim AFTER `sandbox_init` applies the profile
+            // (in `pre_exec`, below), so its directory must be re-allowed for read here or
+            // dyld can't open it, injection silently fails, and the sandboxed app never sees
+            // the shim.
+            shim_dir = dylib.parent().map(Path::to_path_buf);
+            // Set BEFORE `cmd.spawn()`: `Command`'s envp is applied at the `exec` that
+            // follows `pre_exec`'s `sandbox_init` call (not at fork/`pre_exec` time), so both
+            // vars are present in the launched app's environment, having survived the
+            // sandbox — same timing guarantee the profile CString relies on.
+            cmd.env("DYLD_INSERT_LIBRARIES", &dylib);
             cmd.env("GLASS_CLIP_PASTEBOARD", &name);
             clip = Some(ClipLaunch {
                 name,
@@ -188,7 +206,7 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
         let opts = ProfileOpts {
             cwd,
             program,
-            ro_binds: vec![],
+            ro_binds: shim_dir.into_iter().collect(),
             rw_binds: vec![],
             allow_pasteboard,
         };
@@ -428,17 +446,45 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn shim_dylib_path_trusts_an_explicit_env_override_without_checking_existence() {
-        // A deliberately nonexistent path: the override tier is trusted as given (matches
-        // `glass-windows`'s `hook_dll_path` precedent for its own DLL override), unlike the
-        // exe-dir/target-dir fallback tiers below it, which do check.
+    fn shim_dylib_path_uses_an_explicit_env_override_that_exists() {
+        // The override tier is existence-checked like the exe-dir/target-dir fallback tiers
+        // below it (fail-closed, uniformly) — a real file at the override path is returned.
+        let dir = std::env::temp_dir();
+        let dylib = dir.join(format!("glass-clip-shim-test-{}.dylib", std::process::id()));
+        std::fs::write(&dylib, b"stand-in for the real shim dylib; only existence matters here")
+            .expect("write stand-in dylib file");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dylib.clone());
+
         let previous = std::env::var(SHIM_DYLIB_ENV).ok();
-        std::env::set_var(SHIM_DYLIB_ENV, "/nonexistent/glass-clip-shim-test.dylib");
+        std::env::set_var(SHIM_DYLIB_ENV, &dylib);
         let resolved = shim_dylib_path();
         match previous {
             Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
             None => std::env::remove_var(SHIM_DYLIB_ENV),
         }
-        assert_eq!(resolved, Some(PathBuf::from("/nonexistent/glass-clip-shim-test.dylib")));
+        assert_eq!(resolved, Some(dylib));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn shim_dylib_path_falls_through_a_nonexistent_env_override() {
+        // Unlike the old (fail-open) behavior, a bad override — stale env, typo'd path — must
+        // not be trusted blind: it falls through to the remaining tiers (or `None`) rather
+        // than handing dyld an unopenable path, same fail-closed discipline as those tiers.
+        let bogus = PathBuf::from("/nonexistent/glass-clip-shim-test.dylib");
+        let previous = std::env::var(SHIM_DYLIB_ENV).ok();
+        std::env::set_var(SHIM_DYLIB_ENV, &bogus);
+        let resolved = shim_dylib_path();
+        match previous {
+            Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
+            None => std::env::remove_var(SHIM_DYLIB_ENV),
+        }
+        assert_ne!(resolved, Some(bogus), "a nonexistent override must not be returned as-is");
     }
 }
