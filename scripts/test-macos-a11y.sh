@@ -38,9 +38,8 @@ cargo test -p glass-macos --test a11y --no-run
 # bundle holds on this project's dev Mac. That happens out-of-band from this script: copy
 # the `a11y` test binary this script just built into the GlassProbe.app bundle, re-sign,
 # and launch it via a `gui/501` LaunchAgent so it inherits the grant — the same recipe
-# test-macos.sh's GLASS_MACOS_ONBOX block documents for `capture`/`input`/`windows` (see
-# .superpowers/sdd/objc2-spike-report.md and .superpowers/sdd/task-6-brief.md for the exact
-# procedure). Point the launched binary at a fixture built the same way as above via
+# test-macos.sh's GLASS_MACOS_ONBOX block documents for `capture`/`input`/`windows`. Point
+# the launched binary at a fixture built the same way as above via
 # `GLASS_A11Y_FIXTURE_BIN=/path/to/a11y_fixture` — crates/glass-macos/tests/a11y.rs falls
 # back to building its own copy with `swiftc` when the var is unset, but the granted run
 # pre-builds one so the granted process doesn't need a writable `$TMPDIR` / working

@@ -1,7 +1,7 @@
-// a11y_fixture.swift — glass-macos accessibility-tree test fixture (Plan 6 Task 3).
+// a11y_fixture.swift — glass-macos accessibility-tree test fixture.
 //
 // A minimal Cocoa app whose window exposes a real NSAccessibility tree with three named
-// controls, for the macOS a11y reader's later on-box tests (Plan 6) to drive by name:
+// controls, for the macOS a11y reader's on-box tests to drive by name:
 //
 //   - an NSButton titled "Save" — prints `SAVE_CLICKED` to stdout (flushed) when clicked,
 //     so a later bounds-agreement test can grep the app's captured stdout for the marker.

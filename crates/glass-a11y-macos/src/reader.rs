@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `MacosA11y`: the `AXUIElement` accessibility reader behind `glass-core`'s
 //! [`Accessibility`] seam. Given the launched app's pid and the active window's pixel
 //! geometry (from the display backend), it selects the matching `AXWindow`, recovers the
@@ -23,7 +24,7 @@ use glass_core::{
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
 
-use crate::ffi;
+use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
 
 /// Deepest subtree level walked. Bounds work on a pathological/cyclic tree together with
@@ -43,7 +44,9 @@ const MAX_SIBLINGS: usize = 4096;
 /// an already-snapped-to-integer `scale` (see [`select_window`]); the raw width ratio can be
 /// off by a few points from border/content-vs-frame insets, which is why the scale is
 /// snapped before this tolerance is applied rather than folded into a larger tolerance here.
-const POSITION_TOLERANCE_PX: i32 = 8;
+/// Typed `i64` so the pixel-offset comparison in [`select_window`] stays in `i64` end-to-end
+/// (no `.abs()` on an `i32` that could wrap — see there).
+const POSITION_TOLERANCE_PX: i64 = 8;
 /// Slack (pixels) allowed between the backend's reported window height and the height the
 /// width-derived `scale` predicts for the `AXWindow`. The scale is taken from *width*
 /// because a title bar makes the AX frame height exceed the captured content height; this
@@ -101,10 +104,10 @@ impl Accessibility for MacosA11y {
         // Verify role + name + bounds (guards a stale id / tree drift): if drift landed a
         // different same-role+name element on this pre-order id, its bounds sit elsewhere
         // and it is rejected here rather than silently overwritten.
-        let ax_role = ffi::attribute_string(&el, "AXRole").unwrap_or_default();
+        let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role);
-        let name =
-            ffi::attribute_string(&el, "AXTitle").or_else(|| ffi::attribute_string(&el, "AXDescription"));
+        let name = ffi::attribute_string(&el, attr::TITLE)
+            .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
@@ -112,21 +115,27 @@ impl Accessibility for MacosA11y {
             return Err(GlassError::AxElementChanged(target.id.0));
         }
 
-        if !ffi::is_settable(&el, "AXValue") {
+        if !ffi::is_settable(&el, attr::VALUE) {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
 
-        let before = ffi::attribute_string(&el, "AXValue").unwrap_or_default();
+        // Best-effort pre-write value (an unreadable `AXValue` here is fine — the *post*-write
+        // confirmation below is the honesty check, and it is error-aware).
+        let before = ffi::attribute_string(&el, attr::VALUE).unwrap_or_default();
         ffi::set_string_value(&el, text)?;
 
         // Read-back poll: some editables accept the AX write without an `AXError` but never
-        // actually change `AXValue` (a misleading success) — require the read-back to show
-        // the change before reporting success, never a silent false-success.
+        // actually change `AXValue` (a misleading success) — require the read-back to show the
+        // change before reporting success, never a silent false-success. The read-back is
+        // *error-aware*: only `Ok(Some(v))` (a real value) can confirm the write; an `Err` (a
+        // genuine read failure) or `Ok(None)` (absent value) is inconclusive, so we keep
+        // polling to the deadline rather than mistaking a failed read for a change.
         let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
         loop {
-            let after = ffi::attribute_string(&el, "AXValue").unwrap_or_default();
-            if set_value_took(&before, &after, text) {
-                return Ok(());
+            if let Ok(Some(after)) = ffi::attribute_string_checked(&el, attr::VALUE) {
+                if set_value_took(&before, &after, text) {
+                    return Ok(());
+                }
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::AxValueNotApplied(target.id.0));
@@ -170,7 +179,7 @@ fn select_window(
     windows: &[CFRetained<AXUIElement>],
     win: &WindowGeometry,
 ) -> Option<(CFRetained<AXUIElement>, f64)> {
-    let mut best: Option<(i32, CFRetained<AXUIElement>, f64)> = None;
+    let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
         let Ok((ax_w, ax_h)) = ffi::ax_size(w) else {
@@ -192,8 +201,10 @@ fn select_window(
             diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable>"));
             continue;
         };
-        let dx = ((ax_x * scale).round() as i32 - win.x).abs();
-        let dy = ((ax_y * scale).round() as i32 - win.y).abs();
+        // Cast to `i64` before subtracting so `.abs()` can never wrap (`i32::MIN.abs()`
+        // panics) — the same no-overflow discipline `axwindow::within_tolerance` follows.
+        let dx = ((ax_x * scale).round() as i64 - i64::from(win.x)).abs();
+        let dy = ((ax_y * scale).round() as i64 - i64::from(win.y)).abs();
         diagnostics.push(format!("ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}"));
         if dx > POSITION_TOLERANCE_PX || dy > POSITION_TOLERANCE_PX {
             continue;
@@ -230,23 +241,38 @@ fn walk(
 ) -> AxNode {
     *count += 1;
 
-    let ax_role = ffi::attribute_string(el, "AXRole").unwrap_or_default();
+    let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let role = mapping::map_role(&ax_role);
-    // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to
-    // the raw AX role string so `raw_role` is never empty.
-    let raw_role = ffi::attribute_string(el, "AXRoleDescription").unwrap_or(ax_role);
+    // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to the
+    // raw AX role string when it's absent. If both are absent (an element exposing neither)
+    // `raw_role` is the empty string — a "role unknown" signal, not a guaranteed-populated
+    // field.
+    let raw_role = ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role);
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
-    let name = ffi::attribute_string(el, "AXTitle").or_else(|| ffi::attribute_string(el, "AXDescription"));
-    let value = ffi::attribute_string(el, "AXValue");
+    let name = ffi::attribute_string(el, attr::TITLE)
+        .or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
+    let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
     let states = mapping::map_states(&gather_states(el));
 
     let mut children = Vec::new();
     if depth < MAX_DEPTH && *count < MAX_NODES {
+        // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
+        // `AXChildren`) node and only `Err` for a *real* AX read failure. Degrade a real
+        // failure to "no children" so one broken node can't fail the whole snapshot — but log
+        // it (mirroring `select_window`'s no-match diagnostic) so the dropped subtree is
+        // observable, never silent.
+        let child_els = ffi::children(el).unwrap_or_else(|err| {
+            eprintln!(
+                "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
+                 bounds={bounds:?}: {err}; treating as no children"
+            );
+            Vec::new()
+        });
         let mut siblings = 0usize;
-        for child in ffi::children(el).unwrap_or_default() {
+        for child in child_els {
             siblings += 1;
             if siblings > MAX_SIBLINGS {
                 break;
@@ -277,7 +303,7 @@ fn walk(
 /// reusable predicate so [`find_nth`] prunes identically and its pre-order ids line up with
 /// this walk's. A node whose size can't be read is *kept* (its `bounds` become `None`)
 /// rather than pruned, so an unreadable-geometry container never silently drops its subtree.
-pub(crate) fn should_skip(el: &AXUIElement) -> bool {
+fn should_skip(el: &AXUIElement) -> bool {
     matches!(ffi::ax_size(el), Ok((w, h)) if w <= 0.0 || h <= 0.0)
 }
 
@@ -340,10 +366,10 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 /// simple universal attributes, and the reader never over-claims a state it didn't read.
 fn gather_states(el: &AXUIElement) -> AxStateFacts {
     AxStateFacts {
-        enabled: ffi::attribute_bool(el, "AXEnabled").unwrap_or(false),
-        focused: ffi::attribute_bool(el, "AXFocused").unwrap_or(false),
-        focusable: ffi::is_settable(el, "AXFocused"),
-        editable: ffi::is_settable(el, "AXValue"),
+        enabled: ffi::attribute_bool(el, attr::ENABLED).unwrap_or(false),
+        focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
+        focusable: ffi::is_settable(el, attr::FOCUSED),
+        editable: ffi::is_settable(el, attr::VALUE),
         ..Default::default()
     }
 }
