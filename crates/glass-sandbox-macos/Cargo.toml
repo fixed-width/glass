@@ -9,8 +9,5 @@ publish.workspace = true
 [dependencies]
 glass-core.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-
 [lints]
 workspace = true

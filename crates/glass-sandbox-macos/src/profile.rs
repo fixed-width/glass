@@ -38,8 +38,8 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     p.push_str("(version 1)\n(deny default)\n");
     // Process + basic host info.
     p.push_str("(allow process-fork)\n(allow process-exec*)\n(allow sysctl-read)\n");
-    // Mach: broad lookup + register. `mach-register` is REQUIRED so the app can vend its
-    // accessibility port — without it AXUIElement reads return an empty tree (proven on the mini).
+    // Mach: broad lookup + register. `mach-register` is REQUIRED so the app can serve its
+    // accessibility tree — a sandboxed app returns an empty AX tree without it.
     p.push_str("(allow mach-lookup)\n(allow mach-register)\n(allow iokit-open)\n");
     // Filesystem reads: system dyld/frameworks + program dir + cwd + ro_binds. $HOME is NOT
     // listed → deny-default hides the user's home (Linux tmpfs-home parity).
@@ -47,7 +47,10 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     for r in SYSTEM_READ_ROOTS {
         push_subpath(&mut p, r);
     }
-    if let Some(dir) = opts.program.parent() {
+    // A bare program name (no `/`) yields `Some("")` from `Path::parent`; filter it out rather
+    // than emit `(subpath "")`, which would (at best) be a no-op and (at worst) surprise a
+    // future SBPL reader.
+    if let Some(dir) = opts.program.parent().filter(|d| !d.as_os_str().is_empty()) {
         push_subpath_path(&mut p, dir);
     }
     push_subpath_path(&mut p, &opts.cwd);
@@ -175,5 +178,47 @@ mod tests {
         let p = build_profile(SandboxLevel::Default, &o);
         assert!(p.contains(r#"(subpath "/opt/data")"#), "{p}");
         assert!(p.contains(r#"(subpath "/opt/scratch")"#), "{p}");
+    }
+
+    /// A `cwd` containing `"` and `\` must come out of `sbpl_quote` escaped, so the path stays
+    /// an inert string literal rather than breaking out of the generated SBPL. This is the sole
+    /// coverage for `sbpl_quote`, which is the only thing standing between an adversarial path
+    /// and profile injection.
+    #[test]
+    fn cwd_with_quote_and_backslash_is_escaped_not_injected() {
+        let mut o = opts();
+        o.cwd = PathBuf::from(r#"/tmp/a"b\c"#);
+        let p = build_profile(SandboxLevel::Default, &o);
+        assert!(
+            p.contains(r#"/tmp/a\"b\\c"#),
+            "expected the escaped literal in the profile:\n{p}"
+        );
+        // If escaping were missing, the raw `"` would close the SBPL string literal early,
+        // right after `/tmp/a`, letting the rest of the path (or worse) be read as SBPL.
+        assert!(
+            !p.contains("\"/tmp/a\"b"),
+            "raw unescaped quote must not terminate the string literal early:\n{p}"
+        );
+    }
+
+    /// A bare program name has no directory component (`Path::parent` returns `Some("")`);
+    /// `build_profile` must not emit that as `(subpath "")`.
+    #[test]
+    fn bare_program_name_does_not_emit_empty_subpath() {
+        let mut o = opts();
+        o.program = PathBuf::from("Demo");
+        let p = build_profile(SandboxLevel::Default, &o);
+        assert!(!p.contains(r#"(subpath "")"#), "{p}");
+    }
+
+    /// `Strict` is defined as `Default` minus network access; assert that invariant directly
+    /// so the two variants can never silently diverge elsewhere in the profile.
+    #[test]
+    fn strict_equals_default_minus_network_line() {
+        let o = opts();
+        assert_eq!(
+            build_profile(SandboxLevel::Strict, &o),
+            build_profile(SandboxLevel::Default, &o).replace("(allow network*)\n", "")
+        );
     }
 }
