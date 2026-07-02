@@ -1081,6 +1081,7 @@ dependencies = [
  "glass-core",
  "glass-macos",
  "glass-sandbox-linux",
+ "glass-sandbox-macos",
  "glass-wayland",
  "glass-windows",
  "glass-x11",

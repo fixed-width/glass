@@ -53,10 +53,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // Only show sections for backends actually compiled into THIS binary — absent
     // backends (e.g. windows on a Linux build, or macos on a non-macOS build) are
     // omitted rather than listed as "not built into this binary" placeholders.
-    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS instead gets two
-    // sections below — "macos" (the platform backend's own TCC posture) and
-    // "accessibility (macos)" (the a11y-tool reader's readiness) — see the comment there
-    // for why the two aren't merged. Android is the exception: its crate is
+    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS instead gets three
+    // sections below — "macos" (the platform backend's own TCC posture), "sandbox" (Seatbelt
+    // containment posture, mirroring the Linux/Windows "sandbox" sections), and
+    // "accessibility (macos)" (the a11y-tool reader's readiness, kept separate from "macos" —
+    // see the comment there for why). Android is the exception: its crate is
     // host-OS-agnostic and always compiled in, so its section is always emitted, gated
     // at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];
@@ -97,6 +98,8 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     #[cfg(target_os = "macos")]
     {
         sections.push(Section::new("macos", Some("macos".into()), macos_checks(backend)));
+        // Mirrors the Linux/Windows "sandbox" section: Seatbelt containment posture.
+        sections.push(Section::new("sandbox", None, glass_sandbox_macos::checks()));
         // Mirrors "accessibility (linux)"/"accessibility (windows)": a dedicated section
         // for the a11y-tool reader itself (glass_a11y_snapshot/marks/click_element/
         // set_value), distinct from the "macos" section above which covers the platform
@@ -317,7 +320,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
         #[cfg(target_os = "macos")]
-        assert_eq!(titles, ["general", "network", "macos", "accessibility (macos)", "android"]);
+        assert_eq!(titles, ["general", "network", "macos", "sandbox", "accessibility (macos)", "android"]);
         // Android's section is always present and non-empty — its basic presence checks now
         // run unconditionally (deep probes gated to the selected backend; Fails softened to
         // Warn when android isn't active). Asserting non-empty catches accidental removal of

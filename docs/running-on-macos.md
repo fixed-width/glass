@@ -160,7 +160,58 @@ accessibility-tree tools — `glass_a11y_snapshot`, `glass_a11y_marks`,
 driving the AXUIElement tree; they need the same Accessibility grant from step 3
 above (no separate permission).
 
-- **Clipboard** (`glass_clipboard_get`, `glass_clipboard_set`) — read and write the system pasteboard (no containment yet).
+- **Clipboard** (`glass_clipboard_get`, `glass_clipboard_set`) — read and write the system pasteboard at
+  `sandbox: off`. Under containment (`default`/`strict`) the clipboard is isolated — see
+  [Sandboxing](#sandboxing) below.
+
+## Sandboxing
+
+glass **sandboxes every launched app by default** on macOS via the OS's built-in
+**Seatbelt** sandbox (`sandbox_init`) — nothing to install. `glass_start`'s `sandbox`
+arg (or `GLASS_SANDBOX`) selects the level:
+
+- **`default`** (the default) — filesystem and process containment; network allowed.
+- **`strict`** — same containment, plus outbound network blocked.
+- **`off`** — no containment; the app runs unconfined.
+
+`default` and `strict` are **fail-closed**: if `sandbox_init` rejects the generated
+profile, `glass_start` errors rather than launching the app unconfined. `off` is the
+explicit escape hatch. The `sandbox` level governs the **launched app only** — the
+optional `build` step always runs unsandboxed, with your full developer environment.
+
+### The profile
+
+The generated Seatbelt profile is **deny-default**: everything not explicitly allowed is
+denied. Filesystem reads are limited to the system frameworks (`/usr/lib`, `/System`,
+`/Library`, `/private/var/db/dyld`), the launched program's own directory, and the
+working directory — `$HOME` is not broadly readable, so the rest of your home directory
+(including `~/.ssh` and other secrets) stays hidden. Writes are limited to the same
+working directory plus the usual scratch/cache roots (`/private/var/folders`,
+`/private/tmp`, `/tmp`). `mach-register` is allowed so the app can still serve its
+accessibility tree to `glass_a11y_snapshot`/`glass_a11y_marks`/`glass_click_element`/
+`glass_set_value` — a sandboxed app that can't register with the window server returns
+an empty AX tree.
+
+### Clipboard isolation
+
+Under `default`/`strict` the profile denies the app the real pasteboard
+(`com.apple.pasteboard.1`), so `glass_clipboard_get`/`glass_clipboard_set` return
+`Unsupported` rather than silently falling back to the shared system clipboard. At
+`sandbox: off` clipboard access works normally (see
+[Tools available on macOS](#tools-available-on-macos) above).
+
+### Known limits
+
+- **The mach allow-list is broad** (`(allow mach-lookup)`) — narrowing it to only the
+  services a given app actually needs is a hardening follow-up.
+- **Electron apps may be able to escape their own in-app sandbox** under this
+  containment. Seatbelt contains the process from the outside; an Electron app's
+  internal renderer/main-process sandboxing is a separate mechanism this doesn't harden.
+- `sandbox_init` is **deprecated** by Apple in favor of the App Sandbox entitlement
+  model, but it remains present and functional on every currently-supported macOS
+  release — it's what underpins App Sandbox itself, and Chromium uses it too.
+
+Check `glass-mcp doctor`'s `[sandbox]` section for the live Seatbelt availability check.
 
 ## Troubleshooting: headless / SSH setup
 

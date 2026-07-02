@@ -1,9 +1,12 @@
 //! macOS clipboard (the general `NSPasteboard`) read/write behind the `Platform` seam.
 //!
-//! Text only, matching `Platform::get_clipboard`/`set_clipboard`. macOS has no clipboard
-//! containment yet, so this acts on the user's **real system pasteboard** — the same
-//! shared-desktop behaviour the other backends have under `GLASS_DISPLAY=:0` / the Windows
-//! backend's `sandbox=off`. Isolation will arrive with future macOS containment.
+//! Text only, matching `Platform::get_clipboard`/`set_clipboard`. This module implements the
+//! **uncontained** (`sandbox: off`) path only: it acts on the user's **real system
+//! pasteboard** — the same shared-desktop behaviour the other backends have under
+//! `GLASS_DISPLAY=:0` / the Windows backend's `sandbox=off`. Under `Default`/`Strict`
+//! containment the Seatbelt profile denies the app the real pasteboard, so
+//! `MacosPlatform::get_clipboard`/`set_clipboard` route those levels to `Unsupported`
+//! before ever reaching this module — the clipboard is isolated, not bridged.
 //!
 //! The only `unsafe` here is reading AppKit's `NSPasteboardTypeString` extern static (Rust
 //! requires `unsafe` to read any extern static — see the `// SAFETY:` note); the `NSPasteboard`

@@ -136,6 +136,15 @@ jobs:
       - run: cargo build  -p glass-a11y-macos --locked
       - run: cargo clippy -p glass-a11y-macos --all-targets --locked -- -D warnings
       - run: cargo test   -p glass-a11y-macos --locked
+      # glass-sandbox-macos is the Seatbelt (sandbox_init) process-containment crate. Its
+      # pure `build_profile` SBPL generator has no cfg(macos) gate and already builds +
+      # unit-tests on the Linux `check` job's `cargo build/test --workspace` legs; this is
+      # the only job that can build/lint/test the cfg(target_os = "macos") `ffi`/`doctor`
+      # modules underneath it. The `glass-macos` `--lib` containment test that actually
+      # spawns a contained process runs via `./scripts/test-macos.sh` above.
+      - run: cargo build  -p glass-sandbox-macos --locked
+      - run: cargo clippy -p glass-sandbox-macos --all-targets --locked -- -D warnings
+      - run: cargo test   -p glass-sandbox-macos --locked
       # Compile/link gate for the harness=false `a11y` on-box integration test
       # (crates/glass-macos/tests/a11y.rs) and its Swift fixture — proves both build against
       # this runner's SDK without attempting the granted run (needs the Accessibility/Screen
