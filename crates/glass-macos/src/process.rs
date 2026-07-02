@@ -13,7 +13,8 @@
 //!
 //! Clip-shim injection: a contained launch whose target is not hardened-runtime signed
 //! ([`target_is_injectable`]) gets `glass-clip-shim-macos`'s built dylib
-//! ([`shim_dylib_path`]) loaded via `DYLD_INSERT_LIBRARIES`, plus a per-spawn private
+//! ([`shim_dylib_path`], the macOS wrapper around [`crate::shim_path::resolve_shim`]'s pure
+//! path-tier logic) loaded via `DYLD_INSERT_LIBRARIES`, plus a per-spawn private
 //! pasteboard name in `GLASS_CLIP_PASTEBOARD` — both set on the `Command` before
 //! `cmd.spawn()` in [`spawn`]. `Command`'s envp is applied at the `exec` that follows
 //! `pre_exec`'s `sandbox_init` call (not at fork/`pre_exec` time), so both vars are present
@@ -111,33 +112,14 @@ fn target_is_injectable(program: &Path) -> bool {
 /// Env var overriding [`shim_dylib_path`]'s resolution — tests and non-standard layouts.
 const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 
-/// File name of the shim's build artifact: `glass-clip-shim-macos`'s `crate-type =
-/// ["cdylib"]` compiles to `lib<crate name, underscored>.dylib` on macOS.
-const SHIM_DYLIB_NAME: &str = "libglass_clip_shim_macos.dylib";
-
-/// Resolve the injected clip shim's dylib: [`SHIM_DYLIB_ENV`] → next to the running
-/// executable → the cargo target dir one level up from it (`current_exe` is
-/// `target/<profile>/<bin>` for a normal build, or `target/<profile>/deps/<bin>-<hash>`
-/// under `cargo test`, one directory deeper than the shim's own build output — hence the
-/// second candidate). Every tier, including the env override, is existence-checked
-/// (`.is_file()`) before being returned — a bad override (stale/typo'd path) falls through
-/// to the remaining tiers rather than being trusted blind, same fail-closed discipline as
-/// the rest of this resolution. `None` if none of these exist: callers treat that as "not
-/// injectable" (fail-closed — no resolvable shim, no injection).
+/// [`crate::shim_path::resolve_shim`] against the real environment: the running executable's
+/// directory and [`SHIM_DYLIB_ENV`]. The tier logic itself is pure and lives in
+/// [`crate::shim_path`] (unit-tested on the Linux dev box); this wrapper only supplies the
+/// two OS-touching inputs it needs.
 fn shim_dylib_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(SHIM_DYLIB_ENV) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
+    let env_override = std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from);
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let next_to_exe = exe_dir.join(SHIM_DYLIB_NAME);
-    if next_to_exe.is_file() {
-        return Some(next_to_exe);
-    }
-    let target_dir = exe_dir.parent()?.join(SHIM_DYLIB_NAME);
-    target_dir.is_file().then_some(target_dir)
+    crate::shim_path::resolve_shim(&exe_dir, env_override)
 }
 
 /// Log lines captured by the per-stream reader threads spawned in [`spawn`], drained by

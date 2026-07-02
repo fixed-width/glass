@@ -192,6 +192,7 @@ fn macos_checks_from(
                 "not granted — capture will fail with a permission error",
             )
             .with_remedy(glass_macos::screen_recording_remedy())
+            .with_remedy_action(format!("open {}", glass_macos::screen_recording_pane_url()))
         },
         if accessibility {
             Check::new("Accessibility", CheckStatus::Ok, "granted")
@@ -202,6 +203,7 @@ fn macos_checks_from(
                 "not granted — window management and input injection will fail",
             )
             .with_remedy(glass_macos::accessibility_remedy())
+            .with_remedy_action(format!("open {}", glass_macos::accessibility_pane_url()))
         },
         match session_state {
             glass_macos::SessionState::Unlocked => Check::new("display awake", CheckStatus::Ok, "session unlocked"),
@@ -279,6 +281,7 @@ fn macos_a11y_checks(accessibility_granted: bool) -> Vec<Check> {
                  glass_set_value will fail with a permission error",
             )
             .with_remedy(glass_macos::accessibility_remedy())
+            .with_remedy_action(format!("open {}", glass_macos::accessibility_pane_url()))
         },
     ]
 }
@@ -394,11 +397,31 @@ mod tests {
         }
 
         #[test]
+        fn missing_screen_recording_points_at_the_screen_capture_pane() {
+            let checks = macos_checks_from("macos", false, true, SessionState::Unlocked);
+            let c = checks.iter().find(|c| c.name == "Screen Recording").unwrap();
+            assert_eq!(
+                c.remedy_action.as_deref(),
+                Some(format!("open {}", glass_macos::screen_recording_pane_url()).as_str())
+            );
+        }
+
+        #[test]
         fn missing_accessibility_fails_with_the_shared_remedy() {
             let checks = macos_checks_from("macos", true, false, SessionState::Unlocked);
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
             assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
+        }
+
+        #[test]
+        fn missing_accessibility_points_at_the_accessibility_pane() {
+            let checks = macos_checks_from("macos", true, false, SessionState::Unlocked);
+            let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
+            assert_eq!(
+                c.remedy_action.as_deref(),
+                Some(format!("open {}", glass_macos::accessibility_pane_url()).as_str())
+            );
         }
 
         #[test]
@@ -481,6 +504,18 @@ mod tests {
             // Same remedy string as the "macos" section's own Accessibility check — no
             // separate, driftable copy here either.
             assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
+        }
+
+        #[test]
+        fn a11y_not_granted_points_at_the_accessibility_pane() {
+            let checks = macos_a11y_checks(false);
+            let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
+            // Same pane URL as the "macos" section's own Accessibility check — kept in
+            // sync for the same reason as the shared remedy string above.
+            assert_eq!(
+                c.remedy_action.as_deref(),
+                Some(format!("open {}", glass_macos::accessibility_pane_url()).as_str())
+            );
         }
     }
 }

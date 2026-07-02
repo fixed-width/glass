@@ -7,6 +7,7 @@ pub mod doctor;
 mod env;
 mod params;
 pub(crate) mod server;
+pub mod setup;
 pub(crate) mod shutdown;
 mod tools;
 mod untrusted;

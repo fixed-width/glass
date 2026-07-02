@@ -52,6 +52,10 @@ glass-a11y-windows = { path = "../glass-a11y-windows" }
 glass-macos = { path = "../glass-macos" }
 glass-a11y-macos = { path = "../glass-a11y-macos" }
 glass-sandbox-macos.workspace = true
+# `setup`'s `gui/<uid>` LaunchAgent install (`rustix::process::getuid`) — a safe syscall
+# wrapper, so no `unsafe` FFI is needed for this. Already a workspace dependency (glass-macos
+# uses it for process signals); the workspace-level `process` feature covers `getuid`.
+rustix.workspace = true
 
 [build-dependencies]
 embed-manifest = "1"

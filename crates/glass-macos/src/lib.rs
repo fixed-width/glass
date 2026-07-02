@@ -1,14 +1,15 @@
 //! The macOS `Platform` backend for glass (ScreenCaptureKit + CGEvent + AXUIElement,
 //! rendered onto a `CGVirtualDisplay`).
 //!
-//! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`]) is
-//! crate-level and unit-tested on the Linux dev box; the OS-touching modules and the
-//! `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off macOS the crate exposes
-//! only the pure modules.
+//! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`],
+//! [`shim_path`]) is crate-level and unit-tested on the Linux dev box; the OS-touching
+//! modules and the `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off macOS
+//! the crate exposes only the pure modules.
 
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
+pub mod shim_path; // pure clip-shim dylib path resolution — cross-platform, host-tested
 
 #[cfg(target_os = "macos")]
 mod ffi;
@@ -39,5 +40,12 @@ pub use ffi::init_main_thread;
 // and the console session's three-way state (unlocked/locked/no-session-attached).
 #[cfg(target_os = "macos")]
 pub use permissions::{accessibility_granted, accessibility_remedy, screen_recording_granted, screen_recording_remedy};
+// Guided-setup counterparts to the predicates above: pure pane-URL/open helpers (usable
+// anywhere, including `doctor`'s `remedy_action`) and the prompting `request_*` pair
+// (used only by the future `setup` command — never by `preflight`/`doctor`).
+#[cfg(target_os = "macos")]
+pub use permissions::{
+    accessibility_pane_url, open_pane, request_accessibility, request_screen_recording, screen_recording_pane_url,
+};
 #[cfg(target_os = "macos")]
 pub use session::{session_locked, session_state, SessionState};

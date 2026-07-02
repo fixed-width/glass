@@ -49,15 +49,24 @@ pub struct Check {
     /// How to fix it, when failing or warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remedy: Option<String>,
+    /// An actionable remedy: a command/URL a tool can run (e.g. open the exact
+    /// Settings pane). Additive to `remedy` (human text); shown as a separate line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy_action: Option<String>,
 }
 
 impl Check {
     pub fn new(name: impl Into<String>, status: CheckStatus, detail: impl Into<String>) -> Self {
-        Check { name: name.into(), status, detail: detail.into(), remedy: None }
+        Check { name: name.into(), status, detail: detail.into(), remedy: None, remedy_action: None }
     }
     /// Attach a remedy (builder style).
     pub fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
         self.remedy = Some(remedy.into());
+        self
+    }
+    /// Attach an actionable remedy (builder style).
+    pub fn with_remedy_action(mut self, action: impl Into<String>) -> Self {
+        self.remedy_action = Some(action.into());
         self
     }
 }
@@ -147,9 +156,12 @@ impl Diagnosis {
                     CheckStatus::Skip => {}
                 }
                 out.push_str(&format!("  {} {}: {}\n", eff.glyph(), c.name, c.detail));
-                if let Some(r) = &c.remedy {
-                    if eff != CheckStatus::Ok {
+                if eff != CheckStatus::Ok {
+                    if let Some(r) = &c.remedy {
                         out.push_str(&format!("      → {r}\n"));
+                    }
+                    if let Some(a) = &c.remedy_action {
+                        out.push_str(&format!("      ↪ {a}\n"));
                     }
                 }
             }
@@ -237,5 +249,20 @@ mod tests {
         let c = Check::new("Xvfb", CheckStatus::Ok, "found");
         let j = serde_json::to_string(&c).unwrap();
         assert_eq!(j, r#"{"name":"Xvfb","status":"ok","detail":"found"}"#);
+    }
+
+    #[test]
+    fn render_shows_remedy_action_line() {
+        let check = Check::new("Screen Recording", CheckStatus::Fail, "not granted")
+            .with_remedy("enable it in System Settings")
+            .with_remedy_action(
+                "open: x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            );
+        let d = Diagnosis::new(vec![Section::new("macos", Some("macos".into()), vec![check])]);
+        let out = d.render_text("macos");
+        assert!(out.contains("→ enable it in System Settings"));
+        assert!(out.contains(
+            "↪ open: x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        ));
     }
 }

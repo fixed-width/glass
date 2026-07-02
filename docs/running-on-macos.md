@@ -9,6 +9,16 @@ Running glass on a macOS host.
 - glass drives apps in the **logged-in Aqua session** (the real desktop, not a
   headless framebuffer) and captures via ScreenCaptureKit / injects input via
   CGEvent — both gated by **macOS's privacy permissions (TCC)**, covered below.
+- **Building from source needs the Xcode Command Line Tools:**
+
+  ```bash
+  xcode-select --install
+  ```
+
+  The `objc2-*` crates that bind Cocoa/CoreGraphics/CoreFoundation need the macOS SDK
+  and `clang` the CLT provides at their build-time link step; without it, `cargo build`
+  fails there. (There's no prebuilt macOS binary yet, so building from source is the
+  only path today — see [Install](../README.md#install) in the main README.)
 
 ## The permission model, in short
 
@@ -29,16 +39,20 @@ code-signing certificate. That has two consequences that shape everything below:
   signed app + LaunchAgent rather than a plain binary you `ssh` in and run.
 
 So the setup is: create a stable signing identity once, build+sign the app with
-it, grant it Screen Recording + Accessibility once via System Settings, then run
-it as a LaunchAgent from then on — rebuilds and restarts never need the dialog
-again.
+it, then run `glass-mcp setup` — it walks you through granting Screen Recording +
+Accessibility and installs whichever run integration you want. From then on,
+rebuilds and restarts never need the dialog again.
 
 ## 1. Create a signing identity
 
 Any code-signing identity works — it doesn't need to be trusted by Apple or tied
 to an Apple Developer account (Developer ID / notarization only matter for
 Gatekeeper-distributing an app to *other* people, not for TCC grants on your own
-machine). The simplest way to make one:
+machine). **This step is only for building from source** (contributors, or
+running an unreleased checkout) — end users will get a notarized, pre-signed
+`.app` in a later release and won't need a signing identity of their own at all.
+
+### GUI (simplest, when you have a keyboard in front of you)
 
 1. Open **Keychain Access**.
 2. Menu bar → **Keychain Access → Certificate Assistant → Create a Certificate…**
@@ -46,10 +60,92 @@ machine). The simplest way to make one:
    Signed Root**; **Certificate Type: Code Signing**.
 4. Click **Create**. It lands in your login keychain, ready for `codesign -s`.
 
-(For a headless box with no one at the keyboard, the same identity can be created
-entirely from the command line into a dedicated keychain with `security
-create-keychain` + `security import`; the interactive Keychain Access flow above
-is simpler when you have a GUI session to run it in.)
+### CLI (headless boxes, or scripting the setup)
+
+The GUI flow above is the simplest when you're sitting at the Mac, and it
+establishes the code-signing trust for you. The same identity can also be
+**scripted** with `openssl` + `security` into a **dedicated keychain** (so it
+never touches your login keychain) — useful when you're driving a box over SSH.
+This is *not* fully turnkey-headless, though: the final trust step (step 3 below)
+triggers a one-time authorization prompt, so plan for either a console you can
+click once or the admin-domain / pre-trusted-cert variant noted there.
+
+```bash
+KEYCHAIN="$HOME/Library/Keychains/glass-signing.keychain-db"
+KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"   # only unlocks this one keychain
+WORKDIR="$(mktemp -d)"
+
+# 1. A self-signed cert carrying the Code Signing extended key usage codesign
+#    requires. Extensions come from a -config file (not the newer -addext flag),
+#    so this works with both real OpenSSL and the LibreSSL macOS ships as
+#    /usr/bin/openssl.
+cat > "$WORKDIR/codesign.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+
+[dn]
+CN = glass-mcp signing
+
+[v3_req]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+EOF
+openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+  -keyout "$WORKDIR/key.pem" -out "$WORKDIR/cert.pem" \
+  -subj "/CN=glass-mcp signing" -config "$WORKDIR/codesign.cnf"
+
+# 2. Bundle it as a PKCS#12 and hand it to a fresh keychain.
+openssl pkcs12 -export -out "$WORKDIR/cert.p12" \
+  -inkey "$WORKDIR/key.pem" -in "$WORKDIR/cert.pem" -passout "pass:$KEYCHAIN_PASSWORD"
+
+security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+security import "$WORKDIR/cert.p12" -k "$KEYCHAIN" -P "$KEYCHAIN_PASSWORD" \
+  -T /usr/bin/codesign -T /usr/bin/security
+# Since macOS Sierra, codesign also needs this explicit ACL grant, or it hits a
+# keychain-access prompt with no one there to click it:
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+  -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+# 3. Trust the cert for code signing. Importing the key pair is NOT enough on its
+#    own: until it's trusted, `security find-identity -p codesigning` reports "0
+#    valid identities" and `codesign -s "glass-mcp signing"` fails with "no identity
+#    found". This step is the one that is NOT headless — it triggers an authorization
+#    prompt, and on a box with no console it fails with "SecTrustSettingsSetTrust-
+#    Settings: The authorization was denied since no user interaction was possible."
+#    So run it where you can click once (user trust domain, below), or on a truly
+#    headless/CI box use the admin domain (`sudo security add-trusted-cert -d …`), or
+#    start from a cert already trusted for code signing.
+security add-trusted-cert -p codeSign -k "$KEYCHAIN" "$WORKDIR/cert.pem"
+
+rm -rf "$WORKDIR"
+```
+
+`build-app.sh` takes the keychain explicitly (`--keychain`), so nothing needs to
+be added to the default keychain search list:
+
+```bash
+security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"   # each new shell/SSH session
+./packaging/macos/build-app.sh --identity "glass-mcp signing" --keychain "$KEYCHAIN"
+```
+
+Verify the identity landed and is usable before relying on it:
+
+```bash
+security find-identity -v -p codesigning "$KEYCHAIN"
+codesign -dvv target/macos-app/GlassMcp.app   # want NO "adhoc" / "not signed"
+```
+
+If `find-identity -p codesigning` reports **"0 valid identities"**, the trust step
+(step 3) didn't take — its prompt was denied or skipped; re-run it where you can
+authorize it, or use the admin-domain variant. (The "Troubleshooting: headless /
+SSH setup" section further down covers the `errSecInternalComponent` you'll hit if
+the keychain is locked when `codesign` runs.) If `codesign` still can't find or use
+the identity, fall back to the GUI method above — it establishes the trust for you,
+and either way this is a one-time step.
 
 ## 2. Build and sign the app
 
@@ -66,34 +162,69 @@ overrides). Confirm the signature:
 codesign -dv target/macos-app/GlassMcp.app
 ```
 
-## 3. Grant Screen Recording + Accessibility
+## 3. Run `glass-mcp setup`
 
-`glass-mcp doctor` only *checks* grant status — it never triggers the OS consent
-dialogs (that's deliberate: a diagnostic shouldn't pop dialogs). The dialogs
-appear the first time glass actually **drives** something, so register the
-signed binary with your agent and ask it to do something:
-
-```bash
-claude mcp add glass --scope user -- \
-  "$(pwd)/target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp"
-```
-
-Then, from your agent: *"Use glass to launch TextEdit and take a screenshot."*
-The first capture attempt prompts for **Screen Recording**; the first click or
-keystroke prompts for **Accessibility**. Grant both in **System Settings →
-Privacy & Security → Screen Recording** and **→ Accessibility** (add `GlassMcp`
-if it isn't listed yet, or toggle it on if it is), then ask your agent to try
-again. Confirm both stuck:
+`build-app.sh` produces a signed bundle but doesn't touch permissions or register
+anything with an agent — `glass-mcp setup` is the guided first-run that does the
+rest: it requests both TCC grants, installs (or skips) the run integration, and
+confirms everything via `doctor`.
 
 ```bash
-target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp doctor
+target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp setup
 ```
 
-You want the `[macos]` section all `✓`.
+What it does, in order:
 
-As long as you keep signing with this same identity and bundle id, this is a
+1. **Requests Screen Recording, then Accessibility**, one at a time. For each: if
+   already granted, it moves on; otherwise it triggers the OS consent flow, opens
+   the exact System Settings pane (Privacy & Security → Screen Recording /
+   Accessibility) for you with `open`, and polls for up to a minute while you
+   flip the toggle — it only reports a grant once it re-checks and confirms it,
+   never on your say-so alone.
+2. **Screen Recording's relaunch nuance.** Unlike Accessibility, a Screen
+   Recording grant only takes effect for the process that requested it *after
+   that process restarts*. If the poll above times out, `setup` asks whether you
+   enabled it in System Settings (or, under `--non-interactive`, assumes yes,
+   since there's no one to ask) and, if so, tells you to run `glass-mcp setup`
+   again rather than reporting a plain "not granted" — run it a second time and
+   Screen Recording confirms granted.
+3. **Picks the run mode.** Unless you forced one with `--launchagent` /
+   `--no-launchagent`, it asks: *"Run glass-mcp unattended as a LaunchAgent
+   (serve --http, starts at login) instead of being spawned by your MCP client
+   over stdio?"* Choosing the LaunchAgent writes
+   `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` (filled in with the
+   app's path, the HTTP bind address, and your home directory) and loads it with
+   `launchctl bootstrap gui/<uid>`; choosing stdio installs nothing.
+4. **Confirms via `doctor`** and prints a ready-to-paste MCP-client registration
+   line for whichever mode you picked:
+
+   ```bash
+   claude mcp add glass --scope user -- /path/to/GlassMcp.app/Contents/MacOS/glass-mcp        # stdio
+   claude mcp add --transport http glass http://127.0.0.1:7300/                                # LaunchAgent
+   ```
+
+   If a grant is still pending at the end, `setup` exits non-zero and prints the
+   exact instruction for what's left (which permission, and what to do) — act on
+   it and run `glass-mcp setup` again.
+
+Flags:
+
+| Flag | Effect |
+|---|---|
+| `--non-interactive` | Never blocks on stdin (for scripting/CI): defaults the run mode to stdio (the least-invasive option) when neither `--launchagent` nor `--no-launchagent` is given, and assumes-and-notes rather than asks about the Screen Recording relaunch nuance. Still exits non-zero — same as an interactive run — if a grant is genuinely missing once the poll times out. |
+| `--launchagent` | Install the `gui/<uid>` LaunchAgent (unattended `serve --http`) without asking. |
+| `--no-launchagent` | Skip the LaunchAgent (attended/stdio) without asking. |
+| `--addr ADDR` | LaunchAgent HTTP bind address (default `127.0.0.1:7300`). |
+
+`setup` also warns up front — without refusing to run — if the binary you're
+running it from isn't inside a `*.app/Contents/MacOS` bundle, or is ad hoc/unsigned:
+either means a grant won't survive a rebuild (see the permission model above). That
+keeps `setup` usable from a plain `cargo run` while you're iterating on it, even
+though it isn't how you'd run it day to day.
+
+As long as you keep signing with the same identity and bundle id, granting is a
 **one-time step**: rebuilding, moving the app, or restarting the LaunchAgent
-below never re-prompts.
+never re-prompts.
 
 ## 4. Keep the Mac awake
 
@@ -107,54 +238,49 @@ caffeinate -d -i -s &
 `glass-mcp doctor` checks this (the `display awake` line) and names this exact
 command if the session is locked.
 
-## 5. Run it
+## 5. Connect your agent
 
-The interactive setup above (stdio, your agent spawns the signed binary
-directly) is fine for driving apps from a Terminal you're sitting at. For a box
-no one is watching, run it as a LaunchAgent instead — that's what keeps
-glass-mcp launchd-parented so its grant stays attached to a stable process
-rather than to whatever spawns it that day.
-
-### Unattended (LaunchAgent + network transport) — the recommended model
+If `setup` installed the LaunchAgent, it's already running — point your client at
+the HTTP address it printed:
 
 ```bash
-mkdir -p ~/Library/LaunchAgents ~/Library/Logs/GlassMcp
-cp packaging/macos/tech.fixedwidth.glass.plist ~/Library/LaunchAgents/
-# Edit the copy: replace /Users/YOU with your home directory (and the app path
-# if you didn't install GlassMcp.app to /Applications).
-
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/tech.fixedwidth.glass.plist
-launchctl print gui/$(id -u)/tech.fixedwidth.glass   # confirm it's running
+claude mcp add --transport http glass http://127.0.0.1:7300/
 ```
 
-This starts `glass-mcp serve --http --addr 127.0.0.1:7300` — see
-[packaging/macos/README.md](../packaging/macos/README.md) for the load/unload
-commands. No `sudo` is needed anywhere in this flow.
+From another machine, tunnel first (`ssh -L 7300:127.0.0.1:7300 you@themac`), then
+point the client at `http://127.0.0.1:7300/`. Binding beyond loopback follows the
+same fail-closed token rule as the other platforms — see the "Network transport"
+section of [running-on-windows.md](running-on-windows.md) for the `gen-token` /
+`--token-file` flow, which works identically here.
 
-Point a client at it:
+If you chose stdio instead, register the binary directly — the same one-liner
+`setup` printed:
 
 ```bash
-# Same machine: connect straight to loopback — no token needed.
-# From another machine, tunnel it first:
-ssh -L 7300:127.0.0.1:7300 you@themac
+claude mcp add glass --scope user -- \
+  "$(pwd)/target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp"
 ```
 
-Then point your MCP client at `http://127.0.0.1:7300`. Binding beyond loopback
-follows the same fail-closed token rule as the other platforms — see the "Network
-transport" section of [running-on-windows.md](running-on-windows.md) for the
-`gen-token` / `--token-file` flow, which works identically here.
+### Managing the LaunchAgent by hand
 
-Stop it with:
+`glass-mcp setup --launchagent` installs and starts it for you; to stop, restart,
+or reload it manually (e.g. after moving the app to a new path):
 
 ```bash
-launchctl bootout gui/$(id -u)/tech.fixedwidth.glass
+launchctl bootout gui/$(id -u)/tech.fixedwidth.glass                                 # stop
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/tech.fixedwidth.glass.plist   # start again
+launchctl print gui/$(id -u)/tech.fixedwidth.glass                                    # confirm it's running
 ```
+
+No `sudo` is needed anywhere in this flow. See
+[packaging/macos/README.md](../packaging/macos/README.md) for the plist template
+and what each field means.
 
 ## Tools available on macOS
 
-Once granted (step 3), the agent has `glass_start`, `glass_screenshot`,
-`glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`, `glass_logs`,
-`glass_list_windows`, `glass_select_window`, and `glass_doctor`. The
+Once `glass-mcp setup` (step 3) confirms both grants, the agent has `glass_start`,
+`glass_screenshot`, `glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`,
+`glass_logs`, `glass_list_windows`, `glass_select_window`, and `glass_doctor`. The
 accessibility-tree tools — `glass_a11y_snapshot`, `glass_a11y_marks`,
 `glass_click_element`, and `glass_set_value` — also work on macOS, reading and
 driving the AXUIElement tree; they need the same Accessibility grant from step 3
@@ -243,16 +369,23 @@ Check `glass-mcp doctor`'s `[sandbox]` section for the live Seatbelt availabilit
 
 ## Troubleshooting: headless / SSH setup
 
-Two gotchas that only show up when you're driving a box over SSH (no one at the
-keyboard), e.g. re-signing after a code change or building the Swift capture-test
-fixture:
+A few gotchas that only show up when you're driving a box over SSH (no one at the
+keyboard), e.g. re-signing after a code change or running `setup` unattended:
 
+- **`glass-mcp setup` needs a real console login, not just an SSH shell.** If
+  nobody's logged in at the screen (or it's sitting at the login window), `setup`
+  refuses outright — glass needs a real GUI login to request permissions and
+  drive anything. Log in at the console first (or, once permissions are already
+  granted, run `glass-mcp` as the `gui/<uid>` LaunchAgent instead, which doesn't
+  need a fresh `setup` run). Pass `--non-interactive` when scripting a repeatable
+  `setup` run so it fails fast instead of blocking on a prompt no one can answer.
 - **Non-interactive `codesign` needs the keychain unlocked first.** A keychain
   created (or last unlocked) in an earlier login session is locked again by the time
   a bare SSH shell runs `codesign` — you'll see `errSecInternalComponent` rather
   than an obviously-keychain-shaped error. Unlock it explicitly before signing:
   `security unlock-keychain -p <password> <keychain>` (the login keychain if you
-  didn't pass `--keychain` to `build-app.sh`). This has nothing to do with TCC/AX
+  didn't pass `--keychain` to `build-app.sh`, or your dedicated signing keychain if
+  you used the CLI cert recipe above). This has nothing to do with TCC/AX
   grants — it's the code-signing step itself failing to reach the private key.
 - **Any `@main` Swift source (including the `glass-macos` capture-test fixture,
   `crates/glass-macos/fixture/quadrants.swift`) needs `swiftc -parse-as-library`.**
