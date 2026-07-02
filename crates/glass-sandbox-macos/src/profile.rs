@@ -26,6 +26,11 @@ pub struct ProfileOpts {
     pub ro_binds: Vec<PathBuf>,
     /// Extra paths re-exposed read-write.
     pub rw_binds: Vec<PathBuf>,
+    /// When true (an injectable contained target), ALLOW `com.apple.pasteboard.1` so the shim's
+    /// private named pasteboard works; when false (hardened/non-injectable), DENY it (the app
+    /// can't reach the real pasteboard). Isolation for injectable targets comes from the shim's
+    /// redirect, not from denying pasteboardd.
+    pub allow_pasteboard: bool,
 }
 
 /// Scratch/cache roots a typical app writes to (also readable via the whole-FS read allow).
@@ -76,8 +81,11 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     if level == SandboxLevel::Default {
         p.push_str("(allow network*)\n");
     }
-    // Clipboard isolation: the contained app cannot reach the real pasteboard.
-    p.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
+    // Clipboard: deny the real pasteboard unless this is an injectable target (whose shim
+    // redirects `generalPasteboard` to a private named pasteboard — see glass-clip-shim-macos).
+    if !opts.allow_pasteboard {
+        p.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
+    }
     p
 }
 
@@ -147,6 +155,8 @@ mod tests {
             program: PathBuf::from("/Applications/Demo.app/Contents/MacOS/Demo"),
             ro_binds: vec![],
             rw_binds: vec![],
+            // Default-safe: deny the real pasteboard unless a test opts in.
+            allow_pasteboard: false,
         }
     }
 
@@ -171,11 +181,24 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_is_denied() {
-        let p = build_profile(SandboxLevel::Default, &opts());
+    fn pasteboard_denied_when_not_injectable() {
+        let mut o = opts();
+        o.allow_pasteboard = false;
+        let p = build_profile(SandboxLevel::Default, &o);
         assert!(
             p.contains(r#"(deny mach-lookup (global-name "com.apple.pasteboard.1"))"#),
             "{p}"
+        );
+    }
+
+    #[test]
+    fn pasteboard_allowed_when_injectable() {
+        let mut o = opts();
+        o.allow_pasteboard = true;
+        let p = build_profile(SandboxLevel::Default, &o);
+        assert!(
+            !p.contains("com.apple.pasteboard.1"),
+            "an injectable target must not deny the pasteboard (the shim redirects it):\n{p}"
         );
     }
 

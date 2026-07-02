@@ -60,7 +60,15 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let program =
             std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
-        let opts = ProfileOpts { cwd, program, ro_binds: vec![], rw_binds: vec![] };
+        // TODO: a later task finalizes allow_pasteboard for injectable (contained) targets whose
+        // shim redirects the pasteboard; for now this keeps prior (always-deny) behavior.
+        let opts = ProfileOpts {
+            cwd,
+            program,
+            ro_binds: vec![],
+            rw_binds: vec![],
+            allow_pasteboard: false,
+        };
         let profile = build_profile(spec.sandbox, &opts);
         let profile_c = CString::new(profile).map_err(|e| {
             GlassError::SandboxUnavailable(format!("sandbox profile contains NUL: {e}"))
