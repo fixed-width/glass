@@ -62,10 +62,13 @@ running an unreleased checkout) — end users will get a notarized, pre-signed
 
 ### CLI (headless boxes, or scripting the setup)
 
-The GUI flow above is the simplest when you're sitting at the Mac. For a box
-you're driving over SSH with no one at the keyboard, the same identity can be
-built non-interactively from `openssl` + `security`, landing in a **dedicated
-keychain** (so it never touches your login keychain):
+The GUI flow above is the simplest when you're sitting at the Mac, and it
+establishes the code-signing trust for you. The same identity can also be
+**scripted** with `openssl` + `security` into a **dedicated keychain** (so it
+never touches your login keychain) — useful when you're driving a box over SSH.
+This is *not* fully turnkey-headless, though: the final trust step (step 3 below)
+triggers a one-time authorization prompt, so plan for either a console you can
+click once or the admin-domain / pre-trusted-cert variant noted there.
 
 ```bash
 KEYCHAIN="$HOME/Library/Keychains/glass-signing.keychain-db"
@@ -107,6 +110,17 @@ security import "$WORKDIR/cert.p12" -k "$KEYCHAIN" -P "$KEYCHAIN_PASSWORD" \
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
+# 3. Trust the cert for code signing. Importing the key pair is NOT enough on its
+#    own: until it's trusted, `security find-identity -p codesigning` reports "0
+#    valid identities" and `codesign -s "glass-mcp signing"` fails with "no identity
+#    found". This step is the one that is NOT headless — it triggers an authorization
+#    prompt, and on a box with no console it fails with "SecTrustSettingsSetTrust-
+#    Settings: The authorization was denied since no user interaction was possible."
+#    So run it where you can click once (user trust domain, below), or on a truly
+#    headless/CI box use the admin domain (`sudo security add-trusted-cert -d …`), or
+#    start from a cert already trusted for code signing.
+security add-trusted-cert -p codeSign -k "$KEYCHAIN" "$WORKDIR/cert.pem"
+
 rm -rf "$WORKDIR"
 ```
 
@@ -125,10 +139,13 @@ security find-identity -v -p codesigning "$KEYCHAIN"
 codesign -dvv target/macos-app/GlassMcp.app   # want NO "adhoc" / "not signed"
 ```
 
-(The "Troubleshooting: headless / SSH setup" section further down covers the
-`errSecInternalComponent` you'll hit if the keychain is locked when `codesign`
-runs.) If `codesign` can't find or use the identity, fall back to the GUI method
-above — either way this is a one-time step.
+If `find-identity -p codesigning` reports **"0 valid identities"**, the trust step
+(step 3) didn't take — its prompt was denied or skipped; re-run it where you can
+authorize it, or use the admin-domain variant. (The "Troubleshooting: headless /
+SSH setup" section further down covers the `errSecInternalComponent` you'll hit if
+the keychain is locked when `codesign` runs.) If `codesign` still can't find or use
+the identity, fall back to the GUI method above — it establishes the trust for you,
+and either way this is a one-time step.
 
 ## 2. Build and sign the app
 

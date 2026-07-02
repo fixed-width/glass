@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Setup { non_interactive, launchagent, no_launchagent, addr }) => {
-            setup::run(non_interactive, launchagent, no_launchagent, addr)?;
+            setup::run(setup::SetupArgs { non_interactive, launchagent, no_launchagent, addr })?;
             Ok(())
         }
     }
