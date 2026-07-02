@@ -160,6 +160,8 @@ accessibility-tree tools — `glass_a11y_snapshot`, `glass_a11y_marks`,
 driving the AXUIElement tree; they need the same Accessibility grant from step 3
 above (no separate permission).
 
+- **Clipboard** (`glass_clipboard_get`, `glass_clipboard_set`) — read and write the system pasteboard (no containment yet).
+
 ## Troubleshooting: headless / SSH setup
 
 Two gotchas that only show up when you're driving a box over SSH (no one at the

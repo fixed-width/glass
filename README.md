@@ -369,14 +369,14 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
 |---|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ◑ ‡ |
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ✓ ‡ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | 🚧 |
 
 † **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard, high-fidelity input, and multi-touch gestures (`glass_gesture`)** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` (single-pointer only — no multi-touch) and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. glass is developed and tested against **Android 14 (API 34)**; the `adb` backend assumes no particular version and the optional companions declare an Android 7.0 (API 24) floor (details in your host guide). Window resize/move (apps are full-screen) and physical devices are non-goals.
 
-‡ **macOS** capture, input, windows, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Clipboard get/set is not yet wired up on macOS.
+‡ **macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Clipboard acts on the real system pasteboard (no containment yet).
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
