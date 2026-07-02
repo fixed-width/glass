@@ -1,6 +1,6 @@
 use clap::Parser;
 use glass_mcp::cli::{Cli, Command};
-use glass_mcp::{boot, run_doctor, run_env, run_stdio};
+use glass_mcp::{boot, run_doctor, run_env, run_stdio, setup};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,6 +62,10 @@ async fn main() -> anyhow::Result<()> {
                      --no-default-features build omits"
                 )
             }
+        }
+        Some(Command::Setup { non_interactive, launchagent, no_launchagent, addr }) => {
+            setup::run(non_interactive, launchagent, no_launchagent, addr)?;
+            Ok(())
         }
     }
 }

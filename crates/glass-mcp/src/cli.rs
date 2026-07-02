@@ -60,6 +60,21 @@ pub enum Command {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Guided macOS first-run: request the TCC grants, install the run integration, confirm.
+    Setup {
+        /// Fail instead of prompting (scripting/CI).
+        #[arg(long)]
+        non_interactive: bool,
+        /// Install the gui/uid LaunchAgent (unattended serve --http) instead of asking.
+        #[arg(long)]
+        launchagent: bool,
+        /// Do NOT install the LaunchAgent (attended/stdio) instead of asking.
+        #[arg(long, conflicts_with = "launchagent")]
+        no_launchagent: bool,
+        /// LaunchAgent HTTP bind address (default 127.0.0.1:7300).
+        #[arg(long)]
+        addr: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -122,6 +137,44 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_an_error() {
         assert!(Cli::try_parse_from(["glass-mcp", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn setup_flags_parse() {
+        let cli = Cli::try_parse_from(["glass-mcp", "setup", "--non-interactive", "--launchagent"]).unwrap();
+        match cli.command {
+            Some(Command::Setup { non_interactive, launchagent, no_launchagent, addr }) => {
+                assert!(non_interactive);
+                assert!(launchagent);
+                assert!(!no_launchagent);
+                assert!(addr.is_none());
+            }
+            other => panic!("expected setup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_flags_default_to_false() {
+        let cli = Cli::try_parse_from(["glass-mcp", "setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Setup { non_interactive: false, launchagent: false, no_launchagent: false, addr: None })
+        ));
+    }
+
+    #[test]
+    fn setup_addr_parses() {
+        let cli = Cli::try_parse_from(["glass-mcp", "setup", "--addr", "0.0.0.0:7300"]).unwrap();
+        match cli.command {
+            Some(Command::Setup { addr, .. }) => assert_eq!(addr.as_deref(), Some("0.0.0.0:7300")),
+            other => panic!("expected setup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_launchagent_and_no_launchagent_conflict() {
+        let err = Cli::try_parse_from(["glass-mcp", "setup", "--launchagent", "--no-launchagent"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
