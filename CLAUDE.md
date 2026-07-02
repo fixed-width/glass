@@ -16,7 +16,9 @@ tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform
 and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
 on-device companion agent), macOS (ScreenCaptureKit capture, CGEvent input, AXUIElement
-windows/logs, accessibility tree, clipboard, sandboxing (Seatbelt)).
+windows/logs, accessibility tree, clipboard (isolated + working for injectable apps under
+containment via a `DYLD_INSERT_LIBRARIES` swizzle shim; hardened-runtime apps fall back to
+unsupported), sandboxing (Seatbelt)).
 
 ## Layout
 
