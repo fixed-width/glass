@@ -11,7 +11,8 @@ use objc2_application_services::AXUIElement;
 use glass_core::frame::{Frame, Region};
 use glass_core::logbuf::Stream;
 use glass_core::platform::{
-    AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, KeyEvent, Platform, PointerEvent, SandboxLevel, WindowGeometry, WindowId, WindowInfo,
+    WindowOp,
 };
 use glass_core::{GlassError, Result};
 
@@ -83,6 +84,10 @@ pub struct MacosPlatform {
     /// meaning "no window chosen yet"; every per-call resolver below falls back to the
     /// original first-on-screen-by-pid lookup in that case.
     active_window: Option<u32>,
+    /// The launched app's containment level. `Off` until `start_app`. Governs clipboard
+    /// routing: contained apps get no real-pasteboard bridge (fail-closed), mirroring the
+    /// Windows `ClipboardRoute` model.
+    sandbox: SandboxLevel,
 }
 
 impl MacosPlatform {
@@ -94,6 +99,7 @@ impl MacosPlatform {
             app_pid: None,
             child: None,
             active_window: None,
+            sandbox: SandboxLevel::Off,
         })
     }
 
@@ -304,6 +310,7 @@ impl Platform for MacosPlatform {
                 // `capture_frame`/`send_pointer`/`send_key` below) is what actually honors
                 // this field on every call.
                 self.active_window = Some(m.window_id);
+                self.sandbox = spec.sandbox;
                 // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
                 // window fresh on every call instead (see its doc) since it may move/resize
                 // after this initial discovery. Only the initial geometry is returned to the
@@ -530,15 +537,25 @@ impl Platform for MacosPlatform {
     fn app_pid(&self) -> Option<u32> {
         self.app_pid
     }
-    /// Read the general pasteboard as UTF-8 text (`""` when it holds no text). macOS has no
-    /// clipboard containment yet, so this reads the user's real system pasteboard.
+    /// Read the clipboard. Uncontained (`sandbox: off`) → the real system pasteboard.
+    /// Contained (`Default`/`Strict`) → `Unsupported`: the app is denied the real pasteboard,
+    /// and glass does not bridge one (fail-closed, mirroring the Windows contained route).
     fn get_clipboard(&mut self) -> Result<String> {
+        if self.sandbox != SandboxLevel::Off {
+            return Err(GlassError::Unsupported(
+                "clipboard is isolated under macOS containment (sandbox != off)".into(),
+            ));
+        }
         crate::clipboard::get()
     }
 
-    /// Write UTF-8 text to the general pasteboard so the app can paste it. Acts on the user's
-    /// real system pasteboard (no macOS containment yet).
+    /// Write the clipboard. Same routing as `get_clipboard`.
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
+        if self.sandbox != SandboxLevel::Off {
+            return Err(GlassError::Unsupported(
+                "clipboard is isolated under macOS containment (sandbox != off)".into(),
+            ));
+        }
         crate::clipboard::set(text)
     }
 }
@@ -569,6 +586,7 @@ mod tests {
             app_pid: Some(42),
             child: None,
             active_window: None,
+            sandbox: SandboxLevel::Off,
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -581,6 +599,7 @@ mod tests {
             app_pid: Some(42),
             child: None,
             active_window: None,
+            sandbox: SandboxLevel::Off,
         };
         assert_eq!(p.app_pid(), Some(42));
     }
@@ -595,6 +614,7 @@ mod tests {
             app_pid: None,
             child: None,
             active_window: None,
+            sandbox: SandboxLevel::Off,
         };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
@@ -611,9 +631,27 @@ mod tests {
             app_pid: Some(42),
             child: None,
             active_window: Some(7),
+            sandbox: SandboxLevel::Off,
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.active_window, None);
+    }
+
+    #[test]
+    fn clipboard_is_unsupported_under_containment() {
+        // Construct the struct directly (not `MacosPlatform::new()`, which runs a
+        // Screen-Recording TCC preflight that the ungranted CI runner can't pass) — the
+        // `!= Off` branch below returns before either clipboard method touches the real
+        // pasteboard, so this exercises the routing grant-free.
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: None,
+            child: None,
+            active_window: None,
+            sandbox: SandboxLevel::Strict,
+        };
+        assert!(matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
+        assert!(matches!(p.set_clipboard("x"), Err(GlassError::Unsupported(_))));
     }
 
     #[test]
