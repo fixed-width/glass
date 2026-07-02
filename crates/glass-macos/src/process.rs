@@ -73,7 +73,12 @@ pub(crate) struct ClipLaunch {
 /// output with no `flags=` line — is treated as non-injectable, so "couldn't determine" never
 /// grants injection.
 fn injectable_from_codesign_report(stderr: &str, status_success: bool) -> bool {
-    if stderr.contains("code object is not signed at all") {
+    // A genuinely unsigned binary's report is ONLY the "not signed" diagnostic — it can never
+    // also carry a `flags=` line (there is no signature to describe one). Requiring that
+    // absence stops the marker being smuggled in via attacker-controlled report text — codesign
+    // echoes `Executable=<path>`, and `<path>` is the caller-chosen `spec.run[0]` — to force a
+    // genuinely signed, possibly hardened-runtime target to classify as injectable.
+    if stderr.contains("code object is not signed at all") && !stderr.contains("flags=") {
         return true;
     }
     status_success && stderr.contains("flags=") && !stderr.contains("runtime")
@@ -510,6 +515,18 @@ mod tests {
             "test-binary: a codesign error that happens not to mention the h-word\n",
             false,
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn injectable_from_codesign_report_false_when_marker_only_in_path() {
+        // A genuinely hardened, successfully-signed target whose PATH happens to contain the
+        // unsigned marker (codesign echoes `Executable=<path>`, and the path is the
+        // caller-chosen `spec.run[0]`) must still fail closed — the marker in path text must
+        // not override a real `flags=(...runtime...)` line.
+        let report = "Executable=/tmp/code object is not signed at all/App.app/Contents/MacOS/App\n\
+                      CodeDirectory v=20400 flags=0x10000(runtime) hashes=3+3 location=embedded\n";
+        assert!(!injectable_from_codesign_report(report, true));
     }
 
     #[test]

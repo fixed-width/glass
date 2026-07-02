@@ -344,6 +344,13 @@ impl Platform for MacosPlatform {
                 // The window never appeared (or discovery otherwise failed): don't leak
                 // the spawned child.
                 process::terminate(&mut child);
+                // Nor the named pasteboards the shim may already have created — the app (and
+                // its ctor) ran before discovery. `self.clip` is never set on this path, so
+                // `stop_app` wouldn't release them; do it here.
+                if let Some(c) = &clip {
+                    crate::clipboard::release_named(&c.name);
+                    crate::clipboard::release_named(&format!("{}.ready", c.name));
+                }
                 Err(e)
             }
         }
@@ -612,6 +619,13 @@ impl Drop for MacosPlatform {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
+        }
+        // Release this session's named pasteboards too if `stop_app` didn't run (panic-unwind
+        // or the process-exit backstop). `stop_app` sets `self.clip = None`, so this is a no-op
+        // when it already ran; otherwise the boards would leak system-wide.
+        if let Some(clip) = &self.clip {
+            crate::clipboard::release_named(&clip.name);
+            crate::clipboard::release_named(&format!("{}.ready", clip.name));
         }
     }
 }
