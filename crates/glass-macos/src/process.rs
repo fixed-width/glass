@@ -51,7 +51,7 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
     // sandbox_init syscall). Off spawns unchanged. Build (run_build) is never contained.
     if spec.sandbox != SandboxLevel::Off {
         let opts = ProfileOpts {
-            cwd: spec.cwd.clone().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
+            cwd: spec.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             program: PathBuf::from(&spec.run[0]),
             ro_binds: vec![],
             rw_binds: vec![],
@@ -78,9 +78,16 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run)))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        // A PermissionDenied under containment is (almost always) sandbox_init rejecting the
+        // profile in pre_exec — surface the actionable SandboxUnavailable, not a generic
+        // "couldn't launch". The failure is real either way (fail-closed; never unconfined).
+        if spec.sandbox != SandboxLevel::Off && e.kind() == std::io::ErrorKind::PermissionDenied {
+            GlassError::SandboxUnavailable(format!("applying the macOS sandbox profile failed: {e}"))
+        } else {
+            GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run))
+        }
+    })?;
 
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -168,6 +175,15 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME must be set");
         let secret_path = std::path::Path::new(&home).join("glass-sbx-test-secret");
         std::fs::write(&secret_path, "top-secret").expect("write test secret under $HOME");
+        // Drop guard (rather than a manual cleanup closure called on each exit path) so the
+        // secret file is removed even if `child.wait()` or an assertion below panics.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(secret_path.clone());
         let secret = secret_path.to_str().expect("secret path is valid UTF-8");
         let shell_cmd = format!(
             "cat /usr/lib/dyld >/dev/null 2>&1 && echo SYS_OK; \
@@ -177,19 +193,9 @@ mod tests {
         let mut denied = spec(&["/bin/sh", "-c", shell_cmd.as_str()]);
         denied.sandbox = SandboxLevel::Default;
         let logs = empty_sink();
-        let spawn_result = spawn(&denied, logs.clone());
-        let cleanup = || {
-            let _ = std::fs::remove_file(&secret_path);
-        };
-        let mut child = match spawn_result {
-            Ok(child) => child,
-            Err(e) => {
-                cleanup();
-                panic!("sandboxed spawn should succeed: {e}");
-            }
-        };
+        let mut child =
+            spawn(&denied, logs.clone()).unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         child.wait().expect("wait");
-        cleanup();
         std::thread::sleep(Duration::from_millis(100));
         let out: Vec<String> = logs
             .lock()
