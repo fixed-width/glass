@@ -28,6 +28,8 @@ mod session;
 #[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
+mod clipboard;
+#[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
 #[cfg(target_os = "macos")]
 pub use ffi::init_main_thread;
