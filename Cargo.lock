@@ -1052,6 +1052,7 @@ dependencies = [
  "block2",
  "glass-a11y-macos",
  "glass-core",
+ "glass-sandbox-macos",
  "objc2",
  "objc2-app-kit",
  "objc2-application-services",
@@ -1080,6 +1081,7 @@ dependencies = [
  "glass-core",
  "glass-macos",
  "glass-sandbox-linux",
+ "glass-sandbox-macos",
  "glass-wayland",
  "glass-windows",
  "glass-x11",
@@ -1106,6 +1108,13 @@ dependencies = [
 
 [[package]]
 name = "glass-sandbox-linux"
+version = "0.0.0"
+dependencies = [
+ "glass-core",
+]
+
+[[package]]
+name = "glass-sandbox-macos"
 version = "0.0.0"
 dependencies = [
  "glass-core",

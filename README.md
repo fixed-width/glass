@@ -14,8 +14,8 @@ glass drives apps as an external black box, so it works with any native GUI app
 regardless of toolkit or language. It currently has two Linux backends — **X11** and
 **Wayland** ([wlroots](https://gitlab.freedesktop.org/wlroots/wlroots)) — a **Windows** backend ([Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture),
 SendInput, UI Automation) — an **Android** backend (drives native apps in an AVD emulator over `adb`) — and a
-**macOS** backend (ScreenCaptureKit capture, CGEvent input, AXUIElement windows and accessibility tree), behind
-a platform-agnostic core; on macOS, sandboxing is still planned. See the per-host setup guides:
+**macOS** backend (ScreenCaptureKit capture, CGEvent input, AXUIElement windows and accessibility tree, Seatbelt
+process containment), behind a platform-agnostic core. See the per-host setup guides:
 [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
 ## The loop in practice
@@ -256,7 +256,9 @@ escape hatch. The `sandbox` level governs the **launched app only** — the opti
 step always runs unsandboxed, with your full developer environment.
 
 Install the containment runtime per your host guide:
-[Linux](docs/running-on-linux.md) (bubblewrap) · [Windows](docs/running-on-windows.md) (Sandboxie).
+[Linux](docs/running-on-linux.md) (bubblewrap) · [Windows](docs/running-on-windows.md) (Sandboxie). macOS uses the
+OS's built-in Seatbelt sandbox (`sandbox_init`) — nothing to install; see
+[macOS](docs/running-on-macos.md#sandboxing) for the profile and known limits.
 
 ```bash
 glass-mcp doctor   # checks sandbox availability alongside your backend's display deps
@@ -371,12 +373,12 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 |---|:--:|:--:|:--:|:--:|
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ✓ ‡ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ AX |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | 🚧 |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | 🚧 |
 
 † **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard, high-fidelity input, and multi-touch gestures (`glass_gesture`)** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` (single-pointer only — no multi-touch) and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. glass is developed and tested against **Android 14 (API 34)**; the `adb` backend assumes no particular version and the optional companions declare an Android 7.0 (API 24) floor (details in your host guide). Window resize/move (apps are full-screen) and physical devices are non-goals.
 
-‡ **macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Clipboard acts on the real system pasteboard (no containment yet).
+‡ **macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem + process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. The filesystem model is whole-filesystem read (read-only) except your home directory (`/Users`), which is denied so secrets stay hidden, with the working directory re-allowed for reads even when it lives inside your home; writes are limited to the working directory plus scratch/cache dirs (`/tmp`, `/private/var/folders`, `/dev`). The clipboard is isolated under containment — `glass_clipboard_get`/`set` return `Unsupported` when `sandbox != off`; at `sandbox: off` it acts on the real system pasteboard. Known limits: the mach allow-list is broad (a hardening follow-up); Electron apps may be able to escape their own sandbox.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
@@ -397,8 +399,8 @@ tree, a managed AVD (attach-or-boot), and two optional on-device companions — 
 high-fidelity `set_value`), both set up in the [Linux](docs/running-on-linux.md) /
 [Windows](docs/running-on-windows.md) Android guides; it's built and unit-tested in CI and
 validated on-device. The **macOS** backend (ScreenCaptureKit capture, CGEvent input,
-AXUIElement windows/logs, and an AXUIElement accessibility tree) is built and CI-tested;
-sandboxing is not yet implemented — see [docs/running-on-macos.md](docs/running-on-macos.md).
+AXUIElement windows/logs, an AXUIElement accessibility tree, and Seatbelt process
+containment) is built and CI-tested — see [docs/running-on-macos.md](docs/running-on-macos.md).
 
 ## License
 

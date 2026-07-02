@@ -138,6 +138,10 @@ block2 = "0.6.2"
 # glass-proc-linux use it on Linux); its `kill_process`/`Pid`/`Signal` are plain POSIX
 # and available on macOS too.
 rustix.workspace = true
+# Seatbelt process containment (`process.rs::spawn`'s `SandboxLevel::Default`/`Strict`
+# pre_exec): the pure SBPL generator (`build_profile`) plus the macOS-only `sandbox_init`
+# FFI (`apply_cstr`).
+glass-sandbox-macos.workspace = true
 
 # Mac-only: the accessibility-reader integration test (tests/a11y.rs) drives the standalone
 # `glass-a11y-macos` snapshot. Kept in the cfg(macos) dev-dep table so the crate still

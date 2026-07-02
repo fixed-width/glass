@@ -11,7 +11,10 @@
 //! Window discovery is a separate concern ([`crate::scwindow::find_window_for_pids`]);
 //! this module only owns the process lifecycle.
 
+use std::ffi::CString;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +23,7 @@ use rustix::process::{kill_process, Pid, Signal};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
 use glass_core::{GlassError, Result, Stream};
+use glass_sandbox_macos::{build_profile, ProfileOpts};
 
 /// Log lines captured by the per-stream reader threads spawned in [`spawn`], drained by
 /// `MacosPlatform::drain_logs`. `Arc<Mutex<_>>` (not a bare `Vec`) because the reader
@@ -36,18 +40,39 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// `logs` via one reader thread per stream. Returns [`GlassError::AppNotStarted`] if the
 /// program can't be launched (e.g. not found, not executable).
 ///
-/// macOS process containment (sandboxing) is not implemented yet: only
-/// [`SandboxLevel::Off`] is honored. `Default`/`Strict` return
-/// [`GlassError::Unsupported`] *before* launching anything — no silent downgrade to an
-/// unsandboxed run (the no-silent-fallback invariant).
+/// macOS process containment: [`SandboxLevel::Default`]/[`SandboxLevel::Strict`] apply a
+/// generated Seatbelt (`sandbox_init`) profile to the launched app via a fork-safe
+/// `pre_exec` (see below). [`SandboxLevel::Off`] spawns unchanged.
 pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
+    let mut cmd = Command::new(&spec.run[0]);
+
+    // Containment: for Default/Strict, apply a generated Seatbelt profile to the launched app
+    // in a fork-safe pre_exec (build the CString here, before fork; the closure only makes the
+    // sandbox_init syscall). Off spawns unchanged. Build (run_build) is never contained.
     if spec.sandbox != SandboxLevel::Off {
-        return Err(GlassError::Unsupported(
-            "macOS process containment is not implemented yet; use sandbox: off".into(),
-        ));
+        // Resolve to absolute paths: a relative `(subpath ".")` never matches the child's real
+        // cwd, and `build_profile`'s guard needs absolute paths to reason about home exposure.
+        let cwd = spec
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let program =
+            std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
+        let opts = ProfileOpts { cwd, program, ro_binds: vec![], rw_binds: vec![] };
+        let profile = build_profile(spec.sandbox, &opts);
+        let profile_c = CString::new(profile).map_err(|e| {
+            GlassError::SandboxUnavailable(format!("sandbox profile contains NUL: {e}"))
+        })?;
+        // SAFETY: the closure runs in the forked child in the narrow window before `exec`; it
+        // makes a single `sandbox_init` syscall over a pre-built `CString` (see `apply_cstr`)
+        // and performs no allocation of its own.
+        unsafe {
+            cmd.pre_exec(move || glass_sandbox_macos::apply_cstr(&profile_c));
+        }
     }
 
-    let mut cmd = Command::new(&spec.run[0]);
     cmd.args(&spec.run[1..]);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
@@ -58,9 +83,20 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run)))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        // A PermissionDenied under containment could be `sandbox_init` rejecting the profile in
+        // pre_exec, OR a plain EACCES on a non-executable binary — the two are indistinguishable
+        // from this `io::Error` alone. Surface the actionable SandboxUnavailable either way
+        // (the failure is real regardless of cause: fail-closed, never unconfined), but don't
+        // overclaim which one it was.
+        if spec.sandbox != SandboxLevel::Off && e.kind() == std::io::ErrorKind::PermissionDenied {
+            GlassError::SandboxUnavailable(format!(
+                "launch failed under containment (sandbox != off): sandbox_init rejected the profile, or the program could not be exec'd: {e}"
+            ))
+        } else {
+            GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run))
+        }
+    })?;
 
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -135,16 +171,64 @@ mod tests {
     }
 
     #[test]
-    fn non_off_sandbox_is_rejected_before_launch() {
-        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
-            let mut s = spec(&["/bin/echo", "hi"]);
-            s.sandbox = level;
-            let err = spawn(&s, empty_sink()).expect_err("non-Off sandbox must be rejected");
-            assert!(
-                matches!(err, GlassError::Unsupported(_)),
-                "expected Unsupported, got {err:?}"
-            );
+    #[cfg(target_os = "macos")]
+    fn default_sandbox_runs_but_contains_filesystem() {
+        // Exercises the full read-all-except-home model through the real spawn path: a system
+        // read (outside cwd, outside home) must succeed (whole-FS read-allow), a read of a
+        // probe file under a project dir living *inside* $HOME must also succeed (the cwd
+        // reallow that undoes the `/Users` deny for a real project dir), and a read of a secret
+        // living directly under $HOME (outside the project dir) must be denied.
+        //
+        // Both the probe and the secret are files that provably exist (rather than relying on a
+        // fixed name like `.ssh/known_hosts`, which may not exist on a fresh CI runner) so a
+        // `cat` failure can only mean the sandbox denied it, never that the path was absent.
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let proj = std::path::Path::new(&home).join(format!("glass-sbx-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&proj).expect("create project dir under $HOME");
+        let probe_path = proj.join("probe");
+        std::fs::write(&probe_path, "probe").expect("write probe file under the project dir");
+        let secret_path = std::path::Path::new(&home).join("glass-sbx-secret");
+        std::fs::write(&secret_path, "top-secret").expect("write test secret under $HOME");
+        // Drop guard (rather than a manual cleanup closure called on each exit path) so both
+        // the secret file and the project dir are removed even if `child.wait()` or an
+        // assertion below panics.
+        struct Cleanup {
+            secret: std::path::PathBuf,
+            proj: std::path::PathBuf,
         }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.secret);
+                let _ = std::fs::remove_dir_all(&self.proj);
+            }
+        }
+        let _cleanup = Cleanup { secret: secret_path.clone(), proj: proj.clone() };
+        let proj_str = proj.to_str().expect("project path is valid UTF-8");
+        let secret = secret_path.to_str().expect("secret path is valid UTF-8");
+        let shell_cmd = format!(
+            "cat /usr/lib/dyld >/dev/null 2>&1 && echo SYS_OK; \
+             cat \"{proj_str}/probe\" >/dev/null 2>&1 && echo CWD_OK; \
+             cat \"{secret}\" >/dev/null 2>&1 && echo HOME_READABLE || echo HOME_DENIED",
+        );
+
+        let mut denied = spec(&["/bin/sh", "-c", shell_cmd.as_str()]);
+        denied.sandbox = SandboxLevel::Default;
+        denied.cwd = Some(proj.clone());
+        let logs = empty_sink();
+        let mut child =
+            spawn(&denied, logs.clone()).unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
+        child.wait().expect("wait");
+        std::thread::sleep(Duration::from_millis(100));
+        let out: Vec<String> = logs
+            .lock()
+            .expect("sink")
+            .iter()
+            .map(|(_, l)| l.clone())
+            .collect();
+        assert!(out.iter().any(|l| l == "SYS_OK"), "whole-FS read should be allowed: {out:?}");
+        assert!(out.iter().any(|l| l == "CWD_OK"), "cwd under home should be reallowed: {out:?}");
+        assert!(out.iter().any(|l| l == "HOME_DENIED"), "home read must be denied: {out:?}");
+        assert!(!out.iter().any(|l| l == "HOME_READABLE"), "home leaked: {out:?}");
     }
 
     #[test]
