@@ -50,6 +50,7 @@ static CLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// `Option` itself — there is no separate flag. `start_app` holds this until the launched
 /// window is confirmed, then combines `name` with a live shim-confirmation check to decide the
 /// session's `ClipboardRoute` (`crate::clipboard_route::decide_route`).
+#[derive(Debug)]
 pub(crate) struct ClipLaunch {
     pub name: String,
 }
