@@ -47,6 +47,9 @@ between screenshots cost no vision tokens.
   Apps are **sandboxed by default**; set `GLASS_SANDBOX=off` to run unconfined.
   See [Containment / sandboxing](#containment--sandboxing) for the levels; `glass-mcp doctor`
   checks availability and prints the exact remedy for your system.
+- **macOS only:** the Xcode Command Line Tools (`xcode-select --install`) — building from
+  source needs the macOS SDK and `clang` they provide (the `objc2-*` crates' link step
+  needs them). See [macOS: System requirements](docs/running-on-macos.md#system-requirements).
 
 ### Build from source
 
@@ -56,8 +59,10 @@ cd glass
 cargo build --release -p glass-mcp        # → target/release/glass-mcp
 ```
 
-(Tagged releases also attach prebuilt binaries to the GitHub Releases page, with
-per-platform setup notes under [`packaging/`](packaging).)
+(Tagged releases also attach prebuilt **Linux and Windows** binaries to the GitHub
+Releases page, with per-platform setup notes under [`packaging/`](packaging). macOS
+prebuilt binaries are a future addition — build from source for now, following
+[docs/running-on-macos.md](docs/running-on-macos.md).)
 
 ### Verify
 

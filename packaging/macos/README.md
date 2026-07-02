@@ -1,10 +1,10 @@
 # packaging/macos
 
-Assembles `glass-mcp` into a signed macOS app bundle and runs it as a per-user
-LaunchAgent. This is a quick reference for the files here; see
+Assembles `glass-mcp` into a signed macOS app bundle and (optionally) runs it as a
+per-user LaunchAgent. This is a quick reference for the files here; see
 [docs/running-on-macos.md](../../docs/running-on-macos.md) for the full setup
-guide (creating a signing identity, granting Screen Recording / Accessibility,
-connecting a client).
+guide (creating a signing identity, running `glass-mcp setup` to grant Screen
+Recording / Accessibility and install the run integration, connecting a client).
 
 ## Files
 
@@ -30,7 +30,26 @@ connecting a client).
 # -> target/macos-app/GlassMcp.app
 ```
 
-## Load / unload the LaunchAgent
+## Grant permissions + install the run integration
+
+```bash
+target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp setup
+```
+
+`glass-mcp setup` is the guided first-run: it requests Screen Recording +
+Accessibility (opening the exact System Settings pane and polling for you),
+then either installs this LaunchAgent (`--launchagent`, or answering yes when
+asked) or leaves nothing installed for an attended/stdio client (`--no-launchagent`),
+and confirms the result via `doctor`. See
+[docs/running-on-macos.md](../../docs/running-on-macos.md) for the full flow,
+including the flags (`--non-interactive`, `--addr`) and the Screen-Recording
+relaunch nuance.
+
+## Load / unload the LaunchAgent by hand
+
+`glass-mcp setup --launchagent` does this for you (filling in the template below
+and running `launchctl bootstrap`); use these commands directly to stop it,
+reload it after moving the app, or debug a load failure:
 
 ```bash
 mkdir -p ~/Library/LaunchAgents ~/Library/Logs/GlassMcp
