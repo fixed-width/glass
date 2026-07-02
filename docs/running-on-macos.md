@@ -161,8 +161,9 @@ driving the AXUIElement tree; they need the same Accessibility grant from step 3
 above (no separate permission).
 
 - **Clipboard** (`glass_clipboard_get`, `glass_clipboard_set`) — read and write the system pasteboard at
-  `sandbox: off`. Under containment (`default`/`strict`) the clipboard is isolated — see
-  [Sandboxing](#sandboxing) below.
+  `sandbox: off`. Under containment (`default`/`strict`) the clipboard is isolated **and
+  working** for an injectable app, and `Unsupported` for a hardened-runtime app — see
+  [Clipboard isolation](#clipboard-isolation) below.
 
 ## Sandboxing
 
@@ -195,16 +196,40 @@ sandboxed app that can't register with the window server returns an empty AX tre
 
 ### Clipboard isolation
 
-Under `default`/`strict` the profile denies the app the real pasteboard
-(`com.apple.pasteboard.1`), so `glass_clipboard_get`/`glass_clipboard_set` return
-`Unsupported` rather than silently falling back to the shared system clipboard. At
-`sandbox: off` clipboard access works normally (see
+Under `default`/`strict`, `glass_clipboard_get`/`glass_clipboard_set` are isolated from your
+real pasteboard **but still work** for an **injectable** app: at launch glass injects a small
+shim (`DYLD_INSERT_LIBRARIES`) that swizzles `+[NSPasteboard generalPasteboard]` inside the
+app process, redirecting it to a private, per-session named pasteboard that glass reads and
+writes from the host side. The app copies/pastes normally against that private pasteboard;
+your real clipboard is never touched. glass confirms the swizzle actually took (a sentinel
+item written to the private pasteboard) before routing to it, so an injection that silently
+failed doesn't get mistaken for a working bridge.
+
+If the target runs under Apple's **hardened runtime**, `DYLD_INSERT_LIBRARIES` injection is
+stripped by the OS and the swizzle can't take. Such apps aren't injectable, so the Seatbelt
+profile denies them the real pasteboard service (`com.apple.pasteboard.1`) outright and
+`glass_clipboard_get`/`glass_clipboard_set` return `Unsupported` — fail-closed at the profile
+level, not a silent fall-back to the shared system clipboard.
+
+For an *injectable* app whose shim confirmation doesn't arrive (injection silently failed),
+`glass_clipboard_get`/`glass_clipboard_set` also return `Unsupported`: glass decides that
+route after launch, from the missing sentinel, and never bridges to the real clipboard. Note
+this is a glass-side gate — the profile *does* allow the pasteboard service for an injectable
+target (that decision is made before launch, before confirmation is possible), so a silently-
+failed injection leaves the app itself still able to reach the real pasteboard directly. In
+practice injection either takes or the launch fails loudly, so this window is rare.
+At `sandbox: off` clipboard access works normally against the real pasteboard (see
 [Tools available on macOS](#tools-available-on-macos) above).
 
 ### Known limits
 
 - **The mach allow-list is broad** (`(allow mach-lookup)`) — narrowing it to only the
   services a given app actually needs is a hardening follow-up.
+- **The clipboard shim covers `NSPasteboard` only.** It swizzles the high-level
+  `+[NSPasteboard generalPasteboard]` entry point that most apps use; an app that reaches the
+  pasteboard through lower-level Carbon/Core Services APIs isn't redirected. Hardened-runtime
+  apps can't be injected at all, so their clipboard access is `Unsupported` rather than
+  isolated-but-working.
 - **Electron apps may be able to escape their own in-app sandbox** under this
   containment. Seatbelt contains the process from the outside; an Electron app's
   internal renderer/main-process sandboxing is a separate mechanism this doesn't harden.

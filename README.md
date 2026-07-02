@@ -209,7 +209,12 @@ A few capabilities worth knowing:
   and Chrome work too; x64) and real-file copy via `CF_HDROP` (virtual-file drag-out
   — shell extensions, zip attachments — is deferred). So they never touch
   your real clipboard unless you set `GLASS_DISPLAY=:0` or run the Windows
-  backend with `sandbox=off`. On **Android**, clipboard get/set works through the
+  backend with `sandbox=off`. On **macOS**, a contained **injectable** app gets an
+  isolated-but-working clipboard too: a `DYLD_INSERT_LIBRARIES` shim redirects it to a
+  private named pasteboard glass shares, so the app can copy/paste normally while your
+  real clipboard is never touched; a **hardened-runtime** app can't be redirected, so
+  these tools return `Unsupported` for it (see
+  [running-on-macos.md](docs/running-on-macos.md)). On **Android**, clipboard get/set works through the
   optional on-device agent (set `GLASS_ANDROID_AGENT_JAR`) —
   the system clipboard isn't reachable over plain `adb`, so without the agent these
   tools report unsupported. `glass_clipboard_get` is also the cheap text-extraction
@@ -378,7 +383,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 
 † **Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass manages the AVD (attach a running one, or boot a headless one). **Clipboard, high-fidelity input, and multi-touch gestures (`glass_gesture`)** use the optional on-device agent, and an optional on-device **AccessibilityService** sharpens the a11y tree (Compose) + `set_value` (both in the Android section of your host guide: [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md)) — without the agent, input falls back to adb's `input` (single-pointer only — no multi-touch) and clipboard is unavailable; without the service, a11y falls back to `uiautomator`. glass is developed and tested against **Android 14 (API 34)**; the `adb` backend assumes no particular version and the optional companions declare an Android 7.0 (API 24) floor (details in your host guide). Window resize/move (apps are full-screen) and physical devices are non-goals.
 
-‡ **macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem + process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. The filesystem model is whole-filesystem read (read-only) except your home directory (`/Users`), which is denied so secrets stay hidden, with the working directory re-allowed for reads even when it lives inside your home; writes are limited to the working directory plus scratch/cache dirs (`/tmp`, `/private/var/folders`, `/dev`). The clipboard is isolated under containment — `glass_clipboard_get`/`set` return `Unsupported` when `sandbox != off`; at `sandbox: off` it acts on the real system pasteboard. Known limits: the mach allow-list is broad (a hardening follow-up); Electron apps may be able to escape their own sandbox.
+‡ **macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem + process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. The filesystem model is whole-filesystem read (read-only) except your home directory (`/Users`), which is denied so secrets stay hidden, with the working directory re-allowed for reads even when it lives inside your home; writes are limited to the working directory plus scratch/cache dirs (`/tmp`, `/private/var/folders`, `/dev`). Under containment, the clipboard is isolated **and working** for an **injectable** app — a swizzle shim redirects it to a private named pasteboard glass shares; a **hardened-runtime** app can't be redirected, so `glass_clipboard_get`/`set` return `Unsupported` for it. At `sandbox: off` it acts on the real system pasteboard. Known limits: the mach allow-list is broad (a hardening follow-up); Electron apps may be able to escape their own sandbox.
 
 The per-platform detail — sandboxing levels, display isolation, the accessibility tree —
 lives in the [Containment](#containment--sandboxing), [Backends](#backends), and
