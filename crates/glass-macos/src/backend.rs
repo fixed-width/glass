@@ -86,7 +86,7 @@ pub struct MacosPlatform {
     active_window: Option<u32>,
     /// How `get_clipboard`/`set_clipboard` route the active session's clipboard. Decided in
     /// `start_app` (success path, from `clip` below plus a live `clipboard::shim_present`
-    /// check), reset to the default (`RealGeneral`) in `stop_app` — see
+    /// check), reset to the fail-closed default (`Unsupported`) in `stop_app` — see
     /// `crate::clipboard_route`'s module doc for the full decision and the three routes.
     clipboard_route: ClipboardRoute,
     /// The clip-shim launch facts `process::spawn` produced for the current session's app —
@@ -320,17 +320,18 @@ impl Platform for MacosPlatform {
                 // this field on every call.
                 self.active_window = Some(m.window_id);
                 // Decide the session's clipboard route now that the launched window is
-                // confirmed: `clip` only carries the shim's launch-time facts
-                // (name/injectable), so a live `clipboard::shim_present` check confirms the
-                // swizzle actually took before a `Private` route is trusted (an injectable
-                // target whose injection silently failed must still land on `Unsupported`,
-                // not a `Private` route to a pasteboard the app was never redirected to).
+                // confirmed: `clip` only carries the shim's launch-time name (its presence
+                // means the launch was injectable), so a live `clipboard::shim_present` check
+                // confirms the swizzle actually took before a `Private` route is trusted (an
+                // injectable target whose injection silently failed must still land on
+                // `Unsupported`, not a `Private` route to a pasteboard the app was never
+                // redirected to).
                 self.clipboard_route = match &clip {
                     Some(c) => {
                         let confirmed = crate::clipboard::shim_present(&c.name);
-                        crate::clipboard_route::decide_route(spec.sandbox, &c.name, c.injectable, confirmed)
+                        crate::clipboard_route::decide_route(spec.sandbox, Some((&c.name, confirmed)))
                     }
-                    None => crate::clipboard_route::decide_route(spec.sandbox, "", false, false),
+                    None => crate::clipboard_route::decide_route(spec.sandbox, None),
                 };
                 self.clip = clip;
                 // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
@@ -353,6 +354,15 @@ impl Platform for MacosPlatform {
     fn stop_app(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
+        }
+        // Release this session's named pasteboards (the content board + its `.ready` sentinel
+        // board) before dropping the shim facts. Named pasteboards persist system-wide until
+        // released, and a leftover sentinel could otherwise mask a failed injection in a later
+        // session (see `crate::clipboard_route`). Only released when a shim launch name is
+        // known (an injectable, contained launch); uncontained/hardened launches have none.
+        if let Some(clip) = &self.clip {
+            crate::clipboard::release_named(&clip.name);
+            crate::clipboard::release_named(&format!("{}.ready", clip.name));
         }
         self.app_pid = None;
         self.active_window = None;
@@ -677,16 +687,17 @@ mod tests {
     #[test]
     fn stop_app_clears_clipboard_route() {
         // start_app decides clipboard_route for the session; stop_app must reset it to the
-        // default (RealGeneral) too, so a later start_app on the same MacosPlatform never
-        // inherits a stale contained-session route (which would wrongly route
-        // get_clipboard/set_clipboard to a private pasteboard, or Unsupported, that no
-        // longer applies) before the next start_app decides fresh.
+        // fail-closed default (Unsupported) too, so a later start_app on the same
+        // MacosPlatform never inherits a stale contained-session route (here a
+        // `Private(name)`, which would wrongly route get_clipboard/set_clipboard to a private
+        // pasteboard that no longer applies) before the next start_app decides fresh. `clip`
+        // is None so stop_app touches no pasteboard here.
         let mut p = MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
             active_window: Some(7),
-            clipboard_route: ClipboardRoute::Unsupported,
+            clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
             clip: None,
         };
         assert!(p.stop_app().is_ok());
@@ -698,14 +709,16 @@ mod tests {
         // start_app stores process::spawn's ClipLaunch facts for a later clipboard-routing
         // decision; stop_app must clear them too, so a later start_app on the same
         // MacosPlatform never leaks a previous session's shim facts (e.g. a stale private
-        // pasteboard name) into a new one.
+        // pasteboard name) into a new one. With `clip` set, stop_app also exercises the
+        // `release_named` path for the content + `.ready` boards (harmless on names no live
+        // shim ever wrote).
         let mut p = MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
             active_window: Some(7),
-            clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.1".into()),
-            clip: Some(ClipLaunch { name: "tech.fixedwidth.glass.clip.1".into(), injectable: true }),
+            clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
+            clip: Some(ClipLaunch { name: "tech.fixedwidth.glass.clip.42.1.1".into() }),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.clip.is_none());

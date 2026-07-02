@@ -1,9 +1,10 @@
 //! glass macOS clipboard shim — injected via `DYLD_INSERT_LIBRARIES` into a contained app
 //! process. On load it reads `GLASS_CLIP_PASTEBOARD`; if set, it swizzles
 //! `+[NSPasteboard generalPasteboard]` to return a private, named pasteboard instead of the
-//! real system one, then writes a sentinel item so glass can confirm the injection took.
-//! Inert if the env var is unset — a copy of this shim loaded into an unrelated (or
-//! uncontained) process is a no-op.
+//! real system one, then writes a sentinel item to a dedicated `<name>.ready` pasteboard so
+//! glass can confirm the injection took (a separate board so the app's own `clearContents` on
+//! the content board can never wipe the sentinel). Inert if the env var is unset — a copy of
+//! this shim loaded into an unrelated (or uncontained) process is a no-op.
 //!
 //! Isolation: the contained app's ordinary `NSPasteboard.generalPasteboard` calls are
 //! transparently redirected to the private named pasteboard; glass reads/writes the same
@@ -81,15 +82,21 @@ mod imp {
             method.set_implementation(imp);
         }
 
-        // Prove the injection took: write a sentinel item to the private pasteboard so
-        // glass can read it back from the host side and confirm the swizzle is live before
-        // trusting anything the contained app writes to "the clipboard".
-        let pb_name = NSString::from_str(name());
-        let pb = NSPasteboard::pasteboardWithName(&pb_name);
-        pb.clearContents();
+        // Prove the injection took: write a sentinel item to a DEDICATED `<name>.ready`
+        // pasteboard (never the content board the app itself uses — its own `clearContents`
+        // on a write would wipe a same-board sentinel) so glass can read it back from the host
+        // side and confirm the swizzle is live before trusting a `Private` clipboard route.
+        let ready_name = NSString::from_str(&format!("{}.ready", name()));
+        let ready = NSPasteboard::pasteboardWithName(&ready_name);
+        ready.clearContents();
         let sentinel_type = NSString::from_str(SENTINEL_TYPE);
         let sentinel_value = NSString::from_str("1");
-        pb.setString_forType(&sentinel_value, &sentinel_type);
+        // Diagnostic only: the swizzle above already took effect regardless of this write. A
+        // `false` here means the sentinel write was refused, which would leave glass on the
+        // fail-closed `Unsupported` route — surface why rather than failing silently.
+        if !ready.setString_forType(&sentinel_value, &sentinel_type) {
+            eprintln!("glass-clip-shim: failed to write injection sentinel to {}.ready", name());
+        }
     }
 }
 

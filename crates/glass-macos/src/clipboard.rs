@@ -9,8 +9,8 @@
 //! - **`Private(name)`** (contained + injectable + the clip shim confirmed): [`get_named`]/
 //!   [`set_named`] act on the private named pasteboard the shim redirected the contained
 //!   app's `NSPasteboard.generalPasteboard` to — the real general pasteboard is never
-//!   touched. [`shim_present`] confirms the shim's sentinel item landed there before
-//!   `start_app` trusts this route.
+//!   touched. [`shim_present`] confirms the shim's sentinel item landed on the dedicated
+//!   `<name>.ready` board before `start_app` trusts this route.
 //!
 //! `Unsupported` (contained, non-injectable/unconfirmed) never reaches this module at all —
 //! `MacosPlatform::get_clipboard`/`set_clipboard` short-circuit to `GlassError::Unsupported`
@@ -26,9 +26,9 @@ use objc2_app_kit::{NSPasteboard, NSPasteboardType, NSPasteboardTypeString};
 use objc2_foundation::NSString;
 
 /// The clip shim's sentinel pasteboard-item type (`glass-clip-shim-macos`'s
-/// `SENTINEL_TYPE`) — written to the private named pasteboard once the shim's swizzle is
+/// `SENTINEL_TYPE`) — written to the session's `<name>.ready` board once the shim's swizzle is
 /// live, so [`shim_present`] can confirm injection actually took rather than trusting
-/// `injectable` (codesign-derived) alone.
+/// injectability (codesign-derived) alone.
 const SHIM_SENTINEL_TYPE: &str = "tech.fixedwidth.glass.clip-shim";
 
 /// The plain-text pasteboard type constant.
@@ -64,14 +64,39 @@ pub(crate) fn set_named(name: &str, text: &str) -> Result<()> {
     write(&NSPasteboard::pasteboardWithName(&NSString::from_str(name)), text)
 }
 
-/// Whether the clip shim's sentinel item ([`SHIM_SENTINEL_TYPE`]) is present on the named
-/// pasteboard `name` — confirms the shim's swizzle-and-write actually took, not merely that
-/// the target was injectable. `start_app` calls this to decide whether a `Private(name)`
-/// route is trustworthy.
+/// Whether the clip shim's sentinel item ([`SHIM_SENTINEL_TYPE`]) is present on the session's
+/// dedicated `<name>.ready` sentinel board — confirms the shim's swizzle-and-write actually
+/// took, not merely that the target was injectable. `start_app` calls this to decide whether a
+/// `Private(name)` route is trustworthy.
+///
+/// The sentinel lives on a SEPARATE `.ready` board (not the `name` content board the app
+/// itself uses) so the app's own `clearContents` on a write can never wipe it — that would
+/// make a live injection read as unconfirmed.
 pub(crate) fn shim_present(name: &str) -> bool {
-    let pb = NSPasteboard::pasteboardWithName(&NSString::from_str(name));
+    let ready_name = format!("{name}.ready");
+    let pb = NSPasteboard::pasteboardWithName(&NSString::from_str(&ready_name));
     let sentinel_type = NSString::from_str(SHIM_SENTINEL_TYPE);
     pb.stringForType(&sentinel_type).is_some()
+}
+
+/// Release a named pasteboard's server-side resources. Named pasteboards persist system-wide
+/// until explicitly released, so `stop_app` calls this on both the session's content board and
+/// its `<name>.ready` sentinel board — hygiene, plus defense against a stale sentinel ever
+/// masking a later failed injection (see [`shim_present`] / `crate::clipboard_route`).
+///
+/// Sends `-[NSPasteboard releaseGlobally]` via `msg_send!` because that (deprecated) selector
+/// is absent from objc2-app-kit 0.3.2's generated bindings (skipped in its translation
+/// config), so there is no safe wrapper to call.
+pub(crate) fn release_named(name: &str) {
+    let pb = NSPasteboard::pasteboardWithName(&NSString::from_str(name));
+    // SAFETY: `releaseGlobally` is a zero-argument `void` instance method; `pb` is a live,
+    // non-null `Retained<NSPasteboard>` from `pasteboardWithName`, so it matches exactly the
+    // receiver and (empty) argument list `-[NSPasteboard releaseGlobally]` expects. The call
+    // returns no object, so no ownership/lifetime obligation follows; the local `Retained`
+    // still drops (releases its own reference) normally afterward.
+    unsafe {
+        let _: () = objc2::msg_send![&*pb, releaseGlobally];
+    }
 }
 
 /// Read `pb`'s plain-text value; `""` when it holds no string of that type. Split from [`get`]
@@ -161,13 +186,13 @@ mod tests {
     #[test]
     fn shim_present_is_true_once_the_sentinel_type_is_written() {
         // Mirrors exactly what `glass-clip-shim-macos::imp::install` does on a real injected
-        // launch — write the sentinel type to the named pasteboard — without depending on the
-        // shim dylib itself.
+        // launch — write the sentinel type to the dedicated `<name>.ready` board — without
+        // depending on the shim dylib itself.
         let name = named("sentinel");
-        let pb = NSPasteboard::pasteboardWithName(&NSString::from_str(&name));
+        let ready = NSPasteboard::pasteboardWithName(&NSString::from_str(&format!("{name}.ready")));
         let sentinel_type = NSString::from_str(SHIM_SENTINEL_TYPE);
         let value = NSString::from_str("1");
-        assert!(pb.setString_forType(&value, &sentinel_type));
+        assert!(ready.setString_forType(&value, &sentinel_type));
         assert!(shim_present(&name));
     }
 }

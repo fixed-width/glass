@@ -7,8 +7,9 @@
 //! denied so secrets (`~/.ssh` etc.) stay hidden by construction; the working dir, the
 //! launched program's own directory, and any caller `ro_binds` are then re-allowed even if
 //! they happen to live under a home, as long as they aren't the home root itself (see
-//! [`is_safe_reallow`]). Writes stay deny-default: only the working dir, caller `rw_binds`,
-//! and scratch/cache roots.
+//! [`is_safe_reallow`]); individual caller `ro_files` are re-allowed as single-file literals
+//! (used for the injected clip-shim dylib). Writes stay deny-default: only the working dir,
+//! caller `rw_binds`, and scratch/cache roots.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -22,8 +23,14 @@ pub struct ProfileOpts {
     pub cwd: PathBuf,
     /// The launched program's path; its directory is read-allowed (the app bundle/binary).
     pub program: PathBuf,
-    /// Extra paths re-exposed read-only (currently none on macOS; kept for parity/extensibility).
+    /// Extra directories re-exposed read-only (a `subpath` re-allow of the whole tree).
     pub ro_binds: Vec<PathBuf>,
+    /// Extra single FILES re-exposed read-only via a `(literal …)` rule — used to re-allow
+    /// exactly the injected clip-shim dylib without exposing its whole directory (a file
+    /// literal, unlike a `subpath`, grants no access to siblings). A file under `/Users` is
+    /// safe to re-allow for read this way, so these are emitted unconditionally after the
+    /// `/Users` deny.
+    pub ro_files: Vec<PathBuf>,
     /// Extra paths re-exposed read-write.
     pub rw_binds: Vec<PathBuf>,
     /// When true (an injectable contained target), ALLOW `com.apple.pasteboard.1` so the shim's
@@ -64,6 +71,13 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     for b in opts.ro_binds.iter().filter(|b| is_safe_reallow(b)) {
         emit_read_allow(&mut p, b);
     }
+    // Re-allow reads of individual FILES (a `literal`, not a `subpath`) after the `/Users`
+    // deny — used for the injected clip-shim dylib, which lives under $HOME. A file literal
+    // grants no access to its siblings, so (unlike a directory subpath) it needs no
+    // home-exposure guard.
+    for f in &opts.ro_files {
+        emit_read_allow_file(&mut p, f);
+    }
     // Writes: deny-default; only scratch/caches + the working dir + caller rw_binds.
     p.push_str("(allow file-write*\n");
     for w in SCRATCH_WRITE_ROOTS {
@@ -94,6 +108,15 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
 fn emit_read_allow(out: &mut String, path: &Path) {
     out.push_str("(allow file-read* file-read-metadata ");
     out.push_str(&format!("(subpath {})", sbpl_quote(&path.to_string_lossy())));
+    out.push_str(")\n");
+}
+
+/// Emit a standalone read-allow for a single FILE (`literal`, not `subpath`), so exactly that
+/// file is re-allowed for read without exposing its directory. Used for the injected clip-shim
+/// dylib (see [`ProfileOpts::ro_files`]).
+fn emit_read_allow_file(out: &mut String, path: &Path) {
+    out.push_str("(allow file-read* file-read-metadata ");
+    out.push_str(&format!("(literal {})", sbpl_quote(&path.to_string_lossy())));
     out.push_str(")\n");
 }
 
@@ -154,6 +177,7 @@ mod tests {
             cwd: PathBuf::from("/work/project"),
             program: PathBuf::from("/Applications/Demo.app/Contents/MacOS/Demo"),
             ro_binds: vec![],
+            ro_files: vec![],
             rw_binds: vec![],
             // Default-safe: deny the real pasteboard unless a test opts in.
             allow_pasteboard: false,
@@ -307,6 +331,34 @@ mod tests {
         let p = build_profile(SandboxLevel::Default, &o);
         assert!(p.contains(r#"(subpath "/opt/data")"#), "{p}");
         assert!(p.contains(r#"(subpath "/opt/scratch")"#), "{p}");
+    }
+
+    /// A `ro_files` entry (the injected clip-shim dylib) must be re-allowed for read as a
+    /// single-file `(literal …)` — never a `(subpath …)` that would expose its whole
+    /// directory — and emitted AFTER the `/Users` deny so SBPL's last-match-wins restores read
+    /// for a file living under $HOME (the shim dylib's normal location in glass's target dir).
+    #[test]
+    fn ro_files_emit_a_file_literal_after_the_home_deny() {
+        let mut o = opts();
+        let dylib = "/Users/dev/proj/target/release/libglass_clip_shim_macos.dylib";
+        o.ro_files = vec![PathBuf::from(dylib)];
+        let p = build_profile(SandboxLevel::Default, &o);
+
+        let literal = format!(r#"(allow file-read* file-read-metadata (literal "{dylib}"))"#);
+        let literal_idx = p.find(&literal).unwrap_or_else(|| {
+            panic!("a ro_files entry must emit a (literal ...) read-allow:\n{p}")
+        });
+        assert!(
+            !p.contains(&format!(r#"(subpath "{dylib}")"#)),
+            "a ro_files entry must NOT widen to a subpath:\n{p}"
+        );
+        let deny_idx = p
+            .find(r#"(deny file-read* (subpath "/Users"))"#)
+            .expect("home deny must be present");
+        assert!(
+            literal_idx > deny_idx,
+            "the file literal must come after the /Users deny so last-match-wins restores it:\n{p}"
+        );
     }
 
     /// A `cwd` containing `"` and `\` must come out of `sbpl_quote` escaped, so the path stays
