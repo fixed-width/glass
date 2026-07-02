@@ -39,5 +39,12 @@ pub use ffi::init_main_thread;
 // and the console session's three-way state (unlocked/locked/no-session-attached).
 #[cfg(target_os = "macos")]
 pub use permissions::{accessibility_granted, accessibility_remedy, screen_recording_granted, screen_recording_remedy};
+// Guided-setup counterparts to the predicates above: pure pane-URL/open helpers (usable
+// anywhere, including `doctor`'s `remedy_action`) and the prompting `request_*` pair
+// (used only by the future `setup` command — never by `preflight`/`doctor`).
+#[cfg(target_os = "macos")]
+pub use permissions::{
+    accessibility_pane_url, open_pane, request_accessibility, request_screen_recording, screen_recording_pane_url,
+};
 #[cfg(target_os = "macos")]
 pub use session::{session_locked, session_state, SessionState};

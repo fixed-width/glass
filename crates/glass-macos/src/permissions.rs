@@ -4,6 +4,10 @@
 //! holds them via a stable code-signed identity. Here we only *detect* a missing grant
 //! and return an actionable error — never a blank frame.
 
+use std::ptr::NonNull;
+
+use objc2_core_foundation::{kCFBooleanTrue, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+
 use glass_core::Result;
 
 /// The two macOS TCC grants glass needs. A local enum keeps the permission names in
@@ -105,6 +109,93 @@ pub(crate) fn preflight() -> Result<()> {
     Ok(())
 }
 
+/// The System Settings deep-link for the Screen Recording privacy pane. Pure (no OS
+/// call), so both `doctor`'s `remedy_action` and the `setup` command can use it without
+/// either one triggering a permission prompt themselves.
+pub fn screen_recording_pane_url() -> &'static str {
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+}
+
+/// The System Settings deep-link for the Accessibility privacy pane. See
+/// [`screen_recording_pane_url`].
+pub fn accessibility_pane_url() -> &'static str {
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+}
+
+/// Open a System Settings pane (or any URL) via the `open` command-line tool. Returns an
+/// error the caller can surface to the agent; never panics.
+pub fn open_pane(url: &str) -> Result<()> {
+    let status = std::process::Command::new("open")
+        .arg(url)
+        .status()
+        .map_err(|e| glass_core::GlassError::Backend(format!("open {url}: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(glass_core::GlassError::Backend(format!("open {url} exited {status}")))
+    }
+}
+
+// --- Guided setup: prompting requests --------------------------------------------------
+//
+// Everything above this point only *reads* TCC state (`screen_recording_granted`,
+// `accessibility_granted`, `preflight`) — safe to call from `doctor` on every run. The two
+// functions below are the opposite: they actively trigger the OS consent flow (a system
+// dialog, on first request). They exist only for the future interactive `setup` command
+// and must never be called from `preflight`/`doctor`, which must stay non-prompting.
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    // Triggers the Screen Recording consent flow (adds glass to the privacy pane if it
+    // isn't already listed, and shows the system dialog on first request) and returns
+    // the current grant state. Post-10.15 API, C99 `bool` ABI — like
+    // `CGPreflightScreenCaptureAccess` above.
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    // With an options dict carrying `kAXTrustedCheckOptionPrompt = true`, shows the
+    // Accessibility consent dialog (when not already trusted) and returns the current
+    // trust state. `Boolean` (u8), not C99 `bool` — see `AXIsProcessTrusted` above for
+    // why that distinction matters for the return-value binding.
+    fn AXIsProcessTrustedWithOptions(options: *const CFDictionary) -> u8;
+}
+
+/// Trigger the Screen Recording consent flow (shows the system dialog and adds glass to
+/// the Privacy & Security > Screen Recording pane) and report whether the grant is
+/// currently held. Only ever called from the `setup` command — `preflight`/`doctor` must
+/// never prompt; they call [`screen_recording_granted`] instead.
+pub fn request_screen_recording() -> bool {
+    // SAFETY: no-argument C call. Unlike `CGPreflightScreenCaptureAccess`, this one's
+    // documented behavior is to prompt; it has no other preconditions and its only
+    // effects are the system dialog plus reading this process's TCC state.
+    unsafe { CGRequestScreenCaptureAccess() }
+}
+
+/// Trigger the Accessibility consent dialog (via `kAXTrustedCheckOptionPrompt`) and
+/// report whether this process is currently trusted. Only ever called from the `setup`
+/// command — `preflight`/`doctor` must never prompt; they call [`accessibility_granted`]
+/// instead.
+pub fn request_accessibility() -> bool {
+    let key = CFString::from_str("AXTrustedCheckOptionPrompt");
+    // SAFETY: `kCFBooleanTrue` is a framework-owned singleton, always live for the
+    // process's lifetime; reading the extern static is a plain global read (same idiom
+    // `axwindow::ax_set_main` and `session.rs`'s tests use).
+    let true_boolean: Option<&CFBoolean> = unsafe { kCFBooleanTrue };
+    // `None` is not a real-world case (the constant is always present on real
+    // CoreFoundation builds) but falling back to the non-prompting predicate instead of
+    // panicking keeps this function total.
+    let Some(true_boolean) = true_boolean else { return accessibility_granted() };
+    let prompt: &CFType = true_boolean;
+    let dict: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(&[&key], &[prompt]);
+    // SAFETY: `AXIsProcessTrustedWithOptions` takes a CFDictionaryRef; `dict` stays alive
+    // for the whole call (it is dropped only when this function returns, after the FFI
+    // call has returned), and the only effects are the documented consent prompt plus
+    // reading this process's trust state (`Boolean`/u8 return, same ABI reasoning as
+    // `AXIsProcessTrusted` above).
+    unsafe { AXIsProcessTrustedWithOptions(NonNull::from(&*dict).cast().as_ptr()) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,4 +219,22 @@ mod tests {
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
+
+    #[test]
+    fn screen_recording_pane_url_points_at_the_screen_capture_anchor() {
+        assert!(screen_recording_pane_url().contains("Privacy_ScreenCapture"));
+    }
+
+    #[test]
+    fn accessibility_pane_url_points_at_the_accessibility_anchor() {
+        assert!(accessibility_pane_url().contains("Privacy_Accessibility"));
+    }
+
+    // `request_screen_recording`/`request_accessibility` are deliberately not exercised
+    // here: unlike every predicate above, they have a real side effect (they can pop the
+    // OS consent dialog), which is unsafe to trigger unattended in CI — a headless runner
+    // has no user to click through it, and a real one shouldn't have its TCC state
+    // mutated by every test run. Their FFI plumbing is verified by hand against the
+    // granted mini (see the workspace's macOS de-risking notes); `open_pane` is likewise
+    // side-effecting (launches System Settings) and not called here for the same reason.
 }
