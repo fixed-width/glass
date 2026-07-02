@@ -253,15 +253,18 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let pat = el
         .get_pattern::<UIValuePattern>()
         .map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
-    let before = pat.get_value().unwrap_or_default();
+    // Pre-write value: the baseline for the "changed" check. `None` (a failed pre-read) means the
+    // baseline is unknown — the confirmation below then requires an exact match rather than
+    // trusting a "differs from before" signal it cannot compute.
+    let before = pat.get_value().ok();
     pat.set_value(text).map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
-    // Verify the write took. egui/accesskit read-only editables accept SetValue without error
-    // but never apply it (false success). Poll the value back — a real numeric set lands a frame
-    // later — and require it to change; a no-op never changes → honest error.
+    // Verify the write took, error-aware. egui/accesskit read-only editables accept SetValue
+    // without error but never apply it (false success). Poll the value back — a real numeric set
+    // lands a frame later. `.ok()` maps a failed read to `None`, which never confirms, so neither
+    // a failed post-read nor a failed pre-read can masquerade as a successful change.
     let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
     loop {
-        let after = pat.get_value().unwrap_or_default();
-        if set_value_took(&before, &after, text) {
+        if read_back_confirms(pat.get_value().ok().as_deref(), before.as_deref(), text) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -318,9 +321,30 @@ pub(crate) fn set_value_took(before: &str, after: &str, requested: &str) -> bool
     after == requested || after != before
 }
 
+/// Whether a read-back poll can *confirm* a `set_value` write took. `read_back` is the value
+/// read after the write (`None` if that read failed); `before` is the pre-write baseline
+/// (`None` if the pre-read failed — baseline unknown). Confirms only when it can prove the
+/// write landed:
+/// - a failed post-write read (`read_back == None`) is inconclusive → never confirms (the
+///   caller keeps polling to its deadline, then reports `AxValueNotApplied`);
+/// - with a known baseline, delegates to [`set_value_took`] (equals request, or changed from it);
+/// - with an unknown baseline, only an exact match with the request confirms — "changed from
+///   before" is meaningless without a trustworthy baseline.
+///
+/// This is the honesty guard against a *failed read* masquerading as a change: the pre-fix loop
+/// collapsed both reads to `""` via `unwrap_or_default()`, so a failed read looked like a value
+/// that "differs from before" and reported false success. Mirrors the macOS reader.
+fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, requested: &str) -> bool {
+    match (read_back, before) {
+        (None, _) => false,
+        (Some(after), Some(before)) => set_value_took(before, after, requested),
+        (Some(after), None) => after == requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::set_value_took;
+    use super::{read_back_confirms, set_value_took};
 
     #[test]
     fn noop_is_not_taken() {
@@ -340,5 +364,27 @@ mod tests {
     fn setting_current_value_is_taken() {
         // edge: requesting the value it already holds → equals request → taken (acceptable).
         assert!(set_value_took("50", "50", "50"));
+    }
+    #[test]
+    fn read_back_rejects_a_failed_post_read() {
+        // A failed post-write read (None) is inconclusive — never a false success.
+        assert!(!read_back_confirms(None, Some("hello"), "world"));
+    }
+    #[test]
+    fn read_back_confirms_change_against_known_baseline() {
+        // Known baseline + value changed from it → took (delegates to set_value_took).
+        assert!(read_back_confirms(Some("50.0"), Some("0"), "50"));
+    }
+    #[test]
+    fn read_back_rejects_unconfirmable_change_when_baseline_unknown() {
+        // Regression: pre-fix a failed pre-read defaulted to "", so a no-op that reads back its
+        // real (non-empty) value looked "changed" → false success. An unknown baseline must not
+        // confirm a mere difference; only an exact match can.
+        assert!(!read_back_confirms(Some("hello"), None, "world"));
+    }
+    #[test]
+    fn read_back_confirms_exact_match_when_baseline_unknown() {
+        // Unknown baseline, but the read-back equals the request → definitively took.
+        assert!(read_back_confirms(Some("world"), None, "world"));
     }
 }
