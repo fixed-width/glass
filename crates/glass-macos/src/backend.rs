@@ -85,8 +85,8 @@ pub struct MacosPlatform {
     /// original first-on-screen-by-pid lookup in that case.
     active_window: Option<u32>,
     /// The launched app's containment level. `Off` until `start_app`. Governs clipboard
-    /// routing: contained apps get no real-pasteboard bridge (fail-closed), mirroring the
-    /// Windows `ClipboardRoute` model.
+    /// routing: contained apps get no real-pasteboard bridge (fail-closed). Cached per-session
+    /// (reset in `stop_app`), unlike Windows' derived `ClipboardRoute`.
     sandbox: SandboxLevel,
 }
 
@@ -334,6 +334,10 @@ impl Platform for MacosPlatform {
         }
         self.app_pid = None;
         self.active_window = None;
+        // Reset containment too, so a later start_app on the same MacosPlatform can't have a
+        // stale sandbox level leak into clipboard routing (get_clipboard/set_clipboard) before
+        // the next start_app sets it fresh.
+        self.sandbox = SandboxLevel::Off;
         Ok(())
     }
 
@@ -635,6 +639,22 @@ mod tests {
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.active_window, None);
+    }
+
+    #[test]
+    fn stop_app_clears_sandbox_level() {
+        // start_app caches spec.sandbox for clipboard routing; stop_app must reset it to Off
+        // too, so a later start_app that launches uncontained never inherits a stale contained
+        // sandbox level (which would wrongly deny get_clipboard/set_clipboard).
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: Some(42),
+            child: None,
+            active_window: Some(7),
+            sandbox: SandboxLevel::Strict,
+        };
+        assert!(p.stop_app().is_ok());
+        assert_eq!(p.sandbox, SandboxLevel::Off);
     }
 
     #[test]

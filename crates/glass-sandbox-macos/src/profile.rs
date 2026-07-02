@@ -1,7 +1,14 @@
 //! Pure SBPL (Seatbelt) profile generator. No `unsafe`, no OS calls — unit-tested on the
 //! Linux dev box. The profile is deny-default and keeps the launched app drivable
 //! (WindowServer + AX) while containing filesystem, process, and (at `Strict`) network.
-//! `$HOME` is not broadly readable, so secrets are hidden by construction.
+//!
+//! Filesystem model (matches Linux's `--ro-bind / /` + `--tmpfs $HOME`): the whole
+//! filesystem is readable read-only, EXCEPT the user home directories (`/Users`), which are
+//! denied so secrets (`~/.ssh` etc.) stay hidden by construction; the working dir, the
+//! launched program's own directory, and any caller `ro_binds` are then re-allowed even if
+//! they happen to live under a home, as long as they aren't the home root itself (see
+//! [`is_safe_reallow`]). Writes stay deny-default: only the working dir, caller `rw_binds`,
+//! and scratch/cache roots.
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -21,50 +28,46 @@ pub struct ProfileOpts {
     pub rw_binds: Vec<PathBuf>,
 }
 
-/// System read-only roots every dynamically-linked macOS process needs (dyld + frameworks).
-const SYSTEM_READ_ROOTS: &[&str] = &[
-    "/usr/lib",
-    "/System",
-    "/Library",
-    "/private/var/db/dyld",
-    "/dev",
-];
-/// Scratch/cache roots a typical app writes to.
+/// Scratch/cache roots a typical app writes to (also readable via the whole-FS read allow).
 const SCRATCH_WRITE_ROOTS: &[&str] = &["/private/var/folders", "/private/tmp", "/tmp", "/dev"];
 
 /// Build the deny-default SBPL profile for `level`. Never called with `SandboxLevel::Off`.
 pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     let mut p = String::new();
     p.push_str("(version 1)\n(deny default)\n");
-    // Process + basic host info.
     p.push_str("(allow process-fork)\n(allow process-exec*)\n(allow sysctl-read)\n");
-    // Mach: broad lookup + register. `mach-register` is REQUIRED so the app can serve its
-    // accessibility tree — a sandboxed app returns an empty AX tree without it.
+    // `mach-register` is REQUIRED so the app can vend its accessibility port — without it an
+    // AXUIElement read returns an empty tree.
     p.push_str("(allow mach-lookup)\n(allow mach-register)\n(allow iokit-open)\n");
-    // Filesystem reads: system dyld/frameworks + program dir + cwd + ro_binds. $HOME is NOT
-    // listed → deny-default hides the user's home (Linux tmpfs-home parity).
-    p.push_str("(allow file-read* file-read-metadata\n");
-    for r in SYSTEM_READ_ROOTS {
-        push_subpath(&mut p, r);
+    // Reads: the whole filesystem, read-only, so any app can launch (matches Linux `--ro-bind
+    // / /`)...
+    p.push_str("(allow file-read* file-read-metadata (subpath \"/\"))\n");
+    // ...except the user home directories, so secrets (~/.ssh etc.) stay hidden (matches Linux
+    // `--tmpfs $HOME`). `/Users` is the standard macOS home layout.
+    p.push_str("(deny file-read* (subpath \"/Users\"))\n");
+    // ...but re-allow reads under the working dir + program dir + caller ro_binds — each only if
+    // it won't re-expose a whole home or the root (see `is_safe_reallow`). Emitted AFTER the
+    // `/Users` deny so SBPL's last-match-wins restores a real project dir living under a home.
+    if is_safe_reallow(&opts.cwd) {
+        emit_read_allow(&mut p, &opts.cwd);
     }
-    // A bare program name (no `/`) yields `Some("")` from `Path::parent`; filter it out rather
-    // than emit `(subpath "")`, which would (at best) be a no-op and (at worst) surprise a
-    // future SBPL reader.
     if let Some(dir) = opts.program.parent().filter(|d| !d.as_os_str().is_empty()) {
-        push_subpath_path(&mut p, dir);
+        if is_safe_reallow(dir) {
+            emit_read_allow(&mut p, dir);
+        }
     }
-    push_subpath_path(&mut p, &opts.cwd);
-    for b in &opts.ro_binds {
-        push_subpath_path(&mut p, b);
+    for b in opts.ro_binds.iter().filter(|b| is_safe_reallow(b)) {
+        emit_read_allow(&mut p, b);
     }
-    p.push_str(")\n");
-    // Filesystem writes: scratch/caches + cwd + rw_binds.
+    // Writes: deny-default; only scratch/caches + the working dir + caller rw_binds.
     p.push_str("(allow file-write*\n");
     for w in SCRATCH_WRITE_ROOTS {
         push_subpath(&mut p, w);
     }
-    push_subpath_path(&mut p, &opts.cwd);
-    for b in &opts.rw_binds {
+    if is_safe_reallow(&opts.cwd) {
+        push_subpath_path(&mut p, &opts.cwd);
+    }
+    for b in opts.rw_binds.iter().filter(|b| is_safe_reallow(b)) {
         push_subpath_path(&mut p, b);
     }
     p.push_str(")\n");
@@ -76,6 +79,37 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     // Clipboard isolation: the contained app cannot reach the real pasteboard.
     p.push_str("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))\n");
     p
+}
+
+/// Emit a standalone read-allow statement for `path` (kept separate from the write block so an
+/// empty set never produces invalid SBPL).
+fn emit_read_allow(out: &mut String, path: &Path) {
+    out.push_str("(allow file-read* file-read-metadata ");
+    out.push_str(&format!("(subpath {})", sbpl_quote(&path.to_string_lossy())));
+    out.push_str(")\n");
+}
+
+/// Whether re-allowing `path` is safe — i.e. it won't re-expose a whole user home or the
+/// filesystem root through the `/Users` read-deny. Rejects non-absolute paths, `/`, `/Users`,
+/// and a bare home root `/Users/<user>`; a deeper path (a real project dir) or any path outside
+/// `/Users` is safe. Fail-safe: an unsafe path is simply omitted (the app is over-contained,
+/// never over-exposed).
+fn is_safe_reallow(path: &Path) -> bool {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return false;
+    }
+    if path == Path::new("/") || path == Path::new("/Users") {
+        return false;
+    }
+    let normals: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    !(normals.len() == 2 && normals[0] == "Users")
 }
 
 /// Append `  (subpath "<escaped>")\n`.
@@ -148,17 +182,89 @@ mod tests {
     #[test]
     fn cwd_is_read_and_write_allowed() {
         let p = build_profile(SandboxLevel::Default, &opts());
-        // cwd appears under both the read block and the write block.
+        // cwd appears under both the read-reallow statement and the write block.
         assert_eq!(p.matches(r#"(subpath "/work/project")"#).count(), 2, "{p}");
     }
 
+    /// Replaces the old `home_is_not_broadly_readable`: reads are now whole-filesystem, with
+    /// `/Users` carved out by an explicit deny — assert both halves of that model are present.
     #[test]
-    fn home_is_not_broadly_readable() {
+    fn reads_all_but_denies_home() {
         let p = build_profile(SandboxLevel::Default, &opts());
         assert!(
-            !p.contains(r#"(subpath "/Users"#),
-            "home must stay hidden (deny-default):\n{p}"
+            p.contains(r#"(allow file-read* file-read-metadata (subpath "/"))"#),
+            "the whole filesystem must be read-allowed:\n{p}"
         );
+        assert!(
+            p.contains(r#"(deny file-read* (subpath "/Users"))"#),
+            "home must be denied:\n{p}"
+        );
+    }
+
+    /// A project dir living under `$HOME` (the common case) must still be usable: its
+    /// read-reallow has to come AFTER the `/Users` deny so SBPL's last-match-wins semantics
+    /// restore it, and it must remain write-allowed too.
+    #[test]
+    fn cwd_under_home_is_reallowed_after_home_deny() {
+        let mut o = opts();
+        o.cwd = PathBuf::from("/Users/dev/project");
+        let p = build_profile(SandboxLevel::Default, &o);
+
+        let deny_idx = p
+            .find(r#"(deny file-read* (subpath "/Users"))"#)
+            .expect("home deny must be present");
+        let reallow_idx = p
+            .find(r#"(allow file-read* file-read-metadata (subpath "/Users/dev/project"))"#)
+            .expect("cwd read-reallow must be present");
+        assert!(
+            reallow_idx > deny_idx,
+            "cwd reallow must be emitted after the home deny so SBPL's last-match-wins restores it:\n{p}"
+        );
+
+        let write_block_start = p.find("(allow file-write*").expect("write block present");
+        assert!(
+            p[write_block_start..].contains(r#"(subpath "/Users/dev/project")"#),
+            "cwd must still be write-allowed:\n{p}"
+        );
+    }
+
+    /// The bare home root (`/Users/<user>`) must never be reallowed — that would re-expose the
+    /// whole home the `/Users` deny exists to hide. Root (`/`) must never be write-allowed
+    /// either, even though it's the expected read-all target.
+    #[test]
+    fn home_root_cwd_is_not_reallowed() {
+        let mut o = opts();
+        o.cwd = PathBuf::from("/Users/dev");
+        let p = build_profile(SandboxLevel::Default, &o);
+        assert!(
+            !p.contains(r#"(subpath "/Users/dev")"#),
+            "a bare home root must not be reallowed for read or write:\n{p}"
+        );
+
+        let mut o_root = opts();
+        o_root.cwd = PathBuf::from("/");
+        let p_root = build_profile(SandboxLevel::Default, &o_root);
+        let write_block_start = p_root.find("(allow file-write*").expect("write block present");
+        assert!(
+            !p_root[write_block_start..].contains(r#"(subpath "/")"#),
+            "root must never be write-allowed:\n{p_root}"
+        );
+    }
+
+    #[test]
+    fn is_safe_reallow_rejects_root_home_and_relative_paths() {
+        assert!(!is_safe_reallow(Path::new("/")), "root");
+        assert!(!is_safe_reallow(Path::new("/Users")), "Users root");
+        assert!(!is_safe_reallow(Path::new("/Users/dev")), "a bare home root");
+        assert!(!is_safe_reallow(Path::new("rel/path")), "relative path");
+        assert!(!is_safe_reallow(Path::new(".")), "relative cwd shorthand");
+    }
+
+    #[test]
+    fn is_safe_reallow_accepts_real_project_dirs() {
+        assert!(is_safe_reallow(Path::new("/Users/dev/project")), "a project dir under home");
+        assert!(is_safe_reallow(Path::new("/work/project")), "outside home entirely");
+        assert!(is_safe_reallow(Path::new("/tmp/x")), "scratch dir");
     }
 
     #[test]

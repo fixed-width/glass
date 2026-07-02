@@ -5,12 +5,18 @@
 use glass_core::{Check, CheckStatus};
 
 /// Whether Seatbelt containment is usable here.
+#[derive(Debug)]
 pub enum Availability {
     Ok,
     Unavailable(String),
 }
 
 /// On macOS, Seatbelt is always present. Off macOS, this crate's containment can't run.
+///
+/// Reporting-only: unlike `glass-sandbox-linux`'s `availability`, `process::spawn`'s
+/// fail-closed guarantee does NOT consult this function — it comes from `sandbox_init`'s own
+/// return code at spawn time (see `glass-macos/src/process.rs`), so this is purely a `glass
+/// doctor` diagnostic.
 pub fn availability() -> Availability {
     #[cfg(target_os = "macos")]
     {

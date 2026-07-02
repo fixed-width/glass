@@ -14,4 +14,4 @@ pub use profile::{build_profile, ProfileOpts};
 #[cfg(target_os = "macos")]
 mod ffi;
 #[cfg(target_os = "macos")]
-pub use ffi::{apply, apply_cstr};
+pub use ffi::apply_cstr;

@@ -182,15 +182,16 @@ optional `build` step always runs unsandboxed, with your full developer environm
 ### The profile
 
 The generated Seatbelt profile is **deny-default**: everything not explicitly allowed is
-denied. Filesystem reads are limited to the system frameworks (`/usr/lib`, `/System`,
-`/Library`, `/private/var/db/dyld`), the launched program's own directory, and the
-working directory — `$HOME` is not broadly readable, so the rest of your home directory
-(including `~/.ssh` and other secrets) stays hidden. Writes are limited to the same
-working directory plus the usual scratch/cache roots (`/private/var/folders`,
-`/private/tmp`, `/tmp`). `mach-register` is allowed so the app can still serve its
-accessibility tree to `glass_a11y_snapshot`/`glass_a11y_marks`/`glass_click_element`/
-`glass_set_value` — a sandboxed app that can't register with the window server returns
-an empty AX tree.
+denied. The filesystem model is not an allowlist of system directories — the **whole
+filesystem is readable (read-only)**, except your **home directory** (`/Users`), which is
+denied so secrets (`~/.ssh` and the rest of your home) stay hidden. Your working directory
+and the launched program's own directory are re-allowed for reads even when they live
+inside your home, so a project checked out under `~/` still works. **Writes** are limited
+to the working directory plus the usual scratch/cache roots (`/private/var/folders`,
+`/private/tmp`, `/tmp`, `/dev`) — nothing under your home is ever write-allowed.
+`mach-register` is allowed so the app can still serve its accessibility tree to
+`glass_a11y_snapshot`/`glass_a11y_marks`/`glass_click_element`/`glass_set_value` — a
+sandboxed app that can't register with the window server returns an empty AX tree.
 
 ### Clipboard isolation
 
