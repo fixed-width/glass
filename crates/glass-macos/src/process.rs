@@ -45,14 +45,8 @@ static CLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// Clip-shim facts for one contained, injectable launch: the private pasteboard name the
 /// shim redirects `NSPasteboard.generalPasteboard` to, and whether injection was attempted
 /// (`true` whenever [`spawn`] returns `Some` — see its doc). `start_app` holds this until
-/// the launched window is confirmed, then uses it to decide clipboard routing (a later,
-/// separate step).
-///
-/// Neither field is read yet (only constructed and moved through `MacosPlatform::clip`) —
-/// that later step is what reads them; `expect` rather than a blanket `allow` so this
-/// attribute itself starts failing the build once that step lands and actually reads them,
-/// as a forcing function to remove it then.
-#[expect(dead_code, reason = "read by clipboard routing, which lands in a later, separate step")]
+/// the launched window is confirmed, then reads both fields to decide the session's
+/// `ClipboardRoute` (`crate::clipboard_route::decide_route`).
 pub(crate) struct ClipLaunch {
     pub name: String,
     pub injectable: bool,
