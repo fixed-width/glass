@@ -1,0 +1,21 @@
+[package]
+name = "glass-clip-shim-macos"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# cdylib = the injected shim (libglass_clip_shim_macos.dylib). No rlib: the pure routing
+# logic lives in glass-macos::clipboard_route, not here.
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard"] }
+ctor = "0.1"
+
+[lints]
+workspace = true
