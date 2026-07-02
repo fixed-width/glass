@@ -10,12 +10,22 @@
 //!
 //! Window discovery is a separate concern ([`crate::scwindow::find_window_for_pids`]);
 //! this module only owns the process lifecycle.
+//!
+//! Clip-shim injection: a contained launch whose target is not hardened-runtime signed
+//! ([`target_is_injectable`]) gets `glass-clip-shim-macos`'s built dylib
+//! ([`shim_dylib_path`]) loaded via `DYLD_INSERT_LIBRARIES`, plus a per-spawn private
+//! pasteboard name in `GLASS_CLIP_PASTEBOARD` — both set on the `Command` before the fork
+//! in [`spawn`], so they're already part of the child's environment when `pre_exec`'s
+//! `sandbox_init` call runs. [`ClipLaunch`] carries those facts back to `start_app`, which
+//! holds them until the launched window is confirmed and the clipboard route can be
+//! decided (a later step; not this module's concern).
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +34,87 @@ use rustix::process::{kill_process, Pid, Signal};
 use glass_core::platform::{AppSpec, SandboxLevel};
 use glass_core::{GlassError, Result, Stream};
 use glass_sandbox_macos::{build_profile, ProfileOpts};
+
+/// Per-spawn counter seeding [`crate::clipboard_route::session_pasteboard_name`] — starts
+/// at 1 (not 0) purely so a default-initialized `u64` elsewhere in the codebase can never
+/// be mistaken for a real token; the exact starting value has no other significance.
+static CLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Clip-shim facts for one contained, injectable launch: the private pasteboard name the
+/// shim redirects `NSPasteboard.generalPasteboard` to, and whether injection was attempted
+/// (`true` whenever [`spawn`] returns `Some` — see its doc). `start_app` holds this until
+/// the launched window is confirmed, then uses it to decide clipboard routing (a later,
+/// separate step).
+///
+/// Neither field is read yet (only constructed and moved through `MacosPlatform::clip`) —
+/// that later step is what reads them; `expect` rather than a blanket `allow` so this
+/// attribute itself starts failing the build once that step lands and actually reads them,
+/// as a forcing function to remove it then.
+#[expect(dead_code, reason = "read by clipboard routing, which lands in a later, separate step")]
+pub(crate) struct ClipLaunch {
+    pub name: String,
+    pub injectable: bool,
+}
+
+/// True iff `stderr` — `codesign --display --verbose=2`'s report — shows no hardened
+/// runtime, i.e. `DYLD_INSERT_LIBRARIES` injection can take on this target. Factored out of
+/// [`target_is_injectable`] as a pure string check so the decision itself is unit-testable
+/// without shelling out to `codesign`.
+fn injectable_from_codesign_report(stderr: &str) -> bool {
+    !stderr.contains("runtime")
+}
+
+/// True iff `program` is not hardened-runtime signed, so injecting the clip shim via
+/// `DYLD_INSERT_LIBRARIES` can take. Shells out to `codesign --display --verbose=2`
+/// (codesign writes its report to stderr, not stdout) rather than linking a
+/// Security-framework binding — simplest option, no new framework dependency.
+///
+/// Conservative and fail-closed: any uncertainty (`codesign` missing or unspawnable, its
+/// output not valid UTF-8) reports `false` (non-injectable), never `true` — an unsigned or
+/// adhoc-signed binary reports `false` from codesign's own exit status, but its stderr
+/// still won't mention `runtime`, so [`injectable_from_codesign_report`] correctly reports
+/// `true` for it regardless of that exit status.
+fn target_is_injectable(program: &Path) -> bool {
+    let Ok(output) = Command::new("codesign")
+        .arg("--display")
+        .arg("--verbose=2")
+        .arg(program)
+        .output()
+    else {
+        return false;
+    };
+    let Ok(stderr) = String::from_utf8(output.stderr) else {
+        return false;
+    };
+    injectable_from_codesign_report(&stderr)
+}
+
+/// Env var overriding [`shim_dylib_path`]'s resolution — tests and non-standard layouts.
+const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
+
+/// File name of the shim's build artifact: `glass-clip-shim-macos`'s `crate-type =
+/// ["cdylib"]` compiles to `lib<crate name, underscored>.dylib` on macOS.
+const SHIM_DYLIB_NAME: &str = "libglass_clip_shim_macos.dylib";
+
+/// Resolve the injected clip shim's dylib: [`SHIM_DYLIB_ENV`] (trusted as given, no
+/// existence check — an explicit override is the caller's own responsibility) → next to the
+/// running executable → the cargo target dir one level up from it (`current_exe` is
+/// `target/<profile>/<bin>` for a normal build, or `target/<profile>/deps/<bin>-<hash>`
+/// under `cargo test`, one directory deeper than the shim's own build output — hence the
+/// second candidate). `None` if none of these exist: callers treat that as "not
+/// injectable" (fail-closed — no resolvable shim, no injection).
+fn shim_dylib_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(SHIM_DYLIB_ENV) {
+        return Some(PathBuf::from(path));
+    }
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let next_to_exe = exe_dir.join(SHIM_DYLIB_NAME);
+    if next_to_exe.is_file() {
+        return Some(next_to_exe);
+    }
+    let target_dir = exe_dir.parent()?.join(SHIM_DYLIB_NAME);
+    target_dir.is_file().then_some(target_dir)
+}
 
 /// Log lines captured by the per-stream reader threads spawned in [`spawn`], drained by
 /// `MacosPlatform::drain_logs`. `Arc<Mutex<_>>` (not a bare `Vec`) because the reader
@@ -43,12 +134,19 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// macOS process containment: [`SandboxLevel::Default`]/[`SandboxLevel::Strict`] apply a
 /// generated Seatbelt (`sandbox_init`) profile to the launched app via a fork-safe
 /// `pre_exec` (see below). [`SandboxLevel::Off`] spawns unchanged.
-pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
+///
+/// The second return value is the clip-shim launch facts ([`ClipLaunch`]), `Some` only for
+/// a contained launch whose target is injectable (see [`target_is_injectable`]) and whose
+/// shim dylib resolved (see [`shim_dylib_path`]); `None` for `SandboxLevel::Off` or a
+/// non-injectable/unresolved target. The caller (`MacosPlatform::start_app`) holds it for a
+/// later clipboard-routing decision — this function only sets up the injection.
+pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<ClipLaunch>)> {
     let mut cmd = Command::new(&spec.run[0]);
 
     // Containment: for Default/Strict, apply a generated Seatbelt profile to the launched app
     // in a fork-safe pre_exec (build the CString here, before fork; the closure only makes the
     // sandbox_init syscall). Off spawns unchanged. Build (run_build) is never contained.
+    let mut clip: Option<ClipLaunch> = None;
     if spec.sandbox != SandboxLevel::Off {
         // Resolve to absolute paths: a relative `(subpath ".")` never matches the child's real
         // cwd, and `build_profile`'s guard needs absolute paths to reason about home exposure.
@@ -60,14 +158,39 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let program =
             std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
-        // Pasteboard stays denied here; a caller that injects the redirecting shim into an
-        // injectable target sets this to true once that wiring exists.
+
+        // Decide injection before building the profile: `allow_pasteboard` depends on it.
+        // `dylib_path` is resolved once and reused below (rather than a second
+        // `shim_dylib_path()` call) so a transient filesystem hiccup between the two checks
+        // can't make `injectable` and the later `.expect` disagree.
+        let dylib_path = shim_dylib_path();
+        let injectable = target_is_injectable(&program) && dylib_path.is_some();
+        let allow_pasteboard = injectable;
+        if injectable {
+            let token = CLIP_TOKEN.fetch_add(1, Ordering::Relaxed);
+            let name = crate::clipboard_route::session_pasteboard_name(token);
+            let dylib = dylib_path.expect("checked Some above");
+            // Set BEFORE the fork below: `Command::env` populates the child's environment at
+            // exec time, so both vars are already present when `pre_exec`'s `sandbox_init`
+            // call runs, and survive it into the launched app — same timing guarantee the
+            // profile CString relies on.
+            cmd.env("DYLD_INSERT_LIBRARIES", dylib);
+            cmd.env("GLASS_CLIP_PASTEBOARD", &name);
+            clip = Some(ClipLaunch {
+                name,
+                injectable: true,
+            });
+        }
+
+        // Pasteboard is allowed only for an injectable target (the shim's redirect is the
+        // actual isolation there); a hardened/non-injectable target keeps it denied, same as
+        // before this task.
         let opts = ProfileOpts {
             cwd,
             program,
             ro_binds: vec![],
             rw_binds: vec![],
-            allow_pasteboard: false,
+            allow_pasteboard,
         };
         let profile = build_profile(spec.sandbox, &opts);
         let profile_c = CString::new(profile).map_err(|e| {
@@ -112,7 +235,7 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
     spawn_reader(stdout, Stream::Stdout, logs.clone());
     spawn_reader(stderr, Stream::Stderr, logs);
 
-    Ok(child)
+    Ok((child, clip))
 }
 
 /// Pipe a child stream's lines into the shared log sink on a background thread. Exits
@@ -223,7 +346,7 @@ mod tests {
         denied.sandbox = SandboxLevel::Default;
         denied.cwd = Some(proj.clone());
         let logs = empty_sink();
-        let mut child =
+        let (mut child, _clip) =
             spawn(&denied, logs.clone()).unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
@@ -243,7 +366,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn spawn_pipes_stdout_and_stderr_lines() {
         let logs = empty_sink();
-        let mut child = spawn(&spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]), logs.clone())
+        let (mut child, _clip) = spawn(&spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]), logs.clone())
             .expect("spawn /bin/sh");
         child.wait().expect("wait for /bin/sh to exit");
         // The reader threads finish shortly after the child's fds close on exit; give them
@@ -266,7 +389,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_kills_a_long_running_child() {
-        let mut child = spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
+        let (mut child, _clip) = spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
         terminate(&mut child);
         let status = child.try_wait().expect("try_wait after terminate");
         assert!(status.is_some(), "child should have exited after terminate");
@@ -275,10 +398,47 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_is_idempotent_on_an_already_exited_child() {
-        let mut child = spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
+        let (mut child, _clip) = spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
         child.wait().expect("wait for /bin/echo to exit");
         // Already reaped; terminate must not panic or hang.
         terminate(&mut child);
         terminate(&mut child);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn injectable_from_codesign_report_true_for_unsigned_or_adhoc() {
+        // codesign's report for an unsigned binary never mentions "runtime" at all.
+        assert!(injectable_from_codesign_report(
+            "TestApp: code object is not signed at all\n"
+        ));
+        // Nor does an adhoc/linker-signed binary's flags line.
+        assert!(injectable_from_codesign_report(
+            "CodeDirectory v=20400 size=91 flags=0x2(adhoc) hashes=3+3 location=embedded\n"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn injectable_from_codesign_report_false_when_hardened_runtime_flag_present() {
+        assert!(!injectable_from_codesign_report(
+            "CodeDirectory v=20500 size=634 flags=0x10000(runtime) hashes=13+3 location=embedded\n"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn shim_dylib_path_trusts_an_explicit_env_override_without_checking_existence() {
+        // A deliberately nonexistent path: the override tier is trusted as given (matches
+        // `glass-windows`'s `hook_dll_path` precedent for its own DLL override), unlike the
+        // exe-dir/target-dir fallback tiers below it, which do check.
+        let previous = std::env::var(SHIM_DYLIB_ENV).ok();
+        std::env::set_var(SHIM_DYLIB_ENV, "/nonexistent/glass-clip-shim-test.dylib");
+        let resolved = shim_dylib_path();
+        match previous {
+            Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
+            None => std::env::remove_var(SHIM_DYLIB_ENV),
+        }
+        assert_eq!(resolved, Some(PathBuf::from("/nonexistent/glass-clip-shim-test.dylib")));
     }
 }

@@ -19,7 +19,7 @@ use glass_core::{GlassError, Result};
 use crate::axwindow;
 use crate::coords;
 use crate::permissions;
-use crate::process::{self, LogSink};
+use crate::process::{self, ClipLaunch, LogSink};
 
 /// Poll interval between discovery attempts in [`MacosPlatform::discover_window`] —
 /// matches `scwindow::find_window_for_pids`'s own poll cadence
@@ -88,6 +88,13 @@ pub struct MacosPlatform {
     /// routing: contained apps get no real-pasteboard bridge (fail-closed). Cached per-session
     /// (reset in `stop_app`), unlike Windows' derived `ClipboardRoute`.
     sandbox: SandboxLevel,
+    /// The clip-shim launch facts `process::spawn` produced for the current session's app —
+    /// `Some` only for a contained, injectable launch (see `process::ClipLaunch`'s doc).
+    /// `None` until `start_app`, and whenever the launch was uncontained or non-injectable.
+    /// Held here (rather than consumed inside `start_app`) so the clipboard-routing decision
+    /// that depends on it can run after the launched window is confirmed; reset in
+    /// `stop_app`.
+    clip: Option<ClipLaunch>,
 }
 
 impl MacosPlatform {
@@ -100,6 +107,7 @@ impl MacosPlatform {
             child: None,
             active_window: None,
             sandbox: SandboxLevel::Off,
+            clip: None,
         })
     }
 
@@ -297,7 +305,7 @@ impl Platform for MacosPlatform {
     /// glass-mcp's worker-thread dispatcher (main-thread marshaling) is deferred to Plan 5.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         Self::run_build(spec)?;
-        let mut child = process::spawn(spec, self.logs.clone())?;
+        let (mut child, clip) = process::spawn(spec, self.logs.clone())?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
             Ok(m) => {
@@ -311,6 +319,10 @@ impl Platform for MacosPlatform {
                 // this field on every call.
                 self.active_window = Some(m.window_id);
                 self.sandbox = spec.sandbox;
+                // `clip` (the clip-shim facts from `process::spawn`) is stored, not yet
+                // consumed here: the clipboard-routing decision it feeds needs the launched
+                // window confirmed first (this arm), and belongs to a later, separate step.
+                self.clip = clip;
                 // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
                 // window fresh on every call instead (see its doc) since it may move/resize
                 // after this initial discovery. Only the initial geometry is returned to the
@@ -338,6 +350,9 @@ impl Platform for MacosPlatform {
         // stale sandbox level leak into clipboard routing (get_clipboard/set_clipboard) before
         // the next start_app sets it fresh.
         self.sandbox = SandboxLevel::Off;
+        // Same reasoning for the clip-shim facts: a stale `Some` from a previous session must
+        // not leak into a later one's clipboard routing.
+        self.clip = None;
         Ok(())
     }
 
@@ -591,6 +606,7 @@ mod tests {
             child: None,
             active_window: None,
             sandbox: SandboxLevel::Off,
+            clip: None,
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -604,6 +620,7 @@ mod tests {
             child: None,
             active_window: None,
             sandbox: SandboxLevel::Off,
+            clip: None,
         };
         assert_eq!(p.app_pid(), Some(42));
     }
@@ -619,6 +636,7 @@ mod tests {
             child: None,
             active_window: None,
             sandbox: SandboxLevel::Off,
+            clip: None,
         };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
@@ -636,6 +654,7 @@ mod tests {
             child: None,
             active_window: Some(7),
             sandbox: SandboxLevel::Off,
+            clip: None,
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.active_window, None);
@@ -652,9 +671,28 @@ mod tests {
             child: None,
             active_window: Some(7),
             sandbox: SandboxLevel::Strict,
+            clip: None,
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.sandbox, SandboxLevel::Off);
+    }
+
+    #[test]
+    fn stop_app_clears_clip() {
+        // start_app stores process::spawn's ClipLaunch facts for a later clipboard-routing
+        // decision; stop_app must clear them too, so a later start_app on the same
+        // MacosPlatform never leaks a previous session's shim facts (e.g. a stale private
+        // pasteboard name) into a new one.
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: Some(42),
+            child: None,
+            active_window: Some(7),
+            sandbox: SandboxLevel::Default,
+            clip: Some(ClipLaunch { name: "tech.fixedwidth.glass.clip.1".into(), injectable: true }),
+        };
+        assert!(p.stop_app().is_ok());
+        assert!(p.clip.is_none());
     }
 
     #[test]
@@ -669,6 +707,7 @@ mod tests {
             child: None,
             active_window: None,
             sandbox: SandboxLevel::Strict,
+            clip: None,
         };
         assert!(matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
         assert!(matches!(p.set_clipboard("x"), Err(GlassError::Unsupported(_))));
