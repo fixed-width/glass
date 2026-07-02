@@ -1112,6 +1112,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-sandbox-macos"
+version = "0.0.0"
+dependencies = [
+ "glass-core",
+ "libc",
+]
+
+[[package]]
 name = "glass-testapp"
 version = "0.0.0"
 dependencies = [
