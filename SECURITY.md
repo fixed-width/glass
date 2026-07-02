@@ -25,8 +25,12 @@ The application glass launches is sandboxed by default, per OS:
   desktop** (display isolation is in progress); for full isolation, run glass inside a VM
   and reach it over the network transport — see
   [`packaging/windows-sandbox/`](packaging/windows-sandbox).
-- **macOS** — the `sandbox` argument is accepted but not yet enforced; glass-macos ships
-  no containment yet.
+- **macOS** — Seatbelt (`sandbox_init`): filesystem + process containment at `default`, plus no
+  network at `strict`, applied to the launched app and **fail-closed**. The clipboard is
+  **isolated** under containment (a contained app cannot reach your real pasteboard). The app
+  still **renders on the real desktop** (display isolation is not yet implemented on macOS).
+  Known limits: the Mach-service allowlist is currently broad (hardening in progress), Electron
+  apps may escape their own sandbox, and `sandbox_init` is deprecated-but-shipping.
 
 Choose the level per launch with `glass_start`'s `sandbox` argument, or globally with
 `GLASS_SANDBOX` (`off` / `default` / `strict`). `glass_doctor` reports what's available.
