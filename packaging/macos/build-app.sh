@@ -93,12 +93,24 @@ if [ ! -x "$bin" ]; then
   exit 1
 fi
 
+echo "==> building glass-clip-shim-macos (release)"
+if [ "$skip_build" -eq 0 ]; then
+  ( cd "$REPO_ROOT" && cargo build --release -p glass-clip-shim-macos )
+fi
+shim="$REPO_ROOT/target/release/libglass_clip_shim_macos.dylib"
+[ -f "$shim" ] || { echo "error: $shim not found (build the shim first)" >&2; exit 1; }
+
 app="$out_dir/GlassMcp.app"
 echo "==> assembling $app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 install -m 0755 "$bin" "$app/Contents/MacOS/glass-mcp"
 cp "$SCRIPT_DIR/Info.plist" "$app/Contents/Info.plist"
+
+# The clip shim ships in the bundle's Frameworks dir, one level up from Contents/MacOS —
+# glass-macos's `shim_dylib_path` resolves it from there ahead of any dev target-dir path.
+mkdir -p "$app/Contents/Frameworks"
+install -m 0644 "$shim" "$app/Contents/Frameworks/libglass_clip_shim_macos.dylib"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$app/Contents/Info.plist"
 if [ -n "$version" ]; then
@@ -117,6 +129,9 @@ codesign_args=(--force --options runtime -s "$sign_identity")
 if [ -n "$sign_keychain" ]; then
   codesign_args+=(--keychain "$sign_keychain")
 fi
+# Nested code must be signed before the enclosing bundle, or `codesign --verify --strict
+# "$app"` below fails on the (still unsigned) dylib.
+codesign "${codesign_args[@]}" "$app/Contents/Frameworks/libglass_clip_shim_macos.dylib"
 codesign "${codesign_args[@]}" "$app"
 
 echo "==> verifying"
