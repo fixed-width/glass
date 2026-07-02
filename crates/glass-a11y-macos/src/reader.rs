@@ -119,23 +119,26 @@ impl Accessibility for MacosA11y {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
 
-        // Best-effort pre-write value (an unreadable `AXValue` here is fine — the *post*-write
-        // confirmation below is the honesty check, and it is error-aware).
-        let before = ffi::attribute_string(&el, attr::VALUE).unwrap_or_default();
+        // Pre-write value: the baseline for the "changed" check. Use the error-aware read (the
+        // same call as the post-read below) so a *present but empty* value stays a known `Some("")`
+        // baseline instead of folding to `None` — keeping macOS symmetric with the Windows reader
+        // (whose `get_value()` returns `Ok("")` for empty). `None` — a failed or absent pre-read —
+        // means the baseline is unknown, and `read_back_confirms` then requires an exact match
+        // rather than trusting a "differs from before" signal it cannot compute.
+        let before = ffi::attribute_string_checked(&el, attr::VALUE).ok().flatten();
         ffi::set_string_value(&el, text)?;
 
         // Read-back poll: some editables accept the AX write without an `AXError` but never
         // actually change `AXValue` (a misleading success) — require the read-back to show the
-        // change before reporting success, never a silent false-success. The read-back is
-        // *error-aware*: only `Ok(Some(v))` (a real value) can confirm the write; an `Err` (a
-        // genuine read failure) or `Ok(None)` (absent value) is inconclusive, so we keep
-        // polling to the deadline rather than mistaking a failed read for a change.
+        // change before reporting success, never a silent false-success. Both reads are
+        // *error-aware*: a failed or absent post-read maps to `None`, which is inconclusive and
+        // never confirms, so we keep polling to the deadline rather than mistaking a failed read
+        // for a change.
         let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
         loop {
-            if let Ok(Some(after)) = ffi::attribute_string_checked(&el, attr::VALUE) {
-                if set_value_took(&before, &after, text) {
-                    return Ok(());
-                }
+            let after = ffi::attribute_string_checked(&el, attr::VALUE).ok().flatten();
+            if read_back_confirms(after.as_deref(), before.as_deref(), text) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::AxValueNotApplied(target.id.0));
@@ -383,9 +386,24 @@ fn set_value_took(before: &str, after: &str, requested: &str) -> bool {
     after == requested || after != before
 }
 
+/// Whether a read-back poll can *confirm* a `set_value` write took. `read_back` is the value
+/// read after the write (`None` if that read failed or the attribute was absent); `before` is
+/// the pre-write baseline (`None` if the pre-read failed/was absent — baseline unknown).
+/// Confirms only when it can prove the write landed: a `None` read-back is inconclusive and
+/// never confirms; with a known baseline it delegates to [`set_value_took`]; with an unknown
+/// baseline only an exact match with the request confirms — "changed from before" is meaningless
+/// without a trustworthy baseline. Mirrors the Windows reader.
+fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, requested: &str) -> bool {
+    match (read_back, before) {
+        (None, _) => false,
+        (Some(after), Some(before)) => set_value_took(before, after, requested),
+        (Some(after), None) => after == requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::set_value_took;
+    use super::{read_back_confirms, set_value_took};
 
     #[test]
     fn noop_is_not_taken() {
@@ -408,5 +426,31 @@ mod tests {
     fn setting_current_value_is_taken() {
         // Edge case: requesting the value it already holds → equals request → taken.
         assert!(set_value_took("world", "world", "world"));
+    }
+
+    #[test]
+    fn read_back_rejects_a_failed_post_read() {
+        // A failed/absent post-write read (None) is inconclusive — never a false success.
+        assert!(!read_back_confirms(None, Some("hello"), "world"));
+    }
+
+    #[test]
+    fn read_back_confirms_change_against_known_baseline() {
+        // Known baseline + value changed from it → took (delegates to set_value_took).
+        assert!(read_back_confirms(Some("0.0"), Some("0"), "0"));
+    }
+
+    #[test]
+    fn read_back_rejects_unconfirmable_change_when_baseline_unknown() {
+        // Regression: pre-fix a failed pre-read defaulted to "", so a no-op that reads back its
+        // real (non-empty) value looked "changed" → false success. An unknown baseline must not
+        // confirm a mere difference; only an exact match can.
+        assert!(!read_back_confirms(Some("hello"), None, "world"));
+    }
+
+    #[test]
+    fn read_back_confirms_exact_match_when_baseline_unknown() {
+        // Unknown baseline, but the read-back equals the request → definitively took.
+        assert!(read_back_confirms(Some("world"), None, "world"));
     }
 }
