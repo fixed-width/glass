@@ -27,10 +27,11 @@ The application glass launches is sandboxed by default, per OS:
   [`packaging/windows-sandbox/`](packaging/windows-sandbox).
 - **macOS** — Seatbelt (`sandbox_init`): filesystem + process containment at `default`, plus no
   network at `strict`, applied to the launched app and **fail-closed**. Under containment the
-  clipboard is **isolated and working** for an **injectable** app: an injected shim
-  (`DYLD_INSERT_LIBRARIES`) redirects the app's clipboard calls to a private named pasteboard
-  glass shares, so it can copy/paste normally while your real pasteboard stays untouched. An
-  app running under Apple's **hardened runtime** can't be redirected and falls back to
+  clipboard is **isolated and working** for an app not built with Apple's **hardened runtime**
+  (typically a debug or unsigned build): an injected shim (`DYLD_INSERT_LIBRARIES`) redirects the
+  app's clipboard calls to a private named pasteboard glass shares, so it can copy/paste normally
+  while your real pasteboard stays untouched. An app that runs under Apple's **hardened runtime**
+  (App Store or notarized apps) can't be redirected and falls back to
   `Unsupported` (fail-closed) rather than reaching the real pasteboard. The app
   still **renders on the real desktop** (display isolation is not yet implemented on macOS).
   Known limits: the Mach-service allowlist is currently broad (hardening in progress), Electron
