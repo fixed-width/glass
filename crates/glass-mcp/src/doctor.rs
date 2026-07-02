@@ -53,8 +53,10 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // Only show sections for backends actually compiled into THIS binary — absent
     // backends (e.g. windows on a Linux build, or macos on a non-macOS build) are
     // omitted rather than listed as "not built into this binary" placeholders.
-    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS's grants live in
-    // its own "macos" section instead. Android is the exception: its crate is
+    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS instead gets two
+    // sections below — "macos" (the platform backend's own TCC posture) and
+    // "accessibility (macos)" (the a11y-tool reader's readiness) — see the comment there
+    // for why the two aren't merged. Android is the exception: its crate is
     // host-OS-agnostic and always compiled in, so its section is always emitted, gated
     // at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];
@@ -95,6 +97,19 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     #[cfg(target_os = "macos")]
     {
         sections.push(Section::new("macos", Some("macos".into()), macos_checks(backend)));
+        // Mirrors "accessibility (linux)"/"accessibility (windows)": a dedicated section
+        // for the a11y-tool reader itself (glass_a11y_snapshot/marks/click_element/
+        // set_value), distinct from the "macos" section above which covers the platform
+        // backend's own TCC posture (Screen Recording, session state, ...). The
+        // Accessibility grant check is intentionally duplicated between the two sections
+        // — here it answers "will the a11y tools work", there it answers "is this Mac
+        // set up at all" — both reuse the same `glass_macos::accessibility_granted()`
+        // fact and remedy string, so there's no risk of the two drifting apart.
+        sections.push(Section::new(
+            "accessibility (macos)",
+            None,
+            macos_a11y_checks(glass_macos::accessibility_granted()),
+        ));
     }
 
     // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always compiled
@@ -235,6 +250,36 @@ fn macos_checks(resolved_backend: &str) -> Vec<Check> {
     )
 }
 
+/// The "accessibility (macos)" section: the `glass-a11y-macos` reader (AXUIElement) is a
+/// system framework, not an optional install like Linux's AT-SPI daemon or a service that
+/// needs spinning up — so it's always present in a macOS build, and the only real
+/// precondition left to report is the Accessibility TCC grant itself. Pure — takes the
+/// already-gathered grant fact, makes no OS calls — so it's unit-tested without needing a
+/// real grant, mirroring `glass_a11y_linux::doctor::a11y_checks`/
+/// `glass_a11y_windows::doctor::a11y_checks`.
+#[cfg(target_os = "macos")]
+fn macos_a11y_checks(accessibility_granted: bool) -> Vec<Check> {
+    vec![
+        Check::new(
+            "a11y reader",
+            CheckStatus::Ok,
+            "AXUIElement reader available — glass_a11y_snapshot / glass_a11y_marks / \
+             glass_click_element / glass_set_value will work once Accessibility is granted (see below)",
+        ),
+        if accessibility_granted {
+            Check::new("Accessibility", CheckStatus::Ok, "granted")
+        } else {
+            Check::new(
+                "Accessibility",
+                CheckStatus::Fail,
+                "not granted — glass_a11y_snapshot / glass_a11y_marks / glass_click_element / \
+                 glass_set_value will fail with a permission error",
+            )
+            .with_remedy(glass_macos::accessibility_remedy())
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,7 +317,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
         #[cfg(target_os = "macos")]
-        assert_eq!(titles, ["general", "network", "macos", "android"]);
+        assert_eq!(titles, ["general", "network", "macos", "accessibility (macos)", "android"]);
         // Android's section is always present and non-empty — its basic presence checks now
         // run unconditionally (deep probes gated to the selected backend; Fails softened to
         // Warn when android isn't active). Asserting non-empty catches accidental removal of
@@ -407,6 +452,32 @@ mod tests {
             let checks = macos_checks_from("android", true, true, SessionState::Unlocked);
             let c = checks.iter().find(|c| c.name == "backend").unwrap();
             assert_eq!(c.status, CheckStatus::Warn);
+        }
+
+        #[test]
+        fn a11y_reader_is_always_reported_present() {
+            // The AXUIElement reader is a system framework compiled unconditionally into
+            // a macOS build — unlike Linux's AT-SPI daemon, there's no "not installed"
+            // state to detect, so this line is always Ok regardless of the grant.
+            let checks = macos_a11y_checks(false);
+            let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
+            assert_eq!(reader.status, CheckStatus::Ok);
+        }
+
+        #[test]
+        fn a11y_granted_is_all_ok() {
+            let checks = macos_a11y_checks(true);
+            assert!(checks.iter().all(|c| c.status == CheckStatus::Ok), "{checks:?}");
+        }
+
+        #[test]
+        fn a11y_not_granted_fails_with_the_shared_remedy() {
+            let checks = macos_a11y_checks(false);
+            let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
+            assert_eq!(c.status, CheckStatus::Fail);
+            // Same remedy string as the "macos" section's own Accessibility check — no
+            // separate, driftable copy here either.
+            assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
         }
     }
 }
