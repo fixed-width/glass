@@ -530,6 +530,17 @@ impl Platform for MacosPlatform {
     fn app_pid(&self) -> Option<u32> {
         self.app_pid
     }
+    /// Read the general pasteboard as UTF-8 text (`""` when it holds no text). macOS has no
+    /// clipboard containment yet, so this reads the user's real system pasteboard.
+    fn get_clipboard(&mut self) -> Result<String> {
+        crate::clipboard::get()
+    }
+
+    /// Write UTF-8 text to the general pasteboard so the app can paste it. Acts on the user's
+    /// real system pasteboard (no macOS containment yet).
+    fn set_clipboard(&mut self, text: &str) -> Result<()> {
+        crate::clipboard::set(text)
+    }
 }
 
 impl Drop for MacosPlatform {

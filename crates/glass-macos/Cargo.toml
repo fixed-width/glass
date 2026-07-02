@@ -66,6 +66,10 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     # `NSRunningApplication` — focus-before-inject (`input.rs::focus`); `libc` unlocks its
     # `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class method.
     "NSRunningApplication",
+    # `NSPasteboard` — the general pasteboard read/write behind `Platform`'s clipboard seam
+    # (`clipboard.rs`): unlocks `NSPasteboard`, its `generalPasteboard`/`clearContents`/
+    # `stringForType`/`setString:forType:` methods, and the `NSPasteboardTypeString` constant.
+    "NSPasteboard",
     "libc",
 ] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
