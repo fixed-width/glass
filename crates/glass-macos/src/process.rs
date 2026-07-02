@@ -60,8 +60,8 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<Child> {
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let program =
             std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
-        // TODO: a later task finalizes allow_pasteboard for injectable (contained) targets whose
-        // shim redirects the pasteboard; for now this keeps prior (always-deny) behavior.
+        // Pasteboard stays denied here; a caller that injects the redirecting shim into an
+        // injectable target sets this to true once that wiring exists.
         let opts = ProfileOpts {
             cwd,
             program,
