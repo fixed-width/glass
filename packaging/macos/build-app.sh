@@ -96,8 +96,8 @@ fi
 if [ "$universal" -eq 1 ]; then
   echo "==> building glass-mcp + clip shim (release, universal2)"
   if [ "$skip_build" -eq 0 ]; then
-    ( cd "$REPO_ROOT" && cargo build --release --target aarch64-apple-darwin -p glass-mcp -p glass-clip-shim-macos )
-    ( cd "$REPO_ROOT" && cargo build --release --target x86_64-apple-darwin  -p glass-mcp -p glass-clip-shim-macos )
+    ( cd "$REPO_ROOT" && cargo build --release --locked --target aarch64-apple-darwin -p glass-mcp -p glass-clip-shim-macos )
+    ( cd "$REPO_ROOT" && cargo build --release --locked --target x86_64-apple-darwin  -p glass-mcp -p glass-clip-shim-macos )
   fi
   bin="$REPO_ROOT/target/glass-mcp-universal"
   shim="$REPO_ROOT/target/libglass_clip_shim_macos-universal.dylib"

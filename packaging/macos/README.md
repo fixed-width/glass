@@ -91,3 +91,6 @@ still publish the Linux/Windows artifacts before macOS signing is available:
 Base64-encode a file for a secret with `base64 -i <file> | pbcopy`. To run the signing +
 notarization steps locally instead of in CI, use `build-app.sh --universal --timestamp
 --identity …` followed by `notarize.sh --app … --key … --key-id … --issuer …`.
+
+The job's skip-gate probes only `MACOS_DEVELOPER_ID_CERT_P12`; configure all six together —
+a partial configuration will run and fail at the first missing value rather than skip cleanly.
