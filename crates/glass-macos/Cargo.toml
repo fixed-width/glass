@@ -40,6 +40,15 @@ harness = false
 name = "a11y"
 harness = false
 
+# Mac-gated `.app`-bundle-launch integration test (crates/glass-macos/tests/bundle_launch.rs)
+# — same harness=false main-thread requirement as `capture`/`input`/`windows`/`a11y` above
+# (start_app's bundle branch reaches AppKit's ffi::app_kit_init() too); drives
+# `MacosPlatform::start_app`'s direct-spawn/NSWorkspace-handoff/fail-closed paths against a
+# built `Demo.app` fixture and the stock `TextEdit.app`. See that file's module doc.
+[[test]]
+name = "bundle_launch"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 plist = "1"
