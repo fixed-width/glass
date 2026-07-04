@@ -94,6 +94,29 @@ fn captures_known_quadrant_colors() {
 
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn oversize_window_capture_returns_actionable_error() {
+    // A display SMALLER than the 320x240 test window, so the window overflows the
+    // screen — the "window bigger than the headless Xvfb" case. Capture must fail
+    // with an actionable message (window + display sizes and the two remedies),
+    // not the raw `GetImage`/`BadMatch` protocol error the agent can't act on.
+    let xvfb = glass_x11::Xvfb::start("200x200x24").expect("spawn Xvfb (is it installed?)");
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let err = p.capture_frame(None).unwrap_err().to_string();
+    assert!(err.contains("320x240"), "names the window size: {err}");
+    assert!(err.contains("200x200"), "names the display size: {err}");
+    assert!(err.contains("GLASS_XVFB_SCREEN"), "names the larger-display remedy: {err}");
+    assert!(
+        !err.contains("get_image"),
+        "should be the pre-flight actionable error, not the raw GetImage failure: {err}"
+    );
+    p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
 fn click_is_delivered_to_the_window() {
     use glass_core::{MouseButton, PointerEvent};
     let xvfb = Xvfb::start();

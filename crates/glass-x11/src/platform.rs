@@ -29,7 +29,8 @@ type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 /// target app's top-level window, and drives it via X requests + XTEST.
 pub struct X11Platform {
     conn: RustConnection,
-    #[expect(dead_code, reason = "captured from the X setup for completeness; not currently read")]
+    /// The X screen glass connected to; indexes `setup().roots` for the display
+    /// (root window) size, used to reject captures that reach off-screen.
     screen_num: usize,
     root: Window,
     display: String,
@@ -811,6 +812,15 @@ impl Platform for X11Platform {
         if w == 0 || h == 0 {
             return Err(GlassError::CaptureFailed("window has zero area".into()));
         }
+        // A window (or region) reaching past the headless display makes GetImage
+        // cover non-viewable area, which X rejects with a bare BadMatch. Convert
+        // that to an actionable error before issuing the request; the root
+        // window's pixel size is the display size.
+        let display = {
+            let root = &self.conn.setup().roots[self.screen_num];
+            (u32::from(root.width_in_pixels), u32::from(root.height_in_pixels))
+        };
+        crate::coords::check_capture_fits(&geo, region, display)?;
         let image = self
             .conn
             .get_image(ImageFormat::Z_PIXMAP, win, cx as i16, cy as i16, w as u16, h as u16, !0u32)
