@@ -14,10 +14,10 @@ set -euo pipefail
 app="" key="" key_id="" issuer=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --app)    app="$2"; shift 2 ;;
-    --key)    key="$2"; shift 2 ;;
-    --key-id) key_id="$2"; shift 2 ;;
-    --issuer) issuer="$2"; shift 2 ;;
+    --app)    [ $# -ge 2 ] || { echo "error: --app requires a value" >&2; exit 1; }; app="$2"; shift 2 ;;
+    --key)    [ $# -ge 2 ] || { echo "error: --key requires a value" >&2; exit 1; }; key="$2"; shift 2 ;;
+    --key-id) [ $# -ge 2 ] || { echo "error: --key-id requires a value" >&2; exit 1; }; key_id="$2"; shift 2 ;;
+    --issuer) [ $# -ge 2 ] || { echo "error: --issuer requires a value" >&2; exit 1; }; issuer="$2"; shift 2 ;;
     -h|--help)
       echo "usage: notarize.sh --app PATH --key AuthKey.p8 --key-id ID --issuer UUID" >&2
       exit 1 ;;
@@ -36,11 +36,24 @@ done
 # here rather than after a slow submit round-trip.
 codesign --verify --strict --deep -vv "$app" \
   || { echo "error: $app is not validly signed (sign it before notarizing)" >&2; exit 1; }
-codesign -dvv "$app" 2>&1 | grep -qi "Timestamp=" \
-  || { echo "error: $app signature has no secure timestamp — re-sign with build-app.sh --timestamp" >&2; exit 1; }
+
+# Notarization requires a secure timestamp on the app AND its nested signed code;
+# catch a missing one here rather than after a slow submit round-trip.
+require_timestamp() { # <signed path>
+  codesign -dvv "$1" 2>&1 | grep -qi "Timestamp=" \
+    || { echo "error: $1 signature has no secure timestamp — re-sign with build-app.sh --timestamp" >&2; exit 1; }
+}
+require_timestamp "$app"
+if [ -d "$app/Contents/Frameworks" ]; then
+  for dylib in "$app/Contents/Frameworks"/*.dylib; do
+    [ -e "$dylib" ] || continue   # no match → skip the literal glob
+    require_timestamp "$dylib"
+  done
+fi
 
 # notarytool needs a container to upload; we staple the .app itself afterward.
 sub="$(dirname "$app")/notarize-submission.zip"
+trap 'rm -f "$sub"' EXIT
 rm -f "$sub"
 ditto -c -k --keepParent "$app" "$sub"
 
@@ -53,11 +66,9 @@ if ! out="$(xcrun notarytool submit "$sub" \
     echo "==> notarization failed; fetching log for $sub_id"
     xcrun notarytool log "$sub_id" --key "$key" --key-id "$key_id" --issuer "$issuer" || true
   fi
-  rm -f "$sub"
   exit 1
 fi
 printf '%s\n' "$out"
-rm -f "$sub"
 
 echo "==> stapling ticket into $(basename "$app")"
 xcrun stapler staple "$app"
