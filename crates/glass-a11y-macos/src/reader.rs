@@ -65,6 +65,15 @@ const SET_VALUE_VERIFY_MS: u64 = 800;
 /// Interval between read-back poll attempts.
 const SET_VALUE_POLL_MS: u64 = 20;
 
+/// How long [`resolve_window`] polls for the app's first `AXWindow` to register before giving
+/// up. The window server publishes a freshly-launched window's AX element a beat after the
+/// window exists, so a snapshot taken immediately after `start` can find an empty `AXWindows`
+/// list and spuriously `WindowNotFound`; this budget absorbs that startup race while still
+/// failing fast for an app that genuinely has no window.
+const RESOLVE_WINDOW_BUDGET_MS: u64 = 500;
+/// Interval between `AXWindows` poll attempts while waiting out the startup race.
+const RESOLVE_WINDOW_POLL_MS: u64 = 40;
+
 /// Remedy text for a missing Accessibility grant. Kept in sync with `glass-macos`'s
 /// `permissions.rs` wording (this crate can't depend on that private module).
 const ACCESSIBILITY_REMEDY: &str =
@@ -166,9 +175,25 @@ fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
 
     let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
     let app = ffi::app_element(pid as i32);
-    // A failed `AXWindows` read is "no windows" → fall through to `WindowNotFound`.
-    let windows = ffi::app_windows(&app).unwrap_or_default();
-    select_window(&windows, &ctx.window).ok_or(GlassError::WindowNotFound)
+
+    // The app's `AXWindows` list can be transiently EMPTY right after launch (the window
+    // server registers the AX window a beat after the window exists), so a snapshot taken
+    // immediately after `start` races it. Poll ONLY the empty-list case: as soon as any
+    // window is present, `select_window` decides the match — and if none fits, that is a real
+    // geometry mismatch (it logs its diagnostics), which retrying would not fix, so it is
+    // returned immediately rather than polled. A failed `AXWindows` read reads as "no windows"
+    // and is likewise retried until the budget, then `WindowNotFound`.
+    let deadline = Instant::now() + Duration::from_millis(RESOLVE_WINDOW_BUDGET_MS);
+    loop {
+        let windows = ffi::app_windows(&app).unwrap_or_default();
+        if !windows.is_empty() {
+            return select_window(&windows, &ctx.window).ok_or(GlassError::WindowNotFound);
+        }
+        if Instant::now() >= deadline {
+            return Err(GlassError::WindowNotFound);
+        }
+        std::thread::sleep(Duration::from_millis(RESOLVE_WINDOW_POLL_MS));
+    }
 }
 
 /// Select the `AXWindow` matching the backend's reported `win` and recover its point→pixel
