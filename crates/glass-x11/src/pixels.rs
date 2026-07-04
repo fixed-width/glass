@@ -77,7 +77,11 @@ mod tests {
             let data: Vec<u8> = (0..pixels * 4)
                 .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
                 .collect();
-            let (w, h) = if pixels == 0 { (0u32, 0u32) } else { (pixels as u32, 1u32) };
+            let (w, h) = if pixels == 0 {
+                (0u32, 0u32)
+            } else {
+                (pixels as u32, 1u32)
+            };
             let got = xdata_to_rgba(&data, w, h, 4).unwrap();
             assert_eq!(got, reference(&data), "pixels={pixels}");
         }

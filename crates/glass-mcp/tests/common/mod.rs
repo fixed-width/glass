@@ -32,7 +32,11 @@ impl Xvfb {
             let _ = child.kill();
             panic!("unexpected Xvfb -displayfd output: {line:?}");
         });
-        Xvfb { child, display: format!(":{num}"), _displayfd: reader.into_inner() }
+        Xvfb {
+            child,
+            display: format!(":{num}"),
+            _displayfd: reader.into_inner(),
+        }
     }
 }
 

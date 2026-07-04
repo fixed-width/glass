@@ -67,7 +67,11 @@ pub struct WrapOpts {
 /// `--ro-bind / /`), so they need no extra bind.
 pub fn program_ro_binds(program: &OsStr) -> Vec<std::path::PathBuf> {
     let p = std::path::Path::new(program);
-    if p.is_absolute() { vec![p.to_path_buf()] } else { vec![] }
+    if p.is_absolute() {
+        vec![p.to_path_buf()]
+    } else {
+        vec![]
+    }
 }
 
 /// The ephemeral HOME path to use: the real `$HOME` (so apps that hardcode the path
@@ -117,7 +121,17 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
     if opts.level == SandboxLevel::Strict {
         v.push(OsString::from("--unshare-net"));
     }
-    for f in ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"] {
+    for f in [
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+    ] {
         v.push(OsString::from(f));
     }
     v.push(OsString::from("--tmpfs"));
@@ -181,7 +195,9 @@ fn build_command_for(spec: &AppSpec) -> Option<Command> {
 /// is the developer's own code and is NOT sandboxed; only the launched run is contained. `cwd` is
 /// applied; a spawn failure or non-zero exit → `AppNotStarted`.
 pub fn run_build(spec: &AppSpec) -> Result<()> {
-    let Some(mut cmd) = build_command_for(spec) else { return Ok(()) };
+    let Some(mut cmd) = build_command_for(spec) else {
+        return Ok(());
+    };
     let status = cmd
         .status()
         .map_err(|e| GlassError::AppNotStarted(format!("build command: {e}")))?;
@@ -247,7 +263,12 @@ fn unavailable_remedy(apparmor_restricted: bool) -> String {
 
 /// Pure: map probed facts to a doctor check. `bin` is the resolved bubblewrap binary;
 /// `apparmor_restricted` tailors the remedy to the AppArmor userns restriction.
-fn sandbox_checks(available: bool, bin: &str, why: Option<String>, apparmor_restricted: bool) -> Vec<Check> {
+fn sandbox_checks(
+    available: bool,
+    bin: &str,
+    why: Option<String>,
+    apparmor_restricted: bool,
+) -> Vec<Check> {
     let check = if available {
         Check::new(
             "sandbox (bubblewrap)",
@@ -271,7 +292,9 @@ pub fn checks() -> Vec<Check> {
     let apparmor_restricted = apparmor_userns_restricted() == Some(true);
     match availability() {
         Availability::Ok => sandbox_checks(true, &bin, None, apparmor_restricted),
-        Availability::Unavailable(why) => sandbox_checks(false, &bin, Some(why), apparmor_restricted),
+        Availability::Unavailable(why) => {
+            sandbox_checks(false, &bin, Some(why), apparmor_restricted)
+        }
     }
 }
 
@@ -298,21 +321,34 @@ mod tests {
 
     #[test]
     fn default_wraps_program_with_core_flags_and_passthrough_args() {
-        let argv = wrap_argv(OsStr::new("/bin/app"), &[OsString::from("--flag")], &opts(SandboxLevel::Default));
+        let argv = wrap_argv(
+            OsStr::new("/bin/app"),
+            &[OsString::from("--flag")],
+            &opts(SandboxLevel::Default),
+        );
         let s = argv_strings(&argv);
         assert_eq!(s[0], "bwrap");
         assert!(s.contains(&"--unshare-user".into()));
         assert!(s.contains(&"--die-with-parent".into()));
-        assert!(!s.contains(&"--unshare-net".into()), "default keeps network");
+        assert!(
+            !s.contains(&"--unshare-net".into()),
+            "default keeps network"
+        );
         let i = s.iter().position(|x| x == "--setenv").unwrap();
-        assert_eq!((&s[i + 1], &s[i + 2]), (&"HOME".to_string(), &"/home/u".to_string()));
+        assert_eq!(
+            (&s[i + 1], &s[i + 2]),
+            (&"HOME".to_string(), &"/home/u".to_string())
+        );
         assert!(s.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
         assert!(s.windows(2).any(|w| w == ["--tmpfs", "/tmp"]));
         assert!(s.windows(2).any(|w| w == ["--tmpfs", "/home/u"]));
         assert!(s.windows(3).any(|w| w == ["--bind", "/work", "/work"]));
         assert!(s.windows(2).any(|w| w == ["--chdir", "/work"]));
         let tmpfs_tmp = s.windows(2).position(|w| w == ["--tmpfs", "/tmp"]).unwrap();
-        let xbind = s.windows(3).position(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"]).unwrap();
+        let xbind = s
+            .windows(3)
+            .position(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"])
+            .unwrap();
         assert!(xbind > tmpfs_tmp, "socket bind must come after tmpfs /tmp");
         let dd = s.iter().position(|x| x == "--").unwrap();
         assert_eq!(&s[dd + 1..], &["/bin/app", "--flag"]);
@@ -386,7 +422,8 @@ mod tests {
         };
         let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
         assert!(
-            s.windows(3).any(|w| w == ["--bind", "/home/u/proj", "/home/u/proj"]),
+            s.windows(3)
+                .any(|w| w == ["--bind", "/home/u/proj", "/home/u/proj"]),
             "cwd subdir of home must emit --bind <cwd> <cwd>; got: {s:?}"
         );
         assert!(
@@ -404,7 +441,10 @@ mod tests {
     #[test]
     fn program_ro_binds_bare_name_returns_empty() {
         let binds = super::program_ro_binds(OsStr::new("app"));
-        assert!(binds.is_empty(), "bare name needs no extra bind; got: {binds:?}");
+        assert!(
+            binds.is_empty(),
+            "bare name needs no extra bind; got: {binds:?}"
+        );
     }
 
     #[test]
@@ -422,14 +462,24 @@ mod tests {
         // Ubuntu 23.10+ restricts unprivileged userns via AppArmor (bwrap then fails
         // "setting up uid map: Permission denied"). When that's the cause, the remedy must
         // name the exact knob; otherwise it must not falsely claim AppArmor.
-        let restricted =
-            sandbox_checks(false, "bwrap", Some("uid map: Permission denied".into()), true);
+        let restricted = sandbox_checks(
+            false,
+            "bwrap",
+            Some("uid map: Permission denied".into()),
+            true,
+        );
         let r = restricted[0].remedy.clone().unwrap();
-        assert!(r.contains("apparmor_restrict_unprivileged_userns"), "got: {r}");
+        assert!(
+            r.contains("apparmor_restrict_unprivileged_userns"),
+            "got: {r}"
+        );
 
         let generic = sandbox_checks(false, "bwrap", Some("bwrap not found".into()), false);
         let g = generic[0].remedy.clone().unwrap();
-        assert!(!g.to_lowercase().contains("apparmor"), "generic remedy must not claim AppArmor: {g}");
+        assert!(
+            !g.to_lowercase().contains("apparmor"),
+            "generic remedy must not claim AppArmor: {g}"
+        );
     }
 
     fn make_spec(build: Option<&str>, sandbox: SandboxLevel) -> AppSpec {
@@ -447,7 +497,11 @@ mod tests {
 
     #[test]
     fn build_is_never_sandboxed() {
-        for level in [SandboxLevel::Off, SandboxLevel::Default, SandboxLevel::Strict] {
+        for level in [
+            SandboxLevel::Off,
+            SandboxLevel::Default,
+            SandboxLevel::Strict,
+        ] {
             let s = make_spec(Some("true"), level);
             let cmd = build_command_for(&s).expect("build present");
             assert_eq!(
@@ -461,16 +515,34 @@ mod tests {
     #[test]
     fn run_build_off_runs_and_reports_status() {
         use glass_core::SandboxLevel;
-        assert!(run_build(&make_spec(None, SandboxLevel::Off)).is_ok(), "no build → Ok");
-        assert!(run_build(&make_spec(Some("true"), SandboxLevel::Off)).is_ok(), "successful build → Ok");
-        assert!(run_build(&make_spec(Some("false"), SandboxLevel::Off)).is_err(), "failing build → Err");
+        assert!(
+            run_build(&make_spec(None, SandboxLevel::Off)).is_ok(),
+            "no build → Ok"
+        );
+        assert!(
+            run_build(&make_spec(Some("true"), SandboxLevel::Off)).is_ok(),
+            "successful build → Ok"
+        );
+        assert!(
+            run_build(&make_spec(Some("false"), SandboxLevel::Off)).is_err(),
+            "failing build → Err"
+        );
     }
 
     #[test]
     fn run_build_default_sandbox_runs_and_reports_status() {
         use glass_core::SandboxLevel;
-        assert!(run_build(&make_spec(None, SandboxLevel::Default)).is_ok(), "no build → Ok");
-        assert!(run_build(&make_spec(Some("true"), SandboxLevel::Default)).is_ok(), "successful build → Ok");
-        assert!(run_build(&make_spec(Some("false"), SandboxLevel::Default)).is_err(), "failing build → Err");
+        assert!(
+            run_build(&make_spec(None, SandboxLevel::Default)).is_ok(),
+            "no build → Ok"
+        );
+        assert!(
+            run_build(&make_spec(Some("true"), SandboxLevel::Default)).is_ok(),
+            "successful build → Ok"
+        );
+        assert!(
+            run_build(&make_spec(Some("false"), SandboxLevel::Default)).is_err(),
+            "failing build → Err"
+        );
     }
 }

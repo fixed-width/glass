@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
-use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
+use rmcp::transport::streamable_http_server::StreamableHttpService;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::GlassServer;
@@ -59,11 +59,9 @@ pub async fn run(
         argv.push("--token-file".into());
         argv.push(tf);
     }
-    let cfg = config::parse_args(
-        &argv,
-        std::env::var("GLASS_TOKEN").ok(),
-        |p| std::fs::read_to_string(p),
-    )
+    let cfg = config::parse_args(&argv, std::env::var("GLASS_TOKEN").ok(), |p| {
+        std::fs::read_to_string(p)
+    })
     .map_err(|e| anyhow::anyhow!("glass serve: {e}"))?;
 
     // Fail-closed exposure rule (spec D4) — refuse a network-exposed bind without a token.
@@ -124,9 +122,13 @@ pub async fn run_on(
 
     // The bearer-token layer fronts the MCP service.
     let expected = Arc::new(cfg.token);
-    let app: Router = Router::new()
-        .fallback_service(service)
-        .layer(axum::middleware::from_fn_with_state(expected, auth::require_bearer));
+    let app: Router =
+        Router::new()
+            .fallback_service(service)
+            .layer(axum::middleware::from_fn_with_state(
+                expected,
+                auth::require_bearer,
+            ));
 
     let r = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -182,7 +184,10 @@ mod tests {
     use super::*;
 
     fn cfg(addr: &str, token: Option<&str>) -> ServeConfig {
-        ServeConfig { addr: addr.parse().unwrap(), token: token.map(String::from) }
+        ServeConfig {
+            addr: addr.parse().unwrap(),
+            token: token.map(String::from),
+        }
     }
 
     #[test]

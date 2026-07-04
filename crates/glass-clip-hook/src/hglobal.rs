@@ -77,8 +77,8 @@ impl OwnedHGlobal {
         {
             // SAFETY: `h` was just returned by GlobalAlloc, so it is valid.
             let mut lock = unsafe { HGlobalLock::new(owned.h) }?; // on None, `owned` drops -> free
-            // GlobalAlloc may round the block UP, so the locked slice can be longer than requested;
-            // copy into the exact prefix (a whole-slice copy_from_slice would panic on a mismatch).
+                                                                  // GlobalAlloc may round the block UP, so the locked slice can be longer than requested;
+                                                                  // copy into the exact prefix (a whole-slice copy_from_slice would panic on a mismatch).
             lock.as_mut_bytes()[..bytes.len()].copy_from_slice(bytes);
             // `lock` drops here -> GlobalUnlock.
         }

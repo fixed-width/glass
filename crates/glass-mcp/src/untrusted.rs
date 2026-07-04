@@ -63,11 +63,14 @@ mod tests {
         assert!(w.contains(body), "body must be verbatim: {w}");
         let n = open_nonce(&w);
         assert!(w.contains(&format!("⟦untrusted:{n}⟧")));
-        assert!(w.contains(&format!("⟦/untrusted:{n}⟧")), "close marker must match nonce");
+        assert!(
+            w.contains(&format!("⟦/untrusted:{n}⟧")),
+            "close marker must match nonce"
+        );
         // inner JSON between the markers still parses
         // strip the NOTE line, the open-marker line, and the close-marker line:
-        let after_note = w.split_once('\n').unwrap().1;            // drop NOTE line
-        let after_open = after_note.split_once('\n').unwrap().1;   // drop open-marker line
+        let after_note = w.split_once('\n').unwrap().1; // drop NOTE line
+        let after_open = after_note.split_once('\n').unwrap().1; // drop open-marker line
         let body_extracted = after_open.rsplit_once('\n').unwrap().0; // drop close-marker line
         let _: serde_json::Value = serde_json::from_str(body_extracted.trim()).unwrap();
     }
@@ -86,9 +89,14 @@ mod tests {
         // CSPRNG value — 128 bits rendered as 32 lowercase hex chars.
         let w = wrap_untrusted("x");
         let n = open_nonce(&w);
-        assert_eq!(n.len(), 32, "nonce should be 128-bit (32 hex chars), got {n:?}");
+        assert_eq!(
+            n.len(),
+            32,
+            "nonce should be 128-bit (32 hex chars), got {n:?}"
+        );
         assert!(
-            n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            n.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "nonce must be lowercase hex: {n:?}"
         );
     }
@@ -109,8 +117,15 @@ mod tests {
         assert_ne!(n, guess, "real nonce must not equal the attacker's guess");
 
         let real_close = format!("⟦/untrusted:{n}⟧");
-        assert_eq!(w.matches(real_close.as_str()).count(), 1, "exactly one real close marker");
-        assert!(w.ends_with(&real_close), "the real close marker terminates the envelope");
+        assert_eq!(
+            w.matches(real_close.as_str()).count(),
+            1,
+            "exactly one real close marker"
+        );
+        assert!(
+            w.ends_with(&real_close),
+            "the real close marker terminates the envelope"
+        );
 
         // Body round-trips byte-for-byte between the real markers (forged markers included).
         let open = format!("⟦untrusted:{n}⟧\n");

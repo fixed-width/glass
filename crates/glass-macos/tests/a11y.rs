@@ -66,7 +66,11 @@ mod macos_main {
     /// `value`) — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
     /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
-    const NEEDLES: [&str; 3] = ["Button \"Save\"", "CheckBox \"Enable\"", "TextField \"Note\""];
+    const NEEDLES: [&str; 3] = [
+        "Button \"Save\"",
+        "CheckBox \"Enable\"",
+        "TextField \"Note\"",
+    ];
 
     /// Pre-order search for the first `TextField` node — the fixture's editable "Note" field.
     /// Separate from the [`NEEDLES`] outline check because `to_outline` only ever renders
@@ -93,7 +97,9 @@ mod macos_main {
     /// layer) observed the click. Mirrors `input.rs`'s `find_reported`, simplified to a
     /// substring test since the fixture's marker line has no variable payload to parse out.
     fn logs_contain(lines: &[(Stream, String)], needle: &str) -> bool {
-        lines.iter().any(|(stream, line)| *stream == Stream::Stdout && line.contains(needle))
+        lines
+            .iter()
+            .any(|(stream, line)| *stream == Stream::Stdout && line.contains(needle))
     }
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
@@ -115,12 +121,18 @@ mod macos_main {
 
     /// Like `expect`, but returns the error as a `String` so a failure flows back to `run()`
     /// for `stop_app` + temp-dir cleanup before the process exits. Mirrors `capture.rs`.
-    fn try_expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
+    fn try_expect<T, E: std::fmt::Display>(
+        result: Result<T, E>,
+        context: &str,
+    ) -> Result<T, String> {
         result.map_err(|e| format!("{context}: {e}"))
     }
 
     fn swiftc_available() -> bool {
-        Command::new("swiftc").arg("--version").output().is_ok_and(|o| o.status.success())
+        Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Build `fixture/a11y_fixture.swift` to a fresh temp path. Returns the built binary's
@@ -133,8 +145,12 @@ mod macos_main {
             fail(format!("fixture source not found at {}", source.display()));
         }
 
-        let out_dir = std::env::temp_dir().join(format!("glass-macos-a11y-test-{}", std::process::id()));
-        expect(std::fs::create_dir_all(&out_dir), "creating fixture build dir");
+        let out_dir =
+            std::env::temp_dir().join(format!("glass-macos-a11y-test-{}", std::process::id()));
+        expect(
+            std::fs::create_dir_all(&out_dir),
+            "creating fixture build dir",
+        );
         let out_bin = out_dir.join("a11y_fixture");
 
         let status = Command::new("swiftc")
@@ -146,7 +162,10 @@ mod macos_main {
             .status();
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) => fail(format!("swiftc exited with {s} building {}", source.display())),
+            Ok(s) => fail(format!(
+                "swiftc exited with {s} building {}",
+                source.display()
+            )),
             Err(e) => fail(format!("failed to run swiftc: {e}")),
         }
         (out_bin, out_dir)
@@ -156,7 +175,10 @@ mod macos_main {
     /// each of [`NEEDLES`]. Returns `Err` instead of exiting so `run()` can always reach
     /// `stop_app` first (a bare `process::exit` here would skip `MacosPlatform::Drop` and
     /// leak the spawned fixture — same rationale as `capture.rs::run_checks`).
-    fn run_checks(platform: &mut MacosPlatform, fixture_bin: &std::path::Path) -> Result<(), String> {
+    fn run_checks(
+        platform: &mut MacosPlatform,
+        fixture_bin: &std::path::Path,
+    ) -> Result<(), String> {
         let spec = AppSpec {
             build: None,
             run: vec![fixture_bin.to_string_lossy().into_owned()],
@@ -201,7 +223,10 @@ mod macos_main {
             None => return Err(format!("no TextField node in tree:\n{outline}")),
         };
         if field.value != Some("hello".to_string()) {
-            return Err(format!("TextField value = {:?}, want Some(\"hello\"):\n{outline}", field.value));
+            return Err(format!(
+                "TextField value = {:?}, want Some(\"hello\"):\n{outline}",
+                field.value
+            ));
         }
 
         // Round-trip an editable field: "hello" -> "world" via set_value, then re-snapshot
@@ -210,9 +235,16 @@ mod macos_main {
             Some(n) => n,
             None => return Err(format!("no \"Note\" field in tree:\n{outline}")),
         };
-        let note_tgt =
-            AxTarget { id: note.id, role: note.role, name: note.name.clone(), bounds: note.bounds };
-        try_expect(a11y.set_value(&ctx, &note_tgt, "world"), "set_value(Note, \"world\")")?;
+        let note_tgt = AxTarget {
+            id: note.id,
+            role: note.role,
+            name: note.name.clone(),
+            bounds: note.bounds,
+        };
+        try_expect(
+            a11y.set_value(&ctx, &note_tgt, "world"),
+            "set_value(Note, \"world\")",
+        )?;
 
         let mut tree2 = try_expect(a11y.snapshot(&ctx), "re-snapshot after set_value")?;
         tree2.assign_ids();
@@ -233,11 +265,19 @@ mod macos_main {
             Some(n) => n,
             None => return Err(format!("no \"Save\" button in re-snapshot:\n{outline2}")),
         };
-        let save_tgt =
-            AxTarget { id: save.id, role: save.role, name: save.name.clone(), bounds: save.bounds };
+        let save_tgt = AxTarget {
+            id: save.id,
+            role: save.role,
+            name: save.name.clone(),
+            bounds: save.bounds,
+        };
         match a11y.set_value(&ctx, &save_tgt, "x") {
             Err(GlassError::AxElementNotEditable(_)) => {}
-            other => return Err(format!("expected AxElementNotEditable for Save, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "expected AxElementNotEditable for Save, got {other:?}"
+                ))
+            }
         }
 
         println!("A11Y_SETVALUE_PASS");
@@ -249,7 +289,11 @@ mod macos_main {
         // system agree end-to-end, not just that each is internally self-consistent. ---
         let save_bounds = match save.bounds {
             Some(b) => b,
-            None => return Err(format!("\"Save\" node has no bounds in re-snapshot:\n{outline2}")),
+            None => {
+                return Err(format!(
+                    "\"Save\" node has no bounds in re-snapshot:\n{outline2}"
+                ))
+            }
         };
         let (cx, cy) = match save_bounds.clamped_center(ctx.window.width, ctx.window.height) {
             Some(p) => p,
@@ -260,9 +304,17 @@ mod macos_main {
                 ))
             }
         };
-        let click_event =
-            PointerEvent::Click { x: cx, y: cy, button: MouseButton::Left, count: 1, modifiers: vec![] };
-        try_expect(platform.send_pointer(&click_event), "send_pointer(Click) on Save's a11y bounds")?;
+        let click_event = PointerEvent::Click {
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        };
+        try_expect(
+            platform.send_pointer(&click_event),
+            "send_pointer(Click) on Save's a11y bounds",
+        )?;
         std::thread::sleep(CLICK_SETTLE);
         let click_logs = platform.drain_logs();
         if !logs_contain(&click_logs, "SAVE_CLICKED") {
@@ -282,7 +334,10 @@ mod macos_main {
             Some(p) => {
                 let path = PathBuf::from(p);
                 if !path.is_file() {
-                    fail(format!("GLASS_A11Y_FIXTURE_BIN set but not a file: {}", path.display()));
+                    fail(format!(
+                        "GLASS_A11Y_FIXTURE_BIN set but not a file: {}",
+                        path.display()
+                    ));
                 }
                 (path, None)
             }
@@ -307,7 +362,9 @@ mod macos_main {
             Ok(p) => p,
             Err(e) => {
                 cleanup_dir(&fixture_dir);
-                fail(format!("MacosPlatform::new() (Screen Recording / Accessibility grant missing?): {e}"));
+                fail(format!(
+                    "MacosPlatform::new() (Screen Recording / Accessibility grant missing?): {e}"
+                ));
             }
         };
 

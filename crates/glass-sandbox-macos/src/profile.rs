@@ -107,7 +107,10 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
 /// empty set never produces invalid SBPL).
 fn emit_read_allow(out: &mut String, path: &Path) {
     out.push_str("(allow file-read* file-read-metadata ");
-    out.push_str(&format!("(subpath {})", sbpl_quote(&path.to_string_lossy())));
+    out.push_str(&format!(
+        "(subpath {})",
+        sbpl_quote(&path.to_string_lossy())
+    ));
     out.push_str(")\n");
 }
 
@@ -116,7 +119,10 @@ fn emit_read_allow(out: &mut String, path: &Path) {
 /// dylib (see [`ProfileOpts::ro_files`]).
 fn emit_read_allow_file(out: &mut String, path: &Path) {
     out.push_str("(allow file-read* file-read-metadata ");
-    out.push_str(&format!("(literal {})", sbpl_quote(&path.to_string_lossy())));
+    out.push_str(&format!(
+        "(literal {})",
+        sbpl_quote(&path.to_string_lossy())
+    ));
     out.push_str(")\n");
 }
 
@@ -291,7 +297,9 @@ mod tests {
         let mut o_root = opts();
         o_root.cwd = PathBuf::from("/");
         let p_root = build_profile(SandboxLevel::Default, &o_root);
-        let write_block_start = p_root.find("(allow file-write*").expect("write block present");
+        let write_block_start = p_root
+            .find("(allow file-write*")
+            .expect("write block present");
         assert!(
             !p_root[write_block_start..].contains(r#"(subpath "/")"#),
             "root must never be write-allowed:\n{p_root}"
@@ -302,15 +310,24 @@ mod tests {
     fn is_safe_reallow_rejects_root_home_and_relative_paths() {
         assert!(!is_safe_reallow(Path::new("/")), "root");
         assert!(!is_safe_reallow(Path::new("/Users")), "Users root");
-        assert!(!is_safe_reallow(Path::new("/Users/dev")), "a bare home root");
+        assert!(
+            !is_safe_reallow(Path::new("/Users/dev")),
+            "a bare home root"
+        );
         assert!(!is_safe_reallow(Path::new("rel/path")), "relative path");
         assert!(!is_safe_reallow(Path::new(".")), "relative cwd shorthand");
     }
 
     #[test]
     fn is_safe_reallow_accepts_real_project_dirs() {
-        assert!(is_safe_reallow(Path::new("/Users/dev/project")), "a project dir under home");
-        assert!(is_safe_reallow(Path::new("/work/project")), "outside home entirely");
+        assert!(
+            is_safe_reallow(Path::new("/Users/dev/project")),
+            "a project dir under home"
+        );
+        assert!(
+            is_safe_reallow(Path::new("/work/project")),
+            "outside home entirely"
+        );
         assert!(is_safe_reallow(Path::new("/tmp/x")), "scratch dir");
     }
 

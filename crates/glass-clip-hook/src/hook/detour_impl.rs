@@ -21,7 +21,7 @@ use crate::proto::FormatKey;
 
 use super::{
     alloc_hglobal_bytes, id_of, key_of, locale_blob, read_bytes_from_hglobal, store_empty,
-    store_get_bytes, store_list, store_set_all, store_seq, unicode_to_codepage, user32_proc,
+    store_get_bytes, store_list, store_seq, store_set_all, unicode_to_codepage, user32_proc,
     CF_BITMAP, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT,
 };
 
@@ -152,9 +152,9 @@ fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
         CreateDIBitmap, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, CBM_INIT, DIB_RGB_COLORS,
     };
     let info = crate::dib::parse_dib(dib)?; // validated geometry → bounds-safe offsets
-    // SAFETY: `dib` parsed clean (header + table + bits within bounds). The header ptr is read as a
-    // BITMAPINFOHEADER/BITMAPINFO; `bits` = dib + header_bytes + color_table_bytes is in-bounds and
-    // sized by `info`. GetDC/ReleaseDC are paired.
+                                            // SAFETY: `dib` parsed clean (header + table + bits within bounds). The header ptr is read as a
+                                            // BITMAPINFOHEADER/BITMAPINFO; `bits` = dib + header_bytes + color_table_bytes is in-bounds and
+                                            // sized by `info`. GetDC/ReleaseDC are paired.
     unsafe {
         let hdc = GetDC(None);
         if hdc.is_invalid() {
@@ -163,10 +163,17 @@ fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
             return None;
         }
         let bmih = dib.as_ptr() as *const BITMAPINFOHEADER;
-        let bits =
-            dib.as_ptr().add(info.header_bytes + info.color_table_bytes) as *const core::ffi::c_void;
+        let bits = dib.as_ptr().add(info.header_bytes + info.color_table_bytes)
+            as *const core::ffi::c_void;
         let bmi = dib.as_ptr() as *const BITMAPINFO;
-        let hbm = CreateDIBitmap(hdc, Some(bmih), CBM_INIT as u32, Some(bits), Some(bmi), DIB_RGB_COLORS);
+        let hbm = CreateDIBitmap(
+            hdc,
+            Some(bmih),
+            CBM_INIT as u32,
+            Some(bits),
+            Some(bmi),
+            DIB_RGB_COLORS,
+        );
         ReleaseDC(None, hdc);
         if hbm.is_invalid() {
             None
@@ -277,8 +284,10 @@ fn is_clipboard_format_available(fmt: u32) -> BOOL {
 
 /// `CountClipboardFormats()` → the number of stored/synthesizable formats.
 fn count_clipboard_formats() -> i32 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| available_ids().len() as i32))
-        .unwrap_or(0)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        available_ids().len() as i32
+    }))
+    .unwrap_or(0)
 }
 
 /// `EnumClipboardFormats(prev)` → walk the stored/synthesizable formats in order: `0` yields the
@@ -324,13 +333,19 @@ pub(super) fn install() {
         }
         if let Some(p) = user32_proc(b"CloseClipboard\0") {
             let target: FnCloseClipboard = std::mem::transmute(p);
-            if CloseClipboardHook.initialize(target, close_clipboard).is_ok() {
+            if CloseClipboardHook
+                .initialize(target, close_clipboard)
+                .is_ok()
+            {
                 let _ = CloseClipboardHook.enable();
             }
         }
         if let Some(p) = user32_proc(b"EmptyClipboard\0") {
             let target: FnEmptyClipboard = std::mem::transmute(p);
-            if EmptyClipboardHook.initialize(target, empty_clipboard).is_ok() {
+            if EmptyClipboardHook
+                .initialize(target, empty_clipboard)
+                .is_ok()
+            {
                 let _ = EmptyClipboardHook.enable();
             }
         }

@@ -50,7 +50,11 @@ pub(crate) enum Decision {
 /// Decide the provider from level + choice + whether Sandboxie is available right now.
 /// `Off` is always Unconfined. For `Default`/`Strict`, an in-OS provider is required:
 /// fail closed if none is available (mirrors Linux bwrap).
-pub(crate) fn decide(level: SandboxLevel, choice: ProviderChoice, sandboxie_available: bool) -> Decision {
+pub(crate) fn decide(
+    level: SandboxLevel,
+    choice: ProviderChoice,
+    sandboxie_available: bool,
+) -> Decision {
     if level == SandboxLevel::Off {
         return Decision::Unconfined;
     }
@@ -83,9 +87,15 @@ pub(crate) struct BoxNet {
 }
 pub(crate) fn box_net(level: SandboxLevel) -> BoxNet {
     match level {
-        SandboxLevel::Strict => BoxNet { allow_network_access: false, close_afd: true },
+        SandboxLevel::Strict => BoxNet {
+            allow_network_access: false,
+            close_afd: true,
+        },
         // Default (and Off, defensively) = network on, no device close.
-        _ => BoxNet { allow_network_access: true, close_afd: false },
+        _ => BoxNet {
+            allow_network_access: true,
+            close_afd: false,
+        },
     }
 }
 
@@ -98,7 +108,10 @@ pub(crate) fn box_settings(level: SandboxLevel) -> Vec<(&'static str, &'static s
         ("KeepTokenIntegrity", "y"),
         ("NotifyInternetAccessDenied", "n"),
         ("NotifyStartRunAccessDenied", "n"),
-        ("AllowNetworkAccess", if net.allow_network_access { "y" } else { "n" }),
+        (
+            "AllowNetworkAccess",
+            if net.allow_network_access { "y" } else { "n" },
+        ),
         // Layer 1 (unconditional): block the boxed app from the user's global clipboard.
         // A private clipboard is layered back on top by the InjectDll64 hook (Layer 2);
         // if the hook is unavailable the app simply has no clipboard — the user's is safe.
@@ -249,11 +262,21 @@ mod tests {
 
     #[test]
     fn launch_cmd_quotes_tokens_and_redirects() {
-        let spec = launch_spec(vec!["C:\\Program Files\\app.exe".into(), "--flag".into()], None);
-        let script = build_launch_cmd_env(&spec, Path::new("out.log"), Path::new("err.log"), None).unwrap();
+        let spec = launch_spec(
+            vec!["C:\\Program Files\\app.exe".into(), "--flag".into()],
+            None,
+        );
+        let script =
+            build_launch_cmd_env(&spec, Path::new("out.log"), Path::new("err.log"), None).unwrap();
         assert!(script.starts_with("@echo off\r\n"), "script: {script:?}");
-        assert!(script.contains("\"C:\\Program Files\\app.exe\" \"--flag\""), "script: {script:?}");
-        assert!(script.contains("1>\"out.log\" 2>\"err.log\""), "script: {script:?}");
+        assert!(
+            script.contains("\"C:\\Program Files\\app.exe\" \"--flag\""),
+            "script: {script:?}"
+        );
+        assert!(
+            script.contains("1>\"out.log\" 2>\"err.log\""),
+            "script: {script:?}"
+        );
     }
 
     #[test]
@@ -282,13 +305,22 @@ mod tests {
 
     #[test]
     fn off_is_always_unconfined() {
-        assert_eq!(decide(SandboxLevel::Off, ProviderChoice::None, false), Decision::Unconfined);
-        assert_eq!(decide(SandboxLevel::Off, ProviderChoice::Auto, false), Decision::Unconfined);
+        assert_eq!(
+            decide(SandboxLevel::Off, ProviderChoice::None, false),
+            Decision::Unconfined
+        );
+        assert_eq!(
+            decide(SandboxLevel::Off, ProviderChoice::Auto, false),
+            Decision::Unconfined
+        );
     }
 
     #[test]
     fn default_auto_uses_sandboxie_when_available_else_fails_closed() {
-        assert_eq!(decide(SandboxLevel::Default, ProviderChoice::Auto, true), Decision::Sandboxie);
+        assert_eq!(
+            decide(SandboxLevel::Default, ProviderChoice::Auto, true),
+            Decision::Sandboxie
+        );
         assert!(matches!(
             decide(SandboxLevel::Default, ProviderChoice::Auto, false),
             Decision::FailClosed(_)
@@ -331,7 +363,10 @@ mod tests {
 
     #[test]
     fn parse_listpids_reads_count_then_pids() {
-        assert_eq!(parse_listpids("3\r\n100\r\n200\r\n300\r\n"), vec![100, 200, 300]);
+        assert_eq!(
+            parse_listpids("3\r\n100\r\n200\r\n300\r\n"),
+            vec![100, 200, 300]
+        );
         assert_eq!(parse_listpids("0\r\n"), Vec::<u32>::new());
         assert_eq!(parse_listpids(""), Vec::<u32>::new());
     }
@@ -339,7 +374,10 @@ mod tests {
     #[test]
     fn provider_choice_parse() {
         assert_eq!(ProviderChoice::parse("AUTO").unwrap(), ProviderChoice::Auto);
-        assert_eq!(ProviderChoice::parse("sandboxie").unwrap(), ProviderChoice::Sandboxie);
+        assert_eq!(
+            ProviderChoice::parse("sandboxie").unwrap(),
+            ProviderChoice::Sandboxie
+        );
         assert!(ProviderChoice::parse("bogus").is_err());
     }
 
@@ -359,15 +397,24 @@ mod tests {
     #[test]
     fn hook_dll_path_precedence() {
         // explicit env wins; else beside the exe; else None (Layer-2 unavailable).
-        assert_eq!(hook_dll_path(Some("X.dll"), Some("/exe/dir")), Some("X.dll".to_string()));
-        assert_eq!(hook_dll_path(None, Some("/exe/dir")), Some("/exe/dir/glass_clip_hook.dll".to_string()));
+        assert_eq!(
+            hook_dll_path(Some("X.dll"), Some("/exe/dir")),
+            Some("X.dll".to_string())
+        );
+        assert_eq!(
+            hook_dll_path(None, Some("/exe/dir")),
+            Some("/exe/dir/glass_clip_hook.dll".to_string())
+        );
         assert_eq!(hook_dll_path(None, None), None);
     }
 
     #[test]
     fn layer2_box_lines_inject_and_open_pipe() {
         let lines = clip_layer2_lines("glass_7", "C:\\g\\glass_clip_hook.dll");
-        assert!(lines.contains(&("InjectDll64".to_string(), "C:\\g\\glass_clip_hook.dll".to_string())));
+        assert!(lines.contains(&(
+            "InjectDll64".to_string(),
+            "C:\\g\\glass_clip_hook.dll".to_string()
+        )));
         assert!(lines.contains(&(
             "OpenPipePath".to_string(),
             "\\Device\\NamedPipe\\glass-clip-glass_7".to_string()
@@ -377,8 +424,17 @@ mod tests {
     #[test]
     fn launch_cmd_sets_clip_pipe_env_when_present() {
         let spec = launch_spec(vec!["app.exe".into()], None);
-        let with = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), Some("glass-clip-glass_9")).unwrap();
-        assert!(with.contains("set \"GLASS_CLIP_PIPE=glass-clip-glass_9\"\r\n"), "got: {with:?}");
+        let with = build_launch_cmd_env(
+            &spec,
+            Path::new("o"),
+            Path::new("e"),
+            Some("glass-clip-glass_9"),
+        )
+        .unwrap();
+        assert!(
+            with.contains("set \"GLASS_CLIP_PIPE=glass-clip-glass_9\"\r\n"),
+            "got: {with:?}"
+        );
         // None → no env line (Layer-1-only), and the exe still runs.
         let without = build_launch_cmd_env(&spec, Path::new("o"), Path::new("e"), None).unwrap();
         assert!(!without.contains("GLASS_CLIP_PIPE"), "got: {without:?}");

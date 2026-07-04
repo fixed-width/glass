@@ -59,7 +59,11 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
     let color_table_bytes: usize = match compression {
         BI_RGB if bpp <= 8 => {
             // Palette: clr_used (or 2^bpp if 0) entries of 4 bytes.
-            let entries = if clr_used == 0 { 1u64 << bpp } else { clr_used as u64 };
+            let entries = if clr_used == 0 {
+                1u64 << bpp
+            } else {
+                clr_used as u64
+            };
             if entries > 256 {
                 return None; // a palette can't exceed 2^8
             }
@@ -235,7 +239,7 @@ mod tests {
         let mut h = bih_2x2_32();
         h[4..8].copy_from_slice(&i32::MAX.to_le_bytes()); // width = 2^31-1
         h[8..12].copy_from_slice(&i32::MAX.to_le_bytes()); // height = 2^31-1
-        // stride*height overflows usize math if done naively; parse must reject, not panic/overflow.
+                                                           // stride*height overflows usize math if done naively; parse must reject, not panic/overflow.
         assert!(parse_dib(&h).is_none());
     }
 
@@ -258,7 +262,10 @@ mod tests {
         v.extend_from_slice(&[0xAA; 8]); // palette
         v.extend_from_slice(&[0xBB; 4]); // 1px * 4B pixels
         let d = parse_dib(&v).expect("valid high-bpp DIB with palette");
-        assert_eq!(d.color_table_bytes, 8, "biClrUsed palette must be counted for bpp>8");
+        assert_eq!(
+            d.color_table_bytes, 8,
+            "biClrUsed palette must be counted for bpp>8"
+        );
         assert_eq!(d.image_bytes, 4);
         // Pixels must be located after header + palette (40 + 8 = 48), not at 40.
         assert_eq!(
@@ -295,7 +302,10 @@ mod tests {
         v.extend_from_slice(&[0xCC; 4]); // 1px * 4B pixels (stride 4)
         let d = parse_dib(&v).expect("BITFIELDS DIB");
         assert_eq!(d.compression, 3);
-        assert_eq!(d.color_table_bytes, 12, "3 DWORD masks sit between header and pixels");
+        assert_eq!(
+            d.color_table_bytes, 12,
+            "3 DWORD masks sit between header and pixels"
+        );
         assert_eq!(d.image_bytes, 4);
         assert_eq!(
             &v[d.header_bytes + d.color_table_bytes..][..4],
@@ -310,7 +320,10 @@ mod tests {
             let mut v = bih_2x2_32();
             v[16..20].copy_from_slice(&comp.to_le_bytes());
             v.extend_from_slice(&[0u8; 16]);
-            assert!(parse_dib(&v).is_none(), "compression {comp} must be rejected");
+            assert!(
+                parse_dib(&v).is_none(),
+                "compression {comp} must be rejected"
+            );
         }
     }
 
@@ -319,7 +332,10 @@ mod tests {
         let mut v = bih_bitfields_1x1_32();
         v[14..16].copy_from_slice(&8u16.to_le_bytes()); // 8bpp + BITFIELDS is invalid
         v.extend_from_slice(&[0u8; 4]);
-        assert!(parse_dib(&v).is_none(), "BITFIELDS is only valid for 16/32bpp");
+        assert!(
+            parse_dib(&v).is_none(),
+            "BITFIELDS is only valid for 16/32bpp"
+        );
     }
 
     #[test]

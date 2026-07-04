@@ -201,10 +201,15 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
             // themselves: glass overrides them below (last-write-wins, above), so their value
             // is intentionally ignored — say so instead of leaving the caller to wonder.
             for (k, _) in &spec.env {
-                if matches!(k.as_str(), "DYLD_INSERT_LIBRARIES" | "GLASS_CLIP_PASTEBOARD") {
+                if matches!(
+                    k.as_str(),
+                    "DYLD_INSERT_LIBRARIES" | "GLASS_CLIP_PASTEBOARD"
+                ) {
                     logs.lock().expect("log sink mutex").push((
                         Stream::Stderr,
-                        format!("glass: caller-supplied {k} is overridden by clipboard-shim injection"),
+                        format!(
+                            "glass: caller-supplied {k} is overridden by clipboard-shim injection"
+                        ),
                     ));
                 }
             }
@@ -355,7 +360,8 @@ mod tests {
         // fixed name like `.ssh/known_hosts`, which may not exist on a fresh CI runner) so a
         // `cat` failure can only mean the sandbox denied it, never that the path was absent.
         let home = std::env::var("HOME").expect("HOME must be set");
-        let proj = std::path::Path::new(&home).join(format!("glass-sbx-cwd-{}", std::process::id()));
+        let proj =
+            std::path::Path::new(&home).join(format!("glass-sbx-cwd-{}", std::process::id()));
         std::fs::create_dir_all(&proj).expect("create project dir under $HOME");
         let probe_path = proj.join("probe");
         std::fs::write(&probe_path, "probe").expect("write probe file under the project dir");
@@ -374,7 +380,10 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.proj);
             }
         }
-        let _cleanup = Cleanup { secret: secret_path.clone(), proj: proj.clone() };
+        let _cleanup = Cleanup {
+            secret: secret_path.clone(),
+            proj: proj.clone(),
+        };
         let proj_str = proj.to_str().expect("project path is valid UTF-8");
         let secret = secret_path.to_str().expect("secret path is valid UTF-8");
         let shell_cmd = format!(
@@ -387,8 +396,8 @@ mod tests {
         denied.sandbox = SandboxLevel::Default;
         denied.cwd = Some(proj.clone());
         let logs = empty_sink();
-        let (mut child, _clip) =
-            spawn(&denied, logs.clone()).unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
+        let (mut child, _clip) = spawn(&denied, logs.clone())
+            .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
         let out: Vec<String> = logs
@@ -397,26 +406,47 @@ mod tests {
             .iter()
             .map(|(_, l)| l.clone())
             .collect();
-        assert!(out.iter().any(|l| l == "SYS_OK"), "whole-FS read should be allowed: {out:?}");
-        assert!(out.iter().any(|l| l == "CWD_OK"), "cwd under home should be reallowed: {out:?}");
-        assert!(out.iter().any(|l| l == "HOME_DENIED"), "home read must be denied: {out:?}");
-        assert!(!out.iter().any(|l| l == "HOME_READABLE"), "home leaked: {out:?}");
+        assert!(
+            out.iter().any(|l| l == "SYS_OK"),
+            "whole-FS read should be allowed: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "CWD_OK"),
+            "cwd under home should be reallowed: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "HOME_DENIED"),
+            "home read must be denied: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "HOME_READABLE"),
+            "home leaked: {out:?}"
+        );
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn spawn_pipes_stdout_and_stderr_lines() {
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(&spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]), logs.clone())
-            .expect("spawn /bin/sh");
+        let (mut child, _clip) = spawn(
+            &spec(&["/bin/sh", "-c", "echo out; echo err 1>&2"]),
+            logs.clone(),
+        )
+        .expect("spawn /bin/sh");
         child.wait().expect("wait for /bin/sh to exit");
         // The reader threads finish shortly after the child's fds close on exit; give them
         // a moment rather than racing the drain against them.
         std::thread::sleep(Duration::from_millis(100));
 
         let lines = logs.lock().expect("log sink mutex").clone();
-        assert!(lines.contains(&(Stream::Stdout, "out".to_string())), "{lines:?}");
-        assert!(lines.contains(&(Stream::Stderr, "err".to_string())), "{lines:?}");
+        assert!(
+            lines.contains(&(Stream::Stdout, "out".to_string())),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&(Stream::Stderr, "err".to_string())),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -424,13 +454,17 @@ mod tests {
     fn spawn_missing_program_returns_app_not_started() {
         let err = spawn(&spec(&["/no/such/glass-test-binary"]), empty_sink())
             .expect_err("missing program must fail to spawn");
-        assert!(matches!(err, GlassError::AppNotStarted(_)), "expected AppNotStarted, got {err:?}");
+        assert!(
+            matches!(err, GlassError::AppNotStarted(_)),
+            "expected AppNotStarted, got {err:?}"
+        );
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_kills_a_long_running_child() {
-        let (mut child, _clip) = spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
+        let (mut child, _clip) =
+            spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
         terminate(&mut child);
         let status = child.try_wait().expect("try_wait after terminate");
         assert!(status.is_some(), "child should have exited after terminate");
@@ -439,7 +473,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn terminate_is_idempotent_on_an_already_exited_child() {
-        let (mut child, _clip) = spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
+        let (mut child, _clip) =
+            spawn(&spec(&["/bin/echo", "hi"]), empty_sink()).expect("spawn /bin/echo");
         child.wait().expect("wait for /bin/echo to exit");
         // Already reaped; terminate must not panic or hang.
         terminate(&mut child);
@@ -484,7 +519,10 @@ mod tests {
         // non-injectable, whether codesign succeeded or not.
         assert!(!injectable_from_codesign_report("", true));
         assert!(!injectable_from_codesign_report("", false));
-        assert!(!injectable_from_codesign_report("garbage output with no flags line", true));
+        assert!(!injectable_from_codesign_report(
+            "garbage output with no flags line",
+            true
+        ));
     }
 
     #[test]
@@ -506,7 +544,8 @@ mod tests {
         // unsigned marker (codesign echoes `Executable=<path>`, and the path is the
         // caller-chosen `spec.run[0]`) must still fail closed — the marker in path text must
         // not override a real `flags=(...runtime...)` line.
-        let report = "Executable=/tmp/code object is not signed at all/App.app/Contents/MacOS/App\n\
+        let report =
+            "Executable=/tmp/code object is not signed at all/App.app/Contents/MacOS/App\n\
                       CodeDirectory v=20400 flags=0x10000(runtime) hashes=3+3 location=embedded\n";
         assert!(!injectable_from_codesign_report(report, true));
     }
@@ -529,8 +568,11 @@ mod tests {
         // below it (fail-closed, uniformly) — a real file at the override path is returned.
         let dir = std::env::temp_dir();
         let dylib = dir.join(format!("glass-clip-shim-test-{}.dylib", std::process::id()));
-        std::fs::write(&dylib, b"stand-in for the real shim dylib; only existence matters here")
-            .expect("write stand-in dylib file");
+        std::fs::write(
+            &dylib,
+            b"stand-in for the real shim dylib; only existence matters here",
+        )
+        .expect("write stand-in dylib file");
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -563,6 +605,10 @@ mod tests {
             Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
             None => std::env::remove_var(SHIM_DYLIB_ENV),
         }
-        assert_ne!(resolved, Some(bogus), "a nonexistent override must not be returned as-is");
+        assert_ne!(
+            resolved,
+            Some(bogus),
+            "a nonexistent override must not be returned as-is"
+        );
     }
 }

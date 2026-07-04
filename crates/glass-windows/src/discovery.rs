@@ -55,7 +55,9 @@ pub fn poll_decision(
     match root_exit {
         // Root exited. Give up only when nothing more could appear: the deadline passed, OR there
         // is neither a hint to wait on nor a live descendant that might still open a window.
-        Some(code) if past_deadline || (!has_hint && !has_live_descendants) => PollStep::FailExited(code),
+        Some(code) if past_deadline || (!has_hint && !has_live_descendants) => {
+            PollStep::FailExited(code)
+        }
         // Root exited, but a hint or a live (Job-child) descendant may yet produce the window.
         Some(_) => PollStep::KeepPolling,
         // Root still alive but out of time: report the timeout.
@@ -83,13 +85,22 @@ mod tests {
 
     #[test]
     fn root_alive_keeps_polling_until_deadline() {
-        assert_eq!(poll_decision(None, false, false, false), PollStep::KeepPolling);
-        assert_eq!(poll_decision(None, true, false, false), PollStep::KeepPolling);
+        assert_eq!(
+            poll_decision(None, false, false, false),
+            PollStep::KeepPolling
+        );
+        assert_eq!(
+            poll_decision(None, true, false, false),
+            PollStep::KeepPolling
+        );
     }
 
     #[test]
     fn root_alive_past_deadline_times_out() {
-        assert_eq!(poll_decision(None, false, false, true), PollStep::FailTimeout);
+        assert_eq!(
+            poll_decision(None, false, false, true),
+            PollStep::FailTimeout
+        );
         assert_eq!(poll_decision(None, true, true, true), PollStep::FailTimeout);
     }
 
@@ -97,31 +108,52 @@ mod tests {
     fn root_exited_crash_fast_fails() {
         // No hint AND no live descendant: a launcher that exited leaving nothing behind has
         // (almost certainly) crashed — fail fast rather than burning the whole timeout.
-        assert_eq!(poll_decision(Some(Some(1)), false, false, false), PollStep::FailExited(Some(1)));
-        assert_eq!(poll_decision(Some(None), false, false, false), PollStep::FailExited(None));
+        assert_eq!(
+            poll_decision(Some(Some(1)), false, false, false),
+            PollStep::FailExited(Some(1))
+        );
+        assert_eq!(
+            poll_decision(Some(None), false, false, false),
+            PollStep::FailExited(None)
+        );
     }
 
     #[test]
     fn root_exited_with_live_descendant_keeps_polling() {
         // The fix: a Chromium/Edge/Electron launcher exits 0 but the Job retains live children
         // whose window maps a beat later — keep polling even without a hint.
-        assert_eq!(poll_decision(Some(Some(0)), false, true, false), PollStep::KeepPolling);
+        assert_eq!(
+            poll_decision(Some(Some(0)), false, true, false),
+            PollStep::KeepPolling
+        );
     }
 
     #[test]
     fn root_exited_with_hint_keeps_polling_for_handoff() {
         // A broker/unrelated-process hand-off (no descendant in the set) — a title/class hint may
         // still locate the window, so keep polling.
-        assert_eq!(poll_decision(Some(Some(0)), true, false, false), PollStep::KeepPolling);
+        assert_eq!(
+            poll_decision(Some(Some(0)), true, false, false),
+            PollStep::KeepPolling
+        );
     }
 
     #[test]
     fn root_exited_reports_exit_at_deadline() {
         // If the hinted/descendant window never showed, report the exit (more actionable than a
         // bare Timeout), preserving the exit code — whichever kept us polling.
-        assert_eq!(poll_decision(Some(Some(0)), true, false, true), PollStep::FailExited(Some(0)));
-        assert_eq!(poll_decision(Some(Some(3)), false, true, true), PollStep::FailExited(Some(3)));
-        assert_eq!(poll_decision(Some(Some(2)), false, false, true), PollStep::FailExited(Some(2)));
+        assert_eq!(
+            poll_decision(Some(Some(0)), true, false, true),
+            PollStep::FailExited(Some(0))
+        );
+        assert_eq!(
+            poll_decision(Some(Some(3)), false, true, true),
+            PollStep::FailExited(Some(3))
+        );
+        assert_eq!(
+            poll_decision(Some(Some(2)), false, false, true),
+            PollStep::FailExited(Some(2))
+        );
     }
 
     #[test]

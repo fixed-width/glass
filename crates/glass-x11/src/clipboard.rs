@@ -1,8 +1,8 @@
 //! X11 clipboard (CLIPBOARD selection) — get via `convert_selection` polling and
 //! set via a dedicated owner thread that serves `SelectionRequest` events.
 
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
@@ -24,27 +24,36 @@ struct GetAtoms {
 }
 
 fn intern_get_atoms(conn: &RustConnection) -> Result<GetAtoms> {
-    let clipboard = conn.intern_atom(false, b"CLIPBOARD")
+    let clipboard = conn
+        .intern_atom(false, b"CLIPBOARD")
         .map_err(|e| GlassError::Backend(format!("intern CLIPBOARD: {e}")))?
         .reply()
         .map_err(|e| GlassError::Backend(format!("intern CLIPBOARD reply: {e}")))?
         .atom;
-    let utf8_string = conn.intern_atom(false, b"UTF8_STRING")
+    let utf8_string = conn
+        .intern_atom(false, b"UTF8_STRING")
         .map_err(|e| GlassError::Backend(format!("intern UTF8_STRING: {e}")))?
         .reply()
         .map_err(|e| GlassError::Backend(format!("intern UTF8_STRING reply: {e}")))?
         .atom;
-    let incr = conn.intern_atom(false, b"INCR")
+    let incr = conn
+        .intern_atom(false, b"INCR")
         .map_err(|e| GlassError::Backend(format!("intern INCR: {e}")))?
         .reply()
         .map_err(|e| GlassError::Backend(format!("intern INCR reply: {e}")))?
         .atom;
-    let glass_clip = conn.intern_atom(false, b"GLASS_CLIP")
+    let glass_clip = conn
+        .intern_atom(false, b"GLASS_CLIP")
         .map_err(|e| GlassError::Backend(format!("intern GLASS_CLIP: {e}")))?
         .reply()
         .map_err(|e| GlassError::Backend(format!("intern GLASS_CLIP reply: {e}")))?
         .atom;
-    Ok(GetAtoms { clipboard, utf8_string, incr, glass_clip })
+    Ok(GetAtoms {
+        clipboard,
+        utf8_string,
+        incr,
+        glass_clip,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -69,39 +78,51 @@ pub fn get(display: &str) -> Result<String> {
     let atoms = intern_get_atoms(&req_conn)?;
 
     // Create a temporary INPUT_ONLY window to receive the SelectionNotify.
-    let win = req_conn.generate_id()
+    let win = req_conn
+        .generate_id()
         .map_err(|e| GlassError::Backend(format!("generate_id: {e}")))?;
-    req_conn.create_window(
-        0,
-        win,
-        req_conn_root,
-        0, 0, 1, 1,
-        0,
-        WindowClass::INPUT_ONLY,
-        0,
-        &CreateWindowAux::default(),
-    )
-    .map_err(|e| GlassError::Backend(format!("create temp window: {e}")))?
-    .check()
-    .map_err(|e| GlassError::Backend(format!("create temp window check: {e}")))?;
+    req_conn
+        .create_window(
+            0,
+            win,
+            req_conn_root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &CreateWindowAux::default(),
+        )
+        .map_err(|e| GlassError::Backend(format!("create temp window: {e}")))?
+        .check()
+        .map_err(|e| GlassError::Backend(format!("create temp window check: {e}")))?;
 
-    let _cleanup = WindowGuard { conn: &req_conn, win };
+    let _cleanup = WindowGuard {
+        conn: &req_conn,
+        win,
+    };
 
     // Request the selection conversion.
-    req_conn.convert_selection(
-        win,
-        atoms.clipboard,
-        atoms.utf8_string,
-        atoms.glass_clip,
-        x11rb::CURRENT_TIME,
-    )
-    .map_err(|e| GlassError::Backend(format!("convert_selection: {e}")))?;
-    req_conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+    req_conn
+        .convert_selection(
+            win,
+            atoms.clipboard,
+            atoms.utf8_string,
+            atoms.glass_clip,
+            x11rb::CURRENT_TIME,
+        )
+        .map_err(|e| GlassError::Backend(format!("convert_selection: {e}")))?;
+    req_conn
+        .flush()
+        .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
 
     // Poll for SelectionNotify up to 1 second.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        match req_conn.poll_for_event()
+        match req_conn
+            .poll_for_event()
             .map_err(|e| GlassError::Backend(format!("poll_for_event: {e}")))?
         {
             Some(event) => {
@@ -116,17 +137,18 @@ pub fn get(display: &str) -> Result<String> {
                         return Ok(String::new());
                     }
                     // Read the property value.
-                    let reply = req_conn.get_property(
-                        true, // delete=true
-                        win,
-                        atoms.glass_clip,
-                        AtomEnum::ANY,
-                        0,
-                        u32::MAX / 4,
-                    )
-                    .map_err(|e| GlassError::Backend(format!("get_property: {e}")))?
-                    .reply()
-                    .map_err(|e| GlassError::Backend(format!("get_property reply: {e}")))?;
+                    let reply = req_conn
+                        .get_property(
+                            true, // delete=true
+                            win,
+                            atoms.glass_clip,
+                            AtomEnum::ANY,
+                            0,
+                            u32::MAX / 4,
+                        )
+                        .map_err(|e| GlassError::Backend(format!("get_property: {e}")))?
+                        .reply()
+                        .map_err(|e| GlassError::Backend(format!("get_property reply: {e}")))?;
 
                     if reply.type_ == atoms.incr {
                         return Err(GlassError::Backend(
@@ -203,7 +225,9 @@ impl ClipboardOwner {
         let handle = std::thread::Builder::new()
             .name("glass-x11-clip-owner".into())
             .spawn(move || {
-                if let Err(e) = owner_thread(&display, text_clone, stop_clone, Arc::clone(&ready_clone)) {
+                if let Err(e) =
+                    owner_thread(&display, text_clone, stop_clone, Arc::clone(&ready_clone))
+                {
                     eprintln!("glass: clipboard owner thread error: {e}");
                 }
             })
@@ -238,7 +262,11 @@ impl ClipboardOwner {
         }
         drop(result);
 
-        Ok(Self { text, stop, handle: Some(handle) })
+        Ok(Self {
+            text,
+            stop,
+            handle: Some(handle),
+        })
     }
 
     /// Update the text that will be served on the next paste.
@@ -296,39 +324,54 @@ fn owner_thread(
     let root = conn.setup().roots[screen_num].root;
 
     // Intern atoms on this connection.
-    let clipboard = conn.intern_atom(false, b"CLIPBOARD").map_err(|e| {
-        let msg = format!("intern CLIPBOARD: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.reply().map_err(|e| {
-        let msg = format!("intern CLIPBOARD reply: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.atom;
-    let utf8_string = conn.intern_atom(false, b"UTF8_STRING").map_err(|e| {
-        let msg = format!("intern UTF8_STRING: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.reply().map_err(|e| {
-        let msg = format!("intern UTF8_STRING reply: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.atom;
-    let targets_atom = conn.intern_atom(false, b"TARGETS").map_err(|e| {
-        let msg = format!("intern TARGETS: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.reply().map_err(|e| {
-        let msg = format!("intern TARGETS reply: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.atom;
+    let clipboard = conn
+        .intern_atom(false, b"CLIPBOARD")
+        .map_err(|e| {
+            let msg = format!("intern CLIPBOARD: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .reply()
+        .map_err(|e| {
+            let msg = format!("intern CLIPBOARD reply: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .atom;
+    let utf8_string = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .map_err(|e| {
+            let msg = format!("intern UTF8_STRING: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .reply()
+        .map_err(|e| {
+            let msg = format!("intern UTF8_STRING reply: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .atom;
+    let targets_atom = conn
+        .intern_atom(false, b"TARGETS")
+        .map_err(|e| {
+            let msg = format!("intern TARGETS: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .reply()
+        .map_err(|e| {
+            let msg = format!("intern TARGETS reply: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .atom;
 
     // Create the owner window.
     let win = conn.generate_id().map_err(|e| {
@@ -341,17 +384,23 @@ fn owner_thread(
         0,
         win,
         root,
-        0, 0, 1, 1,
+        0,
+        0,
+        1,
+        1,
         0,
         WindowClass::INPUT_ONLY,
         0,
         &CreateWindowAux::default(),
-    ).map_err(|e| {
+    )
+    .map_err(|e| {
         let msg = format!("create_window: {e}");
         signal_ready(&ready, ReadyState::Err(msg.clone()));
         stop.store(true, Ordering::Relaxed);
         msg
-    })?.check().map_err(|e| {
+    })?
+    .check()
+    .map_err(|e| {
         let msg = format!("create_window check: {e}");
         signal_ready(&ready, ReadyState::Err(msg.clone()));
         stop.store(true, Ordering::Relaxed);
@@ -359,17 +408,20 @@ fn owner_thread(
     })?;
 
     // Take ownership of CLIPBOARD.
-    conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME).map_err(|e| {
-        let msg = format!("set_selection_owner: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?.check().map_err(|e| {
-        let msg = format!("set_selection_owner check: {e}");
-        signal_ready(&ready, ReadyState::Err(msg.clone()));
-        stop.store(true, Ordering::Relaxed);
-        msg
-    })?;
+    conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
+        .map_err(|e| {
+            let msg = format!("set_selection_owner: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?
+        .check()
+        .map_err(|e| {
+            let msg = format!("set_selection_owner check: {e}");
+            signal_ready(&ready, ReadyState::Err(msg.clone()));
+            stop.store(true, Ordering::Relaxed);
+            msg
+        })?;
     conn.flush().map_err(|e| {
         let msg = format!("flush after set_selection_owner: {e}");
         signal_ready(&ready, ReadyState::Err(msg.clone()));
@@ -387,13 +439,7 @@ fn owner_thread(
                 use x11rb::protocol::Event;
                 match event {
                     Event::SelectionRequest(req) => {
-                        handle_selection_request(
-                            &conn,
-                            &req,
-                            &text,
-                            utf8_string,
-                            targets_atom,
-                        )?;
+                        handle_selection_request(&conn, &req, &text, utf8_string, targets_atom)?;
                     }
                     Event::SelectionClear(_) => {
                         // Another client took ownership; we're done serving.
@@ -435,7 +481,8 @@ fn handle_selection_request(
             reply_prop,
             AtomEnum::ATOM,
             atoms,
-        )?.check()?;
+        )?
+        .check()?;
         reply_prop
     } else if req.target == utf8_string {
         let data = text.lock().expect("clipboard text mutex").clone();
@@ -445,7 +492,8 @@ fn handle_selection_request(
             reply_prop,
             utf8_string,
             data.as_bytes(),
-        )?.check()?;
+        )?
+        .check()?;
         reply_prop
     } else {
         // Unsupported target: refuse with property = NONE.
@@ -462,7 +510,8 @@ fn handle_selection_request(
         target: req.target,
         property: granted_prop,
     };
-    conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)?.check()?;
+    conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)?
+        .check()?;
     conn.flush()?;
     Ok(())
 }

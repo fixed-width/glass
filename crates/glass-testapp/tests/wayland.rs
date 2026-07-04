@@ -13,7 +13,16 @@ const ECHO_TRIES: u32 = 120; //  ~6s: input echoed back once the app is up
 const APP_TIMEOUT_MS: u64 = 15_000; // start_app: wait this long for sway's socket
 
 fn spec(run: Vec<String>, timeout_ms: u64) -> AppSpec {
-    AppSpec { build: None, run, cwd: None, env: vec![], window_hint: None, timeout_ms, sandbox: glass_core::SandboxLevel::Off, a11y: false }
+    AppSpec {
+        build: None,
+        run,
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
 }
 
 /// `start_app`, but dump the captured sway/Xwayland/app logs before panicking on
@@ -70,13 +79,21 @@ fn launches_app_and_reports_window_geometry() {
     // Per-window geometry: the floating glass-testapp at its natural 320x240,
     // not the 1280x720 headless output.
     assert_eq!((geom.width, geom.height), (320, 240));
-    assert!(drain_until(&mut p, "READY", READY_TRIES), "glass-testapp READY never reached the logs");
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "glass-testapp READY never reached the logs"
+    );
     p.stop_app().unwrap();
 }
 
 fn pixel(f: &glass_core::Frame, x: u32, y: u32) -> [u8; 4] {
     let i = ((y * f.width + x) * 4) as usize;
-    [f.pixels[i], f.pixels[i + 1], f.pixels[i + 2], f.pixels[i + 3]]
+    [
+        f.pixels[i],
+        f.pixels[i + 1],
+        f.pixels[i + 2],
+        f.pixels[i + 3],
+    ]
 }
 
 #[test]
@@ -97,13 +114,27 @@ fn captures_active_window_pixels() {
     assert_eq!(pixel(&frame, 240, 180), [255, 255, 255, 255], "BR white");
 
     // Region capture over the red quadrant -> all red.
-    let red = p.capture_frame(Some(&Region { x: 0, y: 0, width: 80, height: 60 })).unwrap();
+    let red = p
+        .capture_frame(Some(&Region {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 60,
+        }))
+        .unwrap();
     assert_eq!((red.width, red.height), (80, 60));
     assert_eq!(pixel(&red, 40, 30), [255, 0, 0, 255]);
 
     // Non-origin region: green (top-right) quadrant -> all green. Proves the
     // source x/y offset, not just crop-at-origin.
-    let green = p.capture_frame(Some(&Region { x: 160, y: 0, width: 80, height: 60 })).unwrap();
+    let green = p
+        .capture_frame(Some(&Region {
+            x: 160,
+            y: 0,
+            width: 80,
+            height: 60,
+        }))
+        .unwrap();
     assert_eq!((green.width, green.height), (80, 60));
     assert_eq!(pixel(&green, 40, 30), [0, 255, 0, 255]);
 
@@ -117,9 +148,18 @@ fn click_reaches_the_app() {
     let mut p = WaylandPlatform::new().unwrap();
     start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
-    p.send_pointer(&PointerEvent::Click { x: 30, y: 40, button: MouseButton::Left, count: 1, modifiers: vec![] })
-        .unwrap();
-    assert!(drain_until(&mut p, "button=1 x=30 y=40", ECHO_TRIES), "click not echoed at (30,40)");
+    p.send_pointer(&PointerEvent::Click {
+        x: 30,
+        y: 40,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![],
+    })
+    .unwrap();
+    assert!(
+        drain_until(&mut p, "button=1 x=30 y=40", ECHO_TRIES),
+        "click not echoed at (30,40)"
+    );
     p.stop_app().unwrap();
 }
 
@@ -164,8 +204,18 @@ fn scroll_reaches_the_app() {
     start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // A downward wheel step. Xwayland maps wl_pointer vertical axis to X11 button 5.
-    p.send_pointer(&PointerEvent::Scroll { x: 30, y: 40, dx: 0, dy: 1, modifiers: vec![] }).unwrap();
-    assert!(drain_until(&mut p, "button=5", ECHO_TRIES), "scroll-down not echoed as wheel button 5");
+    p.send_pointer(&PointerEvent::Scroll {
+        x: 30,
+        y: 40,
+        dx: 0,
+        dy: 1,
+        modifiers: vec![],
+    })
+    .unwrap();
+    assert!(
+        drain_until(&mut p, "button=5", ECHO_TRIES),
+        "scroll-down not echoed as wheel button 5"
+    );
     p.stop_app().unwrap();
 }
 
@@ -176,7 +226,12 @@ fn sway_pids() -> std::collections::HashSet<u32> {
     std::process::Command::new("pgrep")
         .args(["-x", r"sway(\.real)?"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -192,14 +247,20 @@ fn start_app_failure_leaves_no_orphan() {
     match p.start_app(&spec(vec!["true".to_string()], 1500)) {
         Ok(_) => p.stop_app().unwrap(),
         Err(e) => assert!(
-            matches!(e, GlassError::AppExited(_) | GlassError::Timeout(_) | GlassError::Backend(_)),
+            matches!(
+                e,
+                GlassError::AppExited(_) | GlassError::Timeout(_) | GlassError::Backend(_)
+            ),
             "unexpected error variant: {e}"
         ),
     }
     std::thread::sleep(std::time::Duration::from_millis(200)); // let a killed sway leave the table
     let after = sway_pids();
     let leaked: Vec<_> = after.difference(&before).collect();
-    assert!(leaked.is_empty(), "start_app leaked sway process(es): {leaked:?}");
+    assert!(
+        leaked.is_empty(),
+        "start_app leaked sway process(es): {leaked:?}"
+    );
 }
 
 #[test]
@@ -211,7 +272,10 @@ fn types_text_reaches_the_app() {
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Type 'a' -> keysym 0x61 (97), mirroring the X11 keyboard test.
     p.send_key(&KeyEvent::Text("a".into())).unwrap();
-    assert!(drain_until(&mut p, "keysym=97", ECHO_TRIES), "typed 'a' not echoed");
+    assert!(
+        drain_until(&mut p, "keysym=97", ECHO_TRIES),
+        "typed 'a' not echoed"
+    );
     p.stop_app().unwrap();
 }
 
@@ -254,7 +318,10 @@ fn typed_multichar_strings_arrive_intact() {
             let expected: Vec<u32> = s.chars().map(|c| c as u32).collect();
             p.send_key(&KeyEvent::Text(s.to_string())).unwrap();
             let got = collect_keysyms(&mut p, expected.len(), ECHO_TRIES);
-            assert_eq!(got, expected, "typing {s:?} did not arrive intact on Wayland");
+            assert_eq!(
+                got, expected,
+                "typing {s:?} did not arrive intact on Wayland"
+            );
         }
     }
     p.stop_app().unwrap();
@@ -269,7 +336,10 @@ fn chord_reaches_the_app() {
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Press the Return chord -> keysym 0xff0d (65293).
     p.send_key(&KeyEvent::Chord("Return".into())).unwrap();
-    assert!(drain_until(&mut p, "keysym=65293", ECHO_TRIES), "Return chord not echoed");
+    assert!(
+        drain_until(&mut p, "keysym=65293", ECHO_TRIES),
+        "Return chord not echoed"
+    );
     p.stop_app().unwrap();
 }
 
@@ -278,32 +348,59 @@ fn chord_reaches_the_app() {
 fn enumerates_selects_and_captures_multiple_windows() {
     use glass_core::WindowId;
     let mut p = WaylandPlatform::new().unwrap();
-    start(&mut p, &spec(vec![TESTAPP.to_string(), "--windows".into(), "2".into()], APP_TIMEOUT_MS));
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--windows".into(), "2".into()],
+            APP_TIMEOUT_MS,
+        ),
+    );
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
 
     // The 2nd Xwayland toplevel surfaces in sway's tree asynchronously; poll.
     let windows = list_until(&mut p, 2, READY_TRIES);
     assert_eq!(windows.len(), 2, "expected 2 windows, got {windows:?}");
-    let main = windows.iter().find(|w| w.title.as_deref() == Some("glass-testapp")).expect("main window");
-    let extra =
-        windows.iter().find(|w| w.title.as_deref() == Some("glass-testapp-1")).expect("extra window");
+    let main = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("main window");
+    let extra = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp-1"))
+        .expect("extra window");
     // Two distinct, separately-addressable windows, each at its natural size.
     // (sway centers both floating toplevels, so their screen rects coincide;
     // the real distinctness is id + title + per-window captured content below.)
     assert_ne!(main.id, extra.id);
-    assert_eq!((main.geometry.width, main.geometry.height), (320, 240), "main natural size");
-    assert_eq!((extra.geometry.width, extra.geometry.height), (320, 240), "extra natural size");
+    assert_eq!(
+        (main.geometry.width, main.geometry.height),
+        (320, 240),
+        "main natural size"
+    );
+    assert_eq!(
+        (extra.geometry.width, extra.geometry.height),
+        (320, 240),
+        "extra natural size"
+    );
     let (main_id, extra_id) = (main.id, extra.id);
 
     p.select_window(extra_id).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(150));
     let f = p.capture_frame(None).unwrap();
-    assert_eq!(pixel(&f, 160, 120), [255, 0, 255, 255], "extra window is solid magenta");
+    assert_eq!(
+        pixel(&f, 160, 120),
+        [255, 0, 255, 255],
+        "extra window is solid magenta"
+    );
 
     p.select_window(main_id).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(150));
     let f = p.capture_frame(None).unwrap();
-    assert_eq!(pixel(&f, 80, 60), [255, 0, 0, 255], "main window TL quadrant is red");
+    assert_eq!(
+        pixel(&f, 80, 60),
+        [255, 0, 0, 255],
+        "main window TL quadrant is red"
+    );
 
     assert!(p.select_window(WindowId(0xDEAD_BEEF)).is_err());
     p.stop_app().unwrap();
@@ -318,9 +415,17 @@ fn modified_click_carries_modifier_state() {
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
     // Ctrl held -> the Xwayland app's ButtonPress.state has ControlMask (4).
     p.send_pointer(&PointerEvent::Click {
-        x: 30, y: 40, button: MouseButton::Left, count: 1, modifiers: vec![Modifier::Control],
-    }).unwrap();
-    assert!(drain_until(&mut p, "state=4", ECHO_TRIES), "ctrl not held during click");
+        x: 30,
+        y: 40,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![Modifier::Control],
+    })
+    .unwrap();
+    assert!(
+        drain_until(&mut p, "state=4", ECHO_TRIES),
+        "ctrl not held during click"
+    );
     p.stop_app().unwrap();
 }
 
@@ -333,18 +438,38 @@ fn resize_and_move_change_geometry() {
     assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
 
     // Resize the (floating) window via sway IPC; geometry reflects the new size.
-    let resized = p.window(&WindowOp::Resize { width: 500, height: 360 }).unwrap();
-    assert_eq!((resized.width, resized.height), (500, 360), "resize geometry");
+    let resized = p
+        .window(&WindowOp::Resize {
+            width: 500,
+            height: 360,
+        })
+        .unwrap();
+    assert_eq!(
+        (resized.width, resized.height),
+        (500, 360),
+        "resize geometry"
+    );
     // The fixture (under Xwayland) echoes the ConfigureNotify.
-    assert!(drain_until(&mut p, "configure w=500 h=360", ECHO_TRIES), "no configure echo");
+    assert!(
+        drain_until(&mut p, "configure w=500 h=360", ECHO_TRIES),
+        "no configure echo"
+    );
 
     // Move it; geometry reflects the new output-absolute origin, size preserved.
     let moved = p.window(&WindowOp::Move { x: 120, y: 90 }).unwrap();
-    assert_eq!((moved.x, moved.y, moved.width, moved.height), (120, 90, 500, 360), "move geometry");
+    assert_eq!(
+        (moved.x, moved.y, moved.width, moved.height),
+        (120, 90, 500, 360),
+        "move geometry"
+    );
 
     // The Geometry op re-reads the live rect.
     let geo = p.window(&WindowOp::Geometry).unwrap();
-    assert_eq!((geo.x, geo.y, geo.width, geo.height), (120, 90, 500, 360), "geometry op");
+    assert_eq!(
+        (geo.x, geo.y, geo.width, geo.height),
+        (120, 90, 500, 360),
+        "geometry op"
+    );
     p.stop_app().unwrap();
 }
 
@@ -383,13 +508,19 @@ fn sandbox_default_app_still_runs_and_captures() {
     };
     let geom = start(&mut p, &sandboxed_spec);
     assert_eq!((geom.width, geom.height), (320, 240), "window geometry");
-    assert!(drain_until(&mut p, "READY", READY_TRIES), "never saw READY (sandboxed)");
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY (sandboxed)"
+    );
     std::thread::sleep(std::time::Duration::from_millis(300)); // let the first draw land
     let frame = p.capture_frame(None).unwrap();
     // At least one non-zero pixel proves the app rendered something — the
     // runtime_dir rw-bind and binary ro-bind are working inside the namespace.
     let non_zero = frame.pixels.iter().any(|&b| b != 0);
-    assert!(non_zero, "captured frame is entirely zero (blank) — app did not connect to Wayland");
+    assert!(
+        non_zero,
+        "captured frame is entirely zero (blank) — app did not connect to Wayland"
+    );
     p.stop_app().unwrap();
 }
 
@@ -430,7 +561,10 @@ fn fail_closed_when_bwrap_missing_wayland() {
         err
     };
     assert!(
-        matches!(sandboxed_err, Some(glass_core::GlassError::SandboxUnavailable(_))),
+        matches!(
+            sandboxed_err,
+            Some(glass_core::GlassError::SandboxUnavailable(_))
+        ),
         "expected SandboxUnavailable, got {sandboxed_err:?}"
     );
 }
@@ -467,15 +601,24 @@ fn wayland_build_step_runs_before_launch() {
     let geom = start(&mut p, &build_spec);
 
     // Build ran: marker must exist on the host (the tempdir was rw-bound).
-    assert!(marker.exists(), "build marker not found — build step did not run before launch");
+    assert!(
+        marker.exists(),
+        "build marker not found — build step did not run before launch"
+    );
 
     // App launched: sensible geometry and a non-blank frame.
     assert_eq!((geom.width, geom.height), (320, 240), "window geometry");
-    assert!(drain_until(&mut p, "READY", READY_TRIES), "never saw READY after build step");
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY after build step"
+    );
     std::thread::sleep(std::time::Duration::from_millis(300)); // let the first draw land
     let frame = p.capture_frame(None).unwrap();
     let non_zero = frame.pixels.iter().any(|&b| b != 0);
-    assert!(non_zero, "captured frame is blank — app did not render after build step");
+    assert!(
+        non_zero,
+        "captured frame is blank — app did not render after build step"
+    );
 
     p.stop_app().unwrap();
     drop(tmp); // clean up marker dir

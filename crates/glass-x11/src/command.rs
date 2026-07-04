@@ -17,11 +17,7 @@ use glass_sandbox_linux::{ephemeral_home, wrap_argv, WrapOpts};
 /// namespace so the app can still connect to the display. When `a11y.dir`
 /// is given, that directory (which holds the private session-bus and at-spi
 /// sockets) is also re-exposed so a sandboxed app can reach the a11y bus.
-pub fn build_command(
-    spec: &AppSpec,
-    display: &str,
-    a11y: Option<glass_core::A11yBind>,
-) -> Command {
+pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11yBind>) -> Command {
     let dbus_addr = a11y.map(|a| a.addr);
     let a11y_bind_dir = a11y.map(|a| a.dir);
     let mut cmd = match spec.sandbox {
@@ -137,7 +133,14 @@ mod tests {
 
     #[test]
     fn dbus_addr_sets_session_bus_env() {
-        let cmd = build_command(&spec(&["app"]), ":99", Some(glass_core::A11yBind { addr: "unix:path=/tmp/bus", dir: std::path::Path::new("/tmp/bus-dir") }));
+        let cmd = build_command(
+            &spec(&["app"]),
+            ":99",
+            Some(glass_core::A11yBind {
+                addr: "unix:path=/tmp/bus",
+                dir: std::path::Path::new("/tmp/bus-dir"),
+            }),
+        );
         let addr = cmd
             .get_envs()
             .find(|(k, _)| *k == OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
@@ -148,8 +151,18 @@ mod tests {
     #[test]
     fn spec_env_overrides_injected_dbus_addr() {
         let mut s = spec(&["app"]);
-        s.env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/tmp/override".into())];
-        let cmd = build_command(&s, ":99", Some(glass_core::A11yBind { addr: "unix:path=/tmp/bus", dir: std::path::Path::new("/tmp/bus-dir") }));
+        s.env = vec![(
+            "DBUS_SESSION_BUS_ADDRESS".into(),
+            "unix:path=/tmp/override".into(),
+        )];
+        let cmd = build_command(
+            &s,
+            ":99",
+            Some(glass_core::A11yBind {
+                addr: "unix:path=/tmp/bus",
+                dir: std::path::Path::new("/tmp/bus-dir"),
+            }),
+        );
         // Command stores env as a map: a later .env() for the same key replaces the earlier
         // one, so a spec.env entry overrides the injected default.
         let addr = cmd
@@ -164,7 +177,8 @@ mod tests {
     fn none_dbus_addr_leaves_session_bus_unset() {
         let cmd = build_command(&spec(&["app"]), ":9", None);
         assert!(
-            !cmd.get_envs().any(|(k, _)| k == OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            !cmd.get_envs()
+                .any(|(k, _)| k == OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
             "DBUS_SESSION_BUS_ADDRESS must not be set when dbus_addr is None"
         );
     }
@@ -192,7 +206,8 @@ mod tests {
     fn no_a11y_leaves_xdg_runtime_dir_unset() {
         let cmd = build_command(&spec(&["app"]), ":9", None);
         assert!(
-            !cmd.get_envs().any(|(k, _)| k == OsStr::new("XDG_RUNTIME_DIR")),
+            !cmd.get_envs()
+                .any(|(k, _)| k == OsStr::new("XDG_RUNTIME_DIR")),
             "without a11y, XDG_RUNTIME_DIR must be left untouched"
         );
     }
@@ -204,12 +219,20 @@ mod tests {
         s.sandbox = SandboxLevel::Default;
         let cmd = build_command(&s, ":99", None);
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("bwrap"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(args.contains(&"--unshare-user".to_string()));
-        assert!(args.windows(3).any(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"]));
+        assert!(args
+            .windows(3)
+            .any(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"]));
         let dd = args.iter().position(|x| x == "--").unwrap();
         assert_eq!(&args[dd + 1..], &["/bin/app", "--flag"]);
-        let disp = cmd.get_envs().find(|(k, _)| *k == std::ffi::OsStr::new("DISPLAY")).and_then(|(_, v)| v);
+        let disp = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("DISPLAY"))
+            .and_then(|(_, v)| v);
         assert_eq!(disp, Some(std::ffi::OsStr::new(":99")));
     }
 
@@ -218,12 +241,22 @@ mod tests {
         let mut s = spec(&["app"]);
         s.sandbox = glass_core::SandboxLevel::Default;
         let dir = std::path::Path::new("/tmp/glass-a11y-xyz");
-        let cmd = build_command(&s, ":9", Some(glass_core::A11yBind { addr: "unix:path=/tmp/glass-a11y-xyz/session-bus", dir }));
+        let cmd = build_command(
+            &s,
+            ":9",
+            Some(glass_core::A11yBind {
+                addr: "unix:path=/tmp/glass-a11y-xyz/session-bus",
+                dir,
+            }),
+        );
         let joined: String = std::iter::once(cmd.get_program())
             .chain(cmd.get_args())
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(joined.contains("/tmp/glass-a11y-xyz"), "a11y dir not bound into bwrap argv:\n{joined}");
+        assert!(
+            joined.contains("/tmp/glass-a11y-xyz"),
+            "a11y dir not bound into bwrap argv:\n{joined}"
+        );
     }
 }

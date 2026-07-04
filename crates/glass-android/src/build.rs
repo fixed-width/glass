@@ -43,7 +43,10 @@ pub fn run_build(spec: &AppSpec, sink: &LogSink) -> Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(GlassError::AppNotStarted(format!("build `{build}` exited with {}", out.status)))
+        Err(GlassError::AppNotStarted(format!(
+            "build `{build}` exited with {}",
+            out.status
+        )))
     }
 }
 
@@ -71,12 +74,18 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(prog, "cmd");
-            assert_eq!(args, vec!["/C".to_string(), "./gradlew assembleDebug".to_string()]);
+            assert_eq!(
+                args,
+                vec!["/C".to_string(), "./gradlew assembleDebug".to_string()]
+            );
         }
         #[cfg(not(windows))]
         {
             assert_eq!(prog, "sh");
-            assert_eq!(args, vec!["-c".to_string(), "./gradlew assembleDebug".to_string()]);
+            assert_eq!(
+                args,
+                vec!["-c".to_string(), "./gradlew assembleDebug".to_string()]
+            );
         }
     }
 }

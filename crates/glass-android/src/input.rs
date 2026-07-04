@@ -28,10 +28,21 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
             let (ax, ay) = abs(x, y);
             (0..count.max(1)).map(|_| tap(ax, ay)).collect()
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, duration_ms, .. } => {
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            duration_ms,
+            ..
+        } => {
             let (fx, fy) = abs(from_x, from_y);
             let (tx, ty) = abs(to_x, to_y);
-            let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
+            let ms = if duration_ms == 0 {
+                SWIPE_MS
+            } else {
+                duration_ms
+            };
             vec![swipe(fx, fy, tx, ty, ms)]
         }
         PointerEvent::Scroll { x, y, dx, dy, .. } => {
@@ -43,8 +54,12 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
             // fling properly.
             let hi_x = (origin.x + origin.width as i32 - 1).max(origin.x);
             let hi_y = (origin.y + origin.height as i32 - 1).max(origin.y);
-            let ex = cx.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX)).clamp(origin.x, hi_x);
-            let ey = cy.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX)).clamp(origin.y, hi_y);
+            let ex = cx
+                .saturating_sub(dx.saturating_mul(SCROLL_STEP_PX))
+                .clamp(origin.x, hi_x);
+            let ey = cy
+                .saturating_sub(dy.saturating_mul(SCROLL_STEP_PX))
+                .clamp(origin.y, hi_y);
             vec![swipe(cx, cy, ex, ey, SWIPE_MS)]
         }
         PointerEvent::Gesture { .. } => vec![], // adb has no multi-touch; ShellInjector refuses
@@ -52,13 +67,25 @@ pub fn pointer_commands(origin: &WindowGeometry, event: &PointerEvent) -> Vec<Ve
 }
 
 fn tap(x: i32, y: i32) -> Vec<String> {
-    vec!["shell".into(), "input".into(), "tap".into(), x.to_string(), y.to_string()]
+    vec![
+        "shell".into(),
+        "input".into(),
+        "tap".into(),
+        x.to_string(),
+        y.to_string(),
+    ]
 }
 
 fn swipe(x1: i32, y1: i32, x2: i32, y2: i32, ms: u64) -> Vec<String> {
     vec![
-        "shell".into(), "input".into(), "swipe".into(),
-        x1.to_string(), y1.to_string(), x2.to_string(), y2.to_string(), ms.to_string(),
+        "shell".into(),
+        "input".into(),
+        "swipe".into(),
+        x1.to_string(),
+        y1.to_string(),
+        x2.to_string(),
+        y2.to_string(),
+        ms.to_string(),
     ]
 }
 
@@ -89,10 +116,16 @@ fn text_command(s: &str) -> Vec<String> {
 /// keycombination` (Android 12+/API 31+), which presses the keys together.
 fn chord_command(chord: &str) -> Result<Vec<String>> {
     let (mods, keysym) = parse_chord(chord)?;
-    let key = android_keycode(keysym)
-        .ok_or_else(|| GlassError::InvalidKey(format!("no Android keycode for the key in '{chord}'")))?;
+    let key = android_keycode(keysym).ok_or_else(|| {
+        GlassError::InvalidKey(format!("no Android keycode for the key in '{chord}'"))
+    })?;
     if mods.is_empty() {
-        Ok(vec!["shell".into(), "input".into(), "keyevent".into(), key.to_string()])
+        Ok(vec![
+            "shell".into(),
+            "input".into(),
+            "keyevent".into(),
+            key.to_string(),
+        ])
     } else {
         let mut argv = vec!["shell".into(), "input".into(), "keycombination".into()];
         argv.extend(mods.iter().map(|m| meta_keycode(*m).to_string()));
@@ -112,18 +145,18 @@ fn android_keycode(keysym: u32) -> Option<u32> {
         }
     }
     let kc = match keysym {
-        0xff0d => 66,  // Return    → ENTER
-        0xff1b => 111, // Escape    → ESCAPE
-        0xff09 => 61,  // Tab       → TAB
-        0xff08 => 67,  // Backspace → DEL
-        0xffff => 112, // Delete    → FORWARD_DEL
-        0x0020 => 62,  // space     → SPACE
-        0xff52 => 19,  // Up        → DPAD_UP
-        0xff54 => 20,  // Down      → DPAD_DOWN
-        0xff51 => 21,  // Left      → DPAD_LEFT
-        0xff53 => 22,  // Right     → DPAD_RIGHT
-        0xff50 => 122, // Home      → MOVE_HOME
-        0xff57 => 123, // End       → MOVE_END
+        0xff0d => 66,                               // Return    → ENTER
+        0xff1b => 111,                              // Escape    → ESCAPE
+        0xff09 => 61,                               // Tab       → TAB
+        0xff08 => 67,                               // Backspace → DEL
+        0xffff => 112,                              // Delete    → FORWARD_DEL
+        0x0020 => 62,                               // space     → SPACE
+        0xff52 => 19,                               // Up        → DPAD_UP
+        0xff54 => 20,                               // Down      → DPAD_DOWN
+        0xff51 => 21,                               // Left      → DPAD_LEFT
+        0xff53 => 22,                               // Right     → DPAD_RIGHT
+        0xff50 => 122,                              // Home      → MOVE_HOME
+        0xff57 => 123,                              // End       → MOVE_END
         0xffbe..=0xffc9 => 131 + (keysym - 0xffbe), // F1..F12 → KEYCODE_F1(131)..F12(142)
         _ => return None,
     };
@@ -165,8 +198,16 @@ fn agent_path(fx: i32, fy: i32, tx: i32, ty: i32, ms: u64) -> Vec<Pt> {
 /// Build N time-aligned absolute-coord pointer paths from window-relative segments. All paths
 /// share one sample count (from the longest segment, clamped like a drag) and the same `t_ms`
 /// timeline, so the device can emit aligned multi-pointer frames. `from==to` → a constant path.
-fn agent_gesture_paths(origin: &WindowGeometry, segments: &[Segment], duration_ms: u64) -> Vec<Vec<Pt>> {
-    let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
+fn agent_gesture_paths(
+    origin: &WindowGeometry,
+    segments: &[Segment],
+    duration_ms: u64,
+) -> Vec<Vec<Pt>> {
+    let ms = if duration_ms == 0 {
+        SWIPE_MS
+    } else {
+        duration_ms
+    };
     let abs = |x: i32, y: i32| (origin.x + x, origin.y + y);
     let longest = segments
         .iter()
@@ -203,20 +244,43 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
         PointerEvent::Move { .. } => vec![],
         PointerEvent::Click { x, y, count, .. } => {
             let (ax, ay) = abs(x, y);
-            (0..count.max(1)).map(|_| vec![Pt { x: ax, y: ay, t_ms: 0 }]).collect()
+            (0..count.max(1))
+                .map(|_| {
+                    vec![Pt {
+                        x: ax,
+                        y: ay,
+                        t_ms: 0,
+                    }]
+                })
+                .collect()
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, duration_ms, .. } => {
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            duration_ms,
+            ..
+        } => {
             let (fx, fy) = abs(from_x, from_y);
             let (tx, ty) = abs(to_x, to_y);
-            let ms = if duration_ms == 0 { SWIPE_MS } else { duration_ms };
+            let ms = if duration_ms == 0 {
+                SWIPE_MS
+            } else {
+                duration_ms
+            };
             vec![agent_path(fx, fy, tx, ty, ms)]
         }
         PointerEvent::Scroll { x, y, dx, dy, .. } => {
             let (cx, cy) = abs(x, y);
             let hi_x = (origin.x + origin.width as i32 - 1).max(origin.x);
             let hi_y = (origin.y + origin.height as i32 - 1).max(origin.y);
-            let ex = cx.saturating_sub(dx.saturating_mul(SCROLL_STEP_PX)).clamp(origin.x, hi_x);
-            let ey = cy.saturating_sub(dy.saturating_mul(SCROLL_STEP_PX)).clamp(origin.y, hi_y);
+            let ex = cx
+                .saturating_sub(dx.saturating_mul(SCROLL_STEP_PX))
+                .clamp(origin.x, hi_x);
+            let ey = cy
+                .saturating_sub(dy.saturating_mul(SCROLL_STEP_PX))
+                .clamp(origin.y, hi_y);
             // Interpolate so the swipe carries real velocity (a fling), not a single jump —
             // a 2-point swipe under-scrolls and stalls on long lists (dogfood #17).
             vec![agent_path(cx, cy, ex, ey, SWIPE_MS)]
@@ -233,7 +297,11 @@ pub(crate) struct AgentInjector {
 
 impl Injector for AgentInjector {
     fn pointer(&self, _adb: &Adb, origin: &WindowGeometry, event: &PointerEvent) -> Result<()> {
-        if let PointerEvent::Gesture { pointers, duration_ms } = event {
+        if let PointerEvent::Gesture {
+            pointers,
+            duration_ms,
+        } = event
+        {
             let paths = agent_gesture_paths(origin, pointers, *duration_ms);
             return self.agent.gesture(&paths);
         }
@@ -289,33 +357,90 @@ mod agent_inject_tests {
     use crate::agent::Pt;
     use glass_core::{MouseButton, PointerEvent, Segment, WindowGeometry};
 
-    fn origin() -> WindowGeometry { WindowGeometry { x: 100, y: 200, width: 500, height: 800 } }
+    fn origin() -> WindowGeometry {
+        WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 500,
+            height: 800,
+        }
+    }
 
     #[test]
     fn click_maps_to_absolute_taps() {
-        let ev = PointerEvent::Click { x: 10, y: 20, button: MouseButton::Left, count: 2, modifiers: vec![] };
+        let ev = PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 2,
+            modifiers: vec![],
+        };
         let g = agent_pointer(&origin(), &ev);
         assert_eq!(g.len(), 2);
-        assert_eq!(g[0], vec![Pt { x: 110, y: 220, t_ms: 0 }]);
-        assert_eq!(g[1], vec![Pt { x: 110, y: 220, t_ms: 0 }]);
+        assert_eq!(
+            g[0],
+            vec![Pt {
+                x: 110,
+                y: 220,
+                t_ms: 0
+            }]
+        );
+        assert_eq!(
+            g[1],
+            vec![Pt {
+                x: 110,
+                y: 220,
+                t_ms: 0
+            }]
+        );
     }
 
     #[test]
     fn drag_interpolates_intermediate_samples() {
-        let ev = PointerEvent::Drag { from_x: 0, from_y: 0, to_x: 50, to_y: 60, duration_ms: 250, button: MouseButton::Left, modifiers: vec![] };
+        let ev = PointerEvent::Drag {
+            from_x: 0,
+            from_y: 0,
+            to_x: 50,
+            to_y: 60,
+            duration_ms: 250,
+            button: MouseButton::Left,
+            modifiers: vec![],
+        };
         let g = agent_pointer(&origin(), &ev);
         assert_eq!(g.len(), 1);
         let path = &g[0];
         // Endpoints exact: DOWN at abs(from) @ t0, UP at abs(to) @ t=ms.
-        assert_eq!(path.first().copied().unwrap(), Pt { x: 100, y: 200, t_ms: 0 });
-        assert_eq!(path.last().copied().unwrap(), Pt { x: 150, y: 260, t_ms: 250 });
+        assert_eq!(
+            path.first().copied().unwrap(),
+            Pt {
+                x: 100,
+                y: 200,
+                t_ms: 0
+            }
+        );
+        assert_eq!(
+            path.last().copied().unwrap(),
+            Pt {
+                x: 150,
+                y: 260,
+                t_ms: 250
+            }
+        );
         // Real ACTION_MOVE samples between DOWN and UP — a 2-point path is swallowed by
         // Android touch-slop (onDragStart fires at the end coordinate). See dogfood F8.
-        assert!(path.len() >= 8, "expected interpolated samples, got {}", path.len());
-        // Monotonic in time and along the (down-right) path.
-        assert!(path.windows(2).all(|w| w[0].t_ms <= w[1].t_ms), "t_ms not monotonic: {path:?}");
         assert!(
-            path.windows(2).all(|w| w[0].x <= w[1].x && w[0].y <= w[1].y),
+            path.len() >= 8,
+            "expected interpolated samples, got {}",
+            path.len()
+        );
+        // Monotonic in time and along the (down-right) path.
+        assert!(
+            path.windows(2).all(|w| w[0].t_ms <= w[1].t_ms),
+            "t_ms not monotonic: {path:?}"
+        );
+        assert!(
+            path.windows(2)
+                .all(|w| w[0].x <= w[1].x && w[0].y <= w[1].y),
             "not monotonic along path: {path:?}"
         );
     }
@@ -328,31 +453,81 @@ mod agent_inject_tests {
 
     #[test]
     fn scroll_interpolates_one_swipe() {
-        let ev = PointerEvent::Scroll { x: 250, y: 400, dx: 0, dy: 1, modifiers: vec![] };
+        let ev = PointerEvent::Scroll {
+            x: 250,
+            y: 400,
+            dx: 0,
+            dy: 1,
+            modifiers: vec![],
+        };
         let g = agent_pointer(&origin(), &ev);
         assert_eq!(g.len(), 1);
         let path = &g[0];
-        assert_eq!(path.first().copied().unwrap(), Pt { x: 350, y: 600, t_ms: 0 });
-        assert_eq!(path.last().copied().unwrap(), Pt { x: 350, y: 480, t_ms: SWIPE_MS });
+        assert_eq!(
+            path.first().copied().unwrap(),
+            Pt {
+                x: 350,
+                y: 600,
+                t_ms: 0
+            }
+        );
+        assert_eq!(
+            path.last().copied().unwrap(),
+            Pt {
+                x: 350,
+                y: 480,
+                t_ms: SWIPE_MS
+            }
+        );
         // Interpolated samples give the swipe real velocity → a fling, so deep scrolls
         // don't stall. Dogfood finding #17.
-        assert!(path.len() >= 8, "scroll should fling with interpolated samples, got {}", path.len());
+        assert!(
+            path.len() >= 8,
+            "scroll should fling with interpolated samples, got {}",
+            path.len()
+        );
     }
 
     #[test]
     fn gesture_builds_time_aligned_absolute_paths() {
         let segments = vec![
-            Segment { from_x: 0, from_y: 0, to_x: 80, to_y: 0 },   // moves right 80px
-            Segment { from_x: 40, from_y: 40, to_x: 40, to_y: 40 }, // held
+            Segment {
+                from_x: 0,
+                from_y: 0,
+                to_x: 80,
+                to_y: 0,
+            }, // moves right 80px
+            Segment {
+                from_x: 40,
+                from_y: 40,
+                to_x: 40,
+                to_y: 40,
+            }, // held
         ];
         let paths = agent_gesture_paths(&origin(), &segments, 250);
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].len(), paths[1].len());
         assert!(paths[0].len() >= 8);
-        assert_eq!(paths[0].iter().map(|p| p.t_ms).collect::<Vec<_>>(),
-                   paths[1].iter().map(|p| p.t_ms).collect::<Vec<_>>());
-        assert_eq!(paths[0].first().copied().unwrap(), Pt { x: 100, y: 200, t_ms: 0 });
-        assert_eq!(paths[0].last().copied().unwrap(), Pt { x: 180, y: 200, t_ms: 250 });
+        assert_eq!(
+            paths[0].iter().map(|p| p.t_ms).collect::<Vec<_>>(),
+            paths[1].iter().map(|p| p.t_ms).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            paths[0].first().copied().unwrap(),
+            Pt {
+                x: 100,
+                y: 200,
+                t_ms: 0
+            }
+        );
+        assert_eq!(
+            paths[0].last().copied().unwrap(),
+            Pt {
+                x: 180,
+                y: 200,
+                t_ms: 250
+            }
+        );
         assert!(paths[1].iter().all(|p| p.x == 140 && p.y == 240));
     }
 
@@ -361,19 +536,55 @@ mod agent_inject_tests {
     /// fail here.
     #[test]
     fn agent_pointer_agrees_with_pointer_commands_coords() {
-        let o = WindowGeometry { x: 100, y: 200, width: 500, height: 800 };
+        let o = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 500,
+            height: 800,
+        };
         // Click → tap: same absolute coord in both representations.
-        let click = PointerEvent::Click { x: 10, y: 20, button: MouseButton::Left, count: 1, modifiers: vec![] };
+        let click = PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        };
         let argv = pointer_commands(&o, &click);
         let path = agent_pointer(&o, &click);
-        assert_eq!(argv[0], ["shell", "input", "tap", "110", "220"].map(String::from).to_vec());
-        assert_eq!(path[0][0], Pt { x: 110, y: 220, t_ms: 0 });
+        assert_eq!(
+            argv[0],
+            ["shell", "input", "tap", "110", "220"]
+                .map(String::from)
+                .to_vec()
+        );
+        assert_eq!(
+            path[0][0],
+            Pt {
+                x: 110,
+                y: 220,
+                t_ms: 0
+            }
+        );
         // Scroll → swipe: anchor + end coords agree between argv and the Pt path.
-        let scroll = PointerEvent::Scroll { x: 250, y: 400, dx: 0, dy: 1, modifiers: vec![] };
+        let scroll = PointerEvent::Scroll {
+            x: 250,
+            y: 400,
+            dx: 0,
+            dy: 1,
+            modifiers: vec![],
+        };
         let sargv = pointer_commands(&o, &scroll);
         let spath = agent_pointer(&o, &scroll);
         assert_eq!((sargv[0][3].as_str(), sargv[0][4].as_str()), ("350", "600"));
-        assert_eq!(spath[0][0], Pt { x: 350, y: 600, t_ms: 0 });
+        assert_eq!(
+            spath[0][0],
+            Pt {
+                x: 350,
+                y: 600,
+                t_ms: 0
+            }
+        );
         assert_eq!((sargv[0][5].as_str(), sargv[0][6].as_str()), ("350", "480"));
         let end = spath[0].last().unwrap();
         assert_eq!((end.x, end.y), (350, 480));
@@ -386,7 +597,12 @@ mod pointer_tests {
     use glass_core::{MouseButton, PointerEvent, WindowGeometry};
 
     fn win() -> WindowGeometry {
-        WindowGeometry { x: 0, y: 63, width: 1080, height: 2400 }
+        WindowGeometry {
+            x: 0,
+            y: 63,
+            width: 1080,
+            height: 2400,
+        }
     }
 
     #[test]
@@ -397,17 +613,32 @@ mod pointer_tests {
     #[test]
     fn click_taps_at_absolute_coords() {
         let ev = PointerEvent::Click {
-            x: 10, y: 20, button: MouseButton::Left, count: 1, modifiers: vec![],
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
         };
-        assert_eq!(pointer_commands(&win(), &ev), vec![vec![
-            "shell".to_string(), "input".into(), "tap".into(), "10".into(), "83".into(),
-        ]]);
+        assert_eq!(
+            pointer_commands(&win(), &ev),
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "tap".into(),
+                "10".into(),
+                "83".into(),
+            ]]
+        );
     }
 
     #[test]
     fn multi_count_click_taps_repeatedly() {
         let ev = PointerEvent::Click {
-            x: 1, y: 1, button: MouseButton::Left, count: 2, modifiers: vec![],
+            x: 1,
+            y: 1,
+            button: MouseButton::Left,
+            count: 2,
+            modifiers: vec![],
         };
         assert_eq!(pointer_commands(&win(), &ev).len(), 2);
     }
@@ -415,28 +646,63 @@ mod pointer_tests {
     #[test]
     fn drag_swipes_with_duration() {
         let ev = PointerEvent::Drag {
-            from_x: 0, from_y: 0, to_x: 100, to_y: 200,
-            button: MouseButton::Left, modifiers: vec![], duration_ms: 250,
+            from_x: 0,
+            from_y: 0,
+            to_x: 100,
+            to_y: 200,
+            button: MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 250,
         };
-        assert_eq!(pointer_commands(&win(), &ev), vec![vec![
-            "shell".to_string(), "input".into(), "swipe".into(),
-            "0".into(), "63".into(), "100".into(), "263".into(), "250".into(),
-        ]]);
+        assert_eq!(
+            pointer_commands(&win(), &ev),
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "swipe".into(),
+                "0".into(),
+                "63".into(),
+                "100".into(),
+                "263".into(),
+                "250".into(),
+            ]]
+        );
     }
 
     #[test]
     fn scroll_down_swipes_upward_opposite_the_wheel() {
-        let ev = PointerEvent::Scroll { x: 540, y: 1200, dx: 0, dy: 1, modifiers: vec![] };
+        let ev = PointerEvent::Scroll {
+            x: 540,
+            y: 1200,
+            dx: 0,
+            dy: 1,
+            modifiers: vec![],
+        };
         let got = pointer_commands(&win(), &ev);
-        assert_eq!(got, vec![vec![
-            "shell".to_string(), "input".into(), "swipe".into(),
-            "540".into(), "1263".into(), "540".into(), "1143".into(), "300".into(),
-        ]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "swipe".into(),
+                "540".into(),
+                "1263".into(),
+                "540".into(),
+                "1143".into(),
+                "300".into(),
+            ]]
+        );
     }
 
     #[test]
     fn scroll_clamps_to_the_window() {
-        let ev = PointerEvent::Scroll { x: 10, y: 1, dx: 0, dy: 100, modifiers: vec![] };
+        let ev = PointerEvent::Scroll {
+            x: 10,
+            y: 1,
+            dx: 0,
+            dy: 100,
+            modifiers: vec![],
+        };
         let got = pointer_commands(&win(), &ev);
         let end_y = &got[0][6];
         assert_eq!(end_y, "63");
@@ -450,56 +716,104 @@ mod key_tests {
 
     #[test]
     fn empty_text_injects_nothing() {
-        assert!(key_commands(&KeyEvent::Text(String::new())).unwrap().is_empty());
+        assert!(key_commands(&KeyEvent::Text(String::new()))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn text_is_space_escaped_and_quoted() {
         let got = key_commands(&KeyEvent::Text("hello world".into())).unwrap();
-        assert_eq!(got, vec![vec!["shell".to_string(), "input text 'hello%sworld'".into()]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input text 'hello%sworld'".into()
+            ]]
+        );
     }
 
     #[test]
     fn text_single_quote_is_shell_escaped() {
         let got = key_commands(&KeyEvent::Text("it's".into())).unwrap();
-        assert_eq!(got, vec![vec!["shell".to_string(), r"input text 'it'\''s'".into()]]);
+        assert_eq!(
+            got,
+            vec![vec!["shell".to_string(), r"input text 'it'\''s'".into()]]
+        );
     }
 
     #[test]
     fn plain_chord_is_a_keyevent() {
         let got = key_commands(&KeyEvent::Chord("Enter".into())).unwrap();
-        assert_eq!(got, vec![vec!["shell".to_string(), "input".into(), "keyevent".into(), "66".into()]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "keyevent".into(),
+                "66".into()
+            ]]
+        );
     }
 
     #[test]
     fn letter_chord_maps_to_keycode_a() {
         let got = key_commands(&KeyEvent::Chord("a".into())).unwrap();
-        assert_eq!(got, vec![vec!["shell".to_string(), "input".into(), "keyevent".into(), "29".into()]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "keyevent".into(),
+                "29".into()
+            ]]
+        );
     }
 
     #[test]
     fn modifier_chord_is_a_keycombination() {
         let got = key_commands(&KeyEvent::Chord("ctrl+a".into())).unwrap();
-        assert_eq!(got, vec![vec![
-            "shell".to_string(), "input".into(), "keycombination".into(), "113".into(), "29".into(),
-        ]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "keycombination".into(),
+                "113".into(),
+                "29".into(),
+            ]]
+        );
     }
 
     #[test]
     fn multi_modifier_chord_lists_each_meta_then_the_key() {
         let got = key_commands(&KeyEvent::Chord("ctrl+shift+a".into())).unwrap();
-        assert_eq!(got, vec![vec![
-            "shell".to_string(), "input".into(), "keycombination".into(),
-            "113".into(), "59".into(), "29".into(),
-        ]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "keycombination".into(),
+                "113".into(),
+                "59".into(),
+                "29".into(),
+            ]]
+        );
     }
 
     #[test]
     fn function_key_chord_maps_to_f_keycode() {
         let got = key_commands(&KeyEvent::Chord("alt+F4".into())).unwrap();
-        assert_eq!(got, vec![vec![
-            "shell".to_string(), "input".into(), "keycombination".into(), "57".into(), "134".into(),
-        ]]);
+        assert_eq!(
+            got,
+            vec![vec![
+                "shell".to_string(),
+                "input".into(),
+                "keycombination".into(),
+                "57".into(),
+                "134".into(),
+            ]]
+        );
     }
 
     #[test]

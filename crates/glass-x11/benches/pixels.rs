@@ -25,9 +25,13 @@ fn bench(c: &mut Criterion) {
     for &(w, h) in SIZES {
         let data = bgrx(w, h);
         g.throughput(Throughput::Elements(u64::from(w) * u64::from(h)));
-        g.bench_with_input(BenchmarkId::new("convert", format!("{w}x{h}")), &data, |b, data| {
-            b.iter(|| black_box(xdata_to_rgba(black_box(data), w, h, 4).unwrap()));
-        });
+        g.bench_with_input(
+            BenchmarkId::new("convert", format!("{w}x{h}")),
+            &data,
+            |b, data| {
+                b.iter(|| black_box(xdata_to_rgba(black_box(data), w, h, 4).unwrap()));
+            },
+        );
     }
     g.finish();
 }

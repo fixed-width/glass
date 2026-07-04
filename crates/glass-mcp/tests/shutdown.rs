@@ -117,23 +117,36 @@ fn start_session(
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": { "protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": { "name": "glass-shutdown-test", "version": "0" } }
-    }));
-    assert!(read_response(&mut stdout, 1).get("result").is_some(), "initialize failed");
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "method": "notifications/initialized"
-    }));
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": { "name": "glass_start",
-                    "arguments": { "run": [app.to_str().unwrap()], "timeout_ms": 5000 } }
-    }));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": { "name": "glass-shutdown-test", "version": "0" } }
+        }),
+    );
+    assert!(
+        read_response(&mut stdout, 1).get("result").is_some(),
+        "initialize failed"
+    );
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }),
+    );
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "glass_start",
+                        "arguments": { "run": [app.to_str().unwrap()], "timeout_ms": 5000 } }
+        }),
+    );
     let started = read_response(&mut stdout, 2);
     assert_ne!(
-        started["result"]["isError"].as_bool(), Some(true),
+        started["result"]["isError"].as_bool(),
+        Some(true),
         "glass_start errored: {started}"
     );
     // Return stdin/stdout so the CALLER keeps them alive (held in `_stdin`/`_stdout`).
@@ -170,7 +183,9 @@ fn sigterm_reaps_app_in_attach_mode() {
     let _ = child.wait();
 
     if !wait_gone(app_pid, 100) {
-        let _ = Command::new("kill").args(["-KILL", &app_pid.to_string()]).status();
+        let _ = Command::new("kill")
+            .args(["-KILL", &app_pid.to_string()])
+            .status();
         panic!("app pid {app_pid} survived server SIGTERM — orphan leak");
     }
 }
@@ -184,7 +199,10 @@ fn sigterm_reaps_app_and_spawned_display() {
     let (mut child, server_pid, _stdin, _stdout) = start_session(&[]);
     let app_pid = child_pid_of(server_pid, "glass-testapp").expect("app child of server");
     let xvfb_pid = child_pid_of(server_pid, "Xvfb").expect("spawned Xvfb child of server");
-    assert!(pid_alive(app_pid) && pid_alive(xvfb_pid), "app + Xvfb should be running");
+    assert!(
+        pid_alive(app_pid) && pid_alive(xvfb_pid),
+        "app + Xvfb should be running"
+    );
 
     // Keep stdin open: the server must exit via its SIGNAL path, not stdin-EOF.
     sigterm(server_pid);
@@ -194,7 +212,9 @@ fn sigterm_reaps_app_and_spawned_display() {
     let xvfb_gone = wait_gone(xvfb_pid, 100);
     for (alive, pid) in [(!app_gone, app_pid), (!xvfb_gone, xvfb_pid)] {
         if alive {
-            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
         }
     }
     assert!(app_gone, "app pid {app_pid} survived SIGTERM");

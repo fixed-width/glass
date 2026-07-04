@@ -81,9 +81,13 @@ pub fn proc_tree_pids(root_pid: u32) -> Vec<u32> {
     for entry in proc.flatten() {
         let name = entry.file_name();
         let pid_str = name.to_string_lossy();
-        let Ok(pid) = pid_str.parse::<u32>() else { continue };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
         let status_path = format!("/proc/{pid}/status");
-        let Ok(content) = std::fs::read_to_string(&status_path) else { continue };
+        let Ok(content) = std::fs::read_to_string(&status_path) else {
+            continue;
+        };
         for line in content.lines() {
             if let Some(rest) = line.strip_prefix("PPid:") {
                 if let Ok(ppid) = rest.trim().parse::<u32>() {
@@ -154,14 +158,22 @@ mod reap_tests {
             .spawn()
             .unwrap();
         let mut line = String::new();
-        BufReader::new(c.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(c.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
         assert_eq!(line.trim(), "ready");
         let grace = Duration::from_millis(300);
         let t = Instant::now();
         reap_graceful(&mut c, grace);
         let el = t.elapsed();
-        assert!(el >= grace, "should wait the full grace before SIGKILL (waited {el:?})");
-        assert!(el < grace + Duration::from_secs(2), "but must not hang (waited {el:?})");
+        assert!(
+            el >= grace,
+            "should wait the full grace before SIGKILL (waited {el:?})"
+        );
+        assert!(
+            el < grace + Duration::from_secs(2),
+            "but must not hang (waited {el:?})"
+        );
     }
 
     #[test]
@@ -173,12 +185,20 @@ mod reap_tests {
             .spawn()
             .unwrap();
         let mut line = String::new();
-        BufReader::new(leader.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
         let grandchild: u32 = line.trim().parse().expect("grandchild pid");
-        assert!(alive(grandchild), "grandchild should be alive before reaping");
+        assert!(
+            alive(grandchild),
+            "grandchild should be alive before reaping"
+        );
         reap_group(&mut leader, Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(100));
-        assert!(!alive(grandchild), "reap_group must reap the forked grandchild, not orphan it");
+        assert!(
+            !alive(grandchild),
+            "reap_group must reap the forked grandchild, not orphan it"
+        );
     }
 
     #[test]
@@ -213,7 +233,10 @@ mod tests {
         parent_of.insert(200u32, 100u32);
         // Must terminate and include the root.
         let result = collect_descendants(100, &parent_of);
-        assert!(result.contains(&100), "root must be present even with a cycle");
+        assert!(
+            result.contains(&100),
+            "root must be present even with a cycle"
+        );
         assert!(result.len() <= 2, "cycle must not cause unbounded growth");
     }
 
@@ -240,7 +263,10 @@ mod tests {
         let pids = proc_tree_pids(std::process::id());
         let _ = child.kill();
         let _ = child.wait();
-        assert!(pids.contains(&std::process::id()), "must include the root pid");
+        assert!(
+            pids.contains(&std::process::id()),
+            "must include the root pid"
+        );
         assert!(
             pids.contains(&child_pid),
             "must include the spawned descendant pid {child_pid}; got {pids:?}"

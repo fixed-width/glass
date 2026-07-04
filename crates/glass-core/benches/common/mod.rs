@@ -39,7 +39,11 @@ pub fn noise(w: u32, h: u32) -> Frame {
 pub fn with_changed(base: &Frame, fraction: f64) -> Frame {
     let mut f = base.clone();
     let total = f.pixel_count() as usize;
-    let stride = if fraction >= 1.0 { 1 } else { (1.0 / fraction).max(1.0) as usize };
+    let stride = if fraction >= 1.0 {
+        1
+    } else {
+        (1.0 / fraction).max(1.0) as usize
+    };
     let mut i = 0;
     while i < total {
         f.pixels[i * 4] ^= 0xFF; // flip this pixel's red channel

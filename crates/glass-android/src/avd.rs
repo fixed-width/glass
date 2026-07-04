@@ -48,7 +48,12 @@ pub fn resolve_emulator_bin(
         return bin;
     }
     if let Some(root) = crate::sdk::resolve_sdk_root(get, exists) {
-        return root.path.join("emulator").join(emulator_exe()).to_string_lossy().into_owned();
+        return root
+            .path
+            .join("emulator")
+            .join(emulator_exe())
+            .to_string_lossy()
+            .into_owned();
     }
     "emulator".to_string()
 }
@@ -80,7 +85,10 @@ pub fn choose_avd(want: Option<&str>, avds: &[String]) -> Result<String> {
         return if avds.iter().any(|a| a == w) {
             Ok(w.to_string())
         } else {
-            Err(GlassError::Backend(format!("GLASS_AVD={w} not found; AVDs: [{}]", names(avds))))
+            Err(GlassError::Backend(format!(
+                "GLASS_AVD={w} not found; AVDs: [{}]",
+                names(avds)
+            )))
         };
     }
     match avds {
@@ -121,7 +129,12 @@ pub fn new_serial(before: &[Device], after: &[Device]) -> Option<String> {
 /// Attach-or-boot decision. Attach-preferred; a specific requested serial that is
 /// offline is an error (never boot a mismatched serial).
 pub fn decide(online: &[Device], serial_env: Option<&str>, lifecycle: Lifecycle) -> Action {
-    let names = |d: &[Device]| d.iter().map(|x| x.serial.as_str()).collect::<Vec<_>>().join(", ");
+    let names = |d: &[Device]| {
+        d.iter()
+            .map(|x| x.serial.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(want) = serial_env.filter(|s| !s.is_empty()) {
         return if online.iter().any(|d| d.serial == want) {
             Action::Attach(want.to_string())
@@ -172,7 +185,11 @@ impl EmulatorRegistry {
     /// Best-effort: a device already gone is fine. Resolves adb from env.
     pub fn kill_all(&self) {
         let adb = Adb::from_env();
-        let serials = self.booted.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+        let serials = self
+            .booted
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
         for s in serials {
             let _ = adb.with_serial(s).run(["emu", "kill"]);
         }
@@ -202,8 +219,9 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
         .spawn()
         .map_err(|e| GlassError::Backend(format!("failed to spawn emulator `{bin}`: {e}")))?;
 
-    let timeout_ms: u64 =
-        get("GLASS_EMULATOR_BOOT_TIMEOUT_MS").and_then(|s| s.parse().ok()).unwrap_or(120_000);
+    let timeout_ms: u64 = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120_000);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -222,7 +240,8 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
         let online = crate::target::parse_devices(&base.run(["devices"])?);
         if let Some(serial) = new_serial(&before, &online) {
             let adb = base.with_serial(serial.clone());
-            if adb.run(["shell", "getprop", "sys.boot_completed"])
+            if adb
+                .run(["shell", "getprop", "sys.boot_completed"])
                 .map(|o| o.trim() == "1")
                 .unwrap_or(false)
             {
@@ -261,7 +280,12 @@ mod tests {
     use super::*;
     use crate::target::Device;
 
-    fn dev(s: &str) -> Device { Device { serial: s.into(), state: "device".into() } }
+    fn dev(s: &str) -> Device {
+        Device {
+            serial: s.into(),
+            state: "device".into(),
+        }
+    }
 
     #[test]
     fn emulator_bin_prefers_glass_then_sdk_then_path() {
@@ -275,13 +299,19 @@ mod tests {
             "ANDROID_SDK_ROOT" => Some("/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(resolve_emulator_bin(&env, &|_| true), "/sdk/emulator/emulator");
+        assert_eq!(
+            resolve_emulator_bin(&env, &|_| true),
+            "/sdk/emulator/emulator"
+        );
 
         let env = |k: &str| match k {
             "ANDROID_HOME" => Some("/home/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(resolve_emulator_bin(&env, &|_| true), "/home/sdk/emulator/emulator");
+        assert_eq!(
+            resolve_emulator_bin(&env, &|_| true),
+            "/home/sdk/emulator/emulator"
+        );
 
         let env = |_: &str| None;
         assert_eq!(resolve_emulator_bin(&env, &|_| false), "emulator");
@@ -298,19 +328,28 @@ mod tests {
             _ => None,
         };
         let exists = |p: &std::path::Path| p == std::path::Path::new("/home/u/android-sdk");
-        assert_eq!(resolve_emulator_bin(&env, &exists), "/home/u/android-sdk/emulator/emulator");
+        assert_eq!(
+            resolve_emulator_bin(&env, &exists),
+            "/home/u/android-sdk/emulator/emulator"
+        );
     }
 
     #[test]
     fn list_avds_parses_names_only() {
         let out = "INFO | Storing crashdata\nPixel_6\nglass\n";
-        assert_eq!(parse_list_avds(out), vec!["Pixel_6".to_string(), "glass".to_string()]);
+        assert_eq!(
+            parse_list_avds(out),
+            vec!["Pixel_6".to_string(), "glass".to_string()]
+        );
     }
 
     #[test]
     fn choose_avd_sole_or_named_or_errors() {
         assert_eq!(choose_avd(None, &["glass".into()]).unwrap(), "glass");
-        assert_eq!(choose_avd(Some("glass"), &["a".into(), "glass".into()]).unwrap(), "glass");
+        assert_eq!(
+            choose_avd(Some("glass"), &["a".into(), "glass".into()]).unwrap(),
+            "glass"
+        );
         assert!(choose_avd(None, &["a".into(), "b".into()]).is_err());
         assert!(choose_avd(None, &[]).is_err());
         assert!(choose_avd(Some("nope"), &["a".into()]).is_err());
@@ -331,21 +370,36 @@ mod tests {
     fn new_serial_is_the_added_device() {
         let before = vec![dev("emulator-5554")];
         let after = vec![dev("emulator-5554"), dev("emulator-5556")];
-        assert_eq!(new_serial(&before, &after).as_deref(), Some("emulator-5556"));
+        assert_eq!(
+            new_serial(&before, &after).as_deref(),
+            Some("emulator-5556")
+        );
         assert_eq!(new_serial(&before, &before), None);
     }
 
     #[test]
     fn decide_attach_or_boot_or_error() {
-        assert_eq!(decide(&[dev("emulator-5554")], None, Lifecycle::Auto),
-                   Action::Attach("emulator-5554".into()));
+        assert_eq!(
+            decide(&[dev("emulator-5554")], None, Lifecycle::Auto),
+            Action::Attach("emulator-5554".into())
+        );
         assert_eq!(decide(&[], None, Lifecycle::Auto), Action::Boot);
-        assert!(matches!(decide(&[], None, Lifecycle::Attach), Action::Error(_)));
         assert!(matches!(
-            decide(&[dev("a"), dev("b")], None, Lifecycle::Auto), Action::Error(_)));
-        assert_eq!(decide(&[dev("a"), dev("b")], Some("b"), Lifecycle::Auto),
-                   Action::Attach("b".into()));
-        assert!(matches!(decide(&[dev("a")], Some("z"), Lifecycle::Auto), Action::Error(_)));
+            decide(&[], None, Lifecycle::Attach),
+            Action::Error(_)
+        ));
+        assert!(matches!(
+            decide(&[dev("a"), dev("b")], None, Lifecycle::Auto),
+            Action::Error(_)
+        ));
+        assert_eq!(
+            decide(&[dev("a"), dev("b")], Some("b"), Lifecycle::Auto),
+            Action::Attach("b".into())
+        );
+        assert!(matches!(
+            decide(&[dev("a")], Some("z"), Lifecycle::Auto),
+            Action::Error(_)
+        ));
     }
 
     #[test]
@@ -361,6 +415,9 @@ mod tests {
         let r2 = r.clone();
         r.register("emulator-5554".into());
         r2.register("emulator-5556".into());
-        assert_eq!(r.serials(), vec!["emulator-5554".to_string(), "emulator-5556".to_string()]);
+        assert_eq!(
+            r.serials(),
+            vec!["emulator-5554".to_string(), "emulator-5556".to_string()]
+        );
     }
 }

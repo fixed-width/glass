@@ -43,7 +43,10 @@ pub fn resolve(base: Adb, registry: &EmulatorRegistry) -> Result<AttachedDevice>
         Action::Error(msg) => return Err(GlassError::Backend(msg)),
         Action::Boot => {
             let s = boot_avd(&base, &get)?;
-            if get("GLASS_EMULATOR_KEEP").filter(|v| !v.is_empty()).is_none() {
+            if get("GLASS_EMULATOR_KEEP")
+                .filter(|v| !v.is_empty())
+                .is_none()
+            {
                 registry.register(s.clone());
             }
             s
@@ -78,7 +81,10 @@ pub fn parse_devices(output: &str) -> Vec<Device> {
 /// Pure device-selection policy.
 pub fn choose_serial(serial_env: Option<&str>, online: &[Device]) -> Result<String> {
     let names = |d: &[Device]| {
-        d.iter().map(|x| x.serial.as_str()).collect::<Vec<_>>().join(", ")
+        d.iter()
+            .map(|x| x.serial.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     if let Some(want) = serial_env.filter(|s| !s.is_empty()) {
         return if online.iter().any(|d| d.serial == want) {
@@ -127,7 +133,13 @@ mod tests {
     fn parse_devices_skips_header_and_keeps_state() {
         let d = parse_devices(LISTING);
         assert_eq!(d.len(), 2);
-        assert_eq!(d[0], Device { serial: "emulator-5554".into(), state: "device".into() });
+        assert_eq!(
+            d[0],
+            Device {
+                serial: "emulator-5554".into(),
+                state: "device".into()
+            }
+        );
         assert_eq!(d[1].state, "offline");
     }
 
@@ -142,7 +154,10 @@ mod tests {
 
     #[test]
     fn choose_serial_picks_the_only_online_device() {
-        let online = vec![Device { serial: "emulator-5554".into(), state: "device".into() }];
+        let online = vec![Device {
+            serial: "emulator-5554".into(),
+            state: "device".into(),
+        }];
         assert_eq!(choose_serial(None, &online).unwrap(), "emulator-5554");
     }
 
@@ -156,8 +171,14 @@ mod tests {
     #[test]
     fn choose_serial_requires_disambiguation_when_many() {
         let online = vec![
-            Device { serial: "emulator-5554".into(), state: "device".into() },
-            Device { serial: "emulator-5556".into(), state: "device".into() },
+            Device {
+                serial: "emulator-5554".into(),
+                state: "device".into(),
+            },
+            Device {
+                serial: "emulator-5556".into(),
+                state: "device".into(),
+            },
         ];
         let err = choose_serial(None, &online).unwrap_err();
         assert!(err.to_string().contains("GLASS_ANDROID_SERIAL"));
@@ -166,15 +187,27 @@ mod tests {
     #[test]
     fn choose_serial_honors_env_when_present_and_online() {
         let online = vec![
-            Device { serial: "emulator-5554".into(), state: "device".into() },
-            Device { serial: "emulator-5556".into(), state: "device".into() },
+            Device {
+                serial: "emulator-5554".into(),
+                state: "device".into(),
+            },
+            Device {
+                serial: "emulator-5556".into(),
+                state: "device".into(),
+            },
         ];
-        assert_eq!(choose_serial(Some("emulator-5556"), &online).unwrap(), "emulator-5556");
+        assert_eq!(
+            choose_serial(Some("emulator-5556"), &online).unwrap(),
+            "emulator-5556"
+        );
     }
 
     #[test]
     fn choose_serial_rejects_env_not_online() {
-        let online = vec![Device { serial: "emulator-5554".into(), state: "device".into() }];
+        let online = vec![Device {
+            serial: "emulator-5554".into(),
+            state: "device".into(),
+        }];
         let err = choose_serial(Some("emulator-9999"), &online).unwrap_err();
         assert!(err.to_string().contains("emulator-9999"));
     }

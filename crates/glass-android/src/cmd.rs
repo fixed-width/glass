@@ -29,19 +29,32 @@ pub fn parse_launch(run: &[String]) -> Result<LaunchTarget> {
             "malformed component {component:?}; expected package/.Activity"
         )));
     }
-    Ok(LaunchTarget { component, package, apk })
+    Ok(LaunchTarget {
+        component,
+        package,
+        apk,
+    })
 }
 
 pub fn install_args(apk: &str) -> Vec<String> {
-    ["install", "-r", "-t", apk].iter().map(|s| s.to_string()).collect()
+    ["install", "-r", "-t", apk]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub fn launch_args(component: &str) -> Vec<String> {
-    ["shell", "am", "start", "-W", "-n", component].iter().map(|s| s.to_string()).collect()
+    ["shell", "am", "start", "-W", "-n", component]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub fn force_stop_args(package: &str) -> Vec<String> {
-    ["shell", "am", "force-stop", package].iter().map(|s| s.to_string()).collect()
+    ["shell", "am", "force-stop", package]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -65,14 +78,20 @@ mod tests {
             "com.example.app/.MainActivity".to_string(),
         ];
         let t = parse_launch(&run).unwrap();
-        assert_eq!(t.apk.as_deref(), Some("app/build/outputs/apk/debug/app-debug.apk"));
+        assert_eq!(
+            t.apk.as_deref(),
+            Some("app/build/outputs/apk/debug/app-debug.apk")
+        );
         assert_eq!(t.component, "com.example.app/.MainActivity");
     }
 
     #[test]
     fn parse_launch_requires_a_component() {
         let run = vec!["app-debug.apk".to_string()];
-        assert!(matches!(parse_launch(&run), Err(GlassError::AppNotStarted(_))));
+        assert!(matches!(
+            parse_launch(&run),
+            Err(GlassError::AppNotStarted(_))
+        ));
     }
 
     #[test]

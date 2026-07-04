@@ -131,12 +131,18 @@ mod macos_main {
     /// Like `expect`, but returns the error as a `String` instead of exiting the process — so
     /// a failure raised inside `run_checks` (fixture already spawned) still flows back to
     /// `run()`, which reaches `stop_app()` before the process exits.
-    fn try_expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
+    fn try_expect<T, E: std::fmt::Display>(
+        result: Result<T, E>,
+        context: &str,
+    ) -> Result<T, String> {
         result.map_err(|e| format!("{context}: {e}"))
     }
 
     fn swiftc_available() -> bool {
-        Command::new("swiftc").arg("--version").output().is_ok_and(|o| o.status.success())
+        Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Build `fixture/quadrants.swift` to a fresh temp path — identical to `capture.rs`'s/
@@ -149,8 +155,12 @@ mod macos_main {
             fail(format!("fixture source not found at {}", source.display()));
         }
 
-        let out_dir = std::env::temp_dir().join(format!("glass-macos-windows-test-{}", std::process::id()));
-        expect(std::fs::create_dir_all(&out_dir), "creating fixture build dir");
+        let out_dir =
+            std::env::temp_dir().join(format!("glass-macos-windows-test-{}", std::process::id()));
+        expect(
+            std::fs::create_dir_all(&out_dir),
+            "creating fixture build dir",
+        );
         let out_bin = out_dir.join("quadrants");
 
         let status = Command::new("swiftc")
@@ -162,7 +172,10 @@ mod macos_main {
             .status();
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) => fail(format!("swiftc exited with {s} building {}", source.display())),
+            Ok(s) => fail(format!(
+                "swiftc exited with {s} building {}",
+                source.display()
+            )),
             Err(e) => fail(format!("failed to run swiftc: {e}")),
         }
         (out_bin, out_dir)
@@ -194,16 +207,20 @@ mod macos_main {
     /// `target`, rather than further away — tolerant of macOS clamping to an intermediate
     /// size (see `backend.rs`'s `resize_was_refused` doc for the same "clamped, not exact"
     /// contract), while still catching a resize that did nothing or moved the wrong way.
-    fn size_moved_toward(before: &WindowGeometry, after: &WindowGeometry, target: (u32, u32)) -> bool {
+    fn size_moved_toward(
+        before: &WindowGeometry,
+        after: &WindowGeometry,
+        target: (u32, u32),
+    ) -> bool {
         let changed = (after.width as i64 - before.width as i64).abs() > RESIZE_CHANGE_THRESHOLD_PX
             || (after.height as i64 - before.height as i64).abs() > RESIZE_CHANGE_THRESHOLD_PX;
         if !changed {
             return false;
         }
-        let dist_before =
-            (before.width as i64 - target.0 as i64).abs() + (before.height as i64 - target.1 as i64).abs();
-        let dist_after =
-            (after.width as i64 - target.0 as i64).abs() + (after.height as i64 - target.1 as i64).abs();
+        let dist_before = (before.width as i64 - target.0 as i64).abs()
+            + (before.height as i64 - target.1 as i64).abs();
+        let dist_after = (after.width as i64 - target.0 as i64).abs()
+            + (after.height as i64 - target.1 as i64).abs();
         dist_after <= dist_before
     }
 
@@ -211,11 +228,18 @@ mod macos_main {
     /// `capture.rs`'s helper of the same name.
     fn pixel_at(pixels: &[u8], frame_width: u32, x: u32, y: u32) -> [u8; 4] {
         let idx = (y as usize * frame_width as usize + x as usize) * 4;
-        [pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]]
+        [
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        ]
     }
 
     fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-        a.iter().zip(b.iter()).all(|(x, y)| (*x as i32 - *y as i32).abs() <= PIXEL_TOLERANCE)
+        a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| (*x as i32 - *y as i32).abs() <= PIXEL_TOLERANCE)
     }
 
     /// Assert the pixel at `(x, y)` in a tightly-packed RGBA8 buffer is within tolerance of
@@ -241,10 +265,17 @@ mod macos_main {
     /// `Err` instead of exiting the process on any failure, so `run()` can always reach
     /// `platform.stop_app()` first — see `capture.rs`'s identically-shaped `run_checks` for
     /// why a bare `std::process::exit` from in here would leak the spawned fixture process.
-    fn run_checks(platform: &mut MacosPlatform, fixture_bin: &std::path::Path) -> Result<(), String> {
+    fn run_checks(
+        platform: &mut MacosPlatform,
+        fixture_bin: &std::path::Path,
+    ) -> Result<(), String> {
         let spec = AppSpec {
             build: None,
-            run: vec![fixture_bin.to_string_lossy().into_owned(), "--windows".into(), "2".into()],
+            run: vec![
+                fixture_bin.to_string_lossy().into_owned(),
+                "--windows".into(),
+                "2".into(),
+            ],
             cwd: None,
             env: vec![],
             window_hint: None,
@@ -261,7 +292,10 @@ mod macos_main {
         let windows = try_expect(platform.list_windows(), "list_windows (initial)")?;
         println!("list_windows (initial): {windows:?}");
         if windows.len() < 2 {
-            return Err(format!("expected >=2 windows, got {}: {windows:?}", windows.len()));
+            return Err(format!(
+                "expected >=2 windows, got {}: {windows:?}",
+                windows.len()
+            ));
         }
         let ids: HashSet<_> = windows.iter().map(|w| w.id).collect();
         if ids.len() != windows.len() {
@@ -301,8 +335,10 @@ mod macos_main {
         // window's own geometry (via a completely different lookup path — SCShareableContent
         // for the list, AXUIElement for the select — so agreement here already exercises the
         // CGWindowID<->AXUIElement correlation once). ---
-        let selected_geom =
-            try_expect(platform.select_window(secondary_id), "select_window(glass-fixture-2)")?;
+        let selected_geom = try_expect(
+            platform.select_window(secondary_id),
+            "select_window(glass-fixture-2)",
+        )?;
         println!("select_window(glass-fixture-2) -> {selected_geom:?}");
         if !geometry_close(&selected_geom, &secondary_geometry, SELECT_TOLERANCE_PX) {
             return Err(format!(
@@ -313,7 +349,8 @@ mod macos_main {
             ));
         }
 
-        let windows_after_select = try_expect(platform.list_windows(), "list_windows (after select)")?;
+        let windows_after_select =
+            try_expect(platform.list_windows(), "list_windows (after select)")?;
         println!("list_windows (after select): {windows_after_select:?}");
         let now_selected = windows_after_select
             .iter()
@@ -335,9 +372,15 @@ mod macos_main {
         println!("select_window OK: glass-fixture-2 is now the sole active window");
 
         // --- window(Move) on the selected (non-first) window. ---
-        let move_op = WindowOp::Move { x: MOVE_TARGET.0, y: MOVE_TARGET.1 };
+        let move_op = WindowOp::Move {
+            x: MOVE_TARGET.0,
+            y: MOVE_TARGET.1,
+        };
         let moved = try_expect(platform.window(&move_op), "window(Move)")?;
-        println!("window(Move{{{},{}}}) -> {moved:?}", MOVE_TARGET.0, MOVE_TARGET.1);
+        println!(
+            "window(Move{{{},{}}}) -> {moved:?}",
+            MOVE_TARGET.0, MOVE_TARGET.1
+        );
         if !position_close((moved.x, moved.y), MOVE_TARGET, MOVE_TOLERANCE_PX) {
             return Err(format!(
                 "window did not move to ~{MOVE_TARGET:?} (within {MOVE_TOLERANCE_PX}px); backend \
@@ -346,9 +389,16 @@ mod macos_main {
                 moved.x, moved.y
             ));
         }
-        let geom_after_move = try_expect(platform.window(&WindowOp::Geometry), "window(Geometry) after Move")?;
+        let geom_after_move = try_expect(
+            platform.window(&WindowOp::Geometry),
+            "window(Geometry) after Move",
+        )?;
         println!("window(Geometry) after Move -> {geom_after_move:?}");
-        if !position_close((geom_after_move.x, geom_after_move.y), MOVE_TARGET, MOVE_TOLERANCE_PX) {
+        if !position_close(
+            (geom_after_move.x, geom_after_move.y),
+            MOVE_TARGET,
+            MOVE_TOLERANCE_PX,
+        ) {
             return Err(format!(
                 "window(Geometry) after Move disagrees with the Move op's own return: \
                  {geom_after_move:?} vs target {MOVE_TARGET:?}"
@@ -362,9 +412,15 @@ mod macos_main {
         // --- window(Resize) on the selected window: tolerant of macOS clamping — assert it
         // changed toward the target, not exactly reached it. ---
         let before_resize = geom_after_move;
-        let resize_op = WindowOp::Resize { width: RESIZE_TARGET.0, height: RESIZE_TARGET.1 };
+        let resize_op = WindowOp::Resize {
+            width: RESIZE_TARGET.0,
+            height: RESIZE_TARGET.1,
+        };
         let resized = try_expect(platform.window(&resize_op), "window(Resize)")?;
-        println!("window(Resize{{{},{}}}) -> {resized:?}", RESIZE_TARGET.0, RESIZE_TARGET.1);
+        println!(
+            "window(Resize{{{},{}}}) -> {resized:?}",
+            RESIZE_TARGET.0, RESIZE_TARGET.1
+        );
         if !size_moved_toward(&before_resize, &resized, RESIZE_TARGET) {
             return Err(format!(
                 "resize did not move toward {RESIZE_TARGET:?}: before={before_resize:?}, \
@@ -374,24 +430,63 @@ mod macos_main {
         }
         println!(
             "window(Resize) OK: {}x{} -> {}x{} (target {}x{})",
-            before_resize.width, before_resize.height, resized.width, resized.height, RESIZE_TARGET.0, RESIZE_TARGET.1
+            before_resize.width,
+            before_resize.height,
+            resized.width,
+            resized.height,
+            RESIZE_TARGET.0,
+            RESIZE_TARGET.1
         );
         std::thread::sleep(RESIZE_SETTLE);
 
         // --- capture_frame(None): must capture the SELECTED (secondary) window — confirmed
         // by its distinct quadrant palette, not the primary window's. ---
         let frame = try_expect(platform.capture_frame(None), "capture_frame(None)")?;
-        println!("captured {}x{} frame of the selected window", frame.width, frame.height);
+        println!(
+            "captured {}x{} frame of the selected window",
+            frame.width, frame.height
+        );
         if frame.width < 2 || frame.height < 2 {
-            return Err(format!("captured frame too small to sample quadrants: {}x{}", frame.width, frame.height));
+            return Err(format!(
+                "captured frame too small to sample quadrants: {}x{}",
+                frame.width, frame.height
+            ));
         }
         let (fw, fh) = (frame.width, frame.height);
         let (qx0, qx1) = (fw / 4, fw * 3 / 4);
         let (qy0, qy1) = (fh / 4, fh * 3 / 4);
-        assert_pixel(&frame.pixels, fw, qx0, qy0, SECONDARY_TOP_LEFT, "selected-window top-left")?;
-        assert_pixel(&frame.pixels, fw, qx1, qy0, SECONDARY_TOP_RIGHT, "selected-window top-right")?;
-        assert_pixel(&frame.pixels, fw, qx0, qy1, SECONDARY_BOTTOM_LEFT, "selected-window bottom-left")?;
-        assert_pixel(&frame.pixels, fw, qx1, qy1, SECONDARY_BOTTOM_RIGHT, "selected-window bottom-right")?;
+        assert_pixel(
+            &frame.pixels,
+            fw,
+            qx0,
+            qy0,
+            SECONDARY_TOP_LEFT,
+            "selected-window top-left",
+        )?;
+        assert_pixel(
+            &frame.pixels,
+            fw,
+            qx1,
+            qy0,
+            SECONDARY_TOP_RIGHT,
+            "selected-window top-right",
+        )?;
+        assert_pixel(
+            &frame.pixels,
+            fw,
+            qx0,
+            qy1,
+            SECONDARY_BOTTOM_LEFT,
+            "selected-window bottom-left",
+        )?;
+        assert_pixel(
+            &frame.pixels,
+            fw,
+            qx1,
+            qy1,
+            SECONDARY_BOTTOM_RIGHT,
+            "selected-window bottom-right",
+        )?;
         println!(
             "capture_frame OK: captured frame matches glass-fixture-2's distinct palette, not \
              glass-fixture's -- confirms capture followed the select_window retarget"

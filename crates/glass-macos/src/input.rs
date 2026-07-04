@@ -71,14 +71,21 @@ const FOCUS_SETTLE: Duration = Duration::from_millis(300);
 /// mapping coordinates through `scale`/`origin_pt` (the active session's `pointPixelScale`
 /// and window `contentRect.origin`, carried by `MacosPlatform` since the last `start_app` —
 /// see `coords.rs`'s module doc).
-pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt: (f64, f64)) -> Result<()> {
+pub(crate) fn send_pointer(
+    event: &PointerEvent,
+    pid: i32,
+    scale: f64,
+    origin_pt: (f64, f64),
+) -> Result<()> {
     // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity (see
     // the `PointerEvent::Gesture` arm below) — checked first, ahead of `focus`, so this
     // fails fast without the side effect of raising/activating `pid`'s app for an operation
     // that can never succeed (also keeps `focus`'s now-fallible missing-process check, fix
     // 4, from masking this call-shape error behind an unrelated `AppExited`).
     if matches!(event, PointerEvent::Gesture { .. }) {
-        return Err(GlassError::Unsupported("multi-touch gesture is not supported on macOS".into()));
+        return Err(GlassError::Unsupported(
+            "multi-touch gesture is not supported on macOS".into(),
+        ));
     }
     focus(pid)?;
 
@@ -100,7 +107,13 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
             )?;
             post(&ev);
         }
-        PointerEvent::Click { x, y, button, count, ref modifiers } => {
+        PointerEvent::Click {
+            x,
+            y,
+            button,
+            count,
+            ref modifiers,
+        } => {
             let point = to_point(x, y);
             let flags = to_flags(modifiers);
             let cg_button = to_cg_button(button);
@@ -110,13 +123,25 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
             // synthesizing a double/triple click (see Task 2's brief).
             let clicks = i64::from(count.max(1));
             let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
-            CGEvent::set_integer_value_field(Some(&down), CGEventField::MouseEventClickState, clicks);
+            CGEvent::set_integer_value_field(
+                Some(&down),
+                CGEventField::MouseEventClickState,
+                clicks,
+            );
             post(&down);
             let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
             CGEvent::set_integer_value_field(Some(&up), CGEventField::MouseEventClickState, clicks);
             post(&up);
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            button,
+            ref modifiers,
+            duration_ms,
+        } => {
             let gesture = DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
             let mut sink = MacDragSink {
                 source: source.as_deref(),
@@ -128,16 +153,29 @@ pub(crate) fn send_pointer(event: &PointerEvent, pid: i32, scale: f64, origin_pt
             };
             run_drag(&mut sink, &gesture)?;
         }
-        PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
-            let mut sink =
-                MacScrollSink { source: source.as_deref(), point: to_point(x, y), dx, dy, flags: to_flags(modifiers) };
+        PointerEvent::Scroll {
+            x,
+            y,
+            dx,
+            dy,
+            ref modifiers,
+        } => {
+            let mut sink = MacScrollSink {
+                source: source.as_deref(),
+                point: to_point(x, y),
+                dx,
+                dy,
+                flags: to_flags(modifiers),
+            };
             run_scroll(&mut sink, !modifiers.is_empty())?;
         }
         // Already rejected by the early check above (before `focus`); kept here so this
         // match stays exhaustive over `PointerEvent`'s variants and a future variant added
         // to the enum still forces an explicit decision at this call site.
         PointerEvent::Gesture { .. } => {
-            return Err(GlassError::Unsupported("multi-touch gesture is not supported on macOS".into()));
+            return Err(GlassError::Unsupported(
+                "multi-touch gesture is not supported on macOS".into(),
+            ));
         }
     }
     Ok(())
@@ -161,7 +199,9 @@ pub(crate) fn send_key(event: &KeyEvent, pid: i32) -> Result<()> {
 
     match event {
         KeyEvent::Text(s) => {
-            let mut sink = MacTypeSink { source: source.as_deref() };
+            let mut sink = MacTypeSink {
+                source: source.as_deref(),
+            };
             run_type(&mut sink, s, KEY_TYPE_DWELL)
         }
         KeyEvent::Chord(s) => send_chord(s, source.as_deref()),
@@ -207,8 +247,13 @@ struct MacTypeSink<'a> {
 
 impl TypeSink for MacTypeSink<'_> {
     fn character(&mut self, c: char) -> Result<()> {
-        let (keycode, shift) = keymap::key_for(c).ok_or_else(|| GlassError::InvalidKey(c.to_string()))?;
-        let flags = if shift { CGEventFlags::MaskShift } else { CGEventFlags::empty() };
+        let (keycode, shift) =
+            keymap::key_for(c).ok_or_else(|| GlassError::InvalidKey(c.to_string()))?;
+        let flags = if shift {
+            CGEventFlags::MaskShift
+        } else {
+            CGEventFlags::empty()
+        };
         tap_key(self.source, keycode, flags)
     }
 }
@@ -220,17 +265,22 @@ impl TypeSink for MacTypeSink<'_> {
 /// with the accumulated flags — see the module doc for why macOS needs no separate
 /// modifier-hold event (unlike `glass_core::run_chord`'s Windows/X11 use).
 fn send_chord(chord: &str, source: Option<&CGEventSource>) -> Result<()> {
-    let parts: Vec<&str> = chord.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = chord
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     let Some((key_token, mod_tokens)) = parts.split_last() else {
-        return Err(GlassError::InvalidKey(format!("empty chord (no key token): '{chord}'")));
+        return Err(GlassError::InvalidKey(format!(
+            "empty chord (no key token): '{chord}'"
+        )));
     };
 
     let mut modifiers = Vec::with_capacity(mod_tokens.len());
     for m in mod_tokens {
-        modifiers.push(
-            Modifier::from_name(m)
-                .ok_or_else(|| GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'")))?,
-        );
+        modifiers.push(Modifier::from_name(m).ok_or_else(|| {
+            GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'"))
+        })?);
     }
     let (keycode, needs_shift) = resolve_chord_key(key_token)
         .ok_or_else(|| GlassError::InvalidKey(format!("unknown key '{key_token}' in '{chord}'")))?;
@@ -376,14 +426,25 @@ impl MacDragSink<'_> {
 impl DragSink for MacDragSink<'_> {
     fn place(&mut self, x: i32, y: i32) -> Result<()> {
         self.last = self.to_point(x, y);
-        let ev = mouse_event(self.source, CGEventType::MouseMoved, self.last, to_cg_button(self.button), self.flags)?;
+        let ev = mouse_event(
+            self.source,
+            CGEventType::MouseMoved,
+            self.last,
+            to_cg_button(self.button),
+            self.flags,
+        )?;
         post(&ev);
         Ok(())
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
         self.last = self.to_point(x, y);
-        let ev =
-            mouse_event(self.source, dragged_type(self.button), self.last, to_cg_button(self.button), self.flags)?;
+        let ev = mouse_event(
+            self.source,
+            dragged_type(self.button),
+            self.last,
+            to_cg_button(self.button),
+            self.flags,
+        )?;
         post(&ev);
         Ok(())
     }
@@ -425,7 +486,13 @@ impl ScrollSink for MacScrollSink<'_> {
         // `CGEventCreateScrollWheelEvent2` carries no target point of its own — the window
         // server delivers it to whatever's under the cursor (or the key window) — so
         // position the cursor first (Task 2's brief).
-        let mv = mouse_event(self.source, CGEventType::MouseMoved, self.point, CGMouseButton::Left, self.flags)?;
+        let mv = mouse_event(
+            self.source,
+            CGEventType::MouseMoved,
+            self.point,
+            CGMouseButton::Left,
+            self.flags,
+        )?;
         post(&mv);
 
         // Sign: verified against WebKit's macOS WebDriver wheel-action → CGEvent conversion
@@ -436,8 +503,15 @@ impl ScrollSink for MacScrollSink<'_> {
         // positive-Y-is-down/positive-X-is-right contract glass's own `dx`/`dy` already use
         // (see `glass-x11`'s `scroll_button(5=down,4=up, dy)`/`(7=right,6=left, dx)`), so the
         // same negation applies here: `wheel1 = -dy`, `wheel2 = -dx`.
-        let ev = CGEvent::new_scroll_wheel_event2(self.source, CGScrollEventUnit::Line, 2, -self.dy, -self.dx, 0)
-            .ok_or_else(|| GlassError::Backend("CGEventCreateScrollWheelEvent2 failed".into()))?;
+        let ev = CGEvent::new_scroll_wheel_event2(
+            self.source,
+            CGScrollEventUnit::Line,
+            2,
+            -self.dy,
+            -self.dx,
+            0,
+        )
+        .ok_or_else(|| GlassError::Backend("CGEventCreateScrollWheelEvent2 failed".into()))?;
         CGEvent::set_flags(Some(&ev), self.flags);
         post(&ev);
         Ok(())
@@ -474,18 +548,47 @@ mod tests {
         assert_eq!(to_cg_button(MouseButton::Left), CGMouseButton::Left);
         assert_eq!(to_cg_button(MouseButton::Right), CGMouseButton::Right);
         assert_eq!(to_cg_button(MouseButton::Middle), CGMouseButton::Center);
-        assert_eq!(click_types(MouseButton::Left), (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp));
-        assert_eq!(click_types(MouseButton::Right), (CGEventType::RightMouseDown, CGEventType::RightMouseUp));
-        assert_eq!(click_types(MouseButton::Middle), (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp));
-        assert_eq!(dragged_type(MouseButton::Left), CGEventType::LeftMouseDragged);
-        assert_eq!(dragged_type(MouseButton::Right), CGEventType::RightMouseDragged);
-        assert_eq!(dragged_type(MouseButton::Middle), CGEventType::OtherMouseDragged);
+        assert_eq!(
+            click_types(MouseButton::Left),
+            (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp)
+        );
+        assert_eq!(
+            click_types(MouseButton::Right),
+            (CGEventType::RightMouseDown, CGEventType::RightMouseUp)
+        );
+        assert_eq!(
+            click_types(MouseButton::Middle),
+            (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp)
+        );
+        assert_eq!(
+            dragged_type(MouseButton::Left),
+            CGEventType::LeftMouseDragged
+        );
+        assert_eq!(
+            dragged_type(MouseButton::Right),
+            CGEventType::RightMouseDragged
+        );
+        assert_eq!(
+            dragged_type(MouseButton::Middle),
+            CGEventType::OtherMouseDragged
+        );
     }
 
     #[test]
     fn gesture_is_unsupported() {
-        let err = send_pointer(&PointerEvent::Gesture { pointers: vec![], duration_ms: 0 }, 1, 1.0, (0.0, 0.0));
-        assert!(matches!(&err, Err(GlassError::Unsupported(_))), "expected Unsupported, got {err:?}");
+        let err = send_pointer(
+            &PointerEvent::Gesture {
+                pointers: vec![],
+                duration_ms: 0,
+            },
+            1,
+            1.0,
+            (0.0, 0.0),
+        );
+        assert!(
+            matches!(&err, Err(GlassError::Unsupported(_))),
+            "expected Unsupported, got {err:?}"
+        );
     }
 
     #[test]
@@ -511,7 +614,10 @@ mod tests {
     fn mac_type_sink_rejects_unmappable_char() {
         // Errors before posting anything, so a `None` source is safe here too.
         let mut sink = MacTypeSink { source: None };
-        assert!(matches!(sink.character('€'), Err(GlassError::InvalidKey(_))));
+        assert!(matches!(
+            sink.character('€'),
+            Err(GlassError::InvalidKey(_))
+        ));
     }
 
     #[test]
@@ -522,19 +628,28 @@ mod tests {
         // so a regression that flattens these back to a bare `chord.to_string()` is caught.
         match send_chord("", None) {
             Err(GlassError::InvalidKey(msg)) => {
-                assert!(msg.contains("empty"), "expected an 'empty chord' message, got {msg:?}");
+                assert!(
+                    msg.contains("empty"),
+                    "expected an 'empty chord' message, got {msg:?}"
+                );
             }
             other => panic!("expected InvalidKey, got {other:?}"),
         }
         match send_chord("hyper+x", None) {
             Err(GlassError::InvalidKey(msg)) => {
-                assert!(msg.contains("hyper"), "message should name the bad modifier, got {msg:?}");
+                assert!(
+                    msg.contains("hyper"),
+                    "message should name the bad modifier, got {msg:?}"
+                );
             }
             other => panic!("expected InvalidKey, got {other:?}"),
         }
         match send_chord("ctrl+nope", None) {
             Err(GlassError::InvalidKey(msg)) => {
-                assert!(msg.contains("nope"), "message should name the bad key, got {msg:?}");
+                assert!(
+                    msg.contains("nope"),
+                    "message should name the bad key, got {msg:?}"
+                );
             }
             other => panic!("expected InvalidKey, got {other:?}"),
         }

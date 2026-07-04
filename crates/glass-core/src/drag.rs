@@ -71,7 +71,11 @@ impl DragGesture {
         /// button still down before the release, so the drop lands on target.
         const DWELL_MS: u64 = 48;
         let (waypoints, step) = drag_schedule(from, to, duration_ms);
-        Self { waypoints, step, dwell: Duration::from_millis(DWELL_MS) }
+        Self {
+            waypoints,
+            step,
+            dwell: Duration::from_millis(DWELL_MS),
+        }
     }
 }
 
@@ -132,7 +136,10 @@ mod tests {
     #[test]
     fn plan_has_positive_dwell_and_exact_endpoints() {
         let g = super::DragGesture::plan((0, 0), (1000, 0), 200);
-        assert!(g.dwell > Duration::ZERO, "every drag must dwell before release");
+        assert!(
+            g.dwell > Duration::ZERO,
+            "every drag must dwell before release"
+        );
         assert_eq!(g.waypoints.first(), Some(&(0, 0)));
         assert_eq!(g.waypoints.last(), Some(&(1000, 0)));
         assert_eq!(g.step, super::drag_schedule((0, 0), (1000, 0), 200).1);
@@ -148,7 +155,10 @@ mod tests {
 
     #[test]
     fn diagonal_path_is_one_to_one() {
-        assert_eq!(drag_path((0, 0), (3, 3)), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(
+            drag_path((0, 0), (3, 3)),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
     }
 
     #[test]
@@ -201,7 +211,12 @@ mod tests {
     fn schedule_more_waypoints_for_longer_duration() {
         let (short, _) = drag_schedule((0, 0), (1000, 0), 100);
         let (long, _) = drag_schedule((0, 0), (1000, 0), 400);
-        assert!(long.len() > short.len(), "longer duration must yield more waypoints: {} vs {}", long.len(), short.len());
+        assert!(
+            long.len() > short.len(),
+            "longer duration must yield more waypoints: {} vs {}",
+            long.len(),
+            short.len()
+        );
     }
 
     #[test]
@@ -250,7 +265,11 @@ mod run_drag_tests {
     }
 
     fn gesture(waypoints: Vec<(i32, i32)>) -> DragGesture {
-        DragGesture { waypoints, step: Duration::ZERO, dwell: Duration::ZERO }
+        DragGesture {
+            waypoints,
+            step: Duration::ZERO,
+            dwell: Duration::ZERO,
+        }
     }
 
     #[test]
@@ -282,7 +301,14 @@ mod run_drag_tests {
         run_drag(&mut sink, &gesture(vec![(3, 3)])).unwrap();
         assert_eq!(
             sink.calls,
-            vec![Place(3, 3), Mods(true), Button(true), Move(3, 3), Button(false), Mods(false)],
+            vec![
+                Place(3, 3),
+                Mods(true),
+                Button(true),
+                Move(3, 3),
+                Button(false),
+                Mods(false)
+            ],
         );
     }
 

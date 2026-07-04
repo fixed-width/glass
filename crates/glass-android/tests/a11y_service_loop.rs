@@ -3,7 +3,9 @@
 //!   GLASS_ANDROID_A11Y_APK=$HOME/git-sources/fw/glass-android-agent/a11y/build/outputs/apk/debug/a11y-debug.apk \
 //!     cargo test -p glass-android --test a11y_service_loop -- --ignored --nocapture
 
-use glass_android::{A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry, ServiceA11y};
+use glass_android::{
+    A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry, ServiceA11y,
+};
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget};
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowGeometry};
 
@@ -33,14 +35,23 @@ fn a11y_service_snapshot_and_actions() {
     let mut a11y = ServiceA11y::new(client, String::new());
     let ctx = AxContext {
         pids: vec![],
-        window: WindowGeometry { x: 0, y: 0, width: 1080, height: 2400 },
+        window: WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        },
         window_handle: None,
         a11y_bus_addr: None,
     };
 
     let mut tree = a11y.snapshot(&ctx).expect("snapshot");
     tree.assign_ids();
-    assert!(tree.count > 1, "expected a non-trivial a11y tree, got {}", tree.count);
+    assert!(
+        tree.count > 1,
+        "expected a non-trivial a11y tree, got {}",
+        tree.count
+    );
 
     // If the active window has an editable field, set it via the service (ACTION_SET_TEXT — the
     // reliable high-fidelity action). Settings' top screen has none, so this is best-effort; point
@@ -52,8 +63,14 @@ fn a11y_service_snapshot_and_actions() {
         n.children.iter().find_map(first_editable)
     }
     if let Some(node) = first_editable(&tree.root) {
-        let target = AxTarget { id: node.id, role: node.role, name: node.name.clone(), bounds: node.bounds };
-        a11y.set_value(&ctx, &target, "viaA11y").expect("set_value via ACTION_SET_TEXT");
+        let target = AxTarget {
+            id: node.id,
+            role: node.role,
+            name: node.name.clone(),
+            bounds: node.bounds,
+        };
+        a11y.set_value(&ctx, &target, "viaA11y")
+            .expect("set_value via ACTION_SET_TEXT");
     }
 
     reg.shutdown(); // restores enabled_accessibility_services + removes the forward

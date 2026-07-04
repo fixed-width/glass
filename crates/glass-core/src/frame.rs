@@ -27,7 +27,12 @@ impl Region {
     /// hitting the backend.
     pub fn check_fits(&self, width: u32, height: u32) -> Result<()> {
         // Widen to u64 so a huge x/width can't wrap past the bound.
-        let (x, y, w, h) = (self.x as u64, self.y as u64, self.width as u64, self.height as u64);
+        let (x, y, w, h) = (
+            self.x as u64,
+            self.y as u64,
+            self.width as u64,
+            self.height as u64,
+        );
         if w == 0 || h == 0 || x + w > width as u64 || y + h > height as u64 {
             return Err(GlassError::InvalidRegion(format!(
                 "region {}x{} at ({},{}) is empty or exceeds the {}x{} bounds",
@@ -43,7 +48,9 @@ impl Region {
 /// WebP decoder's reported canvas size, a directly-constructed `Frame`), so the
 /// multiply is checked rather than allowed to panic in debug / wrap in release.
 pub(crate) fn rgba_byte_len(width: u32, height: u32) -> Option<usize> {
-    (width as usize).checked_mul(height as usize)?.checked_mul(4)
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)
 }
 
 impl Frame {
@@ -63,13 +70,26 @@ impl Frame {
                 height
             )));
         }
-        Ok(Self { width, height, pixels })
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
     }
 
     /// A solid-color frame, handy for tests and placeholders.
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Self {
-        let pixels = rgba.iter().copied().cycle().take(width as usize * height as usize * 4).collect();
-        Self { width, height, pixels }
+        let pixels = rgba
+            .iter()
+            .copied()
+            .cycle()
+            .take(width as usize * height as usize * 4)
+            .collect();
+        Self {
+            width,
+            height,
+            pixels,
+        }
     }
 
     /// Number of pixels (not bytes).
@@ -137,7 +157,14 @@ mod tests {
             }
         }
         let frame = Frame::new(w, h, px).unwrap();
-        let cropped = frame.crop(&Region { x: 1, y: 1, width: 2, height: 2 }).unwrap();
+        let cropped = frame
+            .crop(&Region {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            })
+            .unwrap();
         assert_eq!((cropped.width, cropped.height), (2, 2));
         assert_eq!(&cropped.pixels[0..4], &[1, 1, 0, 255]); // (1,1)
         assert_eq!(&cropped.pixels[4..8], &[2, 1, 0, 255]); // (2,1)
@@ -148,7 +175,14 @@ mod tests {
     #[test]
     fn crop_full_frame_is_identity() {
         let frame = Frame::solid(3, 2, [9, 8, 7, 255]);
-        let cropped = frame.crop(&Region { x: 0, y: 0, width: 3, height: 2 }).unwrap();
+        let cropped = frame
+            .crop(&Region {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+            })
+            .unwrap();
         assert_eq!(cropped, frame);
     }
 
@@ -156,21 +190,65 @@ mod tests {
     fn crop_flush_to_edges_succeeds() {
         // bottom-right 2x2 corner: x+w == 4 and y+h == 4 are in-bounds.
         let frame = Frame::solid(4, 4, [1, 2, 3, 255]);
-        let cropped = frame.crop(&Region { x: 2, y: 2, width: 2, height: 2 }).unwrap();
+        let cropped = frame
+            .crop(&Region {
+                x: 2,
+                y: 2,
+                width: 2,
+                height: 2,
+            })
+            .unwrap();
         assert_eq!((cropped.width, cropped.height), (2, 2));
     }
 
     #[test]
     fn region_check_fits_validates_bounds() {
-        assert!(Region { x: 0, y: 0, width: 4, height: 4 }.check_fits(4, 4).is_ok());
-        assert!(Region { x: 2, y: 2, width: 2, height: 2 }.check_fits(4, 4).is_ok());
+        assert!(Region {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4
+        }
+        .check_fits(4, 4)
+        .is_ok());
+        assert!(Region {
+            x: 2,
+            y: 2,
+            width: 2,
+            height: 2
+        }
+        .check_fits(4, 4)
+        .is_ok());
         for bad in [
-            Region { x: 0, y: 0, width: 0, height: 2 },
-            Region { x: 0, y: 0, width: 2, height: 0 },
-            Region { x: 3, y: 0, width: 2, height: 1 },
-            Region { x: 0, y: 3, width: 1, height: 2 },
+            Region {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 2,
+            },
+            Region {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 0,
+            },
+            Region {
+                x: 3,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            Region {
+                x: 0,
+                y: 3,
+                width: 1,
+                height: 2,
+            },
         ] {
-            assert!(matches!(bad.check_fits(4, 4), Err(GlassError::InvalidRegion(_))), "{bad:?}");
+            assert!(
+                matches!(bad.check_fits(4, 4), Err(GlassError::InvalidRegion(_))),
+                "{bad:?}"
+            );
         }
     }
 
@@ -178,11 +256,36 @@ mod tests {
     fn crop_rejects_empty_or_out_of_bounds() {
         let frame = Frame::solid(4, 4, [0, 0, 0, 255]);
         for bad in [
-            Region { x: 0, y: 0, width: 0, height: 2 }, // zero width
-            Region { x: 0, y: 0, width: 2, height: 0 }, // zero height
-            Region { x: 3, y: 0, width: 2, height: 1 }, // x+w = 5 > 4
-            Region { x: 0, y: 3, width: 1, height: 2 }, // y+h = 5 > 4
-            Region { x: 5, y: 5, width: 1, height: 1 }, // origin past frame
+            Region {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 2,
+            }, // zero width
+            Region {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 0,
+            }, // zero height
+            Region {
+                x: 3,
+                y: 0,
+                width: 2,
+                height: 1,
+            }, // x+w = 5 > 4
+            Region {
+                x: 0,
+                y: 3,
+                width: 1,
+                height: 2,
+            }, // y+h = 5 > 4
+            Region {
+                x: 5,
+                y: 5,
+                width: 1,
+                height: 1,
+            }, // origin past frame
         ] {
             assert!(
                 matches!(frame.crop(&bad), Err(GlassError::InvalidRegion(_))),

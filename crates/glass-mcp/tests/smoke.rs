@@ -46,24 +46,33 @@ fn initialize_list_tools_and_call_stop() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "glass-smoke", "version": "0" }
-        }
-    }));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "glass-smoke", "version": "0" }
+            }
+        }),
+    );
     let init = read_response(&mut stdout, 1);
     assert!(init.get("result").is_some(), "initialize failed: {init}");
 
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "method": "notifications/initialized"
-    }));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        }),
+    );
 
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
-    }));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+        }),
+    );
     let tools = read_response(&mut stdout, 2);
     let names: Vec<String> = tools["result"]["tools"]
         .as_array()
@@ -71,20 +80,39 @@ fn initialize_list_tools_and_call_stop() {
         .iter()
         .map(|t| t["name"].as_str().unwrap_or("").to_string())
         .collect();
-    for expected in ["glass_start", "glass_screenshot", "glass_click", "glass_stop",
-                     "glass_list_windows", "glass_select_window"] {
-        assert!(names.iter().any(|n| n == expected), "missing tool {expected}; got {names:?}");
+    for expected in [
+        "glass_start",
+        "glass_screenshot",
+        "glass_click",
+        "glass_stop",
+        "glass_list_windows",
+        "glass_select_window",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "missing tool {expected}; got {names:?}"
+        );
     }
 
-    send(&mut stdin, &serde_json::json!({
-        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-        "params": { "name": "glass_stop", "arguments": {} }
-    }));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "glass_stop", "arguments": {} }
+        }),
+    );
     let call = read_response(&mut stdout, 3);
     let result = &call["result"];
-    assert_eq!(result["isError"].as_bool(), Some(true), "expected error result: {call}");
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "expected error result: {call}"
+    );
     let text = result["content"][0]["text"].as_str().unwrap_or("");
-    assert!(text.contains("no active session"), "unexpected message: {text}");
+    assert!(
+        text.contains("no active session"),
+        "unexpected message: {text}"
+    );
 
     let _ = child.kill();
     let _ = child.wait();

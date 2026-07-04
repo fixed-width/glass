@@ -66,7 +66,10 @@ mod tests {
     fn load_missing_reports_baseline_missing() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::new(dir.path());
-        assert!(matches!(store.load("nope").unwrap_err(), GlassError::BaselineMissing(_)));
+        assert!(matches!(
+            store.load("nope").unwrap_err(),
+            GlassError::BaselineMissing(_)
+        ));
     }
 
     #[test]
@@ -74,7 +77,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::new(dir.path());
         let frame = Frame::solid(1, 1, [0, 0, 0, 255]);
-        assert!(matches!(store.save("../escape", &frame).unwrap_err(), GlassError::InvalidName(_)));
-        assert!(matches!(store.load("a/b").unwrap_err(), GlassError::InvalidName(_)));
+        assert!(matches!(
+            store.save("../escape", &frame).unwrap_err(),
+            GlassError::InvalidName(_)
+        ));
+        assert!(matches!(
+            store.load("a/b").unwrap_err(),
+            GlassError::InvalidName(_)
+        ));
     }
 }

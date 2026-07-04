@@ -92,6 +92,9 @@ mod tests {
 
     #[test]
     fn rejects_truncated_header() {
-        assert!(matches!(decode_screencap(&[0u8; 4]), Err(GlassError::CaptureFailed(_))));
+        assert!(matches!(
+            decode_screencap(&[0u8; 4]),
+            Err(GlassError::CaptureFailed(_))
+        ));
     }
 }

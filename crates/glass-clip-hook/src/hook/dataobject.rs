@@ -13,12 +13,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, E_UNEXPECTED, OLE_E_ADVISENOTSUPPORTED, S_FALSE,
-    S_OK,
+    DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, E_UNEXPECTED, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
     IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
-    FORMATETC, STGMEDIUM, STGMEDIUM_0, DATADIR_GET, DVASPECT_CONTENT, TYMED_HGLOBAL,
+    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 
 use crate::proto::FormatKey;

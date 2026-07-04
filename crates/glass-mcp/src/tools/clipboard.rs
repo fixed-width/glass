@@ -18,9 +18,9 @@ pub fn clipboard_set(glass: &mut Glass, a: &ClipboardSetArgs) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::params::{ClipboardSetArgs, StartArgs};
     use crate::tools::testutil::*;
     use crate::tools::{start as start_tool, OutContent};
-    use crate::params::{ClipboardSetArgs, StartArgs};
 
     fn started() -> Glass {
         let mut g = glass_with(FakePlatform::new(100, 100));
@@ -50,12 +50,21 @@ mod tests {
     fn clipboard_set_then_get_roundtrips() {
         let mut g = started();
         // clipboard_set returns glass's own "ok" — NOT wrapped.
-        assert_eq!(text(&clipboard_set(&mut g, &ClipboardSetArgs { text: "foo".into() }).unwrap()), "ok");
+        assert_eq!(
+            text(&clipboard_set(&mut g, &ClipboardSetArgs { text: "foo".into() }).unwrap()),
+            "ok"
+        );
         // clipboard_get returns app-derived text — MUST be wrapped.
         let out = clipboard_get(&mut g).unwrap();
         let got = text(&out);
-        assert!(got.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {got}");
-        assert!(got.contains("⟦untrusted:") && got.contains("⟦/untrusted:"), "enveloped: {got}");
+        assert!(
+            got.starts_with(crate::untrusted::NOTE),
+            "must be marked untrusted: {got}"
+        );
+        assert!(
+            got.contains("⟦untrusted:") && got.contains("⟦/untrusted:"),
+            "enveloped: {got}"
+        );
         assert!(got.contains("foo"), "body intact: {got}");
     }
 
@@ -64,11 +73,20 @@ mod tests {
         let mut g = started();
         let out = clipboard_get(&mut g).unwrap();
         let got = text(&out);
-        assert!(got.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {got}");
-        assert!(got.contains("⟦untrusted:") && got.contains("⟦/untrusted:"), "enveloped: {got}");
+        assert!(
+            got.starts_with(crate::untrusted::NOTE),
+            "must be marked untrusted: {got}"
+        );
+        assert!(
+            got.contains("⟦untrusted:") && got.contains("⟦/untrusted:"),
+            "enveloped: {got}"
+        );
         // empty body -> the envelope is present but body section is blank
         let after_open = got.split("⟧\n").nth(1).unwrap_or("");
-        let body = after_open.rsplit_once('\n').map(|(b, _)| b).unwrap_or(after_open);
+        let body = after_open
+            .rsplit_once('\n')
+            .map(|(b, _)| b)
+            .unwrap_or(after_open);
         assert_eq!(body, "", "body must be empty for empty clipboard: {got}");
     }
 }

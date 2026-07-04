@@ -142,10 +142,19 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
 
 /// Standard (non-`GLASS_*`) env glass reads at runtime — reference only.
 pub(crate) const STD_ENV: &[(&str, &str)] = &[
-    ("PATH", "Resolve bare external-tool names (bwrap/Xvfb/sway/sh)"),
+    (
+        "PATH",
+        "Resolve bare external-tool names (bwrap/Xvfb/sway/sh)",
+    ),
     ("HOME", "Sandbox ephemeral-HOME base; sway data-dir lookup"),
-    ("XDG_DATA_HOME", "sway bundle discovery ($XDG_DATA_HOME/glass/sway)"),
-    ("DBUS_SESSION_BUS_ADDRESS", "Linux accessibility (AT-SPI) bus"),
+    (
+        "XDG_DATA_HOME",
+        "sway bundle discovery ($XDG_DATA_HOME/glass/sway)",
+    ),
+    (
+        "DBUS_SESSION_BUS_ADDRESS",
+        "Linux accessibility (AT-SPI) bus",
+    ),
     ("WINDIR", "Windows system directory"),
 ];
 
@@ -189,7 +198,11 @@ pub(crate) fn render_text(current: &dyn Fn(&str) -> Option<String>) -> String {
     }
     out.push_str("\nstandard env (read, not glass-specific)\n");
     for (name, purpose) in STD_ENV {
-        let cur = if current(name).is_some() { "set" } else { "(unset)" };
+        let cur = if current(name).is_some() {
+            "set"
+        } else {
+            "(unset)"
+        };
         out.push_str(&format!("  {name:<26} {purpose} | current: {cur}\n"));
     }
     out.push_str(&format!("\n{DISPLAY_NOTE}\n"));
@@ -242,9 +255,17 @@ pub(crate) fn render_json(current: &dyn Fn(&str) -> Option<String>) -> String {
     }
     let standard = STD_ENV
         .iter()
-        .map(|(name, purpose)| StdVarView { name, purpose, is_set: current(name).is_some() })
+        .map(|(name, purpose)| StdVarView {
+            name,
+            purpose,
+            is_set: current(name).is_some(),
+        })
         .collect();
-    let doc = EnvJson { glass, standard, notes: vec![DISPLAY_NOTE] };
+    let doc = EnvJson {
+        glass,
+        standard,
+        notes: vec![DISPLAY_NOTE],
+    };
     serde_json::to_string_pretty(&doc).expect("serialize env")
 }
 
@@ -265,22 +286,47 @@ mod tests {
     #[test]
     fn registry_has_all_known_vars_once() {
         let expected = [
-            "GLASS_BACKEND", "GLASS_SANDBOX", "GLASS_DISPLAY", "GLASS_XVFB_SCREEN",
-            "GLASS_XVFB", "GLASS_SWAY", "GLASS_WAYLAND_SCREEN", "GLASS_BWRAP", "GLASS_SH",
-            "GLASS_WIN_SANDBOX_PROVIDER", "GLASS_SANDBOXIE_DIR", "GLASS_TYPE_DWELL_MS",
-            "GLASS_ADB", "GLASS_ANDROID_SERIAL", "GLASS_ANDROID_LIFECYCLE",
-            "GLASS_EMULATOR", "GLASS_AVD", "GLASS_EMULATOR_ARGS",
-            "GLASS_EMULATOR_BOOT_TIMEOUT_MS", "GLASS_EMULATOR_KEEP",
-            "GLASS_ANDROID_AGENT_JAR", "GLASS_ANDROID_AGENT",
-            "GLASS_ANDROID_A11Y_APK", "GLASS_ANDROID_A11Y",
+            "GLASS_BACKEND",
+            "GLASS_SANDBOX",
+            "GLASS_DISPLAY",
+            "GLASS_XVFB_SCREEN",
+            "GLASS_XVFB",
+            "GLASS_SWAY",
+            "GLASS_WAYLAND_SCREEN",
+            "GLASS_BWRAP",
+            "GLASS_SH",
+            "GLASS_WIN_SANDBOX_PROVIDER",
+            "GLASS_SANDBOXIE_DIR",
+            "GLASS_TYPE_DWELL_MS",
+            "GLASS_ADB",
+            "GLASS_ANDROID_SERIAL",
+            "GLASS_ANDROID_LIFECYCLE",
+            "GLASS_EMULATOR",
+            "GLASS_AVD",
+            "GLASS_EMULATOR_ARGS",
+            "GLASS_EMULATOR_BOOT_TIMEOUT_MS",
+            "GLASS_EMULATOR_KEEP",
+            "GLASS_ANDROID_AGENT_JAR",
+            "GLASS_ANDROID_AGENT",
+            "GLASS_ANDROID_A11Y_APK",
+            "GLASS_ANDROID_A11Y",
             "GLASS_TOKEN",
-            "GLASS_AUDIT_LOG", "GLASS_AUDIT_CONTENT", "GLASS_AUDIT_PREFIX_LEN",
+            "GLASS_AUDIT_LOG",
+            "GLASS_AUDIT_CONTENT",
+            "GLASS_AUDIT_PREFIX_LEN",
         ];
         for name in expected {
             let n = GLASS_ENV.iter().filter(|d| d.name == name).count();
-            assert_eq!(n, 1, "{name} must appear exactly once in GLASS_ENV (found {n})");
+            assert_eq!(
+                n, 1,
+                "{name} must appear exactly once in GLASS_ENV (found {n})"
+            );
         }
-        assert_eq!(GLASS_ENV.len(), expected.len(), "GLASS_ENV has an undocumented entry");
+        assert_eq!(
+            GLASS_ENV.len(),
+            expected.len(),
+            "GLASS_ENV has an undocumented entry"
+        );
     }
 
     #[test]
@@ -290,16 +336,25 @@ mod tests {
         assert!(out.contains("current: strict (override)"), "{out}");
         // an unset non-secret shows (unset → default)
         assert!(out.contains("GLASS_BACKEND"), "{out}");
-        assert!(out.contains("(unset \u{2192} x11 (or windows on a Windows host))"), "{out}");
+        assert!(
+            out.contains("(unset \u{2192} x11 (or windows on a Windows host))"),
+            "{out}"
+        );
         // standard-env + ignored-DISPLAY note present
-        assert!(out.contains("standard env (read, not glass-specific)"), "{out}");
+        assert!(
+            out.contains("standard env (read, not glass-specific)"),
+            "{out}"
+        );
         assert!(out.contains("ignores ambient DISPLAY"), "{out}");
     }
 
     #[test]
     fn text_groups_are_in_fixed_scope_order() {
         let out = render_text(&stub);
-        let idx = |s: &str| out.find(s).unwrap_or_else(|| panic!("missing {s} in:\n{out}"));
+        let idx = |s: &str| {
+            out.find(s)
+                .unwrap_or_else(|| panic!("missing {s} in:\n{out}"))
+        };
         // group order: all < x11 < wayland < linux < windows < android < network
         assert!(idx("GLASS_BACKEND") < idx("GLASS_DISPLAY"));
         assert!(idx("GLASS_DISPLAY") < idx("GLASS_SWAY"));
@@ -318,13 +373,23 @@ mod tests {
     fn secret_value_is_never_emitted() {
         let text = render_text(&stub);
         let json = render_json(&stub);
-        assert!(!text.contains("supersecret"), "secret leaked in text:\n{text}");
-        assert!(!json.contains("supersecret"), "secret leaked in json:\n{json}");
+        assert!(
+            !text.contains("supersecret"),
+            "secret leaked in text:\n{text}"
+        );
+        assert!(
+            !json.contains("supersecret"),
+            "secret leaked in json:\n{json}"
+        );
         // but presence is shown
         assert!(text.contains("GLASS_TOKEN"));
         // GLASS_TOKEN line shows `set`
-        let token_line = text.lines().zip(text.lines().skip(1))
-            .find(|(a, _)| a.contains("GLASS_TOKEN")).map(|(_, b)| b).unwrap();
+        let token_line = text
+            .lines()
+            .zip(text.lines().skip(1))
+            .find(|(a, _)| a.contains("GLASS_TOKEN"))
+            .map(|(_, b)| b)
+            .unwrap();
         assert!(token_line.contains("current: set"), "{token_line}");
     }
 
@@ -336,8 +401,10 @@ mod tests {
         assert_eq!(glass.len(), GLASS_ENV.len());
         let token = glass.iter().find(|e| e["name"] == "GLASS_TOKEN").unwrap();
         assert_eq!(token["is_set"], true);
-        assert!(token.get("current").is_none(),
-            "secret `current` must be absent from JSON, not null: {token}");
+        assert!(
+            token.get("current").is_none(),
+            "secret `current` must be absent from JSON, not null: {token}"
+        );
         // a non-secret set var carries its value
         let sandbox = glass.iter().find(|e| e["name"] == "GLASS_SANDBOX").unwrap();
         assert_eq!(sandbox["current"], "strict");

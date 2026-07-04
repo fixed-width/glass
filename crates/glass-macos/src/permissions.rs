@@ -6,7 +6,9 @@
 
 use std::ptr::NonNull;
 
-use objc2_core_foundation::{kCFBooleanTrue, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    kCFBooleanTrue, CFBoolean, CFDictionary, CFRetained, CFString, CFType,
+};
 
 use glass_core::Result;
 
@@ -34,7 +36,10 @@ impl Permission {
         }
     }
     fn denied(self) -> glass_core::GlassError {
-        glass_core::GlassError::PermissionDenied { which: self.label().into(), remedy: self.remedy().into() }
+        glass_core::GlassError::PermissionDenied {
+            which: self.label().into(),
+            remedy: self.remedy().into(),
+        }
     }
 
     /// Like [`Permission::denied`], but appends a caller-supplied diagnostic (e.g. the
@@ -43,7 +48,10 @@ impl Permission {
     /// `pub(crate)` (unlike `denied`) so other modules — e.g. `scwindow`'s
     /// `SCShareableContent` preflight — can reuse this wording instead of hand-rolling
     /// their own remedy string.
-    pub(crate) fn denied_with_detail(self, detail: impl std::fmt::Display) -> glass_core::GlassError {
+    pub(crate) fn denied_with_detail(
+        self,
+        detail: impl std::fmt::Display,
+    ) -> glass_core::GlassError {
         glass_core::GlassError::PermissionDenied {
             which: self.label().into(),
             remedy: format!("{} (underlying error: {detail})", self.remedy()),
@@ -132,7 +140,9 @@ pub fn open_pane(url: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(glass_core::GlassError::Backend(format!("open {url} exited {status}")))
+        Err(glass_core::GlassError::Backend(format!(
+            "open {url} exited {status}"
+        )))
     }
 }
 
@@ -185,9 +195,12 @@ pub fn request_accessibility() -> bool {
     // `None` is not a real-world case (the constant is always present on real
     // CoreFoundation builds) but falling back to the non-prompting predicate instead of
     // panicking keeps this function total.
-    let Some(true_boolean) = true_boolean else { return accessibility_granted() };
+    let Some(true_boolean) = true_boolean else {
+        return accessibility_granted();
+    };
     let prompt: &CFType = true_boolean;
-    let dict: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(&[&key], &[prompt]);
+    let dict: CFRetained<CFDictionary<CFString, CFType>> =
+        CFDictionary::from_slices(&[&key], &[prompt]);
     // SAFETY: `AXIsProcessTrustedWithOptions` takes a CFDictionaryRef; `dict` stays alive
     // for the whole call (it is dropped only when this function returns, after the FFI
     // call has returned), and the only effects are the documented consent prompt plus
@@ -213,7 +226,11 @@ mod tests {
                 assert!(!sr || !ax, "preflight denied but both predicates true");
                 // preflight checks Screen Recording first, so the specific predicate
                 // that failed pins which grant the error must name.
-                let expected = if !sr { Permission::ScreenRecording } else { Permission::Accessibility };
+                let expected = if !sr {
+                    Permission::ScreenRecording
+                } else {
+                    Permission::Accessibility
+                };
                 assert_eq!(which, expected.label());
             }
             Err(e) => panic!("unexpected error: {e}"),

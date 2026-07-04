@@ -120,10 +120,16 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
     // `axwindow::copy_attribute`).
     let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
     if err != AXError::Success {
-        return if is_absent_error(err) { Ok(None) } else { Err(ax_err(attr_name, err)) };
+        return if is_absent_error(err) {
+            Ok(None)
+        } else {
+            Err(ax_err(attr_name, err))
+        };
     }
     let nn = NonNull::new(raw.cast_mut()).ok_or_else(|| {
-        GlassError::Backend(format!("{attr_name}: AX reported success but returned a null value"))
+        GlassError::Backend(format!(
+            "{attr_name}: AX reported success but returned a null value"
+        ))
     })?;
     // SAFETY: `AXUIElementCopyAttributeValue` follows Core Foundation's Copy/Create
     // ownership rule — an already-retained (+1) `CFTypeRef` on success — so
@@ -204,7 +210,9 @@ pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
     // (mirrors `axwindow::ax_position`).
     let ok = unsafe { value.value(AXValueType::CGPoint, NonNull::from(&mut point).cast()) };
     if !ok {
-        return Err(GlassError::Backend("AXValueGetValue(AXPosition, .cgPoint) returned false".into()));
+        return Err(GlassError::Backend(
+            "AXValueGetValue(AXPosition, .cgPoint) returned false".into(),
+        ));
     }
     Ok((point.x, point.y))
 }
@@ -212,11 +220,16 @@ pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
 /// Read `el`'s `AXSize` (width/height, in points).
 pub(crate) fn ax_size(el: &AXUIElement) -> Result<(f64, f64)> {
     let value = axvalue(el, attr::SIZE)?;
-    let mut size = CGSize { width: 0.0, height: 0.0 };
+    let mut size = CGSize {
+        width: 0.0,
+        height: 0.0,
+    };
     // SAFETY: same as `ax_position` above, with `AXValueType::CGSize`/`CGSize`.
     let ok = unsafe { value.value(AXValueType::CGSize, NonNull::from(&mut size).cast()) };
     if !ok {
-        return Err(GlassError::Backend("AXValueGetValue(AXSize, .cgSize) returned false".into()));
+        return Err(GlassError::Backend(
+            "AXValueGetValue(AXSize, .cgSize) returned false".into(),
+        ));
     }
     Ok((size.width, size.height))
 }
@@ -296,7 +309,10 @@ mod tests {
             AXError::APIDisabled,
             AXError::NotImplemented,
         ] {
-            assert!(!is_absent_error(err), "{err:?} must not be treated as absent");
+            assert!(
+                !is_absent_error(err),
+                "{err:?} must not be treated as absent"
+            );
         }
     }
 }

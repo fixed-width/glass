@@ -35,6 +35,9 @@ mod tests {
     fn scratch_dir_joins_name_under_a_base() {
         let p = scratch_dir("glass-probe");
         assert!(p.ends_with("\\glass-probe"), "got {p}");
-        assert!(p.len() > "\\glass-probe".len(), "should have a base prefix: {p}");
+        assert!(
+            p.len() > "\\glass-probe".len(),
+            "should have a base prefix: {p}"
+        );
     }
 }

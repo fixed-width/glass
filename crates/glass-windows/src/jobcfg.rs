@@ -63,7 +63,11 @@ mod tests {
 
     #[test]
     fn teardown_and_crash_dialog_are_always_on() {
-        for level in [SandboxLevel::Off, SandboxLevel::Default, SandboxLevel::Strict] {
+        for level in [
+            SandboxLevel::Off,
+            SandboxLevel::Default,
+            SandboxLevel::Strict,
+        ] {
             let c = job_config(level);
             assert!(c.kill_on_close);
             assert!(c.suppress_crash_dialog);

@@ -10,7 +10,13 @@ use wayland_client::protocol::wl_shm::Format;
 ///
 /// Stride padding is dropped row-by-row; the per-pixel swizzle is the shared SIMD
 /// kernel in [`glass_core::pixels`]. Errors on any other format.
-pub fn to_rgba(src: &[u8], format: Format, width: u32, height: u32, stride: u32) -> Result<Vec<u8>> {
+pub fn to_rgba(
+    src: &[u8],
+    format: Format,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<Vec<u8>> {
     let order = match format {
         Format::Xrgb8888 | Format::Argb8888 => SourceOrder::Bgr,
         Format::Xbgr8888 | Format::Abgr8888 => SourceOrder::Rgb,
@@ -22,7 +28,9 @@ pub fn to_rgba(src: &[u8], format: Format, width: u32, height: u32, stride: u32)
     };
     let (w, h, stride) = (width as usize, height as usize, stride as usize);
     if stride < w * 4 {
-        return Err(GlassError::CaptureFailed(format!("stride {stride} < {w}*4")));
+        return Err(GlassError::CaptureFailed(format!(
+            "stride {stride} < {w}*4"
+        )));
     }
     let needed = stride
         .checked_mul(h)
@@ -55,7 +63,10 @@ mod tests {
             7, 8, 9, 255, 10, 11, 12, 255, 0, 0, 0, 0, // row 1 (+pad)
         ];
         let out = to_rgba(&src, Format::Xrgb8888, 2, 2, 12).unwrap();
-        assert_eq!(out, vec![3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]);
+        assert_eq!(
+            out,
+            vec![3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]
+        );
     }
 
     #[test]

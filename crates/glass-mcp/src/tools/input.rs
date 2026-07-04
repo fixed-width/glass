@@ -20,7 +20,13 @@ pub fn click(glass: &mut Glass, a: &ClickArgs) -> ToolResult {
     let button = parse_button(a.button.as_deref())?;
     let modifiers = parse_modifiers(a.modifiers.as_deref())?;
     glass
-        .pointer(&PointerEvent::Click { x: a.x, y: a.y, button, count: a.count.unwrap_or(1), modifiers })
+        .pointer(&PointerEvent::Click {
+            x: a.x,
+            y: a.y,
+            button,
+            count: a.count.unwrap_or(1),
+            modifiers,
+        })
         .map_err(|e| e.to_string())?;
     Ok(ToolOutput::text("ok"))
 }
@@ -55,15 +61,26 @@ pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
         return Err("glass_gesture needs 2+ pointers; use glass_drag for a single pointer".into());
     }
     if n > glass_core::MAX_GESTURE_POINTERS {
-        return Err(format!("too many pointers ({n}); max is {}", glass_core::MAX_GESTURE_POINTERS));
+        return Err(format!(
+            "too many pointers ({n}); max is {}",
+            glass_core::MAX_GESTURE_POINTERS
+        ));
     }
     let pointers = a
         .pointers
         .iter()
-        .map(|p| glass_core::Segment { from_x: p.from.x, from_y: p.from.y, to_x: p.to.x, to_y: p.to.y })
+        .map(|p| glass_core::Segment {
+            from_x: p.from.x,
+            from_y: p.from.y,
+            to_x: p.to.x,
+            to_y: p.to.y,
+        })
         .collect();
     glass
-        .pointer(&PointerEvent::Gesture { pointers, duration_ms: a.duration_ms.unwrap_or(250).min(10_000) })
+        .pointer(&PointerEvent::Gesture {
+            pointers,
+            duration_ms: a.duration_ms.unwrap_or(250).min(10_000),
+        })
         .map_err(|e| e.to_string())?;
     Ok(ToolOutput::text("ok"))
 }
@@ -129,37 +146,83 @@ mod tests {
     #[test]
     fn click_in_bounds_ok() {
         let mut g = started();
-        let a = ClickArgs { x: 10, y: 20, button: None, count: None, modifiers: None };
+        let a = ClickArgs {
+            x: 10,
+            y: 20,
+            button: None,
+            count: None,
+            modifiers: None,
+        };
         assert_eq!(text(&click(&mut g, &a).unwrap()), "ok");
     }
 
     #[test]
     fn click_out_of_bounds_errors() {
         let mut g = started();
-        let a = ClickArgs { x: 100, y: 20, button: None, count: None, modifiers: None }; // valid 0..=99
+        let a = ClickArgs {
+            x: 100,
+            y: 20,
+            button: None,
+            count: None,
+            modifiers: None,
+        }; // valid 0..=99
         assert!(click(&mut g, &a).unwrap_err().contains("out of bounds"));
     }
 
     #[test]
     fn bad_button_errors() {
         let mut g = started();
-        let a = ClickArgs { x: 1, y: 1, button: Some("nope".into()), count: None, modifiers: None };
+        let a = ClickArgs {
+            x: 1,
+            y: 1,
+            button: Some("nope".into()),
+            count: None,
+            modifiers: None,
+        };
         assert!(click(&mut g, &a).unwrap_err().contains("unknown button"));
     }
 
     #[test]
     fn type_and_key_ok() {
         let mut g = started();
-        assert_eq!(text(&type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap()), "ok");
-        assert_eq!(text(&key(&mut g, &KeyArgs { chord: "ctrl+s".into() }).unwrap()), "ok");
+        assert_eq!(
+            text(&type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap()),
+            "ok"
+        );
+        assert_eq!(
+            text(
+                &key(
+                    &mut g,
+                    &KeyArgs {
+                        chord: "ctrl+s".into()
+                    }
+                )
+                .unwrap()
+            ),
+            "ok"
+        );
     }
 
     #[test]
     fn drag_and_scroll_ok() {
         let mut g = started();
-        let d = DragArgs { x1: 1, y1: 2, x2: 3, y2: 4, button: None, modifiers: None, duration_ms: None };
+        let d = DragArgs {
+            x1: 1,
+            y1: 2,
+            x2: 3,
+            y2: 4,
+            button: None,
+            modifiers: None,
+            duration_ms: None,
+        };
         assert_eq!(text(&drag(&mut g, &d).unwrap()), "ok");
-        let s = ScrollArgs { x: 5, y: 6, dx: None, dy: Some(2), modifiers: None };
+        let s = ScrollArgs {
+            x: 5,
+            y: 6,
+            dx: None,
+            dy: Some(2),
+            modifiers: None,
+        };
         assert_eq!(text(&scroll(&mut g, &s).unwrap()), "ok");
     }
 
@@ -168,8 +231,14 @@ mod tests {
         let mut g = started();
         let a = GestureArgs {
             pointers: vec![
-                PointerArgs { from: PointArg { x: 30, y: 40 }, to: PointArg { x: 10, y: 40 } },
-                PointerArgs { from: PointArg { x: 50, y: 40 }, to: PointArg { x: 70, y: 40 } },
+                PointerArgs {
+                    from: PointArg { x: 30, y: 40 },
+                    to: PointArg { x: 10, y: 40 },
+                },
+                PointerArgs {
+                    from: PointArg { x: 50, y: 40 },
+                    to: PointArg { x: 70, y: 40 },
+                },
             ],
             duration_ms: Some(120),
         };
@@ -180,7 +249,10 @@ mod tests {
     fn gesture_one_pointer_errors() {
         let mut g = started();
         let a = GestureArgs {
-            pointers: vec![PointerArgs { from: PointArg { x: 1, y: 1 }, to: PointArg { x: 2, y: 2 } }],
+            pointers: vec![PointerArgs {
+                from: PointArg { x: 1, y: 1 },
+                to: PointArg { x: 2, y: 2 },
+            }],
             duration_ms: None,
         };
         assert!(gesture(&mut g, &a).is_err());
@@ -189,9 +261,23 @@ mod tests {
     #[test]
     fn click_parses_and_rejects_modifiers() {
         let mut g = started();
-        let ok = ClickArgs { x: 1, y: 1, button: None, count: None, modifiers: Some(vec!["ctrl".into()]) };
+        let ok = ClickArgs {
+            x: 1,
+            y: 1,
+            button: None,
+            count: None,
+            modifiers: Some(vec!["ctrl".into()]),
+        };
         assert_eq!(text(&click(&mut g, &ok).unwrap()), "ok");
-        let bad = ClickArgs { x: 1, y: 1, button: None, count: None, modifiers: Some(vec!["hyper".into()]) };
-        assert!(click(&mut g, &bad).unwrap_err().contains("unknown modifier"));
+        let bad = ClickArgs {
+            x: 1,
+            y: 1,
+            button: None,
+            count: None,
+            modifiers: Some(vec!["hyper".into()]),
+        };
+        assert!(click(&mut g, &bad)
+            .unwrap_err()
+            .contains("unknown modifier"));
     }
 }

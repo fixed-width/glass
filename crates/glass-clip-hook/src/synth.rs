@@ -41,7 +41,10 @@ pub(crate) fn available(stored: &[FormatKey]) -> Vec<FormatKey> {
 /// The formats the OLE proxy advertises: `available` minus GDI `CF_BITMAP` (the byte-serving proxy
 /// only produces HGLOBAL media; `CF_BITMAP` is a GDI handle served only by the user32 path).
 pub(crate) fn serve_keys(stored: &[FormatKey]) -> Vec<FormatKey> {
-    available(stored).into_iter().filter(|k| *k != Standard(CF_BITMAP)).collect()
+    available(stored)
+        .into_iter()
+        .filter(|k| *k != Standard(CF_BITMAP))
+        .collect()
 }
 
 /// If `requested` is a synthesizable derivative, the stored canonical key it derives from.
@@ -63,7 +66,7 @@ mod tests {
     #[test]
     fn unicodetext_yields_text_triad_and_locale() {
         let avail = available(&[Standard(13)]); // CF_UNICODETEXT
-        // canonical first, then synthesized, in a stable order
+                                                // canonical first, then synthesized, in a stable order
         assert_eq!(avail[0], Standard(13));
         for k in [Standard(1), Standard(7), Standard(16)] {
             assert!(avail.contains(&k), "missing {k:?}");
@@ -102,13 +105,19 @@ mod tests {
         let keys = serve_keys(&[Standard(8)]);
         assert!(keys.contains(&Standard(8))); // CF_DIB
         assert!(keys.contains(&Standard(17))); // CF_DIBV5 (byte rewrite)
-        assert!(!keys.contains(&Standard(2)), "CF_BITMAP must be excluded: {keys:?}");
+        assert!(
+            !keys.contains(&Standard(2)),
+            "CF_BITMAP must be excluded: {keys:?}"
+        );
         // CF_UNICODETEXT stored → text triad (all byte) kept.
         let t = serve_keys(&[Standard(13)]);
         for k in [Standard(13), Standard(1), Standard(7), Standard(16)] {
             assert!(t.contains(&k), "missing {k:?}");
         }
         // Named formats pass through.
-        assert_eq!(serve_keys(&[Named("HTML Format".into())]), vec![Named("HTML Format".into())]);
+        assert_eq!(
+            serve_keys(&[Named("HTML Format".into())]),
+            vec![Named("HTML Format".into())]
+        );
     }
 }

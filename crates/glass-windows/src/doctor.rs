@@ -72,9 +72,11 @@ pub(crate) fn build_checks(f: &DoctorFacts) -> Vec<Check> {
     });
     // 3. DPI awareness (per-monitor = physical pixels; system/unaware = virtualized coords)
     v.push(match f.dpi {
-        DpiAwareness::PerMonitorV2 => {
-            Check::new("DPI awareness", CheckStatus::Ok, "Per-Monitor-V2 (manifest)")
-        }
+        DpiAwareness::PerMonitorV2 => Check::new(
+            "DPI awareness",
+            CheckStatus::Ok,
+            "Per-Monitor-V2 (manifest)",
+        ),
         DpiAwareness::PerMonitorV1 => Check::new(
             "DPI awareness",
             CheckStatus::Ok,
@@ -161,9 +163,17 @@ pub(crate) fn build_sandbox_checks(
     }
     // VM tier pointer (separate, stronger deployment option)
     v.push(if windows_sandbox {
-        Check::new("Windows Sandbox (VM tier)", CheckStatus::Ok, "available — strongest isolation; run glass inside it (see packaging/windows-sandbox)")
+        Check::new(
+            "Windows Sandbox (VM tier)",
+            CheckStatus::Ok,
+            "available — strongest isolation; run glass inside it (see packaging/windows-sandbox)",
+        )
     } else {
-        Check::new("Windows Sandbox (VM tier)", CheckStatus::Skip, "not available on this edition (Pro/Enterprise/Education only)")
+        Check::new(
+            "Windows Sandbox (VM tier)",
+            CheckStatus::Skip,
+            "not available on this edition (Pro/Enterprise/Education only)",
+        )
     });
     v
 }
@@ -184,7 +194,9 @@ pub(crate) fn build_clipboard_check(hook_resolvable: bool, dll_path: &str) -> Ch
             CheckStatus::Warn,
             "contained app clipboard disabled (hook DLL not found); your clipboard is protected",
         )
-        .with_remedy("set GLASS_CLIP_HOOK_DLL or reinstall so the boxed app gets a private clipboard")
+        .with_remedy(
+            "set GLASS_CLIP_HOOK_DLL or reinstall so the boxed app gets a private clipboard",
+        )
     }
 }
 
@@ -210,7 +222,10 @@ pub fn sandbox_checks() -> Vec<Check> {
         .as_deref()
         .map(|p| std::path::Path::new(p).exists())
         .unwrap_or(false);
-    v.push(build_clipboard_check(resolvable, dll.as_deref().unwrap_or("<unset>")));
+    v.push(build_clipboard_check(
+        resolvable,
+        dll.as_deref().unwrap_or("<unset>"),
+    ));
     v
 }
 
@@ -433,14 +448,20 @@ mod tests {
     #[test]
     fn windows_sandbox_vm_tier_skip_when_absent() {
         let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), false);
-        let vm = v.iter().find(|c| c.name == "Windows Sandbox (VM tier)").unwrap();
+        let vm = v
+            .iter()
+            .find(|c| c.name == "Windows Sandbox (VM tier)")
+            .unwrap();
         assert_eq!(vm.status, CheckStatus::Skip);
     }
 
     #[test]
     fn windows_sandbox_vm_tier_ok_when_present() {
         let v = build_sandbox_checks(true, r"C:\Program Files\Sandboxie", Some(false), true);
-        let vm = v.iter().find(|c| c.name == "Windows Sandbox (VM tier)").unwrap();
+        let vm = v
+            .iter()
+            .find(|c| c.name == "Windows Sandbox (VM tier)")
+            .unwrap();
         assert_eq!(vm.status, CheckStatus::Ok);
     }
 

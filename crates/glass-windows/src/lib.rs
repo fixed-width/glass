@@ -5,16 +5,16 @@
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
 //! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi`.
 
-pub mod dpi; // pure coordinate math — cross-platform, unit-tested on the Linux dev box
-pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
-pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
-pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on the Linux dev box
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
-pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
-pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box
+pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
+pub mod dpi; // pure coordinate math — cross-platform, unit-tested on the Linux dev box
+pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on the Linux dev box
+pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
 #[doc(hidden)]
-pub mod onbox_support; // env-resolved paths shared by the on-box examples + tests; host-tested
+pub mod onbox_support;
+pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
+pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box // env-resolved paths shared by the on-box examples + tests; host-tested
 
 /// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
 /// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.
@@ -57,8 +57,8 @@ mod backend {
     use glass_core::frame::{Frame, Region};
     use glass_core::logbuf::Stream;
     use glass_core::platform::{
-        AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowHint, WindowId, WindowInfo,
-        WindowOp,
+        AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowHint, WindowId,
+        WindowInfo, WindowOp,
     };
     use glass_core::{GlassError, Result};
 

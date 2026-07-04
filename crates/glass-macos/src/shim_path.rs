@@ -38,7 +38,10 @@ pub fn resolve_shim(exe_dir: &Path, env_override: Option<PathBuf>) -> Option<Pat
             return Some(path);
         }
     }
-    if let Some(bundled) = exe_dir.parent().map(|contents| contents.join("Frameworks").join(SHIM_DYLIB_NAME)) {
+    if let Some(bundled) = exe_dir
+        .parent()
+        .map(|contents| contents.join("Frameworks").join(SHIM_DYLIB_NAME))
+    {
         if bundled.is_file() {
             return Some(bundled);
         }
@@ -64,8 +67,11 @@ mod tests {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("create parent dirs");
             }
-            std::fs::write(&path, b"stand-in dylib contents; only existence matters here")
-                .expect("write stand-in file");
+            std::fs::write(
+                &path,
+                b"stand-in dylib contents; only existence matters here",
+            )
+            .expect("write stand-in file");
             Self(path)
         }
     }
@@ -97,7 +103,11 @@ mod tests {
         // other tier has a file either) rather than being handed back as-is.
         let bogus = PathBuf::from("/nonexistent/glass-clip-shim-test.dylib");
         let resolved = resolve_shim(Path::new("/also/nonexistent/exe/dir"), Some(bogus.clone()));
-        assert_ne!(resolved, Some(bogus), "a nonexistent override must not be returned as-is");
+        assert_ne!(
+            resolved,
+            Some(bogus),
+            "a nonexistent override must not be returned as-is"
+        );
     }
 
     #[test]
@@ -106,7 +116,11 @@ mod tests {
         // packaged `.app` layout `build-app.sh` produces.
         let dir = scratch_dir("bundle");
         let exe_dir = dir.join("Contents").join("MacOS");
-        let bundled = TempFile::create(dir.join("Contents").join("Frameworks").join(SHIM_DYLIB_NAME));
+        let bundled = TempFile::create(
+            dir.join("Contents")
+                .join("Frameworks")
+                .join(SHIM_DYLIB_NAME),
+        );
         // Also drop a file at the target-dir tier's location (`Contents/<name>`) to prove
         // the bundle tier is checked, and wins, before it.
         let target_dir_candidate = TempFile::create(dir.join("Contents").join(SHIM_DYLIB_NAME));

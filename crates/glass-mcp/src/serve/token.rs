@@ -19,7 +19,9 @@ mod tests {
         let t = generate_token();
         // 32 bytes → 43 base64url chars (no padding).
         assert_eq!(t.len(), 43);
-        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert!(!t.contains('\n') && !t.contains('='));
     }
 

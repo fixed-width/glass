@@ -42,7 +42,8 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
             "states": e.states.active(),
         })
     });
-    let body = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element }).to_string();
+    let body =
+        json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element }).to_string();
     Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
 }
 
@@ -88,7 +89,9 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
     let mut out = Vec::new();
     let mut image_produced = false;
     if o.matched && a.include_image.unwrap_or(false) {
-        out.push(OutContent::Image(frame_to_webp(&o.frame).map_err(|e| e.to_string())?));
+        out.push(OutContent::Image(
+            frame_to_webp(&o.frame).map_err(|e| e.to_string())?,
+        ));
         image_produced = true;
     }
     out.push(OutContent::Text(meta.to_string()));
@@ -127,7 +130,9 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
     if let Some(note) = &o.note {
         body["note"] = json!(note);
     }
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body.to_string())))
+    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(
+        &body.to_string(),
+    )))
 }
 
 #[cfg(test)]
@@ -175,12 +180,16 @@ mod tests {
         let mut g = started_a11y();
         let mut a = elem_args();
         a.role = Some("notarole".into());
-        assert!(wait_for_element(&mut g, &a).unwrap_err().contains("unknown role"));
+        assert!(wait_for_element(&mut g, &a)
+            .unwrap_err()
+            .contains("unknown role"));
 
         let mut b = elem_args();
         b.name = Some("Save".into());
         b.condition = Some("nope".into());
-        assert!(wait_for_element(&mut g, &b).unwrap_err().contains("unknown condition"));
+        assert!(wait_for_element(&mut g, &b)
+            .unwrap_err()
+            .contains("unknown condition"));
     }
 
     #[test]
@@ -193,8 +202,14 @@ mod tests {
         let out = wait_for_element(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {t}");
-                assert!(t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"), "enveloped: {t}");
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
                 assert!(t.contains("\"matched\":true"), "got: {t}");
                 assert!(t.contains("\"id\":1"), "got: {t}");
                 assert!(t.contains("\"name\":\"Save\""), "got: {t}");
@@ -213,8 +228,14 @@ mod tests {
         let out = wait_for_element(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {t}");
-                assert!(t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"), "enveloped: {t}");
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
                 assert!(t.contains("\"matched\":false"), "got: {t}");
                 assert!(t.contains("\"element\":null"), "got: {t}");
             }
@@ -290,14 +311,25 @@ mod tests {
         })
         .unwrap();
         let mut a = region_args();
-        a.region = Some(RegionArgs { x: 2, y: 2, width: 2, height: 2 });
+        a.region = Some(RegionArgs {
+            x: 2,
+            y: 2,
+            width: 2,
+            height: 2,
+        });
         let out = wait_for_region(&mut g, &a).unwrap();
         match out.0.last().unwrap() {
             OutContent::Text(t) => {
                 let v: serde_json::Value = serde_json::from_str(t).unwrap();
                 assert_eq!(v["matched"], true, "got: {t}");
-                assert_eq!(v["bbox"]["x"], 2, "bbox x must be window-relative; got: {t}");
-                assert_eq!(v["bbox"]["y"], 2, "bbox y must be window-relative; got: {t}");
+                assert_eq!(
+                    v["bbox"]["x"], 2,
+                    "bbox x must be window-relative; got: {t}"
+                );
+                assert_eq!(
+                    v["bbox"]["y"], 2,
+                    "bbox y must be window-relative; got: {t}"
+                );
                 assert_eq!(v["bbox"]["width"], 2, "got: {t}");
                 assert_eq!(v["bbox"]["height"], 2, "got: {t}");
             }
@@ -311,7 +343,9 @@ mod tests {
         let mut a = region_args();
         a.until = Some("matches".into());
         a.baseline = None;
-        assert!(wait_for_region(&mut g, &a).unwrap_err().contains("baseline"));
+        assert!(wait_for_region(&mut g, &a)
+            .unwrap_err()
+            .contains("baseline"));
     }
 
     #[test]
@@ -319,10 +353,14 @@ mod tests {
         let mut g = started_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]);
         let mut a = region_args();
         a.until = Some("sideways".into());
-        assert!(wait_for_region(&mut g, &a).unwrap_err().contains("unknown until"));
+        assert!(wait_for_region(&mut g, &a)
+            .unwrap_err()
+            .contains("unknown until"));
         let mut b = region_args();
         b.mode = Some("fuzzy".into());
-        assert!(wait_for_region(&mut g, &b).unwrap_err().contains("unknown mode"));
+        assert!(wait_for_region(&mut g, &b)
+            .unwrap_err()
+            .contains("unknown mode"));
     }
 
     fn started_logs(logs: Vec<(glass_core::Stream, &str)>) -> Glass {
@@ -355,8 +393,14 @@ mod tests {
         let out = wait_for_log(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {t}");
-                assert!(t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"), "enveloped: {t}");
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
                 assert!(t.contains("\"matched\":true"), "got: {t}");
                 assert!(t.contains("\"text\":\"build done\""), "got: {t}");
             }
@@ -375,7 +419,9 @@ mod tests {
             interval_ms: Some(0),
             timeout_ms: Some(0),
         };
-        assert!(wait_for_log(&mut g, &empty).unwrap_err().contains("non-empty"));
+        assert!(wait_for_log(&mut g, &empty)
+            .unwrap_err()
+            .contains("non-empty"));
         let bad = WaitForLogArgs {
             contains: "x".into(),
             stream: Some("weird".into()),
@@ -383,7 +429,9 @@ mod tests {
             interval_ms: Some(0),
             timeout_ms: Some(0),
         };
-        assert!(wait_for_log(&mut g, &bad).unwrap_err().contains("unknown stream"));
+        assert!(wait_for_log(&mut g, &bad)
+            .unwrap_err()
+            .contains("unknown stream"));
     }
 
     #[test]
@@ -400,8 +448,14 @@ mod tests {
         let out = wait_for_log(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {t}");
-                assert!(t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"), "enveloped: {t}");
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
                 assert!(t.contains("\"matched\":false"), "got: {t}");
                 assert!(t.contains("\"line\":null"), "got: {t}");
             }
@@ -417,7 +471,11 @@ mod tests {
         let mut a = region_args();
         a.include_image = Some(true);
         let out = wait_for_region(&mut g, &a).unwrap();
-        assert_eq!(out.0.len(), 3, "matched + include_image -> [Image, Text, IMAGE_NOTE]");
+        assert_eq!(
+            out.0.len(),
+            3,
+            "matched + include_image -> [Image, Text, IMAGE_NOTE]"
+        );
         assert!(matches!(out.0[0], OutContent::Image(_)), "image first");
         match &out.0[1] {
             OutContent::Text(t) => assert!(t.contains("\"matched\":true"), "got: {t}"),
@@ -436,9 +494,19 @@ mod tests {
         a.include_image = Some(true);
         let out = wait_for_region(&mut g, &a).unwrap();
         // must have [Image, meta, IMAGE_NOTE]
-        assert!(out.0.len() >= 3, "expected [Image, meta, IMAGE_NOTE], got {} items", out.0.len());
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
-        assert!(has_note, "IMAGE_NOTE must be present when image is returned");
+        assert!(
+            out.0.len() >= 3,
+            "expected [Image, meta, IMAGE_NOTE], got {} items",
+            out.0.len()
+        );
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        assert!(
+            has_note,
+            "IMAGE_NOTE must be present when image is returned"
+        );
         // scalar meta is NOT enveloped
         let meta_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("matched") && t.contains("⟦untrusted:")));
         assert!(!meta_enveloped, "scalar meta must NOT be enveloped");
@@ -451,9 +519,15 @@ mod tests {
         let mut g = started_frames(vec![black, white]);
         // include_image defaults to None (false) -> no image -> no note
         let out = wait_for_region(&mut g, &region_args()).unwrap();
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
         assert!(!has_note, "no IMAGE_NOTE when no image is produced");
-        let has_envelope = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+        let has_envelope = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope on scalar-only result");
     }
 }

@@ -80,9 +80,15 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
-        "perceptual" => glass.diff_baseline_perceptual_with_frame(&a.name, a.threshold.unwrap_or(0.1)),
+        "perceptual" => {
+            glass.diff_baseline_perceptual_with_frame(&a.name, a.threshold.unwrap_or(0.1))
+        }
         "exact" => glass.diff_baseline_with_frame(&a.name, a.tolerance.unwrap_or(0)),
-        other => return Err(format!("unknown diff mode '{other}' (use perceptual/exact)")),
+        other => {
+            return Err(format!(
+                "unknown diff mode '{other}' (use perceptual/exact)"
+            ))
+        }
     }
     .map_err(|e| e.to_string())?;
 
@@ -107,9 +113,16 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let mut image_produced = false;
     if a.include_image.unwrap_or(false) {
         if let Some(b) = r.bbox {
-            let region = Region { x: b.x, y: b.y, width: b.width, height: b.height };
+            let region = Region {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            };
             let cropped = current.crop(&region).map_err(|e| e.to_string())?;
-            out.push(OutContent::Image(frame_to_webp(&cropped).map_err(|e| e.to_string())?));
+            out.push(OutContent::Image(
+                frame_to_webp(&cropped).map_err(|e| e.to_string())?,
+            ));
             image_produced = true;
         }
     }
@@ -191,10 +204,19 @@ mod tests {
 
     #[test]
     fn screenshot_with_region_returns_cropped_dims() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [5, 6, 7, 255])]),
-        );
-        let a = ScreenshotArgs { region: Some(RegionArgs { x: 1, y: 1, width: 2, height: 2 }) };
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [5, 6, 7, 255],
+        )]));
+        let a = ScreenshotArgs {
+            region: Some(RegionArgs {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            }),
+        };
         let out = screenshot(&mut g, &a).unwrap();
         match &out.0[1] {
             OutContent::Text(t) => {
@@ -214,24 +236,40 @@ mod tests {
 
     #[test]
     fn screenshot_region_out_of_bounds_errors() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
-        let a = ScreenshotArgs { region: Some(RegionArgs { x: 0, y: 0, width: 99, height: 99 }) };
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
+        let a = ScreenshotArgs {
+            region: Some(RegionArgs {
+                x: 0,
+                y: 0,
+                width: 99,
+                height: 99,
+            }),
+        };
         assert!(screenshot(&mut g, &a).unwrap_err().contains("region"));
     }
 
     #[test]
     fn wait_stable_with_region_crops_returned_frame() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
         let a = WaitStableArgs {
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
             timeout_ms: Some(200),
-            region: Some(RegionArgs { x: 0, y: 0, width: 2, height: 2 }),
+            region: Some(RegionArgs {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }),
             stability_region: None,
             include_image: None,
         };
@@ -246,16 +284,23 @@ mod tests {
 
     #[test]
     fn wait_stable_out_of_bounds_stability_region_errors() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
         let a = WaitStableArgs {
             interval_ms: Some(1),
             settle_frames: Some(1),
             tolerance: None,
             timeout_ms: Some(200),
             region: None,
-            stability_region: Some(RegionArgs { x: 0, y: 0, width: 99, height: 1 }),
+            stability_region: Some(RegionArgs {
+                x: 0,
+                y: 0,
+                width: 99,
+                height: 1,
+            }),
             include_image: None,
         };
         assert!(wait_stable(&mut g, &a).unwrap_err().contains("region"));
@@ -267,10 +312,24 @@ mod tests {
         let mut changed = base.clone();
         changed.pixels[0] = 255;
         let mut g = started_with(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(&mut g, &BaselineSaveArgs { name: "main".into() }).unwrap();
-        let out =
-            diff(&mut g, &DiffArgs { name: "main".into(), mode: None, threshold: None, tolerance: None, include_image: None })
-                .unwrap();
+        baseline_save(
+            &mut g,
+            &BaselineSaveArgs {
+                name: "main".into(),
+            },
+        )
+        .unwrap();
+        let out = diff(
+            &mut g,
+            &DiffArgs {
+                name: "main".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+            },
+        )
+        .unwrap();
         match &out.0[0] {
             OutContent::Text(t) => assert!(t.contains("\"changed_pixels\":1")),
             _ => panic!("expected text"),
@@ -287,7 +346,13 @@ mod tests {
         // explicit exact mode still works
         let out = diff(
             &mut g,
-            &DiffArgs { name: "m".into(), mode: Some("exact".into()), threshold: None, tolerance: Some(0), include_image: None },
+            &DiffArgs {
+                name: "m".into(),
+                mode: Some("exact".into()),
+                threshold: None,
+                tolerance: Some(0),
+                include_image: None,
+            },
         )
         .unwrap();
         match &out.0[0] {
@@ -297,7 +362,13 @@ mod tests {
         // unknown mode is rejected (no silent fallback)
         let err = diff(
             &mut g,
-            &DiffArgs { name: "m".into(), mode: Some("fuzzy".into()), threshold: None, tolerance: None, include_image: None },
+            &DiffArgs {
+                name: "m".into(),
+                mode: Some("fuzzy".into()),
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+            },
         )
         .unwrap_err();
         assert!(err.contains("unknown diff mode"), "got: {err}");
@@ -305,12 +376,20 @@ mod tests {
 
     #[test]
     fn diff_missing_baseline_errors() {
-        let mut g = started_with(
-            FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(
+            2,
+            2,
+            [0, 0, 0, 255],
+        )]));
         let err = diff(
             &mut g,
-            &DiffArgs { name: "absent".into(), mode: None, threshold: None, tolerance: None, include_image: None },
+            &DiffArgs {
+                name: "absent".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+            },
         )
         .unwrap_err();
         assert!(err.contains("baseline not found"));
@@ -320,12 +399,26 @@ mod tests {
     fn logs_returns_json_lines() {
         let platform = FakePlatform::new(10, 10).with_logs(vec![(Stream::Stdout, "ready")]);
         let mut g = started_with(platform);
-        let out = logs(&mut g, &LogsArgs { cursor: None, max_lines: None, stream: None, contains: None })
-            .unwrap();
+        let out = logs(
+            &mut g,
+            &LogsArgs {
+                cursor: None,
+                max_lines: None,
+                stream: None,
+                contains: None,
+            },
+        )
+        .unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.starts_with(crate::untrusted::NOTE), "must be marked untrusted: {t}");
-                assert!(t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"), "enveloped: {t}");
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
                 assert!(t.contains("\"text\":\"ready\""));
                 assert!(t.contains("\"cursor\":1"));
             }
@@ -336,15 +429,22 @@ mod tests {
     #[test]
     fn logs_rejects_bad_stream() {
         let mut g = started_with(FakePlatform::new(10, 10));
-        let a = LogsArgs { cursor: None, max_lines: None, stream: Some("weird".into()), contains: None };
+        let a = LogsArgs {
+            cursor: None,
+            max_lines: None,
+            stream: Some("weird".into()),
+            contains: None,
+        };
         assert!(logs(&mut g, &a).unwrap_err().contains("unknown stream"));
     }
 
     #[test]
     fn wait_stable_text_only_omits_image() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
         let a = WaitStableArgs {
             interval_ms: Some(1),
             settle_frames: Some(1),
@@ -355,11 +455,18 @@ mod tests {
             include_image: Some(false),
         };
         let out = wait_stable(&mut g, &a).unwrap();
-        assert_eq!(out.0.len(), 1, "text-only should emit a single content item");
+        assert_eq!(
+            out.0.len(),
+            1,
+            "text-only should emit a single content item"
+        );
         match &out.0[0] {
             OutContent::Text(t) => {
                 assert!(t.contains("\"settled\":true"), "got: {t}");
-                assert!(t.contains("\"width\":4") && t.contains("\"height\":4"), "got: {t}");
+                assert!(
+                    t.contains("\"width\":4") && t.contains("\"height\":4"),
+                    "got: {t}"
+                );
             }
             _ => panic!("expected text-only, got an image"),
         }
@@ -387,7 +494,11 @@ mod tests {
         match &out.0[0] {
             OutContent::Image(bytes) => {
                 let decoded = glass_core::frame_from_webp(bytes).unwrap();
-                assert_eq!((decoded.width, decoded.height), (1, 1), "image is the bbox crop");
+                assert_eq!(
+                    (decoded.width, decoded.height),
+                    (1, 1),
+                    "image is the bbox crop"
+                );
             }
             _ => panic!("expected image first"),
         }
@@ -419,9 +530,11 @@ mod tests {
 
     #[test]
     fn wait_stable_image_has_note_and_meta_unmarked() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
         let a = WaitStableArgs {
             interval_ms: Some(1),
             settle_frames: Some(1),
@@ -433,11 +546,24 @@ mod tests {
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // must have [Image, meta-Text, IMAGE_NOTE-Text]
-        assert!(out.0.len() >= 3, "expected [Image, meta, IMAGE_NOTE], got {} items", out.0.len());
-        assert!(matches!(out.0[0], OutContent::Image(_)), "first item must be Image");
+        assert!(
+            out.0.len() >= 3,
+            "expected [Image, meta, IMAGE_NOTE], got {} items",
+            out.0.len()
+        );
+        assert!(
+            matches!(out.0[0], OutContent::Image(_)),
+            "first item must be Image"
+        );
         // IMAGE_NOTE is present
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
-        assert!(has_note, "IMAGE_NOTE must be present when include_image=true");
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        assert!(
+            has_note,
+            "IMAGE_NOTE must be present when include_image=true"
+        );
         // meta text contains settled/width/height and is NOT enveloped
         let meta_enveloped = out.0.iter().any(|c| {
             matches!(c, OutContent::Text(t) if t.contains("\"settled\"") && t.contains("⟦untrusted:"))
@@ -452,9 +578,11 @@ mod tests {
 
     #[test]
     fn wait_stable_text_only_has_no_image_note() {
-        let mut g = started_with(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]),
-        );
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
         let a = WaitStableArgs {
             interval_ms: Some(1),
             settle_frames: Some(1),
@@ -466,10 +594,19 @@ mod tests {
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // no image -> no IMAGE_NOTE
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
-        assert!(!has_note, "IMAGE_NOTE must NOT appear in text-only (include_image=false) result");
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        assert!(
+            !has_note,
+            "IMAGE_NOTE must NOT appear in text-only (include_image=false) result"
+        );
         // no envelope markers
-        let has_envelope = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+        let has_envelope = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope markers in text-only result");
     }
 
@@ -481,17 +618,28 @@ mod tests {
         let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![frame]));
         let out = screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap();
         // must have at least 3 items: Image, meta-Text, note-Text
-        assert!(out.0.len() >= 3, "expected [Image, meta, IMAGE_NOTE], got {} items", out.0.len());
+        assert!(
+            out.0.len() >= 3,
+            "expected [Image, meta, IMAGE_NOTE], got {} items",
+            out.0.len()
+        );
         // third item is the IMAGE_NOTE
         match &out.0[2] {
-            OutContent::Text(t) => assert_eq!(t, crate::untrusted::IMAGE_NOTE, "third item must be IMAGE_NOTE"),
+            OutContent::Text(t) => assert_eq!(
+                t,
+                crate::untrusted::IMAGE_NOTE,
+                "third item must be IMAGE_NOTE"
+            ),
             _ => panic!("expected IMAGE_NOTE text as third item"),
         }
         // meta (second item) must NOT be enveloped
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(t.contains("\"width\":4"), "meta must contain width");
-                assert!(!t.contains("⟦untrusted:"), "meta must NOT be enveloped: {t}");
+                assert!(
+                    !t.contains("⟦untrusted:"),
+                    "meta must NOT be enveloped: {t}"
+                );
             }
             _ => panic!("expected meta text as second item"),
         }
@@ -506,14 +654,30 @@ mod tests {
         baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
         let out = diff(
             &mut g,
-            &DiffArgs { name: "m".into(), mode: None, threshold: None, tolerance: None, include_image: Some(true) },
+            &DiffArgs {
+                name: "m".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: Some(true),
+            },
         )
         .unwrap();
         // [Image, metrics-Text, IMAGE_NOTE-Text]
-        assert!(out.0.len() >= 3, "expected [Image, metrics, IMAGE_NOTE], got {} items", out.0.len());
+        assert!(
+            out.0.len() >= 3,
+            "expected [Image, metrics, IMAGE_NOTE], got {} items",
+            out.0.len()
+        );
         // IMAGE_NOTE is present
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
-        assert!(has_note, "IMAGE_NOTE must be present when image is included");
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        assert!(
+            has_note,
+            "IMAGE_NOTE must be present when image is included"
+        );
         // metrics text is NOT enveloped
         let metrics_enveloped = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("changed_pixels") && t.contains("⟦untrusted:")));
         assert!(!metrics_enveloped, "metrics text must NOT be enveloped");
@@ -526,14 +690,26 @@ mod tests {
         baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
         let out = diff(
             &mut g,
-            &DiffArgs { name: "m".into(), mode: None, threshold: None, tolerance: None, include_image: Some(true) },
+            &DiffArgs {
+                name: "m".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: Some(true),
+            },
         )
         .unwrap();
         // no image -> no note
-        let has_note = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
+        let has_note = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE));
         assert!(!has_note, "no IMAGE_NOTE when nothing changed");
         // no envelope markers anywhere
-        let has_envelope = out.0.iter().any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
+        let has_envelope = out
+            .0
+            .iter()
+            .any(|c| matches!(c, OutContent::Text(t) if t.contains("⟦untrusted:")));
         assert!(!has_envelope, "no envelope markers on metrics-only result");
     }
 }

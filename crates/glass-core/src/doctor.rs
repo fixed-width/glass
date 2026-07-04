@@ -57,7 +57,13 @@ pub struct Check {
 
 impl Check {
     pub fn new(name: impl Into<String>, status: CheckStatus, detail: impl Into<String>) -> Self {
-        Check { name: name.into(), status, detail: detail.into(), remedy: None, remedy_action: None }
+        Check {
+            name: name.into(),
+            status,
+            detail: detail.into(),
+            remedy: None,
+            remedy_action: None,
+        }
     }
     /// Attach a remedy (builder style).
     pub fn with_remedy(mut self, remedy: impl Into<String>) -> Self {
@@ -82,7 +88,11 @@ pub struct Section {
 
 impl Section {
     pub fn new(title: impl Into<String>, backend: Option<String>, checks: Vec<Check>) -> Self {
-        Section { title: title.into(), backend, checks }
+        Section {
+            title: title.into(),
+            backend,
+            checks,
+        }
     }
 }
 
@@ -100,7 +110,10 @@ impl Diagnosis {
     /// Is this section critical to the run? General checks (no backend) and the
     /// default backend's checks are; another backend's are not.
     fn is_critical(section: &Section, default_backend: &str) -> bool {
-        section.backend.as_deref().is_none_or(|b| b == default_backend)
+        section
+            .backend
+            .as_deref()
+            .is_none_or(|b| b == default_backend)
     }
 
     /// A check's *effective* status: a `Fail` in a non-default backend is only a
@@ -119,7 +132,9 @@ impl Diagnosis {
             .iter()
             .flat_map(|s| {
                 let critical = Self::is_critical(s, default_backend);
-                s.checks.iter().map(move |c| Self::effective(c.status, critical).rank())
+                s.checks
+                    .iter()
+                    .map(move |c| Self::effective(c.status, critical).rank())
             })
             .max()
             .unwrap_or(0);
@@ -185,7 +200,11 @@ mod tests {
 
     fn diag() -> Diagnosis {
         Diagnosis::new(vec![
-            Section::new("general", None, vec![Check::new("default backend", CheckStatus::Ok, "x11")]),
+            Section::new(
+                "general",
+                None,
+                vec![Check::new("default backend", CheckStatus::Ok, "x11")],
+            ),
             Section::new(
                 "x11",
                 Some("x11".into()),
@@ -230,7 +249,10 @@ mod tests {
     #[test]
     fn render_flags_nondefault_section_and_downgrades_its_failure() {
         let text = diag().render_text("x11");
-        assert!(text.contains("[wayland]  (only needed for backend=wayland)"), "{text}");
+        assert!(
+            text.contains("[wayland]  (only needed for backend=wayland)"),
+            "{text}"
+        );
         // wayland's Fail renders as a warning glyph, and its remedy is shown.
         assert!(text.contains("⚠ sway >=1.12: not found"), "{text}");
         assert!(text.contains("→ build it"), "{text}");
@@ -258,7 +280,11 @@ mod tests {
             .with_remedy_action(
                 "open: x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
             );
-        let d = Diagnosis::new(vec![Section::new("macos", Some("macos".into()), vec![check])]);
+        let d = Diagnosis::new(vec![Section::new(
+            "macos",
+            Some("macos".into()),
+            vec![check],
+        )]);
         let out = d.render_text("macos");
         assert!(out.contains("→ enable it in System Settings"));
         assert!(out.contains(

@@ -26,17 +26,17 @@ pub fn map_role(control_type_id: u32) -> AxRole {
         50015 => AxRole::Slider,
         50016 => AxRole::SpinButton,
         50017 => AxRole::StatusBar,
-        50018 => AxRole::TabList,   // Tab
-        50019 => AxRole::Tab,       // TabItem
-        50020 => AxRole::Label,     // Text
+        50018 => AxRole::TabList, // Tab
+        50019 => AxRole::Tab,     // TabItem
+        50020 => AxRole::Label,   // Text
         50021 => AxRole::Toolbar,
         50023 => AxRole::Tree,
         50024 => AxRole::TreeItem,
         50026 => AxRole::Group,
-        50028 => AxRole::Table,     // DataGrid
-        50031 => AxRole::Button,    // SplitButton — an actionable button with a dropdown
+        50028 => AxRole::Table,  // DataGrid
+        50031 => AxRole::Button, // SplitButton — an actionable button with a dropdown
         50032 => AxRole::Window,
-        50033 => AxRole::Group,     // Pane
+        50033 => AxRole::Group, // Pane
         50036 => AxRole::Table,
         50038 => AxRole::Separator,
         _ => AxRole::Other,
@@ -95,14 +95,24 @@ mod tests {
     }
     #[test]
     fn offscreen_clears_visible_and_toggle_sets_checked() {
-        let f = StateFacts { enabled: true, offscreen: true, toggled_on: true, ..Default::default() };
+        let f = StateFacts {
+            enabled: true,
+            offscreen: true,
+            toggled_on: true,
+            ..Default::default()
+        };
         let s = map_states(&f);
         assert!(s.enabled && s.checked);
         assert!(!s.visible);
     }
     #[test]
     fn focus_and_editable_map() {
-        let f = StateFacts { focused: true, focusable: true, editable: true, ..Default::default() };
+        let f = StateFacts {
+            focused: true,
+            focusable: true,
+            editable: true,
+            ..Default::default()
+        };
         let s = map_states(&f);
         assert!(s.focused && s.focusable && s.editable);
         assert!(!s.selected && !s.checked);

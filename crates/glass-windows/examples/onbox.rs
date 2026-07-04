@@ -41,7 +41,10 @@ mod imp {
     }
     /// Count of differing pixels between two equal-size RGBA buffers.
     fn changed(a: &[u8], b: &[u8]) -> usize {
-        a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
+        a.chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(x, y)| x != y)
+            .count()
     }
     /// Encode a captured frame as lossless WebP (glass's production format, via
     /// `frame_to_webp`) and write it next to the other artifacts.
@@ -72,7 +75,11 @@ mod imp {
 
         println!("\n[doctor --deep]");
         for c in glass_windows::doctor::checks(true) {
-            let r = c.remedy.as_deref().map(|r| format!("   remedy: {r}")).unwrap_or_default();
+            let r = c
+                .remedy
+                .as_deref()
+                .map(|r| format!("   remedy: {r}"))
+                .unwrap_or_default();
             println!("  {:?}  {} — {}{}", c.status, c.name, c.detail, r);
         }
 
@@ -91,7 +98,10 @@ mod imp {
             run: vec!["charmap.exe".to_string()],
             cwd: None,
             env: vec![],
-            window_hint: Some(WindowHint { title: Some("Character Map".into()), class: None }),
+            window_hint: Some(WindowHint {
+                title: Some("Character Map".into()),
+                class: None,
+            }),
             timeout_ms: 12_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: false,
@@ -145,7 +155,11 @@ mod imp {
             let ch = changed(&f1.pixels, &f2.pixels);
             println!(
                 "  after-type changed_px = {ch}  ({})",
-                if ch > 0 { "PASS text rendered" } else { "FAIL no change" }
+                if ch > 0 {
+                    "PASS text rendered"
+                } else {
+                    "FAIL no change"
+                }
             );
             save("onbox_2_typed.webp", &f2);
         }
@@ -168,15 +182,32 @@ mod imp {
         match p.window(&WindowOp::Move { x: 140, y: 140 }) {
             Ok(g) => {
                 let ok = (g.x - 140).abs() <= 2 && (g.y - 140).abs() <= 2;
-                println!("  -> {g:?}  ({})", if ok { "PASS within 2px" } else { "CHECK offset" });
+                println!(
+                    "  -> {g:?}  ({})",
+                    if ok {
+                        "PASS within 2px"
+                    } else {
+                        "CHECK offset"
+                    }
+                );
             }
             Err(e) => println!("  FAIL  {e}"),
         }
         println!("\n[window Resize -> 720x520]");
-        match p.window(&WindowOp::Resize { width: 720, height: 520 }) {
+        match p.window(&WindowOp::Resize {
+            width: 720,
+            height: 520,
+        }) {
             Ok(g) => {
                 let ok = (g.width as i64 - 720).abs() <= 2 && (g.height as i64 - 520).abs() <= 2;
-                println!("  -> {g:?}  ({})", if ok { "PASS within 2px" } else { "CHECK offset" });
+                println!(
+                    "  -> {g:?}  ({})",
+                    if ok {
+                        "PASS within 2px"
+                    } else {
+                        "CHECK offset"
+                    }
+                );
             }
             Err(e) => println!("  FAIL  {e}"),
         }
@@ -186,14 +217,23 @@ mod imp {
         }
 
         println!("\n[send_pointer Click (50,50)]");
-        match p.send_pointer(&PointerEvent::Click { x: 50, y: 50, button: MouseButton::Left, count: 1, modifiers: vec![] }) {
+        match p.send_pointer(&PointerEvent::Click {
+            x: 50,
+            y: 50,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        }) {
             Ok(()) => println!("  sent"),
             Err(e) => println!("  FAIL  {e}"),
         }
 
         println!("\n[drain_logs]");
         let logs = p.drain_logs();
-        println!("  {} line(s) (charmap is a GUI app — 0 expected)", logs.len());
+        println!(
+            "  {} line(s) (charmap is a GUI app — 0 expected)",
+            logs.len()
+        );
 
         println!("\n[stop_app — Job kill-tree]");
         let pid = p.app_pid();
@@ -212,7 +252,11 @@ mod imp {
                     let alive = s.contains(&pid.to_string());
                     println!(
                         "  survivor check: {}",
-                        if alive { "FAIL root pid still alive" } else { "PASS root pid gone" }
+                        if alive {
+                            "FAIL root pid still alive"
+                        } else {
+                            "PASS root pid gone"
+                        }
                     );
                 }
                 Err(e) => println!("  survivor check inconclusive: {e}"),

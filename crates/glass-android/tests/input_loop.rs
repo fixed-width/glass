@@ -29,8 +29,9 @@ fn settle() {
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn scroll_and_tap_change_the_screen() {
     let agents = glass_android::AgentRegistry::new();
-    let mut p = glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
-        .expect("attach to emulator");
+    let mut p =
+        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
+            .expect("attach to emulator");
     let geo = p.start_app(&settings_spec()).expect("launch settings");
     settle();
 
@@ -38,12 +39,22 @@ fn scroll_and_tap_change_the_screen() {
 
     // Scroll down the Settings list — the screen should change.
     let before = p.capture_frame(None).expect("frame before scroll");
-    p.send_pointer(&PointerEvent::Scroll { x: cx, y: cy, dx: 0, dy: 3, modifiers: vec![] })
-        .expect("scroll");
+    p.send_pointer(&PointerEvent::Scroll {
+        x: cx,
+        y: cy,
+        dx: 0,
+        dy: 3,
+        modifiers: vec![],
+    })
+    .expect("scroll");
     settle();
     let after = p.capture_frame(None).expect("frame after scroll");
     let d = glass_core::diff(&before, &after, 10).expect("diff");
-    assert!(d.changed_pct > 1.0, "scroll should change the screen, got {}%", d.changed_pct);
+    assert!(
+        d.changed_pct > 1.0,
+        "scroll should change the screen, got {}%",
+        d.changed_pct
+    );
 
     // Tap a list row near the top — navigating should change the screen too.
     let before = p.capture_frame(None).expect("frame before tap");
@@ -58,9 +69,13 @@ fn scroll_and_tap_change_the_screen() {
     settle();
     let after = p.capture_frame(None).expect("frame after tap");
     let d = glass_core::diff(&before, &after, 10).expect("diff");
-    assert!(d.changed_pct > 1.0, "tap should change the screen, got {}%", d.changed_pct);
+    assert!(
+        d.changed_pct > 1.0,
+        "tap should change the screen, got {}%",
+        d.changed_pct
+    );
 
     p.stop_app().expect("stop");
-    drop(p);            // close the platform's agent connection (if any) first
-    agents.shutdown();  // tear down a launched agent — these tests must not leak it
+    drop(p); // close the platform's agent connection (if any) first
+    agents.shutdown(); // tear down a launched agent — these tests must not leak it
 }

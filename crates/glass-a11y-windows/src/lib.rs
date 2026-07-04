@@ -3,8 +3,8 @@
 //! `Accessibility` seam (orthogonal to the display `Platform` seam). Mirrors
 //! `glass-a11y-linux`.
 
-pub mod mapping; // pure UIA->normalized mapping — cross-platform, unit-tested on the Linux dev box
-pub mod doctor;  // checks()/a11y_checks() are OS-free (probe_uia is cfg-split), so its tests run on Linux
+pub mod doctor;
+pub mod mapping; // pure UIA->normalized mapping — cross-platform, unit-tested on the Linux dev box // checks()/a11y_checks() are OS-free (probe_uia is cfg-split), so its tests run on Linux
 
 #[cfg(windows)]
 mod reader;

@@ -20,11 +20,11 @@ use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
-    PROCESSENTRY32W, THREADENTRY32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
+    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, QueryInformationJobObject, SetInformationJobObject,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -136,7 +136,10 @@ impl LaunchedApp {
 /// the Job now captures the entire future tree. A launcher that exits and hands off
 /// (Chromium/Electron) therefore cannot escape; assigning after a normal spawn races that
 /// handoff (the validation probe left 15 Edge children alive that way).
-pub(crate) fn spawn_suspended_in_job(cmd: &mut Command, level: SandboxLevel) -> Result<LaunchedApp> {
+pub(crate) fn spawn_suspended_in_job(
+    cmd: &mut Command,
+    level: SandboxLevel,
+) -> Result<LaunchedApp> {
     let mut child = cmd
         .creation_flags(CREATE_SUSPENDED.0)
         .stdout(Stdio::piped())

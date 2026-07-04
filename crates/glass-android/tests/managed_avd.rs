@@ -23,12 +23,17 @@ fn online_count() -> usize {
 #[test]
 #[ignore = "requires NO running emulator + the Android SDK (GLASS_AVD)"]
 fn boots_reuses_and_cleans_up() {
-    assert_eq!(online_count(), 0, "start this test with no emulator running");
+    assert_eq!(
+        online_count(),
+        0,
+        "start this test with no emulator running"
+    );
     let registry = EmulatorRegistry::new();
 
     // First resolve boots the AVD.
     let agents1 = glass_android::AgentRegistry::new();
-    let mut p1 = glass_android::AndroidPlatform::from_env(&registry, &agents1).expect("boot+attach");
+    let mut p1 =
+        glass_android::AndroidPlatform::from_env(&registry, &agents1).expect("boot+attach");
     assert_eq!(online_count(), 1, "expected one emulator after boot");
     let _ = &mut p1;
 
@@ -40,9 +45,13 @@ fn boots_reuses_and_cleans_up() {
     // Cleanup stops the glass-booted emulator.
     drop(p1);
     drop(_p2);
-    agents1.shutdown();  // tear down any launched agent — these tests must not leak it
+    agents1.shutdown(); // tear down any launched agent — these tests must not leak it
     agents2.shutdown();
     registry.kill_all();
     std::thread::sleep(std::time::Duration::from_secs(3));
-    assert_eq!(online_count(), 0, "kill_all should stop the booted emulator");
+    assert_eq!(
+        online_count(),
+        0,
+        "kill_all should stop the booted emulator"
+    );
 }

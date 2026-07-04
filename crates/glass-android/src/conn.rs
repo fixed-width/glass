@@ -31,13 +31,22 @@ impl Conn {
         stream.set_read_timeout(Some(to)).ok();
         stream.set_write_timeout(Some(to)).ok();
         let reader = BufReader::new(
-            stream.try_clone().map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?,
+            stream
+                .try_clone()
+                .map_err(|e| GlassError::Backend(format!("agent clone: {e}")))?,
         );
-        let mut c = Conn { writer: stream, reader, next_id: 1 };
+        let mut c = Conn {
+            writer: stream,
+            reader,
+            next_id: 1,
+        };
         let hello = c.read_line()?;
         let v: Value = serde_json::from_str(&hello)
             .map_err(|e| GlassError::Backend(format!("agent hello parse: {e}")))?;
-        let proto = v.get("hello").and_then(|h| h.get("proto")).and_then(Value::as_i64);
+        let proto = v
+            .get("hello")
+            .and_then(|h| h.get("proto"))
+            .and_then(Value::as_i64);
         if proto != Some(PROTO) {
             return Err(GlassError::Backend(format!(
                 "agent protocol mismatch: got {proto:?}, want {PROTO}"
@@ -87,7 +96,10 @@ impl Conn {
             ));
         }
         if resp.get("ok").and_then(Value::as_bool) != Some(true) {
-            let err = resp.get("error").and_then(Value::as_str).unwrap_or("agent error");
+            let err = resp
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("agent error");
             return Err((GlassError::Backend(format!("agent: {err}")), false));
         }
         Ok(resp)

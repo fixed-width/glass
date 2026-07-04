@@ -6,16 +6,19 @@
 use std::time::Duration;
 
 use glass_mcp::serve::config::ServeConfig;
-use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
-use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::ServiceExt;
 
 /// Bind 127.0.0.1:0, start serve in the background, return the bound URL.
 async fn start_server(token: Option<&str>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let cfg = ServeConfig { addr, token: token.map(String::from) };
+    let cfg = ServeConfig {
+        addr,
+        token: token.map(String::from),
+    };
     let glass = glass_mcp::boot(None);
     let report = glass_mcp::audit::report_from_config(None, |_| None);
     tokio::spawn(async move {
@@ -51,9 +54,16 @@ async fn doctor_round_trips_over_http() {
         .await
         .expect("glass_doctor call");
     // The call succeeded (not an error result) and reads like the doctor report.
-    assert_ne!(result.is_error, Some(true), "glass_doctor returned an error result");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "glass_doctor returned an error result"
+    );
     let text = format!("{result:?}");
-    assert!(text.contains("backend") || text.contains("x11"), "unexpected doctor result: {text}");
+    assert!(
+        text.contains("backend") || text.contains("x11"),
+        "unexpected doctor result: {text}"
+    );
     client.cancel().await.ok();
 }
 

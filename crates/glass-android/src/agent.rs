@@ -28,7 +28,10 @@ pub struct AgentClient {
 
 impl AgentClient {
     pub fn connect(port: u16) -> Result<AgentClient> {
-        Ok(AgentClient { port, conn: Mutex::new(Conn::open(port)?) })
+        Ok(AgentClient {
+            port,
+            conn: Mutex::new(Conn::open(port)?),
+        })
     }
 
     /// Run a request, transparently reconnecting once if the socket dropped.
@@ -56,17 +59,21 @@ impl AgentClient {
         v.get("text")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| GlassError::Backend("agent clipboard_get: response missing `text`".into()))
+            .ok_or_else(|| {
+                GlassError::Backend("agent clipboard_get: response missing `text`".into())
+            })
     }
     pub fn clipboard_set(&self, text: &str) -> Result<()> {
-        self.call(json!({"op": "clipboard_set", "text": text})).map(|_| ())
+        self.call(json!({"op": "clipboard_set", "text": text}))
+            .map(|_| ())
     }
     pub fn pointer(&self, gesture: &[Pt], button: &str) -> Result<()> {
         let g: Vec<Value> = gesture
             .iter()
             .map(|p| json!({"x": p.x, "y": p.y, "t_ms": p.t_ms}))
             .collect();
-        self.call(json!({"op": "pointer", "gesture": g, "button": button})).map(|_| ())
+        self.call(json!({"op": "pointer", "gesture": g, "button": button}))
+            .map(|_| ())
     }
     pub fn gesture(&self, paths: &[Vec<Pt>]) -> Result<()> {
         let pointers: Vec<Value> = paths
@@ -79,7 +86,8 @@ impl AgentClient {
                 )
             })
             .collect();
-        self.call(json!({ "op": "gesture", "pointers": pointers })).map(|_| ())
+        self.call(json!({ "op": "gesture", "pointers": pointers }))
+            .map(|_| ())
     }
     pub fn key(&self, chord: &str) -> Result<()> {
         self.call(json!({"op": "key", "chord": chord})).map(|_| ())
@@ -94,14 +102,20 @@ impl AgentClient {
 pub fn agent_jar(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let mut dirs = crate::sdk::artifact_data_dirs(get);
     dirs.extend(crate::sdk::exe_dir());
-    crate::sdk::resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, get, &|p| {
-        p.is_file()
-    })
+    crate::sdk::resolve_artifact(
+        "GLASS_ANDROID_AGENT_JAR",
+        "glass-agent.jar",
+        &dirs,
+        get,
+        &|p| p.is_file(),
+    )
 }
 
 /// The agent is used when not explicitly `off` and a jar is resolvable.
 pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
-    let off = get("GLASS_ANDROID_AGENT").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    let off = get("GLASS_ANDROID_AGENT")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
     !off && agent_jar(get).is_some()
 }
 
@@ -188,10 +202,13 @@ impl AgentRegistry {
         if let Some(s) = &serial {
             cmd.args(["-s", s]);
         }
-        cmd.args(["shell", &format!("CLASSPATH={REMOTE_JAR} app_process / {MAIN}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null());
+        cmd.args([
+            "shell",
+            &format!("CLASSPATH={REMOTE_JAR} app_process / {MAIN}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
         let mut child = cmd
             .spawn()
             .map_err(|e| GlassError::Backend(format!("launch agent: {e}")))?;
@@ -211,7 +228,9 @@ impl AgentRegistry {
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(GlassError::Backend(format!("adb forward gave no port: {out:?}")));
+                return Err(GlassError::Backend(format!(
+                    "adb forward gave no port: {out:?}"
+                )));
             }
         };
         // Give the server a moment to bind + connect-check it.
@@ -222,7 +241,11 @@ impl AgentRegistry {
             return Err(e);
         }
 
-        *guard = Some(AgentProc { child, port, serial });
+        *guard = Some(AgentProc {
+            child,
+            port,
+            serial,
+        });
         Ok(port)
     }
 
@@ -250,7 +273,9 @@ fn wait_for_agent(port: u16) -> Result<AgentClient> {
         match AgentClient::connect(port) {
             Ok(c) => return Ok(c),
             Err(e) if Instant::now() >= deadline => {
-                return Err(GlassError::Backend(format!("agent never came up on :{port}: {e}")))
+                return Err(GlassError::Backend(format!(
+                    "agent never came up on :{port}: {e}"
+                )))
             }
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
@@ -308,7 +333,9 @@ mod tests {
                 if r.read_line(&mut line).unwrap() == 0 {
                     break;
                 }
-                let id = serde_json::from_str::<Value>(&line).unwrap()["id"].as_i64().unwrap();
+                let id = serde_json::from_str::<Value>(&line).unwrap()["id"]
+                    .as_i64()
+                    .unwrap();
                 let mut out: Value = serde_json::from_str(resp).unwrap();
                 out["id"] = json!(id);
                 writeln!(w, "{out}").unwrap();
@@ -337,7 +364,10 @@ mod tests {
 
     #[test]
     fn error_response_becomes_backend_error() {
-        let port = fake_agent(r#"{"hello":{"proto":1}}"#, vec![r#"{"ok":false,"error":"nope"}"#]);
+        let port = fake_agent(
+            r#"{"hello":{"proto":1}}"#,
+            vec![r#"{"ok":false,"error":"nope"}"#],
+        );
         let c = AgentClient::connect(port).unwrap();
         let e = c.ping().unwrap_err();
         assert!(e.to_string().contains("nope"));
@@ -364,7 +394,15 @@ mod tests {
             vec![r#"{"ok":true}"#, r#"{"ok":true}"#, r#"{"ok":true}"#],
         );
         let c = AgentClient::connect(port).unwrap();
-        c.pointer(&[Pt { x: 5, y: 10, t_ms: 0 }], "left").unwrap();
+        c.pointer(
+            &[Pt {
+                x: 5,
+                y: 10,
+                t_ms: 0,
+            }],
+            "left",
+        )
+        .unwrap();
         c.key("ctrl+a").unwrap();
         c.text("hi").unwrap();
     }

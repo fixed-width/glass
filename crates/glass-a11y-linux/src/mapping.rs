@@ -10,11 +10,9 @@ pub(crate) fn map_role(role: Role) -> AxRole {
     match role {
         Role::Application => AxRole::Application,
         Role::Frame | Role::Window | Role::InternalFrame => AxRole::Window,
-        Role::Dialog
-        | Role::Alert
-        | Role::FileChooser
-        | Role::ColorChooser
-        | Role::FontChooser => AxRole::Dialog,
+        Role::Dialog | Role::Alert | Role::FileChooser | Role::ColorChooser | Role::FontChooser => {
+            AxRole::Dialog
+        }
         Role::Panel
         | Role::Filler
         | Role::Viewport
@@ -95,7 +93,8 @@ mod tests {
 
     #[test]
     fn states_map_to_flags() {
-        let s = StateSet::new(State::Focusable | State::Enabled | State::Sensitive | State::Focused);
+        let s =
+            StateSet::new(State::Focusable | State::Enabled | State::Sensitive | State::Focused);
         let m = map_states(&s);
         assert!(m.focusable && m.enabled && m.focused);
         assert!(!m.checked && !m.selected);

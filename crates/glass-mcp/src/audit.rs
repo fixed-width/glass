@@ -41,12 +41,18 @@ pub struct AuditConfig {
 
 impl Default for AuditConfig {
     fn default() -> Self {
-        AuditConfig { content: ContentMode::Redacted, prefix_len: 8 }
+        AuditConfig {
+            content: ContentMode::Redacted,
+            prefix_len: 8,
+        }
     }
 }
 
 fn sha256_hex(raw: &str) -> String {
-    Sha256::digest(raw.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(raw.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn char_prefix(raw: &str, n: usize) -> &str {
@@ -108,7 +114,13 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
         Actuation::Stop => ("stop", json!({}), None),
         Actuation::Pointer { event } => match event {
             PointerEvent::Move { .. } => return None,
-            PointerEvent::Click { x, y, button, count, modifiers } => (
+            PointerEvent::Click {
+                x,
+                y,
+                button,
+                count,
+                modifiers,
+            } => (
                 "click",
                 json!({
                     "x": x,
@@ -119,7 +131,15 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                 }),
                 None,
             ),
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, modifiers, duration_ms } => (
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                modifiers,
+                duration_ms,
+            } => (
                 "drag",
                 json!({
                     "from_x": from_x,
@@ -132,7 +152,13 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                 }),
                 None,
             ),
-            PointerEvent::Scroll { x, y, dx, dy, modifiers } => (
+            PointerEvent::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                modifiers,
+            } => (
                 "scroll",
                 json!({
                     "x": x,
@@ -143,7 +169,10 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                 }),
                 None,
             ),
-            PointerEvent::Gesture { pointers, duration_ms } => (
+            PointerEvent::Gesture {
+                pointers,
+                duration_ms,
+            } => (
                 "gesture",
                 json!({
                     "pointers": pointers.iter().map(|s: &Segment| json!({
@@ -158,9 +187,7 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             KeyEvent::Text(s) => ("type", json!({}), Some(s.clone())),
             KeyEvent::Chord(c) => ("key", json!({ "chord": c }), None),
         },
-        Actuation::ClipboardSet { text } => {
-            ("clipboard_set", json!({}), Some((*text).to_string()))
-        }
+        Actuation::ClipboardSet { text } => ("clipboard_set", json!({}), Some((*text).to_string())),
         Actuation::Window { op } => {
             let args = match op {
                 WindowOp::Focus => json!({ "op": "focus" }),
@@ -228,7 +255,12 @@ impl JsonlSink {
     #[cfg(test)]
     pub fn with_writer(writer: Box<dyn Write + Send>, cfg: AuditConfig) -> Self {
         JsonlSink {
-            state: Mutex::new(SinkState { writer, seq: 0, session: None, dropped: 0 }),
+            state: Mutex::new(SinkState {
+                writer,
+                seq: 0,
+                session: None,
+                dropped: 0,
+            }),
             cfg,
         }
     }
@@ -237,7 +269,12 @@ impl JsonlSink {
     pub fn open(path: &str, cfg: AuditConfig) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(JsonlSink {
-            state: Mutex::new(SinkState { writer: Box::new(file), seq: 0, session: None, dropped: 0 }),
+            state: Mutex::new(SinkState {
+                writer: Box::new(file),
+                seq: 0,
+                session: None,
+                dropped: 0,
+            }),
             cfg,
         })
     }
@@ -249,8 +286,16 @@ impl JsonlSink {
 }
 
 impl AuditSink for JsonlSink {
-    fn record(&self, act: &Actuation, ctx: &ActuationContext, outcome: &AuditOutcome, dur: Duration) {
-        let Some((action, args, raw)) = describe(act) else { return };
+    fn record(
+        &self,
+        act: &Actuation,
+        ctx: &ActuationContext,
+        outcome: &AuditOutcome,
+        dur: Duration,
+    ) {
+        let Some((action, args, raw)) = describe(act) else {
+            return;
+        };
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         // Monotonic event counter. `saturating_add` so an (unreachable) overflow can't
         // panic while the lock is held — `record` must never panic (trait contract).
@@ -286,9 +331,16 @@ impl AuditSink for JsonlSink {
         match serde_json::to_string(&rec) {
             Ok(mut line) => {
                 line.push('\n');
-                if let Err(e) = st.writer.write_all(line.as_bytes()).and_then(|_| st.writer.flush()) {
+                if let Err(e) = st
+                    .writer
+                    .write_all(line.as_bytes())
+                    .and_then(|_| st.writer.flush())
+                {
                     st.dropped += 1;
-                    eprintln!("glass: AUDIT WRITE FAILED (seq {}): {e} — record dropped", st.seq);
+                    eprintln!(
+                        "glass: AUDIT WRITE FAILED (seq {}): {e} — record dropped",
+                        st.seq
+                    );
                 }
             }
             Err(e) => {
@@ -307,7 +359,10 @@ fn mint_session() -> String {
     if rand::rngs::OsRng.try_fill_bytes(&mut b).is_err() {
         return "s-norand".to_string();
     }
-    format!("s-{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>())
+    format!(
+        "s-{}",
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    )
 }
 
 /// Audit posture (for `doctor`/`env`).
@@ -319,17 +374,40 @@ pub struct AuditReport {
     pub prefix_len: usize,
 }
 
-fn config_from(cli_path: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> (Option<String>, AuditConfig) {
-    let path = cli_path.map(String::from).or_else(|| env("GLASS_AUDIT_LOG").filter(|p| !p.is_empty()));
-    let content = env("GLASS_AUDIT_CONTENT").map(|s| ContentMode::parse(&s)).unwrap_or(ContentMode::Redacted);
-    let prefix_len = env("GLASS_AUDIT_PREFIX_LEN").and_then(|s| s.trim().parse().ok()).unwrap_or(8);
-    (path, AuditConfig { content, prefix_len })
+fn config_from(
+    cli_path: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> (Option<String>, AuditConfig) {
+    let path = cli_path
+        .map(String::from)
+        .or_else(|| env("GLASS_AUDIT_LOG").filter(|p| !p.is_empty()));
+    let content = env("GLASS_AUDIT_CONTENT")
+        .map(|s| ContentMode::parse(&s))
+        .unwrap_or(ContentMode::Redacted);
+    let prefix_len = env("GLASS_AUDIT_PREFIX_LEN")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(8);
+    (
+        path,
+        AuditConfig {
+            content,
+            prefix_len,
+        },
+    )
 }
 
 /// Posture only — used by the `doctor` subcommand (does NOT open the file).
-pub fn report_from_config(cli_path: Option<&str>, env: impl Fn(&str) -> Option<String>) -> AuditReport {
+pub fn report_from_config(
+    cli_path: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> AuditReport {
     let (path, cfg) = config_from(cli_path, &env);
-    AuditReport { enabled: path.is_some(), path, content: cfg.content, prefix_len: cfg.prefix_len }
+    AuditReport {
+        enabled: path.is_some(),
+        path,
+        content: cfg.content,
+        prefix_len: cfg.prefix_len,
+    }
 }
 
 /// Resolve the sink (opening the file, fail-closed) and the report. `None` sink when
@@ -339,10 +417,19 @@ pub fn resolve(
     env: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<(Option<Box<dyn AuditSink>>, AuditReport)> {
     let (path, cfg) = config_from(cli_path, &env);
-    let report = AuditReport { enabled: path.is_some(), path: path.clone(), content: cfg.content, prefix_len: cfg.prefix_len };
+    let report = AuditReport {
+        enabled: path.is_some(),
+        path: path.clone(),
+        content: cfg.content,
+        prefix_len: cfg.prefix_len,
+    };
     let sink: Option<Box<dyn AuditSink>> = match path {
         None => None,
-        Some(p) => Some(Box::new(JsonlSink::open(&p, cfg).map_err(|e| anyhow::anyhow!("cannot open audit log {p:?}: {e}"))?)),
+        Some(p) => {
+            Some(Box::new(JsonlSink::open(&p, cfg).map_err(|e| {
+                anyhow::anyhow!("cannot open audit log {p:?}: {e}")
+            })?))
+        }
     };
     Ok((sink, report))
 }
@@ -370,7 +457,10 @@ mod tests {
         }
     }
     fn ok() -> AuditOutcome {
-        AuditOutcome { ok: true, error: None }
+        AuditOutcome {
+            ok: true,
+            error: None,
+        }
     }
     fn lines(b: &Arc<Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
         String::from_utf8(b.lock().unwrap().clone())
@@ -380,12 +470,20 @@ mod tests {
             .collect()
     }
     fn win_ctx() -> ActuationContext {
-        ActuationContext { window: Some(WindowRef { id: 7, title: Some("W".into()) }) }
+        ActuationContext {
+            window: Some(WindowRef {
+                id: 7,
+                title: Some("W".into()),
+            }),
+        }
     }
 
     #[test]
     fn redacted_content_has_len_sha256_prefix_no_text() {
-        let cfg = AuditConfig { content: ContentMode::Redacted, prefix_len: 8 };
+        let cfg = AuditConfig {
+            content: ContentMode::Redacted,
+            prefix_len: 8,
+        };
         let v = render_content("hunter2!!", &cfg).unwrap();
         assert_eq!(v["len"], 9);
         assert_eq!(v["prefix"], "hunter2!");
@@ -395,13 +493,21 @@ mod tests {
 
     #[test]
     fn prefix_utf8_safe_and_zero_len_omits() {
-        let v =
-            render_content("éà-x", &AuditConfig { content: ContentMode::Redacted, prefix_len: 2 })
-                .unwrap();
+        let v = render_content(
+            "éà-x",
+            &AuditConfig {
+                content: ContentMode::Redacted,
+                prefix_len: 2,
+            },
+        )
+        .unwrap();
         assert_eq!(v["prefix"], "éà");
         let v0 = render_content(
             "x",
-            &AuditConfig { content: ContentMode::Redacted, prefix_len: 0 },
+            &AuditConfig {
+                content: ContentMode::Redacted,
+                prefix_len: 0,
+            },
         )
         .unwrap();
         assert!(v0.get("prefix").is_none());
@@ -409,11 +515,23 @@ mod tests {
 
     #[test]
     fn full_mode_has_text_none_mode_omits() {
-        let f =
-            render_content("s", &AuditConfig { content: ContentMode::Full, prefix_len: 8 }).unwrap();
+        let f = render_content(
+            "s",
+            &AuditConfig {
+                content: ContentMode::Full,
+                prefix_len: 8,
+            },
+        )
+        .unwrap();
         assert_eq!(f["text"], "s");
-        assert!(render_content("s", &AuditConfig { content: ContentMode::None, prefix_len: 8 })
-            .is_none());
+        assert!(render_content(
+            "s",
+            &AuditConfig {
+                content: ContentMode::None,
+                prefix_len: 8
+            }
+        )
+        .is_none());
     }
 
     #[test]
@@ -421,7 +539,9 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
         s.record(
-            &Actuation::Key { event: &KeyEvent::Text("pw".into()) },
+            &Actuation::Key {
+                event: &KeyEvent::Text("pw".into()),
+            },
             &win_ctx(),
             &ok(),
             Duration::from_millis(3),
@@ -453,7 +573,9 @@ mod tests {
             Duration::from_millis(1),
         );
         s.record(
-            &Actuation::Key { event: &KeyEvent::Chord("ctrl+s".into()) },
+            &Actuation::Key {
+                event: &KeyEvent::Chord("ctrl+s".into()),
+            },
             &win_ctx(),
             &ok(),
             Duration::from_millis(1),
@@ -473,7 +595,9 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
         s.record(
-            &Actuation::Pointer { event: &PointerEvent::Move { x: 1, y: 1 } },
+            &Actuation::Pointer {
+                event: &PointerEvent::Move { x: 1, y: 1 },
+            },
             &win_ctx(),
             &ok(),
             Duration::from_millis(1),
@@ -485,9 +609,16 @@ mod tests {
     fn set_value_targets_element() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let el = ElementRef { id: 5, role: Some("PasswordField".into()), name: Some("Password".into()) };
+        let el = ElementRef {
+            id: 5,
+            role: Some("PasswordField".into()),
+            name: Some("Password".into()),
+        };
         s.record(
-            &Actuation::SetValue { element: el, text: "v" },
+            &Actuation::SetValue {
+                element: el,
+                text: "v",
+            },
             &ActuationContext::default(),
             &ok(),
             Duration::from_millis(1),
@@ -503,12 +634,44 @@ mod tests {
     fn seq_monotonic_session_minted_on_launch_cleared_on_stop() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let spec = glass_core::AppSpec { build: None, run: vec!["app".into()], cwd: None, env: vec![], window_hint: None, timeout_ms: 1, sandbox: glass_core::SandboxLevel::Off, a11y: false };
-        s.record(&Actuation::Launch { spec: &spec, backend: "x11" }, &ActuationContext::default(), &ok(), Duration::from_millis(1));
-        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
-        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1)); // after stop
+        let spec = glass_core::AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        s.record(
+            &Actuation::Launch {
+                spec: &spec,
+                backend: "x11",
+            },
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        s.record(
+            &Actuation::Stop,
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        s.record(
+            &Actuation::Stop,
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        ); // after stop
         let r = lines(&buf);
-        assert_eq!(r.iter().map(|x| x["seq"].as_u64().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            r.iter()
+                .map(|x| x["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         let sess = r[0]["session"].as_str().unwrap().to_string();
         assert!(sess.starts_with("s-"));
         assert_eq!(r[1]["session"], sess, "stop stamps the ending session");
@@ -519,8 +682,24 @@ mod tests {
     fn errored_actuation_records_ok_false_with_message() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let out = AuditOutcome { ok: false, error: Some("coords out of bounds".into()) };
-        s.record(&Actuation::Pointer { event: &PointerEvent::Click { x: 9, y: 9, button: MouseButton::Left, count: 1, modifiers: vec![] } }, &ActuationContext::default(), &out, Duration::from_millis(1));
+        let out = AuditOutcome {
+            ok: false,
+            error: Some("coords out of bounds".into()),
+        };
+        s.record(
+            &Actuation::Pointer {
+                event: &PointerEvent::Click {
+                    x: 9,
+                    y: 9,
+                    button: MouseButton::Left,
+                    count: 1,
+                    modifiers: vec![],
+                },
+            },
+            &ActuationContext::default(),
+            &out,
+            Duration::from_millis(1),
+        );
         let r = &lines(&buf)[0];
         assert_eq!(r["result"]["ok"], false);
         assert_eq!(r["result"]["error"], "coords out of bounds");
@@ -530,11 +709,20 @@ mod tests {
     fn write_failure_counts_not_panics() {
         struct Fail;
         impl Write for Fail {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::Error::other("full")) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let s = JsonlSink::with_writer(Box::new(Fail), AuditConfig::default());
-        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        s.record(
+            &Actuation::Stop,
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
         assert_eq!(s.dropped(), 1);
     }
 
@@ -545,7 +733,12 @@ mod tests {
         let p = dir.path().join("a.jsonl");
         std::fs::write(&p, "PRE\n").unwrap();
         let s = JsonlSink::open(p.to_str().unwrap(), AuditConfig::default()).unwrap();
-        s.record(&Actuation::Stop, &ActuationContext::default(), &ok(), Duration::from_millis(1));
+        s.record(
+            &Actuation::Stop,
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.starts_with("PRE\n") && body.lines().count() == 2);
     }
@@ -561,17 +754,23 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let (sink, report) = resolve(Some(path.to_str().unwrap()), |k| {
             // Disable the prefix so the redacted record never contains the plaintext.
-            if k == "GLASS_AUDIT_PREFIX_LEN" { Some("0".into()) } else { None }
+            if k == "GLASS_AUDIT_PREFIX_LEN" {
+                Some("0".into())
+            } else {
+                None
+            }
         })
         .unwrap();
         assert!(report.enabled);
 
         // A FakePlatform with several frames so screenshot / settle work.
         let frame = Frame::solid(100, 100, [0, 0, 0, 255]);
-        let mut g = glass_with(
-            FakePlatform::new(100, 100)
-                .with_frames(vec![frame.clone(), frame.clone(), frame.clone(), frame]),
-        );
+        let mut g = glass_with(FakePlatform::new(100, 100).with_frames(vec![
+            frame.clone(),
+            frame.clone(),
+            frame.clone(),
+            frame,
+        ]));
         g.set_audit_sink(sink.unwrap());
 
         tools::start(
@@ -590,7 +789,13 @@ mod tests {
         )
         .unwrap();
         tools::screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap(); // read — not logged
-        tools::type_text(&mut g, &TypeArgs { text: "secret".into() }).unwrap(); // "type"
+        tools::type_text(
+            &mut g,
+            &TypeArgs {
+                text: "secret".into(),
+            },
+        )
+        .unwrap(); // "type"
         tools::do_actions(
             &mut g,
             &DoArgs {
@@ -614,24 +819,51 @@ mod tests {
             },
         )
         .unwrap(); // click (logged) + settle (read — not logged)
-        tools::window(&mut g, &WindowArgs { op: "geometry".into(), x: None, y: None, width: None, height: None }).unwrap(); // read — not logged
-        tools::window(&mut g, &WindowArgs { op: "focus".into(), x: None, y: None, width: None, height: None }).unwrap(); // "window"
+        tools::window(
+            &mut g,
+            &WindowArgs {
+                op: "geometry".into(),
+                x: None,
+                y: None,
+                width: None,
+                height: None,
+            },
+        )
+        .unwrap(); // read — not logged
+        tools::window(
+            &mut g,
+            &WindowArgs {
+                op: "focus".into(),
+                x: None,
+                y: None,
+                width: None,
+                height: None,
+            },
+        )
+        .unwrap(); // "window"
         tools::stop(&mut g).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
-        let recs: Vec<serde_json::Value> =
-            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        let actions: Vec<&str> =
-            recs.iter().map(|r| r["action"].as_str().unwrap()).collect();
+        let recs: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let actions: Vec<&str> = recs.iter().map(|r| r["action"].as_str().unwrap()).collect();
         assert_eq!(
             actions,
             vec!["launch", "type", "click", "window", "stop"],
             "reads (screenshot, settle, window-geometry) are not logged; glass_do click IS"
         );
         let typ = recs.iter().find(|r| r["action"] == "type").unwrap();
-        assert!(typ["content"].get("text").is_none(), "redacted: no plaintext");
+        assert!(
+            typ["content"].get("text").is_none(),
+            "redacted: no plaintext"
+        );
         assert_eq!(typ["content"]["len"], 6);
-        assert!(!body.contains("secret"), "plaintext must not appear in redacted mode");
+        assert!(
+            !body.contains("secret"),
+            "plaintext must not appear in redacted mode"
+        );
         // launch program is recorded verbatim (structural, not content)
         let launch = recs.iter().find(|r| r["action"] == "launch").unwrap();
         assert_eq!(launch["args"]["program"], "app");
@@ -653,7 +885,11 @@ mod tests {
         };
         let (sink, rep) = resolve(Some(clip.to_str().unwrap()), env).unwrap();
         assert!(sink.is_some());
-        assert_eq!(rep.path.as_deref(), Some(clip.to_str().unwrap()), "CLI path wins");
+        assert_eq!(
+            rep.path.as_deref(),
+            Some(clip.to_str().unwrap()),
+            "CLI path wins"
+        );
         assert_eq!(rep.content, ContentMode::Full);
         assert_eq!(rep.prefix_len, 4);
     }

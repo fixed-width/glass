@@ -10,8 +10,8 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Cap on how long `get()` waits for the selection owner to finish writing the
@@ -341,9 +341,8 @@ pub fn get(socket: &Path) -> Result<String> {
     let conn = Connection::from_socket(stream)
         .map_err(|e| GlassError::Backend(format!("clipboard get: wayland connection: {e}")))?;
 
-    let (globals, mut queue): (_, EventQueue<ClipState>) =
-        registry_queue_init(&conn)
-            .map_err(|e| GlassError::Backend(format!("clipboard get: registry: {e}")))?;
+    let (globals, mut queue): (_, EventQueue<ClipState>) = registry_queue_init(&conn)
+        .map_err(|e| GlassError::Backend(format!("clipboard get: registry: {e}")))?;
 
     let qh = queue.handle();
     let mut state = ClipState {
@@ -355,9 +354,9 @@ pub fn get(socket: &Path) -> Result<String> {
         selection: None,
     };
 
-    let manager: ZwlrDataControlManagerV1 = globals
-        .bind(&qh, 1..=2, ())
-        .map_err(|e| GlassError::Backend(format!("clipboard get: bind data-control manager: {e}")))?;
+    let manager: ZwlrDataControlManagerV1 = globals.bind(&qh, 1..=2, ()).map_err(|e| {
+        GlassError::Backend(format!("clipboard get: bind data-control manager: {e}"))
+    })?;
 
     let seat: wl_seat::WlSeat = globals
         .bind(&qh, 1..=8, ())
@@ -390,13 +389,14 @@ pub fn get(socket: &Path) -> Result<String> {
     };
 
     // Create a pipe: offer writes to write_end, we read from read_end.
-    let (read_end, write_end) =
-        rustix::pipe::pipe().map_err(|e| GlassError::Backend(format!("clipboard get: pipe: {e}")))?;
+    let (read_end, write_end) = rustix::pipe::pipe()
+        .map_err(|e| GlassError::Backend(format!("clipboard get: pipe: {e}")))?;
 
     offer.receive(mime, write_end.as_fd());
     drop(write_end); // close write end BEFORE roundtrip so the source can EOF us
 
-    conn.flush().map_err(|e| GlassError::Backend(format!("clipboard get: flush: {e}")))?;
+    conn.flush()
+        .map_err(|e| GlassError::Backend(format!("clipboard get: flush: {e}")))?;
 
     // Roundtrip so the compositor can service our receive request and tell the
     // source to write data. The source's write happens in a separate connection
@@ -439,7 +439,10 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
         // The PollFd borrows `file` only for this statement, freeing it before
         // the read below.
         let ready = rustix::event::poll(
-            &mut [rustix::event::PollFd::new(&file, rustix::event::PollFlags::IN)],
+            &mut [rustix::event::PollFd::new(
+                &file,
+                rustix::event::PollFlags::IN,
+            )],
             Some(&ts),
         );
         match ready {
@@ -449,7 +452,9 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    return Err(GlassError::Backend(format!("clipboard get: read pipe: {e}")))
+                    return Err(GlassError::Backend(format!(
+                        "clipboard get: read pipe: {e}"
+                    )))
                 }
             },
             Err(rustix::io::Errno::INTR) => continue,
@@ -535,7 +540,11 @@ impl ClipboardOwner {
         }
         drop(result);
 
-        Ok(Self { text, stop, handle: Some(handle) })
+        Ok(Self {
+            text,
+            stop,
+            handle: Some(handle),
+        })
     }
 
     /// Update the text being served. If the thread already lost ownership
@@ -690,9 +699,15 @@ fn serve_loop(
         // Poll the connection fd with a short timeout so we can check `stop`
         // between polls without parking the thread forever (50 ms).
         let fd = conn.as_fd();
-        let timeout = rustix::event::Timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+        let timeout = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
         match rustix::event::poll(
-            &mut [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)],
+            &mut [rustix::event::PollFd::new(
+                &fd,
+                rustix::event::PollFlags::IN,
+            )],
             Some(&timeout),
         ) {
             Ok(n) if n > 0 => {
@@ -732,7 +747,10 @@ mod tests {
         // the transfer but never finishes writing. Must NOT hang forever.
         let (read_end, _write_end) = rustix::pipe::pipe().expect("pipe");
         let r = read_to_eof_bounded(read_end, Duration::from_millis(200));
-        assert!(matches!(r, Err(GlassError::Timeout(_))), "expected Timeout, got {r:?}");
+        assert!(
+            matches!(r, Err(GlassError::Timeout(_))),
+            "expected Timeout, got {r:?}"
+        );
         // _write_end stays alive above so no EOF is signalled during the read.
     }
 

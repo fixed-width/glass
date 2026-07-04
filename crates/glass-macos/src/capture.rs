@@ -49,7 +49,9 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// unset — see [`capture_window_by_id`] for its active-window (retargeted) counterpart.
 pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Frame> {
     let pids_owned: Vec<i32> = pids.to_vec();
-    capture_resolved(region, move |content| find_on_screen_window(content, &pids_owned))
+    capture_resolved(region, move |content| {
+        find_on_screen_window(content, &pids_owned)
+    })
 }
 
 /// Capture the specific on-screen window whose `CGWindowID == window_id` AND
@@ -62,9 +64,15 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
 /// decision 2). The `pids` scoping (final-review fix 1) additionally guards against a
 /// stale/foreign `active_window` id: without it, `window_id` alone could match a window
 /// owned by a completely different app, silently capturing its pixels instead of erroring.
-pub(crate) fn capture_window_by_id(window_id: u32, pids: &[i32], region: Option<&Region>) -> Result<Frame> {
+pub(crate) fn capture_window_by_id(
+    window_id: u32,
+    pids: &[i32],
+    region: Option<&Region>,
+) -> Result<Frame> {
     let pids_owned: Vec<i32> = pids.to_vec();
-    capture_resolved(region, move |content| find_on_screen_window_by_id(content, window_id, &pids_owned))
+    capture_resolved(region, move |content| {
+        find_on_screen_window_by_id(content, window_id, &pids_owned)
+    })
 }
 
 /// Shared nested-async capture body for [`capture_window`]/[`capture_window_by_id`]: resolve
@@ -106,10 +114,7 @@ fn capture_resolved(
             // SAFETY: `window` is a live `SCWindow` just resolved above;
             // `initWithDesktopIndependentWindow:` has no other preconditions.
             let filter = unsafe {
-                SCContentFilter::initWithDesktopIndependentWindow(
-                    SCContentFilter::alloc(),
-                    &window,
-                )
+                SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
             };
             // SAFETY: plain no-arg initializer; no preconditions.
             let config = unsafe { SCStreamConfiguration::new() };
@@ -269,7 +274,10 @@ fn rgba_frame_from_cgimage(image: &CGImage) -> Result<Frame> {
 
     let rect = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize { width: w as f64, height: h as f64 },
+        size: CGSize {
+            width: w as f64,
+            height: h as f64,
+        },
     };
     CGContext::draw_image(Some(&ctx), rect, Some(image));
 

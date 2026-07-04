@@ -43,7 +43,9 @@ fn bench_diff_perceptual(c: &mut Criterion) {
         g.throughput(Throughput::Elements(u64::from(w) * u64::from(h)));
         for (name, other) in &scenarios {
             g.bench_with_input(BenchmarkId::new(*name, &size), other, |b, other| {
-                b.iter(|| black_box(diff_perceptual(black_box(&base), black_box(other), 0.1).unwrap()));
+                b.iter(|| {
+                    black_box(diff_perceptual(black_box(&base), black_box(other), 0.1).unwrap())
+                });
             });
         }
     }

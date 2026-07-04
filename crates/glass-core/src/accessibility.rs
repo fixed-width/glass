@@ -521,59 +521,145 @@ mod tests {
 
     #[test]
     fn ax_target_matches_on_role_and_name() {
-        let t = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: Some("Email".into()), bounds: None };
+        let t = AxTarget {
+            id: AxNodeId(3),
+            role: AxRole::TextField,
+            name: Some("Email".into()),
+            bounds: None,
+        };
         assert!(t.matches(AxRole::TextField, Some("Email")));
         assert!(!t.matches(AxRole::Button, Some("Email")), "role must match");
-        assert!(!t.matches(AxRole::TextField, Some("Name")), "name must match");
-        assert!(!t.matches(AxRole::TextField, None), "missing name must not match a named target");
+        assert!(
+            !t.matches(AxRole::TextField, Some("Name")),
+            "name must match"
+        );
+        assert!(
+            !t.matches(AxRole::TextField, None),
+            "missing name must not match a named target"
+        );
 
-        let t_unnamed = AxTarget { id: AxNodeId(5), role: AxRole::TextField, name: None, bounds: None };
-        assert!(t_unnamed.matches(AxRole::TextField, None), "unnamed target matches unnamed live node");
-        assert!(!t_unnamed.matches(AxRole::TextField, Some("X")), "unnamed target must not match a named live node");
+        let t_unnamed = AxTarget {
+            id: AxNodeId(5),
+            role: AxRole::TextField,
+            name: None,
+            bounds: None,
+        };
+        assert!(
+            t_unnamed.matches(AxRole::TextField, None),
+            "unnamed target matches unnamed live node"
+        );
+        assert!(
+            !t_unnamed.matches(AxRole::TextField, Some("X")),
+            "unnamed target must not match a named live node"
+        );
     }
 
     #[test]
     fn ax_target_bounds_consistent_rejects_a_moved_element() {
-        let r = AxRect { x: 100, y: 50, width: 80, height: 20 };
-        let t = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: None, bounds: Some(r) };
+        let r = AxRect {
+            x: 100,
+            y: 50,
+            width: 80,
+            height: 20,
+        };
+        let t = AxTarget {
+            id: AxNodeId(3),
+            role: AxRole::TextField,
+            name: None,
+            bounds: Some(r),
+        };
         // Exact and within-tolerance bounds pass.
         assert!(t.bounds_consistent(Some(r), 8));
         assert!(
-            t.bounds_consistent(Some(AxRect { x: 104, y: 53, width: 80, height: 20 }), 8),
+            t.bounds_consistent(
+                Some(AxRect {
+                    x: 104,
+                    y: 53,
+                    width: 80,
+                    height: 20
+                }),
+                8
+            ),
             "minor jitter within tolerance is accepted"
         );
         // A different element that drift landed on this id sits elsewhere → rejected.
-        assert!(!t.bounds_consistent(Some(AxRect { x: 300, y: 400, width: 120, height: 30 }), 8));
+        assert!(!t.bounds_consistent(
+            Some(AxRect {
+                x: 300,
+                y: 400,
+                width: 120,
+                height: 30
+            }),
+            8
+        ));
         // Expected a positioned element but the reached one has none → reject.
         assert!(!t.bounds_consistent(None, 8));
         // No fingerprint captured → nothing to verify, accept (role+name still gates).
-        let t_nofp = AxTarget { id: AxNodeId(3), role: AxRole::TextField, name: None, bounds: None };
+        let t_nofp = AxTarget {
+            id: AxNodeId(3),
+            role: AxRole::TextField,
+            name: None,
+            bounds: None,
+        };
         assert!(t_nofp.bounds_consistent(Some(r), 8));
         assert!(t_nofp.bounds_consistent(None, 8));
     }
 
     #[test]
     fn clamped_center_is_in_bounds() {
-        let r = AxRect { x: 10, y: 20, width: 40, height: 10 };
+        let r = AxRect {
+            x: 10,
+            y: 20,
+            width: 40,
+            height: 10,
+        };
         assert_eq!(r.clamped_center(100, 100), Some((30, 25)));
     }
 
     #[test]
     fn clamped_center_clamps_to_window() {
-        let r = AxRect { x: 90, y: 90, width: 40, height: 40 };
+        let r = AxRect {
+            x: 90,
+            y: 90,
+            width: 40,
+            height: 40,
+        };
         // center would be (110,110); clamps to (63,47) for a 64x48 window.
         assert_eq!(r.clamped_center(64, 48), Some((63, 47)));
     }
 
     #[test]
     fn clamped_center_rejects_zero_area() {
-        assert_eq!(AxRect { x: 0, y: 0, width: 0, height: 5 }.clamped_center(10, 10), None);
-        assert_eq!(AxRect { x: 0, y: 0, width: 5, height: 5 }.clamped_center(0, 10), None);
+        assert_eq!(
+            AxRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 5
+            }
+            .clamped_center(10, 10),
+            None
+        );
+        assert_eq!(
+            AxRect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 5
+            }
+            .clamped_center(0, 10),
+            None
+        );
     }
 
     #[test]
     fn active_states_listed_in_order() {
-        let s = AxStates { focusable: true, enabled: true, checked: true, ..Default::default() };
+        let s = AxStates {
+            focusable: true,
+            enabled: true,
+            checked: true,
+            ..Default::default()
+        };
         assert_eq!(s.active(), vec!["focusable", "enabled", "checked"]);
     }
 
@@ -593,8 +679,17 @@ mod tests {
 
     fn sample_tree() -> AxTree {
         let mut button = leaf(AxRole::Button, "Save");
-        button.bounds = Some(AxRect { x: 12, y: 40, width: 80, height: 24 });
-        button.states = AxStates { focusable: true, enabled: true, ..Default::default() };
+        button.bounds = Some(AxRect {
+            x: 12,
+            y: 40,
+            width: 80,
+            height: 24,
+        });
+        button.states = AxStates {
+            focusable: true,
+            enabled: true,
+            ..Default::default()
+        };
         let root = AxNode {
             id: AxNodeId(0),
             role: AxRole::Window,
@@ -602,7 +697,12 @@ mod tests {
             name: Some("Settings".into()),
             value: None,
             states: AxStates::default(),
-            bounds: Some(AxRect { x: 0, y: 0, width: 640, height: 480 }),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+            }),
             children: vec![button, leaf(AxRole::Label, "Ready")],
         };
         AxTree { root, count: 0 }
@@ -660,7 +760,13 @@ mod tests {
         ] {
             assert!(r.is_interactable(), "{r:?} should be interactable");
         }
-        for r in [AxRole::Window, AxRole::Group, AxRole::Label, AxRole::Image, AxRole::Other] {
+        for r in [
+            AxRole::Window,
+            AxRole::Group,
+            AxRole::Label,
+            AxRole::Image,
+            AxRole::Other,
+        ] {
             assert!(!r.is_interactable(), "{r:?} should not be interactable");
         }
     }
@@ -675,14 +781,32 @@ mod tests {
 
     #[test]
     fn condition_from_name_maps_known_and_rejects_unknown() {
-        assert_eq!(ElementCondition::from_name("appears"), Some(ElementCondition::Appears));
-        assert_eq!(ElementCondition::from_name("disappears"), Some(ElementCondition::Disappears));
-        assert_eq!(ElementCondition::from_name("enabled"), Some(ElementCondition::Enabled));
-        assert_eq!(ElementCondition::from_name("hidden"), Some(ElementCondition::Hidden));
+        assert_eq!(
+            ElementCondition::from_name("appears"),
+            Some(ElementCondition::Appears)
+        );
+        assert_eq!(
+            ElementCondition::from_name("disappears"),
+            Some(ElementCondition::Disappears)
+        );
+        assert_eq!(
+            ElementCondition::from_name("enabled"),
+            Some(ElementCondition::Enabled)
+        );
+        assert_eq!(
+            ElementCondition::from_name("hidden"),
+            Some(ElementCondition::Hidden)
+        );
         assert_eq!(ElementCondition::from_name("wat"), None);
         // case-insensitive
-        assert_eq!(ElementCondition::from_name("Enabled"), Some(ElementCondition::Enabled));
-        assert_eq!(ElementCondition::from_name("DISAPPEARS"), Some(ElementCondition::Disappears));
+        assert_eq!(
+            ElementCondition::from_name("Enabled"),
+            Some(ElementCondition::Enabled)
+        );
+        assert_eq!(
+            ElementCondition::from_name("DISAPPEARS"),
+            Some(ElementCondition::Disappears)
+        );
     }
 
     #[test]
@@ -700,7 +824,13 @@ mod tests {
         let mut t = sample_tree();
         t.assign_ids();
         // A Label also exists; require role=Button so only "Save" qualifies.
-        match element_match(&t, None, Some(AxRole::Button), None, ElementCondition::Appears) {
+        match element_match(
+            &t,
+            None,
+            Some(AxRole::Button),
+            None,
+            ElementCondition::Appears,
+        ) {
             ElementMatch::Satisfied(Some(n)) => assert_eq!(n.name.as_deref(), Some("Save")),
             other => panic!("expected the Button, got {other:?}"),
         }
@@ -711,7 +841,11 @@ mod tests {
         // A Compose button often surfaces as a clickable (focusable) Group with the role
         // lost — `role:"Button"` should still find it by name + actability.
         let mut clickable = leaf(AxRole::Group, "Submit");
-        clickable.states = AxStates { focusable: true, enabled: true, ..Default::default() };
+        clickable.states = AxStates {
+            focusable: true,
+            enabled: true,
+            ..Default::default()
+        };
         let inert = leaf(AxRole::Group, "Panel"); // a non-actable Group must NOT match Button
         let root = AxNode {
             id: AxNodeId(0),
@@ -733,7 +867,13 @@ mod tests {
         );
         assert!(
             matches!(
-                element_match(&t, Some("Panel"), Some(AxRole::Button), None, ElementCondition::Appears),
+                element_match(
+                    &t,
+                    Some("Panel"),
+                    Some(AxRole::Button),
+                    None,
+                    ElementCondition::Appears
+                ),
                 ElementMatch::Pending
             ),
             "a non-actable Group must not satisfy role:Button"
@@ -780,12 +920,24 @@ mod tests {
         t.assign_ids();
         // Give the Label a value and match on it.
         t.root.children[1].value = Some("Loading 50%".into());
-        match element_match(&t, None, Some(AxRole::Label), Some("50%"), ElementCondition::Appears) {
+        match element_match(
+            &t,
+            None,
+            Some(AxRole::Label),
+            Some("50%"),
+            ElementCondition::Appears,
+        ) {
             ElementMatch::Satisfied(Some(n)) => assert_eq!(n.name.as_deref(), Some("Ready")),
             other => panic!("expected the Label by value, got {other:?}"),
         }
         assert!(matches!(
-            element_match(&t, None, Some(AxRole::Label), Some("99%"), ElementCondition::Appears),
+            element_match(
+                &t,
+                None,
+                Some(AxRole::Label),
+                Some("99%"),
+                ElementCondition::Appears
+            ),
             ElementMatch::Pending
         ));
     }

@@ -21,8 +21,12 @@ pub fn class_to_role(class: &str) -> AxRole {
         "Spinner" => AxRole::ComboBox,
         "SeekBar" => AxRole::Slider,
         "ProgressBar" => AxRole::ProgressBar,
-        "ScrollView" | "HorizontalScrollView" | "NestedScrollView" | "RecyclerView"
-        | "ListView" | "GridView" => AxRole::List,
+        "ScrollView"
+        | "HorizontalScrollView"
+        | "NestedScrollView"
+        | "RecyclerView"
+        | "ListView"
+        | "GridView" => AxRole::List,
         "WebView" => AxRole::Group,
         other if other.ends_with("Layout") || other == "View" || other == "ViewGroup" => {
             AxRole::Group
@@ -86,7 +90,12 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
         name: None,
         value: None,
         states: AxStates::default(),
-        bounds: Some(AxRect { x: 0, y: 0, width: window.width, height: window.height }),
+        bounds: Some(AxRect {
+            x: 0,
+            y: 0,
+            width: window.width,
+            height: window.height,
+        }),
         children,
     };
     Ok(AxTree { root, count: 0 })
@@ -162,7 +171,12 @@ mod tests {
     );
 
     fn win() -> WindowGeometry {
-        WindowGeometry { x: 0, y: 0, width: 1080, height: 2400 }
+        WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        }
     }
 
     #[test]
@@ -171,14 +185,22 @@ mod tests {
         assert_eq!(class_to_role("android.widget.EditText"), AxRole::TextField);
         assert_eq!(class_to_role("android.widget.TextView"), AxRole::Label);
         assert_eq!(class_to_role("android.widget.CheckBox"), AxRole::CheckBox);
-        assert_eq!(class_to_role("androidx.recyclerview.widget.RecyclerView"), AxRole::List);
+        assert_eq!(
+            class_to_role("androidx.recyclerview.widget.RecyclerView"),
+            AxRole::List
+        );
         assert_eq!(class_to_role("android.widget.FrameLayout"), AxRole::Group);
         assert_eq!(class_to_role("com.example.CustomThing"), AxRole::Other);
     }
 
     #[test]
     fn bounds_become_window_relative() {
-        let win = WindowGeometry { x: 0, y: 63, width: 1080, height: 2337 };
+        let win = WindowGeometry {
+            x: 0,
+            y: 63,
+            width: 1080,
+            height: 2337,
+        };
         let r = parse_bounds("[40,100][300,160]", &win).unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (40, 37, 260, 60));
         assert!(parse_bounds("garbage", &win).is_none());
@@ -200,12 +222,18 @@ mod tests {
         assert_eq!(frame.role, AxRole::Group);
         let kids = &frame.children;
         assert_eq!(kids.len(), 3);
-        assert_eq!((kids[0].role, kids[0].name.as_deref()), (AxRole::Label, Some("Settings")));
+        assert_eq!(
+            (kids[0].role, kids[0].name.as_deref()),
+            (AxRole::Label, Some("Settings"))
+        );
         assert_eq!(kids[1].role, AxRole::TextField);
         assert_eq!(kids[1].name.as_deref(), Some("Email"));
         assert_eq!(kids[1].value.as_deref(), Some("joe@x.com"));
         assert!(kids[1].states.editable && kids[1].states.focused);
-        assert_eq!((kids[2].role, kids[2].name.as_deref()), (AxRole::Button, Some("Save")));
+        assert_eq!(
+            (kids[2].role, kids[2].name.as_deref()),
+            (AxRole::Button, Some("Save"))
+        );
         assert_eq!(kids[2].bounds.unwrap().width, 1000);
     }
 

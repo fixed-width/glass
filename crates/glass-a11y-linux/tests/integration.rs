@@ -28,7 +28,10 @@ fn glass_x11_with_a11y() -> Glass {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -45,7 +48,10 @@ fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
                     ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
                     ("GDK_BACKEND".into(), "x11".into()),
                 ],
-                window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+                window_hint: Some(WindowHint {
+                    title: Some("Glass A11y Fixture".into()),
+                    class: None,
+                }),
                 timeout_ms: 35_000,
                 sandbox: glass_core::SandboxLevel::Off,
                 a11y: true,
@@ -58,7 +64,10 @@ fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_finds_gtk_widgets() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
@@ -69,7 +78,10 @@ fn snapshot_finds_gtk_widgets() {
                 ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
                 ("GDK_BACKEND".into(), "x11".into()),
             ],
-            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
             timeout_ms: 35_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
@@ -85,8 +97,14 @@ fn snapshot_finds_gtk_widgets() {
 
     let tree = glass.a11y_snapshot().expect("a11y snapshot");
     let outline = tree.to_outline();
-    assert!(outline.contains("Button \"Save\""), "no Save button in:\n{outline}");
-    assert!(outline.contains("CheckBox \"Enable\""), "no Enable checkbox in:\n{outline}");
+    assert!(
+        outline.contains("Button \"Save\""),
+        "no Save button in:\n{outline}"
+    );
+    assert!(
+        outline.contains("CheckBox \"Enable\""),
+        "no Enable checkbox in:\n{outline}"
+    );
 
     glass.stop().expect("stop");
 }
@@ -94,21 +112,29 @@ fn snapshot_finds_gtk_widgets() {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_reads_entry_value() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
     let mut glass = glass_x11_with_a11y();
-    glass.start(&AppSpec {
-        build: None,
-        run: vec!["python3".into(), fixture.into()],
-        cwd: None,
-        env: vec![
-            ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
-            ("GDK_BACKEND".into(), "x11".into()),
-        ],
-        window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
-        timeout_ms: 35_000,
-        sandbox: glass_core::SandboxLevel::Off,
-        a11y: true,
-    }).expect("launch GTK fixture");
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch GTK fixture");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let tree = glass.a11y_snapshot().expect("a11y snapshot");
@@ -118,23 +144,40 @@ fn snapshot_reads_entry_value() {
     let entry = find_role(&tree.root, glass_core::AxRole::TextArea)
         .or_else(|| find_role(&tree.root, glass_core::AxRole::TextField))
         .unwrap_or_else(|| panic!("no TextArea/TextField node in tree:\n{outline}"));
-    assert_eq!(entry.value.as_deref(), Some("hello"), "entry value should be read; tree:\n{outline}");
+    assert_eq!(
+        entry.value.as_deref(),
+        Some("hello"),
+        "entry value should be read; tree:\n{outline}"
+    );
     glass.stop().expect("stop");
 }
 
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn set_value_changes_entry() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
     let mut glass = glass_x11_with_a11y();
-    glass.start(&AppSpec {
-        build: None, run: vec!["python3".into(), fixture.into()], cwd: None,
-        env: vec![("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()), ("GDK_BACKEND".into(), "x11".into())],
-        window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
-        timeout_ms: 35_000,
-        sandbox: glass_core::SandboxLevel::Off,
-        a11y: true,
-    }).expect("launch");
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let tree = glass.a11y_snapshot().expect("snapshot");
@@ -150,45 +193,21 @@ fn set_value_changes_entry() {
     let entry2 = find_role(&tree2.root, glass_core::AxRole::TextArea)
         .or_else(|| find_role(&tree2.root, glass_core::AxRole::TextField))
         .expect("entry 2");
-    assert_eq!(entry2.value.as_deref(), Some("changed"), "value should be updated");
+    assert_eq!(
+        entry2.value.as_deref(),
+        Some("changed"),
+        "value should be updated"
+    );
     glass.stop().expect("stop");
 }
 
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn set_value_on_button_is_not_editable() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
-    let mut glass = glass_x11_with_a11y();
-    glass.start(&AppSpec {
-        build: None, run: vec!["python3".into(), fixture.into()], cwd: None,
-        env: vec![("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()), ("GDK_BACKEND".into(), "x11".into())],
-        window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
-        timeout_ms: 35_000,
-        sandbox: glass_core::SandboxLevel::Off,
-        a11y: true,
-    }).expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
-
-    let tree = glass.a11y_snapshot().expect("snapshot");
-    let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
-    let err = glass.set_value(button.id, "x").unwrap_err();
-    assert!(matches!(err, glass_core::GlassError::AxElementNotEditable(_)), "got: {err:?}");
-    glass.stop().expect("stop");
-}
-
-// Pre-order search for the first node of a given role.
-fn find_role(node: &glass_core::AxNode, role: glass_core::AxRole) -> Option<&glass_core::AxNode> {
-    if node.role == role { return Some(node); }
-    node.children.iter().find_map(|c| find_role(c, role))
-}
-
-#[test]
-#[ignore = "needs Xvfb + GTK4 fixture; run via scripts/test-a11y.sh"]
-fn snapshot_without_a11y_flag_errors() {
-    // With a11y:false (the default), glass spawns NO private bus, so the reader has no
-    // bus address and must return a clear "relaunch with a11y:true" error rather than
-    // falling back to the ambient host bus.
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/a11y_fixture.py");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
@@ -199,7 +218,59 @@ fn snapshot_without_a11y_flag_errors() {
                 ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
                 ("GDK_BACKEND".into(), "x11".into()),
             ],
-            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch");
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
+    let err = glass.set_value(button.id, "x").unwrap_err();
+    assert!(
+        matches!(err, glass_core::GlassError::AxElementNotEditable(_)),
+        "got: {err:?}"
+    );
+    glass.stop().expect("stop");
+}
+
+// Pre-order search for the first node of a given role.
+fn find_role(node: &glass_core::AxNode, role: glass_core::AxRole) -> Option<&glass_core::AxNode> {
+    if node.role == role {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| find_role(c, role))
+}
+
+#[test]
+#[ignore = "needs Xvfb + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn snapshot_without_a11y_flag_errors() {
+    // With a11y:false (the default), glass spawns NO private bus, so the reader has no
+    // bus address and must return a clear "relaunch with a11y:true" error rather than
+    // falling back to the ambient host bus.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
             timeout_ms: 35_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: false,
@@ -207,7 +278,9 @@ fn snapshot_without_a11y_flag_errors() {
         .expect("launch GTK fixture");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
-    let err = glass.a11y_snapshot().expect_err("snapshot must fail without a11y:true");
+    let err = glass
+        .a11y_snapshot()
+        .expect_err("snapshot must fail without a11y:true");
     match err {
         glass_core::GlassError::AccessibilityUnavailable(msg) => {
             assert!(msg.contains("a11y:true"), "unexpected message: {msg}");
@@ -233,15 +306,24 @@ fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
                 ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
                 ("GDK_BACKEND".into(), "x11".into()),
             ],
-            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
             timeout_ms: 35_000,
             sandbox: level,
             a11y: true,
         })
         .unwrap_or_else(|e| panic!("launch GTK fixture sandboxed ({level:?}): {e}"));
     std::thread::sleep(std::time::Duration::from_millis(3_000));
-    let outline = glass.a11y_snapshot().expect("a11y snapshot (sandboxed)").to_outline();
-    assert!(outline.contains("Button \"Save\""), "no Save button (sandboxed {level:?}):\n{outline}");
+    let outline = glass
+        .a11y_snapshot()
+        .expect("a11y snapshot (sandboxed)")
+        .to_outline();
+    assert!(
+        outline.contains("Button \"Save\""),
+        "no Save button (sandboxed {level:?}):\n{outline}"
+    );
     glass.stop().expect("stop");
 }
 
@@ -286,15 +368,24 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
                 ("GSK_RENDERER".into(), "cairo".into()),
                 ("GDK_BACKEND".into(), "wayland".into()),
             ],
-            window_hint: Some(WindowHint { title: Some("Glass A11y Fixture".into()), class: None }),
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
             timeout_ms: 35_000,
             sandbox: level,
             a11y: true,
         })
         .unwrap_or_else(|e| panic!("wayland a11y launch ({level:?}): {e}"));
     std::thread::sleep(std::time::Duration::from_millis(3_000));
-    let outline = glass.a11y_snapshot().expect("a11y snapshot (wayland)").to_outline();
-    assert!(outline.contains("Button \"Save\""), "no Save button (wayland {level:?}):\n{outline}");
+    let outline = glass
+        .a11y_snapshot()
+        .expect("a11y snapshot (wayland)")
+        .to_outline();
+    assert!(
+        outline.contains("Button \"Save\""),
+        "no Save button (wayland {level:?}):\n{outline}"
+    );
     glass.stop().expect("stop");
 }
 

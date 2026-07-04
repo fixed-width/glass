@@ -125,7 +125,13 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
     } else {
         0.0
     };
-    Ok(DiffResult { changed_pixels: changed, total_pixels: total, changed_pct, bbox, aa_ignored: 0 })
+    Ok(DiffResult {
+        changed_pixels: changed,
+        total_pixels: total,
+        changed_pct,
+        bbox,
+        aa_ignored: 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +275,8 @@ fn is_antialiased(px: &[u8], x: u32, y: u32, w: u32, h: u32, other: &[u8]) -> bo
         return false;
     }
     (has_many_siblings(px, min_x, min_y, w, h) && has_many_siblings(other, min_x, min_y, w, h))
-        || (has_many_siblings(px, max_x, max_y, w, h) && has_many_siblings(other, max_x, max_y, w, h))
+        || (has_many_siblings(px, max_x, max_y, w, h)
+            && has_many_siblings(other, max_x, max_y, w, h))
 }
 
 enum PixelClass {
@@ -320,11 +327,23 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         // SIMD pre-scan: byte-identical 8-pixel chunks (the common case) can't
         // contain a change, so skip the per-pixel perceptual + AA work entirely.
         while off + LANES <= row_bytes {
-            if u8x32::from_slice(&ra[off..off + LANES]) != u8x32::from_slice(&rb[off..off + LANES]) {
+            if u8x32::from_slice(&ra[off..off + LANES]) != u8x32::from_slice(&rb[off..off + LANES])
+            {
                 for px in 0..(LANES / 4) as u32 {
                     classify_into(
-                        a, b, col + px, y, w, h, max_delta, &mut changed, &mut aa_ignored,
-                        &mut min_x, &mut min_y, &mut max_x, &mut max_y,
+                        a,
+                        b,
+                        col + px,
+                        y,
+                        w,
+                        h,
+                        max_delta,
+                        &mut changed,
+                        &mut aa_ignored,
+                        &mut min_x,
+                        &mut min_y,
+                        &mut max_x,
+                        &mut max_y,
                     );
                 }
             }
@@ -333,8 +352,19 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         }
         while off < row_bytes {
             classify_into(
-                a, b, col, y, w, h, max_delta, &mut changed, &mut aa_ignored, &mut min_x,
-                &mut min_y, &mut max_x, &mut max_y,
+                a,
+                b,
+                col,
+                y,
+                w,
+                h,
+                max_delta,
+                &mut changed,
+                &mut aa_ignored,
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
             );
             off += 4;
             col += 1;
@@ -348,8 +378,18 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         width: max_x - min_x + 1,
         height: max_y - min_y + 1,
     });
-    let changed_pct = if total > 0 { (changed as f64 / total as f64 * 100.0) as f32 } else { 0.0 };
-    Ok(DiffResult { changed_pixels: changed, total_pixels: total, changed_pct, bbox, aa_ignored })
+    let changed_pct = if total > 0 {
+        (changed as f64 / total as f64 * 100.0) as f32
+    } else {
+        0.0
+    };
+    Ok(DiffResult {
+        changed_pixels: changed,
+        total_pixels: total,
+        changed_pct,
+        bbox,
+        aa_ignored,
+    })
 }
 
 /// Classify the pixel at (x,y) and fold it into the running counters/bbox.
@@ -359,8 +399,19 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
     reason = "hot per-pixel classifier; threads counters/bbox by &mut to avoid per-pixel allocation"
 )]
 fn classify_into(
-    a: &Frame, b: &Frame, x: u32, y: u32, w: u32, h: u32, max_delta: f32, changed: &mut u64,
-    aa_ignored: &mut u64, min_x: &mut u32, min_y: &mut u32, max_x: &mut u32, max_y: &mut u32,
+    a: &Frame,
+    b: &Frame,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    max_delta: f32,
+    changed: &mut u64,
+    aa_ignored: &mut u64,
+    min_x: &mut u32,
+    min_y: &mut u32,
+    max_x: &mut u32,
+    max_y: &mut u32,
 ) {
     match classify(&a.pixels, &b.pixels, x, y, w, h, max_delta) {
         PixelClass::Same => {}
@@ -399,7 +450,15 @@ mod tests {
         b.pixels[off] = 255;
         let r = diff(&a, &b, 0).unwrap();
         assert_eq!(r.changed_pixels, 1);
-        assert_eq!(r.bbox, Some(BBox { x: 1, y: 2, width: 1, height: 1 }));
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 1,
+                y: 2,
+                width: 1,
+                height: 1
+            })
+        );
     }
 
     #[test]
@@ -421,14 +480,25 @@ mod tests {
         }
         let r = diff(&a, &b, 0).unwrap();
         assert_eq!(r.changed_pixels, 2);
-        assert_eq!(r.bbox, Some(BBox { x: 1, y: 1, width: 3, height: 2 }));
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 1,
+                y: 1,
+                width: 3,
+                height: 2
+            })
+        );
     }
 
     #[test]
     fn size_mismatch_errors() {
         let a = Frame::solid(2, 2, [0, 0, 0, 255]);
         let b = Frame::solid(3, 2, [0, 0, 0, 255]);
-        assert!(matches!(diff(&a, &b, 0).unwrap_err(), GlassError::SizeMismatch { .. }));
+        assert!(matches!(
+            diff(&a, &b, 0).unwrap_err(),
+            GlassError::SizeMismatch { .. }
+        ));
     }
 
     /// Independent scalar reference (the pre-optimization algorithm) used to
@@ -462,32 +532,68 @@ mod tests {
             width: max_x - min_x + 1,
             height: max_y - min_y + 1,
         });
-        let changed_pct = if total > 0 { (changed as f64 / total as f64 * 100.0) as f32 } else { 0.0 };
-        DiffResult { changed_pixels: changed, total_pixels: total, changed_pct, bbox, aa_ignored: 0 }
+        let changed_pct = if total > 0 {
+            (changed as f64 / total as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct,
+            bbox,
+            aa_ignored: 0,
+        }
     }
 
     fn make(w: u32, h: u32, seed: u32) -> Frame {
         let n = (w as usize) * (h as usize) * 4;
-        let px = (0..n).map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) as u8).collect();
+        let px = (0..n)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) as u8)
+            .collect();
         Frame::new(w, h, px).unwrap()
     }
 
     #[test]
     fn simd_matches_scalar_reference() {
         // Sizes chosen to exercise full chunks, tails, and degenerate cases.
-        let sizes = [(0u32, 0u32), (1, 1), (7, 1), (1, 7), (8, 1), (9, 3), (13, 7), (32, 2), (33, 2), (64, 4), (100, 50)];
+        let sizes = [
+            (0u32, 0u32),
+            (1, 1),
+            (7, 1),
+            (1, 7),
+            (8, 1),
+            (9, 3),
+            (13, 7),
+            (32, 2),
+            (33, 2),
+            (64, 4),
+            (100, 50),
+        ];
         for &(w, h) in &sizes {
             let a = make(w, h, 0);
-            assert_eq!(diff(&a, &a, 0).unwrap(), reference_diff(&a, &a, 0), "identical {w}x{h}");
+            assert_eq!(
+                diff(&a, &a, 0).unwrap(),
+                reference_diff(&a, &a, 0),
+                "identical {w}x{h}"
+            );
             let b = make(w, h, 7);
             for tol in [0u8, 10, 255] {
-                assert_eq!(diff(&a, &b, tol).unwrap(), reference_diff(&a, &b, tol), "{w}x{h} tol={tol}");
+                assert_eq!(
+                    diff(&a, &b, tol).unwrap(),
+                    reference_diff(&a, &b, tol),
+                    "{w}x{h} tol={tol}"
+                );
             }
             if w > 0 && h > 0 {
                 let mut c = a.clone();
                 let last = c.pixels.len() - 4;
                 c.pixels[last] ^= 0xFF;
-                assert_eq!(diff(&a, &c, 0).unwrap(), reference_diff(&a, &c, 0), "one-changed {w}x{h}");
+                assert_eq!(
+                    diff(&a, &c, 0).unwrap(),
+                    reference_diff(&a, &c, 0),
+                    "one-changed {w}x{h}"
+                );
             }
         }
     }
@@ -501,7 +607,13 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let off = ((y * w + x) * 4) as usize;
-                let v: u8 = if x < seam { 0 } else if x == seam { 128 } else { 255 };
+                let v: u8 = if x < seam {
+                    0
+                } else if x == seam {
+                    128
+                } else {
+                    255
+                };
                 px[off..off + 4].copy_from_slice(&[v, v, v, 255]);
             }
         }
@@ -536,7 +648,15 @@ mod tests {
         let r = diff_perceptual(&a, &b, 0.1).unwrap();
         assert_eq!(r.changed_pixels, 100);
         assert_eq!(r.aa_ignored, 0);
-        assert_eq!(r.bbox, Some(BBox { x: 0, y: 0, width: 10, height: 10 }));
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10
+            })
+        );
     }
 
     #[test]
@@ -547,7 +667,10 @@ mod tests {
         let exact = diff(&a, &b, 0).unwrap();
         let perc = diff_perceptual(&a, &b, 0.1).unwrap();
         assert!(exact.changed_pixels > 0, "exact should see the shift");
-        assert!(perc.aa_ignored > 0, "perceptual should suppress some pixels as AA");
+        assert!(
+            perc.aa_ignored > 0,
+            "perceptual should suppress some pixels as AA"
+        );
         assert!(
             perc.changed_pixels < exact.changed_pixels,
             "perceptual ({}) should report fewer changes than exact ({})",
@@ -575,7 +698,10 @@ mod tests {
     fn perceptual_size_mismatch_errors() {
         let a = Frame::solid(2, 2, [0, 0, 0, 255]);
         let b = Frame::solid(3, 2, [0, 0, 0, 255]);
-        assert!(matches!(diff_perceptual(&a, &b, 0.1).unwrap_err(), GlassError::SizeMismatch { .. }));
+        assert!(matches!(
+            diff_perceptual(&a, &b, 0.1).unwrap_err(),
+            GlassError::SizeMismatch { .. }
+        ));
     }
 
     /// Naive per-pixel reference (no SIMD pre-scan, no chunking) — guards the
@@ -608,14 +734,32 @@ mod tests {
             width: max_x - min_x + 1,
             height: max_y - min_y + 1,
         });
-        let changed_pct = if total > 0 { (changed as f64 / total as f64 * 100.0) as f32 } else { 0.0 };
-        DiffResult { changed_pixels: changed, total_pixels: total, changed_pct, bbox, aa_ignored }
+        let changed_pct = if total > 0 {
+            (changed as f64 / total as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct,
+            bbox,
+            aa_ignored,
+        }
     }
 
     #[test]
     fn perceptual_matches_naive_reference() {
         // Widths spanning SIMD-chunk boundaries and tails, against the naive loop.
-        let sizes = [(1u32, 1u32), (7, 3), (8, 8), (9, 9), (33, 17), (64, 8), (100, 40)];
+        let sizes = [
+            (1u32, 1u32),
+            (7, 3),
+            (8, 8),
+            (9, 9),
+            (33, 17),
+            (64, 8),
+            (100, 40),
+        ];
         for &(w, h) in &sizes {
             let a = make(w, h, 1);
             let b = make(w, h, 5);
@@ -639,7 +783,16 @@ mod tests {
             changed_pixels: changed,
             total_pixels: 100,
             changed_pct: changed as f32,
-            bbox: if changed > 0 { Some(BBox { x: 0, y: 0, width: 1, height: 1 }) } else { None },
+            bbox: if changed > 0 {
+                Some(BBox {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                })
+            } else {
+                None
+            },
             aa_ignored: 0,
         }
     }

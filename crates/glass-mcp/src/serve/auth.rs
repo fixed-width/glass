@@ -25,7 +25,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// configured token. Matching is constant-time over the token bytes.
 pub fn bearer_ok(header: Option<&str>, expected: &str) -> bool {
     let Some(h) = header else { return false };
-    let Some(rest) = h.strip_prefix("Bearer ") else { return false };
+    let Some(rest) = h.strip_prefix("Bearer ") else {
+        return false;
+    };
     ct_eq(rest.trim().as_bytes(), expected.as_bytes())
 }
 

@@ -108,9 +108,13 @@ fn copy_session_dictionary() -> Option<CFRetained<CFDictionary<CFString, CFType>
 /// `caffeinate -d`" hint, while a false-positive `Unlocked` would hide a real capture/
 /// input failure behind a clean bill of health.
 fn dict_reports_state(dict: Option<&CFDictionary<CFString, CFType>>) -> SessionState {
-    let Some(dict) = dict else { return SessionState::NoSession };
+    let Some(dict) = dict else {
+        return SessionState::NoSession;
+    };
     let key = CFString::from_str(SCREEN_IS_LOCKED_KEY);
-    let Some(value) = dict.get(&key) else { return SessionState::Unlocked };
+    let Some(value) = dict.get(&key) else {
+        return SessionState::Unlocked;
+    };
     let locked = if let Some(b) = value.downcast_ref::<CFBoolean>() {
         b.as_bool()
     } else if let Some(n) = value.downcast_ref::<CFNumber>() {
@@ -118,7 +122,11 @@ fn dict_reports_state(dict: Option<&CFDictionary<CFString, CFType>>) -> SessionS
     } else {
         true
     };
-    if locked { SessionState::Locked } else { SessionState::Unlocked }
+    if locked {
+        SessionState::Locked
+    } else {
+        SessionState::Unlocked
+    }
 }
 
 #[cfg(test)]

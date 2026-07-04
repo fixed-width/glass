@@ -46,7 +46,8 @@ fn agent_clipboard_and_input_roundtrip() {
         modifiers: vec![],
     })
     .expect("agent tap");
-    p.send_key(&KeyEvent::Text("hi".into())).expect("agent text");
+    p.send_key(&KeyEvent::Text("hi".into()))
+        .expect("agent text");
 
     p.stop_app().expect("stop");
     drop(p); // close the platform's agent connection before stopping the agent

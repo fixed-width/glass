@@ -34,7 +34,10 @@ fn build_runs_on_host_not_in_the_box() {
         std::env::temp_dir().join(format!("glass_build_marker_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
-    let sb = Sandboxie::new(dir.clone(), format!("glass_buildtest_{}", std::process::id()));
+    let sb = Sandboxie::new(
+        dir.clone(),
+        format!("glass_buildtest_{}", std::process::id()),
+    );
     sb.configure(SandboxLevel::Default).expect("configure box");
     let containment = Containment::Sandboxie(sb);
 

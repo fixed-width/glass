@@ -6,8 +6,9 @@
 /// Keycodes are XKB codes `9..` (evdev `N` -> XKB `N+8`); the Nth keysym
 /// (1-based) sits at XKB keycode `8+N`, tapped by sending evdev keycode `N`.
 pub fn build_keymap(keysyms: &[u32]) -> String {
-    let codes: String =
-        (1..=keysyms.len()).map(|n| format!("<K{n}> = {};", 8 + n)).collect();
+    let codes: String = (1..=keysyms.len())
+        .map(|n| format!("<K{n}> = {};", 8 + n))
+        .collect();
     let syms: String = keysyms
         .iter()
         .enumerate()
@@ -39,7 +40,12 @@ mod tests {
     #[test]
     fn has_all_four_sections() {
         let km = build_keymap(&[0x61]);
-        for s in ["xkb_keycodes", "xkb_types", "xkb_compatibility", "xkb_symbols"] {
+        for s in [
+            "xkb_keycodes",
+            "xkb_types",
+            "xkb_compatibility",
+            "xkb_symbols",
+        ] {
             assert!(km.contains(s), "missing {s} in {km}");
         }
     }

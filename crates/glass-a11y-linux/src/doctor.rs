@@ -13,20 +13,33 @@ use glass_core::{Check, CheckStatus};
 /// Read `/proc` for dbus-daemon entries (impure). Errors degrade to an empty list.
 fn read_proc_entries() -> Vec<ProcEntry> {
     let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else { return out };
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for ent in dir.flatten() {
-        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim().to_string();
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if comm != "dbus-daemon" {
             continue;
         }
-        let cmdline = String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default())
-            .replace('\0', " ");
+        let cmdline = String::from_utf8_lossy(
+            &std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default(),
+        )
+        .replace('\0', " ");
         let ppid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
             .and_then(|s| parse_ppid_from_stat(&s))
             .unwrap_or(0);
-        out.push(ProcEntry { comm, cmdline, ppid });
+        out.push(ProcEntry {
+            comm,
+            cmdline,
+            ppid,
+        });
     }
     out
 }
@@ -37,12 +50,23 @@ fn advertised_a11y_address() -> Option<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let res = (|| {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
             rt.block_on(async {
                 let conn = zbus::Connection::session().await.ok()?;
                 let proxy =
-                    zbus::Proxy::new(&conn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus").await.ok()?;
-                proxy.call_method("GetAddress", &()).await.ok()?.body().deserialize::<String>().ok()
+                    zbus::Proxy::new(&conn, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus")
+                        .await
+                        .ok()?;
+                proxy
+                    .call_method("GetAddress", &())
+                    .await
+                    .ok()?
+                    .body()
+                    .deserialize::<String>()
+                    .ok()
             })
         })();
         let _ = tx.send(res);
@@ -62,7 +86,11 @@ fn gather_host_a11y() -> HostA11yFacts {
         .unwrap_or(false);
     let bus = classify_host_bus(probe_ok, advertised.as_deref(), socket_present);
     let orphaned_daemons = count_orphaned_a11y_daemons(&read_proc_entries());
-    HostA11yFacts { session_bus, bus, orphaned_daemons }
+    HostA11yFacts {
+        session_bus,
+        bus,
+        orphaned_daemons,
+    }
 }
 
 /// Probe whether the AT-SPI accessibility stack is usable.
@@ -99,12 +127,18 @@ fn socket_path_from_address(addr: &str) -> Option<&str> {
 }
 
 /// Classify the host bus from the probe result + what (if anything) it advertises.
-fn classify_host_bus(probe_ok: bool, advertised: Option<&str>, socket_present: bool) -> HostBusState {
+fn classify_host_bus(
+    probe_ok: bool,
+    advertised: Option<&str>,
+    socket_present: bool,
+) -> HostBusState {
     if probe_ok {
         return HostBusState::Reachable;
     }
     match advertised {
-        Some(addr) if !socket_present => HostBusState::Wedged { address: addr.to_string() },
+        Some(addr) if !socket_present => HostBusState::Wedged {
+            address: addr.to_string(),
+        },
         _ => HostBusState::NotRunning,
     }
 }
@@ -120,7 +154,9 @@ fn parse_ppid_from_stat(stat: &str) -> Option<u32> {
 fn count_orphaned_a11y_daemons(procs: &[ProcEntry]) -> usize {
     procs
         .iter()
-        .filter(|p| p.comm == "dbus-daemon" && p.cmdline.contains("accessibility.conf") && p.ppid == 1)
+        .filter(|p| {
+            p.comm == "dbus-daemon" && p.cmdline.contains("accessibility.conf") && p.ppid == 1
+        })
         .count()
 }
 
@@ -203,7 +239,10 @@ fn find_registry() -> Option<std::path::PathBuf> {
         "/usr/lib/at-spi2/at-spi-bus-launcher",
         "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
     ];
-    CANDIDATES.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
+    CANDIDATES
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
 }
 
 /// Try to reach the accessibility bus exactly the way the reader does — on a private
@@ -248,36 +287,74 @@ mod tests {
 
     #[test]
     fn classify_bus_states() {
-        assert_eq!(classify_host_bus(true, Some("unix:path=/x"), false), HostBusState::Reachable);
+        assert_eq!(
+            classify_host_bus(true, Some("unix:path=/x"), false),
+            HostBusState::Reachable
+        );
         assert_eq!(
             classify_host_bus(false, Some("unix:path=/x"), false),
-            HostBusState::Wedged { address: "unix:path=/x".into() }
+            HostBusState::Wedged {
+                address: "unix:path=/x".into()
+            }
         );
-        assert_eq!(classify_host_bus(false, Some("unix:path=/x"), true), HostBusState::NotRunning);
-        assert_eq!(classify_host_bus(false, None, false), HostBusState::NotRunning);
+        assert_eq!(
+            classify_host_bus(false, Some("unix:path=/x"), true),
+            HostBusState::NotRunning
+        );
+        assert_eq!(
+            classify_host_bus(false, None, false),
+            HostBusState::NotRunning
+        );
     }
 
     #[test]
     fn ppid_parsed_after_comm_with_parens_and_spaces() {
-        assert_eq!(parse_ppid_from_stat("42 (we (ird) proc) S 1 999 x"), Some(1));
-        assert_eq!(parse_ppid_from_stat("7 (dbus-daemon) R 1234 7 x"), Some(1234));
+        assert_eq!(
+            parse_ppid_from_stat("42 (we (ird) proc) S 1 999 x"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_ppid_from_stat("7 (dbus-daemon) R 1234 7 x"),
+            Some(1234)
+        );
         assert_eq!(parse_ppid_from_stat("garbage"), None);
     }
 
     #[test]
     fn counts_only_orphaned_a11y_daemons() {
         let procs = vec![
-            ProcEntry { comm: "dbus-daemon".into(), cmdline: "dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf".into(), ppid: 1 },
-            ProcEntry { comm: "dbus-daemon".into(), cmdline: "dbus-daemon --config-file=/x/accessibility.conf".into(), ppid: 5000 },
-            ProcEntry { comm: "dbus-daemon".into(), cmdline: "dbus-daemon --session".into(), ppid: 1 },
-            ProcEntry { comm: "at-spi-bus-launcher".into(), cmdline: "x".into(), ppid: 1 },
+            ProcEntry {
+                comm: "dbus-daemon".into(),
+                cmdline: "dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf"
+                    .into(),
+                ppid: 1,
+            },
+            ProcEntry {
+                comm: "dbus-daemon".into(),
+                cmdline: "dbus-daemon --config-file=/x/accessibility.conf".into(),
+                ppid: 5000,
+            },
+            ProcEntry {
+                comm: "dbus-daemon".into(),
+                cmdline: "dbus-daemon --session".into(),
+                ppid: 1,
+            },
+            ProcEntry {
+                comm: "at-spi-bus-launcher".into(),
+                cmdline: "x".into(),
+                ppid: 1,
+            },
         ];
         assert_eq!(count_orphaned_a11y_daemons(&procs), 1);
     }
 
     // ---- pure mapper ----
     fn facts(bus: HostBusState, orphaned: usize) -> HostA11yFacts {
-        HostA11yFacts { session_bus: true, bus, orphaned_daemons: orphaned }
+        HostA11yFacts {
+            session_bus: true,
+            bus,
+            orphaned_daemons: orphaned,
+        }
     }
 
     #[test]
@@ -299,7 +376,15 @@ mod tests {
 
     #[test]
     fn wedged_host_bus_warns() {
-        let cs = a11y_checks(true, &facts(HostBusState::Wedged { address: "unix:path=/x".into() }, 0));
+        let cs = a11y_checks(
+            true,
+            &facts(
+                HostBusState::Wedged {
+                    address: "unix:path=/x".into(),
+                },
+                0,
+            ),
+        );
         let h = cs.iter().find(|c| c.name == "host desktop a11y").unwrap();
         assert_eq!(h.status, CheckStatus::Warn);
         assert!(h.remedy.is_some());
@@ -308,7 +393,13 @@ mod tests {
     #[test]
     fn healthy_host_bus_ok_and_no_leak_warning() {
         let cs = a11y_checks(true, &facts(HostBusState::Reachable, 0));
-        assert_eq!(cs.iter().find(|c| c.name == "host desktop a11y").unwrap().status, CheckStatus::Ok);
+        assert_eq!(
+            cs.iter()
+                .find(|c| c.name == "host desktop a11y")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
         assert!(cs.iter().all(|c| c.name != "leaked a11y daemons"));
     }
 

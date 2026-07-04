@@ -23,14 +23,14 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_seat, wl_shm};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
     self, ZwlrScreencopyFrameV1,
 };
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
 use std::collections::HashMap;
 
@@ -53,9 +53,9 @@ struct ActiveSession {
     output_size: (u32, u32), // compositor output extent (for pointer normalization)
     ids: HashMap<String, WindowId>, // foreign-toplevel identifier -> stable WindowId
     next_id: u64,
-    active: Option<String>, // active window's foreign-toplevel identifier
+    active: Option<String>,      // active window's foreign-toplevel identifier
     active_rect: WindowGeometry, // active window's output rect (capture/input origin)
-    geometry: WindowGeometry, // active window geometry (session contract)
+    geometry: WindowGeometry,    // active window geometry (session contract)
     time: u32,
 }
 
@@ -152,7 +152,10 @@ fn sway_on_path_if_recent() -> Option<PathBuf> {
         if !cand.is_file() {
             continue;
         }
-        let out = std::process::Command::new(&cand).arg("--version").output().ok()?;
+        let out = std::process::Command::new(&cand)
+            .arg("--version")
+            .output()
+            .ok()?;
         let ver = String::from_utf8_lossy(&out.stdout);
         return match parse_sway_version(&ver) {
             Some((maj, min)) if (maj, min) >= (1, 12) => Some(cand),
@@ -165,7 +168,9 @@ fn sway_on_path_if_recent() -> Option<PathBuf> {
 /// Parse `"sway version 1.12-abc (...)"` -> `(1, 12)`.
 fn parse_sway_version(s: &str) -> Option<(u32, u32)> {
     let v = s.split_whitespace().nth(2)?; // "1.12-abc"
-    let mut nums = v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty());
+    let mut nums = v
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty());
     let major = nums.next()?.parse().ok()?;
     let minor = nums.next()?.parse().ok()?;
     Some((major, minor))
@@ -212,7 +217,12 @@ fn mint_id(ids: &mut HashMap<String, WindowId>, next: &mut u64, identifier: &str
 
 /// sway IPC rect (i32) -> `WindowGeometry`.
 fn rect_to_geom(r: &crate::swayipc::Rect) -> WindowGeometry {
-    WindowGeometry { x: r.x, y: r.y, width: r.width.max(0) as u32, height: r.height.max(0) as u32 }
+    WindowGeometry {
+        x: r.x,
+        y: r.y,
+        width: r.width.max(0) as u32,
+        height: r.height.max(0) as u32,
+    }
 }
 
 /// SCTK state: registry + output (for the output extent), shm (for capture
@@ -289,12 +299,18 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     ) {
         use zwlr_screencopy_frame_v1::Event;
         match event {
-            Event::Buffer { format: WEnum::Value(f), width, height, stride } => {
+            Event::Buffer {
+                format: WEnum::Value(f),
+                width,
+                height,
+                stride,
+            } => {
                 state.frame_buffer = Some((f, width, height, stride));
             }
             Event::Ready { .. } => state.capture_done = Some(Ok(())),
             Event::Failed => {
-                state.capture_done = Some(Err(GlassError::CaptureFailed("screencopy failed".into())))
+                state.capture_done =
+                    Some(Err(GlassError::CaptureFailed("screencopy failed".into())))
             }
             _ => {} // Flags, Damage, LinuxDmabuf, BufferDone, etc.
         }
@@ -382,11 +398,15 @@ fn open_session(
         .map_err(|e| GlassError::Backend(format!("connect to wayland socket: {e}")))?;
     let conn = Connection::from_socket(stream)
         .map_err(|e| GlassError::Backend(format!("wayland connection: {e}")))?;
-    let (globals, mut queue): (_, EventQueue<State>) =
-        registry_queue_init(&conn).map_err(|e| GlassError::Backend(format!("wayland registry: {e}")))?;
+    let (globals, mut queue): (_, EventQueue<State>) = registry_queue_init(&conn)
+        .map_err(|e| GlassError::Backend(format!("wayland registry: {e}")))?;
 
-    let advertised: Vec<String> =
-        globals.contents().clone_list().into_iter().map(|g| g.interface).collect();
+    let advertised: Vec<String> = globals
+        .contents()
+        .clone_list()
+        .into_iter()
+        .map(|g| g.interface)
+        .collect();
     let advertised_refs: Vec<&str> = advertised.iter().map(String::as_str).collect();
     crate::globals::verify_globals(&advertised_refs)?;
 
@@ -401,8 +421,9 @@ fn open_session(
     let manager: ZwlrScreencopyManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .map_err(|e| GlassError::Backend(format!("bind screencopy: {e}")))?;
-    let seat: wl_seat::WlSeat =
-        globals.bind(&qh, 1..=8, ()).map_err(|e| GlassError::Backend(format!("bind seat: {e}")))?;
+    let seat: wl_seat::WlSeat = globals
+        .bind(&qh, 1..=8, ())
+        .map_err(|e| GlassError::Backend(format!("bind seat: {e}")))?;
     let vp_manager: ZwlrVirtualPointerManagerV1 = globals
         .bind(&qh, 1..=2, ())
         .map_err(|e| GlassError::Backend(format!("bind virtual pointer: {e}")))?;
@@ -429,7 +450,8 @@ fn open_session(
         .ok_or_else(|| GlassError::Backend("output has no size".into()))?;
     let output_size = (w as u32, h as u32);
     // Bind the virtual pointer to the output so motion_absolute maps to it.
-    let pointer = vp_manager.create_virtual_pointer_with_output(Some(&seat), Some(&output), &qh, ());
+    let pointer =
+        vp_manager.create_virtual_pointer_with_output(Some(&seat), Some(&output), &qh, ());
     let keyboard = vk_manager.create_virtual_keyboard(&seat, &qh, ());
 
     // The sway IPC socket appears in the private runtime dir alongside the wayland
@@ -443,7 +465,17 @@ fn open_session(
         }
     };
 
-    Ok((conn, queue, state, manager, output, pointer, keyboard, ipc, output_size))
+    Ok((
+        conn,
+        queue,
+        state,
+        manager,
+        output,
+        pointer,
+        keyboard,
+        ipc,
+        output_size,
+    ))
 }
 
 /// Spawn one per-session sway+Xwayland, connect, and discover the app's first
@@ -458,15 +490,28 @@ fn bring_up_session(
     spec: &AppSpec,
     a11y: Option<glass_core::A11yBind>,
 ) -> Result<(ActiveSession, WindowGeometry)> {
-    let runtime_dir =
-        tempfile::Builder::new().prefix("glass-wl.").tempdir().map_err(GlassError::Io)?;
+    let runtime_dir = tempfile::Builder::new()
+        .prefix("glass-wl.")
+        .tempdir()
+        .map_err(GlassError::Io)?;
 
     let config = runtime_dir.path().join("sway.cfg");
-    std::fs::write(&config, sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir)))
-        .map_err(GlassError::Io)?;
-    let mut cmd = build_sway_command(sway, &config, spec, runtime_dir.path(), a11y.map(|a| a.addr));
+    std::fs::write(
+        &config,
+        sway_config(spec, runtime_dir.path(), a11y.map(|a| a.dir)),
+    )
+    .map_err(GlassError::Io)?;
+    let mut cmd = build_sway_command(
+        sway,
+        &config,
+        spec,
+        runtime_dir.path(),
+        a11y.map(|a| a.addr),
+    );
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
     if let Some(out) = child.stdout.take() {
         spawn_reader(out, Stream::Stdout, logs.clone());
     }
@@ -598,7 +643,11 @@ struct WaylandTypeSink<'a> {
 impl glass_core::TypeSink for WaylandTypeSink<'_> {
     fn character(&mut self, c: char) -> Result<()> {
         let ks = glass_core::keys::keysym_for_text(c);
-        upload_keymap(&mut *self.s, &self.kb, &crate::keyboard::build_keymap(&[ks]))?;
+        upload_keymap(
+            &mut *self.s,
+            &self.kb,
+            &crate::keyboard::build_keymap(&[ks]),
+        )?;
         tap(&mut *self.s, &self.kb, 1)
     }
 }
@@ -679,7 +728,11 @@ impl glass_core::DragSink for WaylandDragSink<'_> {
     fn button(&mut self, down: bool) -> Result<()> {
         let vp = self.s.pointer.clone();
         let t = self.tick();
-        let state = if down { ButtonState::Pressed } else { ButtonState::Released };
+        let state = if down {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
         vp.button(t, self.b, state);
         vp.frame();
         self.settle()
@@ -726,7 +779,11 @@ impl glass_core::ChordSink for WaylandChordSink<'_> {
         let kb = self.s.keyboard.clone();
         if down {
             // Upload the keymap (chord key = keycode 1) regardless of mask, then set the modifiers.
-            upload_keymap(&mut *self.s, &kb, &crate::keyboard::build_keymap(&[self.keysym]))?;
+            upload_keymap(
+                &mut *self.s,
+                &kb,
+                &crate::keyboard::build_keymap(&[self.keysym]),
+            )?;
             if self.mask != 0 {
                 kb.modifiers(self.mask, 0, 0, 0);
             }
@@ -831,7 +888,9 @@ impl Platform for WaylandPlatform {
         // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
         // immediately rather than launching unconfined.
         if spec.sandbox != glass_core::SandboxLevel::Off {
-            if let glass_sandbox_linux::Availability::Unavailable(why) = glass_sandbox_linux::availability() {
+            if let glass_sandbox_linux::Availability::Unavailable(why) =
+                glass_sandbox_linux::availability()
+            {
                 return Err(GlassError::SandboxUnavailable(format!(
                     "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
                      sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
@@ -970,7 +1029,9 @@ impl Platform for WaylandPlatform {
                 return Err(e);
             }
             if Instant::now() >= deadline {
-                return Err(GlassError::CaptureFailed("screencopy: no buffer event".into()));
+                return Err(GlassError::CaptureFailed(
+                    "screencopy: no buffer event".into(),
+                ));
             }
         };
 
@@ -1015,7 +1076,8 @@ impl Platform for WaylandPlatform {
         // Flush pending requests and let the compositor + Xwayland process pointer
         // motion (enter/position) before the next event lands.
         let settle = |q: &mut EventQueue<State>, s: &mut State| -> Result<()> {
-            q.roundtrip(s).map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
+            q.roundtrip(s)
+                .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
             std::thread::sleep(Duration::from_millis(8));
             Ok(())
         };
@@ -1041,7 +1103,13 @@ impl Platform for WaylandPlatform {
             PointerEvent::Move { x, y } => {
                 position(&mut session.queue, &mut session.state, x, y)?;
             }
-            PointerEvent::Click { x, y, button, count, ref modifiers } => {
+            PointerEvent::Click {
+                x,
+                y,
+                button,
+                count,
+                ref modifiers,
+            } => {
                 position(&mut session.queue, &mut session.state, x, y)?;
                 let mask = modifier_mask(modifiers);
                 if mask != 0 {
@@ -1061,7 +1129,15 @@ impl Platform for WaylandPlatform {
                     kb.modifiers(0, 0, 0, 0);
                 }
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                ref modifiers,
+                duration_ms,
+            } => {
                 let gesture =
                     glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
                 let mut sink = WaylandDragSink {
@@ -1075,7 +1151,13 @@ impl Platform for WaylandPlatform {
                 };
                 glass_core::run_drag(&mut sink, &gesture)?;
             }
-            PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
+            PointerEvent::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                ref modifiers,
+            } => {
                 // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
                 // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
                 let mut sink = WaylandScrollSink {
@@ -1098,7 +1180,10 @@ impl Platform for WaylandPlatform {
                 ));
             }
         }
-        session.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        session
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         Ok(())
     }
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
@@ -1111,17 +1196,26 @@ impl Platform for WaylandPlatform {
                 // per key) so a heavy client receives a long string instead of dropping a
                 // batch — see glass_core::run_type and WaylandTypeSink. The per-key roundtrip
                 // is the pacing, so no extra inter-character dwell is needed.
-                let mut sink = WaylandTypeSink { s: &mut *session, kb };
+                let mut sink = WaylandTypeSink {
+                    s: &mut *session,
+                    kb,
+                };
                 glass_core::run_type(&mut sink, text, std::time::Duration::ZERO)?;
             }
             KeyEvent::Chord(c) => {
                 let (mods, keysym) = parse_chord(c)?; // validates before any traffic
-                let mut sink =
-                    WaylandChordSink { s: &mut *session, mask: modifier_mask(&mods), keysym };
+                let mut sink = WaylandChordSink {
+                    s: &mut *session,
+                    mask: modifier_mask(&mods),
+                    keysym,
+                };
                 glass_core::run_chord(&mut sink)?;
             }
         }
-        session.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        session
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         Ok(())
     }
 
@@ -1140,14 +1234,14 @@ impl Platform for WaylandPlatform {
         match *op {
             WindowOp::Geometry => {}
             WindowOp::Focus => session.ipc.run_command(&format!("[con_id={con}] focus"))?,
-            WindowOp::Resize { width, height } => session
-                .ipc
-                .run_command(&format!("[con_id={con}] resize set width {width} px height {height} px"))?,
+            WindowOp::Resize { width, height } => session.ipc.run_command(&format!(
+                "[con_id={con}] resize set width {width} px height {height} px"
+            ))?,
             // Move's (x, y) is an output-absolute origin, matching the X11 backend
             // (root coordinates); the headless output is at (0, 0).
-            WindowOp::Move { x, y } => {
-                session.ipc.run_command(&format!("[con_id={con}] move absolute position {x} {y}"))?
-            }
+            WindowOp::Move { x, y } => session
+                .ipc
+                .run_command(&format!("[con_id={con}] move absolute position {x} {y}"))?,
         }
         // Re-read the resulting rect (sway may clamp) and refresh the session
         // contract — active_rect drives the capture crop and pointer offset.
@@ -1192,7 +1286,9 @@ impl Platform for WaylandPlatform {
             .into_iter()
             .find(|w| session.ids.get(&w.identifier) == Some(&id))
             .ok_or(GlassError::WindowNotFound)?;
-        session.ipc.run_command(&format!("[con_id={}] focus", target.con_id))?;
+        session
+            .ipc
+            .run_command(&format!("[con_id={}] focus", target.con_id))?;
         // Confirm the focus moved (no silent fallback).
         let after = session.ipc.windows()?;
         let now = after
@@ -1239,7 +1335,10 @@ mod tests {
 
     #[test]
     fn parse_sway_version_handles_real_and_garbage() {
-        assert_eq!(parse_sway_version("sway version 1.12-8886939 (Jun 3 2026)"), Some((1, 12)));
+        assert_eq!(
+            parse_sway_version("sway version 1.12-8886939 (Jun 3 2026)"),
+            Some((1, 12))
+        );
         assert_eq!(parse_sway_version("sway version 1.9"), Some((1, 9)));
         assert_eq!(parse_sway_version("not a version"), None);
         assert!((1u32, 12u32) >= (1, 12) && (1u32, 9u32) < (1, 12));

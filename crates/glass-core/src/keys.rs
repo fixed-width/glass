@@ -71,15 +71,20 @@ pub fn keysym_for_keyname(name: &str) -> Option<u32> {
 /// Parse a chord like "ctrl+s", "alt+F4", "shift+Tab", "Escape" into its
 /// modifiers and the final key's keysym.
 pub fn parse_chord(chord: &str) -> Result<(Vec<Modifier>, u32)> {
-    let parts: Vec<&str> = chord.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = chord
+        .split('+')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.is_empty() {
         return Err(GlassError::InvalidKey(chord.to_string()));
     }
     let (key, mods) = parts.split_last().unwrap();
     let mut modifiers = Vec::new();
     for m in mods {
-        let modifier = Modifier::from_name(m)
-            .ok_or_else(|| GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'")))?;
+        let modifier = Modifier::from_name(m).ok_or_else(|| {
+            GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'"))
+        })?;
         modifiers.push(modifier);
     }
     let keysym = keysym_for_keyname(key)
@@ -123,8 +128,14 @@ mod tests {
 
     #[test]
     fn parses_chords() {
-        assert_eq!(parse_chord("ctrl+s").unwrap(), (vec![Modifier::Control], 0x73));
-        assert_eq!(parse_chord("alt+F4").unwrap(), (vec![Modifier::Alt], 0xffc1));
+        assert_eq!(
+            parse_chord("ctrl+s").unwrap(),
+            (vec![Modifier::Control], 0x73)
+        );
+        assert_eq!(
+            parse_chord("alt+F4").unwrap(),
+            (vec![Modifier::Alt], 0xffc1)
+        );
         assert_eq!(
             parse_chord("ctrl+shift+a").unwrap(),
             (vec![Modifier::Control, Modifier::Shift], 0x61)
@@ -134,9 +145,18 @@ mod tests {
 
     #[test]
     fn rejects_bad_chords() {
-        assert!(matches!(parse_chord("hyper+x").unwrap_err(), GlassError::InvalidKey(_)));
-        assert!(matches!(parse_chord("ctrl+nope").unwrap_err(), GlassError::InvalidKey(_)));
-        assert!(matches!(parse_chord("").unwrap_err(), GlassError::InvalidKey(_)));
+        assert!(matches!(
+            parse_chord("hyper+x").unwrap_err(),
+            GlassError::InvalidKey(_)
+        ));
+        assert!(matches!(
+            parse_chord("ctrl+nope").unwrap_err(),
+            GlassError::InvalidKey(_)
+        ));
+        assert!(matches!(
+            parse_chord("").unwrap_err(),
+            GlassError::InvalidKey(_)
+        ));
     }
 
     #[test]

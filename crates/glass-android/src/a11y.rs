@@ -6,8 +6,8 @@ use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
 use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
 
 use crate::adb::Adb;
-use crate::input::{key_commands, pointer_commands};
 use crate::axmap::{build_tree, check_dump_status};
+use crate::input::{key_commands, pointer_commands};
 use crate::target::{choose_serial, parse_devices};
 
 const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
@@ -20,13 +20,19 @@ pub struct AndroidA11y {
 
 impl AndroidA11y {
     pub fn new() -> Self {
-        Self { adb: Adb::from_env(), resolved: false }
+        Self {
+            adb: Adb::from_env(),
+            resolved: false,
+        }
     }
 
     /// Bind directly to an already-resolved (serial-bound) adb client. Used in production so
     /// the reader talks to the exact device the platform resolved, instead of re-resolving.
     pub fn for_adb(adb: Adb) -> Self {
-        Self { adb, resolved: true }
+        Self {
+            adb,
+            resolved: true,
+        }
     }
 
     /// Bind the adb client to a device serial on first use (lazy).
@@ -37,7 +43,10 @@ impl AndroidA11y {
                 .into_iter()
                 .filter(|d| d.state == "device")
                 .collect();
-            let serial = choose_serial(std::env::var("GLASS_ANDROID_SERIAL").ok().as_deref(), &online)?;
+            let serial = choose_serial(
+                std::env::var("GLASS_ANDROID_SERIAL").ok().as_deref(),
+                &online,
+            )?;
             self.adb = self.adb.with_serial(serial);
             self.resolved = true;
         }
@@ -68,7 +77,9 @@ impl Accessibility for AndroidA11y {
         // Re-snapshot and number nodes to locate the target by its pre-order id.
         let mut tree = self.snapshot(ctx)?;
         tree.assign_ids();
-        let node = tree.find(target.id).ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        let node = tree
+            .find(target.id)
+            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
         if !target.matches(node.role, node.name.as_deref())
             || !target.bounds_consistent(node.bounds, 8)
         {

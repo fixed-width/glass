@@ -68,7 +68,10 @@ fn private_clipboard_isolation() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie::new(dir.clone(), format!("glass_cliptest_{}", std::process::id()));
+    let sb = Sandboxie::new(
+        dir.clone(),
+        format!("glass_cliptest_{}", std::process::id()),
+    );
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -112,10 +115,15 @@ fn private_clipboard_isolation() {
     );
     app.kill();
 
-    let line = line.expect("probe produced no READBACK= line (hook not intercepting? check the log sink)");
-    assert!(line.contains("READBACK=FROM-BOX"), "boxed read-back mismatch: {line:?}");
+    let line =
+        line.expect("probe produced no READBACK= line (hook not intercepting? check the log sink)");
+    assert!(
+        line.contains("READBACK=FROM-BOX"),
+        "boxed read-back mismatch: {line:?}"
+    );
 
-    let store = store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+    let store =
+        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("FROM-BOX"),
@@ -126,7 +134,9 @@ fn private_clipboard_isolation() {
         ambient_after, sentinel,
         "AMBIENT CLIPBOARD WAS TOUCHED — isolation breach"
     );
-    println!("PASS: boxed clipboard roundtrip served by the private store; ambient clipboard untouched");
+    println!(
+        "PASS: boxed clipboard roundtrip served by the private store; ambient clipboard untouched"
+    );
 }
 
 #[test]
@@ -151,7 +161,10 @@ fn private_clipboard_multiformat() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie::new(dir.clone(), format!("glass_clipmulti_{}", std::process::id()));
+    let sb = Sandboxie::new(
+        dir.clone(),
+        format!("glass_clipmulti_{}", std::process::id()),
+    );
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -174,7 +187,12 @@ fn private_clipboard_multiformat() {
     // synthesized CF_BITMAP, ending with `PROBE-MULTI-DONE`. Boxed (OpenClipboard=n), every
     // READBACK is served by the hook from the private store.
     let done = wait_for_log(&sink, "PROBE-MULTI-DONE", Duration::from_secs(20));
-    let lines: Vec<String> = sink.lock().unwrap().iter().map(|(_, l)| l.clone()).collect();
+    let lines: Vec<String> = sink
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, l)| l.clone())
+        .collect();
     eprintln!("--- boxed log sink: {} line(s) ---", lines.len());
     for l in &lines {
         eprintln!("  {l}");
@@ -200,13 +218,26 @@ fn private_clipboard_multiformat() {
             .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
             .unwrap_or_default()
     };
-    assert_eq!(readback("READBACK-TEXT="), "FROM-BOX-MULTI", "text round-trip");
-    assert_eq!(readback("READBACK-HTML="), "<b>hi</b>", "HTML (named format) round-trip by name");
+    assert_eq!(
+        readback("READBACK-TEXT="),
+        "FROM-BOX-MULTI",
+        "text round-trip"
+    );
+    assert_eq!(
+        readback("READBACK-HTML="),
+        "<b>hi</b>",
+        "HTML (named format) round-trip by name"
+    );
     let dib_len: usize = readback("READBACK-DIB-LEN=").parse().unwrap_or(0);
     assert!(dib_len >= 56, "DIB round-trip too short: {dib_len}");
-    assert_eq!(readback("READBACK-BMP="), "OK", "CF_BITMAP GDI-synthesized from the stored DIB");
+    assert_eq!(
+        readback("READBACK-BMP="),
+        "OK",
+        "CF_BITMAP GDI-synthesized from the stored DIB"
+    );
 
-    let store = store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+    let store =
+        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("FROM-BOX-MULTI"),
@@ -214,7 +245,9 @@ fn private_clipboard_multiformat() {
     );
     let keys = store.list();
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Named("HTML Format".into())),
+        keys.contains(&glass_clip_hook::proto::FormatKey::Named(
+            "HTML Format".into()
+        )),
         "host store missing HTML Format: {keys:?}"
     );
     assert!(
@@ -260,10 +293,7 @@ fn private_clipboard_ole() {
 
     let spec = AppSpec {
         build: None,
-        run: vec![
-            probe.to_string_lossy().into_owned(),
-            "roundtrip-ole".into(),
-        ],
+        run: vec![probe.to_string_lossy().into_owned(), "roundtrip-ole".into()],
         cwd: None,
         env: vec![],
         window_hint: None,
@@ -279,7 +309,12 @@ fn private_clipboard_ole() {
     // coherence), ending with `PROBE-OLE-DONE`. Boxed (OpenClipboard=n), every readback is served by
     // the hook from the private store.
     let done = wait_for_log(&sink, "PROBE-OLE-DONE", Duration::from_secs(20));
-    let lines: Vec<String> = sink.lock().unwrap().iter().map(|(_, l)| l.clone()).collect();
+    let lines: Vec<String> = sink
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, l)| l.clone())
+        .collect();
     eprintln!("--- boxed log sink: {} line(s) ---", lines.len());
     for l in &lines {
         eprintln!("  {l}");
@@ -297,7 +332,9 @@ fn private_clipboard_ole() {
     );
     app.kill();
 
-    done.expect("probe produced no PROBE-OLE-DONE line (OLE detour not intercepting? check the sink)");
+    done.expect(
+        "probe produced no PROBE-OLE-DONE line (OLE detour not intercepting? check the sink)",
+    );
 
     let readback = |prefix: &str| -> String {
         lines
@@ -305,15 +342,24 @@ fn private_clipboard_ole() {
             .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
             .unwrap_or_default()
     };
-    assert_eq!(readback("OLE-TEXT="), "OLE-FROM-BOX", "OLE text round-trip (OleGet → proxy)");
-    assert_eq!(readback("OLE-HTML="), "<i>ole</i>", "OLE HTML (named format) round-trip by name");
+    assert_eq!(
+        readback("OLE-TEXT="),
+        "OLE-FROM-BOX",
+        "OLE text round-trip (OleGet → proxy)"
+    );
+    assert_eq!(
+        readback("OLE-HTML="),
+        "<i>ole</i>",
+        "OLE HTML (named format) round-trip by name"
+    );
     assert_eq!(
         readback("U32-TEXT="),
         "OLE-FROM-BOX",
         "cross-surface coherence — OLE copy visible to user32 GetClipboardData"
     );
 
-    let store = store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+    let store =
+        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("OLE-FROM-BOX"),
@@ -321,7 +367,9 @@ fn private_clipboard_ole() {
     );
     let keys = store.list();
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Named("HTML Format".into())),
+        keys.contains(&glass_clip_hook::proto::FormatKey::Named(
+            "HTML Format".into()
+        )),
         "host store missing HTML Format: {keys:?}"
     );
     assert!(
@@ -358,7 +406,10 @@ fn private_clipboard_hdrop() {
     let sentinel = format!("SENTINEL-{}", std::process::id());
     crate::clipboard::set(&sentinel).expect("set ambient clipboard");
 
-    let sb = Sandboxie::new(dir.clone(), format!("glass_cliphdrop_{}", std::process::id()));
+    let sb = Sandboxie::new(
+        dir.clone(),
+        format!("glass_cliphdrop_{}", std::process::id()),
+    );
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
@@ -382,7 +433,12 @@ fn private_clipboard_hdrop() {
     // hook from the private store. CF_HDROP (id 15) passes through the generic byte path — this
     // test proves the store stores and serves arbitrary binary clipboard formats correctly.
     let done = wait_for_log(&sink, "PROBE-HDROP-DONE", Duration::from_secs(20));
-    let lines: Vec<String> = sink.lock().unwrap().iter().map(|(_, l)| l.clone()).collect();
+    let lines: Vec<String> = sink
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, l)| l.clone())
+        .collect();
     eprintln!("--- boxed log sink: {} line(s) ---", lines.len());
     for l in &lines {
         eprintln!("  {l}");
@@ -407,8 +463,16 @@ fn private_clipboard_hdrop() {
             .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
             .unwrap_or_default()
     };
-    assert_eq!(readback("HDROP-U32-OK="), "true", "user32 CF_HDROP byte round-trip");
-    assert_eq!(readback("HDROP-OLE-OK="), "true", "OLE CF_HDROP byte round-trip");
+    assert_eq!(
+        readback("HDROP-U32-OK="),
+        "true",
+        "user32 CF_HDROP byte round-trip"
+    );
+    assert_eq!(
+        readback("HDROP-OLE-OK="),
+        "true",
+        "OLE CF_HDROP byte round-trip"
+    );
 
     let store =
         store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
