@@ -60,18 +60,31 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSEnumerator",
     "NSError",
     "NSString",
+    # `NSURL` — `ffi.rs::launch_bundle`'s `NSURL::fileURLWithPath`, building the file URL
+    # `NSWorkspace.openApplicationAtURL:...` takes.
+    "NSURL",
 ] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSResponder",
-    # `NSRunningApplication` — focus-before-inject (`input.rs::focus`); `libc` unlocks its
-    # `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class method.
+    # `NSRunningApplication` — focus-before-inject (`input.rs::focus`), plus the
+    # bundle-launch adopt/terminate FFI (`ffi.rs::running_pid_for_bundle_id`/`terminate_app`);
+    # `libc` unlocks its `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class
+    # method.
     "NSRunningApplication",
+    # `NSWorkspace` — `ffi.rs::launch_bundle`'s `NSWorkspace.openApplication(at:configuration:
+    # completionHandler:)`. Also gates `NSWorkspaceOpenConfiguration` (header-translator
+    # generates both types into the same `NSWorkspace.rs` file, and the whole file is gated
+    # by this one feature — there is no separate `NSWorkspaceOpenConfiguration` feature to
+    # request). `block2` additionally gates the completion-handler method itself (its own
+    # `cfg(all(feature = "NSRunningApplication", feature = "block2"))`).
+    "NSWorkspace",
     # `NSPasteboard` — the general pasteboard read/write behind `Platform`'s clipboard seam
     # (`clipboard.rs`): unlocks `NSPasteboard`, its `generalPasteboard`/`clearContents`/
     # `stringForType`/`setString:forType:` methods, and the `NSPasteboardTypeString` constant.
     "NSPasteboard",
     "libc",
+    "block2",
 ] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
     "SCShareableContent",
