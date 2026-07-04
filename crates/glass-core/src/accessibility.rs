@@ -178,15 +178,28 @@ pub struct AxRect {
 }
 
 impl AxRect {
-    /// Center point, clamped into `[0,win_w) × [0,win_h)`. Returns `None` if the
-    /// rect or the window has zero area (nothing clickable).
+    /// The click point for this element: the center of its intersection with the window,
+    /// always inside `[0,win_w) × [0,win_h)`. Returns `None` when there is nothing to click —
+    /// the rect or window has zero area, or the element has no visible overlap with the window
+    /// (fully clipped off-screen) — so the caller surfaces a not-clickable error instead of a
+    /// click on the window edge that never lands on the element.
     pub fn clamped_center(&self, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
         if self.width == 0 || self.height == 0 || win_w == 0 || win_h == 0 {
             return None;
         }
-        let cx = (self.x + self.width as i32 / 2).clamp(0, win_w as i32 - 1);
-        let cy = (self.y + self.height as i32 / 2).clamp(0, win_h as i32 - 1);
-        Some((cx, cy))
+        // Click the center of the element's *intersection* with the window — the visible
+        // portion — not the raw center clamped to the window edge. A partially-clipped element
+        // is then still clicked on itself, and a fully-clipped element (no overlap) returns
+        // `None`, surfaced as a not-clickable error rather than a silent click on the window
+        // edge that never lands on the element (the "no silent fallbacks" invariant).
+        let left = self.x.max(0);
+        let top = self.y.max(0);
+        let right = (self.x + self.width as i32).min(win_w as i32);
+        let bottom = (self.y + self.height as i32).min(win_h as i32);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(((left + right) / 2, (top + bottom) / 2))
     }
 }
 
@@ -617,15 +630,43 @@ mod tests {
     }
 
     #[test]
-    fn clamped_center_clamps_to_window() {
+    fn clamped_center_rejects_fully_offscreen() {
+        // Element entirely past the window's right/bottom edge → no visible portion → None
+        // (a not-clickable error, not a silent click on the window corner that misses it).
         let r = AxRect {
             x: 90,
             y: 90,
             width: 40,
             height: 40,
         };
-        // center would be (110,110); clamps to (63,47) for a 64x48 window.
-        assert_eq!(r.clamped_center(64, 48), Some((63, 47)));
+        assert_eq!(r.clamped_center(64, 48), None);
+    }
+
+    #[test]
+    fn clamped_center_uses_visible_portion_when_partially_clipped() {
+        // Element spans x[60,100] in an 80-wide window → visible x[60,80], center x=70; y
+        // fully inside. The click lands on the visible part of the element, not the edge.
+        let r = AxRect {
+            x: 60,
+            y: 10,
+            width: 40,
+            height: 20,
+        };
+        assert_eq!(r.clamped_center(80, 100), Some((70, 20)));
+    }
+
+    #[test]
+    fn clamped_center_uses_visible_portion_when_clipped_top_left() {
+        // Element hangs off the top-left (a negative origin is valid — see `AxRect.x/y`):
+        // spans x[-10,30] in an 80-wide window → visible x[0,30], center 15; y[-4,16] → visible
+        // y[0,16], center 8. Exercises the `.max(0)` clip on the left/top edges.
+        let r = AxRect {
+            x: -10,
+            y: -4,
+            width: 40,
+            height: 20,
+        };
+        assert_eq!(r.clamped_center(80, 100), Some((15, 8)));
     }
 
     #[test]
