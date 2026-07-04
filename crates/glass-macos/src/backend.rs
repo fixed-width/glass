@@ -2,6 +2,7 @@
 //! window-server methods stubbed; Plan 2 fills capture + display provisioning, Plan 3
 //! input, Plan 4 windows. `new()` runs the TCC preflight so a missing grant fails fast.
 
+use std::path::Path;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +12,8 @@ use objc2_application_services::AXUIElement;
 use glass_core::frame::{Frame, Region};
 use glass_core::logbuf::Stream;
 use glass_core::platform::{
-    AppSpec, KeyEvent, Platform, PointerEvent, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, KeyEvent, Platform, PointerEvent, SandboxLevel, WindowGeometry, WindowId, WindowInfo,
+    WindowOp,
 };
 use glass_core::{GlassError, Result};
 
@@ -96,6 +98,15 @@ pub struct MacosPlatform {
     /// that depends on it can run after the launched window is confirmed; reset in
     /// `stop_app`.
     clip: Option<ClipLaunch>,
+    /// Set when the active window belongs to a LaunchServices-adopted app — one `start_bundle`
+    /// handed off to `NSWorkspace` because the direct-spawned inner executable exited before a
+    /// window appeared (see `start_bundle`'s doc). `None` in every other case, including a
+    /// bundle that direct-spawned successfully (`self.child` is `Some` then, same as a plain
+    /// exec). The `bool` is launched-fresh: `true` when this call's own `ffi::launch_bundle`
+    /// started the app, so `stop_app` terminates it; `false` when `ffi::running_pid_for_bundle_id`
+    /// found an instance already running before this call, so `stop_app` leaves it running
+    /// rather than killing an app glass didn't start.
+    adopted: Option<(i32, bool)>,
 }
 
 impl MacosPlatform {
@@ -109,6 +120,7 @@ impl MacosPlatform {
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
+            adopted: None,
         })
     }
 
@@ -169,6 +181,26 @@ impl MacosPlatform {
         }
     }
 
+    /// Poll for a window owned by `pid` alone, with no `Child` to race against —
+    /// `start_bundle`'s handoff path adopts a pid `NSWorkspace`/LaunchServices owns (found
+    /// already-running via `ffi::running_pid_for_bundle_id`, or just started via
+    /// `ffi::launch_bundle`), so unlike [`discover_window`] there is no local `Child` handle
+    /// (`std::process::Child`) to `try_wait` if the adopted app dies before its window
+    /// appears; this loop only re-queries `scwindow::query_once` until `timeout_ms` elapses.
+    fn discover_window_pid(pid: i32, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
+        crate::ffi::app_kit_init();
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        loop {
+            if let Some(m) = crate::scwindow::query_once(&[pid])? {
+                return Ok(m);
+            }
+            if Instant::now() >= deadline {
+                return Err(GlassError::Timeout(timeout_ms));
+            }
+            std::thread::sleep(DISCOVERY_POLL_INTERVAL);
+        }
+    }
+
     /// Resolve the window `capture_frame`/`send_pointer`/`send_key` should target *this*
     /// call: `scwindow::find_window_by_id(active_window, [pid], ..)` once `select_window`
     /// (or `start_app`'s initial discovery) has set an active `CGWindowID` — the retargeting
@@ -188,6 +220,114 @@ impl MacosPlatform {
             Some(id) => crate::scwindow::find_window_by_id(id, &[pid], WINDOW_RESOLVE_TIMEOUT),
             None => crate::scwindow::find_window_for_pids(&[pid], WINDOW_RESOLVE_TIMEOUT),
         }
+    }
+
+    /// `start_app`'s bundle path, taken when `spec.run[0]` names a `.app` directory
+    /// (`bundle::is_app_bundle`): A-preferred, direct-spawn the bundle's inner executable
+    /// (`bundle::resolve_inner_exec`) exactly like a plain exec — same logs, containment, and
+    /// window-tracking as the non-bundle path — and only fall back to handing the launch off
+    /// to `NSWorkspace` if that direct spawn's process exits before a window ever appears
+    /// (`GlassError::AppExited`, e.g. an app that re-execs itself via LaunchServices and
+    /// leaves the direct-spawned process a dead stub). Any other discovery failure (e.g.
+    /// `GlassError::Timeout`) is NOT treated as a handoff signal — the direct-spawned process
+    /// is still alive and simply never grew a window, so it's terminated and the error
+    /// propagated, same as the plain-exec path.
+    ///
+    /// The handoff itself can't be Seatbelt-contained (`bundle::handoff_gate` fails closed:
+    /// only `sandbox: off` may adopt it), and has no clipboard shim (an
+    /// `NSWorkspace`-launched process is never `direct.env`'s `DYLD_INSERT_LIBRARIES`
+    /// target), so its `ClipboardRoute` is decided directly as the sandbox-off/no-shim case
+    /// rather than via [`decide_clip`].
+    fn start_bundle(&mut self, spec: &AppSpec, bundle: &Path) -> Result<WindowGeometry> {
+        // A-preferred: direct-spawn the inner executable (logs + containment + window
+        // tracking), exactly as the plain-exec path does for a non-bundle `run[0]`.
+        let inner = crate::bundle::resolve_inner_exec(bundle)?;
+        let mut direct = spec.clone();
+        direct.run = std::iter::once(inner.to_string_lossy().into_owned())
+            .chain(spec.run.iter().skip(1).cloned())
+            .collect();
+        let (mut child, clip) = process::spawn(&direct, self.logs.clone())?;
+        let pid = child.id();
+        match Self::discover_window(&mut child, pid, spec.timeout_ms) {
+            Ok(m) => {
+                // Foreground app: adopt exactly as the plain-exec Ok arm does.
+                self.child = Some(child);
+                self.app_pid = Some(pid);
+                self.active_window = Some(m.window_id);
+                self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
+                self.clip = clip;
+                Ok(m.geometry)
+            }
+            Err(GlassError::AppExited(_)) => {
+                // Handoff: the direct-spawned process was a stub that re-launched the real app
+                // through LaunchServices. Don't leak the (dead) child or its pasteboards.
+                process::terminate(&mut child);
+                release_clip(clip.as_ref());
+                // Fail-closed: only sandbox:off may adopt an app glass can no longer contain.
+                crate::bundle::handoff_gate(spec.sandbox)?;
+                let id = crate::bundle::bundle_identifier(bundle)?;
+                let (pid, fresh) = match crate::ffi::running_pid_for_bundle_id(&id) {
+                    Some(pid) => (pid, false),
+                    // NOTE (runtime-verified in Task 4): `ffi::launch_bundle` blocks this
+                    // thread on a channel until `NSWorkspace`'s completion handler fires: if
+                    // LaunchServices needs the main run loop to spin to complete the launch,
+                    // and this call runs on the true main thread (see this module's
+                    // main-thread-affinity notes), that handler could need a run-loop turn this
+                    // blocked thread isn't pumping. Wired here per the design; the on-box round
+                    // confirms whether it actually stalls.
+                    None => (crate::ffi::launch_bundle(bundle, spec.timeout_ms)?, true),
+                };
+                let m = Self::discover_window_pid(pid, spec.timeout_ms)?;
+                self.child = None;
+                // `app_pid` is `u32` (every other pid in this struct comes from
+                // `std::process::Child::id()`); AppKit's pids are `i32` but always
+                // non-negative for a real process, so this cast is exact, matching every
+                // other `pid as {i32,u32}` cast in this file (see e.g. `resolve_active_window`'s
+                // call sites, which cast the other direction).
+                self.app_pid = Some(pid as u32);
+                self.active_window = Some(m.window_id);
+                self.adopted = Some((pid, fresh));
+                self.clip = None;
+                self.clipboard_route =
+                    crate::clipboard_route::decide_route(SandboxLevel::Off, None);
+                Ok(m.geometry)
+            }
+            Err(e) => {
+                process::terminate(&mut child);
+                release_clip(clip.as_ref());
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Decide the launched session's `ClipboardRoute` from the sandbox level and the clip-shim
+/// launch facts `process::spawn` produced (`None` for an uncontained or non-injectable
+/// launch) — shared by `start_app`'s and `start_bundle`'s direct-spawn success paths, both of
+/// which reach this only once the launched window is confirmed. `clip`'s presence only means
+/// the launch was injectable; a live `clipboard::shim_present` check confirms the swizzle
+/// actually took before a `Private` route is trusted (an injectable target whose injection
+/// silently failed must still land on `Unsupported`, not a `Private` route to a pasteboard
+/// the app was never redirected to).
+fn decide_clip(sandbox: SandboxLevel, clip: Option<&ClipLaunch>) -> ClipboardRoute {
+    match clip {
+        Some(c) => {
+            let confirmed = crate::clipboard::shim_present(&c.name);
+            crate::clipboard_route::decide_route(sandbox, Some((&c.name, confirmed)))
+        }
+        None => crate::clipboard_route::decide_route(sandbox, None),
+    }
+}
+
+/// Release `clip`'s named pasteboards (the content board and its `.ready` sentinel), a no-op
+/// when `clip` is `None`. Named pasteboards persist system-wide until released, so every path
+/// that ends a `ClipLaunch`'s lifetime — `start_app`'s/`start_bundle`'s discovery-failure arms
+/// (the launch never became a session), and `stop_app`/`Drop` (an established session ended) —
+/// must release it here, or the boards leak for the life of the host process.
+fn release_clip(clip: Option<&ClipLaunch>) {
+    if let Some(c) = clip {
+        crate::clipboard::release_named(&c.name);
+        crate::clipboard::release_named(&format!("{}.ready", c.name));
     }
 }
 
@@ -323,8 +463,21 @@ impl Platform for MacosPlatform {
     /// requires the true main thread (`MainThreadMarker` panics off it). In Plan 2 this is
     /// exercised only by Task 6's `harness=false` main-thread test; wiring it under
     /// glass-mcp's worker-thread dispatcher (main-thread marshaling) is deferred to Plan 5.
+    ///
+    /// **`.app` bundles:** when `spec.run[0]` names a `.app` bundle directory
+    /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`] instead of the
+    /// plain-exec path below — see its doc for the direct-spawn-then-NSWorkspace-handoff
+    /// design. Every other `run[0]` (the plain-exec case) takes the unchanged path that
+    /// follows.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         Self::run_build(spec)?;
+        let run0 = spec
+            .run
+            .first()
+            .ok_or_else(|| GlassError::AppNotStarted("empty run".into()))?;
+        if crate::bundle::is_app_bundle(run0) {
+            return self.start_bundle(spec, Path::new(run0));
+        }
         let (mut child, clip) = process::spawn(spec, self.logs.clone())?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
@@ -339,22 +492,8 @@ impl Platform for MacosPlatform {
                 // this field on every call.
                 self.active_window = Some(m.window_id);
                 // Decide the session's clipboard route now that the launched window is
-                // confirmed: `clip` only carries the shim's launch-time name (its presence
-                // means the launch was injectable), so a live `clipboard::shim_present` check
-                // confirms the swizzle actually took before a `Private` route is trusted (an
-                // injectable target whose injection silently failed must still land on
-                // `Unsupported`, not a `Private` route to a pasteboard the app was never
-                // redirected to).
-                self.clipboard_route = match &clip {
-                    Some(c) => {
-                        let confirmed = crate::clipboard::shim_present(&c.name);
-                        crate::clipboard_route::decide_route(
-                            spec.sandbox,
-                            Some((&c.name, confirmed)),
-                        )
-                    }
-                    None => crate::clipboard_route::decide_route(spec.sandbox, None),
-                };
+                // confirmed — see `decide_clip`'s doc.
+                self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
                 self.clip = clip;
                 // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
                 // window fresh on every call instead (see its doc) since it may move/resize
@@ -368,11 +507,8 @@ impl Platform for MacosPlatform {
                 process::terminate(&mut child);
                 // Nor the named pasteboards the shim may already have created — the app (and
                 // its ctor) ran before discovery. `self.clip` is never set on this path, so
-                // `stop_app` wouldn't release them; do it here.
-                if let Some(c) = &clip {
-                    crate::clipboard::release_named(&c.name);
-                    crate::clipboard::release_named(&format!("{}.ready", c.name));
-                }
+                // `stop_app` wouldn't release them; do it here (`release_clip`'s doc).
+                release_clip(clip.as_ref());
                 Err(e)
             }
         }
@@ -380,7 +516,23 @@ impl Platform for MacosPlatform {
 
     /// Terminate the launched child (if any) and clear the active pid/window. Idempotent —
     /// a call with nothing running is `Ok(())`.
+    ///
+    /// An `adopted` app (`start_bundle`'s NSWorkspace-handoff path — no `self.child` to
+    /// terminate) is handled first and returns early: a freshly-launched adoptee is
+    /// terminated via `ffi::terminate_app` (glass started it, so glass stops it), while an
+    /// activated-existing one is left running (glass only raised it, so it isn't glass's to
+    /// kill) — see the `adopted` field's doc for the two cases.
     fn stop_app(&mut self) -> Result<()> {
+        if let Some((pid, fresh)) = self.adopted.take() {
+            if fresh {
+                crate::ffi::terminate_app(pid);
+            }
+            self.app_pid = None;
+            self.active_window = None;
+            self.clipboard_route = ClipboardRoute::default();
+            self.clip = None;
+            return Ok(());
+        }
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
@@ -389,10 +541,7 @@ impl Platform for MacosPlatform {
         // released, and a leftover sentinel could otherwise mask a failed injection in a later
         // session (see `crate::clipboard_route`). Only released when a shim launch name is
         // known (an injectable, contained launch); uncontained/hardened launches have none.
-        if let Some(clip) = &self.clip {
-            crate::clipboard::release_named(&clip.name);
-            crate::clipboard::release_named(&format!("{}.ready", clip.name));
-        }
+        release_clip(self.clip.as_ref());
         self.app_pid = None;
         self.active_window = None;
         // Reset the clipboard route too, so a later start_app on the same MacosPlatform can't
@@ -642,17 +791,24 @@ impl Drop for MacosPlatform {
     /// the process-exit backstop path) does not orphan its child. `process::terminate`
     /// is idempotent, and `child.take()` in `stop_app` means this is a no-op if
     /// `stop_app` already ran.
+    ///
+    /// A freshly-launched `adopted` app (`start_bundle`'s handoff path — no `self.child`)
+    /// gets the same treatment via `ffi::terminate_app`, for the same "don't orphan what
+    /// this backend launched" reason; an activated-existing adoptee is left running, same as
+    /// in `stop_app`.
     fn drop(&mut self) {
+        if let Some((pid, fresh)) = self.adopted.take() {
+            if fresh {
+                crate::ffi::terminate_app(pid);
+            }
+        }
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
         // Release this session's named pasteboards too if `stop_app` didn't run (panic-unwind
         // or the process-exit backstop). `stop_app` sets `self.clip = None`, so this is a no-op
         // when it already ran; otherwise the boards would leak system-wide.
-        if let Some(clip) = &self.clip {
-            crate::clipboard::release_named(&clip.name);
-            crate::clipboard::release_named(&format!("{}.ready", clip.name));
-        }
+        release_clip(self.clip.as_ref());
     }
 }
 
@@ -671,6 +827,7 @@ mod tests {
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
+            adopted: None,
         };
         assert_eq!(p.drain_logs().len(), 1);
         assert!(p.drain_logs().is_empty());
@@ -685,6 +842,7 @@ mod tests {
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
+            adopted: None,
         };
         assert_eq!(p.app_pid(), Some(42));
     }
@@ -701,6 +859,7 @@ mod tests {
             active_window: None,
             clipboard_route: ClipboardRoute::default(),
             clip: None,
+            adopted: None,
         };
         assert!(p.stop_app().is_ok());
         assert!(p.stop_app().is_ok(), "a second call must also be Ok");
@@ -719,6 +878,7 @@ mod tests {
             active_window: Some(7),
             clipboard_route: ClipboardRoute::default(),
             clip: None,
+            adopted: None,
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.active_window, None);
@@ -739,6 +899,7 @@ mod tests {
             active_window: Some(7),
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
             clip: None,
+            adopted: None,
         };
         assert!(p.stop_app().is_ok());
         assert_eq!(p.clipboard_route, ClipboardRoute::default());
@@ -761,6 +922,7 @@ mod tests {
             clip: Some(ClipLaunch {
                 name: "tech.fixedwidth.glass.clip.42.1.1".into(),
             }),
+            adopted: None,
         };
         assert!(p.stop_app().is_ok());
         assert!(p.clip.is_none());
@@ -779,6 +941,7 @@ mod tests {
             active_window: None,
             clipboard_route: ClipboardRoute::Unsupported,
             clip: None,
+            adopted: None,
         };
         assert!(matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
         assert!(matches!(
@@ -800,6 +963,7 @@ mod tests {
             active_window: None,
             clipboard_route: ClipboardRoute::RealGeneral,
             clip: None,
+            adopted: None,
         };
         assert!(!matches!(
             p.get_clipboard(),
