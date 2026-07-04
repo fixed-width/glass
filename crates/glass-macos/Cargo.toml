@@ -145,7 +145,7 @@ rustix.workspace = true
 glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 # Mac-only: the accessibility-reader integration test (tests/a11y.rs) drives the standalone
 # `glass-a11y-macos` snapshot. Kept in the cfg(macos) dev-dep table so the crate still
