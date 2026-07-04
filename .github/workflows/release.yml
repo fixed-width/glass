@@ -7,13 +7,52 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  # One release run per tag, and never cancel one mid-flight: a canceled job could
+  # leave a half-populated draft that a later run would then publish.
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Open a DRAFT release for the tag. The build jobs attach every asset to it, and the
+  # `publish` job flips it live last — so a release is only published once all assets are
+  # present. This is what makes the release immutable-safe: once a release is published its
+  # tag and assets freeze, so nothing can be added afterward. A draft keeps the tag unlocked
+  # until publish; a failed build simply leaves an unpublished draft the tag can be reused on.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A published release is frozen under immutability — refuse to clobber assets
+            # onto it (e.g. a manual re-run of an already-succeeded workflow). Only an
+            # unpublished draft from a failed attempt is safe to reuse.
+            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::release $TAG is already published — refusing to modify it. Cut a new tag for a new release."
+              exit 1
+            fi
+            echo "release $TAG already exists as a draft (re-run) — reusing it."
+          else
+            gh release create "$TAG" --draft --generate-notes --title "$TAG"
+          fi
+
   linux:
+    needs: create-release
     name: linux artifacts (gnu + musl)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write      # OIDC token for build-provenance signing
+      attestations: write  # write the provenance to the attestation API
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned toolchain
@@ -45,18 +84,30 @@ jobs:
           }
           pkg target/release/glass-mcp                          README-gnu.md  x86_64-linux-gnu
           pkg target/x86_64-unknown-linux-musl/release/glass-mcp README-musl.md x86_64-linux-musl
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
+          ( cd dist && for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done )
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          files: dist/*.tar.gz
+          subject-path: 'dist/*.tar.gz'
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
 
   windows:
+    needs: create-release
     name: windows artifact
     # The shipped glass-mcp.exe statically links the MSVC CRT (.cargo/config.toml,
     # +crt-static). Cut Windows releases ONLY here (not on a dev box) for consistent build
     # provenance. Toolchain/CRT redistribution licensing has open questions to confirm
     # before commercial GA — see /LICENSING.md.
     runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned toolchain
@@ -75,14 +126,29 @@ jobs:
           Copy-Item target/release/glass-mcp.exe "dist/$name/glass-mcp.exe"
           Copy-Item packaging/README-windows.md  "dist/$name/README.md"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File "dist/$name.zip.sha256" -Encoding ascii
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          files: dist/*.zip
+          subject-path: 'dist/*.zip'
+      - name: Upload to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $files = (Get-ChildItem dist/*.zip, dist/*.zip.sha256).FullName
+          gh release upload $env:GITHUB_REF_NAME $files --clobber
 
   macos:
+    needs: create-release
     name: macos artifact (universal, notarized)
     runs-on: macos-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v6
 
@@ -169,9 +235,34 @@ jobs:
           mkdir -p dist
           # ditto (not zip) preserves the bundle layout + signature.
           ditto -c -k --keepParent target/macos-app/GlassMcp.app "dist/${name}.zip"
+          ( cd dist && for f in *.zip; do shasum -a 256 "$f" > "$f.sha256"; done )
 
-      - name: Upload to release
+      - name: Attest build provenance
         if: steps.creds.outputs.present == 'true'
-        uses: softprops/action-gh-release@v3
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          files: dist/*.zip
+          subject-path: 'dist/*.zip'
+
+      - name: Upload to draft release
+        if: steps.creds.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" dist/*.zip dist/*.zip.sha256 --clobber
+
+  # Flip the draft live only after every build+upload job succeeded, so the published
+  # release carries all its assets atomically. If any upload job failed, this job is skipped
+  # and the draft stays unpublished (re-run the workflow to retry). The macOS skip-gate
+  # composes cleanly: when its secrets are absent the macos job still *succeeds* (its real
+  # steps are skipped), so publish proceeds with the Linux/Windows assets.
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --draft=false
