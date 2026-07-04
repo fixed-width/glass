@@ -236,13 +236,40 @@ mod macos_main {
         }
     }
 
+    /// The result of running one check. Kept distinct from a plain `Result` so a missing
+    /// precondition for ONE check (`Skipped`) is reported as skipped-not-passed and, crucially,
+    /// never causes the OTHER checks to be skipped — the pathological "the whole test silently
+    /// passes because a single precondition was absent" shape. `Ran(Ok(()))` passed;
+    /// `Ran(Err(_))` failed with a reason; `Skipped(_)` asserted nothing. Each check gates
+    /// itself on ONLY the precondition it actually needs (swiftc for check 1; `TextEdit.app`
+    /// for checks 2/3), so `run` no longer has any blanket gate that could skip everything.
+    enum Outcome {
+        Ran(Result<(), String>),
+        Skipped(String),
+    }
+
     /// Check 1 — foreground `.app`, direct-spawn: build `Demo.app`, `start_app` it under
     /// the default sandbox, click it, and confirm the click round-tripped through captured
     /// stdout. A captured `click: <x>,<y>` line is the only externally-observable proof this
     /// went through `process::spawn`'s child path (see this file's module doc) — an
     /// `NSWorkspace`-adopted process (check 2) has nothing piped at all, so its `drain_logs`
     /// is asserted empty instead.
-    fn run_foreground_check() -> Result<(), String> {
+    ///
+    /// Precondition: `swiftc` (to build the fixture bundle). This check alone needs it —
+    /// checks 2/3 use the stock `TextEdit.app` and no compiler — so its absence skips only
+    /// this check, never the others.
+    fn run_foreground_check() -> Outcome {
+        if !swiftc_available() {
+            return Outcome::Skipped(
+                "swiftc unavailable (needed to compile the Demo.app fixture)".to_string(),
+            );
+        }
+        Outcome::Ran(foreground_check_body())
+    }
+
+    /// Check 1's body, split out so [`run_foreground_check`] can gate on `swiftc` and wrap
+    /// this in [`Outcome`] while the body itself keeps using `?` over `Result`.
+    fn foreground_check_body() -> Result<(), String> {
         let (bundle, build_dir) = build_demo_app()?;
         println!("built fixture bundle at {}", bundle.display());
 
@@ -303,10 +330,22 @@ mod macos_main {
     /// orphaned. If `TextEdit` was already running before this test, `stop_app` is expected
     /// to leave it running (glass only raised an existing instance, not one it started), so
     /// the orphan check is skipped in that case rather than asserting the wrong thing.
-    fn run_handoff_check() -> Result<(), String> {
+    ///
+    /// Precondition: `/System/Applications/TextEdit.app` (the handoff target). This check
+    /// needs no `swiftc`, so a missing swiftc must never skip it — its own missing-TextEdit
+    /// gate is the only thing that skips it.
+    fn run_handoff_check() -> Outcome {
         if !Path::new(TEXT_EDIT).is_dir() {
-            return Err(format!("{TEXT_EDIT} not found on this machine"));
+            return Outcome::Skipped(format!(
+                "{TEXT_EDIT} not found (the handoff check needs a stock TextEdit.app)"
+            ));
         }
+        Outcome::Ran(handoff_check_body())
+    }
+
+    /// Check 2's body, split out so [`run_handoff_check`] can gate on `TextEdit.app` and
+    /// wrap this in [`Outcome`].
+    fn handoff_check_body() -> Result<(), String> {
         let text_edit_was_running = process_running("TextEdit");
 
         let mut platform =
@@ -386,11 +425,21 @@ mod macos_main {
     /// Check 3 — fail-closed: the same handoff trigger as check 2, but `sandbox: Default`.
     /// `bundle::handoff_gate` must reject the adoption before it happens, so `start_app`
     /// returns `Err(GlassError::AppNotStarted(_))` rather than ever adopting TextEdit.
-    fn run_fail_closed_check() -> Result<(), String> {
+    ///
+    /// Precondition: `/System/Applications/TextEdit.app` (same target as check 2, no
+    /// `swiftc`). Gates on that alone.
+    fn run_fail_closed_check() -> Outcome {
         if !Path::new(TEXT_EDIT).is_dir() {
-            return Err(format!("{TEXT_EDIT} not found on this machine"));
+            return Outcome::Skipped(format!(
+                "{TEXT_EDIT} not found (the fail-closed check needs a stock TextEdit.app)"
+            ));
         }
+        Outcome::Ran(fail_closed_check_body())
+    }
 
+    /// Check 3's body, split out so [`run_fail_closed_check`] can gate on `TextEdit.app` and
+    /// wrap this in [`Outcome`].
+    fn fail_closed_check_body() -> Result<(), String> {
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
@@ -417,38 +466,59 @@ mod macos_main {
     }
 
     pub(super) fn run() {
-        if !swiftc_available() {
-            println!("skipped (no swiftc)");
-            return;
-        }
-        if !Path::new(TEXT_EDIT).is_dir() {
-            fail(format!(
-                "{TEXT_EDIT} not found -- checks 2/3 need a stock TextEdit.app"
-            ));
-        }
-
+        // No blanket precondition gate here — each check declines itself (returning
+        // `Outcome::Skipped`) when the ONE precondition it needs is absent, so a missing
+        // `swiftc` can never skip the handoff/fail-closed checks and a missing `TextEdit.app`
+        // can never skip the foreground check. Failures fail the run; skips are reported
+        // distinctly (SKIPPED, never counted as a pass) and do not block the PASS banner for
+        // the checks that did run and pass. On the mini both preconditions are present, so
+        // all three run.
         let mut failures = Vec::new();
+        let mut skips = Vec::new();
 
-        println!("--- check 1: foreground .app (direct-spawn) ---");
-        if let Err(e) = run_foreground_check() {
-            failures.push(format!("foreground check: {e}"));
-        }
+        // Takes the check as a `fn` (not an already-evaluated `Outcome`) so the header prints
+        // BEFORE the check runs — otherwise the check's own progress output would land above
+        // its header.
+        let mut record = |label: &str, header: &str, check: fn() -> Outcome| {
+            println!("--- {header} ---");
+            match check() {
+                Outcome::Ran(Ok(())) => {}
+                Outcome::Ran(Err(e)) => failures.push(format!("{label}: {e}")),
+                Outcome::Skipped(reason) => {
+                    println!("SKIPPED: {label}: {reason}");
+                    skips.push(label.to_string());
+                }
+            }
+        };
 
-        println!("--- check 2: handoff app (NSWorkspace adopt) ---");
-        if let Err(e) = run_handoff_check() {
-            failures.push(format!("handoff check: {e}"));
-        }
+        record(
+            "foreground check",
+            "check 1: foreground .app (direct-spawn)",
+            run_foreground_check,
+        );
+        record(
+            "handoff check",
+            "check 2: handoff app (NSWorkspace adopt)",
+            run_handoff_check,
+        );
+        record(
+            "fail-closed check",
+            "check 3: fail-closed (sandboxed handoff)",
+            run_fail_closed_check,
+        );
 
-        println!("--- check 3: fail-closed (sandboxed handoff) ---");
-        if let Err(e) = run_fail_closed_check() {
-            failures.push(format!("fail-closed check: {e}"));
-        }
-
-        if failures.is_empty() {
-            println!("BUNDLE_LAUNCH_INTEGRATION_PASS");
-            std::process::exit(0);
-        } else {
+        if !failures.is_empty() {
             fail(failures.join("\n"));
         }
+        if skips.is_empty() {
+            println!("BUNDLE_LAUNCH_INTEGRATION_PASS");
+        } else {
+            println!(
+                "BUNDLE_LAUNCH_INTEGRATION_PASS ({} check(s) skipped: {})",
+                skips.len(),
+                skips.join(", ")
+            );
+        }
+        std::process::exit(0);
     }
 }
