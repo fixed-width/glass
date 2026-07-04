@@ -193,7 +193,9 @@ pub(crate) fn running_pid_for_bundle_id(bundle_id: &str) -> Option<i32> {
 /// [`classify_null_result`]'s identical stance on ScreenCaptureKit's completion handlers,
 /// that contract is handled defensively rather than assumed, so a (framework-violating)
 /// null/null callback still yields a message instead of silently dropping the reply.
-/// [`GlassError::Timeout`] covers a completion handler that never fires within `timeout_ms`.
+/// [`GlassError::Timeout`] covers a completion handler that never fires within `timeout_ms`;
+/// a handler dropped without ever firing (the channel sender gone) is reported as
+/// [`GlassError::AppNotStarted`] instead, kept distinct from that never-fired-in-time timeout.
 pub(crate) fn launch_bundle(bundle: &Path, timeout_ms: u64) -> Result<i32> {
     let (tx, rx) = mpsc::channel::<std::result::Result<i32, String>>();
 
@@ -233,7 +235,14 @@ pub(crate) fn launch_bundle(bundle: &Path, timeout_ms: u64) -> Result<i32> {
     match rx.recv_timeout(Duration::from_millis(timeout_ms.max(1))) {
         Ok(Ok(pid)) => Ok(pid),
         Ok(Err(msg)) => Err(GlassError::AppNotStarted(msg)),
-        Err(_) => Err(GlassError::Timeout(timeout_ms)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::Timeout(timeout_ms)),
+        // The sender was dropped without ever sending — i.e. `NSWorkspace` dropped the
+        // completion block without invoking it. Distinct from a genuine timeout: surface it
+        // as a structured start failure rather than mislabeling a never-invoked handler as a
+        // slow launch that might still be in flight.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::AppNotStarted(
+            "NSWorkspace dropped the openApplication completion handler without invoking it".into(),
+        )),
     }
 }
 

@@ -60,6 +60,38 @@ pub(crate) fn handoff_gate(level: SandboxLevel) -> Result<()> {
     }
 }
 
+/// Whether an app adopted via the LaunchServices handoff path (`backend.rs`'s
+/// `start_bundle`) is one glass itself started on this call — and so must reap when the
+/// session ends — or one it merely re-found already running, which it must leave alive.
+/// Carried in [`backend::MacosPlatform`]'s `Adopted` record and consulted by
+/// `stop_app`/`Drop` via [`Disposition::should_terminate`].
+///
+/// Derivation caveat: this can't distinguish a genuinely pre-existing user instance from a
+/// stub-spawned LaunchServices copy that briefly raced ahead of the adoption lookup. The
+/// derivation is therefore biased deliberately toward the safer `PreExisting` ("leave the
+/// app alive") whenever it can't be certain glass started the instance — never toward
+/// terminating an app glass may not own.
+#[derive(Clone, Copy)]
+pub(crate) enum Disposition {
+    /// This call's own `ffi::launch_bundle` started the app — glass owns its lifetime, so
+    /// it is terminated when the session ends.
+    Fresh,
+    /// `ffi::running_pid_for_bundle_id` found an instance already running before this call —
+    /// glass only raised it, so it is left running.
+    PreExisting,
+}
+
+impl Disposition {
+    /// Pure reap predicate: only a `Fresh` adoption is terminated on `stop_app`/`Drop`. Kept
+    /// as a standalone predicate (rather than an inline `if fresh`) so the "which
+    /// disposition gets terminated" decision has one unit-testable definition — a boolean
+    /// inversion here would terminate a user's pre-existing app, so it carries a dedicated
+    /// off-macOS test (see `disposition_only_terminates_fresh`).
+    pub(crate) fn should_terminate(self) -> bool {
+        matches!(self, Disposition::Fresh)
+    }
+}
+
 fn plist_string(bundle: &Path, key: &str) -> Result<String> {
     let path = bundle.join("Contents/Info.plist");
     let val = plist::Value::from_file(&path)
@@ -130,17 +162,54 @@ mod tests {
 
     #[test]
     fn non_bare_executable_name_is_rejected() {
+        // Every non-bare `CFBundleExecutable` form must be rejected before the resolved path
+        // is ever handed to `exec`. Each string exercises a different branch of
+        // `is_bare_filename`:
+        //   - `../../etc/evil` — a `..` traversal (leading `ParentDir` component)
+        //   - `/etc/evil`      — a bare absolute path (leading `RootDir` component)
+        //   - `sub/exec`       — a nested, non-traversing name (two `Normal` components, so
+        //                        the second `components.next()` is `Some`, not `None`)
+        //   - `Demo/`          — a trailing slash: one `Normal` component, but its
+        //                        reconstructed bytes ("Demo") differ from the raw string
+        //                        ("Demo/"), caught by the byte-equality guard
         let tmp = tempfile::tempdir().unwrap();
-        let app = write_bundle(
-            tmp.path(),
-            r#"<plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>../../etc/evil</string>
-</dict></plist>"#,
-        );
+        for evil in ["../../etc/evil", "/etc/evil", "sub/exec", "Demo/"] {
+            let app = write_bundle(
+                tmp.path(),
+                &format!(
+                    r#"<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>{evil}</string>
+</dict></plist>"#
+                ),
+            );
+            assert!(
+                matches!(resolve_inner_exec(&app), Err(GlassError::AppNotStarted(_))),
+                "expected {evil:?} to be rejected as a non-bare CFBundleExecutable"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_plist_is_structured_error() {
+        // A genuinely malformed Info.plist (not merely one missing a key) must surface as a
+        // structured `AppNotStarted` from the `plist::Value::from_file` read itself — a
+        // distinct failure from `missing_key_is_structured_error` above, which parses fine
+        // but lacks the key.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = write_bundle(tmp.path(), "not a plist");
         assert!(matches!(
             resolve_inner_exec(&app),
             Err(GlassError::AppNotStarted(_))
         ));
+    }
+
+    #[test]
+    fn disposition_only_terminates_fresh() {
+        // Pure CI backstop for the reap decision (runs off macOS): a boolean inversion here
+        // would make `stop_app`/`Drop` terminate a user's pre-existing app (`PreExisting`) or
+        // orphan a glass-started one (`Fresh`).
+        assert!(Disposition::Fresh.should_terminate());
+        assert!(!Disposition::PreExisting.should_terminate());
     }
 
     #[test]

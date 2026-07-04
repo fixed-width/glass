@@ -102,11 +102,39 @@ pub struct MacosPlatform {
     /// handed off to `NSWorkspace` because the direct-spawned inner executable exited before a
     /// window appeared (see `start_bundle`'s doc). `None` in every other case, including a
     /// bundle that direct-spawned successfully (`self.child` is `Some` then, same as a plain
-    /// exec). The `bool` is launched-fresh: `true` when this call's own `ffi::launch_bundle`
-    /// started the app, so `stop_app` terminates it; `false` when `ffi::running_pid_for_bundle_id`
-    /// found an instance already running before this call, so `stop_app` leaves it running
-    /// rather than killing an app glass didn't start.
-    adopted: Option<(i32, bool)>,
+    /// exec). The [`Adopted`]'s `disposition` records how `stop_app`/`Drop` must reap it:
+    /// `Fresh` when this call's own `ffi::launch_bundle` started the app (glass terminates it),
+    /// `PreExisting` when `ffi::running_pid_for_bundle_id` found an instance already running
+    /// before this call (glass leaves it running rather than killing an app it didn't start).
+    adopted: Option<Adopted>,
+}
+
+/// A LaunchServices-adopted app tracked by `start_bundle`'s handoff path, bundled with the
+/// decision of how `stop_app`/`Drop` must reap it. Replaces the former bare `(i32, bool)`
+/// pair so the pid and its reap disposition travel together as one named unit, and the reap
+/// decision itself lives in a pure, testable predicate
+/// ([`crate::bundle::Disposition::should_terminate`]) rather than a lone `bool` hand-decoded
+/// identically at the two reap sites.
+struct Adopted {
+    /// The adopted app's pid — an `NSRunningApplication` process id, always non-negative.
+    pid: i32,
+    /// Whether glass started this instance (reap it) or merely re-found one already running
+    /// (leave it alive) — see [`crate::bundle::Disposition`].
+    disposition: crate::bundle::Disposition,
+}
+
+impl Adopted {
+    /// Reap the adopted app iff glass started it
+    /// ([`crate::bundle::Disposition::should_terminate`]). Uses [`crate::ffi::terminate_app`],
+    /// which is graceful-only (`-[NSRunningApplication terminate]`, no `SIGKILL`
+    /// escalation): an app that vetoes quit (e.g. an unsaved-changes sheet) is left running
+    /// by design, trading a possible stray process for never forcibly killing an app
+    /// mid-edit and losing the user's work.
+    fn reap(self) {
+        if self.disposition.should_terminate() {
+            crate::ffi::terminate_app(self.pid);
+        }
+    }
 }
 
 impl MacosPlatform {
@@ -171,8 +199,14 @@ impl MacosPlatform {
             if let Some(m) = crate::scwindow::query_once(&[pid as i32])? {
                 return Ok(m);
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(GlassError::AppExited(status.code()));
+            match child.try_wait() {
+                Ok(Some(status)) => return Err(GlassError::AppExited(status.code())),
+                // A `try_wait` error means the child can no longer be reaped (e.g. the pid
+                // is already gone): treat it as an exit, not a bare poll hiccup, so a
+                // transient error here can't mask a handoff as a `Timeout` — `start_bundle`'s
+                // handoff decision keys on `AppExited`.
+                Err(_) => return Err(GlassError::AppExited(None)),
+                Ok(None) => {}
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::Timeout(timeout_ms));
@@ -242,10 +276,11 @@ impl MacosPlatform {
         // A-preferred: direct-spawn the inner executable (logs + containment + window
         // tracking), exactly as the plain-exec path does for a non-bundle `run[0]`.
         let inner = crate::bundle::resolve_inner_exec(bundle)?;
+        // Swap only `run[0]` (the `.app` path) for the resolved inner executable, preserving
+        // any launch args. `run[0]` is guaranteed present — `start_app` checked
+        // `spec.run.first()` before delegating here.
         let mut direct = spec.clone();
-        direct.run = std::iter::once(inner.to_string_lossy().into_owned())
-            .chain(spec.run.iter().skip(1).cloned())
-            .collect();
+        direct.run[0] = inner.to_string_lossy().into_owned();
         let (mut child, clip) = process::spawn(&direct, self.logs.clone())?;
         let pid = child.id();
         match Self::discover_window(&mut child, pid, spec.timeout_ms) {
@@ -254,20 +289,40 @@ impl MacosPlatform {
                 self.child = Some(child);
                 self.app_pid = Some(pid);
                 self.active_window = Some(m.window_id);
+                // Defensive: a direct-spawn is never an adopted session — clear any stale
+                // handoff record from a prior un-stopped session so it can't widen
+                // `stop_app`/`Drop`'s reap blast radius (symmetric with the handoff path
+                // below clearing `self.child`).
+                self.adopted = None;
                 self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
                 self.clip = clip;
                 Ok(m.geometry)
             }
-            Err(GlassError::AppExited(_)) => {
-                // Handoff: the direct-spawned process was a stub that re-launched the real app
-                // through LaunchServices. Don't leak the (dead) child or its pasteboards.
+            Err(e) => {
+                // The direct-spawned process is done with — dead (an `AppExited` stub) or
+                // simply never grew a window. Tear it down: terminate the child and release
+                // any clip-shim pasteboards it created. On a *successful* handoff `clip` is
+                // always `None` (handoff requires sandbox:off, which is never shim-injected),
+                // so `release_clip` there is a no-op; it does real work only for a contained
+                // launch that failed (a plain failure, or a contained stub the gate rejects
+                // just below).
                 process::terminate(&mut child);
                 release_clip(clip.as_ref());
+                // Only an early inner-exec exit (`AppExited`) is the handoff signal — a stub
+                // that re-launched the real app through LaunchServices. Any other failure
+                // (e.g. `Timeout`: the process is alive but never grew a window) is propagated
+                // as-is, exactly as the plain-exec path does. NOTE: `AppExited` here conflates
+                // a genuine early crash of the inner exec with a deliberate re-exec stub; both
+                // fall through to the handoff below, which then either finds/relaunches a real
+                // window or fails.
+                let GlassError::AppExited(_) = e else {
+                    return Err(e);
+                };
                 // Fail-closed: only sandbox:off may adopt an app glass can no longer contain.
                 crate::bundle::handoff_gate(spec.sandbox)?;
                 let id = crate::bundle::bundle_identifier(bundle)?;
-                let (pid, fresh) = match crate::ffi::running_pid_for_bundle_id(&id) {
-                    Some(pid) => (pid, false),
+                let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
+                    Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
                     // NOTE (runtime-verified in Task 4): `ffi::launch_bundle` blocks this
                     // thread on a channel until `NSWorkspace`'s completion handler fires: if
                     // LaunchServices needs the main run loop to spin to complete the launch,
@@ -275,18 +330,28 @@ impl MacosPlatform {
                     // main-thread-affinity notes), that handler could need a run-loop turn this
                     // blocked thread isn't pumping. Wired here per the design; the on-box round
                     // confirms whether it actually stalls.
-                    None => (crate::ffi::launch_bundle(bundle, spec.timeout_ms)?, true),
+                    None => match crate::ffi::launch_bundle(bundle, spec.timeout_ms) {
+                        Ok(pid) => (pid, crate::bundle::Disposition::Fresh),
+                        // `launch_bundle` can start the app yet still error before its pid is
+                        // delivered (e.g. its completion handler timed out) — an orphan. The
+                        // `None` just found above means any instance running now is one we
+                        // spawned, so best-effort reclaim it before propagating the error.
+                        Err(e) => {
+                            if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id) {
+                                crate::ffi::terminate_app(pid);
+                            }
+                            return Err(e);
+                        }
+                    },
                 };
                 // Don't orphan a fresh launch whose window never appears in time: adopt only
                 // after discovery succeeds, since `self.adopted` (what `stop_app`/`Drop` reap)
-                // isn't set until below. Terminate only a `fresh` launch — an already-running
-                // instance we merely re-found is not ours to kill.
+                // isn't set until below. Reaping here terminates only a `Fresh` launch — an
+                // already-running instance we merely re-found is not ours to kill.
                 let m = match Self::discover_window_pid(pid, spec.timeout_ms) {
                     Ok(m) => m,
                     Err(e) => {
-                        if fresh {
-                            crate::ffi::terminate_app(pid);
-                        }
+                        Adopted { pid, disposition }.reap();
                         return Err(e);
                     }
                 };
@@ -298,16 +363,11 @@ impl MacosPlatform {
                 // call sites, which cast the other direction).
                 self.app_pid = Some(pid as u32);
                 self.active_window = Some(m.window_id);
-                self.adopted = Some((pid, fresh));
+                self.adopted = Some(Adopted { pid, disposition });
                 self.clip = None;
                 self.clipboard_route =
                     crate::clipboard_route::decide_route(SandboxLevel::Off, None);
                 Ok(m.geometry)
-            }
-            Err(e) => {
-                process::terminate(&mut child);
-                release_clip(clip.as_ref());
-                Err(e)
             }
         }
     }
@@ -496,6 +556,11 @@ impl Platform for MacosPlatform {
             Ok(m) => {
                 self.child = Some(child);
                 self.app_pid = Some(pid);
+                // Defensive: a plain exec is never an adopted session — clear any stale
+                // handoff record from a prior un-stopped session so it can't widen
+                // `stop_app`/`Drop`'s reap blast radius (symmetric with `start_bundle`'s
+                // handoff path clearing `self.child`).
+                self.adopted = None;
                 // NOTE: this seeds the active-window model (Plan 4 design decision 2): the
                 // first window discovered for the launched app becomes the implicit target
                 // of capture/input, exactly as `select_window` (a later task) will retarget
@@ -539,10 +604,8 @@ impl Platform for MacosPlatform {
     /// structurally identical (both reap `adopted`, then `child`, then release pasteboards)
     /// instead of `stop_app` carrying its own divergent early-return.
     fn stop_app(&mut self) -> Result<()> {
-        if let Some((pid, fresh)) = self.adopted.take() {
-            if fresh {
-                crate::ffi::terminate_app(pid);
-            }
+        if let Some(a) = self.adopted.take() {
+            a.reap();
         }
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
@@ -808,10 +871,8 @@ impl Drop for MacosPlatform {
     /// this backend launched" reason; an activated-existing adoptee is left running, same as
     /// in `stop_app`.
     fn drop(&mut self) {
-        if let Some((pid, fresh)) = self.adopted.take() {
-            if fresh {
-                crate::ffi::terminate_app(pid);
-            }
+        if let Some(a) = self.adopted.take() {
+            a.reap();
         }
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
@@ -937,6 +998,83 @@ mod tests {
         };
         assert!(p.stop_app().is_ok());
         assert!(p.clip.is_none());
+    }
+
+    #[test]
+    fn stop_app_reaps_a_fresh_adoption_and_resets_state() {
+        // A `Fresh` adoptee is terminated on `stop_app` (glass started it). Pid 999_999
+        // resolves to no live app, so `ffi::terminate_app` is a no-op — this exercises the
+        // reap + full state reset without a real process, needing no TCC grant or main
+        // thread. Every per-session field must clear so a later `start_app` decides fresh.
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: Some(999_999),
+            child: None,
+            active_window: Some(7),
+            clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.9.1.1".into()),
+            clip: None,
+            adopted: Some(Adopted {
+                pid: 999_999,
+                disposition: crate::bundle::Disposition::Fresh,
+            }),
+        };
+        assert!(p.stop_app().is_ok());
+        assert!(p.adopted.is_none());
+        assert_eq!(p.app_pid(), None);
+        assert_eq!(p.active_window, None);
+        assert_eq!(p.clipboard_route, ClipboardRoute::default());
+    }
+
+    #[test]
+    fn stop_app_leaves_a_pre_existing_adoption_but_resets_state() {
+        // A `PreExisting` adoptee is left running (glass only raised it), but the adopted
+        // record and the rest of the per-session state must still clear on `stop_app`.
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: Some(999_999),
+            child: None,
+            active_window: Some(7),
+            clipboard_route: ClipboardRoute::default(),
+            clip: None,
+            adopted: Some(Adopted {
+                pid: 999_999,
+                disposition: crate::bundle::Disposition::PreExisting,
+            }),
+        };
+        assert!(p.stop_app().is_ok());
+        assert!(p.adopted.is_none());
+        assert_eq!(p.app_pid(), None);
+        assert_eq!(p.active_window, None);
+    }
+
+    #[test]
+    fn start_app_rejects_an_empty_run() {
+        // `start_app` must reject a spec with an empty `run` (no executable to launch) with a
+        // structured `AppNotStarted`, before any FFI/main-thread work — construct the struct
+        // directly (as the other tests here do) to bypass `new()`'s TCC preflight.
+        let mut p = MacosPlatform {
+            logs: Arc::new(Mutex::new(Vec::new())),
+            app_pid: None,
+            child: None,
+            active_window: None,
+            clipboard_route: ClipboardRoute::default(),
+            clip: None,
+            adopted: None,
+        };
+        let spec = AppSpec {
+            build: None,
+            run: vec![],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1000,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        };
+        assert!(matches!(
+            p.start_app(&spec),
+            Err(GlassError::AppNotStarted(_))
+        ));
     }
 
     #[test]
