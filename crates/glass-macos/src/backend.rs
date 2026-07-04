@@ -277,7 +277,19 @@ impl MacosPlatform {
                     // confirms whether it actually stalls.
                     None => (crate::ffi::launch_bundle(bundle, spec.timeout_ms)?, true),
                 };
-                let m = Self::discover_window_pid(pid, spec.timeout_ms)?;
+                // Don't orphan a fresh launch whose window never appears in time: adopt only
+                // after discovery succeeds, since `self.adopted` (what `stop_app`/`Drop` reap)
+                // isn't set until below. Terminate only a `fresh` launch — an already-running
+                // instance we merely re-found is not ours to kill.
+                let m = match Self::discover_window_pid(pid, spec.timeout_ms) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        if fresh {
+                            crate::ffi::terminate_app(pid);
+                        }
+                        return Err(e);
+                    }
+                };
                 self.child = None;
                 // `app_pid` is `u32` (every other pid in this struct comes from
                 // `std::process::Child::id()`); AppKit's pids are `i32` but always
@@ -514,24 +526,23 @@ impl Platform for MacosPlatform {
         }
     }
 
-    /// Terminate the launched child (if any) and clear the active pid/window. Idempotent —
-    /// a call with nothing running is `Ok(())`.
+    /// Terminate the launched app (however it was launched) and clear the active pid/window.
+    /// Idempotent — a call with nothing running is `Ok(())`.
     ///
     /// An `adopted` app (`start_bundle`'s NSWorkspace-handoff path — no `self.child` to
-    /// terminate) is handled first and returns early: a freshly-launched adoptee is
-    /// terminated via `ffi::terminate_app` (glass started it, so glass stops it), while an
-    /// activated-existing one is left running (glass only raised it, so it isn't glass's to
-    /// kill) — see the `adopted` field's doc for the two cases.
+    /// terminate) is reaped first: a freshly-launched adoptee is terminated via
+    /// `ffi::terminate_app` (glass started it, so glass stops it), while an activated-existing
+    /// one is left running (glass only raised it, so it isn't glass's to kill) — see the
+    /// `adopted` field's doc. This then falls through to the child/pasteboard cleanup below
+    /// rather than returning early: a session is only ever `adopted` XOR `child`-backed, so the
+    /// fall-through is a no-op for an adopted session, but it keeps `stop_app` and `Drop`
+    /// structurally identical (both reap `adopted`, then `child`, then release pasteboards)
+    /// instead of `stop_app` carrying its own divergent early-return.
     fn stop_app(&mut self) -> Result<()> {
         if let Some((pid, fresh)) = self.adopted.take() {
             if fresh {
                 crate::ffi::terminate_app(pid);
             }
-            self.app_pid = None;
-            self.active_window = None;
-            self.clipboard_route = ClipboardRoute::default();
-            self.clip = None;
-            return Ok(());
         }
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
