@@ -50,14 +50,26 @@
 //!   type (`Retained<T>` / `Option<Retained<T>>` / `bool` / a primitive) and the
 //!   selector's method family (`new`/`alloc`/`init`/`copy`) — no `msg_send_id!` needed
 //!   (deprecated in objc2 0.6).
+//! - Not every generated binding needs an `unsafe` block: header-translator marks a method
+//!   `unsafe fn` only when it judges the call genuinely unsafe (e.g. `SCShareableContent`'s
+//!   completion-handler registration); plenty of others — every `NSRunningApplication`/
+//!   `NSWorkspace` method used below, `NSString::from_str`, `NSURL::fileURLWithPath` — are
+//!   plain safe `fn`s. Read each generated signature rather than wrapping defensively; an
+//!   `unsafe` block around an already-safe call trips the `unused_unsafe` lint under this
+//!   workspace's `-D warnings` gate.
 
-use std::sync::Once;
+use std::path::Path;
+use std::sync::{mpsc, Once};
+use std::time::Duration;
 
+use block2::RcBlock;
 use objc2::MainThreadMarker;
-use objc2_app_kit::NSApplication;
-use objc2_foundation::NSError;
+use objc2_app_kit::{
+    NSApplication, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
+};
+use objc2_foundation::{NSError, NSString, NSURL};
 
-use glass_core::GlassError;
+use glass_core::{GlassError, Result};
 
 use crate::permissions::Permission;
 
@@ -150,6 +162,98 @@ pub(crate) fn classify_null_result(err_ptr: *mut NSError, fallback_msg: &str) ->
         Permission::ScreenRecording.denied_with_detail(detail)
     } else {
         GlassError::CaptureFailed(detail)
+    }
+}
+
+/// The first running application whose `CFBundleIdentifier` equals `bundle_id`, or `None`
+/// if none is currently running. `backend.rs`'s bundle-launch path (task 3) uses
+/// this to detect that `LaunchServices` handed the launch off to an already-running
+/// instance rather than spawning the process this call started.
+///
+/// No `unsafe` needed: `NSRunningApplication::runningApplicationsWithBundleIdentifier` and
+/// `processIdentifier` are both plain safe bindings (see this module's doc) — same shape as
+/// `input.rs::focus`'s `runningApplicationWithProcessIdentifier` lookup.
+pub(crate) fn running_pid_for_bundle_id(bundle_id: &str) -> Option<i32> {
+    let id = NSString::from_str(bundle_id);
+    let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&id);
+    apps.iter().next().map(|app| app.processIdentifier())
+}
+
+/// Launch (or, per `NSWorkspaceOpenConfiguration`'s default `createsNewApplicationInstance
+/// == false`, adopt an already-running instance of) the `.app` bundle at `bundle` via
+/// `NSWorkspace.openApplication(at:configuration:completionHandler:)`, blocking the calling
+/// thread on the async completion handler for up to `timeout_ms` (this module's documented
+/// async-bridge convention: the block sends only a plain `Result<i32, String>` — never a
+/// `Retained<NSRunningApplication>` — across the channel). Returns the launched/adopted
+/// app's pid.
+///
+/// [`GlassError::AppNotStarted`] carries the framework's own `NSError` description when the
+/// completion handler reports failure. `NSWorkspace` documents the handler as being called
+/// with either a non-nil app or a non-nil error, never neither — but per
+/// [`classify_null_result`]'s identical stance on ScreenCaptureKit's completion handlers,
+/// that contract is handled defensively rather than assumed, so a (framework-violating)
+/// null/null callback still yields a message instead of silently dropping the reply.
+/// [`GlassError::Timeout`] covers a completion handler that never fires within `timeout_ms`;
+/// a handler dropped without ever firing (the channel sender gone) is reported as
+/// [`GlassError::AppNotStarted`] instead, kept distinct from that never-fired-in-time timeout.
+pub(crate) fn launch_bundle(bundle: &Path, timeout_ms: u64) -> Result<i32> {
+    let (tx, rx) = mpsc::channel::<std::result::Result<i32, String>>();
+
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&bundle.to_string_lossy()));
+    let configuration = NSWorkspaceOpenConfiguration::configuration();
+    let workspace = NSWorkspace::sharedWorkspace();
+
+    // The completion handler decides success/failure synchronously inside the callback (this
+    // module's async-bridge convention) and only ever sends the plain owned `Result<i32,
+    // String>` declared above — never a `Retained<NSRunningApplication>` — across the channel.
+    let handler = RcBlock::new(move |app: *mut NSRunningApplication, err: *mut NSError| {
+        // SAFETY: `openApplication`'s completion handler hands back either a valid, live
+        // `NSRunningApplication` pointer (success) or a valid, live `NSError` pointer
+        // (failure); at most one of `app`/`err` is non-null. `as_ref()` turns each raw
+        // pointer into `Option<&T>`, safe regardless of which one (if either) is null.
+        let app = unsafe { app.as_ref() };
+        if let Some(app) = app {
+            let _ = tx.send(Ok(app.processIdentifier()));
+            return;
+        }
+        // SAFETY: same guarantee as above, applied to `err` instead of `app`.
+        let err = unsafe { err.as_ref() };
+        let msg = err
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_else(|| "openApplication failed with no error".to_string());
+        let _ = tx.send(Err(msg));
+    });
+
+    // No `unsafe` needed: `openApplicationAtURL:configuration:completionHandler:` is a plain
+    // safe binding (see this module's doc) — unlike `SCShareableContent`'s equivalent.
+    workspace.openApplicationAtURL_configuration_completionHandler(
+        &url,
+        &configuration,
+        Some(&handler),
+    );
+
+    match rx.recv_timeout(Duration::from_millis(timeout_ms.max(1))) {
+        Ok(Ok(pid)) => Ok(pid),
+        Ok(Err(msg)) => Err(GlassError::AppNotStarted(msg)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(GlassError::Timeout(timeout_ms)),
+        // The sender was dropped without ever sending — i.e. `NSWorkspace` dropped the
+        // completion block without invoking it. Distinct from a genuine timeout: surface it
+        // as a structured start failure rather than mislabeling a never-invoked handler as a
+        // slow launch that might still be in flight.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::AppNotStarted(
+            "NSWorkspace dropped the openApplication completion handler without invoking it".into(),
+        )),
+    }
+}
+
+/// Gracefully terminate the running application with this pid; a no-op if the pid is
+/// already gone. Cleanup-only (unlike `input.rs::focus`'s identical lookup, which treats a
+/// missing pid as the hard error `GlassError::AppExited` because a caller is depending on
+/// the activation landing) — `backend.rs`'s `stop_app` path doesn't need to know whether the
+/// app was already gone before it asked.
+pub(crate) fn terminate_app(pid: i32) {
+    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        app.terminate();
     }
 }
 
