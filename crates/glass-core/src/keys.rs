@@ -16,7 +16,7 @@ impl Modifier {
             "shift" => Some(Modifier::Shift),
             "ctrl" | "control" => Some(Modifier::Control),
             "alt" => Some(Modifier::Alt),
-            "super" | "meta" | "win" => Some(Modifier::Super),
+            "super" | "meta" | "win" | "cmd" | "command" => Some(Modifier::Super),
             _ => None,
         }
     }
@@ -83,7 +83,9 @@ pub fn parse_chord(chord: &str) -> Result<(Vec<Modifier>, u32)> {
     let mut modifiers = Vec::new();
     for m in mods {
         let modifier = Modifier::from_name(m).ok_or_else(|| {
-            GlassError::InvalidKey(format!("unknown modifier '{m}' in '{chord}'"))
+            GlassError::InvalidKey(format!(
+                "unknown modifier '{m}' in '{chord}' (use ctrl/shift/alt/super/cmd)"
+            ))
         })?;
         modifiers.push(modifier);
     }
@@ -167,5 +169,18 @@ mod tests {
         assert_eq!(Modifier::from_name("super"), Some(Modifier::Super));
         assert_eq!(Modifier::from_name("win"), Some(Modifier::Super));
         assert_eq!(Modifier::from_name("hyper"), None);
+    }
+
+    #[test]
+    fn modifier_cmd_is_super() {
+        // ⌘ is spelled `cmd`/`command` in the macOS idiom; both alias to Super (which the
+        // macOS backend renders as the Command flag), so cmd-chords parse like super-chords.
+        assert_eq!(Modifier::from_name("cmd"), Some(Modifier::Super));
+        assert_eq!(Modifier::from_name("command"), Some(Modifier::Super));
+        assert_eq!(Modifier::from_name("Cmd"), Some(Modifier::Super)); // case-insensitive
+        assert_eq!(
+            parse_chord("cmd+a").unwrap(),
+            parse_chord("super+a").unwrap()
+        );
     }
 }
