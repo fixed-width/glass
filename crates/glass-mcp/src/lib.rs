@@ -6,13 +6,13 @@ pub mod cli;
 pub mod doctor;
 mod env;
 mod params;
+#[cfg(feature = "network")]
+pub mod serve;
 pub(crate) mod server;
 pub mod setup;
 pub(crate) mod shutdown;
 mod tools;
 mod untrusted;
-#[cfg(feature = "network")]
-pub mod serve;
 
 use std::time::Duration;
 
@@ -49,16 +49,28 @@ pub fn make_platform(
                 Some(apk) => match a11y.ensure(&platform.resolved_adb(), &apk) {
                     // The package isn't known until start_app; the device service serves the
                     // ACTIVE window regardless, so an empty package is correct for the MVP.
-                    Ok(client) => Some(Box::new(glass_android::ServiceA11y::new(client, String::new()))),
+                    Ok(client) => Some(Box::new(glass_android::ServiceA11y::new(
+                        client,
+                        String::new(),
+                    ))),
                     Err(e) => {
-                        eprintln!("glass-android: a11y service unavailable, using uiautomator: {e}");
-                        Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb())))
+                        eprintln!(
+                            "glass-android: a11y service unavailable, using uiautomator: {e}"
+                        );
+                        Some(Box::new(glass_android::AndroidA11y::for_adb(
+                            platform.resolved_adb(),
+                        )))
                     }
                 },
-                None => Some(Box::new(glass_android::AndroidA11y::for_adb(platform.resolved_adb()))),
+                None => Some(Box::new(glass_android::AndroidA11y::for_adb(
+                    platform.resolved_adb(),
+                ))),
             };
         let platform: Box<dyn Platform + Send> = Box::new(platform);
-        return Ok(Backend { platform, accessibility });
+        return Ok(Backend {
+            platform,
+            accessibility,
+        });
     }
     let platform: Box<dyn Platform + Send> = match backend {
         #[cfg(target_os = "linux")]
@@ -76,7 +88,9 @@ pub fn make_platform(
             let valid = "\"windows\" or \"android\"";
             #[cfg(target_os = "macos")]
             let valid = "\"macos\" or \"android\"";
-            return Err(GlassError::Backend(format!("unknown backend {other:?}; use {valid}")));
+            return Err(GlassError::Backend(format!(
+                "unknown backend {other:?}; use {valid}"
+            )));
         }
     };
     // On Linux, AT-SPI serves both display backends, so the same reader is attached
@@ -96,7 +110,10 @@ pub fn make_platform(
     #[cfg(target_os = "macos")]
     let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
         Some(Box::new(glass_a11y_macos::MacosA11y::new()));
-    Ok(Backend { platform, accessibility })
+    Ok(Backend {
+        platform,
+        accessibility,
+    })
 }
 
 /// Default backend name from `GLASS_BACKEND` (case-insensitive
@@ -118,7 +135,11 @@ pub fn default_backend(env: Option<&str>) -> &'static str {
 /// `glass-mcp env [--json]`: print glass's configuration env vars (secrets redacted).
 pub fn run_env(json: bool) -> ! {
     let current = |name: &str| env::current_from_env(name);
-    let out = if json { env::render_json(&current) } else { env::render_text(&current) };
+    let out = if json {
+        env::render_json(&current)
+    } else {
+        env::render_text(&current)
+    };
     print!("{out}");
     std::process::exit(0);
 }
@@ -129,7 +150,10 @@ pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
     let report = audit::report_from_config(audit_log, |k| std::env::var(k).ok());
     let diag = doctor::diagnose_with_audit(deep, &report);
     if json {
-        println!("{}", serde_json::to_string_pretty(&diag).expect("serialize diagnosis"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&diag).expect("serialize diagnosis")
+        );
     } else {
         print!("{}", diag.render_text(backend));
     }
@@ -167,7 +191,10 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
 pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyhow::Result<()> {
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
-    let service = server.serve(stdio()).await.context("starting the MCP stdio service")?;
+    let service = server
+        .serve(stdio())
+        .await
+        .context("starting the MCP stdio service")?;
 
     let via_signal = tokio::select! {
         r = service.waiting() => { r.context("serving MCP")?; false }

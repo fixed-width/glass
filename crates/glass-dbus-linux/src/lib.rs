@@ -102,7 +102,10 @@ impl PrivateBus {
             Err(e) => {
                 let _ = dbus.kill();
                 let _ = dbus.wait();
-                return Err(GlassError::Backend(format!("spawn {}: {e}", launcher.display())));
+                return Err(GlassError::Backend(format!(
+                    "spawn {}: {e}",
+                    launcher.display()
+                )));
             }
         };
 
@@ -154,18 +157,24 @@ fn read_first_line(stdout: ChildStdout, timeout: Duration) -> Result<(String, Ch
         let _ = tx.send(n.map(|count| (count, line, reader.into_inner())));
     });
     match rx.recv_timeout(timeout) {
-        Ok(Ok((0, _line, _stdout))) => {
-            Err(GlassError::Backend("dbus-daemon exited without printing an address (failed to start)".into()))
-        }
+        Ok(Ok((0, _line, _stdout))) => Err(GlassError::Backend(
+            "dbus-daemon exited without printing an address (failed to start)".into(),
+        )),
         Ok(Ok((_, line, stdout))) => {
             let addr = line.trim().to_string();
             if addr.is_empty() {
-                return Err(GlassError::Backend("dbus-daemon printed an empty address".into()));
+                return Err(GlassError::Backend(
+                    "dbus-daemon printed an empty address".into(),
+                ));
             }
             Ok((addr, stdout))
         }
-        Ok(Err(e)) => Err(GlassError::Backend(format!("read dbus-daemon address: {e}"))),
-        Err(_) => Err(GlassError::Backend("timed out reading dbus-daemon address".into())),
+        Ok(Err(e)) => Err(GlassError::Backend(format!(
+            "read dbus-daemon address: {e}"
+        ))),
+        Err(_) => Err(GlassError::Backend(
+            "timed out reading dbus-daemon address".into(),
+        )),
     }
 }
 
@@ -254,9 +263,15 @@ mod tests {
     fn session_bus_is_a_path_socket_in_the_private_dir() {
         let bus = PrivateBus::start().expect("private bus");
         let addr = bus.session_bus_address();
-        assert!(addr.starts_with("unix:path="), "session bus must be a path socket, got {addr}");
+        assert!(
+            addr.starts_with("unix:path="),
+            "session bus must be a path socket, got {addr}"
+        );
         let dir = bus.runtime_dir().to_string_lossy().into_owned();
-        assert!(addr.contains(&dir), "socket {addr} must live in the private runtime dir {dir}");
+        assert!(
+            addr.contains(&dir),
+            "socket {addr} must live in the private runtime dir {dir}"
+        );
     }
 
     #[test]

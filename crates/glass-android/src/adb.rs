@@ -21,7 +21,10 @@ impl Adb {
 
     /// Return a copy bound to `serial`.
     pub fn with_serial(&self, serial: impl Into<String>) -> Self {
-        Self { bin: self.bin.clone(), serial: Some(serial.into()) }
+        Self {
+            bin: self.bin.clone(),
+            serial: Some(serial.into()),
+        }
     }
 
     pub fn serial(&self) -> Option<&str> {
@@ -38,7 +41,10 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let argv = build_argv(self.serial.as_deref(), &args.into_iter().collect::<Vec<_>>());
+        let argv = build_argv(
+            self.serial.as_deref(),
+            &args.into_iter().collect::<Vec<_>>(),
+        );
         let out = self.spawn(&argv)?;
         decode_text(&self.bin, &argv, out)
     }
@@ -48,7 +54,10 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let argv = build_argv(self.serial.as_deref(), &args.into_iter().collect::<Vec<_>>());
+        let argv = build_argv(
+            self.serial.as_deref(),
+            &args.into_iter().collect::<Vec<_>>(),
+        );
         let out = self.spawn(&argv)?;
         if out.status.success() {
             Ok(out.stdout)
@@ -107,7 +116,9 @@ mod tests {
         assert_eq!(
             build_argv(Some("emulator-5554"), &["shell", "echo", "hi"]),
             vec!["-s", "emulator-5554", "shell", "echo", "hi"]
-                .into_iter().map(String::from).collect::<Vec<_>>()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
     }
 }

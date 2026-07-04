@@ -53,12 +53,7 @@ pub(crate) fn sandboxie_dir() -> String {
 /// `None` on any failure (the default path then applies). Kept simple — no Win32 registry FFI.
 fn registry_dir() -> Option<String> {
     let out = Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SOFTWARE\Sandboxie",
-            "/v",
-            "InstallLocation",
-        ])
+        .args(["query", r"HKLM\SOFTWARE\Sandboxie", "/v", "InstallLocation"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -88,9 +83,7 @@ fn sbieini(dir: &str) -> String {
 /// Whether Sandboxie is usable right now: `Start.exe` present in `dir` AND both services
 /// (`SbieSvc`, `SbieDrv`) running.
 pub(crate) fn available(dir: &str) -> bool {
-    Path::new(&start_exe(dir)).exists()
-        && service_running("SbieSvc")
-        && service_running("SbieDrv")
+    Path::new(&start_exe(dir)).exists() && service_running("SbieSvc") && service_running("SbieDrv")
 }
 
 /// True if the named Windows service reports RUNNING (`sc query <name>` stdout contains
@@ -119,7 +112,9 @@ pub(crate) struct Sandboxie {
 /// (`SbieIni set <box> * ""` — the maintainer's documented box-clear), so
 /// per-session `glass_<pid>` boxes don't accumulate. Best-effort.
 fn clear_box_section(dir: &str, box_name: &str) {
-    let _ = Command::new(sbieini(dir)).args(["set", box_name, "*", ""]).status();
+    let _ = Command::new(sbieini(dir))
+        .args(["set", box_name, "*", ""])
+        .status();
 }
 
 impl Drop for Sandboxie {
@@ -134,7 +129,11 @@ impl Sandboxie {
     /// A box handle for `box_name` under install `dir`. The section guard starts
     /// disarmed; `configure()` arms it.
     pub(crate) fn new(dir: String, box_name: String) -> Self {
-        Self { dir, box_name, section_armed: AtomicBool::new(false) }
+        Self {
+            dir,
+            box_name,
+            section_armed: AtomicBool::new(false),
+        }
     }
 
     /// Configure the private-clipboard hook for this box (Layer 2). Returns `Some((store, server,
@@ -155,11 +154,19 @@ impl Sandboxie {
         }
         let pipe = config::clip_pipe_name(&self.box_name);
         let store = PrivateClipboard::new();
-        let server =
-            ClipServer::start(&pipe, store.clone(), self.dir.clone(), self.box_name.clone()).ok()?;
+        let server = ClipServer::start(
+            &pipe,
+            store.clone(),
+            self.dir.clone(),
+            self.box_name.clone(),
+        )
+        .ok()?;
         let sbieini = sbieini(&self.dir);
         for (k, v) in config::clip_layer2_lines(&self.box_name, &dll) {
-            if self.run_sbie(&sbieini, &["set", &self.box_name, &k, &v]).is_err() {
+            if self
+                .run_sbie(&sbieini, &["set", &self.box_name, &k, &v])
+                .is_err()
+            {
                 return None;
             }
         }
@@ -202,7 +209,9 @@ impl Sandboxie {
                         "querying GlobalSettings PromptForInternetAccess: {e}"
                     ))
                 })?;
-            let value = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+            let value = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .to_ascii_lowercase();
             if value == "y" {
                 return Err(GlassError::SandboxUnavailable(
                     "Sandboxie GlobalSettings PromptForInternetAccess=y would deadlock strict; \
@@ -263,10 +272,10 @@ impl Sandboxie {
         // Generate launch.cmd: optional cd, then the quoted exe + args with stdio redirected.
         // Passes the clipboard pipe name (if Layer 2 is active) as GLASS_CLIP_PIPE env.
         let cmd_path = logdir.join("launch.cmd");
-        let script = super::config::build_launch_cmd_env(spec, &out_log, &err_log, clip_pipe.as_deref())?;
-        std::fs::write(&cmd_path, script).map_err(|e| {
-            GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display()))
-        })?;
+        let script =
+            super::config::build_launch_cmd_env(spec, &out_log, &err_log, clip_pipe.as_deref())?;
+        std::fs::write(&cmd_path, script)
+            .map_err(|e| GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display())))?;
 
         // Spawn the Start.exe wrapper, reusing the Job wrapper for teardown of the launcher
         // process itself. `Off` so no Job caps are applied to the wrapper.
@@ -339,13 +348,7 @@ fn spawn_tailer(
 /// Read any new bytes from `path` past `offset`, append to `pending`, emit each complete
 /// line into `sink`, and return the new offset. A read error / missing file leaves the
 /// offset unchanged.
-fn drain(
-    path: &Path,
-    offset: u64,
-    pending: &mut String,
-    stream: Stream,
-    sink: &LogSink,
-) -> u64 {
+fn drain(path: &Path, offset: u64, pending: &mut String, stream: Stream, sink: &LogSink) -> u64 {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return offset,

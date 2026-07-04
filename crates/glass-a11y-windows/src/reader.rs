@@ -94,7 +94,10 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     let origin = (ctx.window.x, ctx.window.y);
     let mut count = 0usize;
     let root_node = walk(&walker, &window, origin, 0, &mut count)?;
-    let mut tree = AxTree { root: root_node, count: 0 };
+    let mut tree = AxTree {
+        root: root_node,
+        count: 0,
+    };
     tree.assign_ids();
     Ok(tree)
 }
@@ -191,7 +194,8 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     // ComboBox/Document reports editable=false while set_value would succeed on
     // it. `readonly` is only `Some` for those three types (gated above), so the
     // match keeps non-value controls non-editable.
-    let editable = matches!(ct_id, 50003 | 50004 | 50030) && readonly.map(|ro| !ro).unwrap_or(false);
+    let editable =
+        matches!(ct_id, 50003 | 50004 | 50030) && readonly.map(|ro| !ro).unwrap_or(false);
     let facts = crate::mapping::StateFacts {
         enabled: el.is_enabled().unwrap_or(false),
         offscreen: el.is_offscreen().unwrap_or(false),
@@ -257,7 +261,8 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // baseline is unknown — the confirmation below then requires an exact match rather than
     // trusting a "differs from before" signal it cannot compute.
     let before = pat.get_value().ok();
-    pat.set_value(text).map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
+    pat.set_value(text)
+        .map_err(|_| GlassError::AxElementNotEditable(target.id.0))?;
     // Verify the write took, error-aware. egui/accesskit read-only editables accept SetValue
     // without error but never apply it (false success). Poll the value back — a real numeric set
     // lands a frame later. `.ok()` maps a failed read to `None`, which never confirms, so neither

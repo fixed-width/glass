@@ -14,13 +14,11 @@
 use std::sync::OnceLock;
 
 use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL,
-};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL};
+use windows::Win32::Security::RevertToSelf;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
 };
-use windows::Win32::Security::RevertToSelf;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 
@@ -30,8 +28,8 @@ use windows::Win32::System::DataExchange::{GetClipboardFormatNameW, RegisterClip
 
 use crate::proto::{self, FormatKey, Request, Response};
 
-mod detour_impl;
 mod dataobject;
+mod detour_impl;
 mod ole;
 
 // Standard Win32 clipboard format ids (stable ABI).
@@ -341,6 +339,14 @@ pub(crate) unsafe fn ole32_proc(name: &[u8]) -> Option<*const ()> {
 
 /// `"ole32.dll\0"` as UTF-16.
 static OLE32_W: [u16; 10] = [
-    b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-    b'l' as u16, b'l' as u16, 0,
+    b'o' as u16,
+    b'l' as u16,
+    b'e' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
+    0,
 ];

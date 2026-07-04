@@ -102,7 +102,13 @@ mod tests {
     }
 
     fn click(x: i32, y: i32) -> Action {
-        Action::Click(ClickArgs { x, y, button: None, count: None, modifiers: None })
+        Action::Click(ClickArgs {
+            x,
+            y,
+            button: None,
+            count: None,
+            modifiers: None,
+        })
     }
 
     #[test]
@@ -114,14 +120,21 @@ mod tests {
             &DoArgs {
                 actions: vec![
                     click(10, 20),
-                    Action::Type(TypeArgs { text: "alice".into() }),
-                    Action::Key(KeyArgs { chord: "Tab".into() }),
+                    Action::Type(TypeArgs {
+                        text: "alice".into(),
+                    }),
+                    Action::Key(KeyArgs {
+                        chord: "Tab".into(),
+                    }),
                 ],
                 then: None,
             },
         )
         .unwrap();
-        assert_eq!(*log.lock().unwrap(), vec!["click(10,20)", "type(alice)", "key(Tab)"]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["click(10,20)", "type(alice)", "key(Tab)"]
+        );
         match &out.0[0] {
             OutContent::Text(t) => assert!(t.contains("\"executed\":3"), "got: {t}"),
             _ => panic!("expected executed text"),
@@ -138,7 +151,9 @@ mod tests {
                 actions: vec![
                     click(10, 10),  // ok
                     click(100, 10), // out of bounds (valid 0..=99) -> fails
-                    Action::Key(KeyArgs { chord: "Return".into() }), // never runs
+                    Action::Key(KeyArgs {
+                        chord: "Return".into(),
+                    }), // never runs
                 ],
                 then: None,
             },
@@ -147,13 +162,24 @@ mod tests {
         assert!(err.contains("action[1]"), "got: {err}");
         assert!(err.contains("click"), "got: {err}");
         assert!(err.contains("1 of 3"), "got: {err}");
-        assert_eq!(*log.lock().unwrap(), vec!["click(10,10)"], "only the first action executed");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["click(10,10)"],
+            "only the first action executed"
+        );
     }
 
     #[test]
     fn empty_actions_rejected() {
         let mut g = started(FakePlatform::new(10, 10));
-        let err = do_actions(&mut g, &DoArgs { actions: vec![], then: None }).unwrap_err();
+        let err = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![],
+                then: None,
+            },
+        )
+        .unwrap_err();
         assert!(err.contains("at least one"), "got: {err}");
     }
 
@@ -188,9 +214,8 @@ mod tests {
 
     #[test]
     fn then_screenshot_appends_image() {
-        let mut g = started(
-            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [1, 2, 3, 255])]),
-        );
+        let mut g =
+            started(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [1, 2, 3, 255])]));
         let out = do_actions(
             &mut g,
             &DoArgs {
@@ -204,17 +229,31 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&out.0[0], OutContent::Text(t) if t.contains("\"executed\":1")));
-        assert!(matches!(out.0[1], OutContent::Image(_)), "screenshot image appended");
-        assert_eq!(out.0.len(), 4, "executed text + screenshot image + dims text + IMAGE_NOTE");
-        assert!(matches!(&out.0[2], OutContent::Text(t) if t.contains("\"width\":4")), "dims text after image");
-        assert!(matches!(&out.0[3], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE), "IMAGE_NOTE last");
+        assert!(
+            matches!(out.0[1], OutContent::Image(_)),
+            "screenshot image appended"
+        );
+        assert_eq!(
+            out.0.len(),
+            4,
+            "executed text + screenshot image + dims text + IMAGE_NOTE"
+        );
+        assert!(
+            matches!(&out.0[2], OutContent::Text(t) if t.contains("\"width\":4")),
+            "dims text after image"
+        );
+        assert!(
+            matches!(&out.0[3], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+            "IMAGE_NOTE last"
+        );
     }
 
     #[test]
     fn then_settle_timeout_still_succeeds() {
         // settle_frames=2 but timeout_ms=0 -> one tick, never settles -> settled:false,
         // yet do_actions returns Ok (a settle timeout is not a batch failure).
-        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
+        let mut g =
+            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
         let out = do_actions(
             &mut g,
             &DoArgs {
@@ -241,9 +280,8 @@ mod tests {
 
     #[test]
     fn terminal_observe_failure_is_distinct() {
-        let mut g = started(
-            FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]),
-        );
+        let mut g =
+            started(FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]));
         let err = do_actions(
             &mut g,
             &DoArgs {

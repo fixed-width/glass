@@ -28,7 +28,9 @@ fn snapshot_has_named_role_typed_nodes() {
     let mut platform =
         glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
             .expect("attach");
-    let window = platform.start_app(&settings_spec()).expect("launch settings");
+    let window = platform
+        .start_app(&settings_spec())
+        .expect("launch settings");
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
     let ctx = AxContext {
@@ -42,7 +44,11 @@ fn snapshot_has_named_role_typed_nodes() {
     tree.assign_ids();
 
     println!("{}", tree.to_outline());
-    assert!(tree.count > 5, "expected a non-trivial tree, got {} nodes", tree.count);
+    assert!(
+        tree.count > 5,
+        "expected a non-trivial tree, got {} nodes",
+        tree.count
+    );
 
     fn any_named(n: &glass_core::accessibility::AxNode) -> bool {
         n.name.is_some() || n.children.iter().any(any_named)
@@ -50,6 +56,6 @@ fn snapshot_has_named_role_typed_nodes() {
     assert!(any_named(&tree.root), "expected at least one named node");
 
     platform.stop_app().expect("stop");
-    drop(platform);     // close the platform's agent connection (if any) first
-    agents.shutdown();  // tear down a launched agent — these tests must not leak it
+    drop(platform); // close the platform's agent connection (if any) first
+    agents.shutdown(); // tear down a launched agent — these tests must not leak it
 }

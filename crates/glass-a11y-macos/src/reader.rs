@@ -125,7 +125,9 @@ impl Accessibility for MacosA11y {
         // (whose `get_value()` returns `Ok("")` for empty). `None` — a failed or absent pre-read —
         // means the baseline is unknown, and `read_back_confirms` then requires an exact match
         // rather than trusting a "differs from before" signal it cannot compute.
-        let before = ffi::attribute_string_checked(&el, attr::VALUE).ok().flatten();
+        let before = ffi::attribute_string_checked(&el, attr::VALUE)
+            .ok()
+            .flatten();
         ffi::set_string_value(&el, text)?;
 
         // Read-back poll: some editables accept the AX write without an `AXError` but never
@@ -136,7 +138,9 @@ impl Accessibility for MacosA11y {
         // for a change.
         let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
         loop {
-            let after = ffi::attribute_string_checked(&el, attr::VALUE).ok().flatten();
+            let after = ffi::attribute_string_checked(&el, attr::VALUE)
+                .ok()
+                .flatten();
             if read_back_confirms(after.as_deref(), before.as_deref(), text) {
                 return Ok(());
             }
@@ -197,18 +201,24 @@ fn select_window(
         // inset noise in the raw width ratio (see doc comment above).
         let scale = (win.width as f64 / ax_w).round().max(1.0);
         if !scale.is_finite() || scale <= 0.0 {
-            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>"));
+            diagnostics.push(format!(
+                "ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>"
+            ));
             continue;
         }
         let Ok((ax_x, ax_y)) = ffi::ax_position(w) else {
-            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable>"));
+            diagnostics.push(format!(
+                "ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable>"
+            ));
             continue;
         };
         // Cast to `i64` before subtracting so `.abs()` can never wrap (`i32::MIN.abs()`
         // panics) — the same no-overflow discipline `axwindow::within_tolerance` follows.
         let dx = ((ax_x * scale).round() as i64 - i64::from(win.x)).abs();
         let dy = ((ax_y * scale).round() as i64 - i64::from(win.y)).abs();
-        diagnostics.push(format!("ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}"));
+        diagnostics.push(format!(
+            "ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}"
+        ));
         if dx > POSITION_TOLERANCE_PX || dy > POSITION_TOLERANCE_PX {
             continue;
         }
@@ -216,7 +226,10 @@ fn select_window(
             continue;
         }
         let dist = dx + dy;
-        if best.as_ref().is_none_or(|(best_dist, _, _)| dist < *best_dist) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_dist, _, _)| dist < *best_dist)
+        {
             best = Some((dist, w.clone(), scale));
         }
     }
@@ -360,7 +373,12 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
     if g.width == 0 || g.height == 0 {
         return None;
     }
-    Some(AxRect { x: g.x - win.x, y: g.y - win.y, width: g.width, height: g.height })
+    Some(AxRect {
+        x: g.x - win.x,
+        y: g.y - win.y,
+        width: g.width,
+        height: g.height,
+    })
 }
 
 /// Gather the plain state facts `mapping::map_states` normalizes: `AXEnabled`/`AXFocused`

@@ -4,9 +4,9 @@
 //! to `adb`. The emulator's VM is the isolation boundary, so there is no
 //! sandbox machinery here.
 
-mod adb;
 mod a11y;
 mod a11y_service;
+mod adb;
 mod agent;
 mod avd;
 mod axmap;
@@ -23,7 +23,7 @@ mod sdk;
 mod target;
 
 pub use a11y::AndroidA11y;
-pub use a11y_service::{ServiceA11y, A11yServiceRegistry, a11y_apk};
+pub use a11y_service::{a11y_apk, A11yServiceRegistry, ServiceA11y};
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;

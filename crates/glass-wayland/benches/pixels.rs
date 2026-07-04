@@ -26,9 +26,15 @@ fn bench(c: &mut Criterion) {
         let stride = w * 4 + PAD;
         let data = buffer(h, stride);
         g.throughput(Throughput::Elements(u64::from(w) * u64::from(h)));
-        g.bench_with_input(BenchmarkId::new("xrgb8888", format!("{w}x{h}")), &data, |b, data| {
-            b.iter(|| black_box(to_rgba(black_box(data), Format::Xrgb8888, w, h, stride).unwrap()));
-        });
+        g.bench_with_input(
+            BenchmarkId::new("xrgb8888", format!("{w}x{h}")),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(to_rgba(black_box(data), Format::Xrgb8888, w, h, stride).unwrap())
+                });
+            },
+        );
     }
     g.finish();
 }

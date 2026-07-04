@@ -6,17 +6,17 @@
 /// Returns None for printable-ASCII keysyms (caller resolves via VkKeyScanW) and unknowns.
 pub fn named_keysym_to_vk(keysym: u32) -> Option<u16> {
     Some(match keysym {
-        0xff0d => 0x0D, // VK_RETURN
-        0xff1b => 0x1B, // VK_ESCAPE
-        0xff09 => 0x09, // VK_TAB
-        0xff08 => 0x08, // VK_BACK
-        0xffff => 0x2E, // VK_DELETE
-        0xff52 => 0x26, // VK_UP
-        0xff54 => 0x28, // VK_DOWN
-        0xff51 => 0x25, // VK_LEFT
-        0xff53 => 0x27, // VK_RIGHT
-        0xff50 => 0x24, // VK_HOME
-        0xff57 => 0x23, // VK_END
+        0xff0d => 0x0D,                                       // VK_RETURN
+        0xff1b => 0x1B,                                       // VK_ESCAPE
+        0xff09 => 0x09,                                       // VK_TAB
+        0xff08 => 0x08,                                       // VK_BACK
+        0xffff => 0x2E,                                       // VK_DELETE
+        0xff52 => 0x26,                                       // VK_UP
+        0xff54 => 0x28,                                       // VK_DOWN
+        0xff51 => 0x25,                                       // VK_LEFT
+        0xff53 => 0x27,                                       // VK_RIGHT
+        0xff50 => 0x24,                                       // VK_HOME
+        0xff57 => 0x23,                                       // VK_END
         0xffbe..=0xffc9 => (0x70 + (keysym - 0xffbe)) as u16, // F1..F12 -> VK_F1(0x70)..VK_F12(0x7B)
         _ => return None,
     })

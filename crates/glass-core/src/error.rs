@@ -28,7 +28,12 @@ pub enum GlassError {
     Timeout(u64),
 
     #[error("coordinate ({x},{y}) out of bounds for {width}x{height} window")]
-    CoordOutOfBounds { x: i32, y: i32, width: u32, height: u32 },
+    CoordOutOfBounds {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
 
     #[error("invalid key: {0}")]
     InvalidKey(String),
@@ -101,7 +106,13 @@ mod tests {
     fn display_messages_are_actionable() {
         assert_eq!(GlassError::NoActiveSession.to_string(), "no active session");
         assert_eq!(
-            GlassError::CoordOutOfBounds { x: 5, y: 9, width: 4, height: 4 }.to_string(),
+            GlassError::CoordOutOfBounds {
+                x: 5,
+                y: 9,
+                width: 4,
+                height: 4
+            }
+            .to_string(),
             "coordinate (5,9) out of bounds for 4x4 window"
         );
         assert_eq!(

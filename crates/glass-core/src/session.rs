@@ -6,8 +6,8 @@ use crate::baseline::BaselineStore;
 use crate::diff::{diff, diff_perceptual, region_satisfied, BBox, DiffResult, RegionUntil};
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
-use crate::marks::Mark;
 use crate::logbuf::{LogBuffer, LogLine, Stream};
+use crate::marks::Mark;
 use crate::platform::{
     AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, WindowGeometry, WindowId, WindowInfo,
     WindowOp,
@@ -154,7 +154,10 @@ pub struct Backend {
 impl Backend {
     /// A backend with no accessibility support (tools return `AxUnsupported`).
     pub fn display_only(platform: Box<dyn Platform + Send>) -> Self {
-        Self { platform, accessibility: None }
+        Self {
+            platform,
+            accessibility: None,
+        }
     }
 }
 
@@ -184,7 +187,15 @@ impl Glass {
         baselines: BaselineStore,
         log_capacity: usize,
     ) -> Self {
-        Self { factory, default_backend, baselines, log_capacity: log_capacity.max(1), active: None, audit: None, shutdown_hook: None }
+        Self {
+            factory,
+            default_backend,
+            baselines,
+            log_capacity: log_capacity.max(1),
+            active: None,
+            audit: None,
+            shutdown_hook: None,
+        }
     }
 
     /// Install the audit sink. Every subsequent actuation is recorded through it.
@@ -198,10 +209,20 @@ impl Glass {
         self.shutdown_hook = Some(hook);
     }
 
-    fn emit_audit(&self, act: &crate::audit::Actuation, outcome: crate::audit::AuditOutcome, dur: std::time::Duration) {
+    fn emit_audit(
+        &self,
+        act: &crate::audit::Actuation,
+        outcome: crate::audit::AuditOutcome,
+        dur: std::time::Duration,
+    ) {
         if let Some(sink) = &self.audit {
             let window = self.active.as_ref().and_then(|s| s.active_window.clone());
-            sink.record(act, &crate::audit::ActuationContext { window }, &outcome, dur);
+            sink.record(
+                act,
+                &crate::audit::ActuationContext { window },
+                &outcome,
+                dur,
+            );
         }
     }
 
@@ -213,7 +234,11 @@ impl Glass {
             .and_then(|t| t.find(id))
             .map(|n| (Some(format!("{:?}", n.role)), n.name.clone()))
             .unwrap_or((None, None));
-        crate::audit::ElementRef { id: id.0, role, name }
+        crate::audit::ElementRef {
+            id: id.0,
+            role,
+            name,
+        }
     }
 
     fn require_active(&self) -> Result<&ActiveSession> {
@@ -245,7 +270,13 @@ impl Glass {
             PointerEvent::Move { x, y } => check(x, y),
             PointerEvent::Click { x, y, .. } => check(x, y),
             PointerEvent::Scroll { x, y, .. } => check(x, y),
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, .. } => {
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                ..
+            } => {
                 check(from_x, from_y)?;
                 check(to_x, to_y)
             }
@@ -282,7 +313,10 @@ impl Glass {
         if let Some(mut s) = self.active.take() {
             let _ = s.platform.stop_app();
         }
-        let Backend { mut platform, accessibility } = (self.factory)(backend)?;
+        let Backend {
+            mut platform,
+            accessibility,
+        } = (self.factory)(backend)?;
         let geometry = platform.start_app(spec)?;
         let mut session = ActiveSession {
             platform,
@@ -298,7 +332,10 @@ impl Glass {
             .list_windows()
             .ok()
             .and_then(|ws| ws.iter().find(|w| w.active).or_else(|| ws.first()).cloned())
-            .map(|w| crate::audit::WindowRef { id: w.id.0, title: w.title });
+            .map(|w| crate::audit::WindowRef {
+                id: w.id.0,
+                title: w.title,
+            });
         self.active = Some(session);
         Ok(geometry)
     }
@@ -447,7 +484,10 @@ impl Glass {
         let s = self.active_mut()?;
         let geometry = s.platform.select_window(id)?;
         s.geometry = geometry.clone();
-        s.active_window = Some(crate::audit::WindowRef { id: id.0, title: None });
+        s.active_window = Some(crate::audit::WindowRef {
+            id: id.0,
+            title: None,
+        });
         s.pump();
         Ok(geometry)
     }
@@ -462,7 +502,12 @@ impl Glass {
         let window_handle = s.platform.active_window_handle();
         let a11y_bus_addr = s.platform.a11y_bus_addr();
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
-        let mut tree = acc.snapshot(&AxContext { pids, window, window_handle, a11y_bus_addr })?;
+        let mut tree = acc.snapshot(&AxContext {
+            pids,
+            window,
+            window_handle,
+            a11y_bus_addr,
+        })?;
         tree.assign_ids();
         s.last_ax = Some(tree.clone());
         s.pump();
@@ -502,7 +547,13 @@ impl Glass {
                 .clamped_center(s.geometry.width, s.geometry.height)
                 .ok_or(GlassError::AxElementNotClickable(id.0))?
         };
-        self.pointer_inner(&PointerEvent::Click { x, y, button: MouseButton::Left, count: 1, modifiers: vec![] })
+        self.pointer_inner(&PointerEvent::Click {
+            x,
+            y,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        })
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -531,8 +582,12 @@ impl Glass {
             }
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
-            let target =
-                AxTarget { id, role: node.role, name: node.name.clone(), bounds: node.bounds };
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+            };
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
                 window: s.geometry.clone(),
@@ -572,7 +627,12 @@ impl Glass {
             Some(_) => self.active_mut()?.platform.capture_frame(None)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
         };
-        Ok(WaitStableOutcome { frame, settled, saw_motion: tracker.saw_change(), observed_ms: outcome.elapsed_ms })
+        Ok(WaitStableOutcome {
+            frame,
+            settled,
+            saw_motion: tracker.saw_change(),
+            observed_ms: outcome.elapsed_ms,
+        })
     }
 
     /// Block until a precise accessibility-element condition holds, re-snapshotting
@@ -583,16 +643,18 @@ impl Glass {
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             let tree = self.a11y_snapshot()?; // fresh snapshot; assigns ids, caches, pumps
-            Ok(match element_match(
-                &tree,
-                params.name.as_deref(),
-                params.role,
-                params.value_contains.as_deref(),
-                params.condition,
-            ) {
-                ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
-                ElementMatch::Pending => None,
-            })
+            Ok(
+                match element_match(
+                    &tree,
+                    params.name.as_deref(),
+                    params.role,
+                    params.value_contains.as_deref(),
+                    params.condition,
+                ) {
+                    ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
+                    ElementMatch::Pending => None,
+                },
+            )
         })?;
         Ok(WaitElementOutcome {
             matched: outcome.value.is_some(),
@@ -628,8 +690,13 @@ impl Glass {
                 f
             }
         };
-        let (perceptual, threshold, tolerance, until, region) =
-            (params.perceptual, params.threshold, params.tolerance, params.until, params.region);
+        let (perceptual, threshold, tolerance, until, region) = (
+            params.perceptual,
+            params.threshold,
+            params.tolerance,
+            params.until,
+            params.region,
+        );
         let mut last: Option<(f32, Option<BBox>, Frame)> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             let s = self.active_mut()?;
@@ -705,7 +772,13 @@ impl Glass {
                 } else {
                     None
                 };
-                WaitLogOutcome { matched: false, line: None, cursor: end, elapsed_ms: outcome.elapsed_ms, note }
+                WaitLogOutcome {
+                    matched: false,
+                    line: None,
+                    cursor: end,
+                    elapsed_ms: outcome.elapsed_ms,
+                    note,
+                }
             }
         })
     }
@@ -734,7 +807,8 @@ impl Glass {
 
     /// Exact per-channel diff of the current frame against a saved baseline.
     pub fn diff_baseline(&mut self, name: &str, tolerance: u8) -> Result<DiffResult> {
-        self.diff_baseline_with_frame(name, tolerance).map(|(r, _)| r)
+        self.diff_baseline_with_frame(name, tolerance)
+            .map(|(r, _)| r)
     }
 
     /// Like [`diff_baseline`] but also returns the current frame that was compared.
@@ -752,7 +826,8 @@ impl Glass {
     /// the default for regression, robust to anti-aliasing / sub-pixel / GPU-font
     /// rendering noise. `threshold` ∈ [0,1] (smaller = stricter).
     pub fn diff_baseline_perceptual(&mut self, name: &str, threshold: f32) -> Result<DiffResult> {
-        self.diff_baseline_perceptual_with_frame(name, threshold).map(|(r, _)| r)
+        self.diff_baseline_perceptual_with_frame(name, threshold)
+            .map(|(r, _)| r)
     }
 
     /// Like [`diff_baseline_perceptual`] but also returns the current frame compared.
@@ -784,7 +859,7 @@ mod tests {
     use super::*;
     use crate::accessibility::{AxNode, AxRect, AxRole, AxStates, AxTarget, ElementCondition};
     use crate::audit::{Actuation, ActuationContext, AuditOutcome, AuditSink};
-    use crate::platform::{Segment, SandboxLevel};
+    use crate::platform::{SandboxLevel, Segment};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -808,7 +883,12 @@ mod tests {
     impl FakePlatform {
         fn new(width: u32, height: u32) -> Self {
             Self {
-                geometry: WindowGeometry { x: 0, y: 0, width, height },
+                geometry: WindowGeometry {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
                 ..Default::default()
             }
         }
@@ -950,7 +1030,10 @@ mod tests {
             if self.set_fail {
                 return Err(GlassError::AxElementNotEditable(target.id.0));
             }
-            self.set_log.lock().unwrap().push((target.clone(), text.to_string()));
+            self.set_log
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_string()));
             Ok(())
         }
     }
@@ -964,7 +1047,12 @@ mod tests {
             name: Some("Save".into()),
             value: None,
             states: AxStates::default(),
-            bounds: Some(AxRect { x: 10, y: 10, width: 20, height: 20 }),
+            bounds: Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            }),
             children: vec![],
         };
         let root = AxNode {
@@ -974,7 +1062,12 @@ mod tests {
             name: Some("Win".into()),
             value: None,
             states: AxStates::default(),
-            bounds: Some(AxRect { x: 0, y: 0, width: 100, height: 100 }),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
             children: vec![button],
         };
         AxTree { root, count: 0 }
@@ -983,7 +1076,10 @@ mod tests {
     /// Like `fake_tree` but the Button "Save" is enabled.
     fn fake_tree_enabled() -> AxTree {
         let mut t = fake_tree();
-        t.root.children[0].states = AxStates { enabled: true, ..Default::default() };
+        t.root.children[0].states = AxStates {
+            enabled: true,
+            ..Default::default()
+        };
         t
     }
 
@@ -995,8 +1091,9 @@ mod tests {
         // Factory yields the pre-scripted platform once (tests start a session once).
         let mut held: Option<Box<dyn Platform + Send>> = Some(Box::new(platform));
         let factory: PlatformFactory = Box::new(move |_backend| {
-            let platform =
-                held.take().ok_or_else(|| GlassError::Backend("test factory called twice".into()))?;
+            let platform = held
+                .take()
+                .ok_or_else(|| GlassError::Backend("test factory called twice".into()))?;
             Ok(Backend::display_only(platform))
         });
         Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
@@ -1015,7 +1112,8 @@ mod tests {
             })),
         });
         let factory: PlatformFactory = Box::new(move |_backend| {
-            held.take().ok_or_else(|| GlassError::Backend("test factory called twice".into()))
+            held.take()
+                .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
         });
         Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
     }
@@ -1036,7 +1134,10 @@ mod tests {
     #[test]
     fn operations_require_an_active_session() {
         let mut g = glass_with(FakePlatform::new(10, 10));
-        assert!(matches!(g.screenshot(None).unwrap_err(), GlassError::NoActiveSession));
+        assert!(matches!(
+            g.screenshot(None).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
         assert!(matches!(g.stop().unwrap_err(), GlassError::NoActiveSession));
         assert!(matches!(
             g.key(&KeyEvent::Chord("ctrl+s".into())).unwrap_err(),
@@ -1046,11 +1147,18 @@ mod tests {
 
     #[test]
     fn start_sets_geometry_and_buffers_initial_logs() {
-        let platform = FakePlatform::new(80, 60)
-            .with_logs(vec![(Stream::Stdout, "ready")]);
+        let platform = FakePlatform::new(80, 60).with_logs(vec![(Stream::Stdout, "ready")]);
         let mut g = glass_with(platform);
         let geom = g.start(&spec()).unwrap();
-        assert_eq!(geom, WindowGeometry { x: 0, y: 0, width: 80, height: 60 });
+        assert_eq!(
+            geom,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 60
+            }
+        );
         let (lines, _) = g.logs(0, 10, None, None).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "ready");
@@ -1076,7 +1184,10 @@ mod tests {
             count: 1,
             modifiers: vec![],
         });
-        assert!(matches!(err.unwrap_err(), GlassError::CoordOutOfBounds { .. }));
+        assert!(matches!(
+            err.unwrap_err(),
+            GlassError::CoordOutOfBounds { .. }
+        ));
     }
 
     #[test]
@@ -1085,19 +1196,37 @@ mod tests {
         g.start(&spec()).unwrap();
         let ev = PointerEvent::Gesture {
             pointers: vec![
-                Segment { from_x: 10, from_y: 10, to_x: 20, to_y: 20 },
-                Segment { from_x: 10, from_y: 10, to_x: 200, to_y: 20 }, // to_x out of 100-wide window
+                Segment {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 20,
+                    to_y: 20,
+                },
+                Segment {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 200,
+                    to_y: 20,
+                }, // to_x out of 100-wide window
             ],
             duration_ms: 100,
         };
-        assert!(matches!(g.pointer(&ev), Err(GlassError::CoordOutOfBounds { .. })));
+        assert!(matches!(
+            g.pointer(&ev),
+            Err(GlassError::CoordOutOfBounds { .. })
+        ));
     }
 
     #[test]
     fn window_resize_updates_tracked_geometry() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         g.start(&spec()).unwrap();
-        let geom = g.window(&WindowOp::Resize { width: 20, height: 30 }).unwrap();
+        let geom = g
+            .window(&WindowOp::Resize {
+                width: 20,
+                height: 30,
+            })
+            .unwrap();
         assert_eq!(geom.width, 20);
         assert_eq!(geom.height, 30);
         assert_eq!(g.geometry().unwrap().width, 20);
@@ -1177,11 +1306,22 @@ mod tests {
                 settle_frames: 2,
                 tolerance: 0,
                 timeout_ms: 1000,
-                stability_region: Some(Region { x: 0, y: 0, width: 2, height: 2 }),
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
             })
             .unwrap();
-        assert!(outcome.settled, "constant region should settle despite the changing corner");
-        assert_eq!(outcome.frame, f2, "wait_stable returns the FULL frame, not the cropped region");
+        assert!(
+            outcome.settled,
+            "constant region should settle despite the changing corner"
+        );
+        assert_eq!(
+            outcome.frame, f2,
+            "wait_stable returns the FULL frame, not the cropped region"
+        );
     }
 
     #[test]
@@ -1197,7 +1337,12 @@ mod tests {
             .with_capture_log(log.clone());
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
-        let region = Region { x: 0, y: 0, width: 2, height: 2 };
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
         let outcome = g
             .wait_stable(&WaitStableParams {
                 interval_ms: 0,
@@ -1208,10 +1353,17 @@ mod tests {
             })
             .unwrap();
         assert!(outcome.settled);
-        assert_eq!((outcome.frame.width, outcome.frame.height), (4, 4), "returns the full window");
+        assert_eq!(
+            (outcome.frame.width, outcome.frame.height),
+            (4, 4),
+            "returns the full window"
+        );
         let calls = log.lock().unwrap();
         let (last, polls) = calls.split_last().expect("at least one capture");
-        assert!(polls.iter().all(|c| *c == Some(region)), "polls capture only the region: {polls:?}");
+        assert!(
+            polls.iter().all(|c| *c == Some(region)),
+            "polls capture only the region: {polls:?}"
+        );
         assert_eq!(*last, None, "final capture is the full window");
     }
 
@@ -1236,7 +1388,10 @@ mod tests {
             .unwrap();
         assert!(outcome.settled);
         let calls = log.lock().unwrap();
-        assert!(calls.iter().all(|c| c.is_none()), "no-region captures are full: {calls:?}");
+        assert!(
+            calls.iter().all(|c| c.is_none()),
+            "no-region captures are full: {calls:?}"
+        );
     }
 
     #[test]
@@ -1251,7 +1406,12 @@ mod tests {
                 settle_frames: 2,
                 tolerance: 0,
                 timeout_ms: 1000,
-                stability_region: Some(Region { x: 0, y: 0, width: 99, height: 1 }),
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 99,
+                    height: 1,
+                }),
             })
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidRegion(_)));
@@ -1263,7 +1423,14 @@ mod tests {
         let platform = FakePlatform::new(4, 4).with_frames(vec![frame]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
-        let out = g.screenshot(Some(Region { x: 1, y: 1, width: 2, height: 2 })).unwrap();
+        let out = g
+            .screenshot(Some(Region {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            }))
+            .unwrap();
         assert_eq!((out.width, out.height), (2, 2));
     }
 
@@ -1273,7 +1440,14 @@ mod tests {
             FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
-        let err = g.screenshot(Some(Region { x: 0, y: 0, width: 9, height: 1 })).unwrap_err();
+        let err = g
+            .screenshot(Some(Region {
+                x: 0,
+                y: 0,
+                width: 9,
+                height: 1,
+            }))
+            .unwrap_err();
         assert!(matches!(err, GlassError::InvalidRegion(_)));
     }
 
@@ -1283,8 +1457,7 @@ mod tests {
         let mut changed = baseline_frame.clone();
         changed.pixels[0] = 255;
         // capture #1 -> save baseline; capture #2 -> diff against it.
-        let platform =
-            FakePlatform::new(2, 2).with_frames(vec![baseline_frame.clone(), changed]);
+        let platform = FakePlatform::new(2, 2).with_frames(vec![baseline_frame.clone(), changed]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         g.save_baseline("main").unwrap();
@@ -1294,8 +1467,8 @@ mod tests {
 
     #[test]
     fn diff_missing_baseline_errors() {
-        let platform = FakePlatform::new(2, 2)
-            .with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]);
+        let platform =
+            FakePlatform::new(2, 2).with_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         assert!(matches!(
@@ -1324,10 +1497,14 @@ mod tests {
         use std::sync::Arc;
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
-        let mut g = glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
+        let mut g =
+            glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
         g.set_shutdown_hook(Box::new(move || f.store(true, Ordering::SeqCst)));
         g.shutdown();
-        assert!(fired.load(Ordering::SeqCst), "shutdown should invoke the hook");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "shutdown should invoke the hook"
+        );
     }
 
     #[test]
@@ -1365,14 +1542,24 @@ mod tests {
             id: WindowId(1),
             title: Some("A".into()),
             class: None,
-            geometry: WindowGeometry { x: 0, y: 0, width: 320, height: 240 },
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 240,
+            },
             active: true,
         };
         let b = WindowInfo {
             id: WindowId(2),
             title: Some("B".into()),
             class: None,
-            geometry: WindowGeometry { x: 400, y: 0, width: 100, height: 80 },
+            geometry: WindowGeometry {
+                x: 400,
+                y: 0,
+                width: 100,
+                height: 80,
+            },
             active: false,
         };
         let mut glass = glass_with(FakePlatform::new(320, 240).with_windows(vec![a, b]));
@@ -1385,7 +1572,10 @@ mod tests {
         assert_eq!((geo.width, geo.height), (100, 80));
         assert_eq!(glass.geometry().unwrap().width, 100);
 
-        assert!(matches!(glass.select_window(WindowId(999)), Err(GlassError::WindowNotFound)));
+        assert!(matches!(
+            glass.select_window(WindowId(999)),
+            Err(GlassError::WindowNotFound)
+        ));
     }
 
     #[test]
@@ -1402,7 +1592,10 @@ mod tests {
     fn snapshot_unsupported_without_reader() {
         let mut g = glass_with(FakePlatform::new(40, 30));
         g.start(&spec()).unwrap();
-        assert!(matches!(g.a11y_snapshot().unwrap_err(), GlassError::AxUnsupported));
+        assert!(matches!(
+            g.a11y_snapshot().unwrap_err(),
+            GlassError::AxUnsupported
+        ));
     }
 
     #[test]
@@ -1421,7 +1614,10 @@ mod tests {
     fn click_element_without_snapshot_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
-        assert!(matches!(g.click_element(AxNodeId(1)).unwrap_err(), GlassError::NoAxSnapshot));
+        assert!(matches!(
+            g.click_element(AxNodeId(1)).unwrap_err(),
+            GlassError::NoAxSnapshot
+        ));
     }
 
     #[test]
@@ -1437,8 +1633,8 @@ mod tests {
 
     #[test]
     fn a11y_marks_overlays_and_legends() {
-        let platform = FakePlatform::new(100, 100)
-            .with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let platform =
+            FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
         let mut g = glass_with_a11y(platform, fake_tree());
         g.start(&spec()).unwrap();
         let (frame, marks) = g.a11y_marks().unwrap();
@@ -1463,14 +1659,22 @@ mod tests {
         let mut g = glass_with_factory(factory);
         g.start(&spec()).unwrap();
         g.shutdown();
-        assert_eq!(*stops.lock().unwrap(), 1, "shutdown calls stop_app exactly once");
+        assert_eq!(
+            *stops.lock().unwrap(),
+            1,
+            "shutdown calls stop_app exactly once"
+        );
         assert!(
             matches!(g.stop().unwrap_err(), GlassError::NoActiveSession),
             "the session is cleared after shutdown"
         );
         // Idempotent: a second shutdown with nothing active is a harmless no-op.
         g.shutdown();
-        assert_eq!(*stops.lock().unwrap(), 1, "no extra stop_app on an empty shutdown");
+        assert_eq!(
+            *stops.lock().unwrap(),
+            1,
+            "no extra stop_app on an empty shutdown"
+        );
     }
 
     #[test]
@@ -1688,16 +1892,26 @@ mod tests {
         assert!(o.line.is_none());
         // Footgun guard: the line WAS in the buffer (seq 0) before the default start
         // cursor, so the timeout must say so and point at cursor:0 — not fail silently.
-        let note = o.note.expect("timeout note when the substring was already buffered");
-        assert!(note.contains("cursor:0"), "note should point at cursor:0, got: {note}");
-        assert!(note.contains("seq 0"), "note should cite the buffered seq, got: {note}");
+        let note = o
+            .note
+            .expect("timeout note when the substring was already buffered");
+        assert!(
+            note.contains("cursor:0"),
+            "note should point at cursor:0, got: {note}"
+        );
+        assert!(
+            note.contains("seq 0"),
+            "note should cite the buffered seq, got: {note}"
+        );
     }
 
     #[test]
     fn wait_for_log_match_cursor_resumes_after_matched_line() {
         // Two lines; match the FIRST -> resume cursor is just after it (1), not the end (2).
-        let platform = FakePlatform::new(10, 10)
-            .with_logs(vec![(Stream::Stdout, "first hit"), (Stream::Stdout, "second")]);
+        let platform = FakePlatform::new(10, 10).with_logs(vec![
+            (Stream::Stdout, "first hit"),
+            (Stream::Stdout, "second"),
+        ]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         let o = g
@@ -1711,14 +1925,20 @@ mod tests {
             .unwrap();
         assert!(o.matched);
         assert_eq!(o.line.unwrap().seq, 0);
-        assert_eq!(o.cursor, 1, "resume cursor is just after the matched line, not the buffer end");
+        assert_eq!(
+            o.cursor, 1,
+            "resume cursor is just after the matched line, not the buffer end"
+        );
     }
 
     #[test]
     fn set_value_no_snapshot_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
-        assert!(matches!(g.set_value(AxNodeId(1), "x").unwrap_err(), GlassError::NoAxSnapshot));
+        assert!(matches!(
+            g.set_value(AxNodeId(1), "x").unwrap_err(),
+            GlassError::NoAxSnapshot
+        ));
     }
 
     #[test]
@@ -1736,7 +1956,10 @@ mod tests {
     fn set_value_unsupported_without_reader() {
         let mut g = glass_with(FakePlatform::new(40, 30)); // no accessibility
         g.start(&spec()).unwrap();
-        assert!(matches!(g.set_value(AxNodeId(0), "x").unwrap_err(), GlassError::AxUnsupported));
+        assert!(matches!(
+            g.set_value(AxNodeId(0), "x").unwrap_err(),
+            GlassError::AxUnsupported
+        ));
     }
 
     #[test]
@@ -1756,7 +1979,8 @@ mod tests {
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
-            held.take().ok_or_else(|| GlassError::Backend("twice".into()))
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
@@ -1770,7 +1994,12 @@ mod tests {
                 id: AxNodeId(1),
                 role: AxRole::Button,
                 name: Some("Save".into()),
-                bounds: Some(AxRect { x: 10, y: 10, width: 20, height: 20 }),
+                bounds: Some(AxRect {
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20
+                }),
             }
         );
         assert_eq!(calls[0].1, "hello");
@@ -1790,7 +2019,8 @@ mod tests {
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
-            held.take().ok_or_else(|| GlassError::Backend("twice".into()))
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
@@ -1840,9 +2070,15 @@ mod tests {
         // get_clipboard and set_clipboard.
         let mut p = BareMinPlatform;
         let get_err = p.get_clipboard().unwrap_err();
-        assert!(matches!(get_err, GlassError::Unsupported(_)), "get_clipboard: {get_err}");
+        assert!(
+            matches!(get_err, GlassError::Unsupported(_)),
+            "get_clipboard: {get_err}"
+        );
         let set_err = p.set_clipboard("hello").unwrap_err();
-        assert!(matches!(set_err, GlassError::Unsupported(_)), "set_clipboard: {set_err}");
+        assert!(
+            matches!(set_err, GlassError::Unsupported(_)),
+            "set_clipboard: {set_err}"
+        );
     }
 
     #[test]
@@ -1862,8 +2098,14 @@ mod tests {
     fn clipboard_requires_active_session() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         // No session started — both ops should return NoActiveSession.
-        assert!(matches!(g.get_clipboard().unwrap_err(), GlassError::NoActiveSession));
-        assert!(matches!(g.set_clipboard("x").unwrap_err(), GlassError::NoActiveSession));
+        assert!(matches!(
+            g.get_clipboard().unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+        assert!(matches!(
+            g.set_clipboard("x").unwrap_err(),
+            GlassError::NoActiveSession
+        ));
     }
 
     /// Records `"action:ok"` for each actuation the seam reports.
@@ -1896,7 +2138,9 @@ mod tests {
 
     fn first_button(t: &AxTree) -> AxNodeId {
         fn walk(n: &AxNode) -> Option<AxNodeId> {
-            if n.role == AxRole::Button { return Some(n.id); }
+            if n.role == AxRole::Button {
+                return Some(n.id);
+            }
             n.children.iter().find_map(walk)
         }
         walk(&t.root).expect("fake_tree has a Button")
@@ -1913,12 +2157,19 @@ mod tests {
         g.set_audit_sink(Box::new(sink.clone()));
 
         g.start(&spec()).unwrap();
-        let _ = g.screenshot(None).unwrap();          // read
-        let tree = g.a11y_snapshot().unwrap();        // read (populates last_ax)
-        g.pointer(&PointerEvent::Click { x: 1, y: 2, button: MouseButton::Left, count: 1, modifiers: vec![] }).unwrap();
+        let _ = g.screenshot(None).unwrap(); // read
+        let tree = g.a11y_snapshot().unwrap(); // read (populates last_ax)
+        g.pointer(&PointerEvent::Click {
+            x: 1,
+            y: 2,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        })
+        .unwrap();
         g.key(&KeyEvent::Text("hi".into())).unwrap();
         let _ = g.window(&WindowOp::Geometry).unwrap(); // read → no record
-        g.window(&WindowOp::Focus).unwrap();            // actuation
+        g.window(&WindowOp::Focus).unwrap(); // actuation
         g.click_element(first_button(&tree)).unwrap();
         g.stop().unwrap();
 
@@ -1933,19 +2184,34 @@ mod tests {
     #[test]
     fn seam_records_failed_actuation_ok_false() {
         let sink = RecordingSink::default();
-        let mut g = glass_with(FakePlatform::new(50, 50).with_frames(vec![Frame::solid(50, 50, [0; 4])]));
+        let mut g =
+            glass_with(FakePlatform::new(50, 50).with_frames(vec![Frame::solid(50, 50, [0; 4])]));
         g.set_audit_sink(Box::new(sink.clone()));
         g.start(&spec()).unwrap();
         // Out-of-bounds click fails check_bounds → still recorded as ok:false.
-        let _ = g.pointer(&PointerEvent::Click { x: 999, y: 0, button: MouseButton::Left, count: 1, modifiers: vec![] });
+        let _ = g.pointer(&PointerEvent::Click {
+            x: 999,
+            y: 0,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        });
         let got = sink.0.lock().unwrap().clone();
         assert_eq!(got, vec!["launch:true", "click:false"]);
     }
 
     #[test]
     fn no_sink_means_no_behavior_change() {
-        let mut g = glass_with(FakePlatform::new(10, 10).with_frames(vec![Frame::solid(10, 10, [0; 4])]));
+        let mut g =
+            glass_with(FakePlatform::new(10, 10).with_frames(vec![Frame::solid(10, 10, [0; 4])]));
         g.start(&spec()).unwrap();
-        g.pointer(&PointerEvent::Click { x: 0, y: 0, button: MouseButton::Left, count: 1, modifiers: vec![] }).unwrap();
+        g.pointer(&PointerEvent::Click {
+            x: 0,
+            y: 0,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        })
+        .unwrap();
     }
 }

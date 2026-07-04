@@ -76,10 +76,17 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
             // String) — all valid UTF-8 in practice; to_string_lossy is the
             // pragmatic conversion (a non-UTF-8 path would make bwrap fail
             // loudly, not escape silently).
-            wrapped.into_iter().map(|s| s.to_string_lossy().into_owned()).collect()
+            wrapped
+                .into_iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
         }
     };
-    let exec = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let exec = argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     let (out_w, out_h) = output_resolution();
     format!(
         "output HEADLESS-1 resolution {out_w}x{out_h}\n\
@@ -191,11 +198,21 @@ mod tests {
     #[test]
     fn sway_config_has_output_border_and_quoted_exec() {
         // sandbox: Off — exec must be the bare app argv, not wrapped in bwrap.
-        let cfg = sway_config(&spec(&["glass-testapp", "--windows", "2"]), std::path::Path::new("/run/glass-rt"), None);
-        assert!(cfg.contains("output HEADLESS-1 resolution 1280x800"), "{cfg}");
+        let cfg = sway_config(
+            &spec(&["glass-testapp", "--windows", "2"]),
+            std::path::Path::new("/run/glass-rt"),
+            None,
+        );
+        assert!(
+            cfg.contains("output HEADLESS-1 resolution 1280x800"),
+            "{cfg}"
+        );
         assert!(cfg.contains("default_border none"), "{cfg}");
         assert!(cfg.contains("floating enable"), "{cfg}");
-        assert!(cfg.contains("exec 'glass-testapp' '--windows' '2'"), "{cfg}");
+        assert!(
+            cfg.contains("exec 'glass-testapp' '--windows' '2'"),
+            "{cfg}"
+        );
     }
 
     #[test]
@@ -205,8 +222,14 @@ mod tests {
         s.sandbox = SandboxLevel::Default;
         let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
         assert!(cfg.contains("exec 'bwrap'"), "{cfg}");
-        assert!(cfg.contains("'--bind-try' '/run/glass-rt' '/run/glass-rt'"), "{cfg}");
-        assert!(cfg.contains("'--' 'glass-testapp' '--windows' '2'"), "{cfg}");
+        assert!(
+            cfg.contains("'--bind-try' '/run/glass-rt' '/run/glass-rt'"),
+            "{cfg}"
+        );
+        assert!(
+            cfg.contains("'--' 'glass-testapp' '--windows' '2'"),
+            "{cfg}"
+        );
     }
 
     #[test]
@@ -229,20 +252,31 @@ mod tests {
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(
             args,
-            vec![OsStr::new("--unsupported-gpu"), OsStr::new("-c"), OsStr::new("/run/x/sway.cfg")]
+            vec![
+                OsStr::new("--unsupported-gpu"),
+                OsStr::new("-c"),
+                OsStr::new("/run/x/sway.cfg")
+            ]
         );
         // Collect envs PRESERVING removals: get_envs yields (key, None) for env_remove.
         let envs: std::collections::HashMap<std::ffi::OsString, Option<std::ffi::OsString>> = cmd
             .get_envs()
             .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
             .collect();
-        assert_eq!(envs.get(OsStr::new("WLR_BACKENDS")), Some(&Some(OsStr::new("headless").to_owned())));
+        assert_eq!(
+            envs.get(OsStr::new("WLR_BACKENDS")),
+            Some(&Some(OsStr::new("headless").to_owned()))
+        );
         assert_eq!(
             envs.get(OsStr::new("WLR_RENDERER_ALLOW_SOFTWARE")),
             Some(&Some(OsStr::new("1").to_owned()))
         );
         for removed in ["WAYLAND_DISPLAY", "DISPLAY", "WAYLAND_SOCKET"] {
-            assert_eq!(envs.get(OsStr::new(removed)), Some(&None), "{removed} must be removed");
+            assert_eq!(
+                envs.get(OsStr::new(removed)),
+                Some(&None),
+                "{removed} must be removed"
+            );
         }
     }
 
@@ -261,7 +295,10 @@ mod tests {
             .find(|(k, _)| *k == std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned());
-        assert_eq!(dbus.as_deref(), Some("unix:path=/tmp/glass-a11y/session-bus"));
+        assert_eq!(
+            dbus.as_deref(),
+            Some("unix:path=/tmp/glass-a11y/session-bus")
+        );
     }
 
     #[test]
@@ -273,6 +310,9 @@ mod tests {
             std::path::Path::new("/run/glass-rt"),
             Some(std::path::Path::new("/tmp/glass-a11y-xyz")),
         );
-        assert!(cfg.contains("/tmp/glass-a11y-xyz"), "a11y dir not bound into the exec bwrap:\n{cfg}");
+        assert!(
+            cfg.contains("/tmp/glass-a11y-xyz"),
+            "a11y dir not bound into the exec bwrap:\n{cfg}"
+        );
     }
 }

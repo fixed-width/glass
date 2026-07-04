@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use glass_core::Platform;
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, PointerEvent, Region, Result, Stream, WindowGeometry,
     WindowId, WindowInfo, WindowOp,
 };
-use glass_core::Platform;
 
 use crate::adb::Adb;
 use crate::agent::{AgentClient, AgentRegistry};
 use crate::build::run_build;
-use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
+use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{check_am_start, check_install, parse_app_windows, parse_pid, parse_pids};
 use crate::screencap::decode_screencap;
@@ -118,7 +118,11 @@ impl AndroidPlatform {
 
     /// Poll `dumpsys window windows` until the app has an on-screen window, returning the
     /// topmost one's id + frame (the default active window).
-    fn discover_window(&self, package: &str, timeout_ms: u64) -> Result<(WindowId, WindowGeometry)> {
+    fn discover_window(
+        &self,
+        package: &str,
+        timeout_ms: u64,
+    ) -> Result<(WindowId, WindowGeometry)> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
             let dump = self.adb().run(["shell", "dumpsys", "window", "windows"])?;
@@ -148,7 +152,12 @@ fn visible_window_region(win: &WindowGeometry, disp_w: u32, disp_h: u32) -> Resu
             win.width, win.height, win.x, win.y
         )));
     }
-    Ok(Region { x: x0 as u32, y: y0 as u32, width: w as u32, height: h as u32 })
+    Ok(Region {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: w as u32,
+        height: h as u32,
+    })
 }
 
 impl Platform for AndroidPlatform {
@@ -167,7 +176,9 @@ impl Platform for AndroidPlatform {
 
         let (active_id, window) = self.discover_window(&target.package, spec.timeout_ms)?;
 
-        let pidof = adb.run(["shell", "pidof", &target.package]).unwrap_or_default();
+        let pidof = adb
+            .run(["shell", "pidof", &target.package])
+            .unwrap_or_default();
         let pid = parse_pid(&pidof);
         let logcat = match pid {
             Some(pid) => Some(LogcatStream::spawn(&adb, pid, self.logs.clone())?),
@@ -190,7 +201,9 @@ impl Platform for AndroidPlatform {
             if let Some(mut logcat) = app.logcat.take() {
                 logcat.stop();
             }
-            let _ = self.adb().run(force_stop_args(&app.package).iter().map(String::as_str));
+            let _ = self
+                .adb()
+                .run(force_stop_args(&app.package).iter().map(String::as_str));
         }
         Ok(())
     }
@@ -225,7 +238,9 @@ impl Platform for AndroidPlatform {
                     let app = self.running()?;
                     (app.component.clone(), app.package.clone())
                 };
-                let out = self.adb().run(launch_args(&component).iter().map(String::as_str))?;
+                let out = self
+                    .adb()
+                    .run(launch_args(&component).iter().map(String::as_str))?;
                 check_am_start(&out)?;
                 let (active_id, window) = self.discover_window(&package, 5_000)?;
                 let app = self.app.as_mut().ok_or(GlassError::NoActiveSession)?;
@@ -255,7 +270,11 @@ impl Platform for AndroidPlatform {
                 title: Some(w.title),
                 class: Some(package.clone()),
                 geometry: w.frame,
-                active: if any_match { WindowId(w.id) == active_id } else { i == 0 },
+                active: if any_match {
+                    WindowId(w.id) == active_id
+                } else {
+                    i == 0
+                },
             })
             .collect())
     }
@@ -278,7 +297,10 @@ impl Platform for AndroidPlatform {
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        self.logs.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+        self.logs
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -302,7 +324,10 @@ impl Platform for AndroidPlatform {
     fn app_pids(&self) -> Vec<u32> {
         // Best-effort live re-scan; falls back to the single known pid.
         if let Some(app) = &self.app {
-            let out = self.adb().run(["shell", "pidof", &app.package]).unwrap_or_default();
+            let out = self
+                .adb()
+                .run(["shell", "pidof", &app.package])
+                .unwrap_or_default();
             let pids = parse_pids(&out);
             if !pids.is_empty() {
                 return pids;
@@ -318,21 +343,36 @@ mod tests {
 
     #[test]
     fn visible_window_region_full_onscreen_is_identity() {
-        let win = WindowGeometry { x: 0, y: 0, width: 1080, height: 2400 };
+        let win = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        };
         let r = visible_window_region(&win, 1080, 2400).unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 1080, 2400));
     }
 
     #[test]
     fn visible_window_region_clamps_negative_origin() {
-        let win = WindowGeometry { x: -10, y: -20, width: 1080, height: 2400 };
+        let win = WindowGeometry {
+            x: -10,
+            y: -20,
+            width: 1080,
+            height: 2400,
+        };
         let r = visible_window_region(&win, 1080, 2400).unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 1070, 2380));
     }
 
     #[test]
     fn visible_window_region_clamps_overhang() {
-        let win = WindowGeometry { x: 1000, y: 0, width: 200, height: 100 };
+        let win = WindowGeometry {
+            x: 1000,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
         let r = visible_window_region(&win, 1080, 720).unwrap();
         assert_eq!((r.x, r.width), (1000, 80));
         assert_eq!((r.y, r.height), (0, 100));
@@ -340,7 +380,12 @@ mod tests {
 
     #[test]
     fn visible_window_region_errors_when_fully_offscreen() {
-        let win = WindowGeometry { x: 2000, y: 0, width: 100, height: 100 };
+        let win = WindowGeometry {
+            x: 2000,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         assert!(visible_window_region(&win, 1080, 720).is_err());
     }
 }

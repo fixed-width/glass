@@ -15,7 +15,12 @@ pub struct RegionArgs {
 
 impl From<&RegionArgs> for Region {
     fn from(a: &RegionArgs) -> Self {
-        Region { x: a.x, y: a.y, width: a.width, height: a.height }
+        Region {
+            x: a.x,
+            y: a.y,
+            width: a.width,
+            height: a.height,
+        }
     }
 }
 
@@ -151,7 +156,10 @@ pub struct PointerArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct PointArg { pub x: i32, pub y: i32 }
+pub struct PointArg {
+    pub x: i32,
+    pub y: i32,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GestureArgs {
@@ -367,7 +375,10 @@ mod tests {
     fn click_args_parse_modifiers() {
         let a: ClickArgs =
             serde_json::from_str(r#"{"x":1,"y":2,"modifiers":["ctrl","shift"]}"#).unwrap();
-        assert_eq!(a.modifiers.as_deref(), Some(&["ctrl".to_string(), "shift".to_string()][..]));
+        assert_eq!(
+            a.modifiers.as_deref(),
+            Some(&["ctrl".to_string(), "shift".to_string()][..])
+        );
     }
 
     #[test]
@@ -408,7 +419,12 @@ mod tests {
 
     #[test]
     fn region_args_map_to_core_region() {
-        let a = RegionArgs { x: 1, y: 2, width: 3, height: 4 };
+        let a = RegionArgs {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
         let r: glass_core::Region = (&a).into();
         assert_eq!((r.x, r.y, r.width, r.height), (1, 2, 3, 4));
     }
@@ -428,8 +444,7 @@ mod tests {
 
     #[test]
     fn click_element_args_parse_return() {
-        let a: ClickElementArgs =
-            serde_json::from_str(r#"{"id":5,"return":"snapshot"}"#).unwrap();
+        let a: ClickElementArgs = serde_json::from_str(r#"{"id":5,"return":"snapshot"}"#).unwrap();
         assert_eq!(a.id, 5);
         assert_eq!(a.return_.as_deref(), Some("snapshot"));
         let b: ClickElementArgs = serde_json::from_str(r#"{"id":1}"#).unwrap();

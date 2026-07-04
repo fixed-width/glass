@@ -67,10 +67,11 @@ impl Node {
     }
     fn collect(&self, out: &mut Vec<Window>) {
         if let Some(id) = &self.foreign_toplevel_identifier {
-            let class = self
-                .app_id
-                .clone()
-                .or_else(|| self.window_properties.as_ref().and_then(|w| w.class.clone()));
+            let class = self.app_id.clone().or_else(|| {
+                self.window_properties
+                    .as_ref()
+                    .and_then(|w| w.class.clone())
+            });
             out.push(Window {
                 con_id: self.id,
                 title: self.name.clone(),
@@ -112,7 +113,9 @@ impl Ipc {
         buf.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         buf.extend_from_slice(&msg_type.to_ne_bytes());
         buf.extend_from_slice(payload);
-        self.sock.write_all(&buf).map_err(|e| GlassError::Backend(format!("sway IPC write: {e}")))?;
+        self.sock
+            .write_all(&buf)
+            .map_err(|e| GlassError::Backend(format!("sway IPC write: {e}")))?;
 
         let mut header = [0u8; 14];
         self.sock
@@ -199,7 +202,10 @@ mod tests {
         assert_eq!(w.con_id, 7);
         assert_eq!(w.title.as_deref(), Some("glass-testapp-1"));
         assert_eq!(w.class.as_deref(), Some("glass-testapp"));
-        assert_eq!((w.rect.x, w.rect.y, w.rect.width, w.rect.height), (480, 240, 320, 240));
+        assert_eq!(
+            (w.rect.x, w.rect.y, w.rect.width, w.rect.height),
+            (480, 240, 320, 240)
+        );
         assert!(w.focused);
         assert_eq!(w.identifier, "abc123");
     }
@@ -219,7 +225,8 @@ mod tests {
     #[test]
     fn command_reply_errors_with_sways_message() {
         let reply = br#"[{"success":false,"error":"No matching node."}]"#;
-        let err = check_command_reply(reply, "[con_id=9] resize set width 1 px height 1 px").unwrap_err();
+        let err =
+            check_command_reply(reply, "[con_id=9] resize set width 1 px height 1 px").unwrap_err();
         assert!(matches!(err, GlassError::Backend(_)));
         assert!(err.to_string().contains("No matching node."), "{err}");
     }

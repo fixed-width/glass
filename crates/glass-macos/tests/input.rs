@@ -97,12 +97,18 @@ mod macos_main {
     /// `run_checks` (fixture already spawned) must flow back to `run()` so it can
     /// `stop_app()` before the process exits, which a direct `std::process::exit` would skip
     /// (Rust destructors don't run across `exit`).
-    fn try_expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
+    fn try_expect<T, E: std::fmt::Display>(
+        result: Result<T, E>,
+        context: &str,
+    ) -> Result<T, String> {
         result.map_err(|e| format!("{context}: {e}"))
     }
 
     fn swiftc_available() -> bool {
-        Command::new("swiftc").arg("--version").output().is_ok_and(|o| o.status.success())
+        Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Build `fixture/quadrants.swift` to a fresh temp path — identical to `capture.rs`'s
@@ -116,8 +122,12 @@ mod macos_main {
             fail(format!("fixture source not found at {}", source.display()));
         }
 
-        let out_dir = std::env::temp_dir().join(format!("glass-macos-input-test-{}", std::process::id()));
-        expect(std::fs::create_dir_all(&out_dir), "creating fixture build dir");
+        let out_dir =
+            std::env::temp_dir().join(format!("glass-macos-input-test-{}", std::process::id()));
+        expect(
+            std::fs::create_dir_all(&out_dir),
+            "creating fixture build dir",
+        );
         let out_bin = out_dir.join("quadrants");
 
         let status = Command::new("swiftc")
@@ -129,7 +139,10 @@ mod macos_main {
             .status();
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) => fail(format!("swiftc exited with {s} building {}", source.display())),
+            Ok(s) => fail(format!(
+                "swiftc exited with {s} building {}",
+                source.display()
+            )),
             Err(e) => fail(format!("failed to run swiftc: {e}")),
         }
         (out_bin, out_dir)
@@ -174,10 +187,16 @@ mod macos_main {
     /// validates the whole pixel -> point -> global -> CGEvent -> back-to-window-pixel round
     /// trip (`coords::pixel_to_global_point` on the way out, `quadrants.swift`'s
     /// `mouseDown` view-space conversion on the way back).
-    fn assert_click_near(lines: &[(Stream, String)], expected: (i32, i32), tolerance: i32) -> Result<(), String> {
+    fn assert_click_near(
+        lines: &[(Stream, String)],
+        expected: (i32, i32),
+        tolerance: i32,
+    ) -> Result<(), String> {
         let reported = find_reported(lines, "click: ");
         let Some(raw) = reported.last() else {
-            return Err(format!("no click: line in fixture output (stdout lines: {lines:?})"));
+            return Err(format!(
+                "no click: line in fixture output (stdout lines: {lines:?})"
+            ));
         };
         let Some((x, y)) = parse_pair::<i32>(raw) else {
             return Err(format!("could not parse click coordinates from {raw:?}"));
@@ -187,7 +206,9 @@ mod macos_main {
                 "click landed at ({x},{y}), expected ~{expected:?} (tolerance {tolerance}px)"
             ));
         }
-        println!("click landed at ({x},{y}), expected ~{expected:?} — within {tolerance}px tolerance");
+        println!(
+            "click landed at ({x},{y}), expected ~{expected:?} — within {tolerance}px tolerance"
+        );
         Ok(())
     }
 
@@ -198,13 +219,17 @@ mod macos_main {
     fn read_scroll(lines: &[(Stream, String)]) -> Result<(f64, f64), String> {
         let reported = find_reported(lines, "scroll: ");
         let Some(raw) = reported.last() else {
-            return Err(format!("no scroll: line in fixture output (stdout lines: {lines:?})"));
+            return Err(format!(
+                "no scroll: line in fixture output (stdout lines: {lines:?})"
+            ));
         };
         let Some((dx, dy)) = parse_pair::<f64>(raw) else {
             return Err(format!("could not parse scroll delta from {raw:?}"));
         };
         if dy == 0.0 {
-            return Err(format!("scroll dy reported as zero (raw scroll line: {raw:?})"));
+            return Err(format!(
+                "scroll dy reported as zero (raw scroll line: {raw:?})"
+            ));
         }
         Ok((dx, dy))
     }
@@ -214,7 +239,10 @@ mod macos_main {
     /// any failure, so `run()` can always reach `platform.stop_app()` first — see
     /// `capture.rs`'s identical-shaped `run_checks` for why a bare `std::process::exit` from
     /// in here would leak the spawned fixture process.
-    fn run_checks(platform: &mut MacosPlatform, fixture_bin: &std::path::Path) -> Result<(), String> {
+    fn run_checks(
+        platform: &mut MacosPlatform,
+        fixture_bin: &std::path::Path,
+    ) -> Result<(), String> {
         let spec = AppSpec {
             build: None,
             run: vec![fixture_bin.to_string_lossy().into_owned()],
@@ -236,7 +264,10 @@ mod macos_main {
         std::thread::sleep(Duration::from_millis(500));
 
         // --- send_key: type "hello", assert the fixture reported exactly those chars. ---
-        try_expect(platform.send_key(&KeyEvent::Text("hello".into())), "send_key(Text(\"hello\"))")?;
+        try_expect(
+            platform.send_key(&KeyEvent::Text("hello".into())),
+            "send_key(Text(\"hello\"))",
+        )?;
         std::thread::sleep(ACTION_SETTLE);
         let key_logs = platform.drain_logs();
         assert_typed(&key_logs, "hello")?;
@@ -271,7 +302,13 @@ mod macos_main {
         // `com.apple.swipescrolldirection` (e.g. via `defaults read -g
         // com.apple.swipescrolldirection`) and fold it into the expectation so this can
         // become a real, machine-independent assertion. ---
-        let scroll_event = PointerEvent::Scroll { x: 200, y: 200, dx: 0, dy: 5, modifiers: vec![] };
+        let scroll_event = PointerEvent::Scroll {
+            x: 200,
+            y: 200,
+            dx: 0,
+            dy: 5,
+            modifiers: vec![],
+        };
         try_expect(platform.send_pointer(&scroll_event), "send_pointer(Scroll)")?;
         std::thread::sleep(ACTION_SETTLE);
         let scroll_logs = platform.drain_logs();

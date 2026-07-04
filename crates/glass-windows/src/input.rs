@@ -33,7 +33,8 @@ const WHEEL_DELTA: i32 = 120;
 
 /// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`: normalized (0..65535) coordinates
 /// over the whole virtual desktop — what every absolute mouse `INPUT` here uses.
-const ABS: MOUSE_EVENT_FLAGS = MOUSE_EVENT_FLAGS(MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
+const ABS: MOUSE_EVENT_FLAGS =
+    MOUSE_EVENT_FLAGS(MOUSEEVENTF_ABSOLUTE.0 | MOUSEEVENTF_VIRTUALDESK.0);
 
 /// Build a `MOUSEINPUT` `INPUT` carrying `dx`/`dy` (normalized 0..65535 coords for
 /// absolute moves; `mouseData` left 0 — use [`mouse_wheel`] for wheel events).
@@ -41,7 +42,14 @@ fn mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
         },
     }
 }
@@ -86,7 +94,11 @@ fn key_unicode(unit: u16, up: bool) -> INPUT {
 
 /// Build a virtual-key `INPUT` (down, or up if `up`).
 fn key_vk(vk: VIRTUAL_KEY, up: bool) -> INPUT {
-    let flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+    let flags = if up {
+        KEYEVENTF_KEYUP
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    };
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -213,7 +225,11 @@ impl glass_core::ChordSink for WindowsChordSink {
         let inputs: Vec<_> = if down {
             self.mod_vks.iter().map(|&m| key_vk(m, false)).collect()
         } else {
-            self.mod_vks.iter().rev().map(|&m| key_vk(m, true)).collect()
+            self.mod_vks
+                .iter()
+                .rev()
+                .map(|&m| key_vk(m, true))
+                .collect()
         };
         send(&inputs)
     }
@@ -239,7 +255,11 @@ impl glass_core::ScrollSink for WindowsScrollSink {
         let inputs: Vec<_> = if down {
             self.mod_vks.iter().map(|&m| key_vk(m, false)).collect()
         } else {
-            self.mod_vks.iter().rev().map(|&m| key_vk(m, true)).collect()
+            self.mod_vks
+                .iter()
+                .rev()
+                .map(|&m| key_vk(m, true))
+                .collect()
         };
         send(&inputs)
     }
@@ -299,8 +319,14 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
     // SAFETY: GetSystemMetrics is a pure query of system geometry.
     let (v0, vs) = unsafe {
         (
-            (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)),
-            (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+            ),
+            (
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            ),
         )
     };
     let to_norm =
@@ -311,7 +337,13 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             let (nx, ny) = to_norm(x, y);
             send(&[mouse(nx, ny, MOUSEEVENTF_MOVE | ABS)])?;
         }
-        PointerEvent::Click { x, y, button, count, ref modifiers } => {
+        PointerEvent::Click {
+            x,
+            y,
+            button,
+            count,
+            ref modifiers,
+        } => {
             let (nx, ny) = to_norm(x, y);
             let (down, up) = button_flags(button);
             let mut inputs = Vec::new();
@@ -328,20 +360,47 @@ pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<(
             }
             send(&inputs)?;
         }
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            button,
+            ref modifiers,
+            duration_ms,
+        } => {
             let gesture =
                 glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
             let (down, up) = button_flags(button);
-            let mut sink =
-                WindowsDragSink { origin, v0, vs, down, up, mods: modifiers, last: (0, 0) };
+            let mut sink = WindowsDragSink {
+                origin,
+                v0,
+                vs,
+                down,
+                up,
+                mods: modifiers,
+                last: (0, 0),
+            };
             glass_core::run_drag(&mut sink, &gesture)?;
         }
-        PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
+        PointerEvent::Scroll {
+            x,
+            y,
+            dx,
+            dy,
+            ref modifiers,
+        } => {
             let (nx, ny) = to_norm(x, y);
             let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().map(|&m| modifier_vk(m)).collect();
             // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead of
             // bursting modifier+wheel+release into one — see glass_core::run_scroll.
-            let mut sink = WindowsScrollSink { nx, ny, dx, dy, mod_vks };
+            let mut sink = WindowsScrollSink {
+                nx,
+                ny,
+                dx,
+                dy,
+                mod_vks,
+            };
             glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
         }
         PointerEvent::Gesture { .. } => {
@@ -369,8 +428,9 @@ pub(crate) fn send_key(active_hwnd: isize, event: &KeyEvent) -> Result<()> {
         }
         KeyEvent::Chord(s) => {
             let (mods, keysym) = glass_core::keys::parse_chord(s)?;
-            let vk = keysym_to_vk(keysym)
-                .ok_or_else(|| GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping")))?;
+            let vk = keysym_to_vk(keysym).ok_or_else(|| {
+                GlassError::InvalidKey(format!("key in chord {s:?} has no Windows mapping"))
+            })?;
             let mod_vks: Vec<VIRTUAL_KEY> = mods.iter().map(|&m| modifier_vk(m)).collect();
             // Shared, frame-aware sequencing: hold the modifier across the key's frame instead of
             // bursting the whole chord into one — see glass_core::run_chord.

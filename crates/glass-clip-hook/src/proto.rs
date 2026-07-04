@@ -60,12 +60,18 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
     fn u32(&mut self) -> Result<u32, ProtoError> {
-        let s = self.b.get(self.i..self.i + 4).ok_or(ProtoError::Truncated)?;
+        let s = self
+            .b
+            .get(self.i..self.i + 4)
+            .ok_or(ProtoError::Truncated)?;
         self.i += 4;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn u64(&mut self) -> Result<u64, ProtoError> {
-        let s = self.b.get(self.i..self.i + 8).ok_or(ProtoError::Truncated)?;
+        let s = self
+            .b
+            .get(self.i..self.i + 8)
+            .ok_or(ProtoError::Truncated)?;
         self.i += 8;
         let mut a = [0u8; 8];
         a.copy_from_slice(s);
@@ -76,7 +82,10 @@ impl<'a> Reader<'a> {
         if n > cap {
             return Err(ProtoError::TooLarge(n));
         }
-        let s = self.b.get(self.i..self.i + n).ok_or(ProtoError::Truncated)?;
+        let s = self
+            .b
+            .get(self.i..self.i + n)
+            .ok_or(ProtoError::Truncated)?;
         self.i += n;
         Ok(s.to_vec())
     }
@@ -85,7 +94,9 @@ impl<'a> Reader<'a> {
             0 => Ok(FormatKey::Standard(self.u32()?)),
             1 => {
                 let b = self.bytes(MAX_NAME_BYTES)?;
-                Ok(FormatKey::Named(String::from_utf8(b).map_err(|_| ProtoError::Utf8)?))
+                Ok(FormatKey::Named(
+                    String::from_utf8(b).map_err(|_| ProtoError::Utf8)?,
+                ))
             }
             t => Err(ProtoError::BadTag(t)),
         }
@@ -255,8 +266,14 @@ mod tests {
 
     fn sample() -> Vec<(FormatKey, Vec<u8>)> {
         vec![
-            (FormatKey::Standard(13), b"\x68\x00\x69\x00\x00\x00".to_vec()), // CF_UNICODETEXT "hi"
-            (FormatKey::Named("HTML Format".into()), b"<b>hi</b>".to_vec()),
+            (
+                FormatKey::Standard(13),
+                b"\x68\x00\x69\x00\x00\x00".to_vec(),
+            ), // CF_UNICODETEXT "hi"
+            (
+                FormatKey::Named("HTML Format".into()),
+                b"<b>hi</b>".to_vec(),
+            ),
         ]
     }
 
@@ -282,7 +299,10 @@ mod tests {
             Response::Seq(42),
             Response::Bytes(None),
             Response::Bytes(Some(b"abc".to_vec())),
-            Response::Formats(vec![FormatKey::Standard(13), FormatKey::Named("HTML Format".into())]),
+            Response::Formats(vec![
+                FormatKey::Standard(13),
+                FormatKey::Named("HTML Format".into()),
+            ]),
             Response::Items(sample()),
         ] {
             assert_eq!(Response::decode(&r.encode()).unwrap(), r);

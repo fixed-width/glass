@@ -15,7 +15,10 @@ use crate::xvfb::Xvfb;
 /// private Xvfb (when in self-spawn mode) to prove it actually starts.
 pub fn checks(deep: bool) -> Vec<Check> {
     let glass_display = std::env::var("GLASS_DISPLAY").ok();
-    let gd = glass_display.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let gd = glass_display
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let xvfb = resolve_bin(&glass_core::tool_path("GLASS_XVFB", "Xvfb"));
     let attach_reachable = gd.map(|d| can_connect(&normalize_display(d)));
     let deep_spawn = (deep && gd.is_none()).then(probe_xvfb);
@@ -66,11 +69,15 @@ fn x11_checks(
                     CheckStatus::Ok,
                     format!("{d} — reachable; glass will attach to it"),
                 ),
-                _ => Check::new("GLASS_DISPLAY", CheckStatus::Fail, format!("{d} — cannot connect"))
-                    .with_remedy(
-                        "start that display (e.g. `./scripts/sandbox-xvfb.sh start` for :42) \
+                _ => Check::new(
+                    "GLASS_DISPLAY",
+                    CheckStatus::Fail,
+                    format!("{d} — cannot connect"),
+                )
+                .with_remedy(
+                    "start that display (e.g. `./scripts/sandbox-xvfb.sh start` for :42) \
                          or unset GLASS_DISPLAY to self-spawn",
-                    ),
+                ),
             });
         }
     }
@@ -80,7 +87,9 @@ fn x11_checks(
 /// First executable named `name` on `PATH`.
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
 }
 
 /// Resolve a configured binary to an existing path: an explicit path (contains `/`) must
@@ -114,7 +123,11 @@ fn probe_xvfb() -> Result<String, String> {
     std::thread::spawn(move || {
         // The Xvfb is dropped at the end of `map` (after we read its display),
         // tearing the test display back down.
-        let _ = tx.send(Xvfb::start(&screen).map(|x| x.display.clone()).map_err(|e| e.to_string()));
+        let _ = tx.send(
+            Xvfb::start(&screen)
+                .map(|x| x.display.clone())
+                .map_err(|e| e.to_string()),
+        );
     });
     match rx.recv_timeout(Duration::from_secs(8)) {
         Ok(r) => r,
@@ -149,7 +162,10 @@ mod tests {
     fn attach_reachable_is_ok_unreachable_fails() {
         let ok = x11_checks(Some(":42"), None, Some(true), None);
         assert_eq!(ok[0].status, CheckStatus::Ok);
-        assert!(ok.iter().all(|c| c.name != "Xvfb"), "attach mode shouldn't require Xvfb");
+        assert!(
+            ok.iter().all(|c| c.name != "Xvfb"),
+            "attach mode shouldn't require Xvfb"
+        );
 
         let bad = x11_checks(Some(":42"), None, Some(false), None);
         assert_eq!(bad[0].status, CheckStatus::Fail);
@@ -158,7 +174,12 @@ mod tests {
 
     #[test]
     fn deep_spawn_failure_is_reported() {
-        let cs = x11_checks(None, Some(Path::new("/usr/bin/Xvfb")), None, Some(Err("boom".into())));
+        let cs = x11_checks(
+            None,
+            Some(Path::new("/usr/bin/Xvfb")),
+            None,
+            Some(Err("boom".into())),
+        );
         let deep = cs.iter().find(|c| c.name == "Xvfb spawn (deep)").unwrap();
         assert_eq!(deep.status, CheckStatus::Fail);
         assert_eq!(deep.detail, "boom");

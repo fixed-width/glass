@@ -64,20 +64,24 @@ pub fn parse_args(
         return Err("serve requires --http (the only transport today)".into());
     }
     let addr_s = addr_s.unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let addr: SocketAddr =
-        addr_s.parse().map_err(|e| format!("invalid --addr {addr_s:?}: {e}"))?;
+    let addr: SocketAddr = addr_s
+        .parse()
+        .map_err(|e| format!("invalid --addr {addr_s:?}: {e}"))?;
 
     // --token-file wins over GLASS_TOKEN.
     let token = match token_file {
         Some(path) => {
-            let raw = read_file(&path).map_err(|e| format!("reading --token-file {path:?}: {e}"))?;
+            let raw =
+                read_file(&path).map_err(|e| format!("reading --token-file {path:?}: {e}"))?;
             let t = raw.trim().to_string();
             if t.is_empty() {
                 return Err(format!("--token-file {path:?} is empty"));
             }
             Some(t)
         }
-        None => token_env.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+        None => token_env
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
     };
     Ok(ServeConfig { addr, token })
 }
@@ -132,9 +136,11 @@ mod tests {
 
     #[test]
     fn empty_token_file_is_error() {
-        let r = parse_args(&["--http".into(), "--token-file".into(), "/x".into()], None, |_| {
-            Ok("   \n".into())
-        });
+        let r = parse_args(
+            &["--http".into(), "--token-file".into(), "/x".into()],
+            None,
+            |_| Ok("   \n".into()),
+        );
         assert!(r.is_err());
     }
 
@@ -147,24 +153,42 @@ mod tests {
     }
 
     fn cfg(addr: &str, token: Option<&str>) -> ServeConfig {
-        ServeConfig { addr: addr.parse().unwrap(), token: token.map(String::from) }
+        ServeConfig {
+            addr: addr.parse().unwrap(),
+            token: token.map(String::from),
+        }
     }
 
     #[test]
     fn exposure_loopback_no_token_warns() {
-        assert_eq!(cfg("127.0.0.1:7300", None).exposure(), Exposure::LoopbackOpen);
+        assert_eq!(
+            cfg("127.0.0.1:7300", None).exposure(),
+            Exposure::LoopbackOpen
+        );
         assert_eq!(cfg("[::1]:7300", None).exposure(), Exposure::LoopbackOpen);
     }
 
     #[test]
     fn exposure_exposed_no_token_refused() {
-        assert_eq!(cfg("0.0.0.0:7300", None).exposure(), Exposure::ExposedNoToken);
-        assert_eq!(cfg("192.168.1.5:7300", None).exposure(), Exposure::ExposedNoToken);
+        assert_eq!(
+            cfg("0.0.0.0:7300", None).exposure(),
+            Exposure::ExposedNoToken
+        );
+        assert_eq!(
+            cfg("192.168.1.5:7300", None).exposure(),
+            Exposure::ExposedNoToken
+        );
     }
 
     #[test]
     fn exposure_with_token_ok() {
-        assert_eq!(cfg("0.0.0.0:7300", Some("t")).exposure(), Exposure::Authenticated);
-        assert_eq!(cfg("127.0.0.1:7300", Some("t")).exposure(), Exposure::Authenticated);
+        assert_eq!(
+            cfg("0.0.0.0:7300", Some("t")).exposure(),
+            Exposure::Authenticated
+        );
+        assert_eq!(
+            cfg("127.0.0.1:7300", Some("t")).exposure(),
+            Exposure::Authenticated
+        );
     }
 }

@@ -40,7 +40,9 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError};
-use objc2_screen_capture_kit::{SCContentFilter, SCRunningApplication, SCShareableContent, SCWindow};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCRunningApplication, SCShareableContent, SCWindow,
+};
 
 use glass_core::platform::WindowGeometry;
 use glass_core::{poll_until, GlassError, Result};
@@ -153,7 +155,11 @@ pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<Wi
 ///
 /// Returns a classified [`GlassError::PermissionDenied`]/[`GlassError::CaptureFailed`]
 /// immediately on a genuine `SCShareableContent` failure, same as `find_window_for_pids`.
-pub(crate) fn find_window_by_id(window_id: u32, pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
+pub(crate) fn find_window_by_id(
+    window_id: u32,
+    pids: &[i32],
+    timeout: Duration,
+) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
 
     let timeout_ms = timeout.as_millis() as u64;
@@ -187,7 +193,9 @@ pub(crate) fn find_on_screen_window(
         }
         // SAFETY: same as above — a plain property getter.
         let owning_application = unsafe { w.owningApplication() };
-        let Some(app) = owning_application else { continue };
+        let Some(app) = owning_application else {
+            continue;
+        };
         // SAFETY: same as above — a plain property getter.
         let pid = unsafe { app.processID() };
         if pids.contains(&pid) {
@@ -231,7 +239,9 @@ pub(crate) fn find_on_screen_window_by_id(
         }
         // SAFETY: same as above — a plain property getter.
         let owning_application = unsafe { w.owningApplication() };
-        let Some(app) = owning_application else { continue };
+        let Some(app) = owning_application else {
+            continue;
+        };
         // SAFETY: same as above — a plain property getter.
         let pid = unsafe { app.processID() };
         if !pids.contains(&pid) {
@@ -252,7 +262,8 @@ fn window_geometry_and_scale(w: &SCWindow) -> (WindowGeometry, f64, (f64, f64)) 
     // live `SCShareableContent.windows()` array (see `find_on_screen_window`/
     // `find_on_screen_window_by_id`/[`list_app_windows`]); `capture.rs` uses this same
     // initializer on the same kind of live `SCWindow` — no other preconditions.
-    let filter = unsafe { SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), w) };
+    let filter =
+        unsafe { SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), w) };
     // SAFETY: `filter` is live; these are plain property getters with no other
     // preconditions.
     let (scale, content_rect) = unsafe { (filter.pointPixelScale() as f64, filter.contentRect()) };
@@ -275,7 +286,13 @@ fn window_match_from(w: &SCWindow, pid: i32) -> WindowMatch {
     // property getter with no other preconditions.
     let window_id = unsafe { w.windowID() };
     let (geometry, scale, origin_pt) = window_geometry_and_scale(w);
-    WindowMatch { pid, window_id, geometry, scale, origin_pt }
+    WindowMatch {
+        pid,
+        window_id,
+        geometry,
+        scale,
+        origin_pt,
+    }
 }
 
 /// Build an [`AppWindow`] snapshot from a live `SCWindow` + its already-resolved owning
@@ -298,7 +315,12 @@ fn app_window_from(w: &SCWindow, app: &SCRunningApplication) -> AppWindow {
     // preconditions.
     let application_name = Some(unsafe { app.applicationName() }.to_string());
     let (geometry, _scale, _origin_pt) = window_geometry_and_scale(w);
-    AppWindow { window_id, geometry, title, application_name }
+    AppWindow {
+        window_id,
+        geometry,
+        title,
+        application_name,
+    }
 }
 
 /// Enumerate every on-screen window owned by one of `pids`, via a single `SCShareableContent`
@@ -325,42 +347,46 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
     // The completion handler collects every matching window into owned `AppWindow`s
     // (plain data, `Send` regardless of what ObjC objects were touched to build it) and
     // sends the whole `Vec` at once — never a `Retained<SCWindow>` (see module doc).
-    let block = RcBlock::new(move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
-        if content_ptr.is_null() {
-            let err = crate::ffi::classify_null_result(
-                err_ptr,
-                "SCShareableContent completion handler returned null content and null error",
-            );
-            let _ = tx.send(ListReply::Failed(err));
-            return;
-        }
-        // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
-        // points to a live `SCShareableContent` for the duration of this callback.
-        let content: &SCShareableContent = unsafe { &*content_ptr };
-        // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
-        // preconditions.
-        let windows: Retained<NSArray<SCWindow>> = unsafe { content.windows() };
+    let block = RcBlock::new(
+        move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
+            if content_ptr.is_null() {
+                let err = crate::ffi::classify_null_result(
+                    err_ptr,
+                    "SCShareableContent completion handler returned null content and null error",
+                );
+                let _ = tx.send(ListReply::Failed(err));
+                return;
+            }
+            // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
+            // points to a live `SCShareableContent` for the duration of this callback.
+            let content: &SCShareableContent = unsafe { &*content_ptr };
+            // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
+            // preconditions.
+            let windows: Retained<NSArray<SCWindow>> = unsafe { content.windows() };
 
-        let mut found = Vec::new();
-        for w in windows.iter() {
-            // SAFETY: `w` is a live `SCWindow` yielded by the array; plain property
-            // getters with no other preconditions — see `find_on_screen_window`'s
-            // identical notes.
-            if !unsafe { w.isOnScreen() } {
-                continue;
+            let mut found = Vec::new();
+            for w in windows.iter() {
+                // SAFETY: `w` is a live `SCWindow` yielded by the array; plain property
+                // getters with no other preconditions — see `find_on_screen_window`'s
+                // identical notes.
+                if !unsafe { w.isOnScreen() } {
+                    continue;
+                }
+                // SAFETY: same as above.
+                let owning_application = unsafe { w.owningApplication() };
+                let Some(app) = owning_application else {
+                    continue;
+                };
+                // SAFETY: same as above.
+                let pid = unsafe { app.processID() };
+                if !pids_owned.contains(&pid) {
+                    continue;
+                }
+                found.push(app_window_from(&w, &app));
             }
-            // SAFETY: same as above.
-            let owning_application = unsafe { w.owningApplication() };
-            let Some(app) = owning_application else { continue };
-            // SAFETY: same as above.
-            let pid = unsafe { app.processID() };
-            if !pids_owned.contains(&pid) {
-                continue;
-            }
-            found.push(app_window_from(&w, &app));
-        }
-        let _ = tx.send(ListReply::Found(found));
-    });
+            let _ = tx.send(ListReply::Found(found));
+        },
+    );
 
     // SAFETY: `block` matches `getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler`'s
     // documented signature (`*mut SCShareableContent, *mut NSError`, per the generated
@@ -407,25 +433,27 @@ pub(crate) fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
     // the callback (per ffi.rs's async-bridge pattern) and only ever sends `QueryReply`
     // — plain owned data, `Send` regardless of what ObjC objects were touched to build
     // it — never a `Retained<SCWindow>` (see module doc).
-    let block = RcBlock::new(move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
-        if content_ptr.is_null() {
-            let err = crate::ffi::classify_null_result(
-                err_ptr,
-                "SCShareableContent completion handler returned null content and null error",
-            );
-            let _ = tx.send(QueryReply::Failed(err));
-            return;
-        }
-        // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
-        // points to a live `SCShareableContent` for the duration of this callback.
-        let content: &SCShareableContent = unsafe { &*content_ptr };
+    let block = RcBlock::new(
+        move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
+            if content_ptr.is_null() {
+                let err = crate::ffi::classify_null_result(
+                    err_ptr,
+                    "SCShareableContent completion handler returned null content and null error",
+                );
+                let _ = tx.send(QueryReply::Failed(err));
+                return;
+            }
+            // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
+            // points to a live `SCShareableContent` for the duration of this callback.
+            let content: &SCShareableContent = unsafe { &*content_ptr };
 
-        let Some((w, pid)) = find_on_screen_window(content, &pids_owned) else {
-            let _ = tx.send(QueryReply::NotFound);
-            return;
-        };
-        let _ = tx.send(QueryReply::Found(window_match_from(&w, pid)));
-    });
+            let Some((w, pid)) = find_on_screen_window(content, &pids_owned) else {
+                let _ = tx.send(QueryReply::NotFound);
+                return;
+            };
+            let _ = tx.send(QueryReply::Found(window_match_from(&w, pid)));
+        },
+    );
 
     // SAFETY: `block` matches `getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler`'s
     // documented signature (`*mut SCShareableContent, *mut NSError`, per the generated
@@ -458,25 +486,28 @@ fn query_once_by_id(window_id: u32, pids: &[i32]) -> Result<Option<WindowMatch>>
 
     // Same completion-handler contract as `query_once`'s block: only ever sends the plain
     // owned `QueryReply`, never a `Retained<SCWindow>` (see module doc).
-    let block = RcBlock::new(move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
-        if content_ptr.is_null() {
-            let err = crate::ffi::classify_null_result(
-                err_ptr,
-                "SCShareableContent completion handler returned null content and null error",
-            );
-            let _ = tx.send(QueryReply::Failed(err));
-            return;
-        }
-        // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
-        // points to a live `SCShareableContent` for the duration of this callback.
-        let content: &SCShareableContent = unsafe { &*content_ptr };
+    let block = RcBlock::new(
+        move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
+            if content_ptr.is_null() {
+                let err = crate::ffi::classify_null_result(
+                    err_ptr,
+                    "SCShareableContent completion handler returned null content and null error",
+                );
+                let _ = tx.send(QueryReply::Failed(err));
+                return;
+            }
+            // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
+            // points to a live `SCShareableContent` for the duration of this callback.
+            let content: &SCShareableContent = unsafe { &*content_ptr };
 
-        let Some((w, pid)) = find_on_screen_window_by_id(content, window_id, &pids_owned) else {
-            let _ = tx.send(QueryReply::NotFound);
-            return;
-        };
-        let _ = tx.send(QueryReply::Found(window_match_from(&w, pid)));
-    });
+            let Some((w, pid)) = find_on_screen_window_by_id(content, window_id, &pids_owned)
+            else {
+                let _ = tx.send(QueryReply::NotFound);
+                return;
+            };
+            let _ = tx.send(QueryReply::Found(window_match_from(&w, pid)));
+        },
+    );
 
     // SAFETY: same as `query_once`'s identical call — the documented signature, no other
     // preconditions.

@@ -20,7 +20,13 @@ pub struct StabilityTracker {
 
 impl StabilityTracker {
     pub fn new(settle_frames: u32, tolerance: u8) -> Self {
-        Self { settle_frames: settle_frames.max(1), tolerance, last: None, stable_count: 0, saw_change: false }
+        Self {
+            settle_frames: settle_frames.max(1),
+            tolerance,
+            last: None,
+            stable_count: 0,
+            saw_change: false,
+        }
     }
 
     /// Feed the next frame. Returns `true` once the frame stream has settled.
@@ -103,6 +109,9 @@ mod tests {
         moved.observe(b.clone()).unwrap(); // a change
         moved.observe(b.clone()).unwrap();
         assert!(moved.observe(b.clone()).unwrap());
-        assert!(moved.saw_change(), "a change occurred -> saw_change is true");
+        assert!(
+            moved.saw_change(),
+            "a change occurred -> saw_change is true"
+        );
     }
 }

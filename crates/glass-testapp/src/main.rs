@@ -51,13 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         0,
         WindowClass::INPUT_OUTPUT,
         screen.root_visual,
-        &CreateWindowAux::new().background_pixel(screen.black_pixel).event_mask(
-            EventMask::EXPOSURE
-                | EventMask::BUTTON_PRESS
-                | EventMask::KEY_PRESS
-                | EventMask::STRUCTURE_NOTIFY
-                | EventMask::BUTTON_MOTION,
-        ),
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::KEY_PRESS
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::BUTTON_MOTION,
+            ),
     )?;
 
     // Identify ourselves so glass-x11 can find this window by PID/name.
@@ -108,7 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn.map_window(frame)?;
         conn.reparent_window(win, frame, 0, 0)?;
         let net_client_list = conn.intern_atom(false, b"_NET_CLIENT_LIST")?.reply()?.atom;
-        conn.change_property32(PropMode::REPLACE, root, net_client_list, AtomEnum::WINDOW, &[win])?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            root,
+            net_client_list,
+            AtomEnum::WINDOW,
+            &[win],
+        )?;
     }
 
     conn.map_window(win)?;
@@ -160,7 +168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         let title = format!("glass-testapp-{i}");
-        conn.change_property8(PropMode::REPLACE, ewin, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes())?;
+        conn.change_property8(
+            PropMode::REPLACE,
+            ewin,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            title.as_bytes(),
+        )?;
         conn.change_property8(
             PropMode::REPLACE,
             ewin,
@@ -197,7 +211,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 conn.flush()?;
             }
             Event::ButtonPress(e) => {
-                println!("EVENT button={} x={} y={} state={}", e.detail, e.event_x, e.event_y, u16::from(e.state));
+                println!(
+                    "EVENT button={} x={} y={} state={}",
+                    e.detail,
+                    e.event_x,
+                    e.event_y,
+                    u16::from(e.state)
+                );
                 std::io::stdout().flush()?;
             }
             Event::MotionNotify(e) => {
@@ -227,23 +247,50 @@ fn extra_color(i: usize) -> u32 {
     PALETTE[(i - 1) % PALETTE.len()]
 }
 
-fn draw_solid(conn: &impl Connection, win: Window, gc: Gcontext, color: u32) -> Result<(), Box<dyn std::error::Error>> {
+fn draw_solid(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+    color: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     conn.change_gc(gc, &ChangeGCAux::new().foreground(color))?;
-    conn.poly_fill_rectangle(win, gc, &[Rectangle { x: 0, y: 0, width: WIDTH, height: HEIGHT }])?;
+    conn.poly_fill_rectangle(
+        win,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: WIDTH,
+            height: HEIGHT,
+        }],
+    )?;
     Ok(())
 }
 
-fn draw_quadrants(conn: &impl Connection, win: Window, gc: Gcontext) -> Result<(), Box<dyn std::error::Error>> {
+fn draw_quadrants(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (hw, hh) = (WIDTH / 2, HEIGHT / 2);
     let cells: [(i16, i16, u16, u16, u32); 4] = [
-        (0, 0, hw, hh, 0x00FF_0000),          // TL red
-        (hw as i16, 0, hw, hh, 0x0000_FF00),  // TR green
-        (0, hh as i16, hw, hh, 0x0000_00FF),  // BL blue
+        (0, 0, hw, hh, 0x00FF_0000),                 // TL red
+        (hw as i16, 0, hw, hh, 0x0000_FF00),         // TR green
+        (0, hh as i16, hw, hh, 0x0000_00FF),         // BL blue
         (hw as i16, hh as i16, hw, hh, 0x00FF_FFFF), // BR white
     ];
     for (x, y, w, h, color) in cells {
         conn.change_gc(gc, &ChangeGCAux::new().foreground(color))?;
-        conn.poly_fill_rectangle(win, gc, &[Rectangle { x, y, width: w, height: h }])?;
+        conn.poly_fill_rectangle(
+            win,
+            gc,
+            &[Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            }],
+        )?;
     }
     Ok(())
 }

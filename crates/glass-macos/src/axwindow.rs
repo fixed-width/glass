@@ -52,7 +52,9 @@
 use std::ptr::NonNull;
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{kCFBooleanTrue, CFArray, CFRetained, CFString, CFType, CGPoint, CGSize};
+use objc2_core_foundation::{
+    kCFBooleanTrue, CFArray, CFRetained, CFString, CFType, CGPoint, CGSize,
+};
 
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -165,7 +167,9 @@ pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
     // mirrors the proven reference's `AXValueGetValue(v, .cgPoint, &p)`.
     let ok = unsafe { value.value(AXValueType::CGPoint, NonNull::from(&mut point).cast()) };
     if !ok {
-        return Err(GlassError::Backend("AXValueGetValue(AXPosition, .cgPoint) returned false".into()));
+        return Err(GlassError::Backend(
+            "AXValueGetValue(AXPosition, .cgPoint) returned false".into(),
+        ));
     }
     Ok((point.x, point.y))
 }
@@ -173,11 +177,16 @@ pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {
 /// Read `el`'s `AXSize` (width/height, in points).
 pub(crate) fn ax_size(el: &AXUIElement) -> Result<(f64, f64)> {
     let value = attribute_axvalue(el, "AXSize")?;
-    let mut size = CGSize { width: 0.0, height: 0.0 };
+    let mut size = CGSize {
+        width: 0.0,
+        height: 0.0,
+    };
     // SAFETY: same as `ax_position` above, with `AXValueType::CGSize`/`CGSize`.
     let ok = unsafe { value.value(AXValueType::CGSize, NonNull::from(&mut size).cast()) };
     if !ok {
-        return Err(GlassError::Backend("AXValueGetValue(AXSize, .cgSize) returned false".into()));
+        return Err(GlassError::Backend(
+            "AXValueGetValue(AXSize, .cgSize) returned false".into(),
+        ));
     }
     Ok((size.width, size.height))
 }
@@ -187,13 +196,26 @@ pub(crate) fn ax_size(el: &AXUIElement) -> Result<(f64, f64)> {
 /// `window(op)` (Task 4), which reads back every mutating op through `ax_position`/
 /// `ax_size` and returns a structured error if the change didn't land.
 pub(crate) fn ax_set_position(el: &AXUIElement, pos: (f64, f64)) -> Result<()> {
-    set_axvalue(el, "AXPosition", AXValueType::CGPoint, &mut CGPoint { x: pos.0, y: pos.1 })
+    set_axvalue(
+        el,
+        "AXPosition",
+        AXValueType::CGPoint,
+        &mut CGPoint { x: pos.0, y: pos.1 },
+    )
 }
 
 /// Set `el`'s `AXSize` to `size` (points). Same no-read-back-verify contract as
 /// [`ax_set_position`].
 pub(crate) fn ax_set_size(el: &AXUIElement, size: (f64, f64)) -> Result<()> {
-    set_axvalue(el, "AXSize", AXValueType::CGSize, &mut CGSize { width: size.0, height: size.1 })
+    set_axvalue(
+        el,
+        "AXSize",
+        AXValueType::CGSize,
+        &mut CGSize {
+            width: size.0,
+            height: size.1,
+        },
+    )
 }
 
 /// Raise `el` to the front of its application's window list (`kAXRaiseAction`).
@@ -213,7 +235,8 @@ pub(crate) fn ax_set_main(el: &AXUIElement) -> Result<()> {
     let attr = CFString::from_str("AXMain");
     // SAFETY: `kCFBooleanTrue` is a framework-owned singleton that is always live for the
     // process's lifetime; reading the extern static is a plain global read.
-    let value = unsafe { kCFBooleanTrue }.ok_or_else(|| GlassError::Backend("kCFBooleanTrue unavailable".into()))?;
+    let value = unsafe { kCFBooleanTrue }
+        .ok_or_else(|| GlassError::Backend("kCFBooleanTrue unavailable".into()))?;
     // SAFETY: `el` is live; `value` derefs to `&CFType` (see the module doc's CFType-memory
     // section); matches `AXUIElementSetAttributeValue`'s documented contract.
     let err = unsafe { el.set_attribute_value(&attr, value) };
@@ -240,7 +263,9 @@ fn ax_windows(app: &AXUIElement) -> Result<CFRetained<CFArray<AXUIElement>>> {
 /// (position/size are always `AXValue`-wrapped `CGPoint`/`CGSize`, never a bare `CFType`).
 fn attribute_axvalue(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<AXValue>> {
     let cftype = copy_attribute(el, attr_name)?;
-    cftype.downcast::<AXValue>().map_err(|_| GlassError::Backend(format!("{attr_name} did not return an AXValue")))
+    cftype
+        .downcast::<AXValue>()
+        .map_err(|_| GlassError::Backend(format!("{attr_name} did not return an AXValue")))
 }
 
 /// `AXUIElementCopyAttributeValue(el, attr_name, ...)`, wrapping the already-retained (+1,
@@ -255,8 +280,11 @@ fn copy_attribute(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<CFType
     if err != AXError::Success {
         return Err(ax_backend_err(attr_name, err));
     }
-    let nn = NonNull::new(raw.cast_mut())
-        .ok_or_else(|| GlassError::Backend(format!("{attr_name}: AX reported success but returned a null value")))?;
+    let nn = NonNull::new(raw.cast_mut()).ok_or_else(|| {
+        GlassError::Backend(format!(
+            "{attr_name}: AX reported success but returned a null value"
+        ))
+    })?;
     // SAFETY: `AXUIElementCopyAttributeValue` follows Core Foundation's Copy/Create
     // ownership rule — an already-retained (+1) `CFTypeRef` on success — so
     // `CFRetained::from_raw` takes ownership without an extra retain (see the module doc).
@@ -265,7 +293,12 @@ fn copy_attribute(el: &AXUIElement, attr_name: &str) -> Result<CFRetained<CFType
 
 /// `AXValueCreate(value_type, value)` + `AXUIElementSetAttributeValue(el, attr_name, ...)`
 /// — the shared body of [`ax_set_position`]/[`ax_set_size`].
-fn set_axvalue<T>(el: &AXUIElement, attr_name: &str, value_type: AXValueType, value: &mut T) -> Result<()> {
+fn set_axvalue<T>(
+    el: &AXUIElement,
+    attr_name: &str,
+    value_type: AXValueType,
+    value: &mut T,
+) -> Result<()> {
     // SAFETY: `AXValueCreate` copies the bytes pointed to by `value` internally (the
     // pointer only needs to be valid for the duration of this call); `T`'s layout matches
     // `value_type` for every caller of this private helper (`ax_set_position`/
@@ -303,7 +336,9 @@ fn geometry_fallback(
 ) -> Option<CFRetained<AXUIElement>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>)> = None;
     for w in windows.iter() {
-        let Ok(geom) = ax_geometry_px(&w, scale) else { continue };
+        let Ok(geom) = ax_geometry_px(&w, scale) else {
+            continue;
+        };
         if !within_tolerance(&geom, target_px) {
             continue;
         }
@@ -324,7 +359,12 @@ fn geometry_fallback(
 fn ax_geometry_px(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
     let (x, y) = point_to_global_pixel(ax_position(el)?, scale);
     let (w, h) = point_to_global_pixel(ax_size(el)?, scale);
-    Ok(WindowGeometry { x, y, width: w.max(0) as u32, height: h.max(0) as u32 })
+    Ok(WindowGeometry {
+        x,
+        y,
+        width: w.max(0) as u32,
+        height: h.max(0) as u32,
+    })
 }
 
 /// True if every field of `a`/`b` is within [`FALLBACK_TOLERANCE_PX`] of the other. Computed
@@ -354,7 +394,12 @@ mod tests {
     use super::*;
 
     fn geom(x: i32, y: i32, width: u32, height: u32) -> WindowGeometry {
-        WindowGeometry { x, y, width, height }
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     #[test]

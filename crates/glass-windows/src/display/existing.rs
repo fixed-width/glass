@@ -15,6 +15,9 @@ impl DisplayProvider for ExistingDesktop {
         let w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(0) as u32;
         // SAFETY: GetSystemMetrics is a pure query with no preconditions.
         let h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(0) as u32;
-        Ok(ProvisionedDisplay { width: w, height: h })
+        Ok(ProvisionedDisplay {
+            width: w,
+            height: h,
+        })
     }
 }

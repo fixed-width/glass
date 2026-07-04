@@ -19,13 +19,17 @@ fn a11y_checks(uia: std::result::Result<(), String>) -> Vec<Check> {
             CheckStatus::Ok,
             "available — glass_a11y_snapshot / glass_a11y_marks / glass_click_element will work",
         ),
-        Err(e) => Check::new("UI Automation", CheckStatus::Warn, format!("not available: {e}"))
-            .with_remedy(
-                "UI Automation could not be initialized. It ships with Windows; ensure glass runs \
+        Err(e) => Check::new(
+            "UI Automation",
+            CheckStatus::Warn,
+            format!("not available: {e}"),
+        )
+        .with_remedy(
+            "UI Automation could not be initialized. It ships with Windows; ensure glass runs \
                  in an interactive desktop session (not Session 0). Until then the a11y tools \
                  return AccessibilityUnavailable; the pixel loop (screenshot/click/type/diff) is \
                  unaffected.",
-            ),
+        ),
     }]
 }
 

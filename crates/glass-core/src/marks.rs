@@ -54,7 +54,11 @@ fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
         if let Some(b) = node.bounds {
             if b.width > 0 && b.height > 0 {
                 draw_mark(frame, b, node.id.0);
-                legend.push(Mark { id: node.id, role: node.role, name: node.name.clone() });
+                legend.push(Mark {
+                    id: node.id,
+                    role: node.role,
+                    name: node.name.clone(),
+                });
             }
         }
     }
@@ -134,7 +138,14 @@ fn draw_digit(frame: &mut Frame, digit: u8, x: i32, y: i32, rgba: [u8; 4]) {
     for (row, &bits) in FONT_3X5[digit as usize].iter().enumerate() {
         for col in 0u8..3 {
             if bits & (1u8 << (2 - col)) != 0 {
-                fill_rect(frame, x + col as i32 * SCALE, y + row as i32 * SCALE, SCALE, SCALE, rgba);
+                fill_rect(
+                    frame,
+                    x + col as i32 * SCALE,
+                    y + row as i32 * SCALE,
+                    SCALE,
+                    SCALE,
+                    rgba,
+                );
             }
         }
     }
@@ -164,8 +175,28 @@ mod tests {
 
     /// Window (not interactable) containing a Button and a Label.
     fn tree() -> AxTree {
-        let button = node(0, AxRole::Button, "Save", Some(AxRect { x: 10, y: 10, width: 20, height: 16 }));
-        let label = node(0, AxRole::Label, "Ready", Some(AxRect { x: 10, y: 40, width: 30, height: 10 }));
+        let button = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 16,
+            }),
+        );
+        let label = node(
+            0,
+            AxRole::Label,
+            "Ready",
+            Some(AxRect {
+                x: 10,
+                y: 40,
+                width: 30,
+                height: 10,
+            }),
+        );
         let root = AxNode {
             id: AxNodeId(0),
             role: AxRole::Window,
@@ -173,7 +204,12 @@ mod tests {
             name: Some("Win".into()),
             value: None,
             states: Default::default(),
-            bounds: Some(AxRect { x: 0, y: 0, width: 100, height: 100 }),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
             children: vec![button, label],
         };
         let mut t = AxTree { root, count: 0 };
@@ -205,7 +241,17 @@ mod tests {
     #[test]
     fn render_with_no_interactables_returns_clone_and_empty_legend() {
         let label_only = {
-            let root = node(0, AxRole::Label, "x", Some(AxRect { x: 0, y: 0, width: 4, height: 4 }));
+            let root = node(
+                0,
+                AxRole::Label,
+                "x",
+                Some(AxRect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                }),
+            );
             let mut t = AxTree { root, count: 0 };
             t.assign_ids();
             t
@@ -219,7 +265,17 @@ mod tests {
     #[test]
     fn offscreen_element_does_not_panic() {
         let off = {
-            let root = node(0, AxRole::Button, "b", Some(AxRect { x: 90, y: 90, width: 40, height: 40 }));
+            let root = node(
+                0,
+                AxRole::Button,
+                "b",
+                Some(AxRect {
+                    x: 90,
+                    y: 90,
+                    width: 40,
+                    height: 40,
+                }),
+            );
             let mut t = AxTree { root, count: 0 };
             t.assign_ids();
             t

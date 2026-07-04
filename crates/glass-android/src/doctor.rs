@@ -77,7 +77,11 @@ fn probe(deep_requested: bool) -> Probe {
     let adb_trail = crate::sdk::sdk_search_trail(&get);
     let adb = Adb::from_env();
     let adb_bin = adb.bin().to_string();
-    let adb_version = adb.run(["version"]).ok().map(|s| first_line(&s)).filter(|s| !s.is_empty());
+    let adb_version = adb
+        .run(["version"])
+        .ok()
+        .map(|s| first_line(&s))
+        .filter(|s| !s.is_empty());
     let emulator_bin = resolve_emulator_bin(&get, &|p| p.exists());
     let avds = list_avds(&emulator_bin);
 
@@ -93,7 +97,11 @@ fn probe(deep_requested: bool) -> Probe {
     // Reuse the runtime's own selection policy so the doctor's verdict matches what
     // `glass_start` will actually do (attach a specific serial / boot / refuse).
     let lifecycle = Lifecycle::from_env(get("GLASS_ANDROID_LIFECYCLE").as_deref());
-    let selection = decide(&online_devices, get("GLASS_ANDROID_SERIAL").as_deref(), lifecycle);
+    let selection = decide(
+        &online_devices,
+        get("GLASS_ANDROID_SERIAL").as_deref(),
+        lifecycle,
+    );
 
     // Deep-probe exactly the device glass would attach to (it never boots one).
     let deep = match &selection {
@@ -101,33 +109,47 @@ fn probe(deep_requested: bool) -> Probe {
         _ => None,
     };
 
-    let agent_off = get("GLASS_ANDROID_AGENT").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    let agent_off = get("GLASS_ANDROID_AGENT")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
     let agent_jar = crate::agent::agent_jar(&get);
-    let agent_jar_exists =
-        agent_jar.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
+    let agent_jar_exists = agent_jar
+        .as_deref()
+        .map(|p| std::path::Path::new(p).is_file())
+        .unwrap_or(false);
     // Deep agent probe: launch the agent on the device glass would attach to, ping it, then
     // tear it down (reuses the production lifecycle; leak-free — no pkill).
     let agent_deep = match &selection {
         Action::Attach(serial) if deep_requested && !agent_off && agent_jar_exists => {
             let reg = crate::agent::AgentRegistry::new();
-            let r = reg.ensure(&adb.with_serial(serial.clone())).map(|_| ()).map_err(|e| e.to_string());
+            let r = reg
+                .ensure(&adb.with_serial(serial.clone()))
+                .map(|_| ())
+                .map_err(|e| e.to_string());
             reg.shutdown();
             Some(r)
         }
         _ => None,
     };
 
-    let a11y_off = get("GLASS_ANDROID_A11Y").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false);
+    let a11y_off = get("GLASS_ANDROID_A11Y")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
     let a11y_apk = crate::a11y_service::a11y_apk(&get);
-    let a11y_apk_exists =
-        a11y_apk.as_deref().map(|p| std::path::Path::new(p).is_file()).unwrap_or(false);
+    let a11y_apk_exists = a11y_apk
+        .as_deref()
+        .map(|p| std::path::Path::new(p).is_file())
+        .unwrap_or(false);
     // Deep a11y probe: install + enable the service on the device glass would attach to,
     // ping it, then tear it down (reuses the production lifecycle; idempotent + clean).
     let a11y_deep = match &selection {
         Action::Attach(serial) if deep_requested && !a11y_off && a11y_apk_exists => {
             let apk = a11y_apk.as_deref().unwrap();
             let reg = crate::a11y_service::A11yServiceRegistry::new();
-            let r = reg.ensure(&adb.with_serial(serial.clone()), apk).map(|_| ()).map_err(|e| e.to_string());
+            let r = reg
+                .ensure(&adb.with_serial(serial.clone()), apk)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
             reg.shutdown();
             Some(r)
         }
@@ -177,7 +199,12 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
 
     let screencap = match dev.run_bytes(["exec-out", "screencap"]) {
         Ok(bytes) => match crate::screencap::decode_screencap(&bytes) {
-            Ok(f) => Ok(format!("captured {}x{}, {} bytes raw", f.width, f.height, bytes.len())),
+            Ok(f) => Ok(format!(
+                "captured {}x{}, {} bytes raw",
+                f.width,
+                f.height,
+                bytes.len()
+            )),
             Err(e) => Err(e.to_string()),
         },
         Err(e) => Err(e.to_string()),
@@ -198,18 +225,34 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
         Err(e) => Err(e.to_string()),
     };
 
-    DeepProbe { serial: serial.to_string(), screencap, uiautomator }
+    DeepProbe {
+        serial: serial.to_string(),
+        screencap,
+        uiautomator,
+    }
 }
 
 /// Build the Android doctor section's checks from observed state. Pure.
 fn build_checks(p: &Probe) -> Vec<Check> {
     let (screencap, uiautomator) = deep_checks(p);
-    vec![adb_check(p), emulator_check(p), device_check(p), agent_check(p), a11y_check(p), screencap, uiautomator]
+    vec![
+        adb_check(p),
+        emulator_check(p),
+        device_check(p),
+        agent_check(p),
+        a11y_check(p),
+        screencap,
+        uiautomator,
+    ]
 }
 
 fn agent_check(p: &Probe) -> Check {
     if p.agent_off {
-        return Check::new("agent", CheckStatus::Skip, "disabled (GLASS_ANDROID_AGENT=off)");
+        return Check::new(
+            "agent",
+            CheckStatus::Skip,
+            "disabled (GLASS_ANDROID_AGENT=off)",
+        );
     }
     let Some(jar) = &p.agent_jar else {
         return Check::new(
@@ -229,13 +272,17 @@ fn agent_check(p: &Probe) -> Check {
     // agent_deep is Some only when deep was requested (see probe); so None means
     // either not-deep (Ok configured) or deep-but-no-attachable-device (Skip).
     match (&p.agent_deep, p.deep_requested) {
-        (Some(Ok(())), _) => {
-            Check::new("agent", CheckStatus::Ok, format!("reachable (launched + ping ok): {jar}"))
-        }
-        (Some(Err(e)), _) => {
-            Check::new("agent", CheckStatus::Fail, format!("agent did not come up: {e}"))
-                .with_remedy("ensure the device allows `app_process` and the jar is a valid dexed build")
-        }
+        (Some(Ok(())), _) => Check::new(
+            "agent",
+            CheckStatus::Ok,
+            format!("reachable (launched + ping ok): {jar}"),
+        ),
+        (Some(Err(e)), _) => Check::new(
+            "agent",
+            CheckStatus::Fail,
+            format!("agent did not come up: {e}"),
+        )
+        .with_remedy("ensure the device allows `app_process` and the jar is a valid dexed build"),
         (None, false) => Check::new("agent", CheckStatus::Ok, format!("configured: {jar}")),
         (None, true) => {
             // agent_deep is Some only when deep + the device is Attach-able, so here the
@@ -251,7 +298,11 @@ fn agent_check(p: &Probe) -> Check {
 
 fn a11y_check(p: &Probe) -> Check {
     if p.a11y_off {
-        return Check::new("a11y-service", CheckStatus::Skip, "disabled (GLASS_ANDROID_A11Y=off)");
+        return Check::new(
+            "a11y-service",
+            CheckStatus::Skip,
+            "disabled (GLASS_ANDROID_A11Y=off)",
+        );
     }
     let Some(apk) = &p.a11y_apk else {
         return Check::new(
@@ -307,7 +358,10 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
         Err(e) => Check::new(name, CheckStatus::Fail, format!("{}: {e}", d.serial))
             .with_remedy("ensure the device is fully booted"),
     };
-    (render("screencap", &d.screencap), render("uiautomator", &d.uiautomator))
+    (
+        render("screencap", &d.screencap),
+        render("uiautomator", &d.uiautomator),
+    )
 }
 
 fn device_check(p: &Probe) -> Check {
@@ -331,8 +385,12 @@ fn device_check(p: &Probe) -> Check {
                     "none online; glass will boot an AVD on start (auto lifecycle)",
                 )
             } else {
-                Check::new("device", CheckStatus::Fail, "no online device and no AVD to boot")
-                    .with_remedy("start an emulator (`emulator -avd <name>`) or create an AVD")
+                Check::new(
+                    "device",
+                    CheckStatus::Fail,
+                    "no online device and no AVD to boot",
+                )
+                .with_remedy("start an emulator (`emulator -avd <name>`) or create an AVD")
             }
         }
         Action::Error(msg) => Check::new("device", CheckStatus::Fail, msg.clone()),
@@ -424,11 +482,17 @@ mod tests {
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
-        checks.iter().find(|c| c.name == name).expect("check present")
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .expect("check present")
     }
 
     fn dev(serial: &str) -> Device {
-        Device { serial: serial.into(), state: "device".into() }
+        Device {
+            serial: serial.into(),
+            state: "device".into(),
+        }
     }
 
     #[test]
@@ -456,7 +520,11 @@ mod tests {
         let c = build_checks(&base_probe());
         let adb = find(&c, "adb");
         assert_eq!(adb.status, CheckStatus::Ok);
-        assert!(adb.detail.contains("via discovered SDK"), "got {}", adb.detail);
+        assert!(
+            adb.detail.contains("via discovered SDK"),
+            "got {}",
+            adb.detail
+        );
     }
 
     #[test]
@@ -467,7 +535,8 @@ mod tests {
         let adb = find(&c, "adb");
         assert_eq!(adb.status, CheckStatus::Fail);
         assert!(
-            adb.detail.contains("looked in: ANDROID_SDK_ROOT, ANDROID_HOME"),
+            adb.detail
+                .contains("looked in: ANDROID_SDK_ROOT, ANDROID_HOME"),
             "got {}",
             adb.detail
         );
@@ -517,8 +586,11 @@ mod tests {
         // Drive `selection` through the real `decide` so the test tracks runtime behavior.
         let mut p = base_probe();
         p.online = vec!["emulator-5554".into(), "emulator-5556".into()];
-        p.selection =
-            decide(&[dev("emulator-5554"), dev("emulator-5556")], Some("emulator-5556"), Lifecycle::Auto);
+        p.selection = decide(
+            &[dev("emulator-5554"), dev("emulator-5556")],
+            Some("emulator-5556"),
+            Lifecycle::Auto,
+        );
         let d = build_checks(&p);
         let d = find(&d, "device");
         assert_eq!(d.status, CheckStatus::Ok);
@@ -661,7 +733,18 @@ mod tests {
         // Spawns adb/emulator; both fail-fast when absent, so this is host-independent.
         let c = checks(false);
         let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["adb", "emulator", "device", "agent", "a11y-service", "screencap", "uiautomator"]);
+        assert_eq!(
+            names,
+            [
+                "adb",
+                "emulator",
+                "device",
+                "agent",
+                "a11y-service",
+                "screencap",
+                "uiautomator"
+            ]
+        );
     }
 
     #[test]
@@ -744,7 +827,10 @@ mod tests {
     fn a11y_off_is_skip() {
         let mut p = base_probe();
         p.a11y_off = true;
-        assert_eq!(find(&build_checks(&p), "a11y-service").status, CheckStatus::Skip);
+        assert_eq!(
+            find(&build_checks(&p), "a11y-service").status,
+            CheckStatus::Skip
+        );
     }
 
     #[test]
@@ -797,6 +883,9 @@ mod tests {
         p.deep_requested = true;
         p.selection = Action::Boot; // deep but nothing attachable → service not probed
         p.a11y_deep = None;
-        assert_eq!(find(&build_checks(&p), "a11y-service").status, CheckStatus::Skip);
+        assert_eq!(
+            find(&build_checks(&p), "a11y-service").status,
+            CheckStatus::Skip
+        );
     }
 }

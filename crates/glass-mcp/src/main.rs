@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Doctor { deep, json }) => run_doctor(deep, json, audit_log.as_deref()),
         Some(Command::Env { json }) => run_env(json),
-        Some(Command::Serve { http, addr, token_file }) => {
+        Some(Command::Serve {
+            http,
+            addr,
+            token_file,
+        }) => {
             #[cfg(feature = "network")]
             {
                 let (sink, report) =
@@ -63,8 +67,18 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
         }
-        Some(Command::Setup { non_interactive, launchagent, no_launchagent, addr }) => {
-            setup::run(setup::SetupArgs { non_interactive, launchagent, no_launchagent, addr })?;
+        Some(Command::Setup {
+            non_interactive,
+            launchagent,
+            no_launchagent,
+            addr,
+        }) => {
+            setup::run(setup::SetupArgs {
+                non_interactive,
+                launchagent,
+                no_launchagent,
+                addr,
+            })?;
             Ok(())
         }
     }

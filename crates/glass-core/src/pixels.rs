@@ -64,7 +64,11 @@ fn convert<const SWAP: bool>(src: &[u8], dst: &mut [u8]) {
     // Scalar tail (< 8 pixels). A trailing run shorter than one pixel is left
     // untouched, matching the per-backend buffers (always whole `w*h*4` pixels).
     while off + 4 <= src.len() {
-        let (r, b) = if SWAP { (src[off + 2], src[off]) } else { (src[off], src[off + 2]) };
+        let (r, b) = if SWAP {
+            (src[off + 2], src[off])
+        } else {
+            (src[off], src[off + 2])
+        };
         dst[off] = r;
         dst[off + 1] = src[off + 1];
         dst[off + 2] = b;
@@ -126,7 +130,9 @@ mod tests {
     }
 
     fn sample(pixels: usize) -> Vec<u8> {
-        (0..pixels * 4).map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8).collect()
+        (0..pixels * 4)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+            .collect()
     }
 
     #[test]
@@ -137,11 +143,19 @@ mod tests {
             for order in [SourceOrder::Bgr, SourceOrder::Rgb] {
                 let mut out = vec![0u8; data.len()];
                 to_opaque_rgba(&data, &mut out, order);
-                assert_eq!(out, reference(&data, order), "pixels={pixels} order={order:?}");
+                assert_eq!(
+                    out,
+                    reference(&data, order),
+                    "pixels={pixels} order={order:?}"
+                );
 
                 let mut inplace = data.clone();
                 to_opaque_rgba_in_place(&mut inplace, order);
-                assert_eq!(inplace, reference(&data, order), "in-place pixels={pixels} order={order:?}");
+                assert_eq!(
+                    inplace,
+                    reference(&data, order),
+                    "in-place pixels={pixels} order={order:?}"
+                );
             }
         }
     }

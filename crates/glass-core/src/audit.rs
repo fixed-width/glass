@@ -40,8 +40,14 @@ impl AuditOutcome {
     /// Derive an outcome from a `glass-core` result (the error is stringified).
     pub fn from_result<T>(r: &Result<T>) -> Self {
         match r {
-            Ok(_) => AuditOutcome { ok: true, error: None },
-            Err(e) => AuditOutcome { ok: false, error: Some(e.to_string()) },
+            Ok(_) => AuditOutcome {
+                ok: true,
+                error: None,
+            },
+            Err(e) => AuditOutcome {
+                ok: false,
+                error: Some(e.to_string()),
+            },
         }
     }
 }

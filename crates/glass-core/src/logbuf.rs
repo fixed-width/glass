@@ -24,12 +24,20 @@ pub struct LogBuffer {
 
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
-        Self { capacity: capacity.max(1), next_seq: 0, lines: VecDeque::new() }
+        Self {
+            capacity: capacity.max(1),
+            next_seq: 0,
+            lines: VecDeque::new(),
+        }
     }
 
     /// Append a line, evicting the oldest if at capacity.
     pub fn push(&mut self, stream: Stream, text: impl Into<String>) {
-        let line = LogLine { seq: self.next_seq, stream, text: text.into() };
+        let line = LogLine {
+            seq: self.next_seq,
+            stream,
+            text: text.into(),
+        };
         self.next_seq += 1;
         self.lines.push_back(line);
         while self.lines.len() > self.capacity {
@@ -148,7 +156,10 @@ mod tests {
         b.push(Stream::Stdout, "two");
         b.push(Stream::Stdout, "three");
         let (lines, cursor) = b.read(0, 100, None, None);
-        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["two", "three"]);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
         assert_eq!(lines[0].seq, 1); // "one" (seq 0) was evicted
         assert_eq!(cursor, 3);
     }
@@ -158,6 +169,9 @@ mod tests {
         let b = buf(); // 3 lines, seq 0..2
         assert_eq!(b.end_cursor(), 3);
         let (lines, _) = b.read(b.end_cursor(), 100, None, None);
-        assert!(lines.is_empty(), "reading from end_cursor yields only future lines");
+        assert!(
+            lines.is_empty(),
+            "reading from end_cursor yields only future lines"
+        );
     }
 }

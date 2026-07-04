@@ -99,12 +99,16 @@ fn no_app_tree_message(pids: &[u32]) -> String {
 async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
     let conn = match ctx.a11y_bus_addr.as_deref() {
         Some(addr) => {
-            let parsed = addr
-                .try_into()
-                .map_err(|e| GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}")))?;
-            AccessibilityConnection::from_address(parsed).await.map_err(|e| {
-                GlassError::AccessibilityUnavailable(format!("cannot reach the private a11y bus ({e})"))
-            })?
+            let parsed = addr.try_into().map_err(|e| {
+                GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}"))
+            })?;
+            AccessibilityConnection::from_address(parsed)
+                .await
+                .map_err(|e| {
+                    GlassError::AccessibilityUnavailable(format!(
+                        "cannot reach the private a11y bus ({e})"
+                    ))
+                })?
         }
         None => {
             return Err(GlassError::AccessibilityUnavailable(
@@ -134,10 +138,16 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
 
 async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
     let (app_ref, zbus_conn) = find_app(ctx).await?;
-    let app = app_ref.as_accessible_proxy(&zbus_conn).await.map_err(bus_err)?;
+    let app = app_ref
+        .as_accessible_proxy(&zbus_conn)
+        .await
+        .map_err(bus_err)?;
 
     let root_node = Box::pin(walk(&app, &zbus_conn)).await?;
-    let mut tree = AxTree { root: root_node, count: 0 };
+    let mut tree = AxTree {
+        root: root_node,
+        count: 0,
+    };
     tree.assign_ids();
     Ok(tree)
 }
@@ -210,10 +220,10 @@ async fn find_nth(
     }
     *counter += 1;
     for child_ref in proxy.get_children().await.map_err(bus_err)? {
-        let Ok(child) = child_ref.as_accessible_proxy(conn).await else { continue };
-        if let Some(found) =
-            Box::pin(find_nth(&child_ref, &child, conn, target, counter)).await?
-        {
+        let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+            continue;
+        };
+        if let Some(found) = Box::pin(find_nth(&child_ref, &child, conn, target, counter)).await? {
             return Ok(Some(found));
         }
     }
@@ -224,17 +234,20 @@ async fn find_nth(
 /// signal: the app matches when its owning pid is in `ctx.pids` (the launched app's PID
 /// set — root + enumerable descendants). An empty set (no pid hint, e.g. a backend that
 /// can't enumerate) accepts the first app (refine later).
-async fn app_matches(
-    app_ref: &ObjectRefOwned,
-    ctx: &AxContext,
-    conn: &zbus::Connection,
-) -> bool {
+async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Connection) -> bool {
     if ctx.pids.is_empty() {
         return true; // no pid hint: accept the first app (refine by geometry/title elsewhere)
     }
-    let Some(unique) = app_ref.name() else { return false };
-    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else { return false };
-    match dbus.get_connection_unix_process_id(unique.clone().into()).await {
+    let Some(unique) = app_ref.name() else {
+        return false;
+    };
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    match dbus
+        .get_connection_unix_process_id(unique.clone().into())
+        .await
+    {
         Ok(pid) => ctx.pids.contains(&pid),
         Err(_) => false,
     }
@@ -250,7 +263,9 @@ async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<Ax
 
     let mut children = Vec::new();
     for child_ref in proxy.get_children().await.map_err(bus_err)? {
-        let Ok(child) = child_ref.as_accessible_proxy(conn).await else { continue };
+        let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+            continue;
+        };
         children.push(Box::pin(walk(&child, conn)).await?);
     }
 
@@ -291,7 +306,12 @@ async fn extents(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Option
     if w <= 0 || h <= 0 {
         return None;
     }
-    Some(AxRect { x, y, width: w as u32, height: h as u32 })
+    Some(AxRect {
+        x,
+        y,
+        width: w as u32,
+        height: h as u32,
+    })
 }
 
 /// Read the element's current value/text for value-bearing roles, or `None`.
@@ -346,7 +366,13 @@ mod tests {
         let msg = no_app_tree_message(&[4321, 4322]);
         assert!(msg.contains("4321"), "names the PID(s)");
         assert!(msg.contains("enable accessibility") || msg.contains("AccessKit"));
-        assert!(msg.contains("pixel") || msg.contains("screenshot"), "points at the pixel-loop fallback");
-        assert!(!msg.contains("relaunch with a11y:true"), "distinct from the bus/opt-in error");
+        assert!(
+            msg.contains("pixel") || msg.contains("screenshot"),
+            "points at the pixel-loop fallback"
+        );
+        assert!(
+            !msg.contains("relaunch with a11y:true"),
+            "distinct from the bus/opt-in error"
+        );
     }
 }

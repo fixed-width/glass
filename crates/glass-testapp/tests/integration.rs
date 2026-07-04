@@ -40,16 +40,26 @@ fn wait_for_log(p: &mut X11Platform, needle: &str, tries: u32) -> bool {
 fn launches_testapp_and_finds_its_window() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    let geom = p.start_app(&app_spec()).unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    let geom = p
+        .start_app(&app_spec())
+        .unwrap_or_else(|e| panic!("start_app failed: {e}"));
     assert_eq!(geom.width, 320);
     assert_eq!(geom.height, 240);
-    assert!(wait_for_log(&mut p, "READY", 40), "never saw READY on stdout");
+    assert!(
+        wait_for_log(&mut p, "READY", 40),
+        "never saw READY on stdout"
+    );
     p.stop_app().unwrap();
 }
 
 fn pixel(frame: &glass_core::Frame, x: u32, y: u32) -> [u8; 4] {
     let i = ((y * frame.width + x) * 4) as usize;
-    [frame.pixels[i], frame.pixels[i + 1], frame.pixels[i + 2], frame.pixels[i + 3]]
+    [
+        frame.pixels[i],
+        frame.pixels[i + 1],
+        frame.pixels[i + 2],
+        frame.pixels[i + 3],
+    ]
 }
 
 #[test]
@@ -61,7 +71,12 @@ fn capture_frame_with_region_returns_subrectangle() {
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
     std::thread::sleep(std::time::Duration::from_millis(150));
     // A region inside the top-left red quadrant, captured straight from X.
-    let region = glass_core::Region { x: 10, y: 10, width: 80, height: 60 };
+    let region = glass_core::Region {
+        x: 10,
+        y: 10,
+        width: 80,
+        height: 60,
+    };
     let frame = p.capture_frame(Some(&region)).unwrap();
     assert_eq!((frame.width, frame.height), (80, 60));
     assert_eq!(pixel(&frame, 0, 0), [255, 0, 0, 255]);
@@ -86,9 +101,21 @@ fn captures_known_quadrant_colors() {
     assert_eq!(frame.height, 240);
     // Sample the center of each quadrant.
     assert_eq!(pixel(&frame, 80, 60), [255, 0, 0, 255], "TL should be red");
-    assert_eq!(pixel(&frame, 240, 60), [0, 255, 0, 255], "TR should be green");
-    assert_eq!(pixel(&frame, 80, 180), [0, 0, 255, 255], "BL should be blue");
-    assert_eq!(pixel(&frame, 240, 180), [255, 255, 255, 255], "BR should be white");
+    assert_eq!(
+        pixel(&frame, 240, 60),
+        [0, 255, 0, 255],
+        "TR should be green"
+    );
+    assert_eq!(
+        pixel(&frame, 80, 180),
+        [0, 0, 255, 255],
+        "BL should be blue"
+    );
+    assert_eq!(
+        pixel(&frame, 240, 180),
+        [255, 255, 255, 255],
+        "BR should be white"
+    );
     p.stop_app().unwrap();
 }
 
@@ -107,7 +134,10 @@ fn oversize_window_capture_returns_actionable_error() {
     let err = p.capture_frame(None).unwrap_err().to_string();
     assert!(err.contains("320x240"), "names the window size: {err}");
     assert!(err.contains("200x200"), "names the display size: {err}");
-    assert!(err.contains("GLASS_XVFB_SCREEN"), "names the larger-display remedy: {err}");
+    assert!(
+        err.contains("GLASS_XVFB_SCREEN"),
+        "names the larger-display remedy: {err}"
+    );
     assert!(
         !err.contains("get_image"),
         "should be the pre-flight actionable error, not the raw GetImage failure: {err}"
@@ -123,8 +153,14 @@ fn click_is_delivered_to_the_window() {
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     p.start_app(&app_spec()).unwrap();
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
-    p.send_pointer(&PointerEvent::Click { x: 30, y: 40, button: MouseButton::Left, count: 1, modifiers: vec![] })
-        .unwrap();
+    p.send_pointer(&PointerEvent::Click {
+        x: 30,
+        y: 40,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![],
+    })
+    .unwrap();
     // The fixture echoes: EVENT button=1 x=30 y=40
     assert!(
         wait_for_log(&mut p, "button=1 x=30 y=40", 40),
@@ -165,7 +201,10 @@ fn drag_emits_continuous_motion() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert!(motions >= 10, "expected many intermediate motion events, got {motions}");
+    assert!(
+        motions >= 10,
+        "expected many intermediate motion events, got {motions}"
+    );
     p.stop_app().unwrap();
 }
 
@@ -177,11 +216,19 @@ fn resize_changes_geometry_and_is_observed() {
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     p.start_app(&app_spec()).unwrap();
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
-    let geo = p.window(&WindowOp::Resize { width: 200, height: 150 }).unwrap();
+    let geo = p
+        .window(&WindowOp::Resize {
+            width: 200,
+            height: 150,
+        })
+        .unwrap();
     assert_eq!(geo.width, 200);
     assert_eq!(geo.height, 150);
     // The fixture echoes ConfigureNotify: EVENT configure w=200 h=150
-    assert!(wait_for_log(&mut p, "configure w=200 h=150", 40), "no configure echo");
+    assert!(
+        wait_for_log(&mut p, "configure w=200 h=150", 40),
+        "no configure echo"
+    );
     p.stop_app().unwrap();
 }
 
@@ -201,7 +248,10 @@ fn typed_text_and_chord_reach_the_window() {
     assert!(wait_for_log(&mut p, "keysym=97", 40), "did not receive 'a'");
     // Press Return chord -> keysym 0xff0d (65293).
     p.send_key(&KeyEvent::Chord("Return".into())).unwrap();
-    assert!(wait_for_log(&mut p, "keysym=65293", 40), "did not receive Return");
+    assert!(
+        wait_for_log(&mut p, "keysym=65293", 40),
+        "did not receive Return"
+    );
     p.stop_app().unwrap();
 }
 
@@ -320,18 +370,39 @@ fn crop_extracts_region_of_real_capture() {
     let full = p.capture_frame(None).unwrap();
 
     // A region fully inside the top-left red quadrant.
-    let red = full.crop(&glass_core::Region { x: 10, y: 10, width: 80, height: 60 }).unwrap();
+    let red = full
+        .crop(&glass_core::Region {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 60,
+        })
+        .unwrap();
     assert_eq!((red.width, red.height), (80, 60));
     assert_eq!(pixel(&red, 0, 0), [255, 0, 0, 255]);
     assert_eq!(pixel(&red, 79, 59), [255, 0, 0, 255]);
 
     // A region straddling the vertical midline (x=160): left half red, right half green.
-    let straddle = full.crop(&glass_core::Region { x: 120, y: 60, width: 80, height: 60 }).unwrap();
+    let straddle = full
+        .crop(&glass_core::Region {
+            x: 120,
+            y: 60,
+            width: 80,
+            height: 60,
+        })
+        .unwrap();
     assert_eq!(pixel(&straddle, 10, 30), [255, 0, 0, 255]); // src x≈130 -> red
     assert_eq!(pixel(&straddle, 70, 30), [0, 255, 0, 255]); // src x≈190 -> green
 
     // Out of bounds is rejected, not clamped.
-    assert!(full.crop(&glass_core::Region { x: 0, y: 0, width: 999, height: 1 }).is_err());
+    assert!(full
+        .crop(&glass_core::Region {
+            x: 0,
+            y: 0,
+            width: 999,
+            height: 1
+        })
+        .is_err());
 
     p.stop_app().unwrap();
 }
@@ -346,7 +417,11 @@ fn failed_start_kills_the_child_process() {
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
         build: None,
-        run: vec!["sh".to_string(), "-c".to_string(), "echo PIDLINE=$$; exec sleep 30".to_string()],
+        run: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo PIDLINE=$$; exec sleep 30".to_string(),
+        ],
         cwd: None,
         env: vec![],
         window_hint: None,
@@ -355,7 +430,10 @@ fn failed_start_kills_the_child_process() {
         a11y: false,
     };
     let err = p.start_app(&spec).unwrap_err();
-    assert!(matches!(err, GlassError::Timeout(_)), "expected Timeout, got {err}");
+    assert!(
+        matches!(err, GlassError::Timeout(_)),
+        "expected Timeout, got {err}"
+    );
 
     // Recover the child PID from its stdout (captured before it was killed).
     let mut pid = None;
@@ -394,28 +472,43 @@ fn enumerates_and_selects_multiple_windows() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    p.start_app(&spec).unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("start_app failed: {e}"));
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
     std::thread::sleep(std::time::Duration::from_millis(200)); // let both windows draw
 
     let windows = p.list_windows().unwrap();
     assert_eq!(windows.len(), 2, "expected 2 windows, got {windows:?}");
 
-    let main = windows.iter().find(|w| w.title.as_deref() == Some("glass-testapp")).expect("main window");
-    let extra = windows.iter().find(|w| w.title.as_deref() == Some("glass-testapp-1")).expect("extra window");
+    let main = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("main window");
+    let extra = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp-1"))
+        .expect("extra window");
     assert_ne!(main.id, extra.id);
 
     // Select the extra window: it is a solid magenta fill.
     p.select_window(extra.id).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     let f = p.capture_frame(None).unwrap();
-    assert_eq!(pixel(&f, 160, 120), [255, 0, 255, 255], "extra window should be solid magenta");
+    assert_eq!(
+        pixel(&f, 160, 120),
+        [255, 0, 255, 255],
+        "extra window should be solid magenta"
+    );
 
     // Select the main window: top-left quadrant is red.
     p.select_window(main.id).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     let f = p.capture_frame(None).unwrap();
-    assert_eq!(pixel(&f, 80, 60), [255, 0, 0, 255], "main window TL should be red");
+    assert_eq!(
+        pixel(&f, 80, 60),
+        [255, 0, 0, 255],
+        "main window TL should be red"
+    );
 
     // A bogus id is rejected.
     assert!(p.select_window(glass_core::WindowId(0xDEAD_BEEF)).is_err());
@@ -440,7 +533,10 @@ fn modified_click_carries_modifier_state() {
         modifiers: vec![Modifier::Control],
     })
     .unwrap();
-    assert!(wait_for_log(&mut p, "state=4", 40), "ctrl not held during click");
+    assert!(
+        wait_for_log(&mut p, "state=4", 40),
+        "ctrl not held during click"
+    );
     // Shift -> ShiftMask (1).
     p.send_pointer(&PointerEvent::Click {
         x: 30,
@@ -450,7 +546,10 @@ fn modified_click_carries_modifier_state() {
         modifiers: vec![Modifier::Shift],
     })
     .unwrap();
-    assert!(wait_for_log(&mut p, "state=1", 40), "shift not held during click");
+    assert!(
+        wait_for_log(&mut p, "state=1", 40),
+        "shift not held during click"
+    );
     p.stop_app().unwrap();
 }
 
@@ -478,11 +577,19 @@ fn dropping_platform_reaps_the_app() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     p.start_app(&app_spec()).unwrap();
-    assert!(wait_for_log(&mut p, "READY", 40), "never saw READY on stdout");
-    let pid = p.app_pid().expect("the X11 backend exposes the launched app pid");
+    assert!(
+        wait_for_log(&mut p, "READY", 40),
+        "never saw READY on stdout"
+    );
+    let pid = p
+        .app_pid()
+        .expect("the X11 backend exposes the launched app pid");
     assert!(pid_alive(pid), "the app should be running before drop");
     drop(p); // deliberately no stop_app(): teardown must happen via Drop
-    assert!(wait_until_gone(pid, 50), "app pid {pid} still alive after Drop — orphan leak");
+    assert!(
+        wait_until_gone(pid, 50),
+        "app pid {pid} still alive after Drop — orphan leak"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -502,9 +609,24 @@ fn serve_clipboard_once(display: &str, text: &str) {
     let screen = &conn.setup().roots[screen_num];
 
     // Intern the atoms we need.
-    let clipboard = conn.intern_atom(false, b"CLIPBOARD").unwrap().reply().unwrap().atom;
-    let utf8 = conn.intern_atom(false, b"UTF8_STRING").unwrap().reply().unwrap().atom;
-    let targets_atom = conn.intern_atom(false, b"TARGETS").unwrap().reply().unwrap().atom;
+    let clipboard = conn
+        .intern_atom(false, b"CLIPBOARD")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let targets_atom = conn
+        .intern_atom(false, b"TARGETS")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
 
     // Create a window to own the selection.
     let win = conn.generate_id().unwrap();
@@ -512,15 +634,24 @@ fn serve_clipboard_once(display: &str, text: &str) {
         0,
         win,
         root,
-        0, 0, 1, 1,
+        0,
+        0,
+        1,
+        1,
         0,
         WindowClass::INPUT_ONLY,
         screen.root_visual,
         &CreateWindowAux::default(),
-    ).unwrap().check().unwrap();
+    )
+    .unwrap()
+    .check()
+    .unwrap();
 
     // Take ownership of CLIPBOARD.
-    conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME).unwrap().check().unwrap();
+    conn.set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
     conn.flush().unwrap();
 
     // Serve events: answer one SelectionRequest then exit.
@@ -547,7 +678,10 @@ fn serve_clipboard_once(display: &str, text: &str) {
                                 reply_prop,
                                 AtomEnum::ATOM,
                                 atoms,
-                            ).unwrap().check().unwrap();
+                            )
+                            .unwrap()
+                            .check()
+                            .unwrap();
                         } else if req.target == utf8 {
                             conn.change_property8(
                                 PropMode::REPLACE,
@@ -555,7 +689,10 @@ fn serve_clipboard_once(display: &str, text: &str) {
                                 reply_prop,
                                 utf8,
                                 text.as_bytes(),
-                            ).unwrap().check().unwrap();
+                            )
+                            .unwrap()
+                            .check()
+                            .unwrap();
                         } else {
                             // Unsupported target: refuse by setting property to None.
                             // We notify with property=NONE.
@@ -569,7 +706,9 @@ fn serve_clipboard_once(display: &str, text: &str) {
                                 property: x11rb::NONE,
                             };
                             conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)
-                                .unwrap().check().unwrap();
+                                .unwrap()
+                                .check()
+                                .unwrap();
                             conn.flush().unwrap();
                             continue;
                         }
@@ -585,7 +724,9 @@ fn serve_clipboard_once(display: &str, text: &str) {
                             property: reply_prop,
                         };
                         conn.send_event(false, req.requestor, EventMask::NO_EVENT, notify)
-                            .unwrap().check().unwrap();
+                            .unwrap()
+                            .check()
+                            .unwrap();
                         conn.flush().unwrap();
                         served = true;
                     }
@@ -652,15 +793,23 @@ fn sandbox_default_app_still_runs_and_captures() {
         sandbox: glass_core::SandboxLevel::Default,
         a11y: false,
     };
-    let geom = p.start_app(&spec).unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
+    let geom = p
+        .start_app(&spec)
+        .unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
     assert_eq!(geom.width, 320);
     assert_eq!(geom.height, 240);
-    assert!(wait_for_log(&mut p, "READY", 60), "never saw READY on stdout (sandboxed)");
+    assert!(
+        wait_for_log(&mut p, "READY", 60),
+        "never saw READY on stdout (sandboxed)"
+    );
     std::thread::sleep(std::time::Duration::from_millis(150));
     let frame = p.capture_frame(None).unwrap();
     // At least one non-zero pixel proves the app rendered something.
     let non_zero = frame.pixels.iter().any(|&b| b != 0);
-    assert!(non_zero, "captured frame is entirely zero (blank) — app may not have connected to X");
+    assert!(
+        non_zero,
+        "captured frame is entirely zero (blank) — app may not have connected to X"
+    );
     p.stop_app().unwrap();
 }
 
@@ -686,11 +835,15 @@ fn sandbox_off_build_step_writes_to_real_home() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    p.start_app(&spec).unwrap_or_else(|e| panic!("off-sandbox start_app failed: {e}"));
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("off-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
     let exists = sentinel_path.exists();
     std::fs::remove_file(&sentinel_path).ok();
-    assert!(exists, "Off sandbox: sentinel {sentinel_path:?} must exist (unconfined write)");
+    assert!(
+        exists,
+        "Off sandbox: sentinel {sentinel_path:?} must exist (unconfined write)"
+    );
 }
 
 /// The build step is UNSANDBOXED (only the launched run is contained), so even at the
@@ -700,7 +853,10 @@ fn sandbox_off_build_step_writes_to_real_home() {
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
 fn sandbox_default_build_step_writes_real_home() {
-    let sentinel_name = format!("glass-sandbox-test-sentinel-default-{}.tmp", std::process::id());
+    let sentinel_name = format!(
+        "glass-sandbox-test-sentinel-default-{}.tmp",
+        std::process::id()
+    );
     let real_home = std::env::var("HOME").expect("$HOME must be set");
     let sentinel_path = std::path::PathBuf::from(&real_home).join(&sentinel_name);
     let _ = std::fs::remove_file(&sentinel_path);
@@ -717,7 +873,8 @@ fn sandbox_default_build_step_writes_real_home() {
         sandbox: glass_core::SandboxLevel::Default,
         a11y: false,
     };
-    p.start_app(&spec).unwrap_or_else(|e| panic!("default-sandbox start_app failed: {e}"));
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("default-sandbox start_app failed: {e}"));
     p.stop_app().unwrap();
     let exists = sentinel_path.exists();
     std::fs::remove_file(&sentinel_path).ok();
@@ -765,7 +922,10 @@ fn fail_closed_when_bwrap_missing() {
         err
     };
     assert!(
-        matches!(sandboxed_err, Some(glass_core::GlassError::SandboxUnavailable(_))),
+        matches!(
+            sandboxed_err,
+            Some(glass_core::GlassError::SandboxUnavailable(_))
+        ),
         "expected SandboxUnavailable, got {sandboxed_err:?}"
     );
 }
@@ -781,17 +941,25 @@ fn a11y_true_fails_launch_when_bus_cannot_start() {
     struct EnvGuard(Option<std::ffi::OsString>);
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match &self.0 { Some(v) => std::env::set_var("GLASS_DBUS_DAEMON", v), None => std::env::remove_var("GLASS_DBUS_DAEMON") }
+            match &self.0 {
+                Some(v) => std::env::set_var("GLASS_DBUS_DAEMON", v),
+                None => std::env::remove_var("GLASS_DBUS_DAEMON"),
+            }
         }
     }
     let _guard = EnvGuard(std::env::var_os("GLASS_DBUS_DAEMON"));
-    std::env::set_var("GLASS_DBUS_DAEMON", "/nonexistent/glass-no-such-dbus-daemon");
+    std::env::set_var(
+        "GLASS_DBUS_DAEMON",
+        "/nonexistent/glass-no-such-dbus-daemon",
+    );
 
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let mut spec = app_spec();
     spec.a11y = true;
-    let err = p.start_app(&spec).expect_err("a11y:true with an unstartable bus must fail the launch");
+    let err = p
+        .start_app(&spec)
+        .expect_err("a11y:true with an unstartable bus must fail the launch");
     assert!(
         matches!(err, glass_core::GlassError::AccessibilityUnavailable(_)),
         "expected AccessibilityUnavailable, got {err:?}"
@@ -914,7 +1082,8 @@ fn sandbox_off_bypasses_bwrap_check() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    p.start_app(&spec).unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
     p.stop_app().unwrap();
 }
 
@@ -941,7 +1110,9 @@ fn stop_app_reaps_the_apps_forked_child() {
                 child_pid = rest.trim().parse().ok();
             }
         }
-        if child_pid.is_some() { break; }
+        if child_pid.is_some() {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let child_pid = child_pid.expect("fixture should report its forked child pid");
@@ -967,8 +1138,13 @@ fn drag_is_time_paced() {
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
     let t = std::time::Instant::now();
     p.send_pointer(&PointerEvent::Drag {
-        from_x: 30, from_y: 30, to_x: 200, to_y: 200,
-        button: MouseButton::Left, modifiers: vec![], duration_ms: 200,
+        from_x: 30,
+        from_y: 30,
+        to_x: 200,
+        to_y: 200,
+        button: MouseButton::Left,
+        modifiers: vec![],
+        duration_ms: 200,
     })
     .unwrap();
     let el = t.elapsed();
@@ -1013,7 +1189,10 @@ fn click_with_modifier_reaches_app() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    assert!(saw_ctrl, "Control modifier (mask 0x04) not reflected on the button event");
+    assert!(
+        saw_ctrl,
+        "Control modifier (mask 0x04) not reflected on the button event"
+    );
     p.stop_app().unwrap();
 }
 
@@ -1026,7 +1205,8 @@ fn window_op_on_a_closed_window_reports_window_not_found() {
 
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    p.start_app(&app_spec()).unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    p.start_app(&app_spec())
+        .unwrap_or_else(|e| panic!("start_app failed: {e}"));
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
 
     // Capture glass's stored window id, then kill it out from under glass via a

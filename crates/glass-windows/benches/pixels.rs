@@ -29,16 +29,20 @@ fn bench(c: &mut Criterion) {
         let data = bgra(w, h);
         g.throughput(Throughput::Elements(u64::from(w) * u64::from(h)));
         // Conversion is in place, so clone per iteration (the clone is setup, not timed).
-        g.bench_with_input(BenchmarkId::new("convert", format!("{w}x{h}")), &data, |b, data| {
-            b.iter_batched(
-                || data.clone(),
-                |mut buf| {
-                    bgra_to_rgba(black_box(&mut buf));
-                    buf
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        g.bench_with_input(
+            BenchmarkId::new("convert", format!("{w}x{h}")),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || data.clone(),
+                    |mut buf| {
+                        bgra_to_rgba(black_box(&mut buf));
+                        buf
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
     g.finish();
 }

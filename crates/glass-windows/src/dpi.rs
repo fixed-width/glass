@@ -40,7 +40,10 @@ mod tests {
     fn normalized_subtracts_virtual_origin() {
         // a monitor to the LEFT of primary: the virtual origin is negative, so the
         // subtraction (not a no-op here) must place its left edge at 0 and right at 65535.
-        assert_eq!(screen_to_normalized((-1920, 0), (3840, 1080), (-1920, 0)), (0, 0));
+        assert_eq!(
+            screen_to_normalized((-1920, 0), (3840, 1080), (-1920, 0)),
+            (0, 0)
+        );
         let (nx, _) = screen_to_normalized((-1920, 0), (3840, 1080), (1919, 0));
         assert_eq!(nx, 65535);
     }

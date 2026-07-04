@@ -31,12 +31,21 @@ impl PrivateClipboard {
     }
 
     pub fn list(&self) -> Vec<FormatKey> {
-        self.0.lock().expect("clip mutex").items.iter().map(|(k, _)| k.clone()).collect()
+        self.0
+            .lock()
+            .expect("clip mutex")
+            .items
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     pub fn get(&self, key: &FormatKey) -> Option<Vec<u8>> {
         let g = self.0.lock().expect("clip mutex");
-        g.items.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        g.items
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
     }
 
     pub fn get_all(&self) -> Vec<(FormatKey, Vec<u8>)> {
@@ -113,9 +122,18 @@ mod tests {
         let s0 = c.seq();
         c.set_all(items());
         assert!(c.seq() > s0);
-        assert_eq!(c.list(), vec![FormatKey::Standard(13), FormatKey::Named("HTML Format".into())]);
+        assert_eq!(
+            c.list(),
+            vec![
+                FormatKey::Standard(13),
+                FormatKey::Named("HTML Format".into())
+            ]
+        );
         assert_eq!(c.get(&FormatKey::Standard(13)), Some(b"u".to_vec()));
-        assert_eq!(c.get(&FormatKey::Named("HTML Format".into())), Some(b"<b/>".to_vec()));
+        assert_eq!(
+            c.get(&FormatKey::Named("HTML Format".into())),
+            Some(b"<b/>".to_vec())
+        );
         assert_eq!(c.get(&FormatKey::Standard(999)), None);
         assert_eq!(c.get_all(), items());
     }
@@ -134,9 +152,21 @@ mod tests {
     fn apply_dispatches_v2() {
         let c = PrivateClipboard::new();
         assert_eq!(c.apply(Request::SetAll(items())), Response::Ok);
-        assert_eq!(c.apply(Request::List), Response::Formats(vec![FormatKey::Standard(13), FormatKey::Named("HTML Format".into())]));
-        assert_eq!(c.apply(Request::Get(FormatKey::Standard(13))), Response::Bytes(Some(b"u".to_vec())));
-        assert_eq!(c.apply(Request::Get(FormatKey::Standard(1))), Response::Bytes(None));
+        assert_eq!(
+            c.apply(Request::List),
+            Response::Formats(vec![
+                FormatKey::Standard(13),
+                FormatKey::Named("HTML Format".into())
+            ])
+        );
+        assert_eq!(
+            c.apply(Request::Get(FormatKey::Standard(13))),
+            Response::Bytes(Some(b"u".to_vec()))
+        );
+        assert_eq!(
+            c.apply(Request::Get(FormatKey::Standard(1))),
+            Response::Bytes(None)
+        );
         assert_eq!(c.apply(Request::GetAll), Response::Items(items()));
         assert!(matches!(c.apply(Request::Seq), Response::Seq(_)));
         assert_eq!(c.apply(Request::Empty), Response::Ok);

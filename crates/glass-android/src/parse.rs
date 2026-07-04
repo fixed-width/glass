@@ -41,7 +41,11 @@ fn finish_block(b: WinBlock, out: &mut Vec<ParsedWindow>) {
     // window during launch, but not one the agent should drive.
     if b.pkg_match && b.on_screen && !b.title.starts_with("Splash Screen") {
         if let Some(frame) = b.frame {
-            out.push(ParsedWindow { id: b.id, title: b.title, frame });
+            out.push(ParsedWindow {
+                id: b.id,
+                title: b.title,
+                frame,
+            });
         }
     }
 }
@@ -73,7 +77,13 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
             if let Some(b) = cur.take() {
                 finish_block(b, &mut out);
             }
-            cur = Some(WinBlock { id, title, pkg_match: false, on_screen: false, frame: None });
+            cur = Some(WinBlock {
+                id,
+                title,
+                pkg_match: false,
+                on_screen: false,
+                frame: None,
+            });
             continue;
         }
         // A non-blank, less-indented line ends the window list / current block, so trailing
@@ -123,7 +133,10 @@ pub fn check_install(output: &str) -> Result<()> {
         .lines()
         .find(|l| l.contains("INSTALL_FAILED") || l.contains("Failure"))
         .unwrap_or_else(|| output.trim());
-    Err(GlassError::AppNotStarted(format!("adb install failed: {}", reason.trim())))
+    Err(GlassError::AppNotStarted(format!(
+        "adb install failed: {}",
+        reason.trim()
+    )))
 }
 
 /// `am start -W` → Err on an `Error:`/`Error type` line, else Ok.
@@ -132,7 +145,10 @@ pub fn check_am_start(output: &str) -> Result<()> {
         .lines()
         .find(|l| l.trim_start().starts_with("Error:") || l.contains("Error type"))
     {
-        return Err(GlassError::AppNotStarted(format!("am start failed: {}", err.trim())));
+        return Err(GlassError::AppNotStarted(format!(
+            "am start failed: {}",
+            err.trim()
+        )));
     }
     Ok(())
 }
@@ -144,7 +160,10 @@ pub fn parse_pid(output: &str) -> Option<u32> {
 
 /// All pids from `pidof <pkg>` output.
 pub fn parse_pids(output: &str) -> Vec<u32> {
-    output.split_whitespace().filter_map(|t| t.parse().ok()).collect()
+    output
+        .split_whitespace()
+        .filter_map(|t| t.parse().ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -162,7 +181,9 @@ mod tests {
     #[test]
     fn am_start_error_is_detected() {
         assert!(check_am_start("Starting: Intent {...}\nStatus: ok\n").is_ok());
-        let err = check_am_start("Starting: Intent {...}\nError type 3\nError: Activity not started\n").unwrap_err();
+        let err =
+            check_am_start("Starting: Intent {...}\nError type 3\nError: Activity not started\n")
+                .unwrap_err();
         assert!(matches!(err, GlassError::AppNotStarted(_)));
     }
 
@@ -204,12 +225,22 @@ mod tests {
         assert!(ws[0].title.contains("MyDialog"));
         assert_eq!(
             ws[0].frame,
-            glass_core::WindowGeometry { x: 140, y: 800, width: 800, height: 800 }
+            glass_core::WindowGeometry {
+                x: 140,
+                y: 800,
+                width: 800,
+                height: 800
+            }
         );
         assert_eq!(ws[1].id, 0xddd444);
         assert_eq!(
             ws[1].frame,
-            glass_core::WindowGeometry { x: 0, y: 0, width: 1080, height: 2400 }
+            glass_core::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1080,
+                height: 2400
+            }
         );
     }
 
@@ -249,7 +280,11 @@ mod tests {
             "    isOnScreen=true\n",
         );
         let ws = parse_app_windows(dump, "com.example.app");
-        assert_eq!(ws.len(), 1, "wallpaper must not absorb the trailing settings package");
+        assert_eq!(
+            ws.len(),
+            1,
+            "wallpaper must not absorb the trailing settings package"
+        );
         assert_eq!(ws[0].id, 0xaaa111);
     }
 
@@ -270,7 +305,12 @@ mod tests {
         // the window's own mFrame, NOT the containing/parent frame on the Frames: line
         assert_eq!(
             ws[0].frame,
-            glass_core::WindowGeometry { x: 0, y: 63, width: 1080, height: 2157 }
+            glass_core::WindowGeometry {
+                x: 0,
+                y: 63,
+                width: 1080,
+                height: 2157
+            }
         );
     }
 
@@ -289,7 +329,12 @@ mod tests {
         assert_eq!(ws.len(), 1);
         assert_eq!(
             ws[0].frame,
-            glass_core::WindowGeometry { x: 0, y: 63, width: 1080, height: 2274 }
+            glass_core::WindowGeometry {
+                x: 0,
+                y: 63,
+                width: 1080,
+                height: 2274
+            }
         );
     }
 }

@@ -56,7 +56,10 @@ mod tests {
 
     #[test]
     fn off_is_real_general() {
-        assert_eq!(decide_route(SandboxLevel::Off, None), ClipboardRoute::RealGeneral);
+        assert_eq!(
+            decide_route(SandboxLevel::Off, None),
+            ClipboardRoute::RealGeneral
+        );
     }
     #[test]
     fn off_is_real_general_even_with_a_confirmed_attempt() {
@@ -76,7 +79,10 @@ mod tests {
     }
     #[test]
     fn contained_with_no_attempt_is_unsupported() {
-        assert_eq!(decide_route(SandboxLevel::Strict, None), ClipboardRoute::Unsupported);
+        assert_eq!(
+            decide_route(SandboxLevel::Strict, None),
+            ClipboardRoute::Unsupported
+        );
     }
     #[test]
     fn contained_injectable_but_unconfirmed_is_unsupported() {
@@ -91,7 +97,10 @@ mod tests {
     }
     #[test]
     fn session_name_includes_pid_nonce_and_token() {
-        assert_eq!(session_pasteboard_name(42, 7, 3), "tech.fixedwidth.glass.clip.42.7.3");
+        assert_eq!(
+            session_pasteboard_name(42, 7, 3),
+            "tech.fixedwidth.glass.clip.42.7.3"
+        );
     }
     #[test]
     fn session_name_differs_when_any_input_differs() {

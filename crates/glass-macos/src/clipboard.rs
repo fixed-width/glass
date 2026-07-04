@@ -61,7 +61,10 @@ pub(crate) fn get_named(name: &str) -> Result<String> {
 /// Replace a named pasteboard's contents with `text` (plain text). Same routing as
 /// [`get_named`].
 pub(crate) fn set_named(name: &str, text: &str) -> Result<()> {
-    write(&NSPasteboard::pasteboardWithName(&NSString::from_str(name)), text)
+    write(
+        &NSPasteboard::pasteboardWithName(&NSString::from_str(name)),
+        text,
+    )
 }
 
 /// Whether the clip shim's sentinel item ([`SHIM_SENTINEL_TYPE`]) is present on the session's
@@ -147,7 +150,10 @@ mod tests {
     /// exercises `NSPasteboard::pasteboardWithName` — the exact lookup `get_named`/
     /// `set_named`/`shim_present` themselves perform — rather than `pasteboardWithUniqueName`.
     fn named(tag: &str) -> String {
-        format!("tech.fixedwidth.glass.clip-shim-test.{}.{tag}", std::process::id())
+        format!(
+            "tech.fixedwidth.glass.clip-shim-test.{}.{tag}",
+            std::process::id()
+        )
     }
 
     #[test]
@@ -168,7 +174,10 @@ mod tests {
     fn get_named_set_named_roundtrip_text() {
         let name = named("roundtrip");
         set_named(&name, "glass-named-probe-\u{1F9EA}").expect("set_named");
-        assert_eq!(get_named(&name).expect("get_named"), "glass-named-probe-\u{1F9EA}");
+        assert_eq!(
+            get_named(&name).expect("get_named"),
+            "glass-named-probe-\u{1F9EA}"
+        );
     }
 
     #[test]

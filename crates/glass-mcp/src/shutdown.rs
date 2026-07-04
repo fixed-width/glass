@@ -66,7 +66,12 @@ mod tests {
     struct BlockingBackend;
     impl Platform for BlockingBackend {
         fn start_app(&mut self, _s: &AppSpec) -> Result<WindowGeometry> {
-            Ok(WindowGeometry { x: 0, y: 0, width: 10, height: 10 })
+            Ok(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
         }
         fn stop_app(&mut self) -> Result<()> {
             // 2s >> the 200ms budget below — long enough to prove `run_shutdown`
@@ -76,15 +81,29 @@ mod tests {
             std::thread::sleep(Duration::from_secs(2));
             Ok(())
         }
-        fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> { unimplemented!() }
-        fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> { unimplemented!() }
-        fn send_key(&mut self, _e: &KeyEvent) -> Result<()> { unimplemented!() }
-        fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> { unimplemented!() }
+        fn capture_frame(&mut self, _r: Option<&Region>) -> Result<Frame> {
+            unimplemented!()
+        }
+        fn send_pointer(&mut self, _e: &PointerEvent) -> Result<()> {
+            unimplemented!()
+        }
+        fn send_key(&mut self, _e: &KeyEvent) -> Result<()> {
+            unimplemented!()
+        }
+        fn window(&mut self, _o: &WindowOp) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
         // start_on() lists windows (best-effort) to attribute audit records, so this
         // must answer rather than panic; no windows is fine for the shutdown test.
-        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> { Ok(vec![]) }
-        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> { unimplemented!() }
-        fn drain_logs(&mut self) -> Vec<(Stream, String)> { vec![] }
+        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            Ok(vec![])
+        }
+        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            vec![]
+        }
     }
 
     fn glass_with_blocking_backend() -> Glass {

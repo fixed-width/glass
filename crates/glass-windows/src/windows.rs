@@ -22,9 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
-use crate::util::{
-    enum_top_windows, extended_frame_bounds, find_by_title, window_rect, WinInfo,
-};
+use crate::util::{enum_top_windows, extended_frame_bounds, find_by_title, window_rect, WinInfo};
 
 /// A DWM frame `RECT` (left/top/right/bottom, physical pixels) as window geometry.
 pub(crate) fn rect_to_geometry(r: RECT) -> WindowGeometry {
@@ -121,8 +119,8 @@ pub(crate) fn focus_window(hwnd: HWND) -> Result<()> {
 /// works in `GetWindowRect` space, which includes the invisible resize border, so
 /// shift by the border delta (legacy-rect origin − DWM-frame origin, <= 0).
 pub(crate) fn move_window(hwnd: HWND, x: i32, y: i32) -> Result<()> {
-    let efb =
-        extended_frame_bounds(hwnd).ok_or_else(|| GlassError::Backend("no DWM frame bounds".into()))?;
+    let efb = extended_frame_bounds(hwnd)
+        .ok_or_else(|| GlassError::Backend("no DWM frame bounds".into()))?;
     let wr = window_rect(hwnd).ok_or_else(|| GlassError::Backend("no window rect".into()))?;
     // Border deltas: for a normal window GetWindowRect sits a few px outside the visible
     // DWM frame, so dx,dy <= 0. Maximized/borderless windows are degenerate here (the legacy
@@ -147,8 +145,8 @@ pub(crate) fn move_window(hwnd: HWND, x: i32, y: i32) -> Result<()> {
 /// Resize so the *visible* (DWM) frame is `width` x `height`. The legacy rect is
 /// larger by the invisible resize border, so add that extra to the requested size.
 pub(crate) fn resize_window(hwnd: HWND, width: u32, height: u32) -> Result<()> {
-    let efb =
-        extended_frame_bounds(hwnd).ok_or_else(|| GlassError::Backend("no DWM frame bounds".into()))?;
+    let efb = extended_frame_bounds(hwnd)
+        .ok_or_else(|| GlassError::Backend("no DWM frame bounds".into()))?;
     let wr = window_rect(hwnd).ok_or_else(|| GlassError::Backend("no window rect".into()))?;
     let extra_w = (wr.right - wr.left) - (efb.right - efb.left);
     let extra_h = (wr.bottom - wr.top) - (efb.bottom - efb.top);

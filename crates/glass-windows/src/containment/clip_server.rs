@@ -15,11 +15,9 @@ use glass_clip_hook::proto::{self, Request, Response};
 use glass_clip_hook::store::PrivateClipboard;
 use glass_core::{GlassError, Result};
 
-use windows::core::PCWSTR;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
@@ -64,7 +62,11 @@ impl ClipServer {
             .name(format!("glass-clip:{pipe_name}"))
             .spawn(move || accept_loop(&path_t, store, stop_t, dir, box_name))
             .map_err(|e| GlassError::Backend(format!("spawn clip server: {e}")))?;
-        Ok(ClipServer { pipe_path, stop, thread: Some(thread) })
+        Ok(ClipServer {
+            pipe_path,
+            stop,
+            thread: Some(thread),
+        })
     }
 
     /// Stop the loop and join its accept thread. Thin consuming wrapper over
@@ -287,9 +289,15 @@ fn read_exact(pipe: HANDLE, buf: &mut [u8]) -> bool {
     while off < buf.len() {
         let mut read = 0u32;
         // SAFETY: reading into buf[off..] on a connected pipe instance we own.
-        let ok =
-            unsafe { ReadFile(pipe, Some(&mut buf[off..]), Some(&mut read as *mut u32), None) }
-                .is_ok();
+        let ok = unsafe {
+            ReadFile(
+                pipe,
+                Some(&mut buf[off..]),
+                Some(&mut read as *mut u32),
+                None,
+            )
+        }
+        .is_ok();
         if !ok || read == 0 {
             return false;
         }

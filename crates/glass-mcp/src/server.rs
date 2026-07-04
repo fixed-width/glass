@@ -7,7 +7,7 @@ use glass_core::Glass;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use tokio::sync::Mutex;
 
 use crate::audit::AuditReport;
@@ -79,13 +79,19 @@ impl GlassServer {
                     let mut g = worker_glass.blocking_lock();
                     // A panicking tool becomes a loud error AND the thread survives — so it
                     // keeps serving calls and keeps parenting any still-running sandbox.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
-                        .unwrap_or_else(|_| Err("tool handler panicked".to_string()));
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut g)))
+                            .unwrap_or_else(|_| Err("tool handler panicked".to_string()));
                     let _ = reply.send(result);
                 }
             })
             .expect("spawn glass-platform thread");
-        Self { glass, jobs, report, tool_router: Self::tool_router() }
+        Self {
+            glass,
+            jobs,
+            report,
+            tool_router: Self::tool_router(),
+        }
     }
 
     /// A clone of the shared session registry, for the process-exit teardown path in
@@ -106,7 +112,9 @@ impl GlassServer {
         // panic comes back as a loud error, never an unanswered request.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send((Box::new(f), reply_tx)).is_err() {
-            return Ok(map_tool_result(Err("glass-platform thread is gone".to_string())));
+            return Ok(map_tool_result(Err(
+                "glass-platform thread is gone".to_string()
+            )));
         }
         let outcome = reply_rx
             .await
@@ -117,7 +125,10 @@ impl GlassServer {
     #[tool(
         description = "Build, launch, and locate a native GUI app; returns its window geometry. Optional `backend`: \"x11\" (headless Xvfb) or \"wayland\" (headless sway) on Linux, or \"windows\" on a Windows host, or \"android\" for an AVD emulator on any host; defaults to the host backend (windows on Windows, else x11). Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to an unrelated process (some packaged Windows apps)."
     )]
-    async fn glass_start(&self, Parameters(a): Parameters<StartArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_start(
+        &self,
+        Parameters(a): Parameters<StartArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::start(g, &a)).await
     }
 
@@ -126,8 +137,13 @@ impl GlassServer {
         self.run(tools::stop).await
     }
 
-    #[tool(description = "Focus/resize/move the window or read its geometry. op: focus|resize|move|geometry.")]
-    async fn glass_window(&self, Parameters(a): Parameters<WindowArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Focus/resize/move the window or read its geometry. op: focus|resize|move|geometry."
+    )]
+    async fn glass_window(
+        &self,
+        Parameters(a): Parameters<WindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::window(g, &a)).await
     }
 
@@ -151,23 +167,41 @@ impl GlassServer {
         self.run(move |g| tools::wait_stable(g, &a)).await
     }
 
-    #[tool(description = "Click at window-relative coordinates. button: left|right|middle; count for multi-click. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select.")]
-    async fn glass_click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Click at window-relative coordinates. button: left|right|middle; count for multi-click. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+    )]
+    async fn glass_click(
+        &self,
+        Parameters(a): Parameters<ClickArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::click(g, &a)).await
     }
 
     #[tool(description = "Move the pointer to window-relative coordinates.")]
-    async fn glass_move(&self, Parameters(a): Parameters<MoveArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_move(
+        &self,
+        Parameters(a): Parameters<MoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::mouse_move(g, &a)).await
     }
 
-    #[tool(description = "Drag with a button held from (x1,y1) to (x2,y2) — window-relative coordinates. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select.")]
-    async fn glass_drag(&self, Parameters(a): Parameters<DragArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Drag with a button held from (x1,y1) to (x2,y2) — window-relative coordinates. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+    )]
+    async fn glass_drag(
+        &self,
+        Parameters(a): Parameters<DragArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::drag(g, &a)).await
     }
 
-    #[tool(description = "Scroll at window-relative coordinates by (dx,dy) wheel steps. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select.")]
-    async fn glass_scroll(&self, Parameters(a): Parameters<ScrollArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Scroll at window-relative coordinates by (dx,dy) wheel steps. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+    )]
+    async fn glass_scroll(
+        &self,
+        Parameters(a): Parameters<ScrollArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::scroll(g, &a)).await
     }
 
@@ -178,17 +212,26 @@ impl GlassServer {
                        two-finger swipe = two parallel segments; a from==to pointer is held. \
                        Android backend only (needs the on-device agent)."
     )]
-    async fn glass_gesture(&self, Parameters(a): Parameters<GestureArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_gesture(
+        &self,
+        Parameters(a): Parameters<GestureArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::gesture(g, &a)).await
     }
 
     #[tool(description = "Type a string of text into the focused window.")]
-    async fn glass_type(&self, Parameters(a): Parameters<TypeArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_type(
+        &self,
+        Parameters(a): Parameters<TypeArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::type_text(g, &a)).await
     }
 
     #[tool(description = "Press a key chord like 'ctrl+s', 'Return', 'alt+F4'.")]
-    async fn glass_key(&self, Parameters(a): Parameters<KeyArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_key(
+        &self,
+        Parameters(a): Parameters<KeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::key(g, &a)).await
     }
 
@@ -230,12 +273,20 @@ impl GlassServer {
     }
 
     #[tool(description = "Save the current frame as a named visual baseline.")]
-    async fn glass_baseline_save(&self, Parameters(a): Parameters<BaselineSaveArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_baseline_save(
+        &self,
+        Parameters(a): Parameters<BaselineSaveArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::baseline_save(g, &a)).await
     }
 
-    #[tool(description = "Diff the current frame against a named baseline; returns change stats + bbox. Set `include_image: true` to also return the current frame cropped to the changed region (omitted when nothing changed).")]
-    async fn glass_diff(&self, Parameters(a): Parameters<DiffArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Diff the current frame against a named baseline; returns change stats + bbox. Set `include_image: true` to also return the current frame cropped to the changed region (omitted when nothing changed)."
+    )]
+    async fn glass_diff(
+        &self,
+        Parameters(a): Parameters<DiffArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::diff(g, &a)).await
     }
 
@@ -254,19 +305,27 @@ impl GlassServer {
         // The probes are blocking (and `deep` spawns a display), so keep them off the
         // stdio reactor thread.
         let report = self.report.clone();
-        let diag = tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
-            .await
-            .expect("doctor task panicked");
+        let diag =
+            tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
+                .await
+                .expect("doctor task panicked");
         Ok(to_call_result(ToolOutput::text(diag.render_text(backend))))
     }
 
-    #[tool(description = "List the app's top-level windows: id, title, class, geometry, and which is active. Returns a JSON array. Window ids are not stable across calls — re-list after windows open/close instead of caching ids.")]
+    #[tool(
+        description = "List the app's top-level windows: id, title, class, geometry, and which is active. Returns a JSON array. Window ids are not stable across calls — re-list after windows open/close instead of caching ids."
+    )]
     async fn glass_list_windows(&self) -> Result<CallToolResult, McpError> {
         self.run(tools::list_windows).await
     }
 
-    #[tool(description = "Make a window active by id (from glass_list_windows). Subsequent screenshot/click/type/window ops target it; coordinates are relative to it.")]
-    async fn glass_select_window(&self, Parameters(a): Parameters<SelectWindowArgs>) -> Result<CallToolResult, McpError> {
+    #[tool(
+        description = "Make a window active by id (from glass_list_windows). Subsequent screenshot/click/type/window ops target it; coordinates are relative to it."
+    )]
+    async fn glass_select_window(
+        &self,
+        Parameters(a): Parameters<SelectWindowArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::select_window(g, &a)).await
     }
 
@@ -330,7 +389,10 @@ impl GlassServer {
     }
 
     #[tool(description = "Read captured stdout/stderr log lines with a resumable cursor.")]
-    async fn glass_logs(&self, Parameters(a): Parameters<LogsArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_logs(
+        &self,
+        Parameters(a): Parameters<LogsArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::logs(g, &a)).await
     }
 
@@ -392,7 +454,10 @@ impl GlassServer {
                        form-fill, menu→item); if you must see a result to choose the next action, \
                        don't batch that part."
     )]
-    async fn glass_do(&self, Parameters(a): Parameters<DoArgs>) -> Result<CallToolResult, McpError> {
+    async fn glass_do(
+        &self,
+        Parameters(a): Parameters<DoArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.run(move |g| tools::do_actions(g, &a)).await
     }
 }
@@ -400,9 +465,8 @@ impl GlassServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GlassServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "glass gives you a build → see → interact → debug loop over a real native GUI \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "glass gives you a build → see → interact → debug loop over a real native GUI \
                  app — no app integration needed. One active session; tools target it implicitly; \
                  choose a backend (x11 or wayland) at glass_start.\n\n\
                  Loop: glass_start launches the app and captures its logs; glass_screenshot to see \
@@ -435,7 +499,7 @@ impl ServerHandler for GlassServer {
                  Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
                  failed capture or input returns a message, never a blank or stale frame; fix the \
                  cause instead of retrying blindly.",
-            )
+        )
     }
 }
 
@@ -450,14 +514,26 @@ mod tests {
     #[test]
     fn map_tool_result_flags_err_as_error() {
         let r = map_tool_result(Err("capture failed".to_string()));
-        assert_eq!(r.is_error, Some(true), "an Err must surface as an MCP error result");
-        assert!(first_text(&r).contains("capture failed"), "got {:?}", first_text(&r));
+        assert_eq!(
+            r.is_error,
+            Some(true),
+            "an Err must surface as an MCP error result"
+        );
+        assert!(
+            first_text(&r).contains("capture failed"),
+            "got {:?}",
+            first_text(&r)
+        );
     }
 
     #[test]
     fn map_tool_result_marks_ok_as_success() {
         let r = map_tool_result(Ok(ToolOutput::text("done")));
-        assert_eq!(r.is_error, Some(false), "an Ok must surface as a success result");
+        assert_eq!(
+            r.is_error,
+            Some(false),
+            "an Ok must surface as a success result"
+        );
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
     }
 }

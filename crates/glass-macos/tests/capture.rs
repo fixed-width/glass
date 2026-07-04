@@ -76,12 +76,18 @@ mod macos_main {
     /// build dir) before the process exits — `std::process::exit` skips Rust
     /// destructors, so `MacosPlatform::Drop` would never reap the child if we exited
     /// straight from in here.
-    fn try_expect<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
+    fn try_expect<T, E: std::fmt::Display>(
+        result: Result<T, E>,
+        context: &str,
+    ) -> Result<T, String> {
         result.map_err(|e| format!("{context}: {e}"))
     }
 
     fn swiftc_available() -> bool {
-        Command::new("swiftc").arg("--version").output().is_ok_and(|o| o.status.success())
+        Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Build `fixture/quadrants.swift` to a fresh temp path. Returns the built binary's
@@ -94,8 +100,12 @@ mod macos_main {
             fail(format!("fixture source not found at {}", source.display()));
         }
 
-        let out_dir = std::env::temp_dir().join(format!("glass-macos-capture-test-{}", std::process::id()));
-        expect(std::fs::create_dir_all(&out_dir), "creating fixture build dir");
+        let out_dir =
+            std::env::temp_dir().join(format!("glass-macos-capture-test-{}", std::process::id()));
+        expect(
+            std::fs::create_dir_all(&out_dir),
+            "creating fixture build dir",
+        );
         let out_bin = out_dir.join("quadrants");
 
         let status = Command::new("swiftc")
@@ -107,7 +117,10 @@ mod macos_main {
             .status();
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) => fail(format!("swiftc exited with {s} building {}", source.display())),
+            Ok(s) => fail(format!(
+                "swiftc exited with {s} building {}",
+                source.display()
+            )),
             Err(e) => fail(format!("failed to run swiftc: {e}")),
         }
         (out_bin, out_dir)
@@ -116,11 +129,18 @@ mod macos_main {
     /// Fetch pixel `(x, y)` from a tightly-packed RGBA8 `Frame` buffer.
     fn pixel_at(pixels: &[u8], frame_width: u32, x: u32, y: u32) -> [u8; 4] {
         let idx = (y as usize * frame_width as usize + x as usize) * 4;
-        [pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]]
+        [
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        ]
     }
 
     fn close(a: [u8; 4], b: [u8; 4]) -> bool {
-        a.iter().zip(b.iter()).all(|(x, y)| (*x as i32 - *y as i32).abs() <= TOLERANCE)
+        a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| (*x as i32 - *y as i32).abs() <= TOLERANCE)
     }
 
     /// Assert the pixel at `(x, y)` in `frame` is within tolerance of `expected`,
@@ -147,7 +167,13 @@ mod macos_main {
 
     /// Assert every pixel in a tightly-packed RGBA8 buffer of `w`x`h` is within tolerance
     /// of `expected`. Returns `Result` for the same reason as `assert_pixel`.
-    fn assert_uniform(pixels: &[u8], w: u32, h: u32, expected: [u8; 4], label: &str) -> Result<(), String> {
+    fn assert_uniform(
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        expected: [u8; 4],
+        label: &str,
+    ) -> Result<(), String> {
         for y in 0..h {
             for x in 0..w {
                 let got = pixel_at(pixels, w, x, y);
@@ -168,7 +194,10 @@ mod macos_main {
     /// from in here would skip `MacosPlatform::Drop` (Rust destructors don't run across
     /// `exit`) and leak the spawned `quadrants` fixture process (reparented to launchd,
     /// accumulating stray windows across repeated failed runs).
-    fn run_checks(platform: &mut MacosPlatform, fixture_bin: &std::path::Path) -> Result<(), String> {
+    fn run_checks(
+        platform: &mut MacosPlatform,
+        fixture_bin: &std::path::Path,
+    ) -> Result<(), String> {
         let spec = AppSpec {
             build: None,
             run: vec![fixture_bin.to_string_lossy().into_owned()],
@@ -219,17 +248,33 @@ mod macos_main {
         // red and exactly half-sized.
         let half_w = fw / 2;
         let half_h = fh / 2;
-        let region = Region { x: 0, y: 0, width: half_w, height: half_h };
-        let cropped =
-            try_expect(platform.capture_frame(Some(&region)), "capture_frame(Some(top-left region))")?;
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: half_w,
+            height: half_h,
+        };
+        let cropped = try_expect(
+            platform.capture_frame(Some(&region)),
+            "capture_frame(Some(top-left region))",
+        )?;
         if cropped.width != half_w || cropped.height != half_h {
             return Err(format!(
                 "cropped frame is {}x{}, expected {half_w}x{half_h}",
                 cropped.width, cropped.height
             ));
         }
-        assert_uniform(&cropped.pixels, cropped.width, cropped.height, RED, "cropped top-left region")?;
-        println!("region-crop OK: {}x{} uniformly red", cropped.width, cropped.height);
+        assert_uniform(
+            &cropped.pixels,
+            cropped.width,
+            cropped.height,
+            RED,
+            "cropped top-left region",
+        )?;
+        println!(
+            "region-crop OK: {}x{} uniformly red",
+            cropped.width, cropped.height
+        );
 
         Ok(())
     }

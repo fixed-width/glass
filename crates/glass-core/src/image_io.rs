@@ -31,7 +31,12 @@ pub fn frame_to_webp(frame: &Frame) -> Result<Vec<u8>> {
     }
     let mut out = Vec::new();
     WebPEncoder::new_lossless(&mut out)
-        .write_image(&frame.pixels, frame.width, frame.height, ExtendedColorType::Rgba8)
+        .write_image(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgba8,
+        )
         .map_err(|e| GlassError::ImageCodec(e.to_string()))?;
     Ok(out)
 }
@@ -53,7 +58,12 @@ mod tests {
     fn webp_roundtrip_is_lossless() {
         // A few distinct colors so a lossy codec would visibly corrupt them.
         let mut px = Vec::new();
-        for c in [[200, 100, 50, 255], [0, 0, 0, 255], [255, 255, 255, 255], [12, 240, 90, 255]] {
+        for c in [
+            [200, 100, 50, 255],
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [12, 240, 90, 255],
+        ] {
             px.extend_from_slice(&c);
         }
         let frame = Frame::new(2, 2, px).unwrap();
@@ -73,7 +83,11 @@ mod tests {
         // Frame has pub fields, so a frame whose dims overflow width*height*4
         // can be constructed directly (bypassing Frame::new's guard). Encoding
         // it must error, not panic on the overflowing multiply.
-        let frame = Frame { width: u32::MAX, height: u32::MAX, pixels: vec![0; 16] };
+        let frame = Frame {
+            width: u32::MAX,
+            height: u32::MAX,
+            pixels: vec![0; 16],
+        };
         let err = frame_to_webp(&frame).unwrap_err();
         assert!(matches!(err, GlassError::ImageCodec(_)), "got {err:?}");
     }

@@ -30,7 +30,10 @@ pub(crate) use sandboxie::{available, sandboxie_dir};
 /// Resolve the clip hook DLL path the way the launcher does (env > exe dir > None), for doctor.
 #[cfg(windows)]
 pub(crate) fn config_hook_dll_path(exe_dir: Option<&str>) -> Option<String> {
-    config::hook_dll_path(std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(), exe_dir)
+    config::hook_dll_path(
+        std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(),
+        exe_dir,
+    )
 }
 
 #[cfg(windows)]
@@ -80,10 +83,8 @@ mod imp {
         match decide(spec.sandbox, choice, super::sandboxie::available(&dir)) {
             Decision::Unconfined => Ok(Containment::Unconfined),
             Decision::Sandboxie => {
-                let s = super::sandboxie::Sandboxie::new(
-                    dir,
-                    format!("glass_{}", std::process::id()),
-                );
+                let s =
+                    super::sandboxie::Sandboxie::new(dir, format!("glass_{}", std::process::id()));
                 s.configure(spec.sandbox)?;
                 Ok(Containment::Sandboxie(s))
             }

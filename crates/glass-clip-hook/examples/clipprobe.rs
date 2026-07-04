@@ -144,7 +144,10 @@ fn run_multi() -> i32 {
     use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_UNICODETEXT};
 
     // Three payloads.
-    let utf16: Vec<u16> = "FROM-BOX-MULTI".encode_utf16().chain(std::iter::once(0)).collect();
+    let utf16: Vec<u16> = "FROM-BOX-MULTI"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let text_bytes: Vec<u8> = utf16.iter().flat_map(|u| u.to_le_bytes()).collect();
     let html_bytes = b"<b>hi</b>".to_vec();
     // A 2x2 32bpp BI_RGB DIB: 40-byte BITMAPINFOHEADER + 16 pixel bytes = 56 bytes.
@@ -167,7 +170,10 @@ fn run_multi() -> i32 {
     let cf_bmp = CF_BITMAP.0 as u32;
 
     unsafe {
-        let html_w: Vec<u16> = "HTML Format".encode_utf16().chain(std::iter::once(0)).collect();
+        let html_w: Vec<u16> = "HTML Format"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let html_fmt = RegisterClipboardFormatW(PCWSTR::from_raw(html_w.as_ptr()));
         if html_fmt == 0 {
             eprintln!("FAIL: RegisterClipboardFormatW");
@@ -180,7 +186,11 @@ fn run_multi() -> i32 {
             return 1;
         }
         let _ = EmptyClipboard();
-        for (fmt, data) in [(cf_text, &text_bytes), (html_fmt, &html_bytes), (cf_dib, &dib)] {
+        for (fmt, data) in [
+            (cf_text, &text_bytes),
+            (html_fmt, &html_bytes),
+            (cf_dib, &dib),
+        ] {
             let h = alloc_global(data);
             if h.0.is_null() {
                 let _ = CloseClipboard();
@@ -202,8 +212,10 @@ fn run_multi() -> i32 {
         }
         let text_rb = read_global_bytes(cf_text)
             .map(|b| {
-                let units: Vec<u16> =
-                    b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                let units: Vec<u16> = b
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
                 let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
                 String::from_utf16_lossy(&units[..len])
             })
@@ -257,7 +269,7 @@ fn guard_res<T>(f: impl FnOnce() -> windows::core::Result<T>) -> windows::core::
 /// Build a fresh HGLOBAL/content `FORMATETC` for `cf` (rebuilt per id, never stored/cloned).
 #[cfg(windows)]
 fn probe_formatetc(cf: u16) -> windows::Win32::System::Com::FORMATETC {
-    use windows::Win32::System::Com::{FORMATETC, DVASPECT_CONTENT, TYMED_HGLOBAL};
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
     FORMATETC {
         cfFormat: cf,
         ptd: std::ptr::null_mut(),
@@ -473,8 +485,10 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
 /// Decode `bytes` as a NUL-terminated UTF-16LE string (CF_UNICODETEXT payload).
 #[cfg(windows)]
 fn utf16_to_string(bytes: &[u8]) -> String {
-    let units: Vec<u16> =
-        bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..len])
 }
@@ -534,6 +548,7 @@ fn make_hdrop_blob() -> Vec<u8> {
 /// CF_HDROP round-trip via user32 and OLE.
 #[cfg(windows)]
 fn run_hdrop() -> i32 {
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Com::{
         CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
         TYMED_HGLOBAL,
@@ -541,7 +556,6 @@ fn run_hdrop() -> i32 {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, ReleaseStgMedium};
 
     const CF_HDROP: u32 = 15;
@@ -648,7 +662,7 @@ fn run_hdrop() -> i32 {
 fn run_ole() -> i32 {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::{
-        CoInitializeEx, IDataObject, FORMATETC, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT,
+        CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
         TYMED_HGLOBAL,
     };
     use windows::Win32::System::DataExchange::{
@@ -671,7 +685,10 @@ fn run_ole() -> i32 {
             return 1;
         }
 
-        let html_w: Vec<u16> = "HTML Format".encode_utf16().chain(std::iter::once(0)).collect();
+        let html_w: Vec<u16> = "HTML Format"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         // SAFETY: a NUL-terminated wide string we own for the duration of the call.
         let html_fmt = RegisterClipboardFormatW(PCWSTR::from_raw(html_w.as_ptr()));
         if html_fmt == 0 || html_fmt > u16::MAX as u32 {

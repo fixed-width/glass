@@ -47,7 +47,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     let network = Section::new(
         "network",
         None,
-        vec![Check::new("http transport", CheckStatus::Skip, "not built into this binary")],
+        vec![Check::new(
+            "http transport",
+            CheckStatus::Skip,
+            "not built into this binary",
+        )],
     );
 
     // Only show sections for backends actually compiled into THIS binary — absent
@@ -77,7 +81,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         // Sandbox is a host-level concern shared by both Linux backends; emit it
         // once here rather than once per backend.
         sections.push(Section::new("sandbox", None, glass_sandbox_linux::checks()));
-        sections.push(Section::new("accessibility (linux)", None, glass_a11y_linux::doctor::checks()));
+        sections.push(Section::new(
+            "accessibility (linux)",
+            None,
+            glass_a11y_linux::doctor::checks(),
+        ));
     }
     #[cfg(windows)]
     {
@@ -88,7 +96,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
         // In-OS containment posture (Sandboxie Classic) + VM-tier pointer.
         // Separate section, mirroring the Linux `sandbox` section.
-        sections.push(Section::new("sandbox", None, glass_windows::doctor::sandbox_checks()));
+        sections.push(Section::new(
+            "sandbox",
+            None,
+            glass_windows::doctor::sandbox_checks(),
+        ));
         sections.push(Section::new(
             "accessibility (windows)",
             None,
@@ -97,7 +109,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     }
     #[cfg(target_os = "macos")]
     {
-        sections.push(Section::new("macos", Some("macos".into()), macos_checks(backend)));
+        sections.push(Section::new(
+            "macos",
+            Some("macos".into()),
+            macos_checks(backend),
+        ));
         // Mirrors the Linux/Windows "sandbox" section: Seatbelt containment posture.
         sections.push(Section::new("sandbox", None, glass_sandbox_macos::checks()));
         // Mirrors "accessibility (linux)"/"accessibility (windows)": a dedicated section
@@ -126,7 +142,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     if !android_selected {
         soften_inactive_android(&mut android_checks);
     }
-    sections.push(Section::new("android", Some("android".into()), android_checks));
+    sections.push(Section::new(
+        "android",
+        Some("android".into()),
+        android_checks,
+    ));
 
     if let Some(report) = audit {
         sections.push(audit_section(report));
@@ -143,10 +163,16 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
             crate::audit::ContentMode::Full => "full",
         };
         // Invariant (set by audit::resolve/report_from_config): enabled ⇒ path is Some.
-        let path = report.path.as_deref().expect("AuditReport: enabled implies a path");
+        let path = report
+            .path
+            .as_deref()
+            .expect("AuditReport: enabled implies a path");
         (CheckStatus::Ok, format!("on → {path} (content: {mode})"))
     } else {
-        (CheckStatus::Skip, "off (set --audit-log/GLASS_AUDIT_LOG to enable)".to_string())
+        (
+            CheckStatus::Skip,
+            "off (set --audit-log/GLASS_AUDIT_LOG to enable)".to_string(),
+        )
     };
     Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
@@ -158,7 +184,10 @@ fn soften_inactive_android(checks: &mut [Check]) {
     for c in checks {
         if c.status == CheckStatus::Fail {
             c.status = CheckStatus::Warn;
-            c.detail = format!("{} (only required when the android backend is selected)", c.detail);
+            c.detail = format!(
+                "{} (only required when the android backend is selected)",
+                c.detail
+            );
         }
     }
 }
@@ -293,14 +322,17 @@ mod tests {
     #[test]
     fn inactive_android_fails_soften_to_warn() {
         let mut checks = vec![
-            Check::new("adb", CheckStatus::Fail, "`adb` not found").with_remedy("install platform-tools"),
+            Check::new("adb", CheckStatus::Fail, "`adb` not found")
+                .with_remedy("install platform-tools"),
             Check::new("emulator", CheckStatus::Warn, "no AVDs listed"),
             Check::new("agent", CheckStatus::Skip, "not configured"),
             Check::new("device", CheckStatus::Ok, "1 online"),
         ];
         soften_inactive_android(&mut checks);
         assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
-        assert!(checks[0].detail.contains("only required when the android backend is selected"));
+        assert!(checks[0]
+            .detail
+            .contains("only required when the android backend is selected"));
         assert_eq!(checks[0].remedy.as_deref(), Some("install platform-tools")); // remedy preserved
         assert_eq!(checks[1].status, CheckStatus::Warn); // Warn untouched
         assert_eq!(checks[2].status, CheckStatus::Skip); // Skip untouched
@@ -319,20 +351,59 @@ mod tests {
         // Windows); macOS's grants (Screen Recording, Accessibility) live inside its own
         // "macos" section rather than a separate accessibility section.
         #[cfg(target_os = "linux")]
-        assert_eq!(titles, ["general", "network", "x11", "wayland", "sandbox", "accessibility (linux)", "android"]);
+        assert_eq!(
+            titles,
+            [
+                "general",
+                "network",
+                "x11",
+                "wayland",
+                "sandbox",
+                "accessibility (linux)",
+                "android"
+            ]
+        );
         #[cfg(windows)]
-        assert_eq!(titles, ["general", "network", "windows", "sandbox", "accessibility (windows)", "android"]);
+        assert_eq!(
+            titles,
+            [
+                "general",
+                "network",
+                "windows",
+                "sandbox",
+                "accessibility (windows)",
+                "android"
+            ]
+        );
         #[cfg(target_os = "macos")]
-        assert_eq!(titles, ["general", "network", "macos", "sandbox", "accessibility (macos)", "android"]);
+        assert_eq!(
+            titles,
+            [
+                "general",
+                "network",
+                "macos",
+                "sandbox",
+                "accessibility (macos)",
+                "android"
+            ]
+        );
         // Android's section is always present and non-empty — its basic presence checks now
         // run unconditionally (deep probes gated to the selected backend; Fails softened to
         // Warn when android isn't active). Asserting non-empty catches accidental removal of
         // the section, without depending on which backend the ambient env resolves to.
-        let android = d.sections.iter().find(|s| s.title == "android").expect("android section");
+        let android = d
+            .sections
+            .iter()
+            .find(|s| s.title == "android")
+            .expect("android section");
         assert_eq!(android.backend.as_deref(), Some("android"));
         assert!(!android.checks.is_empty());
         // The `network` section is always present (Ok when compiled in, else Skip).
-        let net = d.sections.iter().find(|s| s.title == "network").expect("network section");
+        let net = d
+            .sections
+            .iter()
+            .find(|s| s.title == "network")
+            .expect("network section");
         assert_eq!(net.checks.len(), 1);
         // No section is a "not built into this binary" placeholder, and absent backends
         // are omitted entirely.
@@ -359,18 +430,36 @@ mod tests {
         // The only allowed "not built" placeholder is the network transport in a
         // stdio-only (no `network` feature) build — never a backend.
         #[cfg(feature = "network")]
-        assert!(!placeholder, "no 'not built into this binary' placeholders when network is compiled in");
+        assert!(
+            !placeholder,
+            "no 'not built into this binary' placeholders when network is compiled in"
+        );
         #[cfg(not(feature = "network"))]
         let _ = placeholder; // network shows its own Skip line in the stdio-only build
     }
 
     #[test]
     fn diagnose_with_audit_reports_posture() {
-        let on = crate::audit::AuditReport { enabled: true, path: Some("/v/g.jsonl".into()), content: crate::audit::ContentMode::Redacted, prefix_len: 8 };
+        let on = crate::audit::AuditReport {
+            enabled: true,
+            path: Some("/v/g.jsonl".into()),
+            content: crate::audit::ContentMode::Redacted,
+            prefix_len: 8,
+        };
         let t = diagnose_with_audit(false, &on).render_text("x11");
-        assert!(t.contains("audit") && t.contains("/v/g.jsonl") && t.contains("redacted"), "{t}");
-        let off = crate::audit::AuditReport { enabled: false, path: None, content: crate::audit::ContentMode::Redacted, prefix_len: 8 };
-        let t = diagnose_with_audit(false, &off).render_text("x11").to_lowercase();
+        assert!(
+            t.contains("audit") && t.contains("/v/g.jsonl") && t.contains("redacted"),
+            "{t}"
+        );
+        let off = crate::audit::AuditReport {
+            enabled: false,
+            path: None,
+            content: crate::audit::ContentMode::Redacted,
+            prefix_len: 8,
+        };
+        let t = diagnose_with_audit(false, &off)
+            .render_text("x11")
+            .to_lowercase();
         assert!(t.contains("audit") && t.contains("off"), "{t}");
     }
 
@@ -383,23 +472,35 @@ mod tests {
         #[test]
         fn all_granted_awake_and_resolved_is_all_ok() {
             let checks = macos_checks_from("macos", true, true, SessionState::Unlocked);
-            assert!(checks.iter().all(|c| c.status == CheckStatus::Ok), "{checks:?}");
+            assert!(
+                checks.iter().all(|c| c.status == CheckStatus::Ok),
+                "{checks:?}"
+            );
         }
 
         #[test]
         fn missing_screen_recording_fails_with_the_shared_remedy() {
             let checks = macos_checks_from("macos", false, true, SessionState::Unlocked);
-            let c = checks.iter().find(|c| c.name == "Screen Recording").unwrap();
+            let c = checks
+                .iter()
+                .find(|c| c.name == "Screen Recording")
+                .unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
             // Same wording `preflight`'s `PermissionDenied` error uses — no separate,
             // driftable copy in glass-mcp.
-            assert_eq!(c.remedy.as_deref(), Some(glass_macos::screen_recording_remedy()));
+            assert_eq!(
+                c.remedy.as_deref(),
+                Some(glass_macos::screen_recording_remedy())
+            );
         }
 
         #[test]
         fn missing_screen_recording_points_at_the_screen_capture_pane() {
             let checks = macos_checks_from("macos", false, true, SessionState::Unlocked);
-            let c = checks.iter().find(|c| c.name == "Screen Recording").unwrap();
+            let c = checks
+                .iter()
+                .find(|c| c.name == "Screen Recording")
+                .unwrap();
             assert_eq!(
                 c.remedy_action.as_deref(),
                 Some(format!("open {}", glass_macos::screen_recording_pane_url()).as_str())
@@ -411,7 +512,10 @@ mod tests {
             let checks = macos_checks_from("macos", true, false, SessionState::Unlocked);
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
-            assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
+            assert_eq!(
+                c.remedy.as_deref(),
+                Some(glass_macos::accessibility_remedy())
+            );
         }
 
         #[test]
@@ -429,7 +533,10 @@ mod tests {
             let checks = macos_checks_from("macos", true, true, SessionState::Locked);
             let c = checks.iter().find(|c| c.name == "display awake").unwrap();
             assert_eq!(c.status, CheckStatus::Warn);
-            assert!(c.remedy.as_deref().unwrap().contains("caffeinate -d"), "{c:?}");
+            assert!(
+                c.remedy.as_deref().unwrap().contains("caffeinate -d"),
+                "{c:?}"
+            );
         }
 
         #[test]
@@ -451,8 +558,17 @@ mod tests {
             let checks = macos_checks_from("macos", true, true, SessionState::NoSession);
             let c = checks.iter().find(|c| c.name == "display awake").unwrap();
             assert_eq!(c.status, CheckStatus::Warn);
-            assert!(c.detail.contains("no account is logged in at the console"), "{c:?}");
-            assert!(c.remedy.as_deref().unwrap().contains("launchctl bootstrap gui/"), "{c:?}");
+            assert!(
+                c.detail.contains("no account is logged in at the console"),
+                "{c:?}"
+            );
+            assert!(
+                c.remedy
+                    .as_deref()
+                    .unwrap()
+                    .contains("launchctl bootstrap gui/"),
+                "{c:?}"
+            );
         }
 
         #[test]
@@ -493,7 +609,10 @@ mod tests {
         #[test]
         fn a11y_granted_is_all_ok() {
             let checks = macos_a11y_checks(true);
-            assert!(checks.iter().all(|c| c.status == CheckStatus::Ok), "{checks:?}");
+            assert!(
+                checks.iter().all(|c| c.status == CheckStatus::Ok),
+                "{checks:?}"
+            );
         }
 
         #[test]
@@ -503,7 +622,10 @@ mod tests {
             assert_eq!(c.status, CheckStatus::Fail);
             // Same remedy string as the "macos" section's own Accessibility check — no
             // separate, driftable copy here either.
-            assert_eq!(c.remedy.as_deref(), Some(glass_macos::accessibility_remedy()));
+            assert_eq!(
+                c.remedy.as_deref(),
+                Some(glass_macos::accessibility_remedy())
+            );
         }
 
         #[test]

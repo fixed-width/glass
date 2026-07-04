@@ -23,10 +23,16 @@ pub fn poll_until<T>(
     let start = Instant::now();
     loop {
         if let Some(v) = tick()? {
-            return Ok(PollOutcome { value: Some(v), elapsed_ms: start.elapsed().as_millis() as u64 });
+            return Ok(PollOutcome {
+                value: Some(v),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
         }
         if start.elapsed().as_millis() as u64 >= timeout_ms {
-            return Ok(PollOutcome { value: None, elapsed_ms: start.elapsed().as_millis() as u64 });
+            return Ok(PollOutcome {
+                value: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
         }
         if interval_ms > 0 {
             std::thread::sleep(Duration::from_millis(interval_ms));

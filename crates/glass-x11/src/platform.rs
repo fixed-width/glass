@@ -200,7 +200,10 @@ impl X11Platform {
     /// callers can distinguish "window gone" from other backend failures.
     fn geometry_of_raw(&self, win: Window) -> std::result::Result<WindowGeometry, ReplyError> {
         let geo = self.conn.get_geometry(win)?.reply()?;
-        let abs = self.conn.translate_coordinates(win, self.root, 0, 0)?.reply()?;
+        let abs = self
+            .conn
+            .translate_coordinates(win, self.root, 0, 0)?
+            .reply()?;
         Ok(WindowGeometry {
             x: abs.dst_x as i32,
             y: abs.dst_y as i32,
@@ -214,7 +217,9 @@ impl X11Platform {
         Ok(self
             .conn
             .intern_atom(false, name)
-            .map_err(|e| GlassError::Backend(format!("intern {}: {e}", String::from_utf8_lossy(name))))?
+            .map_err(|e| {
+                GlassError::Backend(format!("intern {}: {e}", String::from_utf8_lossy(name)))
+            })?
             .reply()
             .map_err(|e| GlassError::Backend(format!("intern reply: {e}")))?
             .atom)
@@ -235,7 +240,11 @@ impl X11Platform {
             .children;
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for win in self.client_list_windows(client_list_atom).into_iter().chain(root_children) {
+        for win in self
+            .client_list_windows(client_list_atom)
+            .into_iter()
+            .chain(root_children)
+        {
             if !seen.insert(win) {
                 continue;
             }
@@ -316,9 +325,7 @@ impl X11Platform {
         loop {
             // Re-collect the pid set each iteration: a sandboxed launch's bwrap
             // child (the real app) appears in /proc shortly after bwrap starts.
-            let pids: Vec<u32> = root_pid
-                .map(proc_tree_pids)
-                .unwrap_or_default();
+            let pids: Vec<u32> = root_pid.map(proc_tree_pids).unwrap_or_default();
             if let Some(win) =
                 self.scan_for_window(&pids, pid_atom, client_list_atom, spec.window_hint.as_ref())?
             {
@@ -355,7 +362,11 @@ impl X11Platform {
         // then root's direct children (no-WM / bare Xvfb fallback). Dedup so a
         // non-reparented window present in both is only checked once.
         let mut seen = std::collections::HashSet::new();
-        for win in self.client_list_windows(client_list_atom).into_iter().chain(root_children) {
+        for win in self
+            .client_list_windows(client_list_atom)
+            .into_iter()
+            .chain(root_children)
+        {
             if !seen.insert(win) {
                 continue;
             }
@@ -472,7 +483,11 @@ impl X11Platform {
     }
 
     fn scroll_button(&self, pos_btn: u8, neg_btn: u8, delta: i32) -> Result<()> {
-        let (btn, times) = if delta >= 0 { (pos_btn, delta) } else { (neg_btn, -delta) };
+        let (btn, times) = if delta >= 0 {
+            (pos_btn, delta)
+        } else {
+            (neg_btn, -delta)
+        };
         for _ in 0..times {
             self.button(XT_BTN_PRESS, btn)?;
             self.button(XT_BTN_RELEASE, btn)?;
@@ -500,7 +515,9 @@ impl X11Platform {
                 return Ok((kc, true));
             }
         }
-        Err(GlassError::InvalidKey(format!("no keycode for keysym 0x{keysym:x}")))
+        Err(GlassError::InvalidKey(format!(
+            "no keycode for keysym 0x{keysym:x}"
+        )))
     }
 
     fn modifier_keycode(&self, m: glass_core::keys::Modifier) -> Result<u8> {
@@ -516,10 +533,26 @@ impl X11Platform {
 
     fn tap_keycode(&self, keycode: u8) -> Result<()> {
         self.conn
-            .xtest_fake_input(XT_KEY_PRESS, keycode, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
+            .xtest_fake_input(
+                XT_KEY_PRESS,
+                keycode,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )
             .map_err(|e| GlassError::Backend(format!("xtest key press: {e}")))?;
         self.conn
-            .xtest_fake_input(XT_KEY_RELEASE, keycode, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
+            .xtest_fake_input(
+                XT_KEY_RELEASE,
+                keycode,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )
             .map_err(|e| GlassError::Backend(format!("xtest key release: {e}")))?;
         Ok(())
     }
@@ -548,7 +581,12 @@ impl X11Platform {
         Ok(())
     }
 
-    fn key_with_mods(&self, keysym: u32, extra_shift: bool, mods: &[glass_core::keys::Modifier]) -> Result<()> {
+    fn key_with_mods(
+        &self,
+        keysym: u32,
+        extra_shift: bool,
+        mods: &[glass_core::keys::Modifier],
+    ) -> Result<()> {
         let (keycode, needs_shift) = self.keycode_for(keysym)?;
         let mut mods = mods.to_vec();
         if (needs_shift || extra_shift) && !mods.contains(&glass_core::keys::Modifier::Shift) {
@@ -620,7 +658,10 @@ struct X11DragSink<'a> {
 
 impl X11DragSink<'_> {
     fn flush(&self) -> Result<()> {
-        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
     }
 }
 
@@ -664,7 +705,10 @@ impl glass_core::TypeSink for X11TypeSink<'_> {
         })?;
         self.idx += 1;
         self.p.key_with_mods(keysym, false, &[])?;
-        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
     }
 }
 
@@ -680,7 +724,10 @@ struct X11ChordSink<'a> {
 
 impl X11ChordSink<'_> {
     fn flush(&self) -> Result<()> {
-        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
     }
 }
 
@@ -697,7 +744,15 @@ impl glass_core::ChordSink for X11ChordSink<'_> {
         let kind = if down { XT_KEY_PRESS } else { XT_KEY_RELEASE };
         self.p
             .conn
-            .xtest_fake_input(kind, self.keycode, x11rb::CURRENT_TIME, self.p.root, 0, 0, 0)
+            .xtest_fake_input(
+                kind,
+                self.keycode,
+                x11rb::CURRENT_TIME,
+                self.p.root,
+                0,
+                0,
+                0,
+            )
             .map_err(|e| GlassError::Backend(format!("xtest key: {e}")))?;
         self.flush()
     }
@@ -720,7 +775,10 @@ struct X11ScrollSink<'a> {
 
 impl X11ScrollSink<'_> {
     fn flush(&self) -> Result<()> {
-        self.p.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))
+        self.p
+            .conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))
     }
 }
 
@@ -745,7 +803,9 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         if spec.sandbox != glass_core::SandboxLevel::Off {
-            if let glass_sandbox_linux::Availability::Unavailable(why) = glass_sandbox_linux::availability() {
+            if let glass_sandbox_linux::Availability::Unavailable(why) =
+                glass_sandbox_linux::availability()
+            {
                 return Err(GlassError::SandboxUnavailable(format!(
                     "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
                      sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
@@ -775,7 +835,10 @@ impl Platform for X11Platform {
             self.kill_child(); // reap the private bus (and any child) on a failed spawn
             return Err(e);
         }
-        match self.discover_window(spec).and_then(|_| self.window_geometry()) {
+        match self
+            .discover_window(spec)
+            .and_then(|_| self.window_geometry())
+        {
             Ok(geo) => {
                 // Give the launched window keyboard focus so synthetic keys reach
                 // it (no WM in the headless Xvfb assigns focus). Best-effort: a
@@ -818,12 +881,23 @@ impl Platform for X11Platform {
         // window's pixel size is the display size.
         let display = {
             let root = &self.conn.setup().roots[self.screen_num];
-            (u32::from(root.width_in_pixels), u32::from(root.height_in_pixels))
+            (
+                u32::from(root.width_in_pixels),
+                u32::from(root.height_in_pixels),
+            )
         };
         crate::coords::check_capture_fits(&geo, region, display)?;
         let image = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, win, cx as i16, cy as i16, w as u16, h as u16, !0u32)
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                win,
+                cx as i16,
+                cy as i16,
+                w as u16,
+                h as u16,
+                !0u32,
+            )
             .map_err(|e| GlassError::CaptureFailed(format!("get_image: {e}")))?
             .reply()
             .map_err(|e| GlassError::CaptureFailed(format!("get_image reply: {e}")))?;
@@ -846,7 +920,13 @@ impl Platform for X11Platform {
         let (ox, oy) = (origin.x, origin.y);
         match *event {
             PointerEvent::Move { x, y } => self.warp(ox, oy, x, y)?,
-            PointerEvent::Scroll { x, y, dx, dy, ref modifiers } => {
+            PointerEvent::Scroll {
+                x,
+                y,
+                dx,
+                dy,
+                ref modifiers,
+            } => {
                 // Shared, frame-aware sequencing: hold the modifier across the wheel's frame instead
                 // of bursting modifier+wheel+release into one — see glass_core::run_scroll.
                 let mut sink = X11ScrollSink {
@@ -862,7 +942,13 @@ impl Platform for X11Platform {
                 };
                 glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
-            PointerEvent::Click { x, y, button, count, ref modifiers } => {
+            PointerEvent::Click {
+                x,
+                y,
+                button,
+                count,
+                ref modifiers,
+            } => {
                 self.warp(ox, oy, x, y)?;
                 let kcs = self.press_mods(modifiers)?;
                 let b = button_number(button);
@@ -872,7 +958,15 @@ impl Platform for X11Platform {
                 }
                 self.release_mods(&kcs)?;
             }
-            PointerEvent::Drag { from_x, from_y, to_x, to_y, button, ref modifiers, duration_ms } => {
+            PointerEvent::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+                ref modifiers,
+                duration_ms,
+            } => {
                 let gesture =
                     glass_core::DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
                 let mut sink = X11DragSink {
@@ -891,7 +985,9 @@ impl Platform for X11Platform {
                 ));
             }
         }
-        self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         Ok(())
     }
 
@@ -912,11 +1008,18 @@ impl Platform for X11Platform {
                 if needs_shift && !mods.contains(&glass_core::keys::Modifier::Shift) {
                     mods.push(glass_core::keys::Modifier::Shift);
                 }
-                let mut sink = X11ChordSink { p: &*self, mods: &mods, keycode, kcs: Vec::new() };
+                let mut sink = X11ChordSink {
+                    p: &*self,
+                    mods: &mods,
+                    keycode,
+                    kcs: Vec::new(),
+                };
                 glass_core::run_chord(&mut sink)?;
             }
         }
-        self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         Ok(())
     }
 
@@ -958,7 +1061,9 @@ impl Platform for X11Platform {
             }
             WindowOp::Geometry => {}
         }
-        self.conn.flush().map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
+        self.conn
+            .flush()
+            .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         self.window_geometry()
     }
 
@@ -1059,8 +1164,8 @@ impl Drop for X11Platform {
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
         self.kill_child(); // also stops clipboard_owner
-        // Redundant safety: kill_child already calls take(), but be explicit
-        // in case clipboard_owner was set after the last kill_child call.
+                           // Redundant safety: kill_child already calls take(), but be explicit
+                           // in case clipboard_owner was set after the last kill_child call.
         if let Some(owner) = self.clipboard_owner.take() {
             owner.stop();
         }
@@ -1084,34 +1189,60 @@ mod tests {
     // (tested there).
 
     fn hint(title: Option<&str>, class: Option<&str>) -> WindowHint {
-        WindowHint { title: title.map(Into::into), class: class.map(Into::into) }
+        WindowHint {
+            title: title.map(Into::into),
+            class: class.map(Into::into),
+        }
     }
 
     #[test]
     fn matches_title_exactly() {
         let h = hint(Some("Calculator"), None);
         assert!(hint_matches(Some("Calculator"), None, &h));
-        assert!(!hint_matches(Some("Calc"), None, &h), "title is an exact match, not substring");
+        assert!(
+            !hint_matches(Some("Calc"), None, &h),
+            "title is an exact match, not substring"
+        );
     }
 
     #[test]
     fn class_hint_matches_either_instance_or_class() {
         // xcalc's WM_CLASS is ("xcalc", "XCalc") — either should satisfy the hint.
-        assert!(hint_matches(None, Some(("xcalc", "XCalc")), &hint(None, Some("XCalc"))));
-        assert!(hint_matches(None, Some(("xcalc", "XCalc")), &hint(None, Some("xcalc"))));
-        assert!(!hint_matches(None, Some(("xcalc", "XCalc")), &hint(None, Some("gedit"))));
+        assert!(hint_matches(
+            None,
+            Some(("xcalc", "XCalc")),
+            &hint(None, Some("XCalc"))
+        ));
+        assert!(hint_matches(
+            None,
+            Some(("xcalc", "XCalc")),
+            &hint(None, Some("xcalc"))
+        ));
+        assert!(!hint_matches(
+            None,
+            Some(("xcalc", "XCalc")),
+            &hint(None, Some("gedit"))
+        ));
     }
 
     #[test]
     fn class_hint_does_not_match_when_window_has_no_class() {
-        assert!(!hint_matches(Some("whatever"), None, &hint(None, Some("XCalc"))));
+        assert!(!hint_matches(
+            Some("whatever"),
+            None,
+            &hint(None, Some("XCalc"))
+        ));
     }
 
     #[test]
     fn either_title_or_class_can_match() {
         // title wrong but class right still matches (OR semantics).
         let h = hint(Some("Nope"), Some("XCalc"));
-        assert!(hint_matches(Some("Calculator"), Some(("xcalc", "XCalc")), &h));
+        assert!(hint_matches(
+            Some("Calculator"),
+            Some(("xcalc", "XCalc")),
+            &h
+        ));
     }
 
     #[test]
@@ -1133,9 +1264,18 @@ mod env_display_tests {
 
     #[test]
     fn explicit_display_attaches() {
-        assert_eq!(display_target(Some(":0")), DisplayTarget::Attach(":0".into()));
-        assert_eq!(display_target(Some(":42")), DisplayTarget::Attach(":42".into()));
-        assert_eq!(display_target(Some("42")), DisplayTarget::Attach(":42".into()));
+        assert_eq!(
+            display_target(Some(":0")),
+            DisplayTarget::Attach(":0".into())
+        );
+        assert_eq!(
+            display_target(Some(":42")),
+            DisplayTarget::Attach(":42".into())
+        );
+        assert_eq!(
+            display_target(Some("42")),
+            DisplayTarget::Attach(":42".into())
+        );
     }
 
     #[test]

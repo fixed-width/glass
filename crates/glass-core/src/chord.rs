@@ -70,7 +70,10 @@ mod tests {
         run_chord(&mut sink).unwrap();
         // The order is the fix: the modifier is pressed before, and released strictly AFTER, the key
         // — so a frame-based client sees `key_pressed && modifiers` hold in the key's frame.
-        assert_eq!(sink.calls, vec![Mods(true), Key(true), Key(false), Mods(false)]);
+        assert_eq!(
+            sink.calls,
+            vec![Mods(true), Key(true), Key(false), Mods(false)]
+        );
     }
 
     #[test]

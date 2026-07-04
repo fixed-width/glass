@@ -20,7 +20,10 @@ pub struct Xvfb {
     /// The chosen display, formatted `:N`.
     pub display: String,
     // Held open for the server's lifetime so Xvfb never gets SIGPIPE on the fd.
-    #[expect(dead_code, reason = "RAII: held open for the server's lifetime so the fd never SIGPIPEs")]
+    #[expect(
+        dead_code,
+        reason = "RAII: held open for the server's lifetime so the fd never SIGPIPEs"
+    )]
     displayfd: ChildStdout,
 }
 
@@ -44,7 +47,11 @@ impl Xvfb {
 
         let stdout = child.stdout.take().expect("piped stdout");
         match read_displayfd(stdout, READY_TIMEOUT) {
-            Ok((num, displayfd)) => Ok(Xvfb { child, display: format!(":{num}"), displayfd }),
+            Ok((num, displayfd)) => Ok(Xvfb {
+                child,
+                display: format!(":{num}"),
+                displayfd,
+            }),
             Err(e) => {
                 glass_proc_linux::reap_graceful(&mut child, glass_proc_linux::REAP_GRACE);
                 Err(GlassError::Backend(match e {
@@ -127,8 +134,11 @@ mod tests {
     fn read_displayfd_times_out_on_a_silent_child() {
         // A child that stays alive and never writes its display (the wedged-Xvfb
         // case) must NOT block forever — read_displayfd returns TimedOut.
-        let mut child =
-            Command::new("sleep").arg("30").stdout(Stdio::piped()).spawn().expect("spawn sleep");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
         let stdout = child.stdout.take().expect("piped");
         let r = read_displayfd(stdout, Duration::from_millis(200));
         let _ = child.kill();
@@ -158,7 +168,10 @@ mod tests {
     #[test]
     fn read_displayfd_reports_closed_on_immediate_exit() {
         // Exits without writing — the pipe closes (EOF) → Closed, not a hang.
-        let mut child = Command::new("true").stdout(Stdio::piped()).spawn().expect("spawn true");
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
         let stdout = child.stdout.take().expect("piped");
         let r = read_displayfd(stdout, Duration::from_secs(5));
         let _ = child.wait();

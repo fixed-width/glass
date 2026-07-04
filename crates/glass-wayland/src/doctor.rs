@@ -33,18 +33,28 @@ fn wayland_checks(
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(match sway {
-        Ok((path, ver)) => {
-            Check::new("sway >=1.12", CheckStatus::Ok, format!("{ver} at {}", path.display()))
-        }
+        Ok((path, ver)) => Check::new(
+            "sway >=1.12",
+            CheckStatus::Ok,
+            format!("{ver} at {}", path.display()),
+        ),
         Err(remedy) => {
             Check::new("sway >=1.12", CheckStatus::Fail, "not found").with_remedy(remedy.clone())
         }
     });
     checks.push(if gl_present {
-        Check::new("software GL (Mesa)", CheckStatus::Ok, "libEGL + swrast DRI driver present")
+        Check::new(
+            "software GL (Mesa)",
+            CheckStatus::Ok,
+            "libEGL + swrast DRI driver present",
+        )
     } else {
-        Check::new("software GL (Mesa)", CheckStatus::Warn, "libEGL / swrast DRI driver not found")
-            .with_remedy("install Mesa software GL: `apt install libegl1 libgl1-mesa-dri`")
+        Check::new(
+            "software GL (Mesa)",
+            CheckStatus::Warn,
+            "libEGL / swrast DRI driver not found",
+        )
+        .with_remedy("install Mesa software GL: `apt install libegl1 libgl1-mesa-dri`")
     });
     if let Some(res) = deep_spawn {
         checks.push(match res {
@@ -92,12 +102,16 @@ fn gl_present() -> bool {
     ]
     .iter()
     .any(|p| Path::new(p).exists());
-    let swrast = ["/usr/lib/x86_64-linux-gnu/dri", "/usr/lib/dri", "/usr/lib64/dri"]
-        .iter()
-        .any(|d| {
-            let d = Path::new(d);
-            d.join("swrast_dri.so").exists() || d.join("kms_swrast_dri.so").exists()
-        });
+    let swrast = [
+        "/usr/lib/x86_64-linux-gnu/dri",
+        "/usr/lib/dri",
+        "/usr/lib64/dri",
+    ]
+    .iter()
+    .any(|d| {
+        let d = Path::new(d);
+        d.join("swrast_dri.so").exists() || d.join("kms_swrast_dri.so").exists()
+    });
     egl && swrast
 }
 

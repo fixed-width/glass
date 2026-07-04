@@ -95,7 +95,10 @@ mod imp {
         // `false` here means the sentinel write was refused, which would leave glass on the
         // fail-closed `Unsupported` route — surface why rather than failing silently.
         if !ready.setString_forType(&sentinel_value, &sentinel_type) {
-            eprintln!("glass-clip-shim: failed to write injection sentinel to {}.ready", name());
+            eprintln!(
+                "glass-clip-shim: failed to write injection sentinel to {}.ready",
+                name()
+            );
         }
     }
 }

@@ -41,7 +41,10 @@ fn charmap_spec() -> AppSpec {
         run: vec!["charmap.exe".to_string()],
         cwd: None,
         env: vec![],
-        window_hint: Some(WindowHint { title: Some("Character Map".into()), class: None }),
+        window_hint: Some(WindowHint {
+            title: Some("Character Map".into()),
+            class: None,
+        }),
         timeout_ms: 15_000,
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
@@ -60,7 +63,8 @@ fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
         repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
     AppSpec {
         build: Some(
-            "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml".to_string(),
+            "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml"
+                .to_string(),
         ),
         run: vec![fixture_exe.to_string_lossy().into_owned()],
         cwd: Some(repo_root),
@@ -78,13 +82,23 @@ fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
 /// Used to verify wheel + modifier delivery AND modifier-hold across containment levels.
 fn scroll_evidence(p: &mut WindowsPlatform, geo: &WindowGeometry) -> (Vec<String>, Vec<String>) {
     fn wheel_lines(p: &mut WindowsPlatform) -> Vec<String> {
-        p.drain_logs().into_iter().map(|(_, l)| l).filter(|l| l.contains("wheel")).collect()
+        p.drain_logs()
+            .into_iter()
+            .map(|(_, l)| l)
+            .filter(|l| l.contains("wheel"))
+            .collect()
     }
     let _ = p.drain_logs(); // discard startup ("ready") logs
     let (cx, cy) = (geo.width as i32 / 2, geo.height as i32 / 2);
 
-    p.send_pointer(&PointerEvent::Scroll { x: cx, y: cy, dx: 0, dy: -3, modifiers: vec![] })
-        .expect("plain scroll submits");
+    p.send_pointer(&PointerEvent::Scroll {
+        x: cx,
+        y: cy,
+        dx: 0,
+        dy: -3,
+        modifiers: vec![],
+    })
+    .expect("plain scroll submits");
     std::thread::sleep(Duration::from_millis(500));
     let plain = wheel_lines(p);
 
@@ -109,7 +123,10 @@ fn is_blank(px: &[u8]) -> bool {
 }
 
 fn changed(a: &[u8], b: &[u8]) -> usize {
-    a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, y)| x != y).count()
+    a.chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(x, y)| x != y)
+        .count()
 }
 
 fn counts(n: &AxNode, total: &mut usize, interactable: &mut usize) {
@@ -147,8 +164,14 @@ fn our_edge_count(marker: &str) -> i32 {
         "@(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | \
          Where-Object {{ $_.CommandLine -like '*{marker}*' }}).Count"
     );
-    match std::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps]).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(-1),
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(-1),
         Err(_) => -1,
     }
 }
@@ -165,14 +188,25 @@ fn onbox_capture_and_input() {
     let f1 = p.capture_frame(None).expect("capture");
     assert!(!is_blank(&f1.pixels), "capture must be non-blank");
 
-    p.send_key(&KeyEvent::Text("glass-onbox".into())).expect("send_key");
+    p.send_key(&KeyEvent::Text("glass-onbox".into()))
+        .expect("send_key");
     std::thread::sleep(Duration::from_millis(900));
     let f2 = p.capture_frame(None).expect("recapture");
-    assert_eq!(f1.pixels.len(), f2.pixels.len(), "frame size stable across input");
-    assert!(changed(&f1.pixels, &f2.pixels) > 0, "typed text must change the frame");
+    assert_eq!(
+        f1.pixels.len(),
+        f2.pixels.len(),
+        "frame size stable across input"
+    );
+    assert!(
+        changed(&f1.pixels, &f2.pixels) > 0,
+        "typed text must change the frame"
+    );
 
     let g = p.window(&WindowOp::Move { x: 140, y: 140 }).expect("move");
-    assert!((g.x - 140).abs() <= 2 && (g.y - 140).abs() <= 2, "moved within 2px: {g:?}");
+    assert!(
+        (g.x - 140).abs() <= 2 && (g.y - 140).abs() <= 2,
+        "moved within 2px: {g:?}"
+    );
 
     let _ = p.stop_app();
 }
@@ -206,11 +240,16 @@ fn onbox_isolated_edge_killtree() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    let _geo = p.start_app(&spec).expect("isolated Edge discovery (Job-child window)");
+    let _geo = p
+        .start_app(&spec)
+        .expect("isolated Edge discovery (Job-child window)");
     std::thread::sleep(Duration::from_secs(6)); // let renderer/GPU/utility children spawn
 
     let before = our_edge_count(marker);
-    assert!(before >= 2, "expected a multi-process Edge tree, got {before}");
+    assert!(
+        before >= 2,
+        "expected a multi-process Edge tree, got {before}"
+    );
 
     let f = p.capture_frame(None).expect("capture Edge");
     assert!(!is_blank(&f.pixels), "Edge capture must be non-blank");
@@ -219,7 +258,10 @@ fn onbox_isolated_edge_killtree() {
     std::thread::sleep(Duration::from_secs(3)); // let the tree die with the job
     let after = our_edge_count(marker);
     let _ = std::fs::remove_dir_all(&udd);
-    assert_eq!(after, 0, "Job kill-tree must leave 0 survivors, got {after}");
+    assert_eq!(
+        after, 0,
+        "Job kill-tree must leave 0 survivors, got {after}"
+    );
 }
 
 #[test]
@@ -242,7 +284,10 @@ fn onbox_a11y_snapshot_and_click() {
     assert!(tree.count > 0, "snapshot must have nodes");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);
-    assert!(inter > 0, "charmap must expose interactable elements, got {inter}");
+    assert!(
+        inter > 0,
+        "charmap must expose interactable elements, got {inter}"
+    );
 
     let mut hit = None;
     first_clickable(&tree.root, &mut hit);
@@ -264,8 +309,15 @@ fn onbox_a11y_snapshot_and_click() {
     .expect("click element by center");
     std::thread::sleep(Duration::from_millis(700));
     let after = p.capture_frame(None).expect("capture after click");
-    assert_eq!(before.pixels.len(), after.pixels.len(), "frame size stable across click");
-    assert!(changed(&before.pixels, &after.pixels) > 0, "clicking the element must change the UI");
+    assert_eq!(
+        before.pixels.len(),
+        after.pixels.len(),
+        "frame size stable across click"
+    );
+    assert!(
+        changed(&before.pixels, &after.pixels) > 0,
+        "clicking the element must change the UI"
+    );
 
     let _ = p.stop_app();
 }
@@ -280,7 +332,11 @@ fn onbox_handoff_grace() {
         // Stop-Process (not `taskkill /IM notepad.exe`) so broker-hosted Win11 Notepad windows are
         // actually killed — taskkill by image name leaves them alive.
         let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue"])
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue",
+            ])
             .output();
         std::thread::sleep(Duration::from_millis(800));
     }
@@ -303,10 +359,17 @@ fn onbox_handoff_grace() {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     };
-    let _geo = p.start_app(&spec).expect("notepad's handoff-to-descendant window must be discovered no-hint");
+    let _geo = p
+        .start_app(&spec)
+        .expect("notepad's handoff-to-descendant window must be discovered no-hint");
     std::thread::sleep(Duration::from_millis(800));
-    let f = p.capture_frame(None).expect("capture the adopted notepad window");
-    assert!(!is_blank(&f.pixels), "the adopted handoff window must capture non-blank");
+    let f = p
+        .capture_frame(None)
+        .expect("capture the adopted notepad window");
+    assert!(
+        !is_blank(&f.pixels),
+        "the adopted handoff window must capture non-blank"
+    );
     let _ = p.stop_app();
     kill_notepad();
 }
@@ -348,7 +411,10 @@ fn onbox_modifier_click() {
     .expect("plain click");
     std::thread::sleep(Duration::from_millis(500));
     let after = p.capture_frame(None).expect("capture after click");
-    assert!(changed(&before.pixels, &after.pixels) > 0, "plain click must change the UI");
+    assert!(
+        changed(&before.pixels, &after.pixels) > 0,
+        "plain click must change the UI"
+    );
 
     // Modifier-held clicks must submit cleanly (the modifier-VK-down -> mouse -> ups SendInput batch
     // builds and sends; modifier *delivery* is asserted by the X11/Wayland integration tests).
@@ -376,10 +442,17 @@ fn onbox_clipboard_roundtrip() {
     // Includes non-ASCII to exercise the UTF-16 round-trip.
     const SENTINEL: &str = "glass-clip-\u{2713}-\u{e9}-\u{4e16}\u{754c}";
     p.set_clipboard(SENTINEL).expect("set_clipboard");
-    assert_eq!(p.get_clipboard().expect("get_clipboard"), SENTINEL, "clipboard round-trip exact");
+    assert_eq!(
+        p.get_clipboard().expect("get_clipboard"),
+        SENTINEL,
+        "clipboard round-trip exact"
+    );
 
     p.set_clipboard("").expect("set empty clipboard");
-    assert!(p.get_clipboard().expect("get empty clipboard").is_empty(), "empty round-trip");
+    assert!(
+        p.get_clipboard().expect("get empty clipboard").is_empty(),
+        "empty round-trip"
+    );
 }
 
 // The dogfood found that a CONTAINED app's own clipboard write was invisible to glass: glass set/get
@@ -410,7 +483,10 @@ fn onbox_contained_clipboard_app_write() {
     eprintln!("copied-log={copied} after_app={after_app:?} after_glass={after_glass:?}");
     let _ = p.stop_app();
 
-    assert!(copied, "the contained app must have run its copy (frame counter reached)");
+    assert!(
+        copied,
+        "the contained app must have run its copy (frame counter reached)"
+    );
     assert_eq!(
         after_app, "GLASS-CLIP-SENTINEL",
         "glass must read the contained app's own clipboard write (glass's own set/get on the same \
@@ -439,27 +515,42 @@ fn onbox_a11y_set_value() {
     let mut field = None;
     first_role(&tree.root, AxRole::TextField, &mut field);
     let field = field.expect("charmap must expose a TextField (Edit)");
-    let target =
-        AxTarget { id: field.id, role: field.role, name: field.name.clone(), bounds: field.bounds };
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+    };
 
     const NEW: &str = "GLASSVALUE";
-    a11y.set_value(&ctx, &target, NEW).expect("set_value on the Edit field");
+    a11y.set_value(&ctx, &target, NEW)
+        .expect("set_value on the Edit field");
     std::thread::sleep(Duration::from_millis(500));
 
     // Re-snapshot: the field's value changed (charmap's Edit keeps a trailing CR; compare trimmed).
     let t2 = a11y.snapshot(&ctx).expect("re-snapshot");
     let mut f2 = None;
     first_role(&t2.root, AxRole::TextField, &mut f2);
-    let v = f2.and_then(|n| n.value.as_deref()).expect("TextField has a value after set");
+    let v = f2
+        .and_then(|n| n.value.as_deref())
+        .expect("TextField has a value after set");
     assert_eq!(v.trim_end(), NEW, "set_value must change the field value");
 
     // A non-editable element (Button) must error AxElementNotEditable, never silently succeed.
     let mut button = None;
     first_role(&tree.root, AxRole::Button, &mut button);
     let b = button.expect("charmap must expose at least one Button for the not-editable guard");
-    let bt = AxTarget { id: b.id, role: b.role, name: b.name.clone(), bounds: b.bounds };
+    let bt = AxTarget {
+        id: b.id,
+        role: b.role,
+        name: b.name.clone(),
+        bounds: b.bounds,
+    };
     assert!(
-        matches!(a11y.set_value(&ctx, &bt, "x"), Err(GlassError::AxElementNotEditable(_))),
+        matches!(
+            a11y.set_value(&ctx, &bt, "x"),
+            Err(GlassError::AxElementNotEditable(_))
+        ),
         "set_value on a Button must error AxElementNotEditable"
     );
 
@@ -484,15 +575,21 @@ fn onbox_egui_set_value_honesty() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
     };
-    let tree = a11y.snapshot(&ctx).expect("a11y snapshot of the egui fixture");
+    let tree = a11y
+        .snapshot(&ctx)
+        .expect("a11y snapshot of the egui fixture");
 
     // egui exposes TextEdit as a read-only AccessKit projection — UIA SetValue is accepted
     // but never applied. set_value must report that honestly (AxValueNotApplied), not false success.
     let mut field = None;
     first_role(&tree.root, AxRole::TextField, &mut field);
     let field = field.expect("the egui fixture must expose a TextField");
-    let target =
-        AxTarget { id: field.id, role: field.role, name: field.name.clone(), bounds: field.bounds };
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+    };
     assert!(
         matches!(
             a11y.set_value(&ctx, &target, "hello"),
@@ -526,7 +623,10 @@ fn onbox_scroll_modifier_delivery() {
     eprintln!("[uncontained] plain={plain:?} ctrl={ctrl:?}");
     let _ = p.stop_app();
 
-    assert!(!plain.is_empty(), "plain scroll must deliver a wheel event to egui");
+    assert!(
+        !plain.is_empty(),
+        "plain scroll must deliver a wheel event to egui"
+    );
     assert!(
         ctrl.iter().any(|l| l.contains("ev_ctrl=true")),
         "ctrl+scroll must deliver a wheel event carrying ctrl to egui, got {ctrl:?}"
@@ -556,7 +656,10 @@ fn onbox_scroll_modifier_delivery_sandboxed() {
     eprintln!("[sandboxed] plain={plain:?} ctrl={ctrl:?}");
     let _ = p.stop_app();
 
-    assert!(!plain.is_empty(), "plain scroll must cross the Sandboxie boundary to egui");
+    assert!(
+        !plain.is_empty(),
+        "plain scroll must cross the Sandboxie boundary to egui"
+    );
     assert!(
         ctrl.iter().any(|l| l.contains("ev_ctrl=true")),
         "ctrl+scroll must cross the Sandboxie boundary carrying ctrl on the event, got {ctrl:?}"
@@ -583,16 +686,27 @@ fn onbox_chord_modifier_frame() {
     std::thread::sleep(Duration::from_millis(2000));
     let _ = p.drain_logs(); // discard startup logs
 
-    p.send_key(&KeyEvent::Chord("ctrl+z".to_string())).expect("ctrl+z chord submits");
+    p.send_key(&KeyEvent::Chord("ctrl+z".to_string()))
+        .expect("ctrl+z chord submits");
     std::thread::sleep(Duration::from_millis(600));
     let logs: Vec<String> = p.drain_logs().into_iter().map(|(_, l)| l).collect();
-    for l in logs.iter().filter(|l| l.contains("key ") || l.contains("chord Z")) {
+    for l in logs
+        .iter()
+        .filter(|l| l.contains("key ") || l.contains("chord Z"))
+    {
         eprintln!("  {l}");
     }
     let _ = p.stop_app();
 
-    let chord = logs.iter().filter(|l| l.contains("chord Z")).cloned().collect::<Vec<_>>();
-    assert!(!chord.is_empty(), "ctrl+z must reach egui as a Z key press, got none");
+    let chord = logs
+        .iter()
+        .filter(|l| l.contains("chord Z"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        !chord.is_empty(),
+        "ctrl+z must reach egui as a Z key press, got none"
+    );
     assert!(
         chord.iter().any(|l| l.contains("undo_idiom=true")),
         "ctrl+z must let `key_pressed(Z) && modifiers.command` hold in one frame, got {chord:?}"
@@ -630,7 +744,9 @@ fn onbox_a11y_edge_multiprocess() {
     // Edge's top-level window is owned by a DESCENDANT process. glass adopts it as the active window;
     // the a11y reader reads it via that adopted handle (ctx.window_handle) — verifying a11y on a
     // multi-process app whose window a single-process target like charmap can't exercise.
-    let geo = p.start_app(&spec).expect("isolated Edge discovery (Job-child window)");
+    let geo = p
+        .start_app(&spec)
+        .expect("isolated Edge discovery (Job-child window)");
     std::thread::sleep(Duration::from_secs(6));
 
     let mut a11y = WindowsA11y::new();
@@ -640,11 +756,20 @@ fn onbox_a11y_edge_multiprocess() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
     };
-    let tree = a11y.snapshot(&ctx).expect("a11y snapshot on multi-process Edge");
+    let tree = a11y
+        .snapshot(&ctx)
+        .expect("a11y snapshot on multi-process Edge");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);
-    assert!(tree.count > 20, "Edge's chrome should yield a sizable a11y tree, got {}", tree.count);
-    assert!(inter > 0, "Edge tree must expose interactable elements, got {inter}");
+    assert!(
+        tree.count > 20,
+        "Edge's chrome should yield a sizable a11y tree, got {}",
+        tree.count
+    );
+    assert!(
+        inter > 0,
+        "Edge tree must expose interactable elements, got {inter}"
+    );
 
     p.stop_app().expect("stop_app");
     std::thread::sleep(Duration::from_secs(2));
@@ -672,9 +797,15 @@ fn onbox_contained_launch_adopts_app_not_console() {
         .start_app(&spec)
         .expect("contained Notepad must adopt the app window, not the launcher console");
     let windows = p.list_windows().expect("list_windows");
-    let active = windows.iter().find(|w| w.active).expect("an active adopted window");
+    let active = windows
+        .iter()
+        .find(|w| w.active)
+        .expect("an active adopted window");
     let class = active.class.clone().unwrap_or_default();
-    assert_ne!(class, "ConsoleWindowClass", "glass_start adopted the Sandboxie launcher console");
+    assert_ne!(
+        class, "ConsoleWindowClass",
+        "glass_start adopted the Sandboxie launcher console"
+    );
     assert!(
         class.starts_with("Sandbox:"),
         "expected a boxed app window class (Sandbox:<box>:...), got {class:?}"

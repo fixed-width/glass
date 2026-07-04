@@ -208,7 +208,13 @@ fn check_pointer_bounds(event: &PointerEvent, geom: &WindowGeometry) -> Result<(
         PointerEvent::Move { x, y } => check(x, y),
         PointerEvent::Click { x, y, .. } => check(x, y),
         PointerEvent::Scroll { x, y, .. } => check(x, y),
-        PointerEvent::Drag { from_x, from_y, to_x, to_y, .. } => {
+        PointerEvent::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+            ..
+        } => {
             check(from_x, from_y)?;
             check(to_x, to_y)
         }
@@ -246,7 +252,9 @@ fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -
 fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
     let (x, y) = axwindow::ax_position(el)?;
     let (width, height) = axwindow::ax_size(el)?;
-    Ok(coords::pixel_geometry_from_content_rect(x, y, width, height, scale))
+    Ok(coords::pixel_geometry_from_content_rect(
+        x, y, width, height, scale,
+    ))
 }
 
 /// True if a `Move { x, y }` request succeeded: either `x`/`y` was already (within
@@ -260,14 +268,17 @@ fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
 /// so no cast can wrap for any input (matches `coords.rs`'s house rule). Pure so it's
 /// unit-testable without a live `AXUIElement`.
 fn move_took_effect(before: &WindowGeometry, after: &WindowGeometry, x: i32, y: i32) -> bool {
-    let requested_a_change = (i64::from(x) - i64::from(before.x)).abs() > i64::from(REQUEST_EPSILON_PX)
+    let requested_a_change = (i64::from(x) - i64::from(before.x)).abs()
+        > i64::from(REQUEST_EPSILON_PX)
         || (i64::from(y) - i64::from(before.y)).abs() > i64::from(REQUEST_EPSILON_PX);
     if !requested_a_change {
         return true;
     }
-    let reached_target = (i64::from(after.x) - i64::from(x)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX)
+    let reached_target = (i64::from(after.x) - i64::from(x)).abs()
+        <= i64::from(WINDOW_OP_TOLERANCE_PX)
         && (i64::from(after.y) - i64::from(y)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX);
-    let stayed_put = (i64::from(after.x) - i64::from(before.x)).abs() <= i64::from(REQUEST_EPSILON_PX)
+    let stayed_put = (i64::from(after.x) - i64::from(before.x)).abs()
+        <= i64::from(REQUEST_EPSILON_PX)
         && (i64::from(after.y) - i64::from(before.y)).abs() <= i64::from(REQUEST_EPSILON_PX);
     reached_target && !stayed_put
 }
@@ -285,11 +296,19 @@ fn move_took_effect(before: &WindowGeometry, after: &WindowGeometry, x: i32, y: 
 /// despite a real change being requested) is treated as the "macOS refused the resize"
 /// failure. Computed in `i64` before `.abs()` so no cast can wrap for any input (matches
 /// `coords.rs`'s house rule). Pure so it's unit-testable without a live `AXUIElement`.
-fn resize_was_refused(before: &WindowGeometry, after: &WindowGeometry, width: u32, height: u32) -> bool {
-    let requested_a_change = (i64::from(width) - i64::from(before.width)).abs() > i64::from(REQUEST_EPSILON_PX)
+fn resize_was_refused(
+    before: &WindowGeometry,
+    after: &WindowGeometry,
+    width: u32,
+    height: u32,
+) -> bool {
+    let requested_a_change = (i64::from(width) - i64::from(before.width)).abs()
+        > i64::from(REQUEST_EPSILON_PX)
         || (i64::from(height) - i64::from(before.height)).abs() > i64::from(REQUEST_EPSILON_PX);
-    let nothing_moved = (i64::from(after.width) - i64::from(before.width)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX)
-        && (i64::from(after.height) - i64::from(before.height)).abs() <= i64::from(WINDOW_OP_TOLERANCE_PX);
+    let nothing_moved = (i64::from(after.width) - i64::from(before.width)).abs()
+        <= i64::from(WINDOW_OP_TOLERANCE_PX)
+        && (i64::from(after.height) - i64::from(before.height)).abs()
+            <= i64::from(WINDOW_OP_TOLERANCE_PX);
     requested_a_change && nothing_moved
 }
 
@@ -329,7 +348,10 @@ impl Platform for MacosPlatform {
                 self.clipboard_route = match &clip {
                     Some(c) => {
                         let confirmed = crate::clipboard::shim_present(&c.name);
-                        crate::clipboard_route::decide_route(spec.sandbox, Some((&c.name, confirmed)))
+                        crate::clipboard_route::decide_route(
+                            spec.sandbox,
+                            Some((&c.name, confirmed)),
+                        )
                     }
                     None => crate::clipboard_route::decide_route(spec.sandbox, None),
                 };
@@ -535,7 +557,10 @@ impl Platform for MacosPlatform {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
         let windows = crate::scwindow::list_app_windows(&[pid as i32])?;
-        Ok(windows.into_iter().map(|w| window_info_from(w, self.active_window)).collect())
+        Ok(windows
+            .into_iter()
+            .map(|w| window_info_from(w, self.active_window))
+            .collect())
     }
     /// Retarget `active_window` to `id` — the `Platform` contract's "make `id` the
     /// active window, the implicit target of capture/input/window ops" (see
@@ -575,7 +600,8 @@ impl Platform for MacosPlatform {
         let previous = self.active_window;
         crate::scwindow::find_window_by_id(id.0 as u32, &[pid as i32], WINDOW_RESOLVE_TIMEOUT)?;
         self.active_window = Some(id.0 as u32);
-        self.window(&WindowOp::Focus).inspect_err(|_| self.active_window = previous)
+        self.window(&WindowOp::Focus)
+            .inspect_err(|_| self.active_window = previous)
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
@@ -732,7 +758,9 @@ mod tests {
             child: None,
             active_window: Some(7),
             clipboard_route: ClipboardRoute::Private("tech.fixedwidth.glass.clip.42.1.1".into()),
-            clip: Some(ClipLaunch { name: "tech.fixedwidth.glass.clip.42.1.1".into() }),
+            clip: Some(ClipLaunch {
+                name: "tech.fixedwidth.glass.clip.42.1.1".into(),
+            }),
         };
         assert!(p.stop_app().is_ok());
         assert!(p.clip.is_none());
@@ -753,7 +781,10 @@ mod tests {
             clip: None,
         };
         assert!(matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
-        assert!(matches!(p.set_clipboard("x"), Err(GlassError::Unsupported(_))));
+        assert!(matches!(
+            p.set_clipboard("x"),
+            Err(GlassError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -770,7 +801,10 @@ mod tests {
             clipboard_route: ClipboardRoute::RealGeneral,
             clip: None,
         };
-        assert!(!matches!(p.get_clipboard(), Err(GlassError::Unsupported(_))));
+        assert!(!matches!(
+            p.get_clipboard(),
+            Err(GlassError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -778,12 +812,20 @@ mod tests {
         // The central invariant: new() must error iff preflight() errors. Guards against a
         // future edit that swallows the missing-grant propagation. On an ungranted CI runner
         // both are Err; on a granted box both are Ok.
-        assert_eq!(crate::permissions::preflight().is_err(), MacosPlatform::new().is_err());
+        assert_eq!(
+            crate::permissions::preflight().is_err(),
+            MacosPlatform::new().is_err()
+        );
     }
 
     #[test]
     fn check_pointer_bounds_accepts_inside_rejects_outside() {
-        let geom = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let geom = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
         assert!(check_pointer_bounds(&PointerEvent::Move { x: 0, y: 0 }, &geom).is_ok());
         assert!(check_pointer_bounds(&PointerEvent::Move { x: 639, y: 479 }, &geom).is_ok());
         assert!(matches!(
@@ -799,7 +841,12 @@ mod tests {
     #[test]
     fn check_pointer_bounds_checks_both_drag_endpoints() {
         use glass_core::platform::MouseButton;
-        let geom = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let geom = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
         // In-bounds `from`, out-of-bounds `to`: must still reject.
         let ev = PointerEvent::Drag {
             from_x: 0,
@@ -810,14 +857,22 @@ mod tests {
             modifiers: vec![],
             duration_ms: 100,
         };
-        assert!(matches!(check_pointer_bounds(&ev, &geom), Err(GlassError::CoordOutOfBounds { .. })));
+        assert!(matches!(
+            check_pointer_bounds(&ev, &geom),
+            Err(GlassError::CoordOutOfBounds { .. })
+        ));
     }
 
     #[test]
     fn window_info_from_marks_the_active_window() {
         let w = crate::scwindow::AppWindow {
             window_id: 7,
-            geometry: WindowGeometry { x: 1, y: 2, width: 640, height: 480 },
+            geometry: WindowGeometry {
+                x: 1,
+                y: 2,
+                width: 640,
+                height: 480,
+            },
             title: Some("Untitled".into()),
             application_name: Some("TestApp".into()),
         };
@@ -825,18 +880,34 @@ mod tests {
         assert_eq!(info.id, WindowId(7));
         assert_eq!(info.title, Some("Untitled".into()));
         assert_eq!(info.class, Some("TestApp".into()));
-        assert_eq!(info.geometry, WindowGeometry { x: 1, y: 2, width: 640, height: 480 });
+        assert_eq!(
+            info.geometry,
+            WindowGeometry {
+                x: 1,
+                y: 2,
+                width: 640,
+                height: 480
+            }
+        );
         assert!(info.active, "window_id matches active_window");
 
         let not_active = window_info_from(w, Some(8));
-        assert!(!not_active.active, "window_id does not match a different active_window");
+        assert!(
+            !not_active.active,
+            "window_id does not match a different active_window"
+        );
     }
 
     #[test]
     fn window_info_from_is_not_active_when_no_window_is_selected() {
         let w = crate::scwindow::AppWindow {
             window_id: 7,
-            geometry: WindowGeometry { x: 0, y: 0, width: 100, height: 100 },
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
             title: None,
             application_name: None,
         };
@@ -848,21 +919,58 @@ mod tests {
 
     #[test]
     fn move_took_effect_accepts_a_genuine_move_that_reached_target() {
-        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        let after_exact = WindowGeometry { x: 300, y: 200, width: 640, height: 480 };
-        assert!(move_took_effect(&before, &after_exact, 300, 200), "exact match");
-        let after_tolerance = WindowGeometry { x: 304, y: 196, width: 640, height: 480 };
-        assert!(move_took_effect(&before, &after_tolerance, 300, 200), "within tolerance");
+        let before = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        let after_exact = WindowGeometry {
+            x: 300,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        assert!(
+            move_took_effect(&before, &after_exact, 300, 200),
+            "exact match"
+        );
+        let after_tolerance = WindowGeometry {
+            x: 304,
+            y: 196,
+            width: 640,
+            height: 480,
+        };
+        assert!(
+            move_took_effect(&before, &after_tolerance, 300, 200),
+            "within tolerance"
+        );
     }
 
     #[test]
     fn move_took_effect_rejects_when_read_back_is_far_from_target() {
         // The refusal case: AXSetAttributeValue(AXPosition) reported success but the
         // window is still sitting wherever it started.
-        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        let unmoved = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        assert!(!move_took_effect(&before, &unmoved, 500, 200), "x off by more than tolerance");
-        assert!(!move_took_effect(&before, &unmoved, 100, 600), "y off by more than tolerance");
+        let before = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        let unmoved = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        assert!(
+            !move_took_effect(&before, &unmoved, 500, 200),
+            "x off by more than tolerance"
+        );
+        assert!(
+            !move_took_effect(&before, &unmoved, 100, 600),
+            "y off by more than tolerance"
+        );
     }
 
     #[test]
@@ -871,8 +979,18 @@ mod tests {
         // requested delta that's fully refused must not be reported as success just because
         // the unmoved position happens to still land within WINDOW_OP_TOLERANCE_PX of the
         // target — the exact bug this fix closes.
-        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        let unmoved = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let before = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        let unmoved = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
         // Requested delta is 5px (> REQUEST_EPSILON_PX's 2px) but <= WINDOW_OP_TOLERANCE_PX's
         // 8px, so the old single-tolerance logic silently accepted this as success.
         assert!(!move_took_effect(&before, &unmoved, 105, 200));
@@ -882,15 +1000,35 @@ mod tests {
     fn move_took_effect_is_true_when_no_real_change_was_requested() {
         // Target is within REQUEST_EPSILON_PX of `before` -- essentially a no-op move, so
         // whatever `after` reads back as is not a refusal to report.
-        let before = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
-        let after = WindowGeometry { x: 100, y: 200, width: 640, height: 480 };
+        let before = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
         assert!(move_took_effect(&before, &after, 101, 201));
     }
 
     #[test]
     fn resize_was_refused_when_size_never_moves() {
-        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let before = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
         // Requested a real size change (800x600) but the window is still exactly where it
         // started — the silent-no-op case `window(op)`'s Resize branch must catch.
         assert!(resize_was_refused(&before, &after, 800, 600));
@@ -900,8 +1038,18 @@ mod tests {
     fn resize_was_refused_is_false_when_nothing_was_requested() {
         // width/height happen to equal `before`'s own size (e.g. a Resize to the current
         // size) — no change was requested, so an unchanged `after` is not a refusal.
-        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
+        let before = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
         assert!(!resize_was_refused(&before, &after, 640, 480));
     }
 
@@ -910,15 +1058,35 @@ mod tests {
         // macOS clamped to an intermediate size short of the request (e.g. a min-size
         // constraint) rather than ignoring the resize outright — expected behavior, not a
         // refusal; `window(op)` returns this actual geometry rather than erroring.
-        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-        let after = WindowGeometry { x: 0, y: 0, width: 700, height: 480 };
+        let before = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 700,
+            height: 480,
+        };
         assert!(!resize_was_refused(&before, &after, 1200, 480));
     }
 
     #[test]
     fn resize_was_refused_is_false_when_the_read_back_matches_the_request() {
-        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-        let after = WindowGeometry { x: 0, y: 0, width: 800, height: 600 };
+        let before = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
         assert!(!resize_was_refused(&before, &after, 800, 600));
     }
 
@@ -929,8 +1097,18 @@ mod tests {
         // request that's fully refused must now be caught. Before this fix, a 5px delta
         // wasn't even considered "a change was requested" (5 <= the old 8px threshold), so a
         // total no-op silently reported success.
-        let before = WindowGeometry { x: 0, y: 0, width: 640, height: 480 };
-        let after = WindowGeometry { x: 0, y: 0, width: 640, height: 480 }; // unmoved
+        let before = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        };
+        let after = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+        }; // unmoved
         assert!(resize_was_refused(&before, &after, 645, 480));
     }
 }

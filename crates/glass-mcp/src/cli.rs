@@ -84,16 +84,31 @@ mod tests {
     #[test]
     fn no_subcommand_is_none() {
         let cli = Cli::try_parse_from(["glass-mcp"]).unwrap();
-        assert!(cli.command.is_none(), "bare invocation must mean the stdio default");
+        assert!(
+            cli.command.is_none(),
+            "bare invocation must mean the stdio default"
+        );
     }
 
     #[test]
     fn doctor_flags_parse() {
         let cli = Cli::try_parse_from(["glass-mcp", "doctor", "--deep", "--json"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Doctor { deep: true, json: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                deep: true,
+                json: true
+            })
+        ));
         // flags default to false
         let cli = Cli::try_parse_from(["glass-mcp", "doctor"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Doctor { deep: false, json: false })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                deep: false,
+                json: false
+            })
+        ));
     }
 
     #[test]
@@ -105,11 +120,21 @@ mod tests {
     #[test]
     fn serve_flags_use_kebab_case() {
         let cli = Cli::try_parse_from([
-            "glass-mcp", "serve", "--http", "--addr", "0.0.0.0:7300", "--token-file", "/t",
+            "glass-mcp",
+            "serve",
+            "--http",
+            "--addr",
+            "0.0.0.0:7300",
+            "--token-file",
+            "/t",
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Serve { http, addr, token_file }) => {
+            Some(Command::Serve {
+                http,
+                addr,
+                token_file,
+            }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
@@ -121,7 +146,10 @@ mod tests {
     #[test]
     fn gen_token_subcommand_is_kebab_case() {
         let cli = Cli::try_parse_from(["glass-mcp", "gen-token", "--out", "/p"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::GenToken { out: Some(_) })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::GenToken { out: Some(_) })
+        ));
     }
 
     #[test]
@@ -131,7 +159,10 @@ mod tests {
         assert_eq!(c.audit_log.as_deref(), Some("/p"));
         let c = Cli::try_parse_from(["glass-mcp", "serve", "--http", "--audit-log", "/q"]).unwrap();
         assert_eq!(c.audit_log.as_deref(), Some("/q"));
-        assert!(Cli::try_parse_from(["glass-mcp"]).unwrap().audit_log.is_none());
+        assert!(Cli::try_parse_from(["glass-mcp"])
+            .unwrap()
+            .audit_log
+            .is_none());
     }
 
     #[test]
@@ -141,9 +172,15 @@ mod tests {
 
     #[test]
     fn setup_flags_parse() {
-        let cli = Cli::try_parse_from(["glass-mcp", "setup", "--non-interactive", "--launchagent"]).unwrap();
+        let cli = Cli::try_parse_from(["glass-mcp", "setup", "--non-interactive", "--launchagent"])
+            .unwrap();
         match cli.command {
-            Some(Command::Setup { non_interactive, launchagent, no_launchagent, addr }) => {
+            Some(Command::Setup {
+                non_interactive,
+                launchagent,
+                no_launchagent,
+                addr,
+            }) => {
                 assert!(non_interactive);
                 assert!(launchagent);
                 assert!(!no_launchagent);
@@ -158,7 +195,12 @@ mod tests {
         let cli = Cli::try_parse_from(["glass-mcp", "setup"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Setup { non_interactive: false, launchagent: false, no_launchagent: false, addr: None })
+            Some(Command::Setup {
+                non_interactive: false,
+                launchagent: false,
+                no_launchagent: false,
+                addr: None
+            })
         ));
     }
 
@@ -173,7 +215,8 @@ mod tests {
 
     #[test]
     fn setup_launchagent_and_no_launchagent_conflict() {
-        let err = Cli::try_parse_from(["glass-mcp", "setup", "--launchagent", "--no-launchagent"]).unwrap_err();
+        let err = Cli::try_parse_from(["glass-mcp", "setup", "--launchagent", "--no-launchagent"])
+            .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

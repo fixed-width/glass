@@ -161,10 +161,7 @@ mod tests {
             "second session must be rejected while one is live"
         );
         m.close_session(&id).await.expect("close releases the slot");
-        let (_id2, _t2) = m
-            .create_session()
-            .await
-            .expect("slot reusable after close");
+        let (_id2, _t2) = m.create_session().await.expect("slot reusable after close");
     }
 
     #[tokio::test]
@@ -183,8 +180,12 @@ mod tests {
             "slot must stay claimed after a close for a non-active id"
         );
         // The admitted session's own close still releases it.
-        m.close_session(&id).await.expect("closing the active session releases");
-        let (_id2, _t2) =
-            m.create_session().await.expect("slot reusable after the real close");
+        m.close_session(&id)
+            .await
+            .expect("closing the active session releases");
+        let (_id2, _t2) = m
+            .create_session()
+            .await
+            .expect("slot reusable after the real close");
     }
 }

@@ -31,10 +31,7 @@ impl LogcatStream {
     pub fn spawn(adb: &Adb, pid: u32, sink: LogSink) -> Result<Self> {
         // Build argv via the same serial-prefixing path the Adb client uses.
         let pid_arg = format!("--pid={pid}");
-        let argv = crate::adb::build_argv(
-            adb.serial(),
-            &["logcat", "-v", "threadtime", &pid_arg],
-        );
+        let argv = crate::adb::build_argv(adb.serial(), &["logcat", "-v", "threadtime", &pid_arg]);
         let mut child = Command::new(adb.bin())
             .args(&argv)
             .stdout(Stdio::piped())
@@ -53,7 +50,10 @@ impl LogcatStream {
                 }
             }
         });
-        Ok(Self { child, _reader: reader })
+        Ok(Self {
+            child,
+            _reader: reader,
+        })
     }
 
     /// Kill the logcat process; the reader thread ends on pipe EOF.
@@ -76,18 +76,33 @@ mod tests {
 
     #[test]
     fn error_and_fatal_map_to_stderr() {
-        assert_eq!(classify_logcat_line("06-15 12:00:00.0  1 1 E Tag: boom"), Stream::Stderr);
-        assert_eq!(classify_logcat_line("06-15 12:00:00.0  1 1 F Tag: crash"), Stream::Stderr);
+        assert_eq!(
+            classify_logcat_line("06-15 12:00:00.0  1 1 E Tag: boom"),
+            Stream::Stderr
+        );
+        assert_eq!(
+            classify_logcat_line("06-15 12:00:00.0  1 1 F Tag: crash"),
+            Stream::Stderr
+        );
     }
 
     #[test]
     fn info_and_debug_map_to_stdout() {
-        assert_eq!(classify_logcat_line("06-15 12:00:00.0  1 1 I Tag: hello"), Stream::Stdout);
-        assert_eq!(classify_logcat_line("06-15 12:00:00.0  1 1 D Tag: detail"), Stream::Stdout);
+        assert_eq!(
+            classify_logcat_line("06-15 12:00:00.0  1 1 I Tag: hello"),
+            Stream::Stdout
+        );
+        assert_eq!(
+            classify_logcat_line("06-15 12:00:00.0  1 1 D Tag: detail"),
+            Stream::Stdout
+        );
     }
 
     #[test]
     fn unparseable_defaults_to_stdout() {
-        assert_eq!(classify_logcat_line("--------- beginning of main"), Stream::Stdout);
+        assert_eq!(
+            classify_logcat_line("--------- beginning of main"),
+            Stream::Stdout
+        );
     }
 }

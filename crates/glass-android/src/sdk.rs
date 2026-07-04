@@ -55,14 +55,20 @@ pub fn resolve_sdk_root(
         if let Some(p) = get(var).filter(|s| !s.is_empty()) {
             let path = PathBuf::from(p);
             if exists(&path) {
-                return Some(SdkRoot { path, source: SdkSource::Env(var) });
+                return Some(SdkRoot {
+                    path,
+                    source: SdkSource::Env(var),
+                });
             }
         }
     }
     default_locations(get)
         .into_iter()
         .find(|p| exists(p))
-        .map(|path| SdkRoot { path, source: SdkSource::Default })
+        .map(|path| SdkRoot {
+            path,
+            source: SdkSource::Default,
+        })
 }
 
 /// How `adb` was resolved, for honest diagnostics.
@@ -91,7 +97,11 @@ impl AdbResolution {
         match self {
             AdbResolution::GlassAdb(p) => format!("{p} (via GLASS_ADB)"),
             AdbResolution::Sdk { bin, root } => {
-                format!("{bin} (via {} SDK {})", source_word(&root.source), root.path.display())
+                format!(
+                    "{bin} (via {} SDK {})",
+                    source_word(&root.source),
+                    root.path.display()
+                )
             }
             AdbResolution::Path => "adb (on PATH)".to_string(),
         }
@@ -127,7 +137,10 @@ pub fn resolve_adb(
     if let Some(root) = resolve_sdk_root(get, exists) {
         let bin = root.path.join("platform-tools").join(adb_exe());
         if exists(&bin) {
-            return AdbResolution::Sdk { bin: bin.to_string_lossy().into_owned(), root };
+            return AdbResolution::Sdk {
+                bin: bin.to_string_lossy().into_owned(),
+                root,
+            };
         }
     }
     AdbResolution::Path
@@ -137,7 +150,11 @@ pub fn resolve_adb(
 /// locations — so `glass doctor` can render the search trail on failure.
 pub fn sdk_search_trail(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     let mut t = vec!["ANDROID_SDK_ROOT".to_string(), "ANDROID_HOME".to_string()];
-    t.extend(default_locations(get).into_iter().map(|p| p.display().to_string()));
+    t.extend(
+        default_locations(get)
+            .into_iter()
+            .map(|p| p.display().to_string()),
+    );
     t
 }
 
@@ -153,7 +170,9 @@ pub fn artifact_data_dirs(get: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> 
     }
     #[cfg(target_os = "macos")]
     if let Some(h) = get("HOME").filter(|s| !s.is_empty()) {
-        v.push(PathBuf::from(format!("{h}/Library/Application Support/glass")));
+        v.push(PathBuf::from(format!(
+            "{h}/Library/Application Support/glass"
+        )));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -169,7 +188,9 @@ pub fn artifact_data_dirs(get: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> 
 /// The directory holding the running executable, for finding artifacts shipped next to
 /// the `glass-mcp` binary. `None` if it can't be determined.
 pub fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from))
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
 }
 
 /// Resolve an optional artifact (e.g. the agent jar) by `env_var` → the first `dirs`
@@ -197,7 +218,12 @@ mod tests {
     use super::*;
 
     fn getter(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     #[test]
@@ -231,10 +257,16 @@ mod tests {
     fn describe_names_the_discovered_sdk() {
         let r = AdbResolution::Sdk {
             bin: "/home/u/android-sdk/platform-tools/adb".into(),
-            root: SdkRoot { path: "/home/u/android-sdk".into(), source: SdkSource::Default },
+            root: SdkRoot {
+                path: "/home/u/android-sdk".into(),
+                source: SdkSource::Default,
+            },
         };
         let d = r.describe();
-        assert!(d.contains("/home/u/android-sdk/platform-tools/adb"), "got {d}");
+        assert!(
+            d.contains("/home/u/android-sdk/platform-tools/adb"),
+            "got {d}"
+        );
         assert!(d.contains("discovered"), "got {d}");
     }
 
@@ -252,7 +284,13 @@ mod tests {
     fn artifact_env_override_wins() {
         let get = getter(&[("GLASS_ANDROID_AGENT_JAR", "/explicit/glass-agent.jar")]);
         let dirs = [PathBuf::from("/data/glass")];
-        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| true);
+        let r = resolve_artifact(
+            "GLASS_ANDROID_AGENT_JAR",
+            "glass-agent.jar",
+            &dirs,
+            &get,
+            &|_| true,
+        );
         assert_eq!(r.as_deref(), Some("/explicit/glass-agent.jar"));
     }
 
@@ -261,7 +299,13 @@ mod tests {
         let get = getter(&[]);
         let dirs = [PathBuf::from("/data/glass")];
         let exists = |p: &Path| p == Path::new("/data/glass/glass-agent.jar");
-        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &exists);
+        let r = resolve_artifact(
+            "GLASS_ANDROID_AGENT_JAR",
+            "glass-agent.jar",
+            &dirs,
+            &get,
+            &exists,
+        );
         assert_eq!(r.as_deref(), Some("/data/glass/glass-agent.jar"));
     }
 
@@ -269,7 +313,13 @@ mod tests {
     fn artifact_none_when_unset_and_absent() {
         let get = getter(&[]);
         let dirs = [PathBuf::from("/data/glass")];
-        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| false);
+        let r = resolve_artifact(
+            "GLASS_ANDROID_AGENT_JAR",
+            "glass-agent.jar",
+            &dirs,
+            &get,
+            &|_| false,
+        );
         assert_eq!(r, None);
     }
 
@@ -278,7 +328,13 @@ mod tests {
         // So doctor can warn "set but no file there" instead of silently using another copy.
         let get = getter(&[("GLASS_ANDROID_AGENT_JAR", "/explicit/missing.jar")]);
         let dirs = [PathBuf::from("/data/glass")];
-        let r = resolve_artifact("GLASS_ANDROID_AGENT_JAR", "glass-agent.jar", &dirs, &get, &|_| false);
+        let r = resolve_artifact(
+            "GLASS_ANDROID_AGENT_JAR",
+            "glass-agent.jar",
+            &dirs,
+            &get,
+            &|_| false,
+        );
         assert_eq!(r.as_deref(), Some("/explicit/missing.jar"));
     }
 
@@ -288,7 +344,10 @@ mod tests {
         let get = getter(&[("XDG_DATA_HOME", "/xdg"), ("HOME", "/home/u")]);
         assert_eq!(artifact_data_dirs(&get)[0], PathBuf::from("/xdg/glass"));
         let get2 = getter(&[("HOME", "/home/u")]);
-        assert_eq!(artifact_data_dirs(&get2)[0], PathBuf::from("/home/u/.local/share/glass"));
+        assert_eq!(
+            artifact_data_dirs(&get2)[0],
+            PathBuf::from("/home/u/.local/share/glass")
+        );
     }
 
     #[test]
@@ -302,7 +361,10 @@ mod tests {
     #[test]
     fn falls_through_env_root_that_is_missing() {
         // ANDROID_SDK_ROOT set but absent; ANDROID_HOME present and exists.
-        let get = getter(&[("ANDROID_SDK_ROOT", "/nope"), ("ANDROID_HOME", "/home/u/android-sdk")]);
+        let get = getter(&[
+            ("ANDROID_SDK_ROOT", "/nope"),
+            ("ANDROID_HOME", "/home/u/android-sdk"),
+        ]);
         let r = resolve_sdk_root(&get, &|p| p == Path::new("/home/u/android-sdk")).unwrap();
         assert_eq!(r.source, SdkSource::Env("ANDROID_HOME"));
     }

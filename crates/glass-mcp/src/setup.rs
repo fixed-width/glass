@@ -83,11 +83,15 @@ pub fn fill_launch_agent(template: &str, fields: LaunchAgentFields<'_>) -> Strin
 /// [`RunMode::Http`] install path turns a non-empty result into a fail-closed error rather
 /// than writing a broken plist.
 pub fn surviving_placeholders(filled: &str, fields: LaunchAgentFields<'_>) -> Vec<&'static str> {
-    [(APP_BIN_PLACEHOLDER, fields.app_bin), (ADDR_PLACEHOLDER, fields.addr), (HOME_PLACEHOLDER, fields.home)]
-        .into_iter()
-        .filter(|&(placeholder, value)| value != placeholder && filled.contains(placeholder))
-        .map(|(placeholder, _)| placeholder)
-        .collect()
+    [
+        (APP_BIN_PLACEHOLDER, fields.app_bin),
+        (ADDR_PLACEHOLDER, fields.addr),
+        (HOME_PLACEHOLDER, fields.home),
+    ]
+    .into_iter()
+    .filter(|&(placeholder, value)| value != placeholder && filled.contains(placeholder))
+    .map(|(placeholder, _)| placeholder)
+    .collect()
 }
 
 /// Decide the run mode from the `--launchagent`/`--no-launchagent` flags alone, without
@@ -101,7 +105,10 @@ pub fn surviving_placeholders(filled: &str, fields: LaunchAgentFields<'_>) -> Ve
 /// `(true, true)` combination unreachable from the CLI, so the `debug_assert!` documents that
 /// invariant and trips in debug builds if a future non-clap caller violates it.
 pub fn run_mode_from_flags(launchagent: bool, no_launchagent: bool) -> Option<RunMode> {
-    debug_assert!(!(launchagent && no_launchagent), "clap conflicts_with should prevent --launchagent + --no-launchagent");
+    debug_assert!(
+        !(launchagent && no_launchagent),
+        "clap conflicts_with should prevent --launchagent + --no-launchagent"
+    );
     if launchagent {
         Some(RunMode::Http)
     } else if no_launchagent {
@@ -122,8 +129,11 @@ pub fn is_inside_app_bundle(exe: &Path) -> bool {
     let macos_dir = exe.parent();
     let contents_dir = macos_dir.and_then(Path::parent);
     let bundle_dir = contents_dir.and_then(Path::parent);
-    let names =
-        (macos_dir.and_then(Path::file_name), contents_dir.and_then(Path::file_name), bundle_dir.and_then(Path::file_name));
+    let names = (
+        macos_dir.and_then(Path::file_name),
+        contents_dir.and_then(Path::file_name),
+        bundle_dir.and_then(Path::file_name),
+    );
     matches!(
         names,
         (Some(macos), Some(contents), Some(bundle))
@@ -164,19 +174,27 @@ pub struct SetupArgs {
 /// prompting (scripting/CI); `launchagent`/`no_launchagent` force the run mode instead of
 /// asking; `addr` overrides the LaunchAgent's HTTP bind address.
 pub fn run(args: SetupArgs) -> Result<()> {
-    let SetupArgs { non_interactive, launchagent, no_launchagent, addr } = args;
+    let SetupArgs {
+        non_interactive,
+        launchagent,
+        no_launchagent,
+        addr,
+    } = args;
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (non_interactive, launchagent, no_launchagent, addr);
-        Err(glass_core::GlassError::Backend("setup is macOS-only".into()))
+        Err(glass_core::GlassError::Backend(
+            "setup is macOS-only".into(),
+        ))
     }
     #[cfg(target_os = "macos")]
     {
         // Step 1: preconditions. Resolve the running binary's own path — used for the
         // signing-identity warning right below, and later as both the LaunchAgent's
         // `ProgramArguments[0]` and the registration line's binary path.
-        let exe = std::env::current_exe()
-            .map_err(|e| glass_core::GlassError::Backend(format!("resolving the running binary's path: {e}")))?;
+        let exe = std::env::current_exe().map_err(|e| {
+            glass_core::GlassError::Backend(format!("resolving the running binary's path: {e}"))
+        })?;
         macos_impl::warn_if_signing_identity_unstable(&exe);
 
         match glass_macos::session_state() {
@@ -189,7 +207,9 @@ pub fn run(args: SetupArgs) -> Result<()> {
                      docs/running-on-macos.md). Then run `glass-mcp setup` again.",
                     uid = macos_impl::self_uid(),
                 );
-                return Err(glass_core::GlassError::Backend("setup needs a logged-in console session".into()));
+                return Err(glass_core::GlassError::Backend(
+                    "setup needs a logged-in console session".into(),
+                ));
             }
             glass_macos::SessionState::Locked => {
                 println!(
@@ -223,7 +243,10 @@ pub fn run(args: SetupArgs) -> Result<()> {
             false,
             non_interactive,
         );
-        let mut pending: Vec<(&'static str, String)> = [screen_recording, accessibility].into_iter().flatten().collect();
+        let mut pending: Vec<(&'static str, String)> = [screen_recording, accessibility]
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Step 3: pick the run mode and, for the unattended LaunchAgent, install it.
         let mode = match run_mode_from_flags(launchagent, no_launchagent) {
@@ -264,7 +287,11 @@ pub fn run(args: SetupArgs) -> Result<()> {
                 println!("{instruction}");
             }
             Err(glass_core::GlassError::PermissionDenied {
-                which: pending.iter().map(|(label, _)| *label).collect::<Vec<_>>().join(", "),
+                which: pending
+                    .iter()
+                    .map(|(label, _)| *label)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 remedy: "grant the permission(s) above, then run `glass-mcp setup` again".into(),
             })
         }
@@ -304,7 +331,8 @@ mod macos_impl {
     /// The embedded LaunchAgent plist template — the same file
     /// [`super::tests::fill_launch_agent_substitutes_the_app_binary`] and friends check
     /// against, so a drift between the two breaks the test rather than shipping silently.
-    const PLIST_TEMPLATE: &str = include_str!("../../../packaging/macos/tech.fixedwidth.glass.plist");
+    const PLIST_TEMPLATE: &str =
+        include_str!("../../../packaging/macos/tech.fixedwidth.glass.plist");
 
     /// This process's own numeric uid, via `rustix::process::getuid` (a safe syscall wrapper,
     /// so no `unsafe` FFI, unlike a raw `libc::getuid()` call). Used for `gui/<uid>` LaunchAgent
@@ -350,7 +378,12 @@ mod macos_impl {
     /// Poll `granted` every `interval` until it returns `true` or `timeout` elapses, calling
     /// `on_wait` once per unsuccessful check (progress output only — it doesn't affect the
     /// result). Returns the final read of `granted()`.
-    fn poll_until(granted: impl Fn() -> bool, interval: Duration, timeout: Duration, mut on_wait: impl FnMut()) -> bool {
+    fn poll_until(
+        granted: impl Fn() -> bool,
+        interval: Duration,
+        timeout: Duration,
+        mut on_wait: impl FnMut(),
+    ) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if granted() {
@@ -437,7 +470,8 @@ mod macos_impl {
             return None;
         }
         if needs_relaunch_note {
-            let acted = non_interactive || prompt_yes_no(&format!("Did you enable {label} in System Settings?"));
+            let acted = non_interactive
+                || prompt_yes_no(&format!("Did you enable {label} in System Settings?"));
             if acted {
                 let instruction = format!(
                     "{label} changes take effect after a relaunch — enable glass, then run \
@@ -447,7 +481,8 @@ mod macos_impl {
                 return Some((label, instruction));
             }
         }
-        let instruction = format!("{label}: not granted — {remedy}, then run `glass-mcp setup` again.");
+        let instruction =
+            format!("{label}: not granted — {remedy}, then run `glass-mcp setup` again.");
         println!("  \u{2717} {instruction}");
         Some((label, instruction))
     }
@@ -461,15 +496,23 @@ mod macos_impl {
     /// the caller can fold it into the same pending / non-zero-exit path a missing grant uses
     /// (never a false "installed + started"); `Err` for a hard failure — no `HOME`, an
     /// un-writable plist, a drifted template, or `bootstrap` itself erroring.
-    pub(super) fn install_launch_agent(app_bin: &str, addr: &str) -> Result<Option<(&'static str, String)>> {
-        let home = std::env::var("HOME")
-            .map_err(|_| GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into()))?;
+    pub(super) fn install_launch_agent(
+        app_bin: &str,
+        addr: &str,
+    ) -> Result<Option<(&'static str, String)>> {
+        let home = std::env::var("HOME").map_err(|_| {
+            GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
+        })?;
         let launch_agents_dir = Path::new(&home).join("Library/LaunchAgents");
         let logs_dir = Path::new(&home).join("Library/Logs/GlassMcp");
         std::fs::create_dir_all(&launch_agents_dir)?;
         std::fs::create_dir_all(&logs_dir)?;
 
-        let fields = super::LaunchAgentFields { app_bin, addr, home: &home };
+        let fields = super::LaunchAgentFields {
+            app_bin,
+            addr,
+            home: &home,
+        };
         let filled = super::fill_launch_agent(PLIST_TEMPLATE, fields);
         // Fail closed on a template drift: if a placeholder survived substitution, the plist is
         // broken (points at `/Users/YOU` etc.) — error rather than write it.
@@ -490,7 +533,10 @@ mod macos_impl {
         // the flow itself asks for, since a Screen Recording grant only takes effect after a
         // relaunch — and wouldn't pick up an `--addr` change. Unload first, ignoring the exit
         // status (a harmless no-op when nothing is loaded), so every re-run converges.
-        let _ = Command::new("launchctl").arg("bootout").arg(&target).status();
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&target)
+            .status();
 
         let status = Command::new("launchctl")
             .arg("bootstrap")
@@ -509,7 +555,10 @@ mod macos_impl {
         // came up serving: a port clash on `--addr` crash-loops under `KeepAlive=true` yet
         // bootstrap still returns success. Confirm real liveness before claiming success.
         if launch_agent_is_serving(addr) {
-            println!("\n  \u{2713} installed + started {target} ({})", plist_path.display());
+            println!(
+                "\n  \u{2713} installed + started {target} ({})",
+                plist_path.display()
+            );
             Ok(None)
         } else {
             let instruction = format!(
@@ -528,7 +577,11 @@ mod macos_impl {
     /// `false` — we can't verify it, so it's treated as not-yet-serving, never a silent
     /// success.
     fn launch_agent_is_serving(addr: &str) -> bool {
-        let Some(sock) = addr.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) else {
+        let Some(sock) = addr
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+        else {
             return false;
         };
         poll_until(
@@ -548,7 +601,11 @@ mod tests {
 
     #[test]
     fn stdio_registration_line_names_the_binary() {
-        let line = registration_line(RunMode::Stdio, "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp", "127.0.0.1:7300");
+        let line = registration_line(
+            RunMode::Stdio,
+            "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp",
+            "127.0.0.1:7300",
+        );
         assert!(line.contains("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"));
         assert!(line.contains("mcp add glass"));
     }
@@ -576,7 +633,11 @@ mod tests {
     fn fill_launch_agent_substitutes_the_app_binary() {
         let filled = fill_launch_agent(
             TEMPLATE,
-            LaunchAgentFields { app_bin: "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp", addr: "127.0.0.1:7300", home: "/Users/alice" },
+            LaunchAgentFields {
+                app_bin: "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp",
+                addr: "127.0.0.1:7300",
+                home: "/Users/alice",
+            },
         );
         assert!(filled.contains("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"));
     }
@@ -585,7 +646,11 @@ mod tests {
     fn fill_launch_agent_substitutes_a_custom_app_binary() {
         let filled = fill_launch_agent(
             TEMPLATE,
-            LaunchAgentFields { app_bin: "/opt/glass/glass-mcp", addr: "127.0.0.1:7300", home: "/Users/alice" },
+            LaunchAgentFields {
+                app_bin: "/opt/glass/glass-mcp",
+                addr: "127.0.0.1:7300",
+                home: "/Users/alice",
+            },
         );
         assert!(filled.contains("/opt/glass/glass-mcp"));
         assert!(!filled.contains("/Applications/GlassMcp.app"));
@@ -595,7 +660,11 @@ mod tests {
     fn fill_launch_agent_substitutes_the_addr() {
         let filled = fill_launch_agent(
             TEMPLATE,
-            LaunchAgentFields { app_bin: "/opt/glass/glass-mcp", addr: "0.0.0.0:9999", home: "/Users/alice" },
+            LaunchAgentFields {
+                app_bin: "/opt/glass/glass-mcp",
+                addr: "0.0.0.0:9999",
+                home: "/Users/alice",
+            },
         );
         assert!(filled.contains("0.0.0.0:9999"));
         assert!(!filled.contains("127.0.0.1:7300"));
@@ -605,7 +674,11 @@ mod tests {
     fn fill_launch_agent_substitutes_the_home_in_both_log_paths() {
         let filled = fill_launch_agent(
             TEMPLATE,
-            LaunchAgentFields { app_bin: "/opt/glass/glass-mcp", addr: "127.0.0.1:7300", home: "/Users/alice" },
+            LaunchAgentFields {
+                app_bin: "/opt/glass/glass-mcp",
+                addr: "127.0.0.1:7300",
+                home: "/Users/alice",
+            },
         );
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stdout.log"));
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stderr.log"));
@@ -616,7 +689,11 @@ mod tests {
 
     #[test]
     fn a_fully_substituted_plist_has_no_surviving_placeholders() {
-        let fields = LaunchAgentFields { app_bin: "/opt/glass/glass-mcp", addr: "0.0.0.0:9999", home: "/Users/alice" };
+        let fields = LaunchAgentFields {
+            app_bin: "/opt/glass/glass-mcp",
+            addr: "0.0.0.0:9999",
+            home: "/Users/alice",
+        };
         let filled = fill_launch_agent(TEMPLATE, fields);
         assert!(surviving_placeholders(&filled, fields).is_empty());
     }
@@ -639,7 +716,11 @@ mod tests {
         // A drifted template whose home placeholder `fill_launch_agent` no longer matches: the
         // filled text still carries `/Users/YOU` though a real home (`/Users/alice`) was asked
         // for, so the guard must flag it.
-        let fields = LaunchAgentFields { app_bin: "/opt/glass/glass-mcp", addr: "0.0.0.0:9999", home: "/Users/alice" };
+        let fields = LaunchAgentFields {
+            app_bin: "/opt/glass/glass-mcp",
+            addr: "0.0.0.0:9999",
+            home: "/Users/alice",
+        };
         let drifted = "<string>/Users/YOU/Library/Logs/GlassMcp/stdout.log</string>";
         assert_eq!(surviving_placeholders(drifted, fields), vec!["/Users/YOU"]);
     }
@@ -665,17 +746,23 @@ mod tests {
 
     #[test]
     fn recognizes_a_real_app_bundle_layout() {
-        assert!(is_inside_app_bundle(Path::new("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp")));
+        assert!(is_inside_app_bundle(Path::new(
+            "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"
+        )));
     }
 
     #[test]
     fn recognizes_a_non_default_install_location() {
-        assert!(is_inside_app_bundle(Path::new("/opt/GlassMcp.app/Contents/MacOS/glass-mcp")));
+        assert!(is_inside_app_bundle(Path::new(
+            "/opt/GlassMcp.app/Contents/MacOS/glass-mcp"
+        )));
     }
 
     #[test]
     fn rejects_a_bare_cargo_build_output_path() {
-        assert!(!is_inside_app_bundle(Path::new("/home/mpd/glass/target/release/glass-mcp")));
+        assert!(!is_inside_app_bundle(Path::new(
+            "/home/mpd/glass/target/release/glass-mcp"
+        )));
     }
 
     #[test]
@@ -687,7 +774,9 @@ mod tests {
     #[test]
     fn rejects_wrong_cased_bundle_directories() {
         // "Contents"/"MacOS" is exact Apple bundle casing; a near-miss shouldn't pass.
-        assert!(!is_inside_app_bundle(Path::new("/Applications/GlassMcp.app/contents/macos/glass-mcp")));
+        assert!(!is_inside_app_bundle(Path::new(
+            "/Applications/GlassMcp.app/contents/macos/glass-mcp"
+        )));
     }
 
     // --- codesign_report_is_unstable ------------------------------------------------------
@@ -727,8 +816,13 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn run_fails_fast_off_macos() {
-        let err = run(SetupArgs { non_interactive: false, launchagent: false, no_launchagent: false, addr: None })
-            .expect_err("setup must refuse to run off macOS");
+        let err = run(SetupArgs {
+            non_interactive: false,
+            launchagent: false,
+            no_launchagent: false,
+            addr: None,
+        })
+        .expect_err("setup must refuse to run off macOS");
         assert!(matches!(err, glass_core::GlassError::Backend(_)));
         assert!(err.to_string().contains("macOS-only"));
     }

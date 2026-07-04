@@ -30,7 +30,10 @@ use crate::platform::WindowGeometry;
 /// captured `Frame`) is backing PIXELS — matching `glass-x11`/`glass-windows`. This is the
 /// one place a pixel value crosses back into points, right before posting a CGEvent.
 pub fn pixel_to_global_point(rel_px: (i32, i32), scale: f64, origin_pt: (f64, f64)) -> (f64, f64) {
-    (origin_pt.0 + rel_px.0 as f64 / scale, origin_pt.1 + rel_px.1 as f64 / scale)
+    (
+        origin_pt.0 + rel_px.0 as f64 / scale,
+        origin_pt.1 + rel_px.1 as f64 / scale,
+    )
 }
 
 /// Map an ABSOLUTE global-screen PIXEL coordinate to Quartz's global POINT space:
@@ -67,7 +70,13 @@ pub fn point_to_global_pixel(pt: (f64, f64), scale: f64) -> (i32, i32) {
 /// clamp to `0` on a degenerate (negative) input rather than wrapping; `x`/`y` stay signed
 /// (a window can sit left-of/above the primary display's origin in a multi-monitor
 /// layout).
-pub fn pixel_geometry_from_content_rect(x: f64, y: f64, width: f64, height: f64, scale: f64) -> WindowGeometry {
+pub fn pixel_geometry_from_content_rect(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
+) -> WindowGeometry {
     let px = |v: f64| (v * scale).round();
     WindowGeometry {
         x: px(x) as i32,
@@ -83,18 +92,27 @@ mod tests {
 
     #[test]
     fn pixel_to_global_point_at_1x() {
-        assert_eq!(pixel_to_global_point((100, 200), 1.0, (10.0, 20.0)), (110.0, 220.0));
+        assert_eq!(
+            pixel_to_global_point((100, 200), 1.0, (10.0, 20.0)),
+            (110.0, 220.0)
+        );
     }
 
     #[test]
     fn pixel_to_global_point_at_2x_retina() {
         // pixel 200 / 2 = 100pt + origin 10 = 110; pixel 400 / 2 = 200pt + origin 20 = 220.
-        assert_eq!(pixel_to_global_point((200, 400), 2.0, (10.0, 20.0)), (110.0, 220.0));
+        assert_eq!(
+            pixel_to_global_point((200, 400), 2.0, (10.0, 20.0)),
+            (110.0, 220.0)
+        );
     }
 
     #[test]
     fn pixel_to_global_point_handles_negative_rel_and_origin() {
-        assert_eq!(pixel_to_global_point((-40, -10), 2.0, (-5.0, 0.0)), (-25.0, -5.0));
+        assert_eq!(
+            pixel_to_global_point((-40, -10), 2.0, (-5.0, 0.0)),
+            (-25.0, -5.0)
+        );
     }
 
     #[test]
@@ -141,7 +159,12 @@ mod tests {
     fn pixel_geometry_from_content_rect_is_identity_at_1x() {
         assert_eq!(
             pixel_geometry_from_content_rect(10.0, 20.0, 300.0, 200.0, 1.0),
-            WindowGeometry { x: 10, y: 20, width: 300, height: 200 }
+            WindowGeometry {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 200
+            }
         );
     }
 
@@ -149,7 +172,12 @@ mod tests {
     fn pixel_geometry_from_content_rect_scales_at_2x_retina() {
         assert_eq!(
             pixel_geometry_from_content_rect(10.0, 20.0, 300.0, 200.0, 2.0),
-            WindowGeometry { x: 20, y: 40, width: 600, height: 400 }
+            WindowGeometry {
+                x: 20,
+                y: 40,
+                width: 600,
+                height: 400
+            }
         );
     }
 
@@ -159,7 +187,12 @@ mod tests {
         // fields round independently rather than truncating.
         assert_eq!(
             pixel_geometry_from_content_rect(1.0, 1.0, 3.0, 3.0, 1.5),
-            WindowGeometry { x: 2, y: 2, width: 5, height: 5 }
+            WindowGeometry {
+                x: 2,
+                y: 2,
+                width: 5,
+                height: 5
+            }
         );
     }
 
@@ -169,7 +202,12 @@ mod tests {
         // conversion must not panic or wrap on malformed input.
         assert_eq!(
             pixel_geometry_from_content_rect(0.0, 0.0, -1.0, -1.0, 2.0),
-            WindowGeometry { x: 0, y: 0, width: 0, height: 0 }
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0
+            }
         );
     }
 
@@ -177,7 +215,12 @@ mod tests {
     fn pixel_geometry_from_content_rect_preserves_negative_origin() {
         assert_eq!(
             pixel_geometry_from_content_rect(-50.0, -10.0, 100.0, 80.0, 2.0),
-            WindowGeometry { x: -100, y: -20, width: 200, height: 160 }
+            WindowGeometry {
+                x: -100,
+                y: -20,
+                width: 200,
+                height: 160
+            }
         );
     }
 }

@@ -197,7 +197,10 @@ pub(super) fn install_ole() {
         }
         if let Some(p) = ole32_proc(b"OleFlushClipboard\0") {
             let t: FnOleFlush = std::mem::transmute(p);
-            if OleFlushClipboardHook.initialize(t, ole_flush_clipboard).is_ok() {
+            if OleFlushClipboardHook
+                .initialize(t, ole_flush_clipboard)
+                .is_ok()
+            {
                 let _ = OleFlushClipboardHook.enable();
             }
         }

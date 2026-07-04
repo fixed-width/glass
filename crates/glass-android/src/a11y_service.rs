@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree,
+};
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
@@ -34,16 +36,25 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
     // (zero or inverted w/h out of `getBoundsInScreen`), so erroring would fail the whole snapshot
     // on one odd node. Negative w/h clamp to 0; values outside the int range clamp to its bounds.
     let bi = |k: &str| -> i32 {
-        b.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        b.get(k)
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     };
     let bu = |k: &str| -> u32 {
-        b.get(k).and_then(Value::as_i64).unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32
+        b.get(k)
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, i64::from(u32::MAX)) as u32
     };
     let (x, y, w, h) = (bi("x"), bi("y"), bu("w"), bu("h"));
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     // Recursion depth = a11y tree depth (shallow in practice; not hardened against adversarial nesting).
     let children = match v.get("children").and_then(Value::as_array) {
-        Some(arr) => arr.iter().map(|c| json_to_node(c, win)).collect::<Result<Vec<_>>>()?,
+        Some(arr) => arr
+            .iter()
+            .map(|c| json_to_node(c, win))
+            .collect::<Result<Vec<_>>>()?,
         None => vec![],
     };
     Ok(AxNode {
@@ -62,7 +73,12 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
             visible: true,
             ..Default::default()
         },
-        bounds: Some(AxRect { x: x - win.x, y: y - win.y, width: w, height: h }),
+        bounds: Some(AxRect {
+            x: x - win.x,
+            y: y - win.y,
+            width: w,
+            height: h,
+        }),
         children,
     })
 }
@@ -70,7 +86,10 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
 /// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
 pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
     // count stays 0 until the caller runs AxTree::assign_ids (per the Accessibility trait contract).
-    Ok(AxTree { root: json_to_node(tree, win)?, count: 0 })
+    Ok(AxTree {
+        root: json_to_node(tree, win)?,
+        count: 0,
+    })
 }
 
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
@@ -82,7 +101,10 @@ pub struct ServiceClient {
 impl ServiceClient {
     pub fn connect(port: u16) -> Result<ServiceClient> {
         let conn = Conn::open(port)?;
-        Ok(ServiceClient { conn: Mutex::new(conn), port })
+        Ok(ServiceClient {
+            conn: Mutex::new(conn),
+            port,
+        })
     }
 
     /// Run a request, transparently reconnecting once if the socket dropped.
@@ -149,7 +171,9 @@ impl Accessibility for ServiceA11y {
             t.assign_ids();
             t
         };
-        let node = tree.find(target.id).ok_or(GlassError::AxElementNotFound(target.id.0))?;
+        let node = tree
+            .find(target.id)
+            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
         if !target.matches(node.role, node.name.as_deref())
             || !target.bounds_consistent(node.bounds, 8)
         {
@@ -185,10 +209,11 @@ impl Accessibility for ServiceA11y {
     }
 }
 
-use std::sync::Arc;
 use crate::adb::Adb;
+use std::sync::Arc;
 
-const SERVICE_COMPONENT: &str = "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
+const SERVICE_COMPONENT: &str =
+    "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
 const SERVICE_PACKAGE: &str = "com.fixedwidth.glassa11y";
 const SOCKET: &str = "glass-a11y";
 
@@ -205,7 +230,9 @@ fn install_service(adb: &Adb, apk: &str) -> Result<()> {
     match adb.run(["install", "-r", apk]) {
         Ok(_) => Ok(()),
         Err(e) if is_signature_mismatch(&e.to_string()) => {
-            eprintln!("glass-a11y: replacing a differently-signed existing install of {SERVICE_PACKAGE}");
+            eprintln!(
+                "glass-a11y: replacing a differently-signed existing install of {SERVICE_PACKAGE}"
+            );
             adb.run(["uninstall", SERVICE_PACKAGE])?;
             adb.run(["install", "-r", apk]).map(|_| ())
         }
@@ -216,43 +243,84 @@ fn install_service(adb: &Adb, apk: &str) -> Result<()> {
 /// `GLASS_ANDROID_A11Y_APK`, else `glass-a11y.apk` dropped in the glass data dir or next
 /// to the `glass-mcp` binary; `None` when disabled via `GLASS_ANDROID_A11Y=off`.
 pub fn a11y_apk(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    if get("GLASS_ANDROID_A11Y").map(|v| v.eq_ignore_ascii_case("off")).unwrap_or(false) {
+    if get("GLASS_ANDROID_A11Y")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+    {
         return None;
     }
     let mut dirs = crate::sdk::artifact_data_dirs(get);
     dirs.extend(crate::sdk::exe_dir());
-    crate::sdk::resolve_artifact("GLASS_ANDROID_A11Y_APK", "glass-a11y.apk", &dirs, get, &|p| {
-        p.is_file()
-    })
+    crate::sdk::resolve_artifact(
+        "GLASS_ANDROID_A11Y_APK",
+        "glass-a11y.apk",
+        &dirs,
+        get,
+        &|p| p.is_file(),
+    )
 }
 
-struct Active { serial: Option<String>, port: u16, prior_enabled: String, prior_a11y_enabled: String }
+struct Active {
+    serial: Option<String>,
+    port: u16,
+    prior_enabled: String,
+    prior_a11y_enabled: String,
+}
 
 /// Owns the installed+enabled state so the shutdown hook can restore it. Cloneable (shared
 /// `Arc<Mutex<Option<Active>>>`) like `AgentRegistry`.
 #[derive(Clone, Default)]
-pub struct A11yServiceRegistry { state: Arc<std::sync::Mutex<Option<Active>>> }
+pub struct A11yServiceRegistry {
+    state: Arc<std::sync::Mutex<Option<Active>>>,
+}
 
 impl A11yServiceRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Install + enable the service on `adb`'s device, forward a port, connect, ping. Returns a
     /// connected `ServiceClient`. The apk path is resolved from env by the caller.
     pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
         install_service(adb, apk)?;
-        let get = |k: &str| adb.run(["shell", "settings", "get", "secure", k]).unwrap_or_default();
+        let get = |k: &str| {
+            adb.run(["shell", "settings", "get", "secure", k])
+                .unwrap_or_default()
+        };
         let prior = get("enabled_accessibility_services");
         let prior = prior.trim();
         let prior = if prior == "null" { "" } else { prior };
         // Save the global flag too, so teardown restores the device's prior a11y state exactly.
         let prior_a11y = get("accessibility_enabled");
         let prior_a11y = prior_a11y.trim();
-        let prior_a11y = if prior_a11y == "null" || prior_a11y.is_empty() { "0" } else { prior_a11y };
-        let want = if prior.is_empty() { SERVICE_COMPONENT.to_string() }
-                   else if prior.split(':').any(|s| s == SERVICE_COMPONENT) { prior.to_string() }
-                   else { format!("{prior}:{SERVICE_COMPONENT}") };
-        adb.run(["shell", "settings", "put", "secure", "enabled_accessibility_services", &want])?;
-        adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", "1"])?;
+        let prior_a11y = if prior_a11y == "null" || prior_a11y.is_empty() {
+            "0"
+        } else {
+            prior_a11y
+        };
+        let want = if prior.is_empty() {
+            SERVICE_COMPONENT.to_string()
+        } else if prior.split(':').any(|s| s == SERVICE_COMPONENT) {
+            prior.to_string()
+        } else {
+            format!("{prior}:{SERVICE_COMPONENT}")
+        };
+        adb.run([
+            "shell",
+            "settings",
+            "put",
+            "secure",
+            "enabled_accessibility_services",
+            &want,
+        ])?;
+        adb.run([
+            "shell",
+            "settings",
+            "put",
+            "secure",
+            "accessibility_enabled",
+            "1",
+        ])?;
         let out = adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")])?;
         let port = crate::agent::parse_forward_port(&out)
             .ok_or_else(|| GlassError::Backend(format!("adb forward gave no port: {out:?}")))?;
@@ -294,11 +362,31 @@ impl A11yServiceRegistry {
 fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: u16) {
     if prior_enabled.is_empty() {
         // `settings put ... ""` errors ("Bad arguments"); delete to clear the list instead.
-        let _ = adb.run(["shell", "settings", "delete", "secure", "enabled_accessibility_services"]);
+        let _ = adb.run([
+            "shell",
+            "settings",
+            "delete",
+            "secure",
+            "enabled_accessibility_services",
+        ]);
     } else {
-        let _ = adb.run(["shell", "settings", "put", "secure", "enabled_accessibility_services", prior_enabled]);
+        let _ = adb.run([
+            "shell",
+            "settings",
+            "put",
+            "secure",
+            "enabled_accessibility_services",
+            prior_enabled,
+        ]);
     }
-    let _ = adb.run(["shell", "settings", "put", "secure", "accessibility_enabled", prior_a11y_enabled]);
+    let _ = adb.run([
+        "shell",
+        "settings",
+        "put",
+        "secure",
+        "accessibility_enabled",
+        prior_a11y_enabled,
+    ]);
     let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
 }
 
@@ -321,7 +409,12 @@ mod tests {
     use serde_json::json;
 
     fn win() -> WindowGeometry {
-        WindowGeometry { x: 0, y: 100, width: 1080, height: 2300 }
+        WindowGeometry {
+            x: 0,
+            y: 100,
+            width: 1080,
+            height: 2300,
+        }
     }
 
     #[test]
@@ -329,8 +422,12 @@ mod tests {
         assert!(is_signature_mismatch(
             "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match newer version; ignoring!]"
         ));
-        assert!(is_signature_mismatch("signatures do not match newer version"));
-        assert!(!is_signature_mismatch("Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"));
+        assert!(is_signature_mismatch(
+            "signatures do not match newer version"
+        ));
+        assert!(!is_signature_mismatch(
+            "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"
+        ));
         assert!(!is_signature_mismatch("error: device offline"));
     }
 

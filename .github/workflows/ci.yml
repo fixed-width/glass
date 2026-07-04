@@ -17,6 +17,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # rustup installs the pinned toolchain + rustfmt from rust-toolchain.toml,
+      # so CI formats with the same nightly the build uses.
+      - name: Install pinned toolchain
+        run: rustup show
+      - run: cargo fmt --all --check
+
   check:
     name: build · clippy · test
     runs-on: ubuntu-latest
