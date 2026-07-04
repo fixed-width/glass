@@ -21,7 +21,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup installs the pinned toolchain + rustfmt from rust-toolchain.toml,
       # so CI formats with the same nightly the build uses.
       - name: Install pinned toolchain
@@ -33,12 +33,12 @@ jobs:
     runs-on: ubuntu-latest
     # The Cargo workspace is at the repo root.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain + components from
       # rust-toolchain.toml (single source of truth for the nightly).
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - run: cargo build --workspace --all-targets --locked
@@ -56,12 +56,12 @@ jobs:
     # The `miri` component is added here (not pinned in rust-toolchain.toml) so a future nightly
     # bump that lacks it fails only this job, not every job's `rustup show`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
       - name: Add miri component
         run: rustup component add miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - run: cargo miri test -p glass-clip-hook -p glass-windows --locked
@@ -70,10 +70,10 @@ jobs:
     name: X11 integration (Xvfb)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Install system deps
@@ -93,10 +93,10 @@ jobs:
     # (cage was retired; Ubuntu only ships sway 1.9). The bundle is extracted into the
     # glass discovery location so test-wayland.sh finds it with zero config.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Install system deps
@@ -126,12 +126,12 @@ jobs:
     # WindowServer-connected TCC context) and run on-box; the runner covers pure +
     # macOS unit tests.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain + components from
       # rust-toolchain.toml (single source of truth for the nightly).
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - run: cargo build  -p glass-macos --locked
@@ -202,12 +202,12 @@ jobs:
     runs-on: windows-latest
     # The Cargo workspace is at the repo root.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain from rust-toolchain.toml for the
       # x86_64-pc-windows-msvc host (MSVC linker ships on the runner).
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       # --workspace can't be used: glass-wayland/glass-testapp are Unix-only. Scope to
@@ -227,15 +227,15 @@ jobs:
     # (not packaged on the runner) so it self-skips. Unit + X11 are measured.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
       - name: Add llvm-tools (required by cargo-llvm-cov)
         run: rustup component add llvm-tools-preview
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
           tool: cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Install system deps
@@ -247,7 +247,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-lcov
           path: target/llvm-cov/glass.lcov

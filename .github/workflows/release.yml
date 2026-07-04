@@ -54,14 +54,14 @@ jobs:
       id-token: write      # OIDC token for build-provenance signing
       attestations: write  # write the provenance to the attestation API
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Build (gnu)
@@ -86,7 +86,7 @@ jobs:
           pkg target/x86_64-unknown-linux-musl/release/glass-mcp README-musl.md x86_64-linux-musl
           ( cd dist && for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done )
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: 'dist/*.tar.gz'
       - name: Upload to draft release
@@ -109,10 +109,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Build
@@ -129,7 +129,7 @@ jobs:
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File "dist/$name.zip.sha256" -Encoding ascii
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: 'dist/*.zip'
       - name: Upload to draft release
@@ -150,7 +150,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # The macOS release artifact needs Developer ID signing + notarization secrets.
       # Until the Apple Developer enrollment is approved and these are configured, this
@@ -175,7 +175,7 @@ jobs:
           rustup show
           rustup target add x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.creds.outputs.present == 'true'
         with:
           workspaces: .
@@ -239,7 +239,7 @@ jobs:
 
       - name: Attest build provenance
         if: steps.creds.outputs.present == 'true'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: 'dist/*.zip'
 
