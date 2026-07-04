@@ -22,6 +22,11 @@
 #   --build N            CFBundleVersion (default: the template's).
 #   --skip-build         reuse the existing target/release/glass-mcp binary
 #                        instead of rebuilding — for iterating on packaging only.
+#   --universal          build a universal2 binary (aarch64 + x86_64) via lipo,
+#                        instead of the host arch only. Requires both rustup
+#                        targets (`rustup target add x86_64-apple-darwin`).
+#   --timestamp          add a secure timestamp to the signature (`codesign
+#                        --timestamp`). Required for notarization; needs network.
 #
 # TCC (Screen Recording / Accessibility) grants key on the bundle's Designated
 # Requirement — bundle id + signing certificate — not on the binary's cdhash. So
@@ -34,7 +39,8 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage: build-app.sh --identity NAME [--bundle-id ID] [--keychain PATH]
-                     [--out DIR] [--version X.Y.Z] [--build N] [--skip-build]
+                     [--out DIR] [--version X.Y.Z] [--build N]
+                     [--universal] [--timestamp] [--skip-build]
 EOF
   exit 1
 }
@@ -49,6 +55,8 @@ out_dir="$REPO_ROOT/target/macos-app"
 version=""
 build_num=""
 skip_build=0
+universal=0
+timestamp=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,6 +66,8 @@ while [ $# -gt 0 ]; do
     --out)        out_dir="$2"; shift 2 ;;
     --version)    version="$2"; shift 2 ;;
     --build)      build_num="$2"; shift 2 ;;
+    --universal)  universal=1; shift ;;
+    --timestamp)  timestamp=1; shift ;;
     --skip-build) skip_build=1; shift ;;
     -h|--help)    usage ;;
     *) echo "error: unknown argument: $1" >&2; usage ;;
@@ -83,21 +93,36 @@ if ! command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> building glass-mcp (release)"
-bin="$REPO_ROOT/target/release/glass-mcp"
-if [ "$skip_build" -eq 0 ]; then
-  ( cd "$REPO_ROOT" && cargo build --release -p glass-mcp )
+if [ "$universal" -eq 1 ]; then
+  echo "==> building glass-mcp + clip shim (release, universal2)"
+  if [ "$skip_build" -eq 0 ]; then
+    ( cd "$REPO_ROOT" && cargo build --release --locked --target aarch64-apple-darwin -p glass-mcp -p glass-clip-shim-macos )
+    ( cd "$REPO_ROOT" && cargo build --release --locked --target x86_64-apple-darwin  -p glass-mcp -p glass-clip-shim-macos )
+  fi
+  bin="$REPO_ROOT/target/glass-mcp-universal"
+  shim="$REPO_ROOT/target/libglass_clip_shim_macos-universal.dylib"
+  lipo -create -output "$bin" \
+    "$REPO_ROOT/target/aarch64-apple-darwin/release/glass-mcp" \
+    "$REPO_ROOT/target/x86_64-apple-darwin/release/glass-mcp"
+  lipo -create -output "$shim" \
+    "$REPO_ROOT/target/aarch64-apple-darwin/release/libglass_clip_shim_macos.dylib" \
+    "$REPO_ROOT/target/x86_64-apple-darwin/release/libglass_clip_shim_macos.dylib"
+else
+  echo "==> building glass-mcp (release)"
+  bin="$REPO_ROOT/target/release/glass-mcp"
+  if [ "$skip_build" -eq 0 ]; then
+    ( cd "$REPO_ROOT" && cargo build --release -p glass-mcp )
+  fi
+  echo "==> building glass-clip-shim-macos (release)"
+  if [ "$skip_build" -eq 0 ]; then
+    ( cd "$REPO_ROOT" && cargo build --release -p glass-clip-shim-macos )
+  fi
+  shim="$REPO_ROOT/target/release/libglass_clip_shim_macos.dylib"
 fi
 if [ ! -x "$bin" ]; then
   echo "error: $bin not found or not executable (run without --skip-build first)" >&2
   exit 1
 fi
-
-echo "==> building glass-clip-shim-macos (release)"
-if [ "$skip_build" -eq 0 ]; then
-  ( cd "$REPO_ROOT" && cargo build --release -p glass-clip-shim-macos )
-fi
-shim="$REPO_ROOT/target/release/libglass_clip_shim_macos.dylib"
 [ -f "$shim" ] || { echo "error: $shim not found (build the shim first)" >&2; exit 1; }
 
 app="$out_dir/GlassMcp.app"
@@ -126,6 +151,9 @@ echo "==> codesigning (identity: $sign_identity, bundle id: $bundle_id)"
 # error — unlock it first with `security unlock-keychain -p <password> <keychain>`
 # (see docs/running-on-macos.md).
 codesign_args=(--force --options runtime -s "$sign_identity")
+if [ "$timestamp" -eq 1 ]; then
+  codesign_args+=(--timestamp)
+fi
 if [ -n "$sign_keychain" ]; then
   codesign_args+=(--keychain "$sign_keychain")
 fi

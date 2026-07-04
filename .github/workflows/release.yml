@@ -79,3 +79,99 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*.zip
+
+  macos:
+    name: macos artifact (universal, notarized)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The macOS release artifact needs Developer ID signing + notarization secrets.
+      # Until the Apple Developer enrollment is approved and these are configured, this
+      # job SKIPS every real step (exit 0) so tagging a release still publishes the
+      # Linux/Windows artifacts. Secrets can't be read in a job-level `if:`, so we probe
+      # one here and gate the rest on its output.
+      - name: Check signing credentials
+        id: creds
+        env:
+          CERT: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12 }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::macOS signing secrets not configured — skipping notarized macOS artifact (Apple Developer enrollment pending)."
+          fi
+
+      - name: Install pinned toolchain
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          rustup show
+          rustup target add x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.present == 'true'
+        with:
+          workspaces: .
+
+      - name: Import Developer ID certificate
+        if: steps.creds.outputs.present == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          kc_pw="$(openssl rand -base64 24)"
+          echo "SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$kc_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pw" "$keychain"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$keychain" >/dev/null
+          # Prepend the build keychain to the search list so codesign resolves the identity.
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | sed 's/[",]//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build + sign universal app
+        if: steps.creds.outputs.present == 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ./packaging/macos/build-app.sh --universal --timestamp \
+            --identity "$SIGN_IDENTITY" --keychain "$SIGN_KEYCHAIN" \
+            --version "${tag#v}" --build "${GITHUB_RUN_NUMBER}"
+
+      - name: Notarize + staple
+        if: steps.creds.outputs.present == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_API_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ./packaging/macos/notarize.sh \
+            --app target/macos-app/GlassMcp.app \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Package
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          name="glass-mcp-${tag}-universal-apple-darwin"
+          mkdir -p dist
+          # ditto (not zip) preserves the bundle layout + signature.
+          ditto -c -k --keepParent target/macos-app/GlassMcp.app "dist/${name}.zip"
+
+      - name: Upload to release
+        if: steps.creds.outputs.present == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.zip
