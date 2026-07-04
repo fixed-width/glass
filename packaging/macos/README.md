@@ -67,3 +67,27 @@ No `sudo` is needed anywhere here — a LaunchAgent bootstrapped into your own
 `gui/<uid>` domain is entirely user-scoped, and it's what keeps glass-mcp's
 process launchd-parented (not SSH- or Terminal-parented), which is what makes its
 TCC grants attach reliably to the signed binary itself.
+
+## Release pipeline (maintainers)
+
+Tagging `v*` runs the `macos` job in [`.github/workflows/release.yml`](../../.github/workflows/release.yml),
+which builds a **universal2** (`arm64` + `x86_64`) `GlassMcp.app`, Developer-ID-signs it
+(hardened runtime + secure timestamp, nested clip-shim dylib included), notarizes and
+staples it via `xcrun notarytool` + `stapler`, and uploads
+`glass-mcp-<tag>-universal-apple-darwin.zip` to the GitHub Release.
+
+The job **skips cleanly** (no failure) until these repository secrets are set, so releases
+still publish the Linux/Windows artifacts before macOS signing is available:
+
+| Secret | Contents |
+|--------|----------|
+| `MACOS_DEVELOPER_ID_CERT_P12` | base64 of the "Developer ID Application" cert + key, exported as `.p12` |
+| `MACOS_DEVELOPER_ID_CERT_PASSWORD` | the `.p12` export password |
+| `MACOS_SIGN_IDENTITY` | the identity Common Name (`Developer ID Application: … (TEAMID)`) |
+| `MACOS_NOTARY_API_KEY_P8` | base64 of the App Store Connect API key `.p8` (role: App Manager) |
+| `MACOS_NOTARY_API_KEY_ID` | the API key ID |
+| `MACOS_NOTARY_API_ISSUER_ID` | the App Store Connect issuer UUID |
+
+Base64-encode a file for a secret with `base64 -i <file> | pbcopy`. To run the signing +
+notarization steps locally instead of in CI, use `build-app.sh --universal --timestamp
+--identity …` followed by `notarize.sh --app … --key … --key-id … --issuer …`.
