@@ -8,10 +8,9 @@ use crate::tools::{parse_button, ToolOutput, ToolResult};
 pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, String> {
     let mut out = Vec::new();
     for m in mods.unwrap_or(&[]) {
-        out.push(
-            Modifier::from_name(m)
-                .ok_or_else(|| format!("unknown modifier '{m}' (use ctrl/shift/alt/super)"))?,
-        );
+        out.push(Modifier::from_name(m).ok_or_else(|| {
+            format!("unknown modifier '{m}' (use ctrl/shift/alt/super; cmd = super on macOS)")
+        })?);
     }
     Ok(out)
 }
