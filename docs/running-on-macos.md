@@ -38,10 +38,9 @@ code-signing certificate. That has two consequences that shape everything below:
   its own, grantable, responsible process. This is why macOS glass ships as a
   signed app + LaunchAgent rather than a plain binary you `ssh` in and run.
 
-So the setup is: create a stable signing identity once, build+sign the app with
-it, then run `glass-mcp setup` — it walks you through granting Screen Recording +
-Accessibility and installs whichever run integration you want. From then on,
-rebuilds and restarts never need the dialog again.
+So the setup is: create a stable signing identity once, build+sign the app,
+install it as a LaunchAgent, and enable it in the Screen Recording + Accessibility
+panes (§3). From then on, rebuilds and restarts never need the dialog again.
 
 ## 1. Create a signing identity
 
@@ -162,69 +161,60 @@ overrides). Confirm the signature:
 codesign -dv target/macos-app/GlassMcp.app
 ```
 
-## 3. Run `glass-mcp setup`
+## 3. Grant the permissions and install the LaunchAgent
 
-`build-app.sh` produces a signed bundle but doesn't touch permissions or register
-anything with an agent — `glass-mcp setup` is the guided first-run that does the
-rest: it requests both TCC grants, installs (or skips) the run integration, and
-confirms everything via `doctor`.
+The two grants have to land on `GlassMcp.app`'s own identity — and, as the permission
+model above explains, a permission *request* fired from a terminal command is attributed
+to the **terminal**, not to the app. So the reliable way, and the path for a
+build-from-source checkout, is to run glass as a **LaunchAgent** (its own responsible
+process) and enable `GlassMcp.app` in the two Privacy panes by hand.
 
-```bash
-target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp setup
-```
-
-What it does, in order:
-
-1. **Requests Screen Recording, then Accessibility**, one at a time. For each: if
-   already granted, it moves on; otherwise it triggers the OS consent flow, opens
-   the exact System Settings pane (Privacy & Security → Screen Recording /
-   Accessibility) for you with `open`, and polls for up to a minute while you
-   flip the toggle — it only reports a grant once it re-checks and confirms it,
-   never on your say-so alone.
-2. **Screen Recording's relaunch nuance.** Unlike Accessibility, a Screen
-   Recording grant only takes effect for the process that requested it *after
-   that process restarts*. If the poll above times out, `setup` asks whether you
-   enabled it in System Settings (or, under `--non-interactive`, assumes yes,
-   since there's no one to ask) and, if so, tells you to run `glass-mcp setup`
-   again rather than reporting a plain "not granted" — run it a second time and
-   Screen Recording confirms granted.
-3. **Picks the run mode.** Unless you forced one with `--launchagent` /
-   `--no-launchagent`, it asks: *"Run glass-mcp unattended as a LaunchAgent
-   (serve --http, starts at login) instead of being spawned by your MCP client
-   over stdio?"* Choosing the LaunchAgent writes
-   `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` (filled in with the
-   app's path, the HTTP bind address, and your home directory) and loads it with
-   `launchctl bootstrap gui/<uid>`; choosing stdio installs nothing.
-4. **Confirms via `doctor`** and prints a ready-to-paste MCP-client registration
-   line for whichever mode you picked:
+1. **Install the LaunchAgent.** Fill the shipped plist template with your app path and
+   home directory and load it:
 
    ```bash
-   claude mcp add glass --scope user -- /path/to/GlassMcp.app/Contents/MacOS/glass-mcp        # stdio
-   claude mcp add --transport http glass http://127.0.0.1:7300/                                # LaunchAgent
+   APP="$PWD/target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp"
+   PLIST="$HOME/Library/LaunchAgents/tech.fixedwidth.glass.plist"
+   sed -e "s|/Applications/GlassMcp.app/Contents/MacOS/glass-mcp|$APP|" \
+       -e "s|/Users/YOU|$HOME|g" \
+       packaging/macos/tech.fixedwidth.glass.plist > "$PLIST"
+   # glass writes capture baselines under its working directory; a LaunchAgent's default
+   # cwd is the read-only "/", so point it at a writable path:
+   /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $HOME" "$PLIST"
+   mkdir -p "$HOME/Library/Logs/GlassMcp"
+   launchctl bootstrap "gui/$(id -u)" "$PLIST"
    ```
 
-   If a grant is still pending at the end, `setup` exits non-zero and prints the
-   exact instruction for what's left (which permission, and what to do) — act on
-   it and run `glass-mcp setup` again.
+2. **Enable `GlassMcp.app` in both Privacy panes.** In **System Settings → Privacy &
+   Security**, open **Screen Recording** and then **Accessibility**; in each, click
+   **＋**, add `GlassMcp.app` (the bundle under `target/macos-app/`), and turn it on.
+   Adding it there keys the grant to the app's Designated Requirement — the process that
+   actually captures the screen and injects input.
 
-Flags:
+3. **Reload the agent so it re-reads the grants.** A grant enabled while the agent is
+   already running isn't visible to it until it restarts — Screen Recording binds its
+   capability at process start, and the Accessibility trust check is cached:
 
-| Flag | Effect |
-|---|---|
-| `--non-interactive` | Never blocks on stdin (for scripting/CI): defaults the run mode to stdio (the least-invasive option) when neither `--launchagent` nor `--no-launchagent` is given, and assumes-and-notes rather than asks about the Screen Recording relaunch nuance. Still exits non-zero — same as an interactive run — if a grant is genuinely missing once the poll times out. |
-| `--launchagent` | Install the `gui/<uid>` LaunchAgent (unattended `serve --http`) without asking. |
-| `--no-launchagent` | Skip the LaunchAgent (attended/stdio) without asking. |
-| `--addr ADDR` | LaunchAgent HTTP bind address (default `127.0.0.1:7300`). |
+   ```bash
+   launchctl kickstart -k "gui/$(id -u)/tech.fixedwidth.glass"
+   ```
 
-`setup` also warns up front — without refusing to run — if the binary you're
-running it from isn't inside a `*.app/Contents/MacOS` bundle, or is ad hoc/unsigned:
-either means a grant won't survive a rebuild (see the permission model above). That
-keeps `setup` usable from a plain `cargo run` while you're iterating on it, even
-though it isn't how you'd run it day to day.
+4. **Register it with your MCP client:**
 
-As long as you keep signing with the same identity and bundle id, granting is a
-**one-time step**: rebuilding, moving the app, or restarting the LaunchAgent
+   ```bash
+   claude mcp add --transport http glass http://127.0.0.1:7300/
+   ```
+
+Your client's `glass_doctor` tool then reports the running agent's own grants — both
+should read granted. As long as you keep signing with the same identity and bundle id,
+this is a **one-time step**: rebuilding, moving the app, or restarting the LaunchAgent
 never re-prompts.
+
+> **With the packaged release,** first-run becomes a **double-click**: you drag
+> `GlassMcp.app` in from a `.dmg` and open it, macOS asks for the two permissions the
+> standard way, and — because the app is asking for *itself* — the grants land on it
+> automatically, no manual `＋`-add or plist editing. The recipe above stays the path for
+> build-from-source checkouts.
 
 ## 4. Keep the Mac awake
 
@@ -263,8 +253,8 @@ claude mcp add glass --scope user -- \
 
 ### Managing the LaunchAgent by hand
 
-`glass-mcp setup --launchagent` installs and starts it for you; to stop, restart,
-or reload it manually (e.g. after moving the app to a new path):
+Step 3 installs and starts the LaunchAgent; to stop, restart, or reload it manually
+(e.g. after moving the app to a new path):
 
 ```bash
 launchctl bootout gui/$(id -u)/tech.fixedwidth.glass                                 # stop
@@ -278,7 +268,7 @@ and what each field means.
 
 ## Tools available on macOS
 
-Once `glass-mcp setup` (step 3) confirms both grants, the agent has `glass_start`,
+Once step 3 grants both permissions, the agent has `glass_start`,
 `glass_screenshot`, `glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`,
 `glass_logs`, `glass_list_windows`, `glass_select_window`, and `glass_doctor`. The
 accessibility-tree tools — `glass_a11y_snapshot`, `glass_a11y_marks`,
@@ -370,15 +360,14 @@ Check `glass-mcp doctor`'s `[sandbox]` section for the live Seatbelt availabilit
 ## Troubleshooting: headless / SSH setup
 
 A few gotchas that only show up when you're driving a box over SSH (no one at the
-keyboard), e.g. re-signing after a code change or running `setup` unattended:
+keyboard), e.g. re-signing after a code change or granting permissions:
 
-- **`glass-mcp setup` needs a real console login, not just an SSH shell.** If
-  nobody's logged in at the screen (or it's sitting at the login window), `setup`
-  refuses outright — glass needs a real GUI login to request permissions and
-  drive anything. Log in at the console first (or, once permissions are already
-  granted, run `glass-mcp` as the `gui/<uid>` LaunchAgent instead, which doesn't
-  need a fresh `setup` run). Pass `--non-interactive` when scripting a repeatable
-  `setup` run so it fails fast instead of blocking on a prompt no one can answer.
+- **Enabling the grants needs a real console login, not just an SSH shell.**
+  Enabling `GlassMcp.app` in the Screen Recording / Accessibility panes (§3, step 2)
+  is a GUI action in System Settings, so it needs someone logged in at the screen —
+  glass also needs a real GUI login to capture and drive anything. Do the one-time
+  grant at the console (Screen Sharing works). Once granted, everything else — the
+  `gui/<uid>` LaunchAgent, `doctor`, driving apps — works headless over SSH.
 - **Non-interactive `codesign` needs the keychain unlocked first.** A keychain
   created (or last unlocked) in an earlier login session is locked again by the time
   a bare SSH shell runs `codesign` — you'll see `errSecInternalComponent` rather
