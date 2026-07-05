@@ -278,7 +278,20 @@ fn first_label(node: &AxNode) -> Option<String> {
 /// (e.g. an open dropdown's option list) — headless a11y backends don't always report
 /// bounds relative to the popover's own origin. `None` when no non-active window
 /// contains the point; the smallest-area match wins when several do (an outer window
-/// fully behind/around a smaller popover shouldn't shadow it).
+/// fully behind/around a smaller popover shouldn't shadow it). If several windows tie
+/// on area, the first one in `windows`' order wins (`min_by_key` keeps the first
+/// minimum) — i.e. whatever order the platform's `list_windows` enumerated them in;
+/// this doesn't matter in practice since same-area overlapping windows aren't a shape
+/// any backend produces.
+///
+/// Known best-effort limitation: this detection is purely geometric — it has no way to
+/// tell "the app's own popover" apart from an unrelated second top-level window of the
+/// same app that happens to overlap the element's projected point. The
+/// `menu_container_bounds` size-matching gate below guards against that residual case:
+/// a genuinely non-popover window is very unlikely to *also* have an ancestor whose size
+/// coincidentally matches its own within tolerance, so the common outcome of a
+/// mis-detection is a clear `AxElementInUnmappedPopover` error, not a silent click into
+/// the wrong window.
 fn owning_popover(
     bounds: crate::accessibility::AxRect,
     active: &WindowGeometry,
@@ -328,7 +341,10 @@ fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
 /// wrappers, not the container itself. Scoring every matching ancestor by closeness to
 /// the popover's exact size (not proximity to `target`) picks the real container: it
 /// tracks the popover's size most tightly, while wrappers trimmed by padding/scrollbars
-/// drift further from it.
+/// drift further from it. Ties (equal score) break toward the shallower ancestor — the
+/// one closer to `root` — since `ancestor_path` walks root-to-target and `min_by_key`
+/// keeps the first minimum; in practice two ancestors matching to the exact same pixel
+/// is vanishingly rare (padding/scrollbar trims almost always differ by at least 1px).
 fn menu_container_bounds(
     root: &AxNode,
     target: AxNodeId,
@@ -735,7 +751,14 @@ impl Glass {
         // may actually render in a separate popover window (e.g. an open dropdown's
         // option list) whose own origin they don't reflect. Detect that and route the
         // click into the popover instead of silently missing.
-        let windows = self.list_windows()?;
+        //
+        // This enumeration is a best-effort popover probe, not something an ordinary
+        // click depends on: a backend where `list_windows` is heavier or flaky must
+        // never turn a normal click into a failure just because the probe failed. An
+        // `Err` here degrades to an empty list, which makes `owning_popover` return
+        // `None` below and falls straight through to the unchanged `clamped_center`
+        // click path.
+        let windows = self.list_windows().unwrap_or_default();
         if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
             let popover_geo = windows
                 .iter()
@@ -1225,6 +1248,10 @@ mod tests {
         /// Every `select_window(id)` call, in order — for asserting popover routing
         /// selects the popover then restores the previously-active window.
         select_log: Arc<Mutex<Vec<WindowId>>>,
+        /// When set, `list_windows` errors instead of returning its scripted list — for
+        /// proving a failed popover-probe enumeration degrades to the normal click path
+        /// instead of propagating.
+        fail_list_windows: bool,
     }
 
     impl FakePlatform {
@@ -1273,6 +1300,10 @@ mod tests {
         }
         fn with_capture_window_log(mut self, log: CaptureWindowLog) -> Self {
             self.capture_window_log = log;
+            self
+        }
+        fn with_failing_list_windows(mut self) -> Self {
+            self.fail_list_windows = true;
             self
         }
     }
@@ -1349,6 +1380,9 @@ mod tests {
             Ok(self.geometry.clone())
         }
         fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            if self.fail_list_windows {
+                return Err(GlassError::Backend("list_windows unavailable".into()));
+            }
             if self.windows.is_empty() {
                 Ok(vec![WindowInfo {
                     id: WindowId(0),
@@ -1738,6 +1772,58 @@ mod tests {
             menu_container_bounds(&root, AxNodeId(6), &popover),
             Some(container_bounds),
             "the real container (closest in size to the popover) must win over nearer wrapper groups"
+        );
+    }
+
+    #[test]
+    fn menu_container_bounds_prefers_content_container_over_window_root_sized_ancestor() {
+        // Disambiguates the two kinds of ancestor that both commonly fall within
+        // tolerance of the popover's size: an outer node sized like the popover
+        // window's own frame (e.g. the toplevel root, a few px *larger* — decorations/
+        // margins), and the inner content container a few px *smaller* (the real
+        // GTK4 shape: a `List` a little inside the window's own bounds). Both are
+        // "near" the popover size, so this proves the scoring picks whichever is
+        // numerically closest — the content container — not whichever is outermost.
+        let popover = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        let content_bounds = AxRect {
+            x: 2,
+            y: 222,
+            width: 322,  // 4px narrower than the popover
+            height: 132, // 3px shorter than the popover
+        };
+        let target = ax_node(
+            2,
+            AxRole::ListItem,
+            Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 80,
+                height: 27,
+            }),
+            vec![],
+        );
+        let content = ax_node(1, AxRole::List, Some(content_bounds), vec![target]);
+        let root = ax_node(
+            0,
+            AxRole::Window,
+            Some(AxRect {
+                x: -3,
+                y: 220,
+                width: 338,  // 12px wider than the popover (outer window-root frame)
+                height: 145, // 10px taller than the popover
+            }),
+            vec![content],
+        );
+        assert_eq!(
+            menu_container_bounds(&root, AxNodeId(2), &popover),
+            Some(content_bounds),
+            "both root and content are within tolerance, but content is numerically \
+             closest to the popover's size and must win over the outer window root"
         );
     }
 
@@ -2674,6 +2760,33 @@ mod tests {
     }
 
     #[test]
+    fn click_element_survives_a_failing_list_windows_and_clicks_normally() {
+        // The popover-routing probe (`list_windows`) is best-effort: if the backend's
+        // enumeration errors, an ordinary click must still succeed via the unchanged
+        // `clamped_center` path rather than propagating the enumeration failure.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks.clone())
+            .with_select_log(select_log.clone())
+            .with_failing_list_windows();
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+        g.click_element(AxNodeId(1))
+            .expect("a failing list_windows must not block an ordinary click");
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            Some((20, 20)),
+            "click still lands on the element's own clamped center"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "no popover routing was attempted since the probe's result was treated as empty"
+        );
+    }
+
+    #[test]
     fn click_element_routes_into_owning_popover_and_restores_active_window() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
@@ -2731,6 +2844,12 @@ mod tests {
     fn click_element_in_popover_without_a_mappable_container_errors() {
         // Same popover-owning geometry, but the target has no List-sized ancestor to
         // recover a container origin from — must error, not silently mis-click.
+        //
+        // This also stands in for the residual `owning_popover` false-positive case
+        // documented on that function: a normal element whose projected point happens to
+        // land inside another real window is indistinguishable, geometrically, from a
+        // genuine popover — the size-matching gate is what turns that misdetection into
+        // this clear, catchable error instead of a silent click into the wrong window.
         let globex = AxNode {
             id: AxNodeId(0),
             role: AxRole::ListItem,
@@ -2782,7 +2901,12 @@ mod tests {
             },
             false,
         );
-        let platform = FakePlatform::new(340, 300).with_windows(vec![a, b]);
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![a, b])
+            .with_click_log(clicks.clone())
+            .with_select_log(select_log.clone());
         let mut g = glass_with_a11y(platform, tree);
         g.start(&spec()).unwrap();
         let snapshot = g.a11y_snapshot().unwrap();
@@ -2791,6 +2915,16 @@ mod tests {
             g.click_element(globex_id).unwrap_err(),
             GlassError::AxElementInUnmappedPopover(id) if id == globex_id.0
         ));
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "a detection that can't be resolved to a container must never fall back to \
+             clicking anywhere — no click of any kind is recorded"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "the candidate window is never selected either — the container gate runs \
+             before select_window, so a mis-detection can't even transiently switch focus"
+        );
     }
 
     #[test]
