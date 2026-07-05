@@ -418,6 +418,28 @@ impl GlassServer {
     }
 
     #[tool(
+        description = "Scroll a container until an accessibility element becomes visible, then \
+                       return it (text-only, no image). For a virtualized list only on-screen \
+                       rows exist in the a11y tree, so an off-screen row can't be clicked until \
+                       scrolled to; this collapses the scroll+snapshot loop into one call. Select \
+                       by `name` (accessible-name substring) and/or `role` (e.g. \"ListItem\"); \
+                       optional `value_contains`. `direction` \"down\" (default) or \"up\" — it \
+                       sweeps that way to the end, then reverses to cover the other end. Optional \
+                       `x`,`y` aim the wheel at a specific container (default: window center); \
+                       `step` sets wheel notches per move (default 3). Returns \
+                       {matched,elapsed_ms,element{id,role,name,bounds,states},scrolled{steps,reversed}} \
+                       — the id is usable with glass_click_element. Returns {matched:false} if the \
+                       element never appears after sweeping both ends or `timeout_ms` (default \
+                       20000). Errors if the app exposes no accessibility tree."
+    )]
+    async fn glass_scroll_to_element(
+        &self,
+        Parameters(a): Parameters<ScrollToElementArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(move |g| tools::scroll_to_element(g, &a)).await
+    }
+
+    #[tool(
         description = "Block until a visual region changes (diverges from a reference) or matches \
                        (converges to a saved baseline), then return text metrics (no image unless \
                        `include_image:true`). `until`: \"changes\" (default) or \"matches\" (needs \
