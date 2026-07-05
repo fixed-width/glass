@@ -344,11 +344,15 @@ impl GlassServer {
 
     #[tool(
         description = "Click an element by its #id from glass_a11y_snapshot (clicks the \
-                       center of its bounds, via the normal click path). Ids are only valid \
-                       within the latest snapshot — re-run glass_a11y_snapshot if the UI changed. \
-                       Optional `return`: \"snapshot\" folds a fresh a11y tree into the result \
-                       (and refreshes the snapshot cache); \"settle\" waits for the UI to stop \
-                       changing (text-only); omit or \"none\" for no observe (default)."
+                       center of its bounds, via the normal click path). If the element actually \
+                       renders in a popover owned by a different window than the active one \
+                       (e.g. an open dropdown's option row), the click is automatically routed \
+                       into that popover window and the previously-active window is restored \
+                       afterward. Ids are only valid within the latest snapshot — re-run \
+                       glass_a11y_snapshot if the UI changed. Optional `return`: \"snapshot\" \
+                       folds a fresh a11y tree into the result (and refreshes the snapshot \
+                       cache); \"settle\" waits for the UI to stop changing (text-only); omit or \
+                       \"none\" for no observe (default)."
     )]
     async fn glass_click_element(
         &self,

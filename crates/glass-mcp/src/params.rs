@@ -97,7 +97,11 @@ pub struct SelectWindowArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickElementArgs {
     /// The element `#id` from `glass_a11y_snapshot`. Valid only within the latest
-    /// snapshot — re-snapshot if the UI changed.
+    /// snapshot — re-snapshot if the UI changed. If the element actually renders in a
+    /// popover owned by a different window than the active one (e.g. an open
+    /// dropdown's option row), the click is automatically routed into that popover
+    /// window and the previously-active window is restored afterward — no extra step
+    /// needed.
     pub id: u32,
     /// Optional observe folded into the result: "snapshot" (a fresh a11y tree, also
     /// refreshing the snapshot cache), "settle" (wait for the UI to stop changing,

@@ -74,6 +74,9 @@ pub enum GlassError {
     #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
     AxValueNotApplied(u32),
 
+    #[error("element #{0} is inside a popover glass could not map to a window; select_window it and click by coordinate")]
+    AxElementInUnmappedPopover(u32),
+
     #[error("accessibility unavailable: {0}")]
     AccessibilityUnavailable(String),
 
@@ -156,6 +159,10 @@ mod tests {
         assert_eq!(
             GlassError::AxElementChanged(2).to_string(),
             "element #2 changed since the snapshot; re-snapshot"
+        );
+        assert_eq!(
+            GlassError::AxElementInUnmappedPopover(9).to_string(),
+            "element #9 is inside a popover glass could not map to a window; select_window it and click by coordinate"
         );
     }
 

@@ -307,6 +307,16 @@ fn find_role_name<'a>(
         .find_map(|c| find_role_name(c, role, name))
 }
 
+// Pre-order search for the first node with an exact accessible name, any role — an
+// open dropdown's option row is a ListItem, not addressable by role alone the way
+// find_role_name is.
+fn find_node<'a>(node: &'a glass_core::AxNode, name: &str) -> Option<&'a glass_core::AxNode> {
+    if node.name.as_deref() == Some(name) {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| find_node(c, name))
+}
+
 fn launch_fixture() -> Glass {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -464,6 +474,32 @@ fn screenshot_includes_open_popover() {
         "opening the dropdown should change many captured pixels in the region below the \
          combo button, where the popover's option rows draw (popover composited); \
          changed_below_combo={changed_below_combo}"
+    );
+    glass.stop().expect("stop");
+}
+
+// Regression (#84): the open GtkDropDown's option rows render in a separate
+// override-redirect popover window, not the app's active window — click_element must
+// auto-route the click into that popover (see glass_core::session's owning_popover /
+// menu_container_bounds) rather than clicking the active window's coordinates and
+// silently missing. Exercises the full click_element -> commit path end to end.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn click_element_commits_dropdown_option() {
+    let mut glass = launch_fixture();
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
+    glass.click_element(combo.id).expect("open");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let t2 = glass.a11y_snapshot().expect("snap2");
+    let globex = find_node(&t2.root, "Globex").expect("globex");
+    glass.click_element(globex.id).expect("click option");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let t3 = glass.a11y_snapshot().expect("snap3");
+    assert_eq!(
+        find_role(&t3.root, glass_core::AxRole::ComboBox).and_then(|c| c.name.as_deref()),
+        Some("Globex"),
+        "clicking the popover's option row should commit the dropdown selection"
     );
     glass.stop().expect("stop");
 }
