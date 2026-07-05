@@ -66,6 +66,76 @@ pub struct WaitElementOutcome {
     pub elapsed_ms: u64,
 }
 
+/// Wheel notches per scroll step; chosen so a step realizes at most a few rows
+/// (won't skip a virtualized row's realized band). Overridable per call.
+pub const SCROLL_TO_DEFAULT_STEP: u32 = 3;
+/// Overall wall-clock bound for a `scroll_to_element` sweep.
+pub const SCROLL_TO_DEFAULT_TIMEOUT_MS: u64 = 20_000;
+
+/// A vertical scroll sweep direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Down,
+    Up,
+}
+
+impl ScrollDirection {
+    /// The other sweep direction.
+    pub fn opposite(self) -> ScrollDirection {
+        match self {
+            ScrollDirection::Down => ScrollDirection::Up,
+            ScrollDirection::Up => ScrollDirection::Down,
+        }
+    }
+    /// Signed vertical wheel delta (notches): `Down` is positive (wheel-down),
+    /// `Up` negative.
+    pub fn dy(self, step: u32) -> i32 {
+        match self {
+            ScrollDirection::Down => step as i32,
+            ScrollDirection::Up => -(step as i32),
+        }
+    }
+    /// Parse from a tool string (case-insensitive). `None` for unknown.
+    pub fn from_name(s: &str) -> Option<ScrollDirection> {
+        match s.to_ascii_lowercase().as_str() {
+            "down" => Some(ScrollDirection::Down),
+            "up" => Some(ScrollDirection::Up),
+            _ => None,
+        }
+    }
+}
+
+/// Parameters for [`Glass::scroll_to_element`].
+#[derive(Clone, Debug)]
+pub struct ScrollToElementParams {
+    pub name: Option<String>,
+    pub role: Option<AxRole>,
+    pub value_contains: Option<String>,
+    /// Primary sweep direction; the search reverses to the other end if the
+    /// target isn't found first.
+    pub direction: ScrollDirection,
+    /// Scroll anchor (window-relative). `None` → the active window's center.
+    pub anchor: Option<(i32, i32)>,
+    /// Wheel notches issued per scroll step.
+    pub step: u32,
+    /// Overall wall-clock bound.
+    pub timeout_ms: u64,
+}
+
+/// Outcome of [`Glass::scroll_to_element`].
+#[derive(Clone, Debug)]
+pub struct ScrollToElementOutcome {
+    pub matched: bool,
+    /// The matched element (absent when `matched` is false). Its id is from the
+    /// final snapshot, so it is usable with `click_element`.
+    pub element: Option<ElementInfo>,
+    pub elapsed_ms: u64,
+    /// Total scroll steps issued across the sweep.
+    pub steps: u32,
+    /// Whether the sweep had reversed past the primary direction when it returned.
+    pub reversed: bool,
+}
+
 /// Parameters for [`Glass::wait_for_region`].
 #[derive(Clone, Debug)]
 pub struct WaitRegionParams {
@@ -3508,5 +3578,20 @@ mod tests {
             modifiers: vec![],
         })
         .unwrap();
+    }
+
+    #[test]
+    fn scroll_direction_opposite_and_dy() {
+        assert_eq!(ScrollDirection::Down.opposite(), ScrollDirection::Up);
+        assert_eq!(ScrollDirection::Up.opposite(), ScrollDirection::Down);
+        // Down = wheel-down = positive notches; Up = negative.
+        assert_eq!(ScrollDirection::Down.dy(3), 3);
+        assert_eq!(ScrollDirection::Up.dy(3), -3);
+        assert_eq!(
+            ScrollDirection::from_name("DOWN"),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(ScrollDirection::from_name("up"), Some(ScrollDirection::Up));
+        assert_eq!(ScrollDirection::from_name("sideways"), None);
     }
 }
