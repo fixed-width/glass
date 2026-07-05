@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal GTK4 app with a known accessibility tree, for glass-a11y-linux tests.
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
-CheckButton "Enable", and an Entry "Field" (initial text "hello"). Run by
-scripts/test-a11y.sh via glass (which sets DISPLAY).
+CheckButton "Enable", an Entry "Field" (initial text "hello"), and a SpinButton
+"Amount" (initial value 1). Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration
 and presents its window immediately without waiting for portal services to settle."""
@@ -32,6 +32,14 @@ class FixtureApp(Gtk.Application):
         entry.set_text("hello")
         entry.update_property([Gtk.AccessibleProperty.LABEL], ["Field"])
         box.append(entry)
+        # A SpinButton exposes BOTH the AT-SPI EditableText and Value interfaces; only
+        # Value commits to the adjustment, so set_value must go through Value.
+        spin = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(value=1, lower=0, upper=10, step_increment=1),
+            digits=0,
+        )
+        spin.update_property([Gtk.AccessibleProperty.LABEL], ["Amount"])
+        box.append(spin)
         win.set_child(box)
         win.present()
 
