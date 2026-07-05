@@ -866,7 +866,8 @@ impl Platform for X11Platform {
     }
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
-        let win = self.require_window()?;
+        // `window_geometry()` itself calls `require_window()`, so it doubles as
+        // the "is there an active window" guard — no separate binding needed.
         let geo = self.window_geometry()?;
         let (cx, cy, w, h) = match region {
             Some(r) => (r.x, r.y, r.width, r.height),
@@ -887,13 +888,18 @@ impl Platform for X11Platform {
             )
         };
         crate::coords::check_capture_fits(&geo, region, display)?;
+        // Capture from ROOT over the window's screen region so overlapping popovers
+        // (separate override-redirect top-levels) are included, not just this window's
+        // own (possibly-obscured) drawable.
+        let sx = geo.x + cx as i32;
+        let sy = geo.y + cy as i32;
         let image = self
             .conn
             .get_image(
                 ImageFormat::Z_PIXMAP,
-                win,
-                cx as i16,
-                cy as i16,
+                self.root,
+                sx as i16,
+                sy as i16,
                 w as u16,
                 h as u16,
                 !0u32,
