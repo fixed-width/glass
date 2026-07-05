@@ -298,6 +298,11 @@ pub struct DiffArgs {
     /// Also return the current frame cropped to the changed region (default
     /// false). No image is returned when nothing changed.
     pub include_image: Option<bool>,
+    /// Optional window-relative sub-rectangle to diff; omit to diff the whole
+    /// window. Scopes the comparison (and the reported `bbox`, which becomes
+    /// region-relative) to just this area — the way to ask "did *only* this part
+    /// change?" Mirrors `glass_wait_for_region`'s `region`.
+    pub region: Option<RegionArgs>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -398,6 +403,17 @@ mod tests {
         let a: ScreenshotArgs =
             serde_json::from_str(r#"{"region":{"x":1,"y":2,"width":3,"height":4}}"#).unwrap();
         let r = a.region.unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn diff_args_region_defaults_none_and_parses() {
+        let none: DiffArgs = serde_json::from_str(r#"{"name":"m"}"#).unwrap();
+        assert!(none.region.is_none());
+        let some: DiffArgs =
+            serde_json::from_str(r#"{"name":"m","region":{"x":1,"y":2,"width":3,"height":4}}"#)
+                .unwrap();
+        let r = some.region.unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (1, 2, 3, 4));
     }
 

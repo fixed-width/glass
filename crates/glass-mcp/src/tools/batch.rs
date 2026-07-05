@@ -289,6 +289,7 @@ mod tests {
                 then: Some(ThenArgs {
                     settle: None,
                     diff: Some(DiffArgs {
+                        region: None,
                         name: "absent".into(),
                         mode: None,
                         threshold: None,
