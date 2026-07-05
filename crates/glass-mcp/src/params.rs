@@ -106,7 +106,10 @@ pub struct ClickElementArgs {
 pub struct SetValueArgs {
     /// The element `#id` from `glass_a11y_snapshot`.
     pub id: u32,
-    /// The text/value to set.
+    /// The value to set. For a text field, the text. For a spin/slider, a number.
+    /// For a switch/checkbox/toggle, a boolean (`"true"`/`"false"`/`"on"`/`"off"`/
+    /// `"1"`/`"0"`) — idempotent. For a dropdown/combo box, an option label
+    /// (case-insensitive); glass opens it and picks that option.
     pub text: String,
     /// Optional observe folded into the result: "snapshot" (a fresh a11y tree, also
     /// refreshing the snapshot cache), "settle" (wait for the UI to stop changing,

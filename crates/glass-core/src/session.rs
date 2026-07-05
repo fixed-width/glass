@@ -1,6 +1,6 @@
 use crate::accessibility::{
-    element_match, Accessibility, AxContext, AxNodeId, AxRole, AxTarget, AxTree, ElementCondition,
-    ElementInfo, ElementMatch,
+    element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRole, AxTarget, AxTree,
+    ElementCondition, ElementInfo, ElementMatch,
 };
 use crate::baseline::BaselineStore;
 use crate::diff::{diff, diff_perceptual, region_satisfied, BBox, DiffResult, RegionUntil};
@@ -178,6 +178,91 @@ pub struct Glass {
     active: Option<ActiveSession>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
     shutdown_hook: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// First node of `role` in pre-order, or `None`.
+fn find_role(node: &AxNode, role: AxRole) -> Option<&AxNode> {
+    if node.role == role {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| find_role(c, role))
+}
+
+fn rect_center(r: &crate::accessibility::AxRect) -> (i64, i64) {
+    (
+        r.x as i64 + r.width as i64 / 2,
+        r.y as i64 + r.height as i64 / 2,
+    )
+}
+
+/// The ComboBox nearest `target` bounds — disambiguates when several combos exist,
+/// since ids don't survive a re-snapshot. Falls back to the first ComboBox when
+/// bounds are unknown (single-combo apps, the common case).
+fn find_combo_near<'a>(
+    root: &'a AxNode,
+    target: Option<&crate::accessibility::AxRect>,
+) -> Option<&'a AxNode> {
+    let Some(t) = target else {
+        return find_role(root, AxRole::ComboBox);
+    };
+    let (tx, ty) = rect_center(t);
+    fn walk<'a>(node: &'a AxNode, tx: i64, ty: i64, best: &mut Option<(&'a AxNode, i64)>) {
+        if node.role == AxRole::ComboBox {
+            if let Some(b) = &node.bounds {
+                let (cx, cy) = rect_center(b);
+                let d = (cx - tx).pow(2) + (cy - ty).pow(2);
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    *best = Some((node, d));
+                }
+            }
+        }
+        for c in &node.children {
+            walk(c, tx, ty, best);
+        }
+    }
+    let mut best = None;
+    walk(root, tx, ty, &mut best);
+    best.map(|(n, _)| n)
+        .or_else(|| find_role(root, AxRole::ComboBox))
+}
+
+/// The open (expanded) ComboBox, if any — disambiguates the one whose popup is up.
+fn find_expanded_combo(node: &AxNode) -> Option<&AxNode> {
+    if node.role == AxRole::ComboBox && node.states.expanded {
+        return Some(node);
+    }
+    node.children.iter().find_map(find_expanded_combo)
+}
+
+/// A combo's option rows, in order, as `(label, is_selected)`. An open dropdown
+/// realizes its options as `ListItem`s, each carrying its text on a nested label.
+fn collect_combo_options(combo: &AxNode) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    collect_list_items(combo, &mut out);
+    out
+}
+
+fn collect_list_items(node: &AxNode, out: &mut Vec<(String, bool)>) {
+    if node.role == AxRole::ListItem {
+        if let Some(label) = first_label(node) {
+            out.push((label, node.states.selected));
+        }
+        return; // an item's text is a leaf; don't descend for nested items
+    }
+    for c in &node.children {
+        collect_list_items(c, out);
+    }
+}
+
+/// First non-empty accessible name in this subtree (an option's text lives on a
+/// nested label, not the `ListItem` itself).
+fn first_label(node: &AxNode) -> Option<String> {
+    if let Some(n) = &node.name {
+        if !n.is_empty() {
+            return Some(n.clone());
+        }
+    }
+    node.children.iter().find_map(first_label)
 }
 
 impl Glass {
@@ -596,6 +681,13 @@ impl Glass {
             };
             (target, ctx)
         };
+        // A dropdown/combo has no committing accessibility write: its `Selection`
+        // interface only moves the popup's *preview* selection, and the model commits
+        // only on row activation (Enter/click). So drive it like a person does —
+        // open it, keyboard-navigate to the option, and press Enter.
+        if target.role == AxRole::ComboBox {
+            return self.set_combo_value(id, &target, text);
+        }
         let s = self.active_mut()?;
         s.accessibility
             .as_mut()
@@ -603,6 +695,77 @@ impl Glass {
             .set_value(&ctx, &target, text)?;
         s.pump();
         Ok(())
+    }
+
+    /// Select an option in a dropdown/combo by label (case-insensitive). Opens the
+    /// popup, arrow-navigates from the current selection to the target, and presses
+    /// Enter to commit — verifying the button label changed (else `AxValueNotApplied`).
+    fn set_combo_value(&mut self, id: AxNodeId, target: &AxTarget, text: &str) -> Result<()> {
+        let want = text.trim();
+        // Already showing it? (the combo's name is its current selection label)
+        if target
+            .name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(want))
+        {
+            return Ok(());
+        }
+        // Open the popup (the combo button is in the main window, so this click lands).
+        self.click_element(id)?;
+        self.settle_for_popup();
+        // Re-read the realized options + which one is currently selected. The open
+        // combo is `expanded`; when several combos exist, ids don't survive the
+        // re-snapshot, so fall back to the one nearest the target's bounds.
+        let tree = self.a11y_snapshot()?;
+        let combo = find_expanded_combo(&tree.root)
+            .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
+            .ok_or(GlassError::AxElementChanged(id.0))?;
+        let options = collect_combo_options(combo);
+        if options.is_empty() {
+            return Err(GlassError::AxElementNotEditable(id.0));
+        }
+        let target_idx = options
+            .iter()
+            .position(|(label, _)| label.eq_ignore_ascii_case(want));
+        let Some(target_idx) = target_idx else {
+            // Unknown option — dismiss the popup so the UI is left neutral, then report.
+            let _ = self.key(&KeyEvent::Chord("Escape".to_string()));
+            let choices = options
+                .iter()
+                .map(|(l, _)| l.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(GlassError::AxOptionNotFound(
+                id.0,
+                text.to_string(),
+                choices,
+            ));
+        };
+        // Opening focuses the current selection; step from it to the target, then Enter.
+        let current_idx = options.iter().position(|(_, sel)| *sel).unwrap_or(0);
+        let delta = target_idx as i32 - current_idx as i32;
+        let chord = if delta >= 0 { "Down" } else { "Up" };
+        for _ in 0..delta.unsigned_abs() {
+            self.key(&KeyEvent::Chord(chord.to_string()))?;
+        }
+        self.key(&KeyEvent::Chord("Return".to_string()))?;
+        self.settle_for_popup();
+        // Verify the model actually committed — the *target* combo (matched by bounds,
+        // now closed so nothing is `expanded`) must read the wanted label.
+        let tree = self.a11y_snapshot()?;
+        let ok = find_combo_near(&tree.root, target.bounds.as_ref())
+            .and_then(|c| c.name.as_deref())
+            .is_some_and(|n| n.eq_ignore_ascii_case(want));
+        if ok {
+            Ok(())
+        } else {
+            Err(GlassError::AxValueNotApplied(id.0))
+        }
+    }
+
+    /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
+    fn settle_for_popup(&self) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {

@@ -65,6 +65,9 @@ pub enum GlassError {
     #[error("element #{0} is not editable")]
     AxElementNotEditable(u32),
 
+    #[error("element #{0} has no option matching {1:?}; available options: {2}")]
+    AxOptionNotFound(u32, String, String),
+
     #[error("element #{0} changed since the snapshot; re-snapshot")]
     AxElementChanged(u32),
 
