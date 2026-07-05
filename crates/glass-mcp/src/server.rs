@@ -148,7 +148,7 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Capture the app window (or an optional window-relative `region`) as a screenshot (lossless WebP image)."
+        description = "Capture the app window (or an optional window-relative `region`) as a screenshot (lossless WebP image). A capture reaching off the display edge is clipped to the on-screen portion — the returned `width`/`height` are the actual captured size, so a frame smaller than the window/region means it was clipped; only a fully off-screen surface errors."
     )]
     async fn glass_screenshot(
         &self,
