@@ -494,13 +494,18 @@ pub fn element_match<'a>(
     value_contains: Option<&str>,
     condition: ElementCondition,
 ) -> ElementMatch<'a> {
-    // Role filter: exact match, OR — when an interactable role is requested — an actable
-    // node that the backend left generically classified. Toolkits like Jetpack Compose
-    // surface a real button as a clickable `Group`/`Other` (the role is lost), so an exact
-    // filter would miss it; matching by name + actability finds it anyway.
+    // Role filter: exact match, OR — when an interactable role is requested *and* a name or
+    // value disambiguator is also present — an actable node the backend left generically
+    // classified. Toolkits like Jetpack Compose surface a real button as a clickable
+    // `Group`/`Other` (the role is lost), so an exact filter would miss it; matching by
+    // name + actability finds it anyway. The disambiguator is required: without it, a
+    // role-only query would match the first focusable container in the tree — a confident
+    // wrong match reported as success rather than an honest miss.
+    let has_disambiguator = name.is_some() || value_contains.is_some();
     let role_match = |n: &AxNode, r: AxRole| {
         n.role == r
             || (r.is_interactable()
+                && has_disambiguator
                 && n.states.focusable
                 && matches!(n.role, AxRole::Group | AxRole::Other))
     };
@@ -918,6 +923,51 @@ mod tests {
                 ElementMatch::Pending
             ),
             "a non-actable Group must not satisfy role:Button"
+        );
+    }
+
+    #[test]
+    fn role_alone_does_not_match_a_bare_focusable_container() {
+        // A focusable container Group (e.g. a scrollable table/viewport) must NOT satisfy a
+        // role-only interactable query: with no name/value to disambiguate, the generic
+        // actable fallback would otherwise return the container as a confident wrong match.
+        let container = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Group,
+            raw_role: "panel".into(),
+            name: None,
+            value: None,
+            states: AxStates {
+                focusable: true,
+                enabled: true,
+                ..Default::default()
+            },
+            bounds: None,
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("App".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![container],
+        };
+        let t = AxTree { root, count: 0 };
+        assert!(
+            matches!(
+                element_match(
+                    &t,
+                    None,
+                    Some(AxRole::Button),
+                    None,
+                    ElementCondition::Appears
+                ),
+                ElementMatch::Pending
+            ),
+            "role:Button alone must not match a bare focusable container Group"
         );
     }
 
