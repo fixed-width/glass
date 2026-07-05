@@ -152,6 +152,16 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
     Ok(tree)
 }
 
+/// Whether `set_value` must write through the AT-SPI `Value` interface only, skipping
+/// `EditableText`. A `GtkSpinButton` exposes both interfaces, but `EditableText` writes its
+/// inner entry buffer without committing to the adjustment (the value silently reverts);
+/// numeric/range widgets with a numeric target must go through `Value`, the sole interface
+/// that applies the change.
+fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
+    use glass_core::AxRole::*;
+    matches!(role, Slider | SpinButton | ScrollBar) && text.parse::<f64>().is_ok()
+}
+
 async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
@@ -170,19 +180,23 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
-    // Prefer EditableText (text fields); fall back to Value (numeric). The builder
-    // `.ok()` chaining mirrors the working ComponentProxy build in `extents`.
-    let editable = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
-        .destination(dest.clone())
-        .ok()
-        .and_then(|b| b.path(path.clone()).ok());
-    if let Some(b) = editable {
-        if let Ok(et) = b.build().await {
-            match et.set_text_contents(text).await {
-                Ok(true) => return Ok(()),
-                // EditableText is present but rejected the write — don't try Value.
-                Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
-                Err(_) => {} // interface absent / call failed — fall through to Value
+    // Numeric/range widgets go through Value only (see `writes_value_only`): a GtkSpinButton
+    // also exposes EditableText, but writing its entry buffer doesn't commit to the adjustment.
+    // Text widgets prefer EditableText, falling back to Value for anything numeric that lacks it.
+    // The builder `.ok()` chaining mirrors the working ComponentProxy build in `extents`.
+    if !writes_value_only(role, text) {
+        let editable = atspi::proxy::editable_text::EditableTextProxy::builder(&conn)
+            .destination(dest.clone())
+            .ok()
+            .and_then(|b| b.path(path.clone()).ok());
+        if let Some(b) = editable {
+            if let Ok(et) = b.build().await {
+                match et.set_text_contents(text).await {
+                    Ok(true) => return Ok(()),
+                    // EditableText is present but rejected the write — don't try Value.
+                    Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
+                    Err(_) => {} // interface absent / call failed — fall through to Value
+                }
             }
         }
     }
@@ -374,5 +388,23 @@ mod tests {
             !msg.contains("relaunch with a11y:true"),
             "distinct from the bus/opt-in error"
         );
+    }
+
+    #[test]
+    fn writes_value_only_for_numeric_range_widgets() {
+        use glass_core::AxRole::*;
+        assert!(writes_value_only(SpinButton, "4"));
+        assert!(writes_value_only(Slider, "50.5"));
+        assert!(writes_value_only(ScrollBar, "0"));
+    }
+
+    #[test]
+    fn writes_value_only_is_false_for_text_or_non_numeric() {
+        use glass_core::AxRole::*;
+        // A text field uses EditableText even when its content is numeric.
+        assert!(!writes_value_only(TextField, "4"));
+        // A non-numeric target isn't the value path.
+        assert!(!writes_value_only(SpinButton, "abc"));
+        assert!(!writes_value_only(Button, "x"));
     }
 }

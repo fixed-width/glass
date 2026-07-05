@@ -239,6 +239,52 @@ fn set_value_on_button_is_not_editable() {
     glass.stop().expect("stop");
 }
 
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn set_value_changes_spinbutton() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch");
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+    // A GtkSpinButton exposes both EditableText and Value; set_value must write through the
+    // Value interface (the only one that commits to the adjustment) rather than the entry
+    // buffer, which reverts.
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let spin = find_role(&tree.root, glass_core::AxRole::SpinButton).expect("spinbutton");
+    assert_eq!(spin.value.as_deref(), Some("1"), "fixture starts at 1");
+    glass.set_value(spin.id, "4").expect("set_value");
+
+    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let spin2 = find_role(&tree2.root, glass_core::AxRole::SpinButton).expect("spinbutton 2");
+    assert_eq!(
+        spin2.value.as_deref(),
+        Some("4"),
+        "value should commit through the Value interface, not silently revert"
+    );
+    glass.stop().expect("stop");
+}
+
 // Pre-order search for the first node of a given role.
 fn find_role(node: &glass_core::AxNode, role: glass_core::AxRole) -> Option<&glass_core::AxNode> {
     if node.role == role {
