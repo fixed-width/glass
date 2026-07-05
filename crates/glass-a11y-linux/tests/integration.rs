@@ -293,6 +293,117 @@ fn find_role(node: &glass_core::AxNode, role: glass_core::AxRole) -> Option<&gla
     node.children.iter().find_map(|c| find_role(c, role))
 }
 
+// Pre-order search for the first node of a given role whose name matches.
+fn find_role_name<'a>(
+    node: &'a glass_core::AxNode,
+    role: glass_core::AxRole,
+    name: &str,
+) -> Option<&'a glass_core::AxNode> {
+    if node.role == role && node.name.as_deref() == Some(name) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|c| find_role_name(c, role, name))
+}
+
+fn launch_fixture() -> Glass {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 35_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch");
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    glass
+}
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn set_value_toggles_switch() {
+    let mut glass = launch_fixture();
+    // The GtkSwitch "Active" starts off; set_value must flip it on via the Action
+    // "toggle" (it exposes no text/Value interface).
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let sw = find_role_name(&tree.root, glass_core::AxRole::CheckBox, "Active").expect("switch");
+    assert!(!sw.states.checked, "switch starts off");
+    glass.set_value(sw.id, "true").expect("set_value true"); // set_value polls until applied
+
+    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let sw2 =
+        find_role_name(&tree2.root, glass_core::AxRole::CheckBox, "Active").expect("switch 2");
+    assert!(
+        sw2.states.checked,
+        "switch should be on after set_value true"
+    );
+
+    // Idempotent: setting true again is a no-op, and false turns it back off.
+    glass
+        .set_value(sw2.id, "true")
+        .expect("set_value true again");
+    let tree3 = glass.a11y_snapshot().expect("snapshot 3");
+    let sw3 =
+        find_role_name(&tree3.root, glass_core::AxRole::CheckBox, "Active").expect("switch 3");
+    assert!(sw3.states.checked, "still on after idempotent set");
+    glass.set_value(sw3.id, "false").expect("set_value false");
+    let tree4 = glass.a11y_snapshot().expect("snapshot 4");
+    let sw4 =
+        find_role_name(&tree4.root, glass_core::AxRole::CheckBox, "Active").expect("switch 4");
+    assert!(
+        !sw4.states.checked,
+        "switch should be off after set_value false"
+    );
+    glass.stop().expect("stop");
+}
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn set_value_selects_dropdown_option() {
+    let mut glass = launch_fixture();
+    // The GtkDropDown starts on "Acme"; set_value must select "Globex" by opening
+    // the popup and picking the option through the Selection interface.
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo box");
+    assert_eq!(combo.name.as_deref(), Some("Acme"), "starts on Acme");
+    glass
+        .set_value(combo.id, "Globex")
+        .expect("set_value Globex");
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let combo2 = find_role(&tree2.root, glass_core::AxRole::ComboBox).expect("combo box 2");
+    assert_eq!(
+        combo2.name.as_deref(),
+        Some("Globex"),
+        "dropdown should now show Globex"
+    );
+
+    // A non-existent option returns a clear error listing the choices.
+    let err = glass.set_value(combo2.id, "Nope").unwrap_err();
+    assert!(
+        matches!(err, glass_core::GlassError::AxOptionNotFound(_, _, _)),
+        "got: {err:?}"
+    );
+    glass.stop().expect("stop");
+}
+
 #[test]
 #[ignore = "needs Xvfb + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_without_a11y_flag_errors() {

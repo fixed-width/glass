@@ -178,6 +178,19 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
         return Err(GlassError::AxElementChanged(target.id.0));
     }
 
+    // Boolean widgets (switch/checkbox/toggle/radio) have no text buffer: set them
+    // through the Action interface (`toggle`) + `Checked` state, before the
+    // EditableText/Value paths. Combos are handled a layer up (session-level
+    // keyboard navigation), never reaching here.
+    {
+        use glass_core::AxRole::{CheckBox, RadioButton, ToggleButton};
+        if matches!(role, CheckBox | ToggleButton | RadioButton) {
+            if let Some(on) = parse_bool(text) {
+                return set_toggle(&conn, &node, role, on, target.id.0).await;
+            }
+        }
+    }
+
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
     // Numeric/range widgets go through Value only (see `writes_value_only`): a GtkSpinButton
@@ -295,6 +308,84 @@ async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<Ax
         bounds,
         children,
     })
+}
+
+/// Parse a boolean target for a toggle widget. Accepts the common textual and
+/// numeric spellings; `None` means "not a boolean" (so the caller falls through
+/// to another path rather than guessing).
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" | "checked" | "check" => Some(true),
+        "false" | "0" | "off" | "no" | "unchecked" | "uncheck" => Some(false),
+        _ => None,
+    }
+}
+
+/// AT-SPI action names that flip / activate a boolean widget. A GtkSwitch exposes
+/// `"toggle"`; buttons/checkboxes expose `"click"`/`"activate"`/`"press"`.
+const TOGGLE_ACTION_NAMES: &[&str] = &[
+    "toggle", "click", "activate", "press", "check", "uncheck", "switch",
+];
+
+/// Invoke the node's first activating Action (see [`TOGGLE_ACTION_NAMES`]).
+/// Returns whether an action was found and reported success.
+async fn invoke_activating_action(conn: &zbus::Connection, node: &AccessibleProxy<'_>) -> bool {
+    let dest = node.inner().destination().to_owned();
+    let path = node.inner().path().to_owned();
+    let Some(action) = atspi::proxy::action::ActionProxy::builder(conn)
+        .destination(dest)
+        .ok()
+        .and_then(|b| b.path(path).ok())
+    else {
+        return false;
+    };
+    let Ok(a) = action.build().await else {
+        return false;
+    };
+    let n = a.n_actions().await.unwrap_or(0);
+    for i in 0..n {
+        let name = a.get_name(i).await.unwrap_or_default().to_ascii_lowercase();
+        if TOGGLE_ACTION_NAMES.contains(&name.as_str()) {
+            return a.do_action(i).await.unwrap_or(false);
+        }
+    }
+    false
+}
+
+/// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`. Idempotent:
+/// only invokes the toggle action when the boolean state differs, then confirms the
+/// state actually changed (the toolkit applies the action on its next loop) — so a
+/// no-op activation (e.g. a radio can't be *un*-selected by clicking it) is reported
+/// as `AxValueNotApplied`, never a silent success. Toggle buttons expose their state
+/// via `Pressed`; checkboxes/switches/radios via `Checked`.
+async fn set_toggle(
+    conn: &zbus::Connection,
+    node: &AccessibleProxy<'_>,
+    role: glass_core::AxRole,
+    target_on: bool,
+    id: u32,
+) -> Result<()> {
+    let flag = if role == glass_core::AxRole::ToggleButton {
+        atspi_common::State::Pressed
+    } else {
+        atspi_common::State::Checked
+    };
+    if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
+        return Ok(()); // already in the desired state
+    }
+    if !invoke_activating_action(conn, node).await {
+        // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
+        // through accessibility; the caller should drive it with click_element.
+        return Err(GlassError::AxElementNotEditable(id));
+    }
+    // Poll until the toolkit applies it; a no-op activation never converges.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
+            return Ok(());
+        }
+    }
+    Err(GlassError::AxValueNotApplied(id))
 }
 
 /// Window-relative bounds via the Component interface, or `None` if the node has no

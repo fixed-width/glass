@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Minimal GTK4 app with a known accessibility tree, for glass-a11y-linux tests.
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
-CheckButton "Enable", an Entry "Field" (initial text "hello"), and a SpinButton
-"Amount" (initial value 1). Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
+CheckButton "Enable", an Entry "Field" (initial text "hello"), a SpinButton
+"Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), and a
+Switch "Active" (off). Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration
 and presents its window immediately without waiting for portal services to settle."""
@@ -40,6 +41,18 @@ class FixtureApp(Gtk.Application):
         )
         spin.update_property([Gtk.AccessibleProperty.LABEL], ["Amount"])
         box.append(spin)
+        # A GtkDropDown. Its options only commit on row activation (Enter/click), not
+        # via AT-SPI SelectChild, so glass drives it with the keyboard. Starts on
+        # "Acme" (index 0).
+        dropdown = Gtk.DropDown.new_from_strings(["Acme", "Globex", "Initech"])
+        dropdown.update_property([Gtk.AccessibleProperty.LABEL], ["Company"])
+        box.append(dropdown)
+        # A GtkSwitch exposes the AT-SPI Action interface + a boolean CHECKED state;
+        # set_value should toggle it to a target boolean. Starts off.
+        switch = Gtk.Switch()
+        switch.set_halign(Gtk.Align.START)
+        switch.update_property([Gtk.AccessibleProperty.LABEL], ["Active"])
+        box.append(switch)
         win.set_child(box)
         win.present()
 
