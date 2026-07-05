@@ -404,6 +404,35 @@ fn set_value_selects_dropdown_option() {
     glass.stop().expect("stop");
 }
 
+// Regression (#85a): X11 capture_frame must read from the ROOT window at the target
+// window's screen offset, not the window's own drawable, so an overlapping
+// override-redirect popover (a separate top-level X window — e.g. the popup a
+// GtkDropDown opens) shows up in the captured pixels instead of being invisible.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn screenshot_includes_open_popover() {
+    let mut glass = launch_fixture();
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
+    let combo_id = combo.id;
+    let before = glass.screenshot(None).expect("before");
+    glass.click_element(combo_id).expect("open");
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let after = glass.screenshot(None).expect("after");
+    assert_eq!((before.width, before.height), (after.width, after.height));
+    let changed = before
+        .pixels
+        .iter()
+        .zip(after.pixels.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        changed > 500,
+        "opening the dropdown should change many captured pixels (popover composited); changed={changed}"
+    );
+    glass.stop().expect("stop");
+}
+
 #[test]
 #[ignore = "needs Xvfb + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_without_a11y_flag_errors() {
