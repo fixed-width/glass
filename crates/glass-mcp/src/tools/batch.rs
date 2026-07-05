@@ -19,6 +19,7 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
         region: None,
         stability_region: s.stability_region.clone(),
         include_image: Some(false),
+        window_id: None,
     }
 }
 
@@ -223,7 +224,10 @@ mod tests {
                 then: Some(ThenArgs {
                     settle: None,
                     diff: None,
-                    screenshot: Some(ScreenshotArgs { region: None }),
+                    screenshot: Some(ScreenshotArgs {
+                        region: None,
+                        window_id: None,
+                    }),
                 }),
             },
         )

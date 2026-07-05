@@ -28,6 +28,10 @@ impl From<&RegionArgs> for Region {
 pub struct ScreenshotArgs {
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
     pub region: Option<RegionArgs>,
+    /// Capture/observe this window (id from `glass_list_windows`) instead of the
+    /// active one, without changing which window subsequent ops target. Omit for
+    /// the active window.
+    pub window_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -220,6 +224,10 @@ pub struct WaitStableArgs {
     /// text-only `{settled,width,height}` result with no WebP — cheap when the
     /// next step is a text `glass_diff`. `region` is ignored when false.
     pub include_image: Option<bool>,
+    /// Capture/observe this window (id from `glass_list_windows`) instead of the
+    /// active one, without changing which window subsequent ops target. Omit for
+    /// the active window.
+    pub window_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -260,6 +268,10 @@ pub struct WaitForRegionArgs {
     pub timeout_ms: Option<u64>,
     /// On match, also return the watched region as an image (default false).
     pub include_image: Option<bool>,
+    /// Capture/observe this window (id from `glass_list_windows`) instead of the
+    /// active one, without changing which window subsequent ops target. Omit for
+    /// the active window.
+    pub window_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -410,6 +422,14 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_args_window_id_defaults_none_and_parses() {
+        let none: ScreenshotArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.window_id.is_none());
+        let some: ScreenshotArgs = serde_json::from_str(r#"{"window_id":42}"#).unwrap();
+        assert_eq!(some.window_id, Some(42));
+    }
+
+    #[test]
     fn diff_args_region_defaults_none_and_parses() {
         let none: DiffArgs = serde_json::from_str(r#"{"name":"m"}"#).unwrap();
         assert!(none.region.is_none());
@@ -434,6 +454,14 @@ mod tests {
                 .unwrap();
         let r = a.stability_region.unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 2, 2));
+    }
+
+    #[test]
+    fn wait_stable_args_window_id_defaults_none_and_parses() {
+        let none: WaitStableArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.window_id.is_none());
+        let some: WaitStableArgs = serde_json::from_str(r#"{"window_id":7}"#).unwrap();
+        assert_eq!(some.window_id, Some(7));
     }
 
     #[test]
@@ -496,6 +524,14 @@ mod tests {
         assert_eq!(a.baseline.as_deref(), Some("login"));
         assert_eq!(a.mode.as_deref(), Some("exact"));
         assert!(a.region.is_none());
+    }
+
+    #[test]
+    fn wait_for_region_args_window_id_defaults_none_and_parses() {
+        let none: WaitForRegionArgs = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(none.window_id.is_none());
+        let some: WaitForRegionArgs = serde_json::from_str(r#"{"window_id":13}"#).unwrap();
+        assert_eq!(some.window_id, Some(13));
     }
 
     #[test]

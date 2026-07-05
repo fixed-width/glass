@@ -150,6 +150,7 @@ fn settle_text_only_args() -> WaitStableArgs {
         region: None,
         stability_region: None,
         include_image: Some(false),
+        window_id: None,
     }
 }
 
