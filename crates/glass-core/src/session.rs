@@ -71,6 +71,9 @@ pub struct WaitElementOutcome {
 pub const SCROLL_TO_DEFAULT_STEP: u32 = 3;
 /// Overall wall-clock bound for a `scroll_to_element` sweep.
 pub const SCROLL_TO_DEFAULT_TIMEOUT_MS: u64 = 20_000;
+/// Hard cap on scroll steps issued across a full bidirectional sweep, independent
+/// of `timeout_ms` — bounds the sweep even if the caller passes an enormous timeout.
+const SCROLL_TO_MAX_STEPS: u32 = 500;
 
 /// A vertical scroll sweep direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1056,6 +1059,120 @@ impl Glass {
             element: outcome.value.flatten(),
             elapsed_ms: outcome.elapsed_ms,
         })
+    }
+
+    /// Scroll a container (at `anchor`, default the active window's center) until an
+    /// element matching name/role/value realizes in the a11y tree, then return it —
+    /// its id is from the final snapshot, so it is immediately `click_element`-able.
+    /// For a virtualized list the target row is absent from the tree until scrolled
+    /// into range; this checks the current view, sweeps the primary `direction` to
+    /// its end (pixel-motion saturation = end reached), then reverses to cover the
+    /// other end. A target never realized after a full bidirectional sweep or
+    /// `timeout_ms` yields a soft `{matched:false}` (not an error), like
+    /// `wait_for_element`. The scroll actions themselves are audited via the pointer
+    /// path; there is no separate top-level audit entry.
+    pub fn scroll_to_element(
+        &mut self,
+        params: &ScrollToElementParams,
+    ) -> Result<ScrollToElementOutcome> {
+        self.require_active()?;
+        let start = std::time::Instant::now();
+        let geo = self.geometry()?;
+        let (ax, ay) = params
+            .anchor
+            .unwrap_or((geo.width as i32 / 2, geo.height as i32 / 2));
+
+        // Already realized in the current view? Return without scrolling.
+        if let Some(info) = self.match_current(params)? {
+            return Ok(ScrollToElementOutcome {
+                matched: true,
+                element: Some(info),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                steps: 0,
+                reversed: false,
+            });
+        }
+
+        // Short settle after each scroll: `saw_motion` is the ground-truth "the view
+        // moved" signal (false ⇒ this end reached). A small tolerance ignores AA noise;
+        // we only read `saw_motion`, not `settled`, so an occasional settle-timeout is
+        // harmless.
+        let settle = WaitStableParams {
+            interval_ms: 50,
+            settle_frames: 2,
+            tolerance: 2,
+            timeout_ms: 800,
+            stability_region: None,
+            window: None,
+        };
+
+        let mut steps: u32 = 0;
+        for (i, dir) in [params.direction, params.direction.opposite()]
+            .into_iter()
+            .enumerate()
+        {
+            let reversed = i == 1;
+            loop {
+                if start.elapsed().as_millis() as u64 >= params.timeout_ms
+                    || steps >= SCROLL_TO_MAX_STEPS
+                {
+                    return Ok(ScrollToElementOutcome {
+                        matched: false,
+                        element: None,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        steps,
+                        reversed,
+                    });
+                }
+                self.pointer(&PointerEvent::Scroll {
+                    x: ax,
+                    y: ay,
+                    dx: 0,
+                    dy: dir.dy(params.step),
+                    modifiers: vec![],
+                })?;
+                steps += 1;
+                let moved = self.wait_stable(&settle)?.saw_motion;
+                if let Some(info) = self.match_current(params)? {
+                    return Ok(ScrollToElementOutcome {
+                        matched: true,
+                        element: Some(info),
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        steps,
+                        reversed,
+                    });
+                }
+                if !moved {
+                    break; // this end reached; sweep the opposite direction
+                }
+            }
+        }
+        Ok(ScrollToElementOutcome {
+            matched: false,
+            element: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            steps,
+            reversed: true,
+        })
+    }
+
+    /// Snapshot the current view and return the matched element (owned) if the
+    /// selector is satisfied, else `None`. The snapshot is cached, so a returned
+    /// element's id is usable with `click_element`.
+    fn match_current(&mut self, params: &ScrollToElementParams) -> Result<Option<ElementInfo>> {
+        let tree = self.a11y_snapshot()?;
+        Ok(
+            match element_match(
+                &tree,
+                params.name.as_deref(),
+                params.role,
+                params.value_contains.as_deref(),
+                ElementCondition::Appears,
+            ) {
+                ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
+                ElementMatch::Pending => None,
+            },
+        )
     }
 
     /// Block until a watched region diverges from / converges to a reference.
@@ -3068,6 +3185,60 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, GlassError::AxUnsupported));
+    }
+
+    #[test]
+    fn scroll_to_element_returns_already_visible_without_scrolling() {
+        // The target is present in the current view → return it immediately, steps=0,
+        // and no scroll is issued.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks)
+            .with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let mut g = glass_with_a11y(platform, fake_tree()); // fake_tree has Button "Save"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert_eq!(out.steps, 0);
+        assert!(!out.reversed);
+        assert_eq!(out.element.unwrap().name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn scroll_to_element_absent_sweeps_both_ends_then_reports_unmatched() {
+        // The target never appears and the view never moves (a single repeated
+        // frame → wait_stable sees no motion), so each direction saturates after one
+        // step. The sweep must terminate (not hang), reversed, matched:false.
+        let platform =
+            FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let mut g = glass_with_a11y(platform, fake_tree()); // no node named "Ghost"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert!(out.element.is_none());
+        assert!(out.reversed, "must have reversed to sweep the other end");
+        // One saturating step per direction: no motion breaks each sweep immediately.
+        assert_eq!(out.steps, 2);
     }
 
     #[test]
