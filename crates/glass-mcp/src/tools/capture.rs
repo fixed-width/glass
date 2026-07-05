@@ -79,11 +79,16 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 }
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
+    let region = a.region.as_ref().map(Region::from);
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
-        "perceptual" => {
-            glass.diff_baseline_perceptual_with_frame(&a.name, a.threshold.unwrap_or(0.1))
+        "perceptual" => glass.diff_baseline_perceptual_with_frame(
+            &a.name,
+            region.as_ref(),
+            a.threshold.unwrap_or(0.1),
+        ),
+        "exact" => {
+            glass.diff_baseline_with_frame(&a.name, region.as_ref(), a.tolerance.unwrap_or(0))
         }
-        "exact" => glass.diff_baseline_with_frame(&a.name, a.tolerance.unwrap_or(0)),
         other => {
             return Err(format!(
                 "unknown diff mode '{other}' (use perceptual/exact)"
@@ -95,16 +100,19 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let bbox = r
         .bbox
         .map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height }));
-    let text = OutContent::Text(
-        json!({
-            "changed_pixels": r.changed_pixels,
-            "total_pixels": r.total_pixels,
-            "changed_pct": r.changed_pct,
-            "aa_ignored": r.aa_ignored,
-            "bbox": bbox,
-        })
-        .to_string(),
-    );
+    let mut body = json!({
+        "changed_pixels": r.changed_pixels,
+        "total_pixels": r.total_pixels,
+        "changed_pct": r.changed_pct,
+        "aa_ignored": r.aa_ignored,
+        "bbox": bbox,
+    });
+    // Echo the region so the caller can map the region-relative bbox back to
+    // window coordinates.
+    if let Some(rr) = a.region.as_ref() {
+        body["region"] = json!({ "x": rr.x, "y": rr.y, "width": rr.width, "height": rr.height });
+    }
+    let text = OutContent::Text(body.to_string());
 
     // Opt-in: when something changed, attach the current frame cropped to the
     // changed region (token-minimal, exactly what differs). Nothing changed ->
@@ -322,6 +330,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "main".into(),
                 mode: None,
                 threshold: None,
@@ -337,6 +346,43 @@ mod tests {
     }
 
     #[test]
+    fn diff_with_region_scopes_and_echoes_region() {
+        // Whole baseline; current differs only outside the region.
+        let base = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut changed = base.clone();
+        changed.pixels[(3 * 4 + 3) * 4] = 255; // pixel (3,3), outside (0,0,2,2)
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![base, changed]));
+        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
+        let out = diff(
+            &mut g,
+            &DiffArgs {
+                region: Some(RegionArgs {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+                name: "m".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+            },
+        )
+        .unwrap();
+        match &out.0[0] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.contains("\"changed_pixels\":0"),
+                    "region excludes change: {t}"
+                );
+                assert!(t.contains("\"region\":{"), "region echoed: {t}");
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
     fn diff_exact_mode_and_unknown_mode() {
         let base = Frame::solid(2, 2, [0, 0, 0, 255]);
         let mut changed = base.clone();
@@ -347,6 +393,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: Some("exact".into()),
                 threshold: None,
@@ -363,6 +410,7 @@ mod tests {
         let err = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: Some("fuzzy".into()),
                 threshold: None,
@@ -384,6 +432,7 @@ mod tests {
         let err = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "absent".into(),
                 mode: None,
                 threshold: None,
@@ -482,6 +531,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: None,
                 threshold: None,
@@ -516,6 +566,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: None,
                 threshold: None,
@@ -655,6 +706,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: None,
                 threshold: None,
@@ -691,6 +743,7 @@ mod tests {
         let out = diff(
             &mut g,
             &DiffArgs {
+                region: None,
                 name: "m".into(),
                 mode: None,
                 threshold: None,
