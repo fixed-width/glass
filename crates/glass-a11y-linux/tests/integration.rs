@@ -663,3 +663,91 @@ fn wayland_a11y_default_sandbox() {
 fn wayland_a11y_strict_sandbox() {
     wayland_a11y_finds_widgets(glass_core::SandboxLevel::Strict);
 }
+
+// ---- #86: scroll_to_element against a virtualized GtkListView ----
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
+    let mut glass = launch_fixture();
+    // Precondition: "Row 180" is virtualized — absent from the initial tree. If it
+    // were present, the test would prove nothing (no scroll needed).
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    assert!(
+        find_node(&tree.root, "Row 180").is_none(),
+        "Row 180 should be off-screen/virtualized at start, but was in the tree"
+    );
+    // Anchor the scroll over the list: use a realized early row's center, so the
+    // wheel lands on the scroller regardless of exact window layout.
+    let seed = find_node(&tree.root, "Row 000").expect("an early row realized at start");
+    let sb = seed.bounds.expect("row bounds");
+    let anchor = (sb.x + sb.width as i32 / 2, sb.y + sb.height as i32 / 2);
+
+    let out = glass
+        .scroll_to_element(&glass_core::ScrollToElementParams {
+            name: Some("Row 180".into()),
+            role: None,
+            value_contains: None,
+            direction: glass_core::ScrollDirection::Down,
+            anchor: Some(anchor),
+            step: glass_core::SCROLL_TO_DEFAULT_STEP,
+            timeout_ms: glass_core::SCROLL_TO_DEFAULT_TIMEOUT_MS,
+        })
+        .expect("scroll_to_element");
+    assert!(
+        out.matched,
+        "Row 180 should be reached by scrolling; {out:?}"
+    );
+    assert!(out.steps > 0, "should have scrolled at least once");
+    let elem = out.element.expect("matched element");
+    assert!(
+        elem.name.as_deref().is_some_and(|n| n.contains("Row 180")),
+        "matched the wrong node: {:?}",
+        elem.name
+    );
+
+    // The returned id is from the final snapshot → click it and confirm the fixture
+    // selected exactly that row (via its stdout).
+    glass
+        .click_element(elem.id)
+        .expect("click the realized row");
+    let seen = glass
+        .wait_for_log(&glass_core::WaitLogParams {
+            contains: "SELECTED Row 180".into(),
+            stream: None,
+            cursor: None,
+            interval_ms: 100,
+            timeout_ms: 4000,
+        })
+        .expect("wait_for_log");
+    assert!(seen.matched, "click did not select Row 180");
+    glass.stop().expect("stop");
+}
+
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn scroll_to_element_reports_unmatched_for_an_absent_row() {
+    let mut glass = launch_fixture();
+    let tree = glass.a11y_snapshot().expect("snapshot");
+    let seed = find_node(&tree.root, "Row 000").expect("an early row realized at start");
+    let sb = seed.bounds.expect("row bounds");
+    let anchor = (sb.x + sb.width as i32 / 2, sb.y + sb.height as i32 / 2);
+
+    // "Row 999" does not exist (rows are 000..199): a full bidirectional sweep must
+    // terminate with matched:false and reversed:true, not hang.
+    let out = glass
+        .scroll_to_element(&glass_core::ScrollToElementParams {
+            name: Some("Row 999".into()),
+            role: None,
+            value_contains: None,
+            direction: glass_core::ScrollDirection::Down,
+            anchor: Some(anchor),
+            step: glass_core::SCROLL_TO_DEFAULT_STEP,
+            timeout_ms: glass_core::SCROLL_TO_DEFAULT_TIMEOUT_MS,
+        })
+        .expect("scroll_to_element");
+    assert!(!out.matched, "Row 999 must not match; {out:?}");
+    assert!(out.element.is_none());
+    assert!(out.reversed, "should have swept both ends; {out:?}");
+    glass.stop().expect("stop");
+}
