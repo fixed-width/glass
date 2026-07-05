@@ -271,6 +271,70 @@ fn first_label(node: &AxNode) -> Option<String> {
     node.children.iter().find_map(first_label)
 }
 
+/// The non-active window (from `windows`) whose screen rect contains the projected
+/// screen center of `bounds` (an element's window-relative bounds within the active
+/// window). Recovers the case where an element's a11y bounds are reported relative to
+/// the active window but the element actually renders in a separate popover window
+/// (e.g. an open dropdown's option list) — headless a11y backends don't always report
+/// bounds relative to the popover's own origin. `None` when no non-active window
+/// contains the point; the smallest-area match wins when several do (an outer window
+/// fully behind/around a smaller popover shouldn't shadow it).
+fn owning_popover(
+    bounds: crate::accessibility::AxRect,
+    active: &WindowGeometry,
+    windows: &[WindowInfo],
+) -> Option<WindowId> {
+    let screen_x = active.x + bounds.x + bounds.width as i32 / 2;
+    let screen_y = active.y + bounds.y + bounds.height as i32 / 2;
+    windows
+        .iter()
+        .filter(|w| !w.active)
+        .filter(|w| {
+            let g = &w.geometry;
+            screen_x >= g.x
+                && screen_x < g.x + g.width as i32
+                && screen_y >= g.y
+                && screen_y < g.y + g.height as i32
+        })
+        .min_by_key(|w| w.geometry.width as u64 * w.geometry.height as u64)
+        .map(|w| w.id)
+}
+
+/// Path of nodes from `root` to `target` (inclusive of both ends), in that order —
+/// `None` if `target` isn't in this tree.
+fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
+    if root.id == target {
+        return Some(vec![root]);
+    }
+    for child in &root.children {
+        if let Some(mut path) = ancestor_path(child, target) {
+            path.insert(0, root);
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The bounds of the ancestor of `target` (searching from `target` upward) whose size
+/// matches `popover`'s window size within 16px tolerance on each dimension — the
+/// element's realized menu/list container, e.g. a dropdown popup's `List`. Its origin
+/// recovers the popover-relative offset of elements inside it, since their own reported
+/// bounds are skewed relative to the *active* window rather than the popover. `None`
+/// if no ancestor's bounds match (or `target` isn't in `root`'s tree).
+fn menu_container_bounds(
+    root: &AxNode,
+    target: AxNodeId,
+    popover: &WindowGeometry,
+) -> Option<crate::accessibility::AxRect> {
+    let path = ancestor_path(root, target)?;
+    path.iter().rev().find_map(|node| {
+        node.bounds.filter(|b| {
+            (b.width as i32 - popover.width as i32).abs() <= 16
+                && (b.height as i32 - popover.height as i32).abs() <= 16
+        })
+    })
+}
+
 impl Glass {
     pub fn new(
         factory: PlatformFactory,
@@ -649,15 +713,48 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
-        let (x, y) = {
+        let (bounds, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let bounds = node.bounds.ok_or(GlassError::AxElementNotClickable(id.0))?;
-            bounds
-                .clamped_center(s.geometry.width, s.geometry.height)
-                .ok_or(GlassError::AxElementNotClickable(id.0))?
+            (bounds, s.geometry.clone())
         };
+        // The element's a11y bounds are reported relative to the active window, but it
+        // may actually render in a separate popover window (e.g. an open dropdown's
+        // option list) whose own origin they don't reflect. Detect that and route the
+        // click into the popover instead of silently missing.
+        let windows = self.list_windows()?;
+        if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
+            let popover_geo = windows
+                .iter()
+                .find(|w| w.id == popover_id)
+                .map(|w| w.geometry.clone())
+                .ok_or(GlassError::WindowNotFound)?;
+            let container = {
+                let s = self.require_active()?;
+                let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+                menu_container_bounds(&tree.root, id, &popover_geo)
+            }
+            .ok_or(GlassError::AxElementInUnmappedPopover(id.0))?;
+            let prev = windows.iter().find(|w| w.active).map(|w| w.id);
+            self.select_window(popover_id)?;
+            let result = self.pointer_inner(&PointerEvent::Click {
+                x: bounds.x - container.x,
+                y: bounds.y - container.y,
+                button: MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            });
+            // Best-effort restore: the click's own result (ok or err) still wins.
+            if let Some(prev) = prev {
+                let _ = self.select_window(prev);
+            }
+            return result;
+        }
+        let (x, y) = bounds
+            .clamped_center(active_geo.width, active_geo.height)
+            .ok_or(GlassError::AxElementNotClickable(id.0))?;
         self.pointer_inner(&PointerEvent::Click {
             x,
             y,
@@ -1114,6 +1211,9 @@ mod tests {
         /// Every `capture_window(id, region)` call, for asserting it (not
         /// `capture_frame`) was used, and with what arguments.
         capture_window_log: CaptureWindowLog,
+        /// Every `select_window(id)` call, in order — for asserting popover routing
+        /// selects the popover then restores the previously-active window.
+        select_log: Arc<Mutex<Vec<WindowId>>>,
     }
 
     impl FakePlatform {
@@ -1138,6 +1238,10 @@ mod tests {
         }
         fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
             self.click_log = log;
+            self
+        }
+        fn with_select_log(mut self, log: Arc<Mutex<Vec<WindowId>>>) -> Self {
+            self.select_log = log;
             self
         }
         fn counting_stops(mut self, c: Arc<Mutex<u32>>) -> Self {
@@ -1247,6 +1351,7 @@ mod tests {
             }
         }
         fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
+            self.select_log.lock().unwrap().push(id);
             if self.windows.is_empty() {
                 return if id == WindowId(0) {
                     Ok(self.geometry.clone())
@@ -1340,6 +1445,195 @@ mod tests {
             ..Default::default()
         };
         t
+    }
+
+    fn window_info(id: u64, geometry: WindowGeometry, active: bool) -> WindowInfo {
+        WindowInfo {
+            id: WindowId(id),
+            title: None,
+            class: None,
+            geometry,
+            active,
+        }
+    }
+
+    #[test]
+    fn owning_popover_none_when_element_only_in_active_window() {
+        let active = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        };
+        let bounds = AxRect {
+            x: 50,
+            y: 50,
+            width: 20,
+            height: 20,
+        };
+        let windows = vec![window_info(1, active.clone(), true)];
+        assert_eq!(owning_popover(bounds, &active, &windows), None);
+    }
+
+    #[test]
+    fn owning_popover_finds_containing_non_active_window() {
+        // Validated numbers from the real Xvfb spike: an open GtkDropDown's popover
+        // window at (-3,220,326,135); the option row "Globex" has a11y bounds (20,248).
+        let active = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        };
+        let bounds = AxRect {
+            x: 20,
+            y: 248,
+            width: 80,
+            height: 27,
+        };
+        let popover_geo = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        let windows = vec![
+            window_info(1, active.clone(), true),
+            window_info(2, popover_geo, false),
+        ];
+        assert_eq!(owning_popover(bounds, &active, &windows), Some(WindowId(2)));
+    }
+
+    #[test]
+    fn owning_popover_picks_smallest_area_when_multiple_contain_the_point() {
+        let active = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 340,
+            height: 300,
+        };
+        // Zero-size bounds project exactly to (50,50) — both candidate windows below
+        // contain that point.
+        let bounds = AxRect {
+            x: 50,
+            y: 50,
+            width: 0,
+            height: 0,
+        };
+        let big = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 200,
+        };
+        let small = WindowGeometry {
+            x: 40,
+            y: 40,
+            width: 20,
+            height: 20,
+        };
+        let windows = vec![
+            window_info(1, active.clone(), true),
+            window_info(2, big, false),
+            window_info(3, small, false),
+        ];
+        assert_eq!(
+            owning_popover(bounds, &active, &windows),
+            Some(WindowId(3)),
+            "the smallest containing window should win"
+        );
+    }
+
+    fn ax_node(id: u32, role: AxRole, bounds: Option<AxRect>, children: Vec<AxNode>) -> AxNode {
+        AxNode {
+            id: AxNodeId(id),
+            role,
+            raw_role: format!("{role:?}"),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds,
+            children,
+        }
+    }
+
+    #[test]
+    fn menu_container_bounds_finds_the_list_sized_ancestor() {
+        // Target nested under a `List` node sized like the popover window.
+        let list_bounds = AxRect {
+            x: 0,
+            y: 194,
+            width: 326,
+            height: 129,
+        };
+        let target = ax_node(
+            2,
+            AxRole::ListItem,
+            Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 80,
+                height: 27,
+            }),
+            vec![],
+        );
+        let list = ax_node(1, AxRole::List, Some(list_bounds), vec![target]);
+        let root = ax_node(
+            0,
+            AxRole::Window,
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            }),
+            vec![list],
+        );
+        let popover = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        assert_eq!(
+            menu_container_bounds(&root, AxNodeId(2), &popover),
+            Some(list_bounds)
+        );
+    }
+
+    #[test]
+    fn menu_container_bounds_none_without_a_matching_ancestor() {
+        // No `List` container this time — target hangs directly off root, and root's
+        // own bounds don't match the popover's size.
+        let target = ax_node(
+            1,
+            AxRole::ListItem,
+            Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 80,
+                height: 27,
+            }),
+            vec![],
+        );
+        let root = ax_node(
+            0,
+            AxRole::Window,
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            }),
+            vec![target],
+        );
+        let popover = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        assert_eq!(menu_container_bounds(&root, AxNodeId(1), &popover), None);
     }
 
     fn glass_with(platform: FakePlatform) -> Glass {
@@ -2173,6 +2467,224 @@ mod tests {
         assert!(matches!(
             g.click_element(AxNodeId(2)).unwrap_err(),
             GlassError::AxElementNotClickable(2)
+        ));
+    }
+
+    /// Builds the tree used by the popover-routing tests: root Window > `List`
+    /// (sized like the popover window) > `ListItem` "Globex" (the click target),
+    /// with the validated real-Xvfb numbers (see `owning_popover`/
+    /// `menu_container_bounds` unit tests above).
+    fn fake_tree_with_popover_option() -> AxTree {
+        let globex = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::ListItem,
+            raw_role: "list item".into(),
+            name: Some("Globex".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 80,
+                height: 27,
+            }),
+            children: vec![],
+        };
+        let list = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::List,
+            raw_role: "list".into(),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 194,
+                width: 326,
+                height: 129,
+            }),
+            children: vec![globex],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            }),
+            children: vec![list],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn click_element_without_popover_clicks_clamped_center_and_never_selects_a_window() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let a = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            true,
+        );
+        // A non-active window that does NOT contain the Button's projected center —
+        // present so `list_windows` isn't trivially empty, still no routing occurs.
+        let b = window_info(
+            2,
+            WindowGeometry {
+                x: 1000,
+                y: 1000,
+                width: 50,
+                height: 50,
+            },
+            false,
+        );
+        let platform = FakePlatform::new(100, 100)
+            .with_windows(vec![a, b])
+            .with_click_log(clicks.clone())
+            .with_select_log(select_log.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+        g.click_element(AxNodeId(1)).unwrap(); // the Button at (10,10 20x20)
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            Some((20, 20)),
+            "unrouted click still lands on the element's own clamped center"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "no popover routing means no select_window call"
+        );
+    }
+
+    #[test]
+    fn click_element_routes_into_owning_popover_and_restores_active_window() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let a = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let b = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![a, b])
+            .with_click_log(clicks.clone())
+            .with_select_log(select_log.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot().unwrap();
+        // assign_ids in pre-order: root=0, List=1, Globex(ListItem)=2.
+        let globex_id = tree.root.children[0].children[0].id;
+        assert_eq!(globex_id, AxNodeId(2));
+
+        g.click_element(globex_id).unwrap();
+
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            Some((20, 54)),
+            "click lands at (Globex.bounds - List.bounds), per the validated algorithm"
+        );
+        assert_eq!(
+            *select_log.lock().unwrap(),
+            vec![WindowId(2), WindowId(1)],
+            "selects the popover to click, then restores the previously-active window"
+        );
+        assert_eq!(
+            g.geometry().unwrap().width,
+            340,
+            "active window geometry is restored after the routed click"
+        );
+    }
+
+    #[test]
+    fn click_element_in_popover_without_a_mappable_container_errors() {
+        // Same popover-owning geometry, but the target has no List-sized ancestor to
+        // recover a container origin from — must error, not silently mis-click.
+        let globex = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::ListItem,
+            raw_role: "list item".into(),
+            name: Some("Globex".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 80,
+                height: 27,
+            }),
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            }),
+            children: vec![globex],
+        };
+        let tree = AxTree { root, count: 0 };
+        let a = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let b = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let platform = FakePlatform::new(340, 300).with_windows(vec![a, b]);
+        let mut g = glass_with_a11y(platform, tree);
+        g.start(&spec()).unwrap();
+        let snapshot = g.a11y_snapshot().unwrap();
+        let globex_id = snapshot.root.children[0].id;
+        assert!(matches!(
+            g.click_element(globex_id).unwrap_err(),
+            GlassError::AxElementInUnmappedPopover(id) if id == globex_id.0
         ));
     }
 
