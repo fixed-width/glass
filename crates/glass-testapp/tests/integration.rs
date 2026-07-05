@@ -579,6 +579,27 @@ fn capture_window_reads_a_specific_window_without_changing_the_active_one() {
     assert_eq!((region_frame.width, region_frame.height), (20, 20));
     assert_eq!(pixel(&region_frame, 10, 10), [255, 0, 255, 255]);
 
+    // A region that overshoots the TARGET window's own geometry (320x240) is
+    // rejected even though it still lands well inside the shared Xvfb display
+    // (default 1280x800) — otherwise this would silently capture pixels from
+    // outside `extra` (desktop / other windows) instead of erroring, violating
+    // the documented "region relative to id's own geometry" contract.
+    let err = p
+        .capture_window(
+            extra.id,
+            Some(&glass_core::Region {
+                x: 150,
+                y: 110,
+                width: 300,
+                height: 200,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, glass_core::GlassError::InvalidRegion(_)),
+        "expected InvalidRegion for a region overshooting the target window's own geometry, got {err:?}"
+    );
+
     // An unknown window id is rejected (no silent fallback to the active window).
     assert!(matches!(
         p.capture_window(glass_core::WindowId(0xDEAD_BEEF), None),

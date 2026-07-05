@@ -953,6 +953,13 @@ impl Platform for X11Platform {
             return Err(GlassError::WindowNotFound);
         }
         let geo = self.geometry_of(target)?;
+        if let Some(r) = region {
+            // `region` must fit the TARGET window's own geometry, not just the
+            // shared Xvfb display — otherwise an over-large region that still
+            // lands inside the display would silently capture pixels outside
+            // this window (desktop / other windows) instead of erroring.
+            r.check_fits(geo.width, geo.height)?;
+        }
         let (sx, sy, w, h) = self.resolve_capture_rect(&geo, region)?;
         self.capture_screen_rect(sx, sy, w, h)
     }

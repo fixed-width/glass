@@ -795,12 +795,12 @@ impl Glass {
     }
 
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
-        self.require_active()?;
+        let active = self.require_active()?;
         // The active window's cached geometry only bounds a stability_region when
         // watching the active window itself; a specific `window` is validated by
         // the backend against its own geometry instead (see `capture`).
         if params.window.is_none() {
-            let geo = self.require_active()?.geometry.clone();
+            let geo = active.geometry.clone();
             if let Some(r) = &params.stability_region {
                 r.check_fits(geo.width, geo.height)?;
             }
@@ -864,12 +864,12 @@ impl Glass {
     /// current window size — a size change since it was saved returns `SizeMismatch`;
     /// crop to a stable `region` to avoid this.
     pub fn wait_for_region(&mut self, params: &WaitRegionParams) -> Result<WaitRegionOutcome> {
-        self.require_active()?;
+        let active = self.require_active()?;
         // As in `wait_stable`: the active window's cached geometry only bounds
         // `region` when watching the active window; a specific `window` is
         // validated by the backend against its own geometry instead.
         if params.window.is_none() {
-            let geo = self.require_active()?.geometry.clone();
+            let geo = active.geometry.clone();
             if let Some(r) = &params.region {
                 r.check_fits(geo.width, geo.height)?;
             }
