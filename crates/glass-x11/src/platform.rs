@@ -626,6 +626,70 @@ impl X11Platform {
             .map_err(|e| GlassError::Backend(format!("flush: {e}")))?;
         Ok(())
     }
+
+    /// Resolve a window-relative `region` (or the whole window) against `geo`
+    /// into an absolute root-coordinate capture rectangle, rejecting a zero-area
+    /// region and one that reaches off the (headless) display before any
+    /// `GetImage` request is issued.
+    fn resolve_capture_rect(
+        &self,
+        geo: &WindowGeometry,
+        region: Option<&Region>,
+    ) -> Result<(i32, i32, u32, u32)> {
+        let (cx, cy, w, h) = match region {
+            Some(r) => (r.x, r.y, r.width, r.height),
+            None => (0, 0, geo.width, geo.height),
+        };
+        if w == 0 || h == 0 {
+            return Err(GlassError::CaptureFailed("window has zero area".into()));
+        }
+        // A window (or region) reaching past the headless display makes GetImage
+        // cover non-viewable area, which X rejects with a bare BadMatch. Convert
+        // that to an actionable error before issuing the request; the root
+        // window's pixel size is the display size.
+        let display = {
+            let root = &self.conn.setup().roots[self.screen_num];
+            (
+                u32::from(root.width_in_pixels),
+                u32::from(root.height_in_pixels),
+            )
+        };
+        crate::coords::check_capture_fits(geo, region, display)?;
+        Ok((geo.x + cx as i32, geo.y + cy as i32, w, h))
+    }
+
+    /// `GetImage` a `w`x`h` rectangle at root-coordinate `(sx,sy)` and decode it to
+    /// an RGBA `Frame`. Always reads from the ROOT drawable (not a specific
+    /// window's own drawable) so overlapping popovers (separate override-redirect
+    /// top-levels) are included in the capture.
+    fn capture_screen_rect(&self, sx: i32, sy: i32, w: u32, h: u32) -> Result<Frame> {
+        let image = self
+            .conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                sx as i16,
+                sy as i16,
+                w as u16,
+                h as u16,
+                !0u32,
+            )
+            .map_err(|e| GlassError::CaptureFailed(format!("get_image: {e}")))?
+            .reply()
+            .map_err(|e| GlassError::CaptureFailed(format!("get_image reply: {e}")))?;
+        let bpp = self
+            .conn
+            .setup()
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == image.depth)
+            .map(|f| f.bits_per_pixel as usize / 8)
+            .ok_or_else(|| {
+                GlassError::CaptureFailed(format!("no pixmap format for depth {}", image.depth))
+            })?;
+        let rgba = crate::pixels::xdata_to_rgba(&image.data, w, h, bpp)?;
+        Frame::new(w, h, rgba)
+    }
 }
 
 fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
@@ -869,56 +933,28 @@ impl Platform for X11Platform {
         // `window_geometry()` itself calls `require_window()`, so it doubles as
         // the "is there an active window" guard — no separate binding needed.
         let geo = self.window_geometry()?;
-        let (cx, cy, w, h) = match region {
-            Some(r) => (r.x, r.y, r.width, r.height),
-            None => (0, 0, geo.width, geo.height),
-        };
-        if w == 0 || h == 0 {
-            return Err(GlassError::CaptureFailed("window has zero area".into()));
-        }
-        // A window (or region) reaching past the headless display makes GetImage
-        // cover non-viewable area, which X rejects with a bare BadMatch. Convert
-        // that to an actionable error before issuing the request; the root
-        // window's pixel size is the display size.
-        let display = {
-            let root = &self.conn.setup().roots[self.screen_num];
-            (
-                u32::from(root.width_in_pixels),
-                u32::from(root.height_in_pixels),
-            )
-        };
-        crate::coords::check_capture_fits(&geo, region, display)?;
+        let (sx, sy, w, h) = self.resolve_capture_rect(&geo, region)?;
         // Capture from ROOT over the window's screen region so overlapping popovers
         // (separate override-redirect top-levels) are included, not just this window's
         // own (possibly-obscured) drawable.
-        let sx = geo.x + cx as i32;
-        let sy = geo.y + cy as i32;
-        let image = self
-            .conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                self.root,
-                sx as i16,
-                sy as i16,
-                w as u16,
-                h as u16,
-                !0u32,
-            )
-            .map_err(|e| GlassError::CaptureFailed(format!("get_image: {e}")))?
-            .reply()
-            .map_err(|e| GlassError::CaptureFailed(format!("get_image reply: {e}")))?;
-        let bpp = self
-            .conn
-            .setup()
-            .pixmap_formats
-            .iter()
-            .find(|f| f.depth == image.depth)
-            .map(|f| f.bits_per_pixel as usize / 8)
-            .ok_or_else(|| {
-                GlassError::CaptureFailed(format!("no pixmap format for depth {}", image.depth))
-            })?;
-        let rgba = crate::pixels::xdata_to_rgba(&image.data, w, h, bpp)?;
-        Frame::new(w, h, rgba)
+        self.capture_screen_rect(sx, sy, w, h)
+    }
+
+    fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+        // Mirror select_window's WindowId -> Window mapping/validation, but never
+        // touch `self.window` — this must not retarget the active window.
+        let pids: Vec<u32> = self
+            .child
+            .as_ref()
+            .map(|c| proc_tree_pids(c.id()))
+            .unwrap_or_default();
+        let target = id.0 as Window;
+        if !self.scan_all_windows(&pids)?.contains(&target) {
+            return Err(GlassError::WindowNotFound);
+        }
+        let geo = self.geometry_of(target)?;
+        let (sx, sy, w, h) = self.resolve_capture_rect(&geo, region)?;
+        self.capture_screen_rect(sx, sy, w, h)
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
