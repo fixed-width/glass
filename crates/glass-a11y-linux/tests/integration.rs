@@ -408,6 +408,17 @@ fn set_value_selects_dropdown_option() {
 // window's screen offset, not the window's own drawable, so an overlapping
 // override-redirect popover (a separate top-level X window — e.g. the popup a
 // GtkDropDown opens) shows up in the captured pixels instead of being invisible.
+//
+// A whole-frame pixel diff is too weak a check here: opening the GtkDropDown also
+// repaints the combo button itself (pressed style / arrow), which lives in the main
+// window's own drawable and would change even under the OLD (buggy) window-drawable
+// capture. So the comparison is scoped to the region strictly BELOW the combo button —
+// where the popover's option rows draw, and where the main window's own content (e.g.
+// the switch) does NOT change when the dropdown opens. Only the new root capture can
+// see anything change there, because that's where the popover (a separate top-level X
+// window) is composited on top; the old window-drawable capture would show that band
+// completely unchanged. So a substantial pixel change confined to that band is
+// specific evidence the popover itself was captured, not just the button's own repaint.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn screenshot_includes_open_popover() {
@@ -415,20 +426,44 @@ fn screenshot_includes_open_popover() {
     let tree = glass.a11y_snapshot().expect("snapshot");
     let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
     let combo_id = combo.id;
+    let combo_bounds = combo.bounds.expect("combo box must report bounds");
     let before = glass.screenshot(None).expect("before");
     glass.click_element(combo_id).expect("open");
     std::thread::sleep(std::time::Duration::from_millis(600));
     let after = glass.screenshot(None).expect("after");
     assert_eq!((before.width, before.height), (after.width, after.height));
-    let changed = before
-        .pixels
+
+    let width = after.width as usize;
+    let height = after.height as usize;
+    // Row just below the combo button, window-relative. Add a margin below the
+    // button's AT-SPI-reported bottom edge: opening the dropdown also repaints the
+    // button itself (pressed style / arrow / focus ring), and that repaint's
+    // border/shadow antialiasing bleeds a few pixels past the button's semantic
+    // bounds — measured empirically at ~3px on this fixture. A margin of half the
+    // button's own height comfortably clears that bleed regardless of exact theme
+    // metrics, so this region only catches the popover's own rows, not runoff from
+    // the button. Computed in i64 so a pathological (e.g. negative or off-screen)
+    // bounds value can't wrap a usize instead of failing the bounds check below.
+    let margin = (combo_bounds.height / 2).max(1) as i64;
+    let y_start_signed = combo_bounds.y as i64 + combo_bounds.height as i64 + margin;
+    assert!(
+        y_start_signed >= 0 && (y_start_signed as usize) < height,
+        "combo bounds {combo_bounds:?} (margin {margin}) leave no row below the button in a \
+         {width}x{height} frame; can't scope the popover-region diff"
+    );
+    let y_start = y_start_signed as usize;
+    // Tightly-packed RGBA8, row-major: row `y` starts at byte `y * width * 4`.
+    let byte_start = y_start * width * 4;
+    let changed_below_combo = before.pixels[byte_start..]
         .iter()
-        .zip(after.pixels.iter())
+        .zip(after.pixels[byte_start..].iter())
         .filter(|(a, b)| a != b)
         .count();
     assert!(
-        changed > 500,
-        "opening the dropdown should change many captured pixels (popover composited); changed={changed}"
+        changed_below_combo > 500,
+        "opening the dropdown should change many captured pixels in the region below the \
+         combo button, where the popover's option rows draw (popover composited); \
+         changed_below_combo={changed_below_combo}"
     );
     glass.stop().expect("stop");
 }
