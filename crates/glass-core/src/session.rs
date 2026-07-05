@@ -315,24 +315,35 @@ fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
     None
 }
 
-/// The bounds of the ancestor of `target` (searching from `target` upward) whose size
-/// matches `popover`'s window size within 16px tolerance on each dimension — the
-/// element's realized menu/list container, e.g. a dropdown popup's `List`. Its origin
-/// recovers the popover-relative offset of elements inside it, since their own reported
-/// bounds are skewed relative to the *active* window rather than the popover. `None`
-/// if no ancestor's bounds match (or `target` isn't in `root`'s tree).
+/// The bounds of the ancestor of `target` whose size most closely matches `popover`'s
+/// window size (within 16px tolerance on each dimension) — the element's realized
+/// menu/list container, e.g. a dropdown popup's `List`. Its origin recovers the
+/// popover-relative offset of elements inside it, since their own reported bounds are
+/// skewed relative to the *active* window rather than the popover. `None` if no
+/// ancestor's bounds match (or `target` isn't in `root`'s tree).
+///
+/// A real widget tree nests the menu container inside several layout wrapper groups
+/// (padding/scroll containers) whose bounds are *also* within tolerance of the
+/// popover's size — so the nearest matching ancestor to `target` is often one of those
+/// wrappers, not the container itself. Scoring every matching ancestor by closeness to
+/// the popover's exact size (not proximity to `target`) picks the real container: it
+/// tracks the popover's size most tightly, while wrappers trimmed by padding/scrollbars
+/// drift further from it.
 fn menu_container_bounds(
     root: &AxNode,
     target: AxNodeId,
     popover: &WindowGeometry,
 ) -> Option<crate::accessibility::AxRect> {
     let path = ancestor_path(root, target)?;
-    path.iter().rev().find_map(|node| {
-        node.bounds.filter(|b| {
-            (b.width as i32 - popover.width as i32).abs() <= 16
-                && (b.height as i32 - popover.height as i32).abs() <= 16
+    path.iter()
+        .filter_map(|node| {
+            let b = node.bounds?;
+            let dw = (b.width as i32 - popover.width as i32).abs();
+            let dh = (b.height as i32 - popover.height as i32).abs();
+            (dw <= 16 && dh <= 16).then_some((b, dw + dh))
         })
-    })
+        .min_by_key(|&(_, score)| score)
+        .map(|(b, _)| b)
 }
 
 impl Glass {
@@ -1634,6 +1645,100 @@ mod tests {
             height: 135,
         };
         assert_eq!(menu_container_bounds(&root, AxNodeId(1), &popover), None);
+    }
+
+    #[test]
+    fn menu_container_bounds_prefers_closest_size_over_nearest_ancestor() {
+        // Reproduces the real GTK4 widget tree (captured from the Xvfb spike): several
+        // layout wrapper `Group`s sit between the option row and the actual menu `List`,
+        // and their bounds *also* fall within the 16px tolerance of the popover's size —
+        // so picking the ancestor NEAREST `target` returns a wrapper Group, not the real
+        // container. The real container (List, id 2) must win because its size is
+        // closest to the popover's, even though it's farther up the chain.
+        let popover = WindowGeometry {
+            x: -3,
+            y: 220,
+            width: 326,
+            height: 135,
+        };
+        let container_bounds = AxRect {
+            x: 0,
+            y: 194,
+            width: 326,
+            height: 129,
+        };
+        let target = ax_node(
+            6,
+            AxRole::ListItem,
+            Some(AxRect {
+                x: 20,
+                y: 248,
+                width: 302,
+                height: 35,
+            }),
+            vec![],
+        );
+        let inner_list = ax_node(
+            5,
+            AxRole::List,
+            Some(AxRect {
+                x: 12,
+                y: 205,
+                width: 302,
+                height: 105,
+            }),
+            vec![target],
+        );
+        let group3 = ax_node(
+            4,
+            AxRole::Group,
+            Some(AxRect {
+                x: 4,
+                y: 197,
+                width: 318,
+                height: 121,
+            }),
+            vec![inner_list],
+        );
+        let group2 = ax_node(
+            3,
+            AxRole::Group,
+            Some(AxRect {
+                x: 4,
+                y: 197,
+                width: 318,
+                height: 121,
+            }),
+            vec![group3],
+        );
+        let group1 = ax_node(
+            2,
+            AxRole::Group,
+            Some(AxRect {
+                x: 4,
+                y: 197,
+                width: 320,
+                height: 123,
+            }),
+            vec![group2],
+        );
+        let container = ax_node(1, AxRole::List, Some(container_bounds), vec![group1]);
+        let root = ax_node(
+            0,
+            AxRole::ComboBox,
+            Some(AxRect {
+                x: 0,
+                y: 188,
+                width: 320,
+                height: 34,
+            }),
+            vec![container],
+        );
+        assert_eq!(
+            menu_container_bounds(&root, AxNodeId(6), &popover),
+            Some(container_bounds),
+            "the real container (closest in size to the popover) must win over nearer wrapper groups"
+        );
     }
 
     fn glass_with(platform: FakePlatform) -> Glass {
