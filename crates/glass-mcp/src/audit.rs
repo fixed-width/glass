@@ -788,7 +788,14 @@ mod tests {
             },
         )
         .unwrap();
-        tools::screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap(); // read — not logged
+        tools::screenshot(
+            &mut g,
+            &ScreenshotArgs {
+                region: None,
+                window_id: None,
+            },
+        )
+        .unwrap(); // read — not logged
         tools::type_text(
             &mut g,
             &TypeArgs {

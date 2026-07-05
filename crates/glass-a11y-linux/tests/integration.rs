@@ -427,10 +427,10 @@ fn screenshot_includes_open_popover() {
     let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
     let combo_id = combo.id;
     let combo_bounds = combo.bounds.expect("combo box must report bounds");
-    let before = glass.screenshot(None).expect("before");
+    let before = glass.screenshot(None, None).expect("before");
     glass.click_element(combo_id).expect("open");
     std::thread::sleep(std::time::Duration::from_millis(600));
-    let after = glass.screenshot(None).expect("after");
+    let after = glass.screenshot(None, None).expect("after");
     assert_eq!((before.width, before.height), (after.width, after.height));
 
     let width = after.width as usize;

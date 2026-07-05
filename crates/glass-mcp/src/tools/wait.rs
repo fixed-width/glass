@@ -70,6 +70,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         interval_ms: a.interval_ms.unwrap_or(100),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
+        window: a.window_id.map(glass_core::WindowId),
     };
     let o = glass.wait_for_region(&params).map_err(|e| e.to_string())?;
     // `wait_for_region` diffs region-cropped frames, so its bbox originates at
@@ -272,6 +273,7 @@ mod tests {
             interval_ms: Some(0),
             timeout_ms: Some(1000),
             include_image: None,
+            window_id: None,
         }
     }
 
@@ -361,6 +363,18 @@ mod tests {
         assert!(wait_for_region(&mut g, &b)
             .unwrap_err()
             .contains("unknown mode"));
+    }
+
+    #[test]
+    fn region_with_window_id_routes_through_capture_window() {
+        // testutil's FakePlatform has no capture_window override, so a window_id
+        // must reach it (Unsupported) rather than silently watching the active
+        // window's scripted capture_frame frames.
+        let mut g = started_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]);
+        let mut a = region_args();
+        a.window_id = Some(9);
+        let err = wait_for_region(&mut g, &a).unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     fn started_logs(logs: Vec<(glass_core::Stream, &str)>) -> Glass {

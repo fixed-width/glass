@@ -24,6 +24,9 @@ pub struct WaitStableParams {
     /// When set, the settle decision compares only this sub-rectangle of each
     /// frame; the returned frame is still the full window.
     pub stability_region: Option<Region>,
+    /// When set, watch this window's own region instead of the active window's —
+    /// without changing which window is active.
+    pub window: Option<WindowId>,
 }
 
 /// Outcome of a wait-until-stable: the final frame and whether it settled
@@ -77,6 +80,9 @@ pub struct WaitRegionParams {
     pub tolerance: u8,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// When set, watch this window's own region instead of the active window's —
+    /// without changing which window is active.
+    pub window: Option<WindowId>,
 }
 
 /// Outcome of [`Glass::wait_for_region`]. `frame` is the last captured region
@@ -471,12 +477,32 @@ impl Glass {
         Ok(self.require_active()?.geometry.clone())
     }
 
-    pub fn screenshot(&mut self, region: Option<Region>) -> Result<Frame> {
+    /// Capture the active window, or — when `window` is set — a different
+    /// window's region WITHOUT changing which window is active (unlike
+    /// `select_window`). `region` is relative to whichever window is captured.
+    pub fn screenshot(
+        &mut self,
+        region: Option<Region>,
+        window: Option<WindowId>,
+    ) -> Result<Frame> {
+        self.capture(window, region.as_ref())
+    }
+
+    /// Capture `window`'s region (or, when `None`, the active window's), pumping
+    /// logs afterward either way. A specific window's own geometry governs its
+    /// capture — the backend validates `id` and any region against it — so the
+    /// active window's cached `s.geometry` is only consulted for the `None` case.
+    fn capture(&mut self, window: Option<WindowId>, region: Option<&Region>) -> Result<Frame> {
         let s = self.active_mut()?;
-        if let Some(r) = &region {
-            r.check_fits(s.geometry.width, s.geometry.height)?;
-        }
-        let frame = s.platform.capture_frame(region.as_ref())?;
+        let frame = match window {
+            Some(id) => s.platform.capture_window(id, region)?,
+            None => {
+                if let Some(r) = region {
+                    r.check_fits(s.geometry.width, s.geometry.height)?;
+                }
+                s.platform.capture_frame(region)?
+            }
+        };
         s.pump();
         Ok(frame)
     }
@@ -603,7 +629,7 @@ impl Glass {
     /// accessibility elements. Returns the annotated frame and the marks legend.
     /// Caches the snapshot, so `click_element` resolves a mark's id afterward.
     pub fn a11y_marks(&mut self) -> Result<(Frame, Vec<Mark>)> {
-        let frame = self.screenshot(None)?;
+        let frame = self.screenshot(None, None)?;
         let tree = self.a11y_snapshot()?;
         Ok(crate::marks::render(&frame, &tree))
     }
@@ -769,17 +795,22 @@ impl Glass {
     }
 
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
-        let geo = self.require_active()?.geometry.clone();
-        if let Some(r) = &params.stability_region {
-            r.check_fits(geo.width, geo.height)?;
+        let active = self.require_active()?;
+        // The active window's cached geometry only bounds a stability_region when
+        // watching the active window itself; a specific `window` is validated by
+        // the backend against its own geometry instead (see `capture`).
+        if params.window.is_none() {
+            let geo = active.geometry.clone();
+            if let Some(r) = &params.stability_region {
+                r.check_fits(geo.width, geo.height)?;
+            }
         }
         let mut tracker = StabilityTracker::new(params.settle_frames, params.tolerance);
         let region = params.stability_region;
+        let window = params.window;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            let s = self.active_mut()?;
             // Poll only the watched region (cheap) when one is set; else the full window.
-            let frame = s.platform.capture_frame(region.as_ref())?;
-            s.pump();
+            let frame = self.capture(window, region.as_ref())?;
             let settled = tracker.observe(frame)?;
             Ok(if settled { Some(()) } else { None })
         })?;
@@ -787,7 +818,7 @@ impl Glass {
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
         let frame = match region {
-            Some(_) => self.active_mut()?.platform.capture_frame(None)?,
+            Some(_) => self.capture(window, None)?,
             None => tracker.last().cloned().expect("a frame was just observed"),
         };
         Ok(WaitStableOutcome {
@@ -833,9 +864,15 @@ impl Glass {
     /// current window size — a size change since it was saved returns `SizeMismatch`;
     /// crop to a stable `region` to avoid this.
     pub fn wait_for_region(&mut self, params: &WaitRegionParams) -> Result<WaitRegionOutcome> {
-        let geo = self.require_active()?.geometry.clone();
-        if let Some(r) = &params.region {
-            r.check_fits(geo.width, geo.height)?;
+        let active = self.require_active()?;
+        // As in `wait_stable`: the active window's cached geometry only bounds
+        // `region` when watching the active window; a specific `window` is
+        // validated by the backend against its own geometry instead.
+        if params.window.is_none() {
+            let geo = active.geometry.clone();
+            if let Some(r) = &params.region {
+                r.check_fits(geo.width, geo.height)?;
+            }
         }
         // Reference: a saved baseline (cropped to the region) or the current frame.
         let reference: Frame = match &params.baseline {
@@ -846,25 +883,19 @@ impl Glass {
                     None => base,
                 }
             }
-            None => {
-                let s = self.active_mut()?;
-                let f = s.platform.capture_frame(params.region.as_ref())?;
-                s.pump();
-                f
-            }
+            None => self.capture(params.window, params.region.as_ref())?,
         };
-        let (perceptual, threshold, tolerance, until, region) = (
+        let (perceptual, threshold, tolerance, until, region, window) = (
             params.perceptual,
             params.threshold,
             params.tolerance,
             params.until,
             params.region,
+            params.window,
         );
         let mut last: Option<(f32, Option<BBox>, Frame)> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            let s = self.active_mut()?;
-            let current = s.platform.capture_frame(region.as_ref())?;
-            s.pump();
+            let current = self.capture(window, region.as_ref())?;
             let d = if perceptual {
                 diff_perceptual(&reference, &current, threshold)?
             } else {
@@ -1059,6 +1090,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    /// Every `capture_window(id, region)` call `FakePlatform` recorded, for
+    /// asserting it (not `capture_frame`) was used, and with what arguments.
+    type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
+
     /// Scriptable in-memory backend for testing the session manager.
     #[derive(Default)]
     struct FakePlatform {
@@ -1073,6 +1108,12 @@ mod tests {
         stop_count: Option<Arc<Mutex<u32>>>,
         windows: Vec<WindowInfo>,
         clipboard: String,
+        /// Frames `capture_window` serves, keyed by window id — independent of
+        /// `frames` (the active-window `capture_frame` script).
+        window_frames: std::collections::HashMap<WindowId, Frame>,
+        /// Every `capture_window(id, region)` call, for asserting it (not
+        /// `capture_frame`) was used, and with what arguments.
+        capture_window_log: CaptureWindowLog,
     }
 
     impl FakePlatform {
@@ -1111,6 +1152,14 @@ mod tests {
             self.windows = windows;
             self
         }
+        fn with_window_frame(mut self, id: WindowId, frame: Frame) -> Self {
+            self.window_frames.insert(id, frame);
+            self
+        }
+        fn with_capture_window_log(mut self, log: CaptureWindowLog) -> Self {
+            self.capture_window_log = log;
+            self
+        }
     }
 
     impl Platform for FakePlatform {
@@ -1136,6 +1185,21 @@ mod tests {
                 }
                 None => return Err(GlassError::CaptureFailed("no scripted frames".into())),
             };
+            match region {
+                Some(r) => frame.crop(r),
+                None => Ok(frame),
+            }
+        }
+        fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
+            self.capture_window_log
+                .lock()
+                .unwrap()
+                .push((id, region.copied()));
+            let frame = self
+                .window_frames
+                .get(&id)
+                .cloned()
+                .ok_or(GlassError::WindowNotFound)?;
             match region {
                 Some(r) => frame.crop(r),
                 None => Ok(frame),
@@ -1330,7 +1394,7 @@ mod tests {
     fn operations_require_an_active_session() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         assert!(matches!(
-            g.screenshot(None).unwrap_err(),
+            g.screenshot(None, None).unwrap_err(),
             GlassError::NoActiveSession
         ));
         assert!(matches!(g.stop().unwrap_err(), GlassError::NoActiveSession));
@@ -1365,7 +1429,7 @@ mod tests {
         let platform = FakePlatform::new(4, 4).with_frames(vec![frame.clone()]);
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
-        assert_eq!(g.screenshot(None).unwrap(), frame);
+        assert_eq!(g.screenshot(None, None).unwrap(), frame);
     }
 
     #[test]
@@ -1442,6 +1506,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                window: None,
             })
             .unwrap();
         assert!(outcome.settled);
@@ -1468,6 +1533,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 0, // give up after the first non-settling capture
                 stability_region: None,
+                window: None,
             })
             .unwrap();
         assert!(!outcome.settled);
@@ -1507,6 +1573,7 @@ mod tests {
                     width: 2,
                     height: 2,
                 }),
+                window: None,
             })
             .unwrap();
         assert!(
@@ -1545,6 +1612,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: Some(region),
+                window: None,
             })
             .unwrap();
         assert!(outcome.settled);
@@ -1579,6 +1647,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                window: None,
             })
             .unwrap();
         assert!(outcome.settled);
@@ -1607,9 +1676,75 @@ mod tests {
                     width: 99,
                     height: 1,
                 }),
+                window: None,
             })
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidRegion(_)));
+    }
+
+    #[test]
+    fn wait_stable_with_window_id_uses_capture_window_and_leaves_active_untouched() {
+        // Window B is constant, so it settles immediately; watching it must go
+        // through capture_window (never capture_frame), and must not disturb the
+        // active window (A).
+        let a = WindowInfo {
+            id: WindowId(1),
+            title: Some("A".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: true,
+        };
+        let b = WindowInfo {
+            id: WindowId(2),
+            title: Some("B".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 100,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: false,
+        };
+        let frame_b = Frame::solid(4, 4, [3, 3, 3, 255]);
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let capture_window_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_windows(vec![a.clone(), b])
+            .with_capture_log(capture_log.clone())
+            .with_capture_window_log(capture_window_log.clone())
+            .with_window_frame(WindowId(2), frame_b.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.select_window(WindowId(1)).unwrap(); // A is active
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                window: Some(WindowId(2)),
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(outcome.frame, frame_b);
+        assert_eq!(
+            g.geometry().unwrap(),
+            a.geometry,
+            "active window is still A after watching B"
+        );
+        assert!(
+            capture_log.lock().unwrap().is_empty(),
+            "watching a specific window must not go through capture_frame"
+        );
+        assert!(!capture_window_log.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1619,12 +1754,15 @@ mod tests {
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         let out = g
-            .screenshot(Some(Region {
-                x: 1,
-                y: 1,
-                width: 2,
-                height: 2,
-            }))
+            .screenshot(
+                Some(Region {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 2,
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!((out.width, out.height), (2, 2));
     }
@@ -1636,14 +1774,87 @@ mod tests {
         let mut g = glass_with(platform);
         g.start(&spec()).unwrap();
         let err = g
-            .screenshot(Some(Region {
-                x: 0,
-                y: 0,
-                width: 9,
-                height: 1,
-            }))
+            .screenshot(
+                Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 9,
+                    height: 1,
+                }),
+                None,
+            )
             .unwrap_err();
         assert!(matches!(err, GlassError::InvalidRegion(_)));
+    }
+
+    #[test]
+    fn screenshot_with_window_id_captures_that_window_without_changing_active() {
+        // Two windows: A (active) and B. screenshot(None, Some(B.id)) must return
+        // B's frame — via capture_window, NOT capture_frame — while the session's
+        // active window (still A) is left untouched.
+        let frame_b = Frame::solid(8, 8, [9, 9, 9, 255]);
+        let a = WindowInfo {
+            id: WindowId(1),
+            title: Some("A".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: true,
+        };
+        let b = WindowInfo {
+            id: WindowId(2),
+            title: Some("B".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 100,
+                y: 0,
+                width: 8,
+                height: 8,
+            },
+            active: false,
+        };
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let capture_window_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_windows(vec![a.clone(), b.clone()])
+            .with_capture_log(capture_log.clone())
+            .with_capture_window_log(capture_window_log.clone())
+            .with_window_frame(WindowId(2), frame_b.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.select_window(WindowId(1)).unwrap(); // A is active
+
+        let out = g.screenshot(None, Some(WindowId(2))).unwrap();
+        assert_eq!(out, frame_b, "screenshot(window: B) returns B's frame");
+        assert_eq!(
+            g.geometry().unwrap(),
+            a.geometry,
+            "active window is still A after capturing B"
+        );
+        assert!(
+            capture_log.lock().unwrap().is_empty(),
+            "capturing a specific window must not go through capture_frame"
+        );
+        assert_eq!(
+            *capture_window_log.lock().unwrap(),
+            vec![(WindowId(2), None)]
+        );
+    }
+
+    #[test]
+    fn screenshot_with_unknown_window_id_errors() {
+        let platform =
+            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        assert!(matches!(
+            g.screenshot(None, Some(WindowId(999))).unwrap_err(),
+            GlassError::WindowNotFound
+        ));
     }
 
     #[test]
@@ -2056,6 +2267,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                window: None,
             })
             .unwrap();
         assert!(o.matched);
@@ -2079,6 +2291,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 0,
+                window: None,
             })
             .unwrap();
         assert!(!o.matched);
@@ -2104,10 +2317,82 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                window: None,
             })
             .unwrap();
         assert!(o.matched);
         assert_eq!(o.changed_pct, 0.0);
+    }
+
+    #[test]
+    fn wait_for_region_with_window_id_uses_capture_window_and_leaves_active_untouched() {
+        // Window B is constant, so it matches its own initial capture immediately;
+        // watching it must go through capture_window (never capture_frame), and
+        // must not disturb the active window (A).
+        let a = WindowInfo {
+            id: WindowId(1),
+            title: Some("A".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: true,
+        };
+        let b = WindowInfo {
+            id: WindowId(2),
+            title: Some("B".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 100,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: false,
+        };
+        let frame_b = Frame::solid(4, 4, [5, 5, 5, 255]);
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let capture_window_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_windows(vec![a.clone(), b])
+            .with_capture_log(capture_log.clone())
+            .with_capture_window_log(capture_window_log.clone())
+            .with_window_frame(WindowId(2), frame_b);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.select_window(WindowId(1)).unwrap(); // A is active
+
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Matches,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                window: Some(WindowId(2)),
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert_eq!(o.changed_pct, 0.0);
+        assert_eq!(
+            g.geometry().unwrap(),
+            a.geometry,
+            "active window is still A after watching B"
+        );
+        assert!(
+            capture_log.lock().unwrap().is_empty(),
+            "watching a specific window must not go through capture_frame"
+        );
+        assert!(
+            capture_window_log.lock().unwrap().len() >= 2,
+            "reference capture + at least one poll"
+        );
     }
 
     #[test]
@@ -2416,7 +2701,7 @@ mod tests {
         g.set_audit_sink(Box::new(sink.clone()));
 
         g.start(&spec()).unwrap();
-        let _ = g.screenshot(None).unwrap(); // read
+        let _ = g.screenshot(None, None).unwrap(); // read
         let tree = g.a11y_snapshot().unwrap(); // read (populates last_ax)
         g.pointer(&PointerEvent::Click {
             x: 1,

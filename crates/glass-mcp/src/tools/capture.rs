@@ -16,7 +16,10 @@ fn crop_frame(frame: Frame, region: Option<&RegionArgs>) -> Result<Frame, String
 
 pub fn screenshot(glass: &mut Glass, a: &ScreenshotArgs) -> ToolResult {
     let frame = glass
-        .screenshot(a.region.as_ref().map(|r| r.into()))
+        .screenshot(
+            a.region.as_ref().map(|r| r.into()),
+            a.window_id.map(glass_core::WindowId),
+        )
         .map_err(|e| e.to_string())?;
     let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
     let mut meta = json!({ "width": frame.width, "height": frame.height });
@@ -38,6 +41,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         timeout_ms: a.timeout_ms.unwrap_or(5000),
         stability_region: a.stability_region.as_ref().map(|r| r.into()),
+        window: a.window_id.map(glass_core::WindowId),
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
     let settled = outcome.settled;
@@ -198,7 +202,14 @@ mod tests {
     fn screenshot_returns_image_then_meta() {
         let frame = Frame::solid(4, 4, [1, 2, 3, 255]);
         let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![frame]));
-        let out = screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap();
+        let out = screenshot(
+            &mut g,
+            &ScreenshotArgs {
+                region: None,
+                window_id: None,
+            },
+        )
+        .unwrap();
         assert!(matches!(out.0[0], OutContent::Image(_)));
         match &out.0[1] {
             OutContent::Text(t) => assert!(t.contains("\"width\":4")),
@@ -224,6 +235,7 @@ mod tests {
                 width: 2,
                 height: 2,
             }),
+            window_id: None,
         };
         let out = screenshot(&mut g, &a).unwrap();
         match &out.0[1] {
@@ -256,8 +268,27 @@ mod tests {
                 width: 99,
                 height: 99,
             }),
+            window_id: None,
         };
         assert!(screenshot(&mut g, &a).unwrap_err().contains("region"));
+    }
+
+    #[test]
+    fn screenshot_with_window_id_routes_through_capture_window() {
+        // testutil's FakePlatform doesn't override capture_window, so a window_id
+        // must reach the backend's (Unsupported) capture_window rather than
+        // silently falling back to the scripted capture_frame frame.
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
+        let a = ScreenshotArgs {
+            region: None,
+            window_id: Some(7),
+        };
+        let err = screenshot(&mut g, &a).unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     #[test]
@@ -280,6 +311,7 @@ mod tests {
             }),
             stability_region: None,
             include_image: None,
+            window_id: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         if let OutContent::Image(bytes) = &out.0[0] {
@@ -310,8 +342,33 @@ mod tests {
                 height: 1,
             }),
             include_image: None,
+            window_id: None,
         };
         assert!(wait_stable(&mut g, &a).unwrap_err().contains("region"));
+    }
+
+    #[test]
+    fn wait_stable_with_window_id_routes_through_capture_window() {
+        // As above: testutil's FakePlatform has no capture_window override, so a
+        // window_id must reach it (Unsupported) rather than silently polling the
+        // active window's scripted capture_frame frames.
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
+        let a = WaitStableArgs {
+            interval_ms: Some(1),
+            settle_frames: Some(1),
+            tolerance: None,
+            timeout_ms: Some(200),
+            region: None,
+            stability_region: None,
+            include_image: None,
+            window_id: Some(3),
+        };
+        let err = wait_stable(&mut g, &a).unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     #[test]
@@ -502,6 +559,7 @@ mod tests {
             region: None,
             stability_region: None,
             include_image: Some(false),
+            window_id: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         assert_eq!(
@@ -594,6 +652,7 @@ mod tests {
             region: None,
             stability_region: None,
             include_image: Some(true),
+            window_id: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // must have [Image, meta-Text, IMAGE_NOTE-Text]
@@ -642,6 +701,7 @@ mod tests {
             region: None,
             stability_region: None,
             include_image: Some(false),
+            window_id: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // no image -> no IMAGE_NOTE
@@ -667,7 +727,14 @@ mod tests {
     fn screenshot_image_note_present_and_meta_unmarked() {
         let frame = Frame::solid(4, 4, [1, 2, 3, 255]);
         let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![frame]));
-        let out = screenshot(&mut g, &ScreenshotArgs { region: None }).unwrap();
+        let out = screenshot(
+            &mut g,
+            &ScreenshotArgs {
+                region: None,
+                window_id: None,
+            },
+        )
+        .unwrap();
         // must have at least 3 items: Image, meta-Text, note-Text
         assert!(
             out.0.len() >= 3,

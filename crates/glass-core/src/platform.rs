@@ -182,6 +182,15 @@ pub trait Platform {
     /// whole window.
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame>;
 
+    /// Capture a specific window's region from the compositor/root WITHOUT changing
+    /// the active window (unlike `select_window`). `region` (if set, relative to
+    /// `id`'s own geometry) captures only that sub-rectangle; `None` captures the
+    /// whole window. `WindowNotFound` if `id` is not currently one of the app's
+    /// windows. Default: unsupported.
+    fn capture_window(&mut self, _id: WindowId, _region: Option<&Region>) -> Result<Frame> {
+        Err(GlassError::Unsupported("capture_window".into()))
+    }
+
     /// Inject a pointer event (coordinates are window-relative).
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()>;
 
@@ -299,5 +308,47 @@ mod tests {
             a11y: false,
         };
         assert_eq!(spec.run[0], "./app");
+    }
+
+    /// A bare-minimum `Platform` that overrides nothing — every optional method
+    /// falls through to its default (erroring) implementation.
+    struct MinimalPlatform;
+    impl Platform for MinimalPlatform {
+        fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+            Ok(WindowGeometry::default())
+        }
+        fn stop_app(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
+            Err(GlassError::CaptureFailed("minimal".into()))
+        }
+        fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+            Ok(())
+        }
+        fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+            Ok(())
+        }
+        fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+            Ok(WindowGeometry::default())
+        }
+        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            Ok(vec![])
+        }
+        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+            Err(GlassError::WindowNotFound)
+        }
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn default_capture_window_is_unsupported() {
+        // A backend with no `capture_window` override (the common case today)
+        // reports `Unsupported`, not a silently-wrong capture of the active window.
+        let mut p = MinimalPlatform;
+        let err = p.capture_window(WindowId(1), None).unwrap_err();
+        assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
     }
 }

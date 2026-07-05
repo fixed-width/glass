@@ -518,6 +518,99 @@ fn enumerates_and_selects_multiple_windows() {
 
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn capture_window_reads_a_specific_window_without_changing_the_active_one() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        build: None,
+        run: vec![TESTAPP.to_string(), "--windows".into(), "2".into()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 5000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    };
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("start_app failed: {e}"));
+    assert!(wait_for_log(&mut p, "READY", 40), "no READY");
+    std::thread::sleep(std::time::Duration::from_millis(200)); // let both windows draw
+
+    let windows = p.list_windows().unwrap();
+    let main = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("main window");
+    let extra = windows
+        .iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp-1"))
+        .expect("extra window");
+    assert_ne!(main.id, extra.id);
+
+    // Active window stays MAIN throughout (never call select_window).
+    let f = p.capture_window(extra.id, None).unwrap();
+    assert_eq!(
+        pixel(&f, 160, 120),
+        [255, 0, 255, 255],
+        "capture_window(extra) should read the extra window's magenta fill"
+    );
+
+    // The active window (never switched) still reads as MAIN's own content via
+    // the normal capture_frame path — proof capture_window did not retarget it.
+    let f = p.capture_frame(None).unwrap();
+    assert_eq!(
+        pixel(&f, 80, 60),
+        [255, 0, 0, 255],
+        "active window is still MAIN after capture_window(extra)"
+    );
+
+    // A region on the target window is honored (window-relative to `extra`).
+    let region_frame = p
+        .capture_window(
+            extra.id,
+            Some(&glass_core::Region {
+                x: 150,
+                y: 110,
+                width: 20,
+                height: 20,
+            }),
+        )
+        .unwrap();
+    assert_eq!((region_frame.width, region_frame.height), (20, 20));
+    assert_eq!(pixel(&region_frame, 10, 10), [255, 0, 255, 255]);
+
+    // A region that overshoots the TARGET window's own geometry (320x240) is
+    // rejected even though it still lands well inside the shared Xvfb display
+    // (default 1280x800) — otherwise this would silently capture pixels from
+    // outside `extra` (desktop / other windows) instead of erroring, violating
+    // the documented "region relative to id's own geometry" contract.
+    let err = p
+        .capture_window(
+            extra.id,
+            Some(&glass_core::Region {
+                x: 150,
+                y: 110,
+                width: 300,
+                height: 200,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, glass_core::GlassError::InvalidRegion(_)),
+        "expected InvalidRegion for a region overshooting the target window's own geometry, got {err:?}"
+    );
+
+    // An unknown window id is rejected (no silent fallback to the active window).
+    assert!(matches!(
+        p.capture_window(glass_core::WindowId(0xDEAD_BEEF), None),
+        Err(glass_core::GlassError::WindowNotFound)
+    ));
+
+    p.stop_app().unwrap();
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
 fn modified_click_carries_modifier_state() {
     use glass_core::{Modifier, MouseButton, PointerEvent};
     let xvfb = Xvfb::start();
