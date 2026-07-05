@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_seat, wl_shm};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_frame_v1::{
@@ -232,8 +232,9 @@ struct State {
     registry: RegistryState,
     output: OutputState,
     shm: Shm,
-    frame_buffer: Option<(wl_shm::Format, u32, u32, u32)>, // format, w, h, stride
-    capture_done: Option<Result<()>>,                      // Some(Ok)=ready, Some(Err)=failed
+    shm_buffers: Vec<(wl_shm::Format, u32, u32, u32)>, // advertised formats (format, w, h, stride)
+    buffer_done: bool,                                 // v3: end of the format advertisement list
+    capture_done: Option<Result<()>>,                  // Some(Ok)=ready, Some(Err)=failed
 }
 
 impl ProvidesRegistryState for State {
@@ -305,14 +306,15 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 height,
                 stride,
             } => {
-                state.frame_buffer = Some((f, width, height, stride));
+                state.shm_buffers.push((f, width, height, stride));
             }
+            Event::BufferDone => state.buffer_done = true,
             Event::Ready { .. } => state.capture_done = Some(Ok(())),
             Event::Failed => {
                 state.capture_done =
                     Some(Err(GlassError::CaptureFailed("screencopy failed".into())))
             }
-            _ => {} // Flags, Damage, LinuxDmabuf, BufferDone, etc.
+            _ => {} // Flags, Damage, LinuxDmabuf, etc.
         }
     }
 }
@@ -415,11 +417,12 @@ fn open_session(
         registry: RegistryState::new(&globals),
         output: OutputState::new(&globals, &qh),
         shm: Shm::bind(&globals, &qh).map_err(|e| GlassError::Backend(format!("bind shm: {e}")))?,
-        frame_buffer: None,
+        shm_buffers: Vec::new(),
+        buffer_done: false,
         capture_done: None,
     };
     let manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=1, ())
+        .bind(&qh, 1..=3, ())
         .map_err(|e| GlassError::Backend(format!("bind screencopy: {e}")))?;
     let seat: wl_seat::WlSeat = globals
         .bind(&qh, 1..=8, ())
@@ -988,7 +991,8 @@ impl Platform for WaylandPlatform {
 
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
         let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
-        session.state.frame_buffer = None;
+        session.state.shm_buffers.clear();
+        session.state.buffer_done = false;
         session.state.capture_done = None;
         let qh = session.queue.handle();
 
@@ -1016,14 +1020,25 @@ impl Platform for WaylandPlatform {
 
         let deadline = Instant::now() + Duration::from_millis(5000);
 
-        // Phase 1: dispatch until the compositor advertises the buffer geometry.
+        // Phase 1: dispatch until the compositor has advertised its buffer formats, then pick
+        // one we can convert (preferring 32-bit). v3 marks the end of the format list with
+        // `buffer_done`; v1/v2 advertise a single format and never send it, so there we proceed
+        // as soon as one arrives.
+        let manager_v3 = session.manager.version() >= 3;
         let (format, w, h, stride) = loop {
             session
                 .queue
                 .blocking_dispatch(&mut session.state)
                 .map_err(|e| GlassError::CaptureFailed(format!("dispatch: {e}")))?;
-            if let Some(b) = session.state.frame_buffer {
-                break b;
+            let advertised = if manager_v3 {
+                session.state.buffer_done
+            } else {
+                !session.state.shm_buffers.is_empty()
+            };
+            if advertised {
+                break crate::pixels::pick_shm_format(&session.state.shm_buffers).ok_or_else(
+                    || GlassError::CaptureFailed("screencopy: no shm format advertised".into()),
+                )?;
             }
             if let Some(Err(e)) = session.state.capture_done.take() {
                 return Err(e);
