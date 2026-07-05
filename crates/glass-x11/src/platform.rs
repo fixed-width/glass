@@ -629,23 +629,24 @@ impl X11Platform {
 
     /// Resolve a window-relative `region` (or the whole window) against `geo`
     /// into an absolute root-coordinate capture rectangle, rejecting a zero-area
-    /// region and one that reaches off the (headless) display before any
-    /// `GetImage` request is issued.
+    /// region and fitting the result to the (headless) display: a rectangle
+    /// reaching off-screen is clipped to its visible portion (flagged in the
+    /// returned [`ClippedRect`]) rather than issuing a doomed `GetImage`.
     fn resolve_capture_rect(
         &self,
         geo: &WindowGeometry,
         region: Option<&Region>,
-    ) -> Result<(i32, i32, u32, u32)> {
-        let (cx, cy, w, h) = match region {
-            Some(r) => (r.x, r.y, r.width, r.height),
-            None => (0, 0, geo.width, geo.height),
+    ) -> Result<crate::coords::ClippedRect> {
+        let (w, h) = match region {
+            Some(r) => (r.width, r.height),
+            None => (geo.width, geo.height),
         };
         if w == 0 || h == 0 {
             return Err(GlassError::CaptureFailed("window has zero area".into()));
         }
         // A window (or region) reaching past the headless display makes GetImage
-        // cover non-viewable area, which X rejects with a bare BadMatch. Convert
-        // that to an actionable error before issuing the request; the root
+        // cover non-viewable area, which X rejects with a bare BadMatch. Clip to
+        // the on-display portion here (a partial frame beats none); the root
         // window's pixel size is the display size.
         let display = {
             let root = &self.conn.setup().roots[self.screen_num];
@@ -654,8 +655,7 @@ impl X11Platform {
                 u32::from(root.height_in_pixels),
             )
         };
-        crate::coords::check_capture_fits(geo, region, display)?;
-        Ok((geo.x + cx as i32, geo.y + cy as i32, w, h))
+        crate::coords::clip_capture_to_display(geo, region, display)
     }
 
     /// `GetImage` a `w`x`h` rectangle at root-coordinate `(sx,sy)` and decode it to
@@ -689,6 +689,21 @@ impl X11Platform {
             })?;
         let rgba = crate::pixels::xdata_to_rgba(&image.data, w, h, bpp)?;
         Frame::new(w, h, rgba)
+    }
+}
+
+/// Emit a one-line diagnostic when a capture was clipped to the display, so the
+/// smaller-than-requested frame the caller receives isn't a silent surprise.
+/// glass's own stderr is its diagnostic channel (same as the focus-on-launch
+/// warning); the MCP `screenshot` result additionally reports the true (clipped)
+/// dimensions, so a frame smaller than the window/region signals the clip.
+fn note_if_clipped(rect: &crate::coords::ClippedRect) {
+    if rect.clipped {
+        eprintln!(
+            "glass: capture reached past the headless display and was clipped to the visible \
+             {}x{} region at ({},{}); returning a partial frame",
+            rect.w, rect.h, rect.sx, rect.sy
+        );
     }
 }
 
@@ -933,11 +948,12 @@ impl Platform for X11Platform {
         // `window_geometry()` itself calls `require_window()`, so it doubles as
         // the "is there an active window" guard — no separate binding needed.
         let geo = self.window_geometry()?;
-        let (sx, sy, w, h) = self.resolve_capture_rect(&geo, region)?;
+        let rect = self.resolve_capture_rect(&geo, region)?;
+        note_if_clipped(&rect);
         // Capture from ROOT over the window's screen region so overlapping popovers
         // (separate override-redirect top-levels) are included, not just this window's
         // own (possibly-obscured) drawable.
-        self.capture_screen_rect(sx, sy, w, h)
+        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
     }
 
     fn capture_window(&mut self, id: WindowId, region: Option<&Region>) -> Result<Frame> {
@@ -960,8 +976,9 @@ impl Platform for X11Platform {
             // this window (desktop / other windows) instead of erroring.
             r.check_fits(geo.width, geo.height)?;
         }
-        let (sx, sy, w, h) = self.resolve_capture_rect(&geo, region)?;
-        self.capture_screen_rect(sx, sy, w, h)
+        let rect = self.resolve_capture_rect(&geo, region)?;
+        note_if_clipped(&rect);
+        self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
     }
 
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {

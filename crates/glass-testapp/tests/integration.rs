@@ -121,26 +121,52 @@ fn captures_known_quadrant_colors() {
 
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
-fn oversize_window_capture_returns_actionable_error() {
+fn oversize_window_capture_is_clipped_to_the_display() {
     // A display SMALLER than the 320x240 test window, so the window overflows the
-    // screen — the "window bigger than the headless Xvfb" case. Capture must fail
-    // with an actionable message (window + display sizes and the two remedies),
-    // not the raw `GetImage`/`BadMatch` protocol error the agent can't act on.
+    // screen — the "window bigger than the headless Xvfb" case. Rather than fail
+    // with the raw `GetImage`/`BadMatch` protocol error the agent can't act on,
+    // glass clips the capture to the on-screen portion and returns a partial frame
+    // (a partial view beats none). This exercises the real GetImage-on-clipped-rect
+    // path: proof the clipped rectangle is actually readable, not another BadMatch.
+    let (dw, dh) = (200i32, 200i32);
     let xvfb = glass_x11::Xvfb::start("200x200x24").expect("spawn Xvfb (is it installed?)");
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     p.start_app(&app_spec()).unwrap();
     assert!(wait_for_log(&mut p, "READY", 40), "no READY");
     std::thread::sleep(std::time::Duration::from_millis(150));
-    let err = p.capture_frame(None).unwrap_err().to_string();
-    assert!(err.contains("320x240"), "names the window size: {err}");
-    assert!(err.contains("200x200"), "names the display size: {err}");
+
+    // Compute the exact on-display intersection from the window's real geometry,
+    // so the assertion has teeth: a bug that over- or under-clips fails, not just
+    // "any frame smaller than the window".
+    let geo = p
+        .list_windows()
+        .unwrap()
+        .into_iter()
+        .find(|w| w.title.as_deref() == Some("glass-testapp"))
+        .expect("test window")
+        .geometry;
+    let ix = geo.x.max(0);
+    let iy = geo.y.max(0);
+    let exp_w = ((geo.x + geo.width as i32).min(dw) - ix) as u32;
+    let exp_h = ((geo.y + geo.height as i32).min(dh) - iy) as u32;
     assert!(
-        err.contains("GLASS_XVFB_SCREEN"),
-        "names the larger-display remedy: {err}"
+        exp_w > 0 && exp_h > 0,
+        "precondition: window {geo:?} must overlap the {dw}x{dh} display"
     );
     assert!(
-        !err.contains("get_image"),
-        "should be the pre-flight actionable error, not the raw GetImage failure: {err}"
+        exp_w < geo.width || exp_h < geo.height,
+        "precondition: window {geo:?} must overflow the {dw}x{dh} display to exercise clipping"
+    );
+
+    let frame = p
+        .capture_frame(None)
+        .expect("oversize-window capture should clip to the display, not error");
+    // The returned frame is exactly the on-display portion — proof it was clipped
+    // to a readable rectangle, not a BadMatch and not garbage/full-window pixels.
+    assert_eq!(
+        (frame.width, frame.height),
+        (exp_w, exp_h),
+        "capture should be clipped to exactly the on-display intersection of {geo:?}"
     );
     p.stop_app().unwrap();
 }
