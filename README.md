@@ -18,6 +18,8 @@ SendInput, UI Automation) — an **Android** backend (drives native apps in an A
 process containment), behind a platform-agnostic core. See the per-host setup guides:
 [Linux](docs/running-on-linux.md) · [Windows](docs/running-on-windows.md) · [macOS](docs/running-on-macos.md).
 
+See [`CHANGELOG.md`](CHANGELOG.md) for release notes.
+
 ## The loop in practice
 
 Point an AI coding agent at a GUI app and it runs the whole **build → see → interact →
