@@ -5,11 +5,16 @@
 //!
 //! This module is split so the parts that don't need macOS are unit-testable on Linux:
 //! [`RunMode`], [`registration_line`], [`fill_launch_agent`], [`run_mode_from_flags`],
-//! [`is_inside_app_bundle`], and [`codesign_report_is_unstable`] are pure — no OS call, no
-//! IO — and are exercised here. The interactive grant flow itself
-//! (`#[cfg(target_os = "macos")]` inside [`run`], plumbed through the private `macos_impl`
-//! submodule) is macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real
-//! file writes.
+//! [`is_inside_app_bundle`], [`codesign_report_is_unstable`], and `parse_health_response`
+//! are pure — no OS call, no IO — and are exercised here. (`parse_health_response` is a
+//! plain code reference, not a doc link, since it's `#[cfg(any(target_os = "macos", test))]`
+//! and so doesn't exist in scope for a plain non-test build on other platforms — a doc link
+//! to it would be broken there.) The interactive grant flow itself (`#[cfg(target_os =
+//! "macos")]` inside [`run`], plumbed through the private `macos_impl` submodule) is
+//! macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real file writes.
+//! `fetch_health` is likewise macOS-only (same reason it's a plain reference here) but
+//! stays its own top-level `pub fn` rather than moving into `macos_impl`, since a later
+//! task calls it from outside this module too (see its doc comment).
 
 // `GlassError` itself is only named in the `#[cfg(not(target_os = "macos"))]` arm of `run`
 // (and its test) — on a macOS build that arm doesn't exist, so import only `Result` here
@@ -18,6 +23,30 @@
 use std::path::Path;
 
 use glass_core::Result;
+
+// `HealthStatus` is only named by `parse_health_response` (below) and `fetch_health` (near
+// `macos_impl`), which are themselves gated to macOS (the only platform with a running
+// server to poll) plus `#[cfg(test)]` (so the parser stays Linux-testable) — gate this `use`
+// the same way, or a plain non-test Linux/Windows build would warn on an import nothing in
+// scope actually needs.
+#[cfg(any(target_os = "macos", test))]
+use crate::health::HealthStatus;
+
+/// Extract and validate a [`HealthStatus`] out of a raw `/healthz` HTTP response: split off
+/// the body at the blank line, require a `200` status line, then deserialize the body as
+/// JSON. `None` for anything short of a genuinely healthy response — text that isn't HTTP at
+/// all, a non-200 status, or a body that doesn't deserialize — never a fabricated
+/// [`HealthStatus`]. Pure (no IO), so it's unit-tested here directly against literal
+/// response text; [`fetch_health`] is the only real caller, feeding it a live socket read.
+#[cfg(any(target_os = "macos", test))]
+fn parse_health_response(raw: &str) -> Option<HealthStatus> {
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    let status_ok = head.lines().next()?.split_whitespace().nth(1) == Some("200");
+    if !status_ok {
+        return None;
+    }
+    serde_json::from_str::<HealthStatus>(body.trim()).ok()
+}
 
 /// How the user will run `glass-mcp` after setup completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +327,37 @@ pub fn run(args: SetupArgs) -> Result<()> {
     }
 }
 
+/// Raw `GET /healthz` against the running server at `addr` (`host:port`), on the same
+/// bounded-TCP-connect budget [`macos_impl::launch_agent_is_serving`] uses to confirm a
+/// just-bootstrapped LaunchAgent is up. `None` for anything short of a full, parseable
+/// response — an unresolvable `addr`, a refused/timed-out connect, a read timeout, or
+/// [`parse_health_response`] rejecting the body — never a fabricated [`HealthStatus`].
+///
+/// `pub`: unlike the rest of the macOS-only glue below, this isn't nested in the private
+/// `macos_impl` module, because it has two callers outside it — `run`'s own guided-enable
+/// poll right here in `setup.rs`, and a later onboarding module's dialog gate — and a
+/// private `mod` can't be named from outside `setup.rs` regardless of its items' visibility.
+#[cfg(target_os = "macos")]
+pub fn fetch_health(addr: &str) -> Option<HealthStatus> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let sock = addr.to_socket_addrs().ok()?.next()?;
+    let mut stream =
+        TcpStream::connect_timeout(&sock, macos_impl::LIVENESS_CONNECT_TIMEOUT).ok()?;
+    stream
+        .set_read_timeout(Some(macos_impl::LIVENESS_CONNECT_TIMEOUT))
+        .ok()?;
+    write!(
+        stream,
+        "GET /healthz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    parse_health_response(&buf)
+}
+
 /// The macOS-only glue behind [`run`]'s grant flow: side-effecting (stdin/stdout, shelling
 /// out to `codesign`/`launchctl`, real TCC calls), unlike the pure helpers above it in this
 /// file. Kept in its own module so its `use` block doesn't have to be repeated per item, and
@@ -324,7 +384,10 @@ mod macos_impl {
 
     /// Liveness-probe budget for [`install_launch_agent`]: launchd needs a beat to exec the
     /// job, so give it ~5s of ~500ms-apart TCP connects before deciding it isn't serving.
-    const LIVENESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+    /// `pub(super)`: also reused by [`super::fetch_health`] as its connect *and* read timeout
+    /// (it isn't a poll loop like [`launch_agent_is_serving`], just a single bounded probe,
+    /// so one budget covers both).
+    pub(super) const LIVENESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
     const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -596,6 +659,24 @@ mod macos_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_health_response -----------------------------------------------------------
+
+    #[test]
+    fn parses_healthz_body_out_of_an_http_response() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                   {\"ok\":true,\"screen_recording\":true,\"accessibility\":false}";
+        let h = super::parse_health_response(raw).unwrap();
+        assert_eq!(h.screen_recording, Some(true));
+        assert_eq!(h.accessibility, Some(false));
+        assert!(!h.grants_ready());
+    }
+
+    #[test]
+    fn parse_health_response_rejects_garbage() {
+        assert!(super::parse_health_response("not http").is_none());
+        assert!(super::parse_health_response("HTTP/1.1 500 X\r\n\r\nnope").is_none());
+    }
 
     // --- registration_line ------------------------------------------------------------
 
