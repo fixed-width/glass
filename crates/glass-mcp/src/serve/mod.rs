@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::routing::get;
 use axum::Router;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -120,15 +121,24 @@ pub async fn run_on(
         http_cfg,
     );
 
-    // The bearer-token layer fronts the MCP service.
+    // The bearer-token layer fronts only the MCP service; `/healthz` is merged in
+    // afterward (outside the layer) so it stays reachable without a token — it exposes
+    // just the two grant booleans, and setup/onboarding must be able to poll it before
+    // any token is available.
     let expected = Arc::new(cfg.token);
-    let app: Router =
+    let mcp: Router =
         Router::new()
             .fallback_service(service)
             .layer(axum::middleware::from_fn_with_state(
                 expected,
                 auth::require_bearer,
             ));
+    let app: Router = Router::new()
+        .route(
+            "/healthz",
+            get(|| async { axum::Json(crate::health::current_health()) }),
+        )
+        .merge(mcp);
 
     let r = axum::serve(listener, app)
         .with_graceful_shutdown(async move {

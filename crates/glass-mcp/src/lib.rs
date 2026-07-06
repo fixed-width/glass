@@ -5,6 +5,7 @@ pub mod audit;
 pub mod cli;
 pub mod doctor;
 mod env;
+pub mod health;
 mod params;
 #[cfg(feature = "network")]
 pub mod serve;
