@@ -17,7 +17,10 @@
 //! macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real file writes.
 //! `fetch_health` is likewise macOS-only (same reason it's a plain reference here) but
 //! stays its own top-level `pub(crate) fn` rather than moving into `macos_impl`, since a
-//! sibling onboarding module calls it too (see its doc comment).
+//! sibling onboarding module calls it too (see its doc comment). The onboarding module also
+//! needs to install the LaunchAgent, so a thin top-level `install_launch_agent` forwards to
+//! `macos_impl::install_launch_agent` for the same reason: a private `mod` can't be named
+//! from a sibling module regardless of its items' visibility.
 
 // `GlassError` itself is only named in the `#[cfg(not(target_os = "macos"))]` arm of `run`
 // (and its test) — on a macOS build that arm doesn't exist, so import only `Result` here
@@ -390,6 +393,21 @@ pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
     let mut buf = String::new();
     stream.read_to_string(&mut buf).ok()?;
     parse_health_response(&buf)
+}
+
+/// Install (or reload) the LaunchAgent — a thin `pub(crate)` forwarder to
+/// [`macos_impl::install_launch_agent`]. Kept at the top level rather than called via its
+/// `macos_impl::` path, for the same reason [`fetch_health`] is: `macos_impl` is a private
+/// module, so a sibling `onboarding` module can't name `crate::setup::macos_impl::...` at
+/// all — module privacy is checked per path segment — regardless of the item's own
+/// visibility. Only a `pub(crate)` item defined directly in `setup` (this module) is
+/// reachable from a sibling module.
+#[cfg(target_os = "macos")]
+pub(crate) fn install_launch_agent(
+    app_bin: &str,
+    addr: &str,
+) -> Result<Option<(&'static str, String)>> {
+    macos_impl::install_launch_agent(app_bin, addr)
 }
 
 /// The macOS-only glue behind [`run`]'s grant flow: side-effecting (stdin/stdout, shelling
