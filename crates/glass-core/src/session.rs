@@ -97,11 +97,14 @@ impl ScrollDirection {
         }
     }
     /// Signed vertical wheel delta (notches): `Down` is positive (wheel-down),
-    /// `Up` negative.
+    /// `Up` negative. Saturates a huge `step` to `i32::MAX` so an absurd caller
+    /// value can't overflow (a plain `step as i32` would wrap, and `-(i32::MIN)`
+    /// panics in debug) — real steps are single digits.
     pub fn dy(self, step: u32) -> i32 {
+        let s = i32::try_from(step).unwrap_or(i32::MAX);
         match self {
-            ScrollDirection::Down => step as i32,
-            ScrollDirection::Up => -(step as i32),
+            ScrollDirection::Down => s,
+            ScrollDirection::Up => -s,
         }
     }
     /// Parse from a tool string (case-insensitive). `None` for unknown.
@@ -3769,6 +3772,9 @@ mod tests {
         // Down = wheel-down = positive notches; Up = negative.
         assert_eq!(ScrollDirection::Down.dy(3), 3);
         assert_eq!(ScrollDirection::Up.dy(3), -3);
+        // An absurd step saturates instead of overflowing/panicking.
+        assert_eq!(ScrollDirection::Down.dy(u32::MAX), i32::MAX);
+        assert_eq!(ScrollDirection::Up.dy(u32::MAX), -i32::MAX);
         assert_eq!(
             ScrollDirection::from_name("DOWN"),
             Some(ScrollDirection::Down)
