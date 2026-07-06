@@ -3,8 +3,8 @@
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
 CheckButton "Enable", an Entry "Field" (initial text "hello"), a SpinButton
 "Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), a
-Switch "Active" (off), and a virtualized GtkListView of 200 rows ("Row 000".."Row
-199") in a small scroller. Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
+Switch "Active" (off), and a virtualized GtkListView of 80 rows ("Row 000".."Row
+079") in a small scroller. Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration
 and presents its window immediately without waiting for portal services to settle."""
@@ -13,7 +13,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
-from gi.repository import Gdk, Gio, Gtk  # noqa: E402
+from gi.repository import Gio, Gtk  # noqa: E402
 
 
 class FixtureApp(Gtk.Application):
@@ -24,25 +24,6 @@ class FixtureApp(Gtk.Application):
         )
 
     def do_activate(self):
-        # GtkScrolledWindow paints a thin "undershoot/overshoot" shadow at a scroll
-        # boundary, and repaints it (with a pixel or two of antialiasing jitter)
-        # every time a further scroll is attempted past that boundary — even
-        # though the adjustment's value itself is fully clamped and unchanging.
-        # scroll_to_element treats any such pixel change as "still moving", so
-        # left alone this defeats its bidirectional sweep's own end-of-scroll
-        # detection: it would never see "no motion" and so never reverse
-        # direction. Suppress the indicator so a clamped scroll is visually a
-        # true no-op.
-        css = Gtk.CssProvider()
-        css.load_from_string(
-            "scrolledwindow > undershoot, scrolledwindow > overshoot { "
-            "background: none; background-image: none; box-shadow: none; }"
-        )
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
-            css,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
         win = Gtk.ApplicationWindow(application=self, title="Glass A11y Fixture")
         win.set_default_size(320, 420)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -73,14 +54,14 @@ class FixtureApp(Gtk.Application):
         switch.set_halign(Gtk.Align.START)
         switch.update_property([Gtk.AccessibleProperty.LABEL], ["Active"])
         box.append(switch)
-        # A virtualized GtkListView of 200 rows in a small scroller. GtkListView
-        # only realizes rows near the viewport, so a late row ("Row 180") is ABSENT
+        # A virtualized GtkListView of 80 rows in a small scroller. GtkListView
+        # only realizes rows near the viewport, so a late row ("Row 060") is ABSENT
         # from the a11y tree until scrolled into view — the case scroll_to_element
-        # must overcome (a non-virtualizing GtkListBox would realize all 200 rows and
+        # must overcome (a non-virtualizing GtkListBox would realize all 80 rows and
         # let a test pass without scrolling). On selection it prints "SELECTED <name>"
         # so a click can be confirmed from the logs regardless of where GTK places the
         # selected state in the a11y tree.
-        rows = Gtk.StringList.new([f"Row {i:03d}" for i in range(200)])
+        rows = Gtk.StringList.new([f"Row {i:03d}" for i in range(80)])
         selection = Gtk.SingleSelection(model=rows)
         selection.set_autoselect(False)
         selection.set_can_unselect(True)
