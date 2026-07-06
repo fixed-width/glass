@@ -6,6 +6,7 @@ pub mod cli;
 pub mod doctor;
 mod env;
 pub mod health;
+pub mod launch;
 pub mod onboarding;
 mod params;
 #[cfg(feature = "network")]

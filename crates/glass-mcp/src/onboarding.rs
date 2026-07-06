@@ -11,6 +11,15 @@
 #[cfg(any(target_os = "macos", test))]
 use crate::health::HealthStatus;
 
+/// The address [`run`] binds the onboarded LaunchAgent to when the caller has no more specific
+/// preference — a LaunchServices double-click never passes one. Not feature-gated (unlike
+/// `crate::serve::config::DEFAULT_ADDR`, which only exists when the network-transport feature is
+/// compiled in — a doc link to it would be broken without that feature, so this is a plain code
+/// reference): onboarding always needs an address to hand to [`crate::setup`] regardless of which
+/// optional features this build carries. Matches the shipped LaunchAgent plist template and the
+/// other `127.0.0.1:7300` defaults in `setup.rs`/`serve/config.rs`.
+pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
+
 /// The text shown in the completion dialog. When both grants are in, it hands off the MCP
 /// endpoint; when one is missing, it names the missing grant instead (no endpoint — nothing
 /// to connect to yet). Pure (no IO), so it's unit-tested on Linux; gated to macOS+test so a

@@ -1,6 +1,7 @@
 use clap::Parser;
 use glass_mcp::cli::{Cli, Command};
-use glass_mcp::{boot, run_doctor, run_env, run_stdio, setup};
+use glass_mcp::launch::NoArgLaunch;
+use glass_mcp::{boot, launch, onboarding, run_doctor, run_env, run_stdio, setup};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,12 +24,16 @@ async fn main() -> anyhow::Result<()> {
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
-        // No subcommand: serve MCP over stdio (the default).
-        None => {
-            let (sink, report) =
-                glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-            run_stdio(boot(sink), report).await
-        }
+        // No subcommand: a LaunchServices double-click routes to onboarding; an MCP client's
+        // stdio spawn (the default, and the only case off macOS) serves MCP over stdio.
+        None => match launch::detect_no_arg_launch() {
+            NoArgLaunch::Onboarding => onboarding::run(onboarding::DEFAULT_ADDR),
+            NoArgLaunch::StdioServe => {
+                let (sink, report) =
+                    glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
+                run_stdio(boot(sink), report).await
+            }
+        },
         Some(Command::Doctor { deep, json }) => run_doctor(deep, json, audit_log.as_deref()),
         Some(Command::Env { json }) => run_env(json),
         Some(Command::Serve {
