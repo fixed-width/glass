@@ -75,6 +75,10 @@ pub const SCROLL_TO_DEFAULT_TIMEOUT_MS: u64 = 20_000;
 /// of `timeout_ms` — bounds the sweep even if the caller passes an enormous timeout.
 const SCROLL_TO_MAX_STEPS: u32 = 500;
 /// Milliseconds to let scrolled rows realize in the a11y tree before re-reading.
+/// 250ms is the validated floor on the headless a11y bus: the tree is read once
+/// per step (for both the match and the end-of-scroll comparison), so a settle
+/// shorter than the toolkit's realize latency would read an unchanged tree and
+/// misfire as premature saturation.
 const SCROLL_TO_SETTLE_MS: u64 = 250;
 
 /// A vertical scroll sweep direction.
@@ -1076,6 +1080,14 @@ impl Glass {
     /// bidirectional sweep or `timeout_ms` yields a soft `{matched:false}` (not an
     /// error), like `wait_for_element`. The scroll actions are audited via the pointer
     /// path; there is no separate top-level audit entry.
+    ///
+    /// Limitations of the a11y-tree end-of-scroll signal: (1) a container holding a
+    /// continuously-repainting a11y node — a live region, a clock, a progress bar —
+    /// never leaves the tree "unchanged", so the sweep runs to `timeout_ms` in the
+    /// primary direction and returns `{matched:false}` instead of reversing; pass the
+    /// `direction` the target actually lies in to avoid the wasted sweep. (2) A very
+    /// long list can exceed `timeout_ms` before a distant target scrolls into range —
+    /// raise `timeout_ms`, or `step` to cover more per move.
     pub fn scroll_to_element(
         &mut self,
         params: &ScrollToElementParams,
