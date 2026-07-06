@@ -2,8 +2,9 @@
 //! text-only JSON (region can opt into an image). Mirrors the capture-tool style.
 
 use glass_core::{
-    frame_to_webp, AxRole, ElementCondition, Glass, RegionUntil, Stream, WaitElementParams,
-    WaitLogParams, WaitRegionParams,
+    frame_to_webp, AxRole, ElementCondition, Glass, RegionUntil, ScrollDirection,
+    ScrollToElementParams, Stream, WaitElementParams, WaitLogParams, WaitRegionParams,
+    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
 };
 use serde_json::json;
 
@@ -44,6 +45,58 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
     });
     let body =
         json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element }).to_string();
+    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+}
+
+pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
+    if a.name.is_none() && a.role.is_none() {
+        return Err("specify `name` and/or `role` to select the element to scroll to".into());
+    }
+    let role = match a.role.as_deref() {
+        Some(r) => Some(AxRole::from_name(r).ok_or_else(|| format!("unknown role '{r}'"))?),
+        None => None,
+    };
+    let direction = match a.direction.as_deref() {
+        None => ScrollDirection::Down,
+        Some(d) => ScrollDirection::from_name(d)
+            .ok_or_else(|| format!("unknown direction '{d}' (use down/up)"))?,
+    };
+    // Anchor: both x and y, or neither (window center). One without the other is a
+    // caller mistake worth naming rather than silently half-defaulting.
+    let anchor = match (a.x, a.y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => return Err("specify both `x` and `y` for a scroll anchor, or neither".into()),
+    };
+    let params = ScrollToElementParams {
+        name: a.name.clone(),
+        role,
+        value_contains: a.value_contains.clone(),
+        direction,
+        anchor,
+        step: a.step.unwrap_or(SCROLL_TO_DEFAULT_STEP),
+        timeout_ms: a.timeout_ms.unwrap_or(SCROLL_TO_DEFAULT_TIMEOUT_MS),
+    };
+    let o = glass
+        .scroll_to_element(&params)
+        .map_err(|e| e.to_string())?;
+    let element = o.element.map(|e| {
+        json!({
+            "id": e.id.0,
+            "role": format!("{:?}", e.role),
+            "name": e.name,
+            "value": e.value,
+            "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
+            "states": e.states.active(),
+        })
+    });
+    let body = json!({
+        "matched": o.matched,
+        "elapsed_ms": o.elapsed_ms,
+        "element": element,
+        "scrolled": { "steps": o.steps, "reversed": o.reversed },
+    })
+    .to_string();
     Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
 }
 
@@ -141,6 +194,31 @@ mod tests {
     use super::*;
     use crate::tools::testutil::*;
     use glass_core::AppSpec;
+
+    #[test]
+    fn scroll_to_element_requires_a_selector() {
+        // Neither name nor role → a clear argument error, before any session work.
+        let mut g = crate::tools::tests::started_a11y_frames(vec![glass_core::Frame::solid(
+            100,
+            100,
+            [0, 0, 0, 255],
+        )]);
+        let err = scroll_to_element(
+            &mut g,
+            &ScrollToElementArgs {
+                name: None,
+                role: None,
+                value_contains: None,
+                direction: None,
+                x: None,
+                y: None,
+                step: None,
+                timeout_ms: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("name") && err.contains("role"), "got: {err}");
+    }
 
     fn started_a11y() -> Glass {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());

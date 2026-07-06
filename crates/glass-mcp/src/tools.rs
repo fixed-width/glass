@@ -867,7 +867,7 @@ mod tests {
         assert!(has_note, "IMAGE_NOTE must be present in a11y_marks output");
     }
 
-    fn started_a11y_frames(frames: Vec<glass_core::Frame>) -> Glass {
+    pub(crate) fn started_a11y_frames(frames: Vec<glass_core::Frame>) -> Glass {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100).with_frames(frames), fake_tree());
         g.start(&AppSpec {
             build: None,

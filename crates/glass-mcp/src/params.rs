@@ -253,6 +253,31 @@ pub struct WaitForElementArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScrollToElementArgs {
+    /// Substring of the target element's accessible name (selector). `name` and/or
+    /// `role` is required.
+    pub name: Option<String>,
+    /// Element role filter, e.g. "ListItem", "Button" (selector).
+    pub role: Option<String>,
+    /// Additionally require the matched element's `value` to contain this substring.
+    /// Not a standalone selector — `name` and/or `role` is still required.
+    pub value_contains: Option<String>,
+    /// Primary sweep direction: "down" (default) or "up". The search reverses to the
+    /// other end if the target isn't found first.
+    pub direction: Option<String>,
+    /// Scroll anchor x (window-relative). Defaults with `y` to the window center;
+    /// set both to point the wheel at a specific scrollable container.
+    pub x: Option<i32>,
+    /// Scroll anchor y (window-relative). See `x`.
+    pub y: Option<i32>,
+    /// Wheel notches per scroll step (default 3). A calibration escape hatch — larger
+    /// covers distance faster but risks stepping past a row's realized band.
+    pub step: Option<u32>,
+    /// Give up after this long (default 20000ms); returns `{matched:false}`.
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct WaitForRegionArgs {
     /// Saved baseline name to compare against; omit to use the frame at call start.
     pub baseline: Option<String>,

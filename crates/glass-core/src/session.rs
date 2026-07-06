@@ -66,6 +66,88 @@ pub struct WaitElementOutcome {
     pub elapsed_ms: u64,
 }
 
+/// Wheel notches per scroll step; chosen so a step realizes at most a few rows
+/// (won't skip a virtualized row's realized band). Overridable per call.
+pub const SCROLL_TO_DEFAULT_STEP: u32 = 3;
+/// Overall wall-clock bound for a `scroll_to_element` sweep.
+pub const SCROLL_TO_DEFAULT_TIMEOUT_MS: u64 = 20_000;
+/// Hard cap on scroll steps issued across a full bidirectional sweep, independent
+/// of `timeout_ms` — bounds the sweep even if the caller passes an enormous timeout.
+const SCROLL_TO_MAX_STEPS: u32 = 500;
+/// Milliseconds to let scrolled rows realize in the a11y tree before re-reading.
+/// 250ms is the validated floor on the headless a11y bus: the tree is read once
+/// per step (for both the match and the end-of-scroll comparison), so a settle
+/// shorter than the toolkit's realize latency would read an unchanged tree and
+/// misfire as premature saturation.
+const SCROLL_TO_SETTLE_MS: u64 = 250;
+
+/// A vertical scroll sweep direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Down,
+    Up,
+}
+
+impl ScrollDirection {
+    /// The other sweep direction.
+    pub fn opposite(self) -> ScrollDirection {
+        match self {
+            ScrollDirection::Down => ScrollDirection::Up,
+            ScrollDirection::Up => ScrollDirection::Down,
+        }
+    }
+    /// Signed vertical wheel delta (notches): `Down` is positive (wheel-down),
+    /// `Up` negative. Saturates a huge `step` to `i32::MAX` so an absurd caller
+    /// value can't overflow (a plain `step as i32` would wrap, and `-(i32::MIN)`
+    /// panics in debug) — real steps are single digits.
+    pub fn dy(self, step: u32) -> i32 {
+        let s = i32::try_from(step).unwrap_or(i32::MAX);
+        match self {
+            ScrollDirection::Down => s,
+            ScrollDirection::Up => -s,
+        }
+    }
+    /// Parse from a tool string (case-insensitive). `None` for unknown.
+    pub fn from_name(s: &str) -> Option<ScrollDirection> {
+        match s.to_ascii_lowercase().as_str() {
+            "down" => Some(ScrollDirection::Down),
+            "up" => Some(ScrollDirection::Up),
+            _ => None,
+        }
+    }
+}
+
+/// Parameters for [`Glass::scroll_to_element`].
+#[derive(Clone, Debug)]
+pub struct ScrollToElementParams {
+    pub name: Option<String>,
+    pub role: Option<AxRole>,
+    pub value_contains: Option<String>,
+    /// Primary sweep direction; the search reverses to the other end if the
+    /// target isn't found first.
+    pub direction: ScrollDirection,
+    /// Scroll anchor (window-relative). `None` → the active window's center.
+    pub anchor: Option<(i32, i32)>,
+    /// Wheel notches issued per scroll step.
+    pub step: u32,
+    /// Overall wall-clock bound.
+    pub timeout_ms: u64,
+}
+
+/// Outcome of [`Glass::scroll_to_element`].
+#[derive(Clone, Debug)]
+pub struct ScrollToElementOutcome {
+    pub matched: bool,
+    /// The matched element (absent when `matched` is false). Its id is from the
+    /// final snapshot, so it is usable with `click_element`.
+    pub element: Option<ElementInfo>,
+    pub elapsed_ms: u64,
+    /// Total scroll steps issued across the sweep.
+    pub steps: u32,
+    /// Whether the sweep had reversed past the primary direction when it returned.
+    pub reversed: bool,
+}
+
 /// Parameters for [`Glass::wait_for_region`].
 #[derive(Clone, Debug)]
 pub struct WaitRegionParams {
@@ -986,6 +1068,129 @@ impl Glass {
             element: outcome.value.flatten(),
             elapsed_ms: outcome.elapsed_ms,
         })
+    }
+
+    /// Scroll a container (at `anchor`, default the active window's center) until an
+    /// element matching name/role/value realizes in the a11y tree, then return it —
+    /// its id is from the final snapshot, so it is immediately `click_element`-able.
+    /// For a virtualized list the target row is absent from the tree until scrolled
+    /// into range; this checks the current view, sweeps the primary `direction` to
+    /// its end, then reverses to cover the other end. End-of-scroll is detected from
+    /// the accessibility tree: when a scroll step leaves the tree's outline unchanged,
+    /// the container did not advance (immune to cosmetic repaints — a scroller's
+    /// boundary shadow, a focus ring, a blinking caret — that a pixel-motion signal
+    /// would misread as "still scrolling"). A target never realized after a full
+    /// bidirectional sweep or `timeout_ms` yields a soft `{matched:false}` (not an
+    /// error), like `wait_for_element`. The scroll actions are audited via the pointer
+    /// path; there is no separate top-level audit entry.
+    ///
+    /// Limitations of the a11y-tree end-of-scroll signal: (1) a container holding a
+    /// continuously-repainting a11y node — a live region, a clock, a progress bar —
+    /// never leaves the tree "unchanged", so the sweep runs to `timeout_ms` in the
+    /// primary direction and returns `{matched:false}` instead of reversing; pass the
+    /// `direction` the target actually lies in to avoid the wasted sweep. (2) A very
+    /// long list can exceed `timeout_ms` before a distant target scrolls into range —
+    /// raise `timeout_ms`, or `step` to cover more per move.
+    pub fn scroll_to_element(
+        &mut self,
+        params: &ScrollToElementParams,
+    ) -> Result<ScrollToElementOutcome> {
+        self.require_active()?;
+        let start = std::time::Instant::now();
+        let geo = self.geometry()?;
+        let (ax, ay) = params
+            .anchor
+            .unwrap_or((geo.width as i32 / 2, geo.height as i32 / 2));
+
+        // Snapshot the current view: return immediately if already realized, and seed
+        // the outline the first scroll step is compared against.
+        let (found, mut prev_outline) = self.snapshot_match_outline(params)?;
+        if let Some(info) = found {
+            return Ok(ScrollToElementOutcome {
+                matched: true,
+                element: Some(info),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                steps: 0,
+                reversed: false,
+            });
+        }
+
+        let mut steps: u32 = 0;
+        for (i, dir) in [params.direction, params.direction.opposite()]
+            .into_iter()
+            .enumerate()
+        {
+            let reversed = i == 1;
+            loop {
+                if start.elapsed().as_millis() as u64 >= params.timeout_ms
+                    || steps >= SCROLL_TO_MAX_STEPS
+                {
+                    return Ok(ScrollToElementOutcome {
+                        matched: false,
+                        element: None,
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        steps,
+                        reversed,
+                    });
+                }
+                self.pointer(&PointerEvent::Scroll {
+                    x: ax,
+                    y: ay,
+                    dx: 0,
+                    dy: dir.dy(params.step),
+                    modifiers: vec![],
+                })?;
+                steps += 1;
+                // Let the scrolled rows realize in the a11y tree before re-reading.
+                std::thread::sleep(std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS));
+                let (found, outline) = self.snapshot_match_outline(params)?;
+                if let Some(info) = found {
+                    return Ok(ScrollToElementOutcome {
+                        matched: true,
+                        element: Some(info),
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        steps,
+                        reversed,
+                    });
+                }
+                // No change in the a11y tree ⇒ the container did not advance ⇒ this
+                // end is reached; sweep the opposite direction.
+                let saturated = outline == prev_outline;
+                prev_outline = outline;
+                if saturated {
+                    break;
+                }
+            }
+        }
+        Ok(ScrollToElementOutcome {
+            matched: false,
+            element: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            steps,
+            reversed: true,
+        })
+    }
+
+    /// Snapshot the current view once; return the matched element (if the selector is
+    /// satisfied) and the tree's outline. The snapshot is cached, so a returned
+    /// element's id is usable with `click_element`. The outline is the end-of-scroll
+    /// signal: unchanged across a scroll step ⇒ the container did not advance.
+    fn snapshot_match_outline(
+        &mut self,
+        params: &ScrollToElementParams,
+    ) -> Result<(Option<ElementInfo>, String)> {
+        let tree = self.a11y_snapshot()?;
+        let found = match element_match(
+            &tree,
+            params.name.as_deref(),
+            params.role,
+            params.value_contains.as_deref(),
+            ElementCondition::Appears,
+        ) {
+            ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
+            ElementMatch::Pending => None,
+        };
+        Ok((found, tree.to_outline()))
     }
 
     /// Block until a watched region diverges from / converges to a reference.
@@ -3001,6 +3206,56 @@ mod tests {
     }
 
     #[test]
+    fn scroll_to_element_returns_already_visible_without_scrolling() {
+        // The target is present in the current view → return it immediately, steps=0,
+        // and no scroll is issued.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree()); // fake_tree has Button "Save"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert_eq!(out.steps, 0);
+        assert!(!out.reversed);
+        assert_eq!(out.element.unwrap().name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn scroll_to_element_absent_sweeps_both_ends_then_reports_unmatched() {
+        // The target never appears and the a11y tree's outline never changes (the
+        // fixture tree is fixed), so each direction saturates after one step. The
+        // sweep must terminate (not hang), reversed, matched:false.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree()); // no node named "Ghost"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert!(out.element.is_none());
+        assert!(out.reversed, "must have reversed to sweep the other end");
+        // One saturating step per direction: no motion breaks each sweep immediately.
+        assert_eq!(out.steps, 2);
+    }
+
+    #[test]
     fn wait_for_region_changes_matches_on_divergence() {
         // Reference captured at start = black; next frame = white -> "changes".
         let a = Frame::solid(2, 2, [0, 0, 0, 255]);
@@ -3508,5 +3763,23 @@ mod tests {
             modifiers: vec![],
         })
         .unwrap();
+    }
+
+    #[test]
+    fn scroll_direction_opposite_and_dy() {
+        assert_eq!(ScrollDirection::Down.opposite(), ScrollDirection::Up);
+        assert_eq!(ScrollDirection::Up.opposite(), ScrollDirection::Down);
+        // Down = wheel-down = positive notches; Up = negative.
+        assert_eq!(ScrollDirection::Down.dy(3), 3);
+        assert_eq!(ScrollDirection::Up.dy(3), -3);
+        // An absurd step saturates instead of overflowing/panicking.
+        assert_eq!(ScrollDirection::Down.dy(u32::MAX), i32::MAX);
+        assert_eq!(ScrollDirection::Up.dy(u32::MAX), -i32::MAX);
+        assert_eq!(
+            ScrollDirection::from_name("DOWN"),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(ScrollDirection::from_name("up"), Some(ScrollDirection::Up));
+        assert_eq!(ScrollDirection::from_name("sideways"), None);
     }
 }

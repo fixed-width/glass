@@ -2,8 +2,9 @@
 """Minimal GTK4 app with a known accessibility tree, for glass-a11y-linux tests.
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
 CheckButton "Enable", an Entry "Field" (initial text "hello"), a SpinButton
-"Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), and a
-Switch "Active" (off). Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
+"Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), a
+Switch "Active" (off), and a virtualized GtkListView of 80 rows ("Row 000".."Row
+079") in a small scroller. Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration
 and presents its window immediately without waiting for portal services to settle."""
@@ -24,7 +25,7 @@ class FixtureApp(Gtk.Application):
 
     def do_activate(self):
         win = Gtk.ApplicationWindow(application=self, title="Glass A11y Fixture")
-        win.set_default_size(320, 200)
+        win.set_default_size(320, 420)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.append(Gtk.Label(label="Ready"))
         box.append(Gtk.Button(label="Save"))
@@ -53,6 +54,38 @@ class FixtureApp(Gtk.Application):
         switch.set_halign(Gtk.Align.START)
         switch.update_property([Gtk.AccessibleProperty.LABEL], ["Active"])
         box.append(switch)
+        # A virtualized GtkListView of 80 rows in a small scroller. GtkListView
+        # only realizes rows near the viewport, so a late row ("Row 060") is ABSENT
+        # from the a11y tree until scrolled into view — the case scroll_to_element
+        # must overcome (a non-virtualizing GtkListBox would realize all 80 rows and
+        # let a test pass without scrolling). On selection it prints "SELECTED <name>"
+        # so a click can be confirmed from the logs regardless of where GTK places the
+        # selected state in the a11y tree.
+        rows = Gtk.StringList.new([f"Row {i:03d}" for i in range(80)])
+        selection = Gtk.SingleSelection(model=rows)
+        selection.set_autoselect(False)
+        selection.set_can_unselect(True)
+        selection.set_selected(Gtk.INVALID_LIST_POSITION)
+
+        def _on_selection_changed(sel, _pos, _n_items):
+            i = sel.get_selected()
+            if i != Gtk.INVALID_LIST_POSITION:
+                print(f"SELECTED {rows.get_string(i)}", flush=True)
+
+        selection.connect("selection-changed", _on_selection_changed)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _f, item: item.set_child(Gtk.Label()))
+        factory.connect(
+            "bind",
+            lambda _f, item: item.get_child().set_text(item.get_item().get_string()),
+        )
+        listview = Gtk.ListView(model=selection, factory=factory)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(120)
+        scroller.set_max_content_height(120)
+        scroller.set_child(listview)
+        box.append(scroller)
         win.set_child(box)
         win.present()
 
