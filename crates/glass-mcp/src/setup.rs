@@ -8,19 +8,18 @@
 //!
 //! This module is split so the parts that don't need macOS are unit-testable on Linux:
 //! [`RunMode`], [`registration_line`], [`fill_launch_agent`], [`run_mode_from_flags`],
-//! [`is_inside_app_bundle`], [`codesign_report_is_unstable`], and `parse_health_response`
-//! are pure — no OS call, no IO — and are exercised here. (`parse_health_response` is a
-//! plain code reference, not a doc link, since it's `#[cfg(any(target_os = "macos", test))]`
-//! and so doesn't exist in scope for a plain non-test build on other platforms — a doc link
-//! to it would be broken there.) The interactive grant flow itself (`#[cfg(target_os =
-//! "macos")]` inside [`run`], plumbed through the private `macos_impl` submodule) is
-//! macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real file writes.
-//! `fetch_health` is likewise macOS-only (same reason it's a plain reference here) but
-//! stays its own top-level `pub(crate) fn` rather than moving into `macos_impl`, since a
-//! sibling onboarding module calls it too (see its doc comment). The onboarding module also
-//! needs to install the LaunchAgent, so a thin top-level `install_launch_agent` forwards to
-//! `macos_impl::install_launch_agent` for the same reason: a private `mod` can't be named
-//! from a sibling module regardless of its items' visibility.
+//! [`is_inside_app_bundle`], [`codesign_report_is_unstable`], [`parse_health_response`], and
+//! [`fetch_health`] are pure/cross-platform — a raw TCP `GET /healthz` and a JSON parse, no
+//! macOS-specific call — and are exercised (or, for `fetch_health`, reachable) on every
+//! target: `glass-mcp status` (`status.rs`) polls a running server's health on any OS, not
+//! just macOS. The interactive grant flow itself (`#[cfg(target_os = "macos")]` inside
+//! [`run`], plumbed through the private `macos_impl` submodule) is macOS-only: permission
+//! prompts, `codesign`/`launchctl` shell-outs, real file writes. `fetch_health` stays its own
+//! top-level `pub(crate) fn` rather than moving into `macos_impl` (itself macOS-only) since
+//! it has callers both outside that module and outside macOS entirely (see its doc comment).
+//! The onboarding module also needs to install the LaunchAgent, so a thin top-level
+//! `install_launch_agent` forwards to `macos_impl::install_launch_agent` for the same reason:
+//! a private `mod` can't be named from a sibling module regardless of its items' visibility.
 
 // `GlassError` itself is only named in the `#[cfg(not(target_os = "macos"))]` arm of `run`
 // (and its test) — on a macOS build that arm doesn't exist, so import only `Result` here
@@ -30,12 +29,9 @@ use std::path::Path;
 
 use glass_core::Result;
 
-// `HealthStatus` is only named by `parse_health_response` (below) and `fetch_health` (near
-// `macos_impl`), which are themselves gated to macOS (the only platform with a running
-// server to poll) plus `#[cfg(test)]` (so the parser stays Linux-testable) — gate this `use`
-// the same way, or a plain non-test Linux/Windows build would warn on an import nothing in
-// scope actually needs.
-#[cfg(any(target_os = "macos", test))]
+// `HealthStatus` is named by `parse_health_response` (below) and `fetch_health` (near
+// `macos_impl`) unconditionally: both are cross-platform (plain TCP + JSON, no macOS API),
+// since `status::run` polls a server's health on every target, not just macOS.
 use crate::health::HealthStatus;
 
 /// Extract and validate a [`HealthStatus`] out of a raw `/healthz` HTTP response: split off
@@ -44,7 +40,6 @@ use crate::health::HealthStatus;
 /// all, a non-200 status, or a body that doesn't deserialize — never a fabricated
 /// [`HealthStatus`]. Pure (no IO), so it's unit-tested here directly against literal
 /// response text; [`fetch_health`] is the only real caller, feeding it a live socket read.
-#[cfg(any(target_os = "macos", test))]
 fn parse_health_response(raw: &str) -> Option<HealthStatus> {
     let (head, body) = raw.split_once("\r\n\r\n")?;
     let status_ok = head.lines().next()?.split_whitespace().nth(1) == Some("200");
@@ -364,29 +359,33 @@ pub fn run(args: SetupArgs) -> Result<()> {
     }
 }
 
-/// Raw `GET /healthz` against the running server at `addr` (`host:port`), on the same
-/// bounded-TCP-connect budget [`macos_impl::launch_agent_is_serving`] uses to confirm a
-/// just-bootstrapped LaunchAgent is up. `None` for anything short of a full, parseable
-/// response — an unresolvable `addr`, a refused/timed-out connect, a read timeout, or
-/// [`parse_health_response`] rejecting the body — never a fabricated [`HealthStatus`].
+/// Raw `GET /healthz` against the running server at `addr` (`host:port`), on a 1s
+/// connect+read budget matching [`macos_impl::launch_agent_is_serving`]'s bounded-TCP-connect
+/// probe. `None` for anything short of a full, parseable response — an unresolvable `addr`, a
+/// refused/timed-out connect, a read timeout, or [`parse_health_response`] rejecting the body
+/// — never a fabricated [`HealthStatus`]. Pure `std::net::TcpStream` networking, so — unlike
+/// the rest of this module — it isn't macOS-specific: cross-platform so `status::run`
+/// (`status.rs`) can poll a running server's health on any OS.
 ///
-/// `pub(crate)`, and kept at the top level rather than nested in the private `macos_impl`
-/// module, because it has callers outside that module — `run`'s guided-enable poll (via
-/// `macos_impl::guide_enable_and_verify` right here in `setup.rs`) and a later onboarding
-/// module's dialog gate, both in this crate — and a private `mod` can't be named from a
-/// sibling module regardless of its items' visibility. Crate-internal, so `pub(crate)`, not
-/// `pub`.
-#[cfg(target_os = "macos")]
+/// `pub(crate)`, and kept at the top level rather than nested in the private, macOS-only
+/// `macos_impl` module, because it has callers outside that module and outside macOS
+/// entirely — `run`'s guided-enable poll (via `macos_impl::guide_enable_and_verify` right
+/// here in `setup.rs`, macOS-only), the onboarding module's dialog gate (macOS-only), and
+/// `status::run` (every platform) — and a private `mod` can't be named from a sibling module
+/// regardless of its items' visibility. Crate-internal, so `pub(crate)`, not `pub`.
 pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    // Matches `macos_impl::LIVENESS_CONNECT_TIMEOUT`'s value; a local const rather than a
+    // shared one because `macos_impl` (and its constant) are `#[cfg(target_os = "macos")]`
+    // and this fn is not.
+    const TIMEOUT: Duration = Duration::from_secs(1);
 
     let sock = addr.to_socket_addrs().ok()?.next()?;
-    let mut stream =
-        TcpStream::connect_timeout(&sock, macos_impl::LIVENESS_CONNECT_TIMEOUT).ok()?;
-    stream
-        .set_read_timeout(Some(macos_impl::LIVENESS_CONNECT_TIMEOUT))
-        .ok()?;
+    let mut stream = TcpStream::connect_timeout(&sock, TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
     write!(
         stream,
         "GET /healthz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
@@ -438,10 +437,9 @@ mod macos_impl {
 
     /// Liveness-probe budget for [`install_launch_agent`]: launchd needs a beat to exec the
     /// job, so give it ~5s of ~500ms-apart TCP connects before deciding it isn't serving.
-    /// `pub(super)`: also reused by [`super::fetch_health`] as its connect *and* read timeout
-    /// (it isn't a poll loop like [`launch_agent_is_serving`], just a single bounded probe,
-    /// so one budget covers both).
-    pub(super) const LIVENESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+    /// (`super::fetch_health` mirrors this value in its own local `const` — it's
+    /// cross-platform and this module is macOS-only, so it can't reuse this constant.)
+    const LIVENESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
     const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 

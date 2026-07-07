@@ -53,6 +53,10 @@ pub enum Command {
         /// File containing the bearer token (overrides GLASS_TOKEN).
         #[arg(long)]
         token_file: Option<String>,
+        /// Also run the visible menu-bar app (macOS). Implies --http; the app serves
+        /// MCP on a background thread while an NSStatusItem shows it is running.
+        #[arg(long)]
+        menubar: bool,
     },
     /// Generate a bearer token for the network transport.
     GenToken {
@@ -72,6 +76,12 @@ pub enum Command {
         #[arg(long, conflicts_with = "launchagent")]
         no_launchagent: bool,
         /// LaunchAgent HTTP bind address (default 127.0.0.1:7300).
+        #[arg(long)]
+        addr: Option<String>,
+    },
+    /// Report whether a glass server is running and its endpoint (reads /healthz).
+    Status {
+        /// Address to check (default: 127.0.0.1:7300).
         #[arg(long)]
         addr: Option<String>,
     },
@@ -134,10 +144,12 @@ mod tests {
                 http,
                 addr,
                 token_file,
+                menubar,
             }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
+                assert!(!menubar, "menubar defaults to false");
             }
             other => panic!("expected serve, got {other:?}"),
         }
@@ -218,6 +230,26 @@ mod tests {
         let err = Cli::try_parse_from(["glass-mcp", "setup", "--launchagent", "--no-launchagent"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn serve_accepts_menubar_flag() {
+        let cli = Cli::try_parse_from(["glass-mcp", "serve", "--http", "--menubar"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { menubar: true, .. })
+        ));
+    }
+
+    #[test]
+    fn status_subcommand_parses_with_optional_addr() {
+        let cli = Cli::try_parse_from(["glass-mcp", "status"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status { addr: None })));
+        let cli = Cli::try_parse_from(["glass-mcp", "status", "--addr", "127.0.0.1:7300"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Status { addr: Some(_) })
+        ));
     }
 
     #[test]

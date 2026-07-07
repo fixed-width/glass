@@ -7,6 +7,12 @@ pub mod doctor;
 mod env;
 pub(crate) mod health;
 pub mod launch;
+// `menubar::run` takes a `serve::config::ServeConfig`, so — like `serve` itself — this module
+// only exists when the network transport is compiled in; a `--no-default-features` ("free",
+// stdio-only) build has no HTTP transport for `--menubar` to serve over (see main.rs's Serve
+// arm, which already bails for plain `serve --http` in that build).
+#[cfg(feature = "network")]
+pub mod menubar;
 pub mod onboarding;
 mod params;
 #[cfg(feature = "network")]
@@ -14,6 +20,7 @@ pub mod serve;
 pub(crate) mod server;
 pub mod setup;
 pub(crate) mod shutdown;
+pub(crate) mod status;
 mod tools;
 mod untrusted;
 
@@ -145,6 +152,16 @@ pub fn run_env(json: bool) -> ! {
     };
     print!("{out}");
     std::process::exit(0);
+}
+
+/// `glass-mcp status [--addr ADDR]`: report whether a glass server is running and its
+/// endpoint. A thin `pub` forwarder to [`status::run`], the same shape as [`run_env`]/
+/// [`run_doctor`] over their own private-to-this-crate modules: `status` (like `env`) is a
+/// CLI-only concern with no library/integration-test consumer, so it stays `pub(crate)`
+/// and only this wrapper is public — `main.rs` is a separate crate from this library, so it
+/// can't name a `pub(crate)` item directly.
+pub fn run_status(addr: Option<&str>) -> anyhow::Result<()> {
+    status::run(addr)
 }
 
 /// Run the `doctor` subcommand and exit.
