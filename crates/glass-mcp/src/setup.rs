@@ -446,14 +446,13 @@ pub(crate) fn install_launch_agent(
 /// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
 /// has one (a sibling `onboarding` module can't name the private `macos_impl` module at all).
 /// A fresh process re-reads TCC (the Screen Recording grant is cached per-process at launch),
-/// so the menu-bar app's "Restart" item calls this after a grant changes — independent of
+/// so both callers restart after a grant changes — the menu-bar app's "Restart" item
+/// (`crate::menubar`) and onboarding's guided grant flow (`crate::onboarding`) — independent of
 /// `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
 ///
-/// The caller is the menu-bar app (`crate::menubar`), which only exists under the `network`
-/// feature; a `--no-default-features` build compiles it out, so keep the `dead_code` allow
-/// scoped to exactly that case rather than dropping it entirely.
+/// `crate::onboarding` is compiled on every macOS build (not only the `network`-featured one the
+/// menu-bar app needs), so this always has a caller — no `dead_code` allow required.
 #[cfg(target_os = "macos")]
-#[cfg_attr(not(feature = "network"), allow(dead_code))]
 pub(crate) fn restart_launch_agent() -> Result<()> {
     macos_impl::restart_launch_agent()
 }
@@ -786,16 +785,15 @@ mod macos_impl {
     /// supervisor) to kill and restart the job in place, so it works even when the caller is
     /// the job being restarted, and doesn't depend on `KeepAlive` at all. `kickstart -k`
     /// requires the target job to already be loaded — true of every caller: the menu-bar app
-    /// *is* the running job, and onboarding's restart step (once wired up) only runs after
+    /// *is* the running job, and onboarding's restart step runs only after
     /// [`install_launch_agent`] has already bootstrapped it.
     ///
     /// Errors surface (`kickstart` failing to spawn, or exiting non-zero) rather than being
     /// silently swallowed.
     ///
-    /// `#[cfg_attr(not(feature = "network"), allow(dead_code))]`: see
-    /// [`super::restart_launch_agent`] — its only caller (the menu-bar app) is compiled out of
-    /// a `--no-default-features` build, so the allow is scoped to exactly that case.
-    #[cfg_attr(not(feature = "network"), allow(dead_code))]
+    /// Reached through [`super::restart_launch_agent`] from both the menu-bar app and
+    /// onboarding's guided grant flow; the latter is compiled on every macOS build, so this is
+    /// never dead code and needs no `allow`.
     pub(super) fn restart_launch_agent() -> Result<()> {
         let target = super::launch_agent_target(self_uid());
 

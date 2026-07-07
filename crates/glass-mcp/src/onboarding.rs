@@ -1,8 +1,15 @@
 //! Double-click first-run for GlassMcp.app. Launched by LaunchServices (see main.rs launch
 //! routing), the app is its own TCC responsible process, so its grant requests raise the
-//! standard popups attributed to GlassMcp.app. We then install the LaunchAgent, confirm via
-//! /healthz, and show + copy the server's MCP endpoint — client-agnostic; per-client wiring is
-//! documented, not assumed.
+//! standard popups attributed to GlassMcp.app.
+//!
+//! The flow: (A) if a healthy agent is already serving with both grants held, short-circuit —
+//! copy the endpoint and hand off ("already running"), touching nothing. Otherwise (B) request
+//! Accessibility then Screen Recording (AX first so Screen Recording's "Quit & Reopen" prompt
+//! lands at the end), install + start the menu-bar LaunchAgent, open both Privacy panes, and
+//! block on a guided modal until the user clicks OK; then (C) restart the agent once so it
+//! re-reads TCC and verify via `/healthz` — showing + copying the server's MCP endpoint only
+//! when both grants actually read ready. Client-agnostic; per-client wiring is documented, not
+//! assumed.
 
 // `HealthStatus` is only named by `completion_message` below, which is itself gated to
 // macOS (the only platform this dialog flow runs on) plus `#[cfg(test)]` (so the pure
@@ -28,8 +35,13 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
 /// builder stays Linux-testable while the enum doesn't warn dead on a plain non-test build.
 #[cfg(any(target_os = "macos", test))]
 enum Outcome {
-    /// Both grants confirmed via `/healthz` — hand off the endpoint.
+    /// Both grants confirmed via `/healthz` after the guided grant flow — hand off the endpoint.
     Ready(HealthStatus),
+    /// A healthy agent was already serving with both grants held before we touched anything —
+    /// short-circuit: hand off the endpoint without re-requesting grants or reinstalling.
+    /// Distinct from [`Outcome::Ready`] only in wording ("already running"), so the returning
+    /// user isn't told glass just became ready when it was ready all along.
+    AlreadyRunning(HealthStatus),
     /// The agent was reached, but a grant is still off — name the missing grant, no endpoint.
     GrantsMissing(HealthStatus),
     /// The agent never answered `/healthz` within the deadline — point at its log, no endpoint.
@@ -39,12 +51,25 @@ enum Outcome {
     NotServing(String),
 }
 
-/// The text shown in the completion dialog, one honest message per [`Outcome`]. Only a `Ready`
-/// outcome hands off the MCP endpoint (and only claims a clipboard copy when `copied`);
-/// `GrantsMissing` names the missing grant; `Unreachable` and `NotServing` point at the agent's
-/// log / instruction without an endpoint (nothing to connect to yet). Pure (no IO), so it's
-/// unit-tested on Linux; gated to macOS+test so a plain non-test Linux/Windows build doesn't
-/// warn it dead.
+/// The endpoint hand-off line shared by the `Ready` and `AlreadyRunning` completion messages:
+/// claims a clipboard copy only when `copied` actually succeeded (review finding M1 — never
+/// report a copy that didn't happen), otherwise tells the user to copy it from the dialog.
+/// Pure; gated macOS+test like its callers.
+#[cfg(any(target_os = "macos", test))]
+fn endpoint_handoff_line(endpoint: &str, copied: bool) -> String {
+    if copied {
+        format!("MCP endpoint (Streamable HTTP), copied to your clipboard:\n{endpoint}")
+    } else {
+        format!("MCP endpoint (Streamable HTTP) — copy it from here:\n{endpoint}")
+    }
+}
+
+/// The text shown in the completion dialog, one honest message per [`Outcome`]. The two ready
+/// outcomes (`Ready` after the guided flow, `AlreadyRunning` for an already-healthy agent) hand
+/// off the MCP endpoint (and only claim a clipboard copy when `copied`); `GrantsMissing` names
+/// the missing grant; `Unreachable` and `NotServing` point at the agent's log / instruction
+/// without an endpoint (nothing to connect to yet). Pure (no IO), so it's unit-tested on Linux;
+/// gated to macOS+test so a plain non-test Linux/Windows build doesn't warn it dead.
 #[cfg(any(target_os = "macos", test))]
 fn completion_message(outcome: &Outcome, endpoint: &str, app_path: &str, copied: bool) -> String {
     match outcome {
@@ -56,15 +81,30 @@ fn completion_message(outcome: &Outcome, endpoint: &str, app_path: &str, copied:
                 h.grants_ready(),
                 "Outcome::Ready must carry a grants-ready HealthStatus"
             );
-            // Only claim the clipboard copy that actually happened (review finding M1).
-            let clipboard_line = if copied {
-                format!("MCP endpoint (Streamable HTTP), copied to your clipboard:\n{endpoint}")
-            } else {
-                format!("MCP endpoint (Streamable HTTP) — copy it from here:\n{endpoint}")
-            };
+            let endpoint_line = endpoint_handoff_line(endpoint, copied);
+            // Append the optional CLI symlink: a .dmg install drops `glass-mcp` inside the
+            // bundle, never on `$PATH`, so offer (never require) a symlink for terminal use.
+            // Derived from `app_path` so a non-default install location stays correct.
             format!(
                 "glass is ready — Screen Recording and Accessibility are granted.\n\n\
-                 {clipboard_line}\n\n\
+                 {endpoint_line}\n\n\
+                 Add it to your MCP client to start driving apps.\n\n\
+                 Optional — glass-mcp isn't on your PATH from a .dmg; to run it in a terminal:\n\
+                 sudo ln -s {app_path}/Contents/MacOS/glass-mcp /usr/local/bin/glass-mcp"
+            )
+        }
+        // Same hand-off as `Ready`, but the agent was already serving with both grants before
+        // onboarding did anything — so say "already running" rather than implying this run just
+        // enabled it. No CLI symlink hint: a returning user has already been through setup.
+        Outcome::AlreadyRunning(h) => {
+            debug_assert!(
+                h.grants_ready(),
+                "Outcome::AlreadyRunning must carry a grants-ready HealthStatus"
+            );
+            let endpoint_line = endpoint_handoff_line(endpoint, copied);
+            format!(
+                "glass is already running — Screen Recording and Accessibility are granted.\n\n\
+                 {endpoint_line}\n\n\
                  Add it to your MCP client to start driving apps."
             )
         }
@@ -98,10 +138,35 @@ fn completion_message(outcome: &Outcome, endpoint: &str, app_path: &str, copied:
     }
 }
 
-/// Onboarding entry: request grants as the self-responsible app, install the LaunchAgent,
-/// confirm via the agent's `/healthz`, and present the completion dialog. macOS-only — a
-/// no-op error off macOS, since there's no LaunchServices double-click hand-off to onboard
-/// anywhere else.
+/// The blocking guided-grant modal shown after both Privacy panes are opened: names *both*
+/// grants (Screen Recording to see the screen, Accessibility to move the mouse and type),
+/// tells the user to enable **GlassMcp.app** in each, and — crucially — pre-empts macOS's
+/// "Quit & Reopen" prompt that a Screen Recording grant raises, telling them to click **Later**
+/// because glass restarts its own background agent once they click OK. Deliberately carries no
+/// endpoint and no CLI symlink hint: this is the *instruction* dialog, shown before the restart;
+/// the endpoint (and the optional symlink) only appear in the [`completion_message`] afterward,
+/// once `/healthz` has actually confirmed the grants. Pure (no IO); gated macOS+test so it stays
+/// Linux-unit-testable while a plain non-test build doesn't warn it dead.
+#[cfg(any(target_os = "macos", test))]
+fn grant_modal_text(app_path: &str) -> String {
+    format!(
+        "glass needs two macOS permissions to see and drive other apps:\n\n\
+         • Screen Recording — to see the screen\n\
+         • Accessibility — to move the mouse and type\n\n\
+         Both System Settings panes are now open. Enable GlassMcp.app in each (toggle it on if \
+         listed, otherwise click ＋ and add it):\n{app_path}\n\n\
+         If macOS offers to \"Quit & Reopen\" for Screen Recording, click Later — glass restarts \
+         its own background agent for you.\n\n\
+         Click OK here once both are enabled."
+    )
+}
+
+/// Onboarding entry (see the module doc for the full A/B/C flow): short-circuit if an agent is
+/// already serving with both grants; otherwise request grants as the self-responsible app,
+/// install the LaunchAgent, guide the user through the two Privacy panes with a blocking modal,
+/// then restart the agent once and verify via `/healthz` before presenting the completion
+/// dialog. macOS-only — a no-op error off macOS, since there's no LaunchServices double-click
+/// hand-off to onboard anywhere else.
 pub fn run(addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -111,33 +176,60 @@ pub fn run(addr: &str) -> anyhow::Result<()> {
         // than a weaker local walk-up-to-any-`.app`.
         let app_path = crate::setup::app_bundle_path(&exe);
 
-        // 1. Request grants from our own identity — the popups attribute to GlassMcp.app,
-        // since a double-clicked .app is its own TCC responsible process (unlike a terminal
-        // spawning `setup`, whose grant would key to the terminal instead).
-        glass_macos::request_screen_recording();
+        // A. Already running? If a healthy agent is already serving with both grants held, this
+        // is a returning user: copy the endpoint and hand off immediately. Don't re-request
+        // grants (would pop dialogs for nothing) or reinstall over a working agent.
+        if let Some(h) = crate::setup::fetch_health(addr) {
+            if h.grants_ready() {
+                let copied = copy_to_clipboard(&endpoint).is_ok();
+                let msg =
+                    completion_message(&Outcome::AlreadyRunning(h), &endpoint, &app_path, copied);
+                show_dialog(&msg);
+                return Ok(());
+            }
+        }
+
+        // B. Request both grants as GlassMcp.app itself — a double-clicked .app is its own TCC
+        // responsible process, so the popups attribute to GlassMcp.app (a terminal spawning
+        // `setup` would instead key the grant to the terminal). Accessibility first: a Screen
+        // Recording grant can raise macOS's "Quit & Reopen" prompt, so requesting AX first keeps
+        // that interruption isolated to the end of the sequence.
         glass_macos::request_accessibility();
+        glass_macos::request_screen_recording();
 
-        // 2. Install the LaunchAgent (a fresh process that re-reads the grants), then resolve
-        // which of the four real outcomes we're in. Install reporting `Some((_, instruction))`
-        // means the job loaded but isn't serving; otherwise poll `/healthz` — a `None` there is
-        // an unreachable agent (never a fabricated grants-denied status), a reached-but-not-ready
-        // read is a genuine missing grant, and a ready read is the hand-off.
-        let outcome = match crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)? {
-            Some((_, instruction)) => Outcome::NotServing(instruction),
-            None => match poll_health_until_ready(addr) {
-                Some(h) if h.grants_ready() => Outcome::Ready(h),
-                Some(h) => Outcome::GrantsMissing(h),
-                None => Outcome::Unreachable,
-            },
-        };
+        // Install + start the menu-bar LaunchAgent (the fresh observer/server that re-reads the
+        // grants). A job that loaded but isn't serving is an outstanding action, not a success:
+        // surface its actionable instruction and stop, rather than restarting a dead agent (a
+        // restart can't fix e.g. a port clash) or claiming a hand-off we can't make.
+        if let Some((_, instruction)) =
+            crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
+        {
+            let msg = completion_message(
+                &Outcome::NotServing(instruction),
+                &endpoint,
+                &app_path,
+                false,
+            );
+            show_dialog(&msg);
+            return Ok(());
+        }
 
-        // 3. Hand off: only a Ready outcome has an endpoint to copy — copy it and remember
-        // whether the copy actually succeeded so the dialog never claims a copy that didn't
-        // happen. The other outcomes have nothing to connect to yet.
-        let copied = match &outcome {
-            Outcome::Ready(_) => copy_to_clipboard(&endpoint).is_ok(),
-            _ => false,
+        // Open both Privacy panes, then block on the guided modal until the user clicks OK.
+        let _ = glass_macos::open_pane(glass_macos::accessibility_pane_url());
+        let _ = glass_macos::open_pane(glass_macos::screen_recording_pane_url());
+        show_dialog(&grant_modal_text(&app_path));
+
+        // C. On OK: one restart so the agent re-reads TCC (the Screen Recording grant is cached
+        // per-process at launch), then verify once via `/healthz`. Only a grants-ready read is
+        // the hand-off; a reached-but-not-ready read is a genuine missing grant; a `None`
+        // (unreachable) is never reported as a denied grant — no arm claims success falsely.
+        crate::setup::restart_launch_agent()?;
+        let outcome = match crate::setup::fetch_health(addr) {
+            Some(h) if h.grants_ready() => Outcome::Ready(h),
+            Some(h) => Outcome::GrantsMissing(h),
+            None => Outcome::Unreachable,
         };
+        let copied = matches!(outcome, Outcome::Ready(_)) && copy_to_clipboard(&endpoint).is_ok();
         let msg = completion_message(&outcome, &endpoint, &app_path, copied);
         show_dialog(&msg);
         Ok(())
@@ -147,28 +239,6 @@ pub fn run(addr: &str) -> anyhow::Result<()> {
         let _ = addr;
         anyhow::bail!("onboarding is macOS-only")
     }
-}
-
-/// Poll the LaunchAgent's `/healthz` (via [`crate::setup::fetch_health`]) until both grants
-/// read ready or a minute elapses, returning the last read seen either way — a `None` read
-/// (agent unreachable) never fabricates a status, it's simply skipped. macOS-only: the only
-/// platform with a `/healthz` to poll.
-#[cfg(target_os = "macos")]
-fn poll_health_until_ready(addr: &str) -> Option<HealthStatus> {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last = None;
-    while Instant::now() < deadline {
-        if let Some(h) = crate::setup::fetch_health(addr) {
-            // `HealthStatus: Copy`, so recording the last read doesn't move it out of `h`.
-            last = Some(h);
-            if h.grants_ready() {
-                return Some(h);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(750));
-    }
-    last
 }
 
 /// Copy `text` to the general pasteboard via `pbcopy` — no AppKit/NSPasteboard dependency
@@ -287,5 +357,69 @@ mod tests {
         );
         assert!(m.contains(&instruction));
         assert!(!m.contains(ENDPOINT));
+    }
+
+    // --- completion_message: AlreadyRunning ----------------------------------------------
+
+    #[test]
+    fn already_running_copied_shows_endpoint_and_says_already_running() {
+        let m = completion_message(
+            &Outcome::AlreadyRunning(both_granted()),
+            ENDPOINT,
+            APP,
+            true,
+        );
+        assert!(m.contains(ENDPOINT));
+        assert!(m.to_lowercase().contains("already running"));
+        assert!(m.to_lowercase().contains("copied to your clipboard"));
+        assert!(!m.to_lowercase().contains("claude mcp add"));
+    }
+
+    #[test]
+    fn already_running_not_copied_shows_endpoint_without_claiming_a_copy() {
+        let m = completion_message(
+            &Outcome::AlreadyRunning(both_granted()),
+            ENDPOINT,
+            APP,
+            false,
+        );
+        assert!(m.contains(ENDPOINT));
+        assert!(m.contains("copy it from here"));
+        // don't claim a copy that didn't happen (review finding M1)
+        assert!(!m.to_lowercase().contains("copied to your clipboard"));
+    }
+
+    // --- completion_message: Ready CLI one-liner -----------------------------------------
+
+    #[test]
+    fn ready_dialog_offers_optional_cli_symlink() {
+        let m = completion_message(&Outcome::Ready(both_granted()), ENDPOINT, APP, true);
+        // the exact symlink one-liner (glass-mcp isn't on PATH from a .dmg), framed as optional
+        assert!(m.contains(
+            "sudo ln -s /Applications/GlassMcp.app/Contents/MacOS/glass-mcp \
+             /usr/local/bin/glass-mcp"
+        ));
+        assert!(m.to_lowercase().contains("optional"));
+        assert!(m.contains(ENDPOINT));
+    }
+
+    // --- grant_modal_text ----------------------------------------------------------------
+
+    #[test]
+    fn grant_modal_names_both_grants_and_warns_about_quit_reopen() {
+        let m = grant_modal_text(APP);
+        assert!(m.contains("Accessibility") && m.contains("Screen Recording"));
+        // pre-empts macOS's "Quit & Reopen" Screen-Recording prompt: tell the user to click Later
+        assert!(m.to_lowercase().contains("later"));
+        assert!(m.contains("Quit & Reopen"));
+        // names the bundle so the user can add it with the pane's ＋
+        assert!(m.contains(APP));
+    }
+
+    #[test]
+    fn grant_modal_omits_the_cli_symlink_hint() {
+        // the optional CLI one-liner belongs in the Ready completion dialog, not the grant modal
+        let m = grant_modal_text(APP);
+        assert!(!m.contains("/usr/local/bin/glass-mcp"));
     }
 }
