@@ -5,8 +5,11 @@
   override CFBundleIdentifier / CFBundleShortVersionString / CFBundleVersion (see
   packaging/macos/README.md); the values below are the production defaults.
 
-  LSBackgroundOnly is set because glass-mcp is a headless agent: it has no windows,
-  no menu bar, and nothing to show in the Dock or the Force Quit list.
+  LSUIElement makes GlassMcp.app an agent app: no Dock icon and no application menu
+  bar, but — unlike LSBackgroundOnly — it may show an NSStatusItem in the system menu
+  bar. That matters because the running server is a visible menu-bar app (glass ●):
+  a process holding Screen Recording + Accessibility must be something the user can
+  always see and quit. LSBackgroundOnly would suppress the status item entirely.
 -->
 <plist version="1.0">
 <dict>
@@ -26,7 +29,7 @@
 	<string>0.1.2</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>LSBackgroundOnly</key>
+	<key>LSUIElement</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
