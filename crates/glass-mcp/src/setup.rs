@@ -227,9 +227,9 @@ pub(crate) fn app_bundle_path(exe: &Path) -> String {
 #[cfg(any(target_os = "macos", test))]
 const LAUNCH_AGENT_LABEL: &str = "tech.fixedwidth.glass";
 
-/// The `gui/<uid>/<label>` target spec `launchctl bootout`/`bootstrap` address the LaunchAgent
-/// job by, given this process's numeric uid (see `macos_impl::self_uid`). Pure string
-/// formatting — no OS call — so it's unit-tested on Linux; [`macos_impl::install_launch_agent`]
+/// The `gui/<uid>/<label>` target spec `launchctl bootout`/`bootstrap`/`kickstart` address the
+/// LaunchAgent job by, given this process's numeric uid (see `macos_impl::self_uid`). Pure
+/// string formatting — no OS call — so it's unit-tested on Linux; [`macos_impl::install_launch_agent`]
 /// and [`macos_impl::restart_launch_agent`] are the two real callers, both feeding it a live
 /// uid, so the target derivation lives in exactly one place instead of two.
 #[cfg(any(target_os = "macos", test))]
@@ -239,10 +239,11 @@ pub(crate) fn launch_agent_target(uid: u32) -> String {
 
 /// The path `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` the LaunchAgent plist is
 /// written to and later `bootstrap`ped from, given the resolved `$HOME`. Pure path-joining —
-/// no filesystem access — so it's unit-tested on Linux; shared by
-/// [`macos_impl::install_launch_agent`] (which writes the file) and
-/// [`macos_impl::restart_launch_agent`] (which only re-bootstraps it) so the two can't derive
-/// different paths for the same job.
+/// no filesystem access — so it's unit-tested on Linux; used by
+/// [`macos_impl::install_launch_agent`], which both writes and `bootstrap`s the file.
+/// [`macos_impl::restart_launch_agent`] doesn't need it — it restarts the already-loaded job
+/// via `launchctl kickstart -k` against [`launch_agent_target`] alone, without touching the
+/// plist.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn launch_agent_plist_path(home: &str) -> std::path::PathBuf {
     Path::new(home)
@@ -677,9 +678,10 @@ mod macos_impl {
         }
     }
 
-    /// Resolve `$HOME`, or a single actionable error — the one place [`install_launch_agent`]
-    /// and [`restart_launch_agent`] both need it (for the plist path and, in
-    /// `install_launch_agent`'s case, the log directory and the filled plist's `home` field).
+    /// Resolve `$HOME`, or a single actionable error — needed to derive the plist path, the
+    /// log directory, and the filled plist's `home` field. [`restart_launch_agent`] doesn't
+    /// call this: it restarts via `launchctl kickstart -k`, which addresses the job by
+    /// `gui/<uid>/<label>` alone and never touches the plist.
     fn home_dir() -> Result<String> {
         std::env::var("HOME").map_err(|_| {
             GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
@@ -775,36 +777,37 @@ mod macos_impl {
     /// Restart the already-installed LaunchAgent so a fresh process re-reads TCC (the Screen
     /// Recording grant is cached per-process at launch) — independent of `KeepAlive`, which is
     /// `false` precisely so the LaunchAgent itself never respawns on its own after a user Quit.
-    /// `launchctl bootout` (ignoring "not loaded" — a harmless no-op the same way
-    /// [`install_launch_agent`]'s unload does) then `bootstrap`, reusing the exact target/plist
-    /// path [`install_launch_agent`] wrote, via [`super::launch_agent_target`] and
-    /// [`super::launch_agent_plist_path`] — never re-filling or re-writing the plist itself.
-    /// Errors surface (no `HOME`, `bootstrap` failing) rather than being silently swallowed.
+    ///
+    /// Uses `launchctl kickstart -k gui/<uid>/<label>`, *not* `bootout`+`bootstrap`: the
+    /// menu-bar app's "Restart" item runs this from *inside* the very LaunchAgent job it's
+    /// restarting, and `bootout` would SIGTERM that process directly — killing the caller
+    /// before `bootstrap` ever runs, with `KeepAlive=false` meaning launchd then never brings
+    /// it back. `kickstart -k` instead asks launchd itself (a separate, always-running
+    /// supervisor) to kill and restart the job in place, so it works even when the caller is
+    /// the job being restarted, and doesn't depend on `KeepAlive` at all. `kickstart -k`
+    /// requires the target job to already be loaded — true of every caller: the menu-bar app
+    /// *is* the running job, and onboarding's restart step (once wired up) only runs after
+    /// [`install_launch_agent`] has already bootstrapped it.
+    ///
+    /// Errors surface (`kickstart` failing to spawn, or exiting non-zero) rather than being
+    /// silently swallowed.
     ///
     /// `#[cfg_attr(not(feature = "network"), allow(dead_code))]`: see
     /// [`super::restart_launch_agent`] — its only caller (the menu-bar app) is compiled out of
     /// a `--no-default-features` build, so the allow is scoped to exactly that case.
     #[cfg_attr(not(feature = "network"), allow(dead_code))]
     pub(super) fn restart_launch_agent() -> Result<()> {
-        let home = home_dir()?;
-        let plist_path = super::launch_agent_plist_path(&home);
-        let uid = self_uid();
-        let target = super::launch_agent_target(uid);
-
-        let _ = Command::new("launchctl")
-            .arg("bootout")
-            .arg(&target)
-            .status();
+        let target = super::launch_agent_target(self_uid());
 
         let status = Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(format!("gui/{uid}"))
-            .arg(&plist_path)
+            .arg("kickstart")
+            .arg("-k")
+            .arg(&target)
             .status()
-            .map_err(|e| GlassError::Backend(format!("launchctl bootstrap: {e}")))?;
+            .map_err(|e| GlassError::Backend(format!("launchctl kickstart: {e}")))?;
         if !status.success() {
             return Err(GlassError::Backend(format!(
-                "launchctl bootstrap exited {status} while restarting {target}"
+                "launchctl kickstart -k exited {status} while restarting {target}"
             )));
         }
         Ok(())

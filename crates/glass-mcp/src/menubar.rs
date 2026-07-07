@@ -98,7 +98,7 @@ mod macos {
 
         // Build the menu bar and block the main thread on the AppKit run loop. The two
         // actionable items reuse glass-mcp's existing, validated helpers (`pbcopy` and the
-        // LaunchAgent `bootout`+`bootstrap`); their errors go loudly to stderr (the menu action
+        // LaunchAgent `kickstart -k`); their errors go loudly to stderr (the menu action
         // has no dialog surface), matching onboarding's best-effort osascript fallback.
         let endpoint_for_copy = endpoint;
         glass_macos::menubar::run(glass_macos::menubar::MenuBarActions {
@@ -110,12 +110,13 @@ mod macos {
                 }
             }),
             on_restart: Box::new(|| {
-                // VERIFY on-box: this process *is* the LaunchAgent job, so
-                // `restart_launch_agent`'s `launchctl bootout gui/<uid>/tech.fixedwidth.glass`
-                // asks launchd to tear *us* down — there's a race where SIGTERM lands before the
-                // following `bootstrap` runs, leaving the agent down (KeepAlive=false). Confirm a
-                // menu "Restart" actually comes back up; if not, switch to a detached re-bootstrap
-                // helper that runs after this process exits.
+                // This process *is* the LaunchAgent job, so `restart_launch_agent` uses
+                // `launchctl kickstart -k gui/<uid>/tech.fixedwidth.glass` rather than
+                // `bootout`+`bootstrap`: `kickstart -k` is a single request to launchd (a
+                // separate supervisor process) to kill-and-restart the job in place, so it's
+                // safe to call from inside the job being restarted and doesn't depend on
+                // `KeepAlive`. `bootout` would instead SIGTERM this very process, and with
+                // `KeepAlive=false` launchd would never bring it back.
                 if let Err(e) = crate::setup::restart_launch_agent() {
                     eprintln!("glass: menu 'Restart' failed: {e}");
                 }
