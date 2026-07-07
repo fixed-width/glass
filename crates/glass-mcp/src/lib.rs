@@ -205,10 +205,11 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
     anyhow::bail!("debug-grants is macOS-only")
 }
 
-/// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window with
-/// two dummy rows (one granted, one not) so its rendering, the per-row "Open Settings" buttons,
-/// and "Re-check" can be smoke-tested on-box without building `GlassMcp.app`. The dummy actions
-/// only print — they don't request grants or relaunch.
+/// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window so its
+/// rendering + the per-row "Open Settings" and "Re-check" buttons can be smoke-tested on-box
+/// without building `GlassMcp.app`. Rows reflect the REAL grant snapshot; "Open Settings" opens
+/// the actual System Settings pane (so you can confirm the panes open); "Re-check" only prints
+/// (a real relaunch belongs to the onboarder, not this harness).
 #[cfg(target_os = "macos")]
 pub fn run_debug_checklist() -> anyhow::Result<()> {
     use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
@@ -217,20 +218,22 @@ pub fn run_debug_checklist() -> anyhow::Result<()> {
         rows: vec![
             GrantRow {
                 label: "Accessibility",
-                granted: true,
+                granted: glass_macos::accessibility_granted(),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Open Settings: Accessibility")
+                    eprintln!("[debug-checklist] Open Settings: Accessibility");
+                    let _ = glass_macos::open_pane(glass_macos::accessibility_pane_url());
                 }),
             },
             GrantRow {
                 label: "Screen Recording",
-                granted: false,
+                granted: glass_macos::screen_recording_granted(),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Open Settings: Screen Recording")
+                    eprintln!("[debug-checklist] Open Settings: Screen Recording");
+                    let _ = glass_macos::open_pane(glass_macos::screen_recording_pane_url());
                 }),
             },
         ],
-        on_recheck: Box::new(|| eprintln!("[debug-checklist] Re-check clicked")),
+        on_recheck: Box::new(|| eprintln!("[debug-checklist] Re-check clicked (harness: no-op)")),
     };
     run_checklist(actions).map_err(|e| anyhow::anyhow!(e))
 }
