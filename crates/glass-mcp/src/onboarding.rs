@@ -13,12 +13,12 @@
 //!   the grants and serve), then exit — the LaunchAgent, not this onboarder, becomes the running
 //!   server.
 //! - **C. Show the checklist.** At least one grant is missing. Show the permission-checklist
-//!   window ([`glass_macos::run_checklist`]): one row per permission with its live snapshot, an
-//!   "Open Settings" button that requests that permission (adding GlassMcp.app to its Privacy
-//!   pane + prompting) and opens its pane, and a "Re-check" button that relaunches a *fresh*
-//!   process. TCC grants are cached per-process at launch, so re-reading them requires a new
-//!   process — the relaunched instance re-enters this flow and, once both grants read granted,
-//!   lands in outcome B.
+//!   window ([`glass_macos::run_checklist`]): one row per permission with its live snapshot, a
+//!   "Request…" button that requests that permission (macOS shows its own consent prompt, which
+//!   adds GlassMcp.app to its Privacy pane and carries an "Open System Settings" button that
+//!   navigates there), and a "Re-check" button that relaunches a *fresh* process. TCC grants are
+//!   cached per-process at launch, so re-reading them requires a new process — the relaunched
+//!   instance re-enters this flow and, once both grants read granted, lands in outcome B.
 //!
 //! Client-agnostic: the checklist only guides the grants; per-client MCP wiring is documented,
 //! not assumed. macOS-only — there is no LaunchServices double-click hand-off to onboard
@@ -112,9 +112,9 @@ fn grant_rows(accessibility: bool, screen_recording: bool) -> [(&'static str, bo
 }
 
 /// Build the checklist's row widgets from this launch's TCC grant snapshot: one [`GrantRow`]
-/// per permission, each carrying its live snapshot and the "Open Settings" closure that
-/// requests the grant and opens its System Settings pane. Factored out of [`run`] so the
-/// menu-bar self-onboard fallback (Task 4) can reuse the *identical* row wiring.
+/// per permission, each carrying its live snapshot and the "Request…" closure that requests
+/// the grant. Factored out of [`run`] so the menu-bar self-onboard fallback (Task 4) can reuse
+/// the *identical* row wiring.
 ///
 /// Only the row widgets are shared, not a whole [`ChecklistActions`] — `on_recheck` is
 /// necessarily per-caller: the onboarder's recheck relaunches a fresh process and `exit(0)`s
@@ -132,7 +132,7 @@ pub(crate) fn grant_row_widgets() -> Vec<GrantRow> {
         GrantRow {
             label: ax_label,
             granted: ax_granted,
-            // "Open Settings" just *requests* the grant: macOS shows its own consent prompt —
+            // "Request…" just *requests* the grant: macOS shows its own consent prompt —
             // which carries an "Open System Settings" button that navigates to the pane — and
             // lists GlassMcp.app there. We deliberately do NOT also `open_pane`: forcing Settings
             // open fought the system's own prompt (it opened even when the user hadn't chosen to).

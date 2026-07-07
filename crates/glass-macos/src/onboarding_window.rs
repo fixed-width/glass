@@ -2,7 +2,7 @@
 //! TCC permission glass needs, driven on the main-thread AppKit run loop. Like
 //! [`crate::menubar`], this module owns *only* the AppKit surface — the host (`glass-mcp`)
 //! supplies each row's label + current grant snapshot and boxed callbacks for the
-//! actionable buttons ("Open Settings" per row, "Re-check" in the footer), so this crate
+//! actionable buttons ("Request…" per row, "Re-check" in the footer), so this crate
 //! stays free of glass-mcp's permission-probing / relaunch logic and every AppKit `unsafe`
 //! stays confined here.
 //!
@@ -21,7 +21,7 @@
 //!
 //! ## Actions
 //!
-//! Each row's "Open Settings" button and the footer "Re-check" button are wired to a tiny
+//! Each row's "Request…" button and the footer "Re-check" button are wired to a tiny
 //! per-button [`ButtonTarget`] (an `objc2` `define_class!` object holding one boxed
 //! closure), all responding to the same `fire:` selector — the same minimal-target idiom
 //! `menubar.rs` uses, one instance per button so no selector/tag dispatch is needed. A
@@ -42,17 +42,18 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSNotification, NSString};
 
 /// One permission's row: the human label, its current grant snapshot (drives the status
-/// glyph), and the action that opens the relevant System Settings pane / triggers the
-/// TCC prompt. `on_open_settings` is a boxed callback so this crate never has to know *how*
-/// a pane is opened (glass-mcp's `open_pane`/`request_*` calls).
+/// glyph), and the action that requests the permission's grant (macOS then shows its own
+/// consent prompt). `on_open_settings` is a boxed callback so this crate never has to know
+/// *how* the grant is requested (glass-mcp's `request_*` calls).
 pub struct GrantRow {
     /// The permission's display name (e.g. `"Screen Recording"`).
     pub label: &'static str,
     /// Whether the permission is currently granted — snapshot taken by the host just before
     /// building the window. Drives the ✓ / ○ status glyph; never re-read here.
     pub granted: bool,
-    /// "Open Settings" — open this permission's System Settings pane (and, for the
-    /// prompt-capable ones, trigger the TCC request). Invoked on the main thread.
+    /// "Request…" — request this permission's grant. macOS shows its own consent prompt in
+    /// response (whose "Open System Settings" button navigates to the pane); this callback
+    /// does not open Settings itself. Invoked on the main thread.
     pub on_open_settings: Box<dyn Fn()>,
 }
 
@@ -148,7 +149,7 @@ impl WindowDelegate {
 // plain frames — computed top-down and converted to AppKit's bottom-left origin by `rect`.
 //
 // VERIFY on-box: these constants are eyeballed, not measured — confirm on a real render that
-// labels aren't clipped, the ✓/○ glyph and the "Open Settings" button sit level with each
+// labels aren't clipped, the ✓/○ glyph and the "Request…" button sit level with each
 // row's name, and nothing overlaps at the default system font size; nudge the constants if so.
 const WIDTH: f64 = 480.0;
 const H_MARGIN: f64 = 24.0;
@@ -309,7 +310,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
             name.setFrame(rect(content_h, label_x, row_top, LABEL_W, ROW_H));
             container.addSubview(&name);
 
-            // "Open Settings" button → this row's boxed action, via its own target.
+            // "Request…" button → this row's boxed action, via its own target.
             let target = ButtonTarget::new(mtm, row.on_open_settings);
             // SAFETY: `buttonWithTitle:target:action:` is `unsafe` because the target must
             // respond to the action selector — `target` is a live `ButtonTarget` (kept in
@@ -317,7 +318,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
             // `sel!(fire:)` is exactly that selector. The title is a valid `NSString`.
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("Open Settings"),
+                    &NSString::from_str("Request…"),
                     Some(&target),
                     Some(sel!(fire:)),
                     mtm,
@@ -373,7 +374,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // references), so they stay bound until after `run` returns.
     //
     // VERIFY on-box: the window shows the title "glass permissions", the instruction line,
-    // one row per permission (✓ for granted, ○ for not) each with a working "Open Settings"
+    // one row per permission (✓ for granted, ○ for not) each with a working "Request…"
     // button, and a "Re-check" button that fires `on_recheck`; the window comes to the
     // front on launch; closing it exits the process. None of this is checkable off a real
     // WindowServer/AppKit run loop — the darwin build only proves it compiles.

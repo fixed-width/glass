@@ -206,8 +206,8 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
 }
 
 /// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window so its
-/// rendering + the per-row "Open Settings" and "Re-check" buttons can be smoke-tested on-box
-/// without building `GlassMcp.app`. Rows reflect the REAL grant snapshot; "Open Settings" opens
+/// rendering + the per-row "Request…" and "Re-check" buttons can be smoke-tested on-box
+/// without building `GlassMcp.app`. Rows reflect the REAL grant snapshot; "Request…" opens
 /// the actual System Settings pane (so you can confirm the panes open); "Re-check" only prints
 /// (a real relaunch belongs to the onboarder, not this harness).
 #[cfg(target_os = "macos")]
@@ -219,7 +219,7 @@ pub fn run_debug_checklist() -> anyhow::Result<()> {
                 label: "Accessibility",
                 granted: glass_macos::accessibility_granted(),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Open Settings: Accessibility");
+                    eprintln!("[debug-checklist] Request: Accessibility");
                     let _ = glass_macos::open_pane(glass_macos::accessibility_pane_url());
                 }),
             },
@@ -227,7 +227,7 @@ pub fn run_debug_checklist() -> anyhow::Result<()> {
                 label: "Screen Recording",
                 granted: glass_macos::screen_recording_granted(),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Open Settings: Screen Recording");
+                    eprintln!("[debug-checklist] Request: Screen Recording");
                     let _ = glass_macos::open_pane(glass_macos::screen_recording_pane_url());
                 }),
             },
