@@ -59,6 +59,8 @@ Capture the app window, or an optional sub-rectangle, as a lossless WebP image.
 
 - `region` (`{ x, y, width, height }`, window-relative) — capture just this rectangle; omit for the
   whole window. Vision cost scales with pixel area, so a tight region is a recurring token saving.
+- `window_id` (integer) — capture this window (id from `glass_list_windows`) instead of the active
+  one, without changing which window subsequent ops target. Omit for the active window.
 
 ### `glass_baseline_save`
 
@@ -98,6 +100,8 @@ Wait until the window stops changing, then return the settled frame.
 - `interval_ms` (integer) — sample interval.
 - `timeout_ms` (integer) — give up after this long.
 - `tolerance` (integer 0–255) — per-frame change tolerance.
+- `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
+  one, without changing which window subsequent ops target.
 
 ### `glass_wait_for_element`
 
@@ -131,6 +135,8 @@ baseline), then return text metrics.
 - `interval_ms` (integer, default 100) — poll interval.
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 - `include_image` (boolean, default false) — on match, also return the watched region as an image.
+- `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
+  one, without changing which window subsequent ops target.
 
 Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
 an approved design without spending vision tokens.
@@ -289,6 +295,29 @@ element isn't editable, changed since the snapshot, or the app exposes no access
 - `id` (integer, **required**) — the element's `#id`.
 - `text` (string, **required**) — the value to set.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for `glass_click_element`.
+
+### `glass_scroll_to_element`
+
+Scroll a container until an accessibility element becomes visible, then return it as text. In a
+virtualized list only the on-screen rows exist in the a11y tree, so an off-screen row can't be clicked
+until it's scrolled into view; this collapses the scroll-and-snapshot loop into one call. Errors if the
+app exposes no accessibility tree.
+
+- `name` (string) — substring of the target's accessible name (selector); `name` and/or `role` is
+  required.
+- `role` (string) — role filter, e.g. `"ListItem"`, `"Button"` (selector).
+- `value_contains` (string) — additionally require the matched element's value to contain this
+  substring; not a standalone selector.
+- `direction` (string, default `down`) — primary sweep direction (`"down"`/`"up"`); the search
+  reverses to the other end if the target isn't found first.
+- `x`, `y` (integer) — scroll anchor (window-relative); default to the window center. Set both to aim
+  the wheel at a specific scrollable container.
+- `step` (integer, default 3) — wheel notches per scroll step; larger covers distance faster but risks
+  stepping past a row's realized band.
+- `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
+
+Returns `{matched, elapsed_ms, element{id, role, name, bounds, states}, scrolled{steps, reversed}}` —
+the `id` is usable with `glass_click_element`.
 
 ## Clipboard
 
