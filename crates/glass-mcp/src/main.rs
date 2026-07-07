@@ -52,10 +52,12 @@ async fn main() -> anyhow::Result<()> {
                     // rather than duplicate its token-precedence/exposure-parsing logic.
                     #[cfg(target_os = "macos")]
                     {
-                        let mut argv: Vec<String> = Vec::new();
-                        if http {
-                            argv.push("--http".into());
-                        }
+                        // `--menubar` implies serving over HTTP (the only transport today), so
+                        // don't require the caller to also pass `--http`: `serve --menubar`
+                        // alone must not error "serve requires --http". The plist passes both;
+                        // this makes the flag redundant rather than mandatory.
+                        let _ = http;
+                        let mut argv: Vec<String> = vec!["--http".into()];
                         if let Some(a) = addr {
                             argv.push("--addr".into());
                             argv.push(a);

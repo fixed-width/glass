@@ -24,6 +24,11 @@ mod clipboard;
 mod ffi;
 #[cfg(target_os = "macos")]
 mod input;
+// The visible menu-bar app (`NSStatusItem`): `pub` because glass-mcp's `--menubar` mode
+// drives it directly (unlike the `Platform`-seam backends above). macOS-only — it owns an
+// AppKit run loop.
+#[cfg(target_os = "macos")]
+pub mod menubar;
 #[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]

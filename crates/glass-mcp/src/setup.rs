@@ -445,14 +445,14 @@ pub(crate) fn install_launch_agent(
 /// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
 /// has one (a sibling `onboarding` module can't name the private `macos_impl` module at all).
 /// A fresh process re-reads TCC (the Screen Recording grant is cached per-process at launch),
-/// so onboarding calls this after a grant changes — independent of `KeepAlive`, which is
-/// `false` precisely so the LaunchAgent itself never does this uninvited.
+/// so the menu-bar app's "Restart" item calls this after a grant changes — independent of
+/// `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
 ///
-/// `#[allow(dead_code)]`: no caller wires this in yet in this build — onboarding's
-/// grant-change handling is separate work that will call it. Documented rather than left as
-/// an unexplained lint suppression.
+/// The caller is the menu-bar app (`crate::menubar`), which only exists under the `network`
+/// feature; a `--no-default-features` build compiles it out, so keep the `dead_code` allow
+/// scoped to exactly that case rather than dropping it entirely.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
 pub(crate) fn restart_launch_agent() -> Result<()> {
     macos_impl::restart_launch_agent()
 }
@@ -781,9 +781,10 @@ mod macos_impl {
     /// [`super::launch_agent_plist_path`] — never re-filling or re-writing the plist itself.
     /// Errors surface (no `HOME`, `bootstrap` failing) rather than being silently swallowed.
     ///
-    /// `#[allow(dead_code)]`: see [`super::restart_launch_agent`] — its one caller isn't wired
-    /// up yet in this build.
-    #[allow(dead_code)]
+    /// `#[cfg_attr(not(feature = "network"), allow(dead_code))]`: see
+    /// [`super::restart_launch_agent`] — its only caller (the menu-bar app) is compiled out of
+    /// a `--no-default-features` build, so the allow is scoped to exactly that case.
+    #[cfg_attr(not(feature = "network"), allow(dead_code))]
     pub(super) fn restart_launch_agent() -> Result<()> {
         let home = home_dir()?;
         let plist_path = super::launch_agent_plist_path(&home);

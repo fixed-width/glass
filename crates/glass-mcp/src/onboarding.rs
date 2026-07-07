@@ -172,9 +172,10 @@ fn poll_health_until_ready(addr: &str) -> Option<HealthStatus> {
 }
 
 /// Copy `text` to the general pasteboard via `pbcopy` — no AppKit/NSPasteboard dependency
-/// needed in this headless binary.
+/// needed in this headless binary. `pub(crate)` so the menu-bar app's "Copy endpoint" item
+/// (`crate::menubar`) reuses this exact helper rather than rolling its own `pbcopy` shell-out.
 #[cfg(target_os = "macos")]
-fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("/usr/bin/pbcopy")

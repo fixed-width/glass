@@ -25,7 +25,11 @@ use session_gate::SingleSessionManager;
 /// any authenticated bind. Pure (no I/O) so this security invariant is unit-
 /// testable independently of actually binding a socket; `run` prints the advisory
 /// notes for the allowed cases.
-fn check_exposure(cfg: &ServeConfig) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so menu-bar mode (`crate::menubar`) applies the identical fail-closed rule
+/// before binding its own listener — a `--menubar` serve on an exposed address must honor the
+/// same policy as a headless `serve --http`.
+pub(crate) fn check_exposure(cfg: &ServeConfig) -> anyhow::Result<()> {
     if let Exposure::ExposedNoToken = cfg.exposure() {
         anyhow::bail!(
             "refusing to bind {} without a token: anyone on the network could drive this \
