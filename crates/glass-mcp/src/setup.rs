@@ -401,8 +401,8 @@ pub fn run(args: SetupArgs) -> Result<()> {
 /// `pub(crate)`, and kept at the top level rather than nested in the private, macOS-only
 /// `macos_impl` module, because it has callers outside that module and outside macOS
 /// entirely — `run`'s guided-enable poll (via `macos_impl::guide_enable_and_verify` right
-/// here in `setup.rs`, macOS-only), the onboarding module's dialog gate (macOS-only), and
-/// `status::run` (every platform) — and a private `mod` can't be named from a sibling module
+/// here in `setup.rs`, macOS-only), the onboarding module's already-running health short-circuit
+/// (macOS-only), and `status::run` (every platform) — and a private `mod` can't be named from a sibling module
 /// regardless of its items' visibility. Crate-internal, so `pub(crate)`, not `pub`.
 pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
     use std::io::{Read, Write};
@@ -444,15 +444,16 @@ pub(crate) fn install_launch_agent(
 
 /// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
 /// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
-/// has one (a sibling `onboarding` module can't name the private `macos_impl` module at all).
-/// A fresh process re-reads TCC (the Screen Recording grant is cached per-process at launch),
-/// so both callers restart after a grant changes — the menu-bar app's "Restart" item
-/// (`crate::menubar`) and onboarding's guided grant flow (`crate::onboarding`) — independent of
-/// `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
+/// has one (a sibling module can't name the private `macos_impl` module at all). A fresh
+/// process re-reads TCC (the Screen Recording grant is cached per-process at launch), so the
+/// menu-bar app's "Restart" item (`crate::menubar`) restarts after a grant changes — independent
+/// of `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
 ///
-/// `crate::onboarding` is compiled on every macOS build (not only the `network`-featured one the
-/// menu-bar app needs), so this always has a caller — no `dead_code` allow required.
-#[cfg(target_os = "macos")]
+/// Gated to `network` + macOS to match that sole caller (`crate::menubar` is itself
+/// `#[cfg(feature = "network")]`): the onboarder re-reads TCC by relaunching a fresh *process*
+/// (`open -n`, see `crate::onboarding`), not by restarting the agent, so without the `network`
+/// feature a plain macOS build would have no caller and flag this dead.
+#[cfg(all(target_os = "macos", feature = "network"))]
 pub(crate) fn restart_launch_agent() -> Result<()> {
     macos_impl::restart_launch_agent()
 }
@@ -793,16 +794,16 @@ mod macos_impl {
     /// it back. `kickstart -k` instead asks launchd itself (a separate, always-running
     /// supervisor) to kill and restart the job in place, so it works even when the caller is
     /// the job being restarted, and doesn't depend on `KeepAlive` at all. `kickstart -k`
-    /// requires the target job to already be loaded — true of every caller: the menu-bar app
-    /// *is* the running job, and onboarding's restart step runs only after
-    /// [`install_launch_agent`] has already bootstrapped it.
+    /// requires the target job to already be loaded — true of its caller: the menu-bar app
+    /// *is* the running LaunchAgent job.
     ///
     /// Errors surface (`kickstart` failing to spawn, or exiting non-zero) rather than being
     /// silently swallowed.
     ///
-    /// Reached through [`super::restart_launch_agent`] from both the menu-bar app and
-    /// onboarding's guided grant flow; the latter is compiled on every macOS build, so this is
-    /// never dead code and needs no `allow`.
+    /// Reached through [`super::restart_launch_agent`] from the menu-bar app's "Restart" item;
+    /// gated to the `network` feature to match it (see the forwarder's note), so it isn't dead
+    /// code in a plain macOS build where the menu bar isn't compiled.
+    #[cfg(feature = "network")]
     pub(super) fn restart_launch_agent() -> Result<()> {
         let target = super::launch_agent_target(self_uid());
 

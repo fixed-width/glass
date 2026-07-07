@@ -56,15 +56,13 @@ pub struct GrantRow {
     pub on_open_settings: Box<dyn Fn()>,
 }
 
-/// What the host asks the checklist window to show and do: one [`GrantRow`] per permission,
-/// a defensive `all_granted` snapshot, and the footer "Re-check" action.
+/// What the host asks the checklist window to show and do: one [`GrantRow`] per permission
+/// plus the footer "Re-check" action. The host only opens this window when at least one
+/// permission is missing, so an empty `rows` is the sole (defensive) "nothing to configure"
+/// case — see [`run_checklist`]'s empty-state handling.
 pub struct ChecklistActions {
     /// One row per permission, each with its current snapshot and open/request action.
     pub rows: Vec<GrantRow>,
-    /// Whether every required permission was already granted when the host built this. If
-    /// `true` the host shouldn't have opened the window at all; the window handles it
-    /// defensively by showing a "ready" message instead of an (empty) checklist.
-    pub all_granted: bool,
     /// "Re-check" — re-probe permissions by relaunching as a fresh process (so a new
     /// process re-reads TCC grants) and exiting this one. Supplied by glass-mcp; this crate
     /// only invokes it.
@@ -168,8 +166,8 @@ const FOOTER_H: f64 = 32.0;
 const CONTENT_W: f64 = WIDTH - 2.0 * H_MARGIN;
 const LABEL_W: f64 = CONTENT_W - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W;
 
-/// Total content height, driven by how many rows there are (or one "ready" line in the
-/// defensive `all_granted` / empty case).
+/// Total content height, driven by how many rows there are (or one line in the defensive
+/// empty-`rows` case).
 fn content_height(n_rows: usize) -> f64 {
     let body = if n_rows == 0 {
         ROW_H
@@ -212,11 +210,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
         "the onboarding checklist window must start on the main thread".to_string()
     })?;
 
-    let ChecklistActions {
-        rows,
-        all_granted,
-        on_recheck,
-    } = actions;
+    let ChecklistActions { rows, on_recheck } = actions;
     let n_rows = rows.len();
 
     let app = NSApplication::sharedApplication(mtm);
@@ -284,14 +278,11 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     let mut button_targets: Vec<Retained<ButtonTarget>> = Vec::with_capacity(rows.len() + 1);
 
     if rows.is_empty() {
-        // Defensive: `all_granted` (or an empty row set) means the host shouldn't have
-        // opened this window — show a "ready" line rather than an empty checklist.
-        let msg = if all_granted {
-            "glass is ready — all required permissions are granted."
-        } else {
-            "No permissions to configure."
-        };
-        let ready = NSTextField::labelWithString(&NSString::from_str(msg), mtm);
+        // Defensive: the host only opens this window when a permission is missing, so an empty
+        // row set means it shouldn't have opened it at all — show a line rather than a blank
+        // checklist.
+        let ready =
+            NSTextField::labelWithString(&NSString::from_str("No permissions to configure."), mtm);
         ready.setFrame(rect(content_h, H_MARGIN, body_top, CONTENT_W, ROW_H));
         container.addSubview(&ready);
     } else {

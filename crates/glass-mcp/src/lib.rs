@@ -214,7 +214,6 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
 pub fn run_debug_checklist() -> anyhow::Result<()> {
     use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
     let actions = ChecklistActions {
-        all_granted: false,
         rows: vec![
             GrantRow {
                 label: "Accessibility",
