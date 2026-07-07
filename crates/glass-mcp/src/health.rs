@@ -3,7 +3,7 @@
 //! different responsible process, cannot read the agent's grant from themselves, so they poll this.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthStatus {
     /// The server is up and answering. Always true from a live handler.
     pub ok: bool,
@@ -17,6 +17,12 @@ pub struct HealthStatus {
 
 impl HealthStatus {
     /// True once both macOS grants read granted — the signal setup/onboarding poll to complete.
+    /// Its only callers are the macOS grant-verification flow (`setup`/`onboarding`) and this
+    /// crate's tests, so it's gated to macOS+test like they are: now that `health` is
+    /// `pub(crate)` (no longer public API), a plain non-test Linux/Windows build — where
+    /// `/healthz` still serializes a [`HealthStatus`] but nothing reads this predicate — would
+    /// otherwise flag it dead.
+    #[cfg(any(target_os = "macos", test))]
     pub fn grants_ready(&self) -> bool {
         self.screen_recording == Some(true) && self.accessibility == Some(true)
     }

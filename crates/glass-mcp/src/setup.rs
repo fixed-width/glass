@@ -212,8 +212,10 @@ fn enable_instruction(label: &str, app_path: &str) -> String {
 /// sits inside a bundle (per [`is_inside_app_bundle`]); otherwise falls back to
 /// [`DEFAULT_APP_PATH`], so a bare `cargo run` still yields a concrete path to add. Pure (path
 /// shape only, no filesystem access), so it's unit-tested on Linux against fabricated paths.
+/// `pub(crate)` so the onboarding module reuses this validated helper (via
+/// [`is_inside_app_bundle`]) rather than keeping its own weaker walk-up-to-any-`.app` copy.
 #[cfg(any(target_os = "macos", test))]
-fn app_bundle_path(exe: &Path) -> String {
+pub(crate) fn app_bundle_path(exe: &Path) -> String {
     // `is_inside_app_bundle` guarantees the three-parents-up ancestor is the `*.app` dir.
     if is_inside_app_bundle(exe) {
         if let Some(bundle) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
@@ -533,28 +535,31 @@ mod macos_impl {
 
     /// One macOS TCC pane `setup` guides through: its display label, its System Settings
     /// deep-link URL, and the `/healthz` accessor for the grant it maps to (so the deadline
-    /// check can read the matching field back off [`super::fetch_health`]).
-    type GrantPane = (
-        &'static str,
-        &'static str,
-        fn(&super::HealthStatus) -> Option<bool>,
-    );
+    /// check can read the matching field back off [`super::fetch_health`]). Named fields
+    /// rather than a positional tuple so a consumer can't transpose the label and pane URL
+    /// (both `&'static str`) — the same anti-transposition reasoning as [`super::SetupArgs`]
+    /// and [`super::LaunchAgentFields`].
+    struct GrantPane {
+        label: &'static str,
+        pane_url: &'static str,
+        read: fn(&super::HealthStatus) -> Option<bool>,
+    }
 
     /// The two macOS TCC panes `setup` guides the user through, paired with the `/healthz`
     /// field each maps to. Named once so [`guide_enable_and_verify`] both opens the panes and
     /// reads back the matching grant without re-typing the labels.
     fn grant_panes() -> [GrantPane; 2] {
         [
-            (
-                "Screen Recording",
-                glass_macos::screen_recording_pane_url(),
-                |h| h.screen_recording,
-            ),
-            (
-                "Accessibility",
-                glass_macos::accessibility_pane_url(),
-                |h| h.accessibility,
-            ),
+            GrantPane {
+                label: "Screen Recording",
+                pane_url: glass_macos::screen_recording_pane_url(),
+                read: |h| h.screen_recording,
+            },
+            GrantPane {
+                label: "Accessibility",
+                pane_url: glass_macos::accessibility_pane_url(),
+                read: |h| h.accessibility,
+            },
         ]
     }
 
@@ -586,7 +591,10 @@ mod macos_impl {
         }
 
         println!("\nEnable GlassMcp.app in System Settings (opening the two panes now):");
-        for (label, pane_url, _) in grant_panes() {
+        for GrantPane {
+            label, pane_url, ..
+        } in grant_panes()
+        {
             if let Err(e) = glass_macos::open_pane(pane_url) {
                 eprintln!(
                     "  note: couldn't open the {label} pane automatically ({e}); open Privacy \
@@ -610,7 +618,10 @@ mod macos_impl {
         // Deadline reached without both grants. Read `/healthz` once more to name the ones
         // still missing; a `None` (unreachable) leaves every grant unconfirmed → all pending.
         let health = super::fetch_health(addr);
-        for (label, _, field) in grant_panes() {
+        for GrantPane {
+            label, read: field, ..
+        } in grant_panes()
+        {
             if health.as_ref().and_then(field) != Some(true) {
                 let instruction = format!(
                     "{} — then run `glass-mcp setup` again.",

@@ -55,15 +55,18 @@ pub fn detect_no_arg_launch() -> NoArgLaunch {
 /// `true` when stdin is a FIFO (pipe) — the MCP stdio transport. A LaunchServices double-click
 /// gives the process `/dev/null` (a character device, not a FIFO), so this is the second half
 /// of the discriminator. Uses `rustix::fs::fstat` (a safe syscall wrapper) rather than a raw
-/// `libc::fstat`, per this repo's unsafe policy; an fstat failure reads as "not a pipe", so
-/// the bundle-id half of [`classify_no_arg_launch`] alone decides.
+/// `libc::fstat`, per this repo's unsafe policy; an stdin we can't stat is assumed a pipe, so
+/// the ambiguous case routes to `StdioServe` (never hijacks an MCP client), matching this
+/// module's fail-safe-to-stdio bias.
 #[cfg(target_os = "macos")]
 fn stdin_is_pipe() -> bool {
     match rustix::fs::fstat(std::io::stdin()) {
         Ok(stat) => {
             rustix::fs::FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode).is_fifo()
         }
-        Err(_) => false,
+        // Fail safe to stdio: an unstat-able stdin is treated as a pipe so onboarding never
+        // hijacks a possible MCP client spawn.
+        Err(_) => true,
     }
 }
 

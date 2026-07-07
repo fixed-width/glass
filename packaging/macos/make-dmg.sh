@@ -23,7 +23,9 @@ mkdir -p "$out"
 name="glass-mcp-${version}-universal-apple-darwin"
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
-cp -R "$app" "$staging/"
+# ditto (not cp -R) is the guaranteed-faithful copy for a signed bundle — it preserves the
+# bundle layout + code signature, matching release.yml's Package step.
+ditto "$app" "$staging/$(basename "$app")"
 ln -s /Applications "$staging/Applications"
 dmg="$out/${name}.dmg"
 rm -f "$dmg"
