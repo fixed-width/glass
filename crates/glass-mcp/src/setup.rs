@@ -1034,9 +1034,12 @@ mod tests {
     fn plist_template_launches_menubar_and_does_not_keepalive() {
         // The LaunchAgent must launch the visible menu-bar mode, and must not fight a user's
         // Quit by relaunching (`KeepAlive=false`; `RunAtLoad` alone starts it at login).
-        assert!(TEMPLATE.contains("<string>--menubar</string>"));
-        assert!(TEMPLATE.contains("<key>KeepAlive</key>\n\t<false/>"));
-        assert!(!TEMPLATE.contains("<key>KeepAlive</key>\n\t<true/>"));
+        // Normalize line endings first: on Windows the `.plist` can be checked out with CRLF,
+        // and the key/value assertions below span a line boundary (`</key>\n\t<…/>`).
+        let t = TEMPLATE.replace("\r\n", "\n");
+        assert!(t.contains("<string>--menubar</string>"));
+        assert!(t.contains("<key>KeepAlive</key>\n\t<false/>"));
+        assert!(!t.contains("<key>KeepAlive</key>\n\t<true/>"));
     }
 
     // --- surviving_placeholders (template-drift guard) -----------------------------------
