@@ -88,29 +88,6 @@ pub async fn run(
     run_on(listener, cfg, crate::boot(sink), report).await
 }
 
-/// Prompt for the two TCC grants under the *serve process's own* identity (on macOS, the
-/// LaunchAgent = GlassMcp.app), so the app shows up in the Screen Recording / Accessibility
-/// panes even before it's granted, and so later `/healthz` reads reflect this same process.
-/// Idempotent: an already-granted permission is a no-op (the `request_*` call returns `true`
-/// immediately without prompting).
-#[cfg(target_os = "macos")]
-fn self_register_grants() {
-    if !glass_macos::screen_recording_granted() {
-        glass_macos::request_screen_recording();
-        eprintln!(
-            "glass: Screen Recording not granted — enable GlassMcp.app in System Settings → \
-             Privacy & Security → Screen Recording."
-        );
-    }
-    if !glass_macos::accessibility_granted() {
-        glass_macos::request_accessibility();
-        eprintln!(
-            "glass: Accessibility not granted — enable GlassMcp.app in System Settings → \
-             Privacy & Security → Accessibility."
-        );
-    }
-}
-
 /// Assemble the outer HTTP router: `/healthz` (unauthenticated, loopback-only — see
 /// below) merged with the bearer-gated MCP service. `cancel` is threaded into
 /// `StreamableHttpServerConfig` so that a caller cancelling the *same* token (e.g.
@@ -170,9 +147,6 @@ pub async fn run_on(
     glass: glass_core::Glass,
     report: crate::audit::AuditReport,
 ) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    self_register_grants();
-
     let server = GlassServer::new(glass, report);
     let sessions = server.sessions();
     let cancel = CancellationToken::new();
