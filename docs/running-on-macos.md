@@ -10,25 +10,29 @@ and notarized, macOS opens it without a Gatekeeper detour, and first-run is a do
 
 1. **Download** the `.dmg` from Releases and open it.
 2. **Drag `GlassMcp.app` to `/Applications`.**
-3. **Double-click `GlassMcp.app`.** macOS shows the two standard privacy popups, in order —
-   **Accessibility first, then Screen Recording** — both attributed to **GlassMcp.app**.
-   Grant both. Because the app is asking for *itself* (it's its own responsible process),
-   the grants land on `GlassMcp.app` directly — no manual `＋`-add in System Settings. They
-   are **one-time**: keyed to the app's signed identity, they survive restarts and updates
-   (see [The permission model, in short](#the-permission-model-in-short)). When you enable
-   Screen Recording, macOS may offer to **"Quit & Reopen"** GlassMcp.app — click **Later**;
-   glass restarts its own background agent for you, so quitting it yourself isn't needed.
-4. The app then **installs its LaunchAgent** (so it keeps serving across logins and
-   restarts), confirms it's serving, and shows a **completion dialog** that displays the
-   MCP endpoint and **copies it to your clipboard**:
+3. **Double-click `GlassMcp.app`.** A **permission checklist window** appears, listing
+   **Accessibility** and **Screen Recording**, each with a ✓/○ status and its own **Open
+   Settings** button.
+4. Click **Open Settings** for each permission, **one at a time**. It adds `GlassMcp.app` to
+   that permission's pane under **System Settings → Privacy & Security** and opens the pane
+   so you can turn it on. Because the app is asking for *itself* (it's its own responsible
+   process), the grant lands on `GlassMcp.app` directly — no manual `＋`-add needed. Granting
+   **Screen Recording relaunches `GlassMcp.app` automatically** (macOS quits and reopens it
+   to pick up the grant) — that relaunch is expected, not an error. If you grant the two out
+   of that order, or a grant made elsewhere doesn't show up, click **Re-check**. Grants are
+   **one-time**: keyed to the app's signed identity, they survive restarts and updates (see
+   [The permission model, in short](#the-permission-model-in-short)).
+5. Once both rows read ✓, the checklist closes on its own: glass **installs its
+   LaunchAgent** (so it keeps serving across logins and restarts) and starts, showing up as
+   a **`glass ●` menu-bar item**.
 
-   ```
-   http://127.0.0.1:7300/
-   ```
+That's the whole setup. The MCP endpoint is:
 
-That's the whole setup. If a grant is still missing when the app checks, the dialog names
-which one and asks you to enable `GlassMcp.app` under **System Settings → Privacy &
-Security** and re-open it. Once both are in, head to [Connect your agent](#connect-your-agent).
+```
+http://127.0.0.1:7300/
+```
+
+Head to [Connect your agent](#connect-your-agent).
 
 ### The menu-bar item
 
@@ -36,9 +40,11 @@ Once granted, `GlassMcp.app` runs as a **visible menu-bar app** — look for **`
 the menu bar. It starts automatically at login (via the LaunchAgent) and its dropdown shows:
 
 - the **served endpoint** (or a notice if another glass is already bound to it),
-- **Copy endpoint** — copy the MCP endpoint to your clipboard again,
+- **Copy endpoint** — copy the MCP endpoint to your clipboard,
 - **Restart** — restart the background agent (e.g. after a fresh grant),
-- **Quit glass** — stop the agent.
+- **Quit glass** — stop the agent,
+- **Uninstall glass…** — stop glass from starting at login and quit it now (asks you to
+  confirm first; see [Uninstall](#uninstall)).
 
 glass is deliberately never a silent, invisible background process: it holds Screen
 Recording and Accessibility, so it stays something you can always see and stop. **Quit
@@ -47,8 +53,8 @@ stays stopped until you next log in or relaunch `GlassMcp.app` yourself.
 
 ## Connect your agent
 
-The onboarded LaunchAgent serves MCP over **Streamable HTTP** at the endpoint the completion
-dialog copied for you:
+The onboarded LaunchAgent serves MCP over **Streamable HTTP** at the endpoint shown in the
+`glass ●` menu bar:
 
 ```
 http://127.0.0.1:7300/
@@ -156,12 +162,13 @@ code-signing certificate. That has two consequences that shape everything below:
   signed app + LaunchAgent rather than a plain binary you `ssh` in and run.
 
 With the notarized `.dmg`, all of this is automatic: double-clicking `GlassMcp.app` makes it
-its own responsible process, so the two grant popups attribute to the app and land on it, and
-the app installs its own LaunchAgent (see [Install](#install-recommended-the-notarized-dmg)).
+its own responsible process, so each checklist **Open Settings** request attributes to the
+app and lands on it, and once both are granted the app installs its own LaunchAgent (see
+[Install](#install-recommended-the-notarized-dmg)).
 Building from source, you do the same steps by hand: create a stable signing identity once,
 build + sign the app, install it as a LaunchAgent, and enable it in the Screen Recording +
 Accessibility panes (see [Build from source](#build-from-source-contributors)). Either way,
-once the grants are in, rebuilds and restarts never need the dialog again.
+once the grants are in, rebuilds and restarts never need the checklist again.
 
 ## Keep the Mac awake
 
@@ -374,16 +381,20 @@ and what each field means.
 
 ## Uninstall
 
+From the **`glass ●`** menu bar, click **Uninstall glass…** (it asks you to confirm, since
+uninstalling also quits glass). Or, from a terminal:
+
 ```bash
 glass-mcp uninstall
 ```
 
-Stops glass from starting at login: removes `~/Library/LaunchAgents/tech.fixedwidth.glass.plist`
-and boots out the running job. It doesn't touch the app bundle itself — drag `GlassMcp.app` to
-the Trash afterward to remove glass entirely. (The menu-bar app is planned to grow an "Uninstall
-glass…" item that does the same thing without a terminal.)
+Either one stops glass from starting at login: removes
+`~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and boots out the running job. Neither
+touches the app bundle itself — drag `GlassMcp.app` to the Trash afterward to remove glass
+entirely.
 
-Without the CLI (or on a build that predates it), the equivalent by hand:
+Without either (e.g. on a build that predates the menu item or the CLI), the equivalent by
+hand:
 
 ```bash
 launchctl bootout gui/$(id -u)/tech.fixedwidth.glass
