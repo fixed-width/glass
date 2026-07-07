@@ -361,13 +361,18 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     let delegate = WindowDelegate::new(mtm);
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    // Center, show, and bring to front.
+    // Center, show, and force to the front. A just-launched `LSUIElement` app does not come
+    // forward on its own, and the modern cooperative `activate()` (macOS 14+) deliberately
+    // refuses to steal focus from the app that launched us — Finder, immediately after a
+    // double-click — so the checklist would open *behind* the Finder window and look like
+    // nothing happened. Use the forceful path instead: `activateIgnoringOtherApps` (deprecated
+    // but still the reliable escape hatch for a user-initiated launch) plus
+    // `orderFrontRegardless`, which raises the window even before the app is fully active.
     window.center();
     window.makeKeyAndOrderFront(None);
-    // `activate` (macOS 14+) supersedes the deprecated `activateIgnoringOtherApps:`; the
-    // onboarder is a foreground `Regular` app, so this pulls its window in front of whatever
-    // launched it.
-    app.activate();
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    window.orderFrontRegardless();
 
     // Block the main thread on the AppKit event loop. `window`, `container`, `delegate`, and
     // every `ButtonTarget` must outlive this call (`setTarget:`/`setDelegate:` hold only weak
