@@ -220,6 +220,36 @@ pub(crate) fn app_bundle_path(exe: &Path) -> String {
     DEFAULT_APP_PATH.to_string()
 }
 
+/// The LaunchAgent's `launchctl` job label — matches the shipped plist's `<key>Label</key>`
+/// (`packaging/macos/tech.fixedwidth.glass.plist`) and its filename on disk. Named once so
+/// [`launch_agent_target`] and [`launch_agent_plist_path`] can't drift from each other or from
+/// the plist itself.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCH_AGENT_LABEL: &str = "tech.fixedwidth.glass";
+
+/// The `gui/<uid>/<label>` target spec `launchctl bootout`/`bootstrap` address the LaunchAgent
+/// job by, given this process's numeric uid (see `macos_impl::self_uid`). Pure string
+/// formatting — no OS call — so it's unit-tested on Linux; [`macos_impl::install_launch_agent`]
+/// and [`macos_impl::restart_launch_agent`] are the two real callers, both feeding it a live
+/// uid, so the target derivation lives in exactly one place instead of two.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn launch_agent_target(uid: u32) -> String {
+    format!("gui/{uid}/{LAUNCH_AGENT_LABEL}")
+}
+
+/// The path `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` the LaunchAgent plist is
+/// written to and later `bootstrap`ped from, given the resolved `$HOME`. Pure path-joining —
+/// no filesystem access — so it's unit-tested on Linux; shared by
+/// [`macos_impl::install_launch_agent`] (which writes the file) and
+/// [`macos_impl::restart_launch_agent`] (which only re-bootstraps it) so the two can't derive
+/// different paths for the same job.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn launch_agent_plist_path(home: &str) -> std::path::PathBuf {
+    Path::new(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+}
+
 /// The parsed `setup` invocation, forwarded from the `Setup` clap variant (see `cli.rs`). A
 /// struct rather than four positional arguments to [`run`] so the three adjacent `bool`s can't
 /// be transposed at the call site without a field-name mismatch.
@@ -409,6 +439,22 @@ pub(crate) fn install_launch_agent(
     addr: &str,
 ) -> Result<Option<(&'static str, String)>> {
     macos_impl::install_launch_agent(app_bin, addr)
+}
+
+/// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
+/// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
+/// has one (a sibling `onboarding` module can't name the private `macos_impl` module at all).
+/// A fresh process re-reads TCC (the Screen Recording grant is cached per-process at launch),
+/// so onboarding calls this after a grant changes — independent of `KeepAlive`, which is
+/// `false` precisely so the LaunchAgent itself never does this uninvited.
+///
+/// `#[allow(dead_code)]`: no caller wires this in yet in this build — onboarding's
+/// grant-change handling is separate work that will call it. Documented rather than left as
+/// an unexplained lint suppression.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn restart_launch_agent() -> Result<()> {
+    macos_impl::restart_launch_agent()
 }
 
 /// The macOS-only glue behind [`run`]'s grant flow: side-effecting (stdin/stdout, shelling
@@ -631,6 +677,15 @@ mod macos_impl {
         }
     }
 
+    /// Resolve `$HOME`, or a single actionable error — the one place [`install_launch_agent`]
+    /// and [`restart_launch_agent`] both need it (for the plist path and, in
+    /// `install_launch_agent`'s case, the log directory and the filled plist's `home` field).
+    fn home_dir() -> Result<String> {
+        std::env::var("HOME").map_err(|_| {
+            GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
+        })
+    }
+
     /// Write the filled LaunchAgent plist to `~/Library/LaunchAgents/tech.fixedwidth.glass.plist`
     /// (creating it and `~/Library/Logs/GlassMcp/` if needed), (re)load it with `launchctl
     /// bootstrap gui/<uid>`, and confirm it's actually serving before reporting success.
@@ -644,12 +699,14 @@ mod macos_impl {
         app_bin: &str,
         addr: &str,
     ) -> Result<Option<(&'static str, String)>> {
-        let home = std::env::var("HOME").map_err(|_| {
-            GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
-        })?;
-        let launch_agents_dir = Path::new(&home).join("Library/LaunchAgents");
+        let home = home_dir()?;
+        let plist_path = super::launch_agent_plist_path(&home);
+        // `plist_path`'s parent is always `~/Library/LaunchAgents` (see
+        // `super::launch_agent_plist_path`) — derive it rather than re-joining the path
+        // ourselves, so the two can't drift.
+        let launch_agents_dir = plist_path.parent().expect("plist_path has a parent dir");
         let logs_dir = Path::new(&home).join("Library/Logs/GlassMcp");
-        std::fs::create_dir_all(&launch_agents_dir)?;
+        std::fs::create_dir_all(launch_agents_dir)?;
         std::fs::create_dir_all(&logs_dir)?;
 
         let fields = super::LaunchAgentFields {
@@ -668,11 +725,10 @@ mod macos_impl {
                  drifted; refusing to write a broken plist."
             )));
         }
-        let plist_path = launch_agents_dir.join("tech.fixedwidth.glass.plist");
         std::fs::write(&plist_path, filled)?;
 
         let uid = self_uid();
-        let target = format!("gui/{uid}/tech.fixedwidth.glass");
+        let target = super::launch_agent_target(uid);
         // Idempotent (re)load. `bootstrap` fails with "already loaded" on a second run — which
         // the flow itself asks for, since a Screen Recording grant only takes effect after a
         // relaunch — and wouldn't pick up an `--addr` change. Unload first, ignoring the exit
@@ -696,8 +752,9 @@ mod macos_impl {
         }
 
         // `bootstrap` succeeding only means launchd accepted the job spec, not that the process
-        // came up serving: a port clash on `--addr` crash-loops under `KeepAlive=true` yet
-        // bootstrap still returns success. Confirm real liveness before claiming success.
+        // came up serving: e.g. a port clash on `--addr` fails the job (once — `KeepAlive` is
+        // `false`, so launchd won't keep retrying it) yet bootstrap still returns success.
+        // Confirm real liveness before claiming success.
         if launch_agent_is_serving(addr) {
             println!(
                 "\n  \u{2713} installed + started {target} ({})",
@@ -707,12 +764,49 @@ mod macos_impl {
         } else {
             let instruction = format!(
                 "LaunchAgent {target} loaded but isn't accepting connections on {addr} yet — \
-                 check ~/Library/Logs/GlassMcp/stderr.log (a port clash on --addr crash-loops \
-                 under KeepAlive), resolve it, then run `glass-mcp setup` again."
+                 check ~/Library/Logs/GlassMcp/stderr.log (e.g. a port clash on --addr), \
+                 resolve it, then run `glass-mcp setup` again."
             );
             println!("\n  \u{2717} {instruction}");
             Ok(Some(("LaunchAgent", instruction)))
         }
+    }
+
+    /// Restart the already-installed LaunchAgent so a fresh process re-reads TCC (the Screen
+    /// Recording grant is cached per-process at launch) — independent of `KeepAlive`, which is
+    /// `false` precisely so the LaunchAgent itself never respawns on its own after a user Quit.
+    /// `launchctl bootout` (ignoring "not loaded" — a harmless no-op the same way
+    /// [`install_launch_agent`]'s unload does) then `bootstrap`, reusing the exact target/plist
+    /// path [`install_launch_agent`] wrote, via [`super::launch_agent_target`] and
+    /// [`super::launch_agent_plist_path`] — never re-filling or re-writing the plist itself.
+    /// Errors surface (no `HOME`, `bootstrap` failing) rather than being silently swallowed.
+    ///
+    /// `#[allow(dead_code)]`: see [`super::restart_launch_agent`] — its one caller isn't wired
+    /// up yet in this build.
+    #[allow(dead_code)]
+    pub(super) fn restart_launch_agent() -> Result<()> {
+        let home = home_dir()?;
+        let plist_path = super::launch_agent_plist_path(&home);
+        let uid = self_uid();
+        let target = super::launch_agent_target(uid);
+
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&target)
+            .status();
+
+        let status = Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(format!("gui/{uid}"))
+            .arg(&plist_path)
+            .status()
+            .map_err(|e| GlassError::Backend(format!("launchctl bootstrap: {e}")))?;
+        if !status.success() {
+            return Err(GlassError::Backend(format!(
+                "launchctl bootstrap exited {status} while restarting {target}"
+            )));
+        }
+        Ok(())
     }
 
     /// Bounded liveness probe for a just-bootstrapped agent: TCP-connect to `addr` on a
@@ -794,6 +888,21 @@ mod tests {
         assert_eq!(
             app_bundle_path(Path::new("/home/mpd/glass/target/release/glass-mcp")),
             DEFAULT_APP_PATH
+        );
+    }
+
+    // --- launch_agent_target / launch_agent_plist_path (shared by install/restart) --------
+
+    #[test]
+    fn launch_agent_target_is_the_gui_uid_spec() {
+        assert_eq!(launch_agent_target(501), "gui/501/tech.fixedwidth.glass");
+    }
+
+    #[test]
+    fn launch_agent_plist_path_is_rooted_under_home_library_launchagents() {
+        assert_eq!(
+            launch_agent_plist_path("/Users/alice"),
+            Path::new("/Users/alice/Library/LaunchAgents/tech.fixedwidth.glass.plist")
         );
     }
 
@@ -883,6 +992,17 @@ mod tests {
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stdout.log"));
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stderr.log"));
         assert!(!filled.contains("/Users/YOU"));
+    }
+
+    // --- plist template shape (menu-bar launch, KeepAlive) --------------------------------
+
+    #[test]
+    fn plist_template_launches_menubar_and_does_not_keepalive() {
+        // The LaunchAgent must launch the visible menu-bar mode, and must not fight a user's
+        // Quit by relaunching (`KeepAlive=false`; `RunAtLoad` alone starts it at login).
+        assert!(TEMPLATE.contains("<string>--menubar</string>"));
+        assert!(TEMPLATE.contains("<key>KeepAlive</key>\n\t<false/>"));
+        assert!(!TEMPLATE.contains("<key>KeepAlive</key>\n\t<true/>"));
     }
 
     // --- surviving_placeholders (template-drift guard) -----------------------------------

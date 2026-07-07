@@ -2,8 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   gui/<uid> LaunchAgent template that runs the signed GlassMcp.app as
-  `glass-mcp serve --http` — the unattended run model (see
-  docs/running-on-macos.md and packaging/macos/README.md).
+  `glass-mcp serve --http --menubar` — the visible menu-bar app, showing a
+  status item the user can Quit from (see docs/running-on-macos.md and
+  packaging/macos/README.md).
+
+  KeepAlive is false so a user's Quit sticks: launchd won't relaunch the job
+  until the next login (RunAtLoad starts it then). Onboarding's one-shot
+  restart (bootout+bootstrap) is how a fresh process gets spawned in between,
+  independent of KeepAlive.
 
   Before loading this, edit the two placeholders below:
     - /Users/YOU  -> your home directory (also fix the app path if you didn't
@@ -21,6 +27,7 @@
 		<string>/Applications/GlassMcp.app/Contents/MacOS/glass-mcp</string>
 		<string>serve</string>
 		<string>--http</string>
+		<string>--menubar</string>
 		<string>--addr</string>
 		<string>127.0.0.1:7300</string>
 	</array>
@@ -34,7 +41,7 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<false/>
 	<key>ProcessType</key>
 	<string>Background</string>
 
