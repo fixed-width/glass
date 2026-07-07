@@ -205,6 +205,42 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
     anyhow::bail!("debug-grants is macOS-only")
 }
 
+/// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window with
+/// two dummy rows (one granted, one not) so its rendering, the per-row "Open Settings" buttons,
+/// and "Re-check" can be smoke-tested on-box without building `GlassMcp.app`. The dummy actions
+/// only print — they don't request grants or relaunch.
+#[cfg(target_os = "macos")]
+pub fn run_debug_checklist() -> anyhow::Result<()> {
+    use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
+    let actions = ChecklistActions {
+        all_granted: false,
+        rows: vec![
+            GrantRow {
+                label: "Accessibility",
+                granted: true,
+                on_open_settings: Box::new(|| {
+                    eprintln!("[debug-checklist] Open Settings: Accessibility")
+                }),
+            },
+            GrantRow {
+                label: "Screen Recording",
+                granted: false,
+                on_open_settings: Box::new(|| {
+                    eprintln!("[debug-checklist] Open Settings: Screen Recording")
+                }),
+            },
+        ],
+        on_recheck: Box::new(|| eprintln!("[debug-checklist] Re-check clicked")),
+    };
+    run_checklist(actions).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Non-macOS: no checklist window.
+#[cfg(not(target_os = "macos"))]
+pub fn run_debug_checklist() -> anyhow::Result<()> {
+    anyhow::bail!("debug-checklist is macOS-only")
+}
+
 /// Run the `doctor` subcommand and exit.
 pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
     let backend = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());

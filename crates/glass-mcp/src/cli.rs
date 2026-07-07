@@ -93,6 +93,10 @@ pub enum Command {
     /// relaunch (Screen Recording). macOS-only; hidden from help.
     #[command(hide = true)]
     DebugGrants,
+    /// Spike/diagnostic: show the onboarding permission-checklist window with dummy rows, so
+    /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
+    #[command(hide = true)]
+    DebugChecklist,
 }
 
 #[cfg(test)]
