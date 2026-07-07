@@ -29,6 +29,11 @@ mod input;
 // AppKit run loop.
 #[cfg(target_os = "macos")]
 pub mod menubar;
+// The first-run permission checklist window (`NSWindow`): `pub` because glass-mcp's
+// onboarding mode drives it directly (like `menubar`, unlike the `Platform`-seam backends).
+// macOS-only — it owns an AppKit run loop.
+#[cfg(target_os = "macos")]
+pub mod onboarding_window;
 #[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]

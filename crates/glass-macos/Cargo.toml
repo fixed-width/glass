@@ -92,6 +92,18 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSView",
     "NSMenu",
     "NSMenuItem",
+    # The first-run permission checklist window (`onboarding_window.rs`): `NSWindow` (the
+    # window itself + its `NSWindowDelegate` protocol and `setDelegate:` — used to terminate
+    # the onboarder when the window closes; it also transitively enables the
+    # `objc2-foundation` `NSNotification`/`NSGeometry` features the delegate's
+    # `windowWillClose:` and the frame math need), `NSGraphics` (gates
+    # `NSWindow::initWithContentRect:styleMask:backing:defer:` and its `NSBackingStoreType`
+    # argument), and `NSTextField` (the instruction line, per-row labels + status glyphs via
+    # `labelWithString:`/`wrappingLabelWithString:`). The window's "Open Settings"/"Re-check"
+    # push buttons reuse the already-on `NSButton`/`NSControl`/`NSView` features above.
+    "NSWindow",
+    "NSGraphics",
+    "NSTextField",
     # `CGFloat` — the status-item length type: `NSStatusBar::statusItemWithLength:` and the
     # `NSVariableStatusItemLength` constant are both `cfg`-gated on app-kit's own
     # `objc2-core-foundation` feature (which pulls the `CGFloat` alias in).
