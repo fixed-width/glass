@@ -164,6 +164,30 @@ pub fn run_status(addr: Option<&str>) -> anyhow::Result<()> {
     status::run(addr)
 }
 
+/// Spike/diagnostic (`debug-grants`): poll the two TCC grants once a second in one long-lived
+/// process, so you can watch which flips live when granted in System Settings (Accessibility)
+/// vs. which stays stale until the process relaunches (Screen Recording — `CGPreflightScreen
+/// CaptureAccess` is a launch-time snapshot). Confirms the mechanics the onboarding flow relies on.
+#[cfg(target_os = "macos")]
+pub fn run_debug_grants() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    println!("watching TCC grants once a second (Ctrl-C to stop).");
+    println!("grant each in System Settings > Privacy & Security and watch which flips here:");
+    loop {
+        let ax = glass_macos::accessibility_granted();
+        let sr = glass_macos::screen_recording_granted();
+        println!("accessibility={ax}  screen_recording={sr}");
+        std::io::stdout().flush().ok();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Non-macOS: no TCC to poll.
+#[cfg(not(target_os = "macos"))]
+pub fn run_debug_grants() -> anyhow::Result<()> {
+    anyhow::bail!("debug-grants is macOS-only")
+}
+
 /// Run the `doctor` subcommand and exit.
 pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
     let backend = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());

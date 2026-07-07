@@ -85,6 +85,11 @@ pub enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// Spike/diagnostic: poll the two TCC grants once a second in one long-lived process,
+    /// so you can watch which flips live when granted (Accessibility) vs. stays stale until
+    /// relaunch (Screen Recording). macOS-only; hidden from help.
+    #[command(hide = true)]
+    DebugGrants,
 }
 
 #[cfg(test)]
