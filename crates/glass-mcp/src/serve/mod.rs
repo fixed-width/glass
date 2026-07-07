@@ -111,20 +111,12 @@ fn self_register_grants() {
     }
 }
 
-/// Serve on an already-bound listener (so tests can bind `127.0.0.1:0`).
-pub async fn run_on(
-    listener: tokio::net::TcpListener,
-    cfg: ServeConfig,
-    glass: glass_core::Glass,
-    report: crate::audit::AuditReport,
-) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    self_register_grants();
-
-    let server = GlassServer::new(glass, report);
-    let sessions = server.sessions();
-
-    let cancel = CancellationToken::new();
+/// Assemble the outer HTTP router: `/healthz` (unauthenticated, loopback-only — see
+/// below) merged with the bearer-gated MCP service. `cancel` is threaded into
+/// `StreamableHttpServerConfig` so that a caller cancelling the *same* token (e.g.
+/// `run_on`'s graceful-shutdown hook) also stops in-flight MCP sessions. Doesn't touch
+/// a socket, so this is unit-testable independently of `run_on`.
+fn build_router(cfg: &ServeConfig, server: GlassServer, cancel: &CancellationToken) -> Router {
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build it via the builder
     // rather than a struct literal.
     //
@@ -147,24 +139,44 @@ pub async fn run_on(
         http_cfg,
     );
 
-    // The bearer-token layer fronts only the MCP service; `/healthz` is merged in
-    // afterward (outside the layer) so it stays reachable without a token — it exposes
-    // just the two grant booleans, and setup/onboarding must be able to poll it before
-    // any token is available.
-    let expected = Arc::new(cfg.token);
-    let mcp: Router =
+    // The bearer-token layer fronts only the MCP service; `/healthz` (added below,
+    // outside the layer) stays reachable without a token — it exposes just the two
+    // grant booleans, and setup/onboarding must be able to poll it before any token
+    // is available.
+    let expected = Arc::new(cfg.token.clone());
+    let mut app: Router =
         Router::new()
             .fallback_service(service)
             .layer(axum::middleware::from_fn_with_state(
                 expected,
                 auth::require_bearer,
             ));
-    let app: Router = Router::new()
-        .route(
+
+    // Exposed (non-loopback) binds omit the unauthenticated `/healthz` route so it
+    // can't leak grant state past the bearer gate; only a loopback bind gets it.
+    if cfg.addr.ip().is_loopback() {
+        app = app.route(
             "/healthz",
             get(|| async { axum::Json(crate::health::current_health()) }),
-        )
-        .merge(mcp);
+        );
+    }
+    app
+}
+
+/// Serve on an already-bound listener (so tests can bind `127.0.0.1:0`).
+pub async fn run_on(
+    listener: tokio::net::TcpListener,
+    cfg: ServeConfig,
+    glass: glass_core::Glass,
+    report: crate::audit::AuditReport,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    self_register_grants();
+
+    let server = GlassServer::new(glass, report);
+    let sessions = server.sessions();
+    let cancel = CancellationToken::new();
+    let app = build_router(&cfg, server, &cancel);
 
     let r = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -246,5 +258,45 @@ mod tests {
     #[test]
     fn allows_network_exposed_bind_with_token() {
         assert!(check_exposure(&cfg("0.0.0.0:7300", Some("s3cret"))).is_ok());
+    }
+
+    fn test_server() -> GlassServer {
+        GlassServer::new(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+        )
+    }
+
+    #[tokio::test]
+    async fn healthz_mounted_on_loopback_absent_on_exposed() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let loopback = build_router(
+            &cfg("127.0.0.1:7300", None),
+            test_server(),
+            &CancellationToken::new(),
+        );
+        let resp = loopback
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let exposed = build_router(
+            &cfg("0.0.0.0:7300", None),
+            test_server(),
+            &CancellationToken::new(),
+        );
+        let resp = exposed
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "/healthz must not be reachable on a non-loopback bind"
+        );
     }
 }
