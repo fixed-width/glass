@@ -226,6 +226,24 @@ jobs:
             --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
 
+      - name: Build + notarize .dmg
+        if: steps.creds.outputs.present == 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_API_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ./packaging/macos/make-dmg.sh --app target/macos-app/GlassMcp.app --out dist --version "${tag}"
+          ./packaging/macos/notarize.sh \
+            --dmg "dist/glass-mcp-${tag}-universal-apple-darwin.dmg" \
+            --identity "$SIGN_IDENTITY" --keychain "$SIGN_KEYCHAIN" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
+
       - name: Package
         if: steps.creds.outputs.present == 'true'
         run: |
@@ -235,13 +253,15 @@ jobs:
           mkdir -p dist
           # ditto (not zip) preserves the bundle layout + signature.
           ditto -c -k --keepParent target/macos-app/GlassMcp.app "dist/${name}.zip"
-          ( cd dist && for f in *.zip; do shasum -a 256 "$f" > "$f.sha256"; done )
+          ( cd dist && for f in *.zip *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done )
 
       - name: Attest build provenance
         if: steps.creds.outputs.present == 'true'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: |
+            dist/*.zip
+            dist/*.dmg
 
       - name: Upload to draft release
         if: steps.creds.outputs.present == 'true'
@@ -249,7 +269,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release upload "$TAG" dist/*.zip dist/*.zip.sha256 --clobber
+        run: gh release upload "$TAG" dist/*.zip dist/*.zip.sha256 dist/*.dmg dist/*.dmg.sha256 --clobber
 
   # Flip the draft live only after every build+upload job succeeded, so the published
   # release carries all its assets atomically. If any upload job failed, this job is skipped
