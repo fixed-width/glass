@@ -8,9 +8,9 @@ set -euo pipefail
 app="" out="" version=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --app)     app="$2"; shift 2 ;;
-    --out)     out="$2"; shift 2 ;;
-    --version) version="$2"; shift 2 ;;
+    --app)     [ $# -ge 2 ] || { echo "error: --app requires a value" >&2; exit 1; };     app="$2"; shift 2 ;;
+    --out)     [ $# -ge 2 ] || { echo "error: --out requires a value" >&2; exit 1; };     out="$2"; shift 2 ;;
+    --version) [ $# -ge 2 ] || { echo "error: --version requires a value" >&2; exit 1; }; version="$2"; shift 2 ;;
     -h|--help) echo "usage: make-dmg.sh --app PATH --out DIR --version X.Y.Z" >&2; exit 1 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
