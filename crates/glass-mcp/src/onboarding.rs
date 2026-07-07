@@ -220,11 +220,17 @@ pub fn run(addr: &str) -> anyhow::Result<()> {
         show_dialog(&grant_modal_text(&app_path));
 
         // C. On OK: one restart so the agent re-reads TCC (the Screen Recording grant is cached
-        // per-process at launch), then verify once via `/healthz`. Only a grants-ready read is
-        // the hand-off; a reached-but-not-ready read is a genuine missing grant; a `None`
-        // (unreachable) is never reported as a denied grant — no arm claims success falsely.
+        // per-process at launch), then verify via `/healthz`. `kickstart -k` returns as soon as
+        // launchd *spawns* the new process, not once it's listening — the fresh agent still has
+        // to build its tokio runtime, do AppKit init, and bind the socket, which takes a few
+        // hundred ms. Probing once immediately races that startup window and reports a bogus
+        // `Unreachable` on an otherwise-successful grant+restart, so bounded-poll for the first
+        // reachable read instead. That first reachable read is authoritative (a freshly-started
+        // process reads TCC fresh) and final: don't keep polling for grants to flip — the user
+        // already clicked OK, so a reached-but-not-ready read is a genuine missing grant, not a
+        // race to retry.
         crate::setup::restart_launch_agent()?;
-        let outcome = match crate::setup::fetch_health(addr) {
+        let outcome = match poll_health_until_reachable(addr) {
             Some(h) if h.grants_ready() => Outcome::Ready(h),
             Some(h) => Outcome::GrantsMissing(h),
             None => Outcome::Unreachable,
@@ -238,6 +244,26 @@ pub fn run(addr: &str) -> anyhow::Result<()> {
     {
         let _ = addr;
         anyhow::bail!("onboarding is macOS-only")
+    }
+}
+
+/// Poll the LaunchAgent's `/healthz` (via [`crate::setup::fetch_health`]) until the first
+/// reachable read or a ~10s budget elapses. Bounded to cover `kickstart -k`'s launchd-startup
+/// window (see the call site in [`run`]) — once the agent answers at all, that read's grant
+/// state is final: the caller classifies it (ready vs. grants-missing) rather than this helper
+/// looping until grants flip. macOS-only: the only platform with a `/healthz` to poll.
+#[cfg(target_os = "macos")]
+fn poll_health_until_reachable(addr: &str) -> Option<HealthStatus> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(h) = crate::setup::fetch_health(addr) {
+            return Some(h);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

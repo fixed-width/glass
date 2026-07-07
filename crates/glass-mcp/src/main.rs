@@ -45,11 +45,11 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "network")]
             {
                 if menubar {
-                    // The visible menu-bar app (macOS only) — a later task's
-                    // `menubar::run` binds and serves; for now it's a stub that bails
-                    // (see menubar.rs). Reuse `serve::config::parse_args` (the "single
-                    // source of truth" resolver `serve::run` itself delegates to below)
-                    // rather than duplicate its token-precedence/exposure-parsing logic.
+                    // The visible menu-bar app (macOS only) — `menubar::run` binds and
+                    // serves (see menubar.rs). Reuse `serve::config::parse_args` (the
+                    // "single source of truth" resolver `serve::run` itself delegates to
+                    // below) rather than duplicate its token-precedence/exposure-parsing
+                    // logic.
                     #[cfg(target_os = "macos")]
                     {
                         // `--menubar` implies serving over HTTP (the only transport today), so
