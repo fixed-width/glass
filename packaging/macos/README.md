@@ -9,10 +9,11 @@ Recording / Accessibility and install the run integration, connecting a client).
 ## Files
 
 - **`Info.plist`** — the app bundle's `Info.plist` template. Ships with the
-  production bundle id (`tech.fixedwidth.glass`) and `LSBackgroundOnly` set, so
-  glass-mcp has no Dock icon and no standard app menu; it still shows a menu-bar
-  status item at runtime (`NSStatusItem`, requested via `--menubar` — see below).
-  `build-app.sh` copies this in and can override the identifier and version.
+  production bundle id (`tech.fixedwidth.glass`) and `LSUIElement` set, so
+  glass-mcp has no Dock icon and no standard app menu but **does** show a menu-bar
+  status item at runtime (`NSStatusItem`, via `--menubar` — see below). (Not
+  `LSBackgroundOnly`, which would suppress the status item.) `build-app.sh` copies
+  this in and can override the identifier and version.
 - **`build-app.sh`** — builds `glass-mcp --release`, assembles `GlassMcp.app`
   around it, and codesigns the bundle. Run `./build-app.sh --help` for flags;
   `--identity` is required (there's deliberately no ad-hoc-signing default — an
