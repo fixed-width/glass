@@ -166,15 +166,22 @@ const FOOTER_H: f64 = 32.0;
 const CONTENT_W: f64 = WIDTH - 2.0 * H_MARGIN;
 const LABEL_W: f64 = CONTENT_W - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W;
 
-/// Total content height, driven by how many rows there are (or one line in the defensive
-/// empty-`rows` case).
-fn content_height(n_rows: usize) -> f64 {
-    let body = if n_rows == 0 {
+/// Height of the row list (or one line in the defensive empty-`rows` case). Shared by
+/// [`content_height`] (total window height) and the footer's top offset in [`run_checklist`]
+/// — both must agree on where the body ends, so this is the single source of truth for that
+/// formula.
+fn body_height(n_rows: usize) -> f64 {
+    if n_rows == 0 {
         ROW_H
     } else {
         n_rows as f64 * ROW_H + (n_rows as f64 - 1.0) * ROW_GAP
-    };
-    V_MARGIN + INSTRUCTION_H + SECTION_GAP + body + SECTION_GAP + FOOTER_H + V_MARGIN
+    }
+}
+
+/// Total content height, driven by how many rows there are (or one line in the defensive
+/// empty-`rows` case).
+fn content_height(n_rows: usize) -> f64 {
+    V_MARGIN + INSTRUCTION_H + SECTION_GAP + body_height(n_rows) + SECTION_GAP + FOOTER_H + V_MARGIN
 }
 
 /// Converts a top-down `(x, top, w, h)` box into an AppKit bottom-left-origin [`CGRect`]
@@ -324,12 +331,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
 
     // Footer "Re-check" button (right-aligned), below the body. The body is a single
     // "ready"/empty line when there are no rows, otherwise the `n_rows` checklist rows.
-    let body_h = if n_rows == 0 {
-        ROW_H
-    } else {
-        n_rows as f64 * ROW_H + (n_rows as f64 - 1.0) * ROW_GAP
-    };
-    let footer_top = body_top + body_h + SECTION_GAP;
+    let footer_top = body_top + body_height(n_rows) + SECTION_GAP;
     let recheck_target = ButtonTarget::new(mtm, on_recheck);
     // SAFETY: identical contract to the per-row buttons above — `recheck_target` is a live
     // `ButtonTarget` implementing `fire:`, kept alive in `button_targets` across the run

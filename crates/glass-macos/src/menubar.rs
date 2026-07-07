@@ -202,7 +202,11 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
 
     // 5. Uninstall glass… — routed to our custom target. The trailing ellipsis is the macOS
     // convention for "opens a dialog first": the host confirms (and warns it stops glass now)
-    // before removing the LaunchAgent, so a stray click can't uninstall.
+    // before removing the LaunchAgent, so a stray click can't uninstall. A separator sets it
+    // apart from "Quit glass" above, matching macOS HIG for destructive items.
+    let sep3 = NSMenuItem::separatorItem(mtm);
+    menu.addItem(&sep3);
+
     let uninstall_item = action_item(
         mtm,
         "Uninstall glass\u{2026}",

@@ -22,9 +22,9 @@ and notarized, macOS opens it without a Gatekeeper detour, and first-run is a do
    of that order, or a grant made elsewhere doesn't show up, click **Re-check**. Grants are
    **one-time**: keyed to the app's signed identity, they survive restarts and updates (see
    [The permission model, in short](#the-permission-model-in-short)).
-5. Once both rows read ✓, the checklist closes on its own: glass **installs its
-   LaunchAgent** (so it keeps serving across logins and restarts) and starts, showing up as
-   a **`glass ●` menu-bar item**.
+5. Once both are granted, glass relaunches into its ready state — the checklist doesn't
+   reappear, and the **`glass ●`** menu bar shows instead. Along the way it **installs its
+   LaunchAgent** (so it keeps serving across logins and restarts).
 
 That's the whole setup. The MCP endpoint is:
 
