@@ -10,12 +10,14 @@ and notarized, macOS opens it without a Gatekeeper detour, and first-run is a do
 
 1. **Download** the `.dmg` from Releases and open it.
 2. **Drag `GlassMcp.app` to `/Applications`.**
-3. **Double-click `GlassMcp.app`.** macOS shows the two standard privacy popups —
-   **Screen Recording** and **Accessibility** — both attributed to **GlassMcp.app**.
+3. **Double-click `GlassMcp.app`.** macOS shows the two standard privacy popups, in order —
+   **Accessibility first, then Screen Recording** — both attributed to **GlassMcp.app**.
    Grant both. Because the app is asking for *itself* (it's its own responsible process),
    the grants land on `GlassMcp.app` directly — no manual `＋`-add in System Settings. They
    are **one-time**: keyed to the app's signed identity, they survive restarts and updates
-   (see [The permission model, in short](#the-permission-model-in-short)).
+   (see [The permission model, in short](#the-permission-model-in-short)). When you enable
+   Screen Recording, macOS may offer to **"Quit & Reopen"** GlassMcp.app — click **Later**;
+   glass restarts its own background agent for you, so quitting it yourself isn't needed.
 4. The app then **installs its LaunchAgent** (so it keeps serving across logins and
    restarts), confirms it's serving, and shows a **completion dialog** that displays the
    MCP endpoint and **copies it to your clipboard**:
@@ -27,6 +29,21 @@ and notarized, macOS opens it without a Gatekeeper detour, and first-run is a do
 That's the whole setup. If a grant is still missing when the app checks, the dialog names
 which one and asks you to enable `GlassMcp.app` under **System Settings → Privacy &
 Security** and re-open it. Once both are in, head to [Connect your agent](#connect-your-agent).
+
+### The menu-bar item
+
+Once granted, `GlassMcp.app` runs as a **visible menu-bar app** — look for **`glass ●`** in
+the menu bar. It starts automatically at login (via the LaunchAgent) and its dropdown shows:
+
+- the **served endpoint** (or a notice if another glass is already bound to it),
+- **Copy endpoint** — copy the MCP endpoint to your clipboard again,
+- **Restart** — restart the background agent (e.g. after a fresh grant),
+- **Quit glass** — stop the agent.
+
+glass is deliberately never a silent, invisible background process: it holds Screen
+Recording and Accessibility, so it stays something you can always see and stop. **Quit
+glass** actually stops it — the LaunchAgent won't relaunch it behind your back — and it
+stays stopped until you next log in or relaunch `GlassMcp.app` yourself.
 
 ## Connect your agent
 
@@ -82,6 +99,24 @@ claude mcp add glass --scope user -- \
 Note that a stdio server is launched by — and attributed to — your MCP client, so the grants
 must attach to *that* process; the LaunchAgent model above exists precisely so glass holds its
 own grants (see [The permission model, in short](#the-permission-model-in-short)).
+
+### Optional: the `glass-mcp` CLI
+
+The `.dmg` doesn't put `glass-mcp` on your `$PATH` — it's a binary inside the app bundle, at
+`/Applications/GlassMcp.app/Contents/MacOS/glass-mcp`. You don't need it for MCP (the menu-bar
+LaunchAgent and your client registration above are the whole setup), but it's handy for
+checking things from a terminal. To use it as a plain command, symlink it onto `$PATH` once:
+
+```bash
+sudo ln -s /Applications/GlassMcp.app/Contents/MacOS/glass-mcp /usr/local/bin/glass-mcp
+```
+
+Then:
+
+```bash
+glass-mcp status   # is glass running, and at what endpoint (reads /healthz)
+glass-mcp doctor    # checks the environment, with a remedy for any gap
+```
 
 ## System requirements
 
@@ -290,6 +325,12 @@ process) and enable `GlassMcp.app` in the two Privacy panes by hand.
    mkdir -p "$HOME/Library/Logs/GlassMcp"
    launchctl bootstrap "gui/$(id -u)" "$PLIST"
    ```
+
+   The shipped template runs `glass-mcp serve --http --menubar`, so this LaunchAgent shows
+   the same **`glass ●`** menu-bar item as the `.dmg` install (see [The menu-bar
+   item](#the-menu-bar-item)). If you run `glass-mcp serve --http` directly, without
+   `--menubar` — e.g. testing a build by hand, not via the LaunchAgent — it stays headless:
+   no menu bar, no Dock icon, MCP served silently over HTTP.
 
 2. **Enable `GlassMcp.app` in both Privacy panes.** In **System Settings → Privacy &
    Security**, open **Screen Recording** and then **Accessibility**; in each, click
