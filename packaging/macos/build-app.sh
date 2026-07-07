@@ -137,6 +137,12 @@ cp "$SCRIPT_DIR/Info.plist" "$app/Contents/Info.plist"
 mkdir -p "$app/Contents/Frameworks"
 install -m 0644 "$shim" "$app/Contents/Frameworks/libglass_clip_shim_macos.dylib"
 
+# App icon: AppIcon.icns lives in Contents/Resources, named by CFBundleIconFile (AppIcon) in
+# Info.plist, so Finder/Dock show the mark instead of a blank bundle. Regenerated from
+# packaging/macos/AppIcon.svg — see packaging/macos/README.md.
+mkdir -p "$app/Contents/Resources"
+install -m 0644 "$SCRIPT_DIR/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$app/Contents/Info.plist"
 if [ -n "$version" ]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"

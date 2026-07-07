@@ -98,3 +98,10 @@ notarization steps locally instead of in CI, use `build-app.sh --universal --tim
 
 The job's skip-gate probes only `MACOS_DEVELOPER_ID_CERT_P12`; configure all six together —
 a partial configuration will run and fail at the first missing value rather than skip cleanly.
+
+## App icon
+
+`AppIcon.icns` is the Fixed Width app-icon mark, copied from `AppIcon.svg` (the public
+brand icon). `build-app.sh` installs it into `GlassMcp.app/Contents/Resources` and
+`Info.plist`'s `CFBundleIconFile` (`AppIcon`) names it, so Finder/Dock show the mark.
+Regenerate after editing the SVG: `python3 packaging/macos/make-appicon.py` (needs Pillow).

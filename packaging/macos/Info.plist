@@ -17,6 +17,8 @@
 	<string>tech.fixedwidth.glass</string>
 	<key>CFBundleExecutable</key>
 	<string>glass-mcp</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleName</key>
 	<string>GlassMcp</string>
 	<key>CFBundleDisplayName</key>
