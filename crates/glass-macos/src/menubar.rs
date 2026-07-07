@@ -17,10 +17,10 @@
 //! ## Actions
 //!
 //! "Quit glass" uses AppKit's built-in `terminate:` routed through the responder chain to
-//! `NSApp` (no custom target needed). "Copy endpoint" and "Restart" are wired to a minimal
-//! custom [`MenuTarget`] (an `objc2` `define_class!` object) that just invokes the boxed
-//! callbacks the host supplied. `setTarget:` is a *weak* reference, so the retained
-//! `MenuTarget` (and the status item and menu) are held in locals across `run`'s
+//! `NSApp` (no custom target needed). "Copy endpoint", "Restart", and "Uninstall glass…" are
+//! wired to a minimal custom [`MenuTarget`] (an `objc2` `define_class!` object) that just
+//! invokes the boxed callbacks the host supplied. `setTarget:` is a *weak* reference, so the
+//! retained `MenuTarget` (and the status item and menu) are held in locals across `run`'s
 //! `NSApplication::run` call for the whole lifetime of the app.
 
 use objc2::rc::Retained;
@@ -34,10 +34,10 @@ use objc2_foundation::NSString;
 
 use glass_core::{GlassError, Result};
 
-/// What the host asks the menu bar to show and do. The two actionable items ("Copy
-/// endpoint", "Restart") are boxed callbacks so this crate never has to know *how* they're
-/// implemented (glass-mcp's `pbcopy`/`launchctl` calls); the two text fields are shown
-/// verbatim.
+/// What the host asks the menu bar to show and do. The three actionable items ("Copy
+/// endpoint", "Restart", "Uninstall glass…") are boxed callbacks so this crate never has to
+/// know *how* they're implemented (glass-mcp's `pbcopy`/`launchctl` calls); the two text
+/// fields are shown verbatim.
 pub struct MenuBarActions {
     /// The status-item's button title in the menu bar (e.g. `"glass ●"`).
     pub title: String,
@@ -49,6 +49,11 @@ pub struct MenuBarActions {
     pub on_copy: Box<dyn Fn()>,
     /// "Restart" — restart the background LaunchAgent so a fresh process re-reads TCC grants.
     pub on_restart: Box<dyn Fn()>,
+    /// "Uninstall glass…" — remove the LaunchAgent so glass stops auto-starting (and stops
+    /// now). The host confirms first and, because uninstalling terminates this very process,
+    /// puts any "finish in the Finder" guidance in that confirmation; this crate only invokes
+    /// the callback.
+    pub on_uninstall: Box<dyn Fn()>,
 }
 
 /// The boxed callbacks, stored in [`MenuTarget`]'s instance variables. Not `Send`/`Sync`, and
@@ -57,6 +62,7 @@ pub struct MenuBarActions {
 struct Ivars {
     on_copy: Box<dyn Fn()>,
     on_restart: Box<dyn Fn()>,
+    on_uninstall: Box<dyn Fn()>,
 }
 
 define_class!(
@@ -82,6 +88,11 @@ define_class!(
         fn restart(&self, _sender: Option<&AnyObject>) {
             (self.ivars().on_restart)();
         }
+
+        #[unsafe(method(uninstall:))]
+        fn uninstall(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_uninstall)();
+        }
     }
 
     unsafe impl NSObjectProtocol for MenuTarget {}
@@ -97,8 +108,8 @@ impl MenuTarget {
 }
 
 /// Build one actionable `NSMenuItem`. `target` is `Some` for our custom-target items
-/// ("Copy endpoint"/"Restart") and `None` for `terminate:` (routed to `NSApp` through the
-/// responder chain).
+/// ("Copy endpoint"/"Restart"/"Uninstall glass…") and `None` for `terminate:` (routed to
+/// `NSApp` through the responder chain).
 fn action_item(
     mtm: MainThreadMarker,
     title: &str,
@@ -108,8 +119,8 @@ fn action_item(
 ) -> Retained<NSMenuItem> {
     // SAFETY: `initWithTitle:action:keyEquivalent:` is `unsafe` only because it takes a raw
     // selector — `action` is always either a selector `MenuTarget` implements
-    // (`copyEndpoint:`/`restart:`) or AppKit's own `terminate:`; the title and key-equivalent
-    // are valid `NSString`s.
+    // (`copyEndpoint:`/`restart:`/`uninstall:`) or AppKit's own `terminate:`; the title and
+    // key-equivalent are valid `NSString`s.
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -121,7 +132,8 @@ fn action_item(
     if let Some(target) = target {
         // SAFETY: `setTarget:` is `unsafe` because the target must respond to the item's
         // action selector — `target` is a live `MenuTarget` implementing `copyEndpoint:`/
-        // `restart:`, kept alive by [`run`] for the whole run loop (this is a weak reference).
+        // `restart:`/`uninstall:`, kept alive by [`run`] for the whole run loop (this is a weak
+        // reference).
         unsafe { item.setTarget(Some(target)) };
     }
     item.setEnabled(true);
@@ -157,6 +169,7 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
         Ivars {
             on_copy: actions.on_copy,
             on_restart: actions.on_restart,
+            on_uninstall: actions.on_uninstall,
         },
     );
 
@@ -187,16 +200,30 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
     let quit_item = action_item(mtm, "Quit glass", sel!(terminate:), "q", None);
     menu.addItem(&quit_item);
 
+    // 5. Uninstall glass… — routed to our custom target. The trailing ellipsis is the macOS
+    // convention for "opens a dialog first": the host confirms (and warns it stops glass now)
+    // before removing the LaunchAgent, so a stray click can't uninstall.
+    let uninstall_item = action_item(
+        mtm,
+        "Uninstall glass\u{2026}",
+        sel!(uninstall:),
+        "",
+        Some(&target),
+    );
+    menu.addItem(&uninstall_item);
+
     status_item.setMenu(Some(&menu));
 
     // Block the main thread on the AppKit event loop while the server serves on the caller's
     // background threads. `status_item`, `menu`, and `target` must outlive this call
     // (`setTarget:` holds only a weak reference), so they stay bound below.
     //
-    // VERIFY on-box: the status item shows the `title` ("glass ●"), the dropdown lists the four
-    // items with the status line greyed, "Copy endpoint"/"Restart" invoke the callbacks, and
-    // "Quit glass" (⌘Q → `terminate:`) exits the process cleanly. None of this is checkable off
-    // a real WindowServer/AppKit run loop; the darwin build only proves it compiles.
+    // VERIFY on-box: the status item shows the `title` ("glass ●"), the dropdown lists the
+    // greyed status line plus "Copy endpoint", "Restart", "Quit glass", and "Uninstall glass…";
+    // "Copy endpoint"/"Restart"/"Uninstall glass…" invoke their callbacks (the uninstall one
+    // raising the host's confirm dialog first), and "Quit glass" (⌘Q → `terminate:`) exits the
+    // process cleanly. None of this is checkable off a real WindowServer/AppKit run loop; the
+    // darwin build only proves it compiles.
     app.run();
 
     // Reached only if the run loop stops without the process exiting (`terminate:` normally
