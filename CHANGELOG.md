@@ -15,6 +15,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-07
+
 ### Added
 - `glass_scroll_to_element`: blind-scroll an accessibility element into view.
 - `window_id` parameter on `glass_screenshot`, `glass_wait_stable`, and
@@ -24,6 +26,16 @@ internal refactors, CI, or test-only changes.
 - macOS: `glass_start` launches `.app` bundles directly (LaunchServices /
   NSWorkspace), adopting or terminating the running app.
 - macOS: `cmd`/`command` is accepted as an alias for the Super modifier.
+- **macOS drag-install + double-click setup.** Tagged releases attach a notarized,
+  Gatekeeper-clean universal `.dmg`; drag `GlassMcp.app` to `/Applications` and
+  double-click it. A permission checklist guides granting Accessibility and Screen
+  Recording (one at a time; granting Screen Recording relaunches glass so it takes
+  effect), then glass installs a login item and runs as a visible **`glass ●`
+  menu-bar app** showing the MCP endpoint, with Copy endpoint, Restart, Quit, and
+  Uninstall.
+- macOS: `glass-mcp uninstall` (and the menu-bar "Uninstall glass…") stop glass from
+  starting at login; `glass-mcp status` reports whether glass is running and its endpoint.
+- macOS: an app icon, so `GlassMcp.app` is no longer a blank bundle in Finder and the Dock.
 
 ### Fixed
 - x11: off-screen captures are clipped to the display instead of failing with
@@ -99,7 +111,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fixed-width/glass/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fixed-width/glass/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/fixed-width/glass/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/fixed-width/glass/compare/c1d0d5f...v0.1.1
