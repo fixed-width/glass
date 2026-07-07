@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::routing::get;
 use axum::Router;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
@@ -24,7 +25,11 @@ use session_gate::SingleSessionManager;
 /// any authenticated bind. Pure (no I/O) so this security invariant is unit-
 /// testable independently of actually binding a socket; `run` prints the advisory
 /// notes for the allowed cases.
-fn check_exposure(cfg: &ServeConfig) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so menu-bar mode (`crate::menubar`) applies the identical fail-closed rule
+/// before binding its own listener — a `--menubar` serve on an exposed address must honor the
+/// same policy as a headless `serve --http`.
+pub(crate) fn check_exposure(cfg: &ServeConfig) -> anyhow::Result<()> {
     if let Exposure::ExposedNoToken = cfg.exposure() {
         anyhow::bail!(
             "refusing to bind {} without a token: anyone on the network could drive this \
@@ -87,17 +92,12 @@ pub async fn run(
     run_on(listener, cfg, crate::boot(sink), report).await
 }
 
-/// Serve on an already-bound listener (so tests can bind `127.0.0.1:0`).
-pub async fn run_on(
-    listener: tokio::net::TcpListener,
-    cfg: ServeConfig,
-    glass: glass_core::Glass,
-    report: crate::audit::AuditReport,
-) -> anyhow::Result<()> {
-    let server = GlassServer::new(glass, report);
-    let sessions = server.sessions();
-
-    let cancel = CancellationToken::new();
+/// Assemble the outer HTTP router: `/healthz` (unauthenticated, loopback-only — see
+/// below) merged with the bearer-gated MCP service. `cancel` is threaded into
+/// `StreamableHttpServerConfig` so that a caller cancelling the *same* token (e.g.
+/// `run_on`'s graceful-shutdown hook) also stops in-flight MCP sessions. Doesn't touch
+/// a socket, so this is unit-testable independently of `run_on`.
+fn build_router(cfg: &ServeConfig, server: GlassServer, cancel: &CancellationToken) -> Router {
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build it via the builder
     // rather than a struct literal.
     //
@@ -120,15 +120,41 @@ pub async fn run_on(
         http_cfg,
     );
 
-    // The bearer-token layer fronts the MCP service.
-    let expected = Arc::new(cfg.token);
-    let app: Router =
+    // The bearer-token layer fronts only the MCP service; `/healthz` (added below,
+    // outside the layer) stays reachable without a token — it exposes just the two
+    // grant booleans, and setup/onboarding must be able to poll it before any token
+    // is available.
+    let expected = Arc::new(cfg.token.clone());
+    let mut app: Router =
         Router::new()
             .fallback_service(service)
             .layer(axum::middleware::from_fn_with_state(
                 expected,
                 auth::require_bearer,
             ));
+
+    // Exposed (non-loopback) binds omit the unauthenticated `/healthz` route so it
+    // can't leak grant state past the bearer gate; only a loopback bind gets it.
+    if cfg.addr.ip().is_loopback() {
+        app = app.route(
+            "/healthz",
+            get(|| async { axum::Json(crate::health::current_health()) }),
+        );
+    }
+    app
+}
+
+/// Serve on an already-bound listener (so tests can bind `127.0.0.1:0`).
+pub async fn run_on(
+    listener: tokio::net::TcpListener,
+    cfg: ServeConfig,
+    glass: glass_core::Glass,
+    report: crate::audit::AuditReport,
+) -> anyhow::Result<()> {
+    let server = GlassServer::new(glass, report);
+    let sessions = server.sessions();
+    let cancel = CancellationToken::new();
+    let app = build_router(&cfg, server, &cancel);
 
     let r = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -210,5 +236,45 @@ mod tests {
     #[test]
     fn allows_network_exposed_bind_with_token() {
         assert!(check_exposure(&cfg("0.0.0.0:7300", Some("s3cret"))).is_ok());
+    }
+
+    fn test_server() -> GlassServer {
+        GlassServer::new(
+            crate::boot(None),
+            crate::audit::report_from_config(None, |_| None),
+        )
+    }
+
+    #[tokio::test]
+    async fn healthz_mounted_on_loopback_absent_on_exposed() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let loopback = build_router(
+            &cfg("127.0.0.1:7300", None),
+            test_server(),
+            &CancellationToken::new(),
+        );
+        let resp = loopback
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let exposed = build_router(
+            &cfg("0.0.0.0:7300", None),
+            test_server(),
+            &CancellationToken::new(),
+        );
+        let resp = exposed
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "/healthz must not be reachable on a non-loopback bind"
+        );
     }
 }

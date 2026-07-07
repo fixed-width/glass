@@ -5,12 +5,22 @@ pub mod audit;
 pub mod cli;
 pub mod doctor;
 mod env;
+pub(crate) mod health;
+pub mod launch;
+// `menubar::run` takes a `serve::config::ServeConfig`, so — like `serve` itself — this module
+// only exists when the network transport is compiled in; a `--no-default-features` ("free",
+// stdio-only) build has no HTTP transport for `--menubar` to serve over (see main.rs's Serve
+// arm, which already bails for plain `serve --http` in that build).
+#[cfg(feature = "network")]
+pub mod menubar;
+pub mod onboarding;
 mod params;
 #[cfg(feature = "network")]
 pub mod serve;
 pub(crate) mod server;
 pub mod setup;
 pub(crate) mod shutdown;
+pub(crate) mod status;
 mod tools;
 mod untrusted;
 
@@ -142,6 +152,95 @@ pub fn run_env(json: bool) -> ! {
     };
     print!("{out}");
     std::process::exit(0);
+}
+
+/// `glass-mcp status [--addr ADDR]`: report whether a glass server is running and its
+/// endpoint. A thin `pub` forwarder to [`status::run`], the same shape as [`run_env`]/
+/// [`run_doctor`] over their own private-to-this-crate modules: `status` (like `env`) is a
+/// CLI-only concern with no library/integration-test consumer, so it stays `pub(crate)`
+/// and only this wrapper is public — `main.rs` is a separate crate from this library, so it
+/// can't name a `pub(crate)` item directly.
+pub fn run_status(addr: Option<&str>) -> anyhow::Result<()> {
+    status::run(addr)
+}
+
+/// Run the `uninstall` subcommand: stop + remove the login LaunchAgent, then print the "drag
+/// GlassMcp.app to the Trash" note. Doesn't touch the app bundle itself — only the LaunchAgent's
+/// stop/start-at-login registration, which is the part `glass-mcp` can actually reach; removing
+/// the `.app` is a Finder action the user does by hand.
+#[cfg(target_os = "macos")]
+pub fn run_uninstall() -> anyhow::Result<()> {
+    setup::uninstall_launch_agent()?;
+    println!("glass no longer starts at login. To remove the app, drag GlassMcp.app to the Trash.");
+    Ok(())
+}
+
+/// Non-macOS: no LaunchAgent to remove.
+#[cfg(not(target_os = "macos"))]
+pub fn run_uninstall() -> anyhow::Result<()> {
+    anyhow::bail!("uninstall is macOS-only")
+}
+
+/// Spike/diagnostic (`debug-grants`): poll the two TCC grants once a second in one long-lived
+/// process, so you can watch which flips live when granted in System Settings (Accessibility)
+/// vs. which stays stale until the process relaunches (Screen Recording — `CGPreflightScreen
+/// CaptureAccess` is a launch-time snapshot). Confirms the mechanics the onboarding flow relies on.
+#[cfg(target_os = "macos")]
+pub fn run_debug_grants() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    println!("watching TCC grants once a second (Ctrl-C to stop).");
+    println!("grant each in System Settings > Privacy & Security and watch which flips here:");
+    loop {
+        let ax = glass_macos::accessibility_granted();
+        let sr = glass_macos::screen_recording_granted();
+        println!("accessibility={ax}  screen_recording={sr}");
+        std::io::stdout().flush().ok();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Non-macOS: no TCC to poll.
+#[cfg(not(target_os = "macos"))]
+pub fn run_debug_grants() -> anyhow::Result<()> {
+    anyhow::bail!("debug-grants is macOS-only")
+}
+
+/// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window so its
+/// rendering + the per-row "Request…" and "Re-check" buttons can be smoke-tested on-box
+/// without building `GlassMcp.app`. Rows reflect the REAL grant snapshot; "Request…" opens
+/// the actual System Settings pane (so you can confirm the panes open); "Re-check" only prints
+/// (a real relaunch belongs to the onboarder, not this harness).
+#[cfg(target_os = "macos")]
+pub fn run_debug_checklist() -> anyhow::Result<()> {
+    use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
+    let actions = ChecklistActions {
+        rows: vec![
+            GrantRow {
+                label: "Accessibility",
+                granted: glass_macos::accessibility_granted(),
+                on_open_settings: Box::new(|| {
+                    eprintln!("[debug-checklist] Request: Accessibility");
+                    let _ = glass_macos::open_pane(glass_macos::accessibility_pane_url());
+                }),
+            },
+            GrantRow {
+                label: "Screen Recording",
+                granted: glass_macos::screen_recording_granted(),
+                on_open_settings: Box::new(|| {
+                    eprintln!("[debug-checklist] Request: Screen Recording");
+                    let _ = glass_macos::open_pane(glass_macos::screen_recording_pane_url());
+                }),
+            },
+        ],
+        on_recheck: Box::new(|| eprintln!("[debug-checklist] Re-check clicked (harness: no-op)")),
+    };
+    run_checklist(actions).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Non-macOS: no checklist window.
+#[cfg(not(target_os = "macos"))]
+pub fn run_debug_checklist() -> anyhow::Result<()> {
+    anyhow::bail!("debug-checklist is macOS-only")
 }
 
 /// Run the `doctor` subcommand and exit.

@@ -1,6 +1,10 @@
 use clap::Parser;
 use glass_mcp::cli::{Cli, Command};
-use glass_mcp::{boot, run_doctor, run_env, run_stdio, setup};
+use glass_mcp::launch::NoArgLaunch;
+use glass_mcp::{
+    boot, launch, onboarding, run_debug_checklist, run_debug_grants, run_doctor, run_env,
+    run_status, run_stdio, run_uninstall, setup,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,28 +27,70 @@ async fn main() -> anyhow::Result<()> {
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
-        // No subcommand: serve MCP over stdio (the default).
-        None => {
-            let (sink, report) =
-                glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-            run_stdio(boot(sink), report).await
-        }
+        // No subcommand: a LaunchServices double-click routes to onboarding; an MCP client's
+        // stdio spawn (the default, and the only case off macOS) serves MCP over stdio.
+        None => match launch::detect_no_arg_launch() {
+            NoArgLaunch::Onboarding => onboarding::run(onboarding::DEFAULT_ADDR),
+            NoArgLaunch::StdioServe => {
+                let (sink, report) =
+                    glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
+                run_stdio(boot(sink), report).await
+            }
+        },
         Some(Command::Doctor { deep, json }) => run_doctor(deep, json, audit_log.as_deref()),
         Some(Command::Env { json }) => run_env(json),
         Some(Command::Serve {
             http,
             addr,
             token_file,
+            menubar,
         }) => {
             #[cfg(feature = "network")]
             {
-                let (sink, report) =
-                    glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                glass_mcp::serve::run(http, addr, token_file, sink, report).await
+                if menubar {
+                    // The visible menu-bar app (macOS only) — `menubar::run` binds and
+                    // serves (see menubar.rs). Reuse `serve::config::parse_args` (the
+                    // "single source of truth" resolver `serve::run` itself delegates to
+                    // below) rather than duplicate its token-precedence/exposure-parsing
+                    // logic.
+                    #[cfg(target_os = "macos")]
+                    {
+                        // `--menubar` implies serving over HTTP (the only transport today), so
+                        // don't require the caller to also pass `--http`: `serve --menubar`
+                        // alone must not error "serve requires --http". The plist passes both;
+                        // this makes the flag redundant rather than mandatory.
+                        let _ = http;
+                        let mut argv: Vec<String> = vec!["--http".into()];
+                        if let Some(a) = addr {
+                            argv.push("--addr".into());
+                            argv.push(a);
+                        }
+                        if let Some(tf) = token_file {
+                            argv.push("--token-file".into());
+                            argv.push(tf);
+                        }
+                        let cfg = glass_mcp::serve::config::parse_args(
+                            &argv,
+                            std::env::var("GLASS_TOKEN").ok(),
+                            |p| std::fs::read_to_string(p),
+                        )
+                        .map_err(|e| anyhow::anyhow!("glass serve --menubar: {e}"))?;
+                        glass_mcp::menubar::run(cfg)
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = (http, addr, token_file, &audit_log);
+                        anyhow::bail!("--menubar is macOS-only")
+                    }
+                } else {
+                    let (sink, report) =
+                        glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
+                    glass_mcp::serve::run(http, addr, token_file, sink, report).await
+                }
             }
             #[cfg(not(feature = "network"))]
             {
-                let _ = (http, addr, token_file, &audit_log);
+                let _ = (http, addr, token_file, menubar, &audit_log);
                 anyhow::bail!(
                     "`serve` (the network transport) is not included in this build; it \
                      requires the default-on `network` feature, which a \
@@ -81,5 +127,9 @@ async fn main() -> anyhow::Result<()> {
             })?;
             Ok(())
         }
+        Some(Command::Status { addr }) => run_status(addr.as_deref()),
+        Some(Command::Uninstall) => run_uninstall(),
+        Some(Command::DebugGrants) => run_debug_grants(),
+        Some(Command::DebugChecklist) => run_debug_checklist(),
     }
 }

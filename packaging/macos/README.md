@@ -9,19 +9,23 @@ Recording / Accessibility and install the run integration, connecting a client).
 ## Files
 
 - **`Info.plist`** — the app bundle's `Info.plist` template. Ships with the
-  production bundle id (`tech.fixedwidth.glass`) and `LSBackgroundOnly` set —
-  glass-mcp is a headless agent with no windows, no menu bar, and nothing to show
-  in the Dock. `build-app.sh` copies this in and can override the identifier and
-  version.
+  production bundle id (`tech.fixedwidth.glass`) and `LSUIElement` set, so
+  glass-mcp has no Dock icon and no standard app menu but **does** show a menu-bar
+  status item at runtime (`NSStatusItem`, via `--menubar` — see below). (Not
+  `LSBackgroundOnly`, which would suppress the status item.) `build-app.sh` copies
+  this in and can override the identifier and version.
 - **`build-app.sh`** — builds `glass-mcp --release`, assembles `GlassMcp.app`
   around it, and codesigns the bundle. Run `./build-app.sh --help` for flags;
   `--identity` is required (there's deliberately no ad-hoc-signing default — an
   ad-hoc signature's Designated Requirement isn't stable, so TCC grants wouldn't
   survive a rebuild).
 - **`tech.fixedwidth.glass.plist`** — a `gui/<uid>` LaunchAgent template that runs
-  the bundled binary as `glass-mcp serve --http`. Copy it, fill in the
-  placeholders (your home directory, and the app path if you didn't install to
-  `/Applications`), then load it.
+  the bundled binary as `glass-mcp serve --http --menubar`: a visible `glass ●`
+  menu-bar item (endpoint, Copy endpoint, Restart, Quit glass) alongside the MCP
+  server. `KeepAlive` is `false`, so **Quit glass** actually stops it — launchd
+  won't relaunch the job until the next login (`RunAtLoad` starts it then). Copy
+  the template, fill in the placeholders (your home directory, and the app path
+  if you didn't install to `/Applications`), then load it.
 
 ## Build + sign
 
@@ -94,3 +98,10 @@ notarization steps locally instead of in CI, use `build-app.sh --universal --tim
 
 The job's skip-gate probes only `MACOS_DEVELOPER_ID_CERT_P12`; configure all six together —
 a partial configuration will run and fail at the first missing value rather than skip cleanly.
+
+## App icon
+
+`AppIcon.icns` is the Fixed Width app-icon mark, copied from `AppIcon.svg` (the public
+brand icon). `build-app.sh` installs it into `GlassMcp.app/Contents/Resources` and
+`Info.plist`'s `CFBundleIconFile` (`AppIcon`) names it, so Finder/Dock show the mark.
+Regenerate after editing the SVG: `python3 packaging/macos/make-appicon.py` (needs Pillow).

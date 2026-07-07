@@ -76,10 +76,43 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSResponder",
+    # The visible menu-bar app (`menubar.rs`): the system status bar (`NSStatusBar`), its
+    # variable-length item (`NSStatusItem`) and the item's clickable button
+    # (`NSStatusBarButton`, whose title-setter lives on its `NSButton`/`NSControl`/`NSView`
+    # superclasses — each a separate per-type feature the `NSStatusItem::button(mtm)` binding
+    # is `cfg`-gated on), plus the dropdown menu (`NSMenu` + `NSMenuItem`).
+    # `NSApplicationActivationPolicy` (Accessory/LSUIElement) rides along with the already-on
+    # `NSApplication` + `NSRunningApplication` features (its `setActivationPolicy:` setter is
+    # `cfg`-gated on `NSRunningApplication`).
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    "NSMenu",
+    "NSMenuItem",
+    # The first-run permission checklist window (`onboarding_window.rs`): `NSWindow` (the
+    # window itself + its `NSWindowDelegate` protocol and `setDelegate:` — used to terminate
+    # the onboarder when the window closes; it also transitively enables the
+    # `objc2-foundation` `NSNotification`/`NSGeometry` features the delegate's
+    # `windowWillClose:` and the frame math need), `NSGraphics` (gates
+    # `NSWindow::initWithContentRect:styleMask:backing:defer:` and its `NSBackingStoreType`
+    # argument), and `NSTextField` (the instruction line, per-row labels + status glyphs via
+    # `labelWithString:`/`wrappingLabelWithString:`). The window's "Open Settings"/"Re-check"
+    # push buttons reuse the already-on `NSButton`/`NSControl`/`NSView` features above.
+    "NSWindow",
+    "NSGraphics",
+    "NSTextField",
+    # `CGFloat` — the status-item length type: `NSStatusBar::statusItemWithLength:` and the
+    # `NSVariableStatusItemLength` constant are both `cfg`-gated on app-kit's own
+    # `objc2-core-foundation` feature (which pulls the `CGFloat` alias in).
+    "objc2-core-foundation",
     # `NSRunningApplication` — focus-before-inject (`input.rs::focus`), plus the
     # bundle-launch adopt/terminate FFI (`ffi.rs::running_pid_for_bundle_id`/`terminate_app`);
     # `libc` unlocks its `runningApplicationWithProcessIdentifier(pid: libc::pid_t)` class
-    # method.
+    # method. Also gates `NSApplicationActivationPolicy` + `NSApplication::setActivationPolicy:`
+    # used by `menubar.rs`.
     "NSRunningApplication",
     # `NSWorkspace` — `ffi.rs::launch_bundle`'s `NSWorkspace.openApplication(at:configuration:
     # completionHandler:)`. Also gates `NSWorkspaceOpenConfiguration` (header-translator

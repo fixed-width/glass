@@ -53,6 +53,10 @@ pub enum Command {
         /// File containing the bearer token (overrides GLASS_TOKEN).
         #[arg(long)]
         token_file: Option<String>,
+        /// Also run the visible menu-bar app (macOS). Implies --http; the app serves
+        /// MCP on a background thread while an NSStatusItem shows it is running.
+        #[arg(long)]
+        menubar: bool,
     },
     /// Generate a bearer token for the network transport.
     GenToken {
@@ -75,6 +79,24 @@ pub enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// Report whether a glass server is running and its endpoint (reads /healthz).
+    Status {
+        /// Address to check (default: 127.0.0.1:7300).
+        #[arg(long)]
+        addr: Option<String>,
+    },
+    /// Remove the login LaunchAgent so glass stops starting at login (macOS). Then drag
+    /// GlassMcp.app to the Trash to remove the app itself.
+    Uninstall,
+    /// Spike/diagnostic: poll the two TCC grants once a second in one long-lived process,
+    /// so you can watch which flips live when granted (Accessibility) vs. stays stale until
+    /// relaunch (Screen Recording). macOS-only; hidden from help.
+    #[command(hide = true)]
+    DebugGrants,
+    /// Spike/diagnostic: show the onboarding permission-checklist window with dummy rows, so
+    /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
+    #[command(hide = true)]
+    DebugChecklist,
 }
 
 #[cfg(test)]
@@ -134,10 +156,12 @@ mod tests {
                 http,
                 addr,
                 token_file,
+                menubar,
             }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
+                assert!(!menubar, "menubar defaults to false");
             }
             other => panic!("expected serve, got {other:?}"),
         }
@@ -218,6 +242,32 @@ mod tests {
         let err = Cli::try_parse_from(["glass-mcp", "setup", "--launchagent", "--no-launchagent"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn serve_accepts_menubar_flag() {
+        let cli = Cli::try_parse_from(["glass-mcp", "serve", "--http", "--menubar"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { menubar: true, .. })
+        ));
+    }
+
+    #[test]
+    fn status_subcommand_parses_with_optional_addr() {
+        let cli = Cli::try_parse_from(["glass-mcp", "status"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status { addr: None })));
+        let cli = Cli::try_parse_from(["glass-mcp", "status", "--addr", "127.0.0.1:7300"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Status { addr: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn uninstall_subcommand_parses() {
+        let cli = Cli::try_parse_from(["glass-mcp", "uninstall"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Uninstall)));
     }
 
     #[test]

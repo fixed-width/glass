@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Fixed Width app icon">
+  <!-- Ink tile -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="#15202B"/>
+  <!-- Mark (canonical paths). The artwork bbox (x16-48, y14-50) is fit to a centered safe
+       area: scale 9 -> 324px tall (~63% of tile), translate(-32,-32) to center at (256,256). -->
+  <g transform="translate(-32,-32) scale(9)">
+    <path d="M16,14 H26 V19 H21 V45 H26 V50 H16 Z" fill="#FAFAFA"/>
+    <path d="M48,14 H38 V19 H43 V45 H38 V50 H48 Z" fill="#FAFAFA"/>
+    <path d="M30,25 H34 V30 H39 V34 H34 V39 H30 V34 H25 V30 H30 Z" fill="#FF9F1C"/>
+  </g>
+</svg>

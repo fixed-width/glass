@@ -62,8 +62,11 @@ cargo build --release -p glass-mcp        # → target/release/glass-mcp
 ```
 
 (Tagged releases also attach prebuilt **Linux and Windows** binaries to the GitHub
-Releases page, with per-platform setup notes under [`packaging/`](packaging). macOS
-prebuilt binaries are a future addition — build from source for now, following
+Releases page, with per-platform setup notes under [`packaging/`](packaging). For **macOS**,
+a tagged release attaches a **notarized universal `.dmg`** — drag `GlassMcp.app` to
+`/Applications` and double-click it. A permission checklist walks you through granting
+Accessibility and Screen Recording, then the app runs as a visible **`glass ●` menu-bar
+app**, starting at login (with an **Uninstall glass…** item when you want it gone); see
 [docs/running-on-macos.md](docs/running-on-macos.md).)
 
 ### Verify

@@ -1,15 +1,25 @@
-//! `glass-mcp setup`: the guided macOS first-run — request the two TCC grants (Screen
-//! Recording, Accessibility), install the chosen run integration (an unattended
-//! `gui/<uid>` LaunchAgent serving HTTP, or nothing for an attended/stdio client-spawned
-//! run), and confirm with `doctor` plus a ready-to-paste MCP-client registration line.
+//! `glass-mcp setup`: the guided macOS first-run — install the chosen run integration (an
+//! unattended `gui/<uid>` LaunchAgent serving HTTP, or nothing for an attended/stdio
+//! client-spawned run), then — for the LaunchAgent — guide the user to enable **GlassMcp.app**
+//! in the two TCC panes (Screen Recording, Accessibility) and verify by polling that agent's
+//! own `/healthz`, and confirm with `doctor` plus a ready-to-paste MCP-client registration
+//! line. The terminal itself never requests a grant: a terminal-attributed TCC grant keys to
+//! the terminal, not to GlassMcp.app — so `setup` guides + verifies instead of prompting.
 //!
 //! This module is split so the parts that don't need macOS are unit-testable on Linux:
 //! [`RunMode`], [`registration_line`], [`fill_launch_agent`], [`run_mode_from_flags`],
-//! [`is_inside_app_bundle`], and [`codesign_report_is_unstable`] are pure — no OS call, no
-//! IO — and are exercised here. The interactive grant flow itself
-//! (`#[cfg(target_os = "macos")]` inside [`run`], plumbed through the private `macos_impl`
-//! submodule) is macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real
-//! file writes.
+//! [`is_inside_app_bundle`], [`codesign_report_is_unstable`], [`parse_health_response`], and
+//! [`fetch_health`] are pure/cross-platform — a raw TCP `GET /healthz` and a JSON parse, no
+//! macOS-specific call — and are exercised (or, for `fetch_health`, reachable) on every
+//! target: `glass-mcp status` (`status.rs`) polls a running server's health on any OS, not
+//! just macOS. The interactive grant flow itself (`#[cfg(target_os = "macos")]` inside
+//! [`run`], plumbed through the private `macos_impl` submodule) is macOS-only: permission
+//! prompts, `codesign`/`launchctl` shell-outs, real file writes. `fetch_health` stays its own
+//! top-level `pub(crate) fn` rather than moving into `macos_impl` (itself macOS-only) since
+//! it has callers both outside that module and outside macOS entirely (see its doc comment).
+//! The onboarding module also needs to install the LaunchAgent, so a thin top-level
+//! `install_launch_agent` forwards to `macos_impl::install_launch_agent` for the same reason:
+//! a private `mod` can't be named from a sibling module regardless of its items' visibility.
 
 // `GlassError` itself is only named in the `#[cfg(not(target_os = "macos"))]` arm of `run`
 // (and its test) — on a macOS build that arm doesn't exist, so import only `Result` here
@@ -18,6 +28,26 @@
 use std::path::Path;
 
 use glass_core::Result;
+
+// `HealthStatus` is named by `parse_health_response` (below) and `fetch_health` (near
+// `macos_impl`) unconditionally: both are cross-platform (plain TCP + JSON, no macOS API),
+// since `status::run` polls a server's health on every target, not just macOS.
+use crate::health::HealthStatus;
+
+/// Extract and validate a [`HealthStatus`] out of a raw `/healthz` HTTP response: split off
+/// the body at the blank line, require a `200` status line, then deserialize the body as
+/// JSON. `None` for anything short of a genuinely healthy response — text that isn't HTTP at
+/// all, a non-200 status, or a body that doesn't deserialize — never a fabricated
+/// [`HealthStatus`]. Pure (no IO), so it's unit-tested here directly against literal
+/// response text; [`fetch_health`] is the only real caller, feeding it a live socket read.
+fn parse_health_response(raw: &str) -> Option<HealthStatus> {
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    let status_ok = head.lines().next()?.split_whitespace().nth(1) == Some("200");
+    if !status_ok {
+        return None;
+    }
+    serde_json::from_str::<HealthStatus>(body.trim()).ok()
+}
 
 /// How the user will run `glass-mcp` after setup completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +181,76 @@ pub fn codesign_report_is_unstable(report: &str) -> bool {
     report.contains("adhoc") || report.contains("not signed")
 }
 
+/// The default install location named in the enable-in-System-Settings guidance when the
+/// running binary isn't inside a `*.app` bundle (e.g. a bare `cargo run`), so the instruction
+/// still points at a concrete path the user can add with the pane's `＋` button.
+#[cfg(any(target_os = "macos", test))]
+const DEFAULT_APP_PATH: &str = "/Applications/GlassMcp.app";
+
+/// One line of guided-enable instruction for a TCC pane: enable **GlassMcp.app** (the running
+/// server's own responsible process — never this terminal) in Privacy & Security → `label`,
+/// naming the `.app` bundle path so the user can add it with the pane's `＋` if it isn't
+/// already listed. Deliberately says nothing about a consent dialog / "click Allow": the
+/// terminal `setup` no longer requests a grant, so no prompt appears — the grant is granted by
+/// toggling GlassMcp.app on in the pane. Pure (no IO); reused by onboarding. Gated to
+/// macOS+test so a plain non-test Linux/Windows build doesn't warn it dead.
+#[cfg(any(target_os = "macos", test))]
+fn enable_instruction(label: &str, app_path: &str) -> String {
+    format!(
+        "Enable GlassMcp.app in System Settings → Privacy & Security → {label}: \
+         toggle it on if listed, otherwise click ＋ and add: {app_path}"
+    )
+}
+
+/// The `*.app` bundle path to name in [`enable_instruction`]. Walks up from `exe`
+/// (`…/GlassMcp.app/Contents/MacOS/glass-mcp`) to the enclosing `*.app` directory when `exe`
+/// sits inside a bundle (per [`is_inside_app_bundle`]); otherwise falls back to
+/// [`DEFAULT_APP_PATH`], so a bare `cargo run` still yields a concrete path to add. Pure (path
+/// shape only, no filesystem access), so it's unit-tested on Linux against fabricated paths.
+/// `pub(crate)` so the onboarding module reuses this validated helper (via
+/// [`is_inside_app_bundle`]) rather than keeping its own weaker walk-up-to-any-`.app` copy.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn app_bundle_path(exe: &Path) -> String {
+    // `is_inside_app_bundle` guarantees the three-parents-up ancestor is the `*.app` dir.
+    if is_inside_app_bundle(exe) {
+        if let Some(bundle) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+            return bundle.to_string_lossy().into_owned();
+        }
+    }
+    DEFAULT_APP_PATH.to_string()
+}
+
+/// The LaunchAgent's `launchctl` job label — matches the shipped plist's `<key>Label</key>`
+/// (`packaging/macos/tech.fixedwidth.glass.plist`) and its filename on disk. Named once so
+/// [`launch_agent_target`] and [`launch_agent_plist_path`] can't drift from each other or from
+/// the plist itself.
+#[cfg(any(target_os = "macos", test))]
+const LAUNCH_AGENT_LABEL: &str = "tech.fixedwidth.glass";
+
+/// The `gui/<uid>/<label>` target spec `launchctl bootout`/`bootstrap`/`kickstart` address the
+/// LaunchAgent job by, given this process's numeric uid (see `macos_impl::self_uid`). Pure
+/// string formatting — no OS call — so it's unit-tested on Linux; [`macos_impl::install_launch_agent`]
+/// and [`macos_impl::restart_launch_agent`] are the two real callers, both feeding it a live
+/// uid, so the target derivation lives in exactly one place instead of two.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn launch_agent_target(uid: u32) -> String {
+    format!("gui/{uid}/{LAUNCH_AGENT_LABEL}")
+}
+
+/// The path `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` the LaunchAgent plist is
+/// written to and later `bootstrap`ped from, given the resolved `$HOME`. Pure path-joining —
+/// no filesystem access — so it's unit-tested on Linux; used by
+/// [`macos_impl::install_launch_agent`], which both writes and `bootstrap`s the file.
+/// [`macos_impl::restart_launch_agent`] doesn't need it — it restarts the already-loaded job
+/// via `launchctl kickstart -k` against [`launch_agent_target`] alone, without touching the
+/// plist.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn launch_agent_plist_path(home: &str) -> std::path::PathBuf {
+    Path::new(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+}
+
 /// The parsed `setup` invocation, forwarded from the `Setup` clap variant (see `cli.rs`). A
 /// struct rather than four positional arguments to [`run`] so the three adjacent `bool`s can't
 /// be transposed at the call site without a field-name mismatch.
@@ -213,61 +313,53 @@ pub fn run(args: SetupArgs) -> Result<()> {
             }
             glass_macos::SessionState::Locked => {
                 println!(
-                    "note: the console session is locked/asleep. That doesn't block \
-                     requesting permissions below, but capture/input won't work until it's \
-                     unlocked (`caffeinate -d` keeps the display awake, no sudo needed)."
+                    "note: the console session is locked/asleep. That doesn't block installing \
+                     the LaunchAgent or enabling GlassMcp.app below, but capture/input won't \
+                     work until it's unlocked (`caffeinate -d` keeps the display awake, no sudo \
+                     needed)."
                 );
             }
             glass_macos::SessionState::Unlocked => {}
         }
 
-        // Step 2: request the two TCC grants, one at a time. `Some((label, instruction))`
-        // for a grant that's still missing once the poll times out; `None` once `granted()`
-        // itself confirms it — never claimed on the user's say-so alone.
-        println!("\nRequesting permissions:");
-        let screen_recording = macos_impl::ensure_granted(
-            "Screen Recording",
-            glass_macos::screen_recording_pane_url(),
-            glass_macos::screen_recording_remedy(),
-            glass_macos::screen_recording_granted,
-            glass_macos::request_screen_recording,
-            true, // needs_relaunch_note: SR only takes effect for this process after a relaunch
-            non_interactive,
-        );
-        let accessibility = macos_impl::ensure_granted(
-            "Accessibility",
-            glass_macos::accessibility_pane_url(),
-            glass_macos::accessibility_remedy(),
-            glass_macos::accessibility_granted,
-            glass_macos::request_accessibility,
-            false,
-            non_interactive,
-        );
-        let mut pending: Vec<(&'static str, String)> = [screen_recording, accessibility]
-            .into_iter()
-            .flatten()
-            .collect();
-
-        // Step 3: pick the run mode and, for the unattended LaunchAgent, install it.
+        // Step 2: resolve the run mode, the app binary + its `.app` bundle path (for the
+        // enable-in-System-Settings guidance), and the HTTP bind address.
         let mode = match run_mode_from_flags(launchagent, no_launchagent) {
             Some(mode) => mode,
             None if non_interactive => RunMode::Stdio, // no prompts allowed; least-invasive default
             None => macos_impl::prompt_run_mode(),
         };
         let app_bin = exe.to_string_lossy().into_owned();
+        let app_path = app_bundle_path(&exe);
         let addr = addr.unwrap_or_else(|| macos_impl::DEFAULT_ADDR.to_string());
+
+        // `Some((label, instruction))` per outstanding action once the flow settles; an empty
+        // `pending` is the only thing that lets `setup` exit zero.
+        let mut pending: Vec<(&'static str, String)> = Vec::new();
+
+        // Step 3: install the LaunchAgent (unattended/HTTP) and, once it's serving, guide the
+        // user to enable GlassMcp.app in the two Privacy panes — then verify by polling the
+        // *agent's* own `/healthz`. Crucially, this terminal never requests a TCC grant
+        // itself: a terminal-attributed grant keys to the terminal, not to GlassMcp.app (the
+        // bug this flow fixes). The attended/stdio path installs nothing and only warns.
         match mode {
-            // A LaunchAgent that loaded but isn't yet serving is an outstanding action, not a
-            // success: fold it into the same `pending` / non-zero-exit path a missing grant
-            // uses rather than printing a false "installed + started" (no-silent-success).
             RunMode::Http => {
+                // A LaunchAgent that loaded but isn't yet serving is an outstanding action,
+                // not a success: fold it into the same `pending` / non-zero-exit path a
+                // missing grant uses (no-silent-success). Only guide+verify once it's up —
+                // polling `/healthz` on a dead agent would just burn the whole timeout.
                 if let Some(item) = macos_impl::install_launch_agent(&app_bin, &addr)? {
                     pending.push(item);
+                } else {
+                    macos_impl::guide_enable_and_verify(&app_path, &addr, &mut pending);
                 }
             }
             RunMode::Stdio => println!(
-                "\nNot installing the LaunchAgent (attended/stdio). If one is already loaded \
-                 from a previous run, remove it with: launchctl bootout gui/{}/tech.fixedwidth.glass",
+                "\nNot installing the LaunchAgent (attended/stdio). On macOS a stdio server's \
+                 TCC grant keys to whichever MCP client spawns it, which is fragile; the HTTP \
+                 LaunchAgent (`--launchagent`) is the recommended, grant-bearing setup. If one \
+                 is already loaded from a previous run, remove it with: launchctl bootout \
+                 gui/{}/tech.fixedwidth.glass",
                 macos_impl::self_uid(),
             ),
         }
@@ -298,6 +390,83 @@ pub fn run(args: SetupArgs) -> Result<()> {
     }
 }
 
+/// Raw `GET /healthz` against the running server at `addr` (`host:port`), on a 1s
+/// connect+read budget matching [`macos_impl::launch_agent_is_serving`]'s bounded-TCP-connect
+/// probe. `None` for anything short of a full, parseable response — an unresolvable `addr`, a
+/// refused/timed-out connect, a read timeout, or [`parse_health_response`] rejecting the body
+/// — never a fabricated [`HealthStatus`]. Pure `std::net::TcpStream` networking, so — unlike
+/// the rest of this module — it isn't macOS-specific: cross-platform so `status::run`
+/// (`status.rs`) can poll a running server's health on any OS.
+///
+/// `pub(crate)`, and kept at the top level rather than nested in the private, macOS-only
+/// `macos_impl` module, because it has callers outside that module and outside macOS
+/// entirely — `run`'s guided-enable poll (via `macos_impl::guide_enable_and_verify` right
+/// here in `setup.rs`, macOS-only), the onboarding module's already-running health short-circuit
+/// (macOS-only), and `status::run` (every platform) — and a private `mod` can't be named from a sibling module
+/// regardless of its items' visibility. Crate-internal, so `pub(crate)`, not `pub`.
+pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    // Matches `macos_impl::LIVENESS_CONNECT_TIMEOUT`'s value; a local const rather than a
+    // shared one because `macos_impl` (and its constant) are `#[cfg(target_os = "macos")]`
+    // and this fn is not.
+    const TIMEOUT: Duration = Duration::from_secs(1);
+
+    let sock = addr.to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&sock, TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
+    write!(
+        stream,
+        "GET /healthz HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    parse_health_response(&buf)
+}
+
+/// Install (or reload) the LaunchAgent — a thin `pub(crate)` forwarder to
+/// [`macos_impl::install_launch_agent`]. Kept at the top level rather than called via its
+/// `macos_impl::` path, for the same reason [`fetch_health`] is: `macos_impl` is a private
+/// module, so a sibling `onboarding` module can't name `crate::setup::macos_impl::...` at
+/// all — module privacy is checked per path segment — regardless of the item's own
+/// visibility. Only a `pub(crate)` item defined directly in `setup` (this module) is
+/// reachable from a sibling module.
+#[cfg(target_os = "macos")]
+pub(crate) fn install_launch_agent(
+    app_bin: &str,
+    addr: &str,
+) -> Result<Option<(&'static str, String)>> {
+    macos_impl::install_launch_agent(app_bin, addr)
+}
+
+/// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
+/// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
+/// has one (a sibling module can't name the private `macos_impl` module at all). A fresh
+/// process re-reads TCC (the Screen Recording grant is cached per-process at launch), so the
+/// menu-bar app's "Restart" item (`crate::menubar`) restarts after a grant changes — independent
+/// of `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
+///
+/// Gated to `network` + macOS to match that sole caller (`crate::menubar` is itself
+/// `#[cfg(feature = "network")]`): the onboarder re-reads TCC by relaunching a fresh *process*
+/// (`open -n`, see `crate::onboarding`), not by restarting the agent, so without the `network`
+/// feature a plain macOS build would have no caller and flag this dead.
+#[cfg(all(target_os = "macos", feature = "network"))]
+pub(crate) fn restart_launch_agent() -> Result<()> {
+    macos_impl::restart_launch_agent()
+}
+
+/// Remove the login LaunchAgent so glass stops auto-starting — a thin `pub(crate)` forwarder to
+/// [`macos_impl::uninstall_launch_agent`], for the same reason [`install_launch_agent`] above has
+/// one (a sibling module can't name the private `macos_impl` module at all regardless of an
+/// item's own visibility).
+#[cfg(target_os = "macos")]
+pub(crate) fn uninstall_launch_agent() -> Result<()> {
+    macos_impl::uninstall_launch_agent()
+}
+
 /// The macOS-only glue behind [`run`]'s grant flow: side-effecting (stdin/stdout, shelling
 /// out to `codesign`/`launchctl`, real TCC calls), unlike the pure helpers above it in this
 /// file. Kept in its own module so its `use` block doesn't have to be repeated per item, and
@@ -324,6 +493,8 @@ mod macos_impl {
 
     /// Liveness-probe budget for [`install_launch_agent`]: launchd needs a beat to exec the
     /// job, so give it ~5s of ~500ms-apart TCP connects before deciding it isn't serving.
+    /// (`super::fetch_health` mirrors this value in its own local `const` — it's
+    /// cross-platform and this module is macOS-only, so it can't reuse this constant.)
     const LIVENESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
     const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -395,18 +566,6 @@ mod macos_impl {
         granted()
     }
 
-    /// Ask a yes/no question on stdin; any I/O failure (no controlling terminal, EOF, ...)
-    /// answers `false` rather than blocking or panicking.
-    fn prompt_yes_no(question: &str) -> bool {
-        print!("{question} [y/N] ");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return false;
-        }
-        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    }
-
     /// Ask which run mode to use when neither `--launchagent` nor `--no-launchagent` forced
     /// one; only reached in an interactive run (`--non-interactive` defaults to `Stdio`
     /// instead of calling this — see `run`). Any I/O failure answers `Stdio`, the
@@ -428,63 +587,114 @@ mod macos_impl {
         }
     }
 
-    /// Request one TCC grant if it isn't already held: call `request` (pops the consent
-    /// dialog / adds glass to the pane), open the relevant System Settings pane, then poll
-    /// `granted` for up to [`POLL_TIMEOUT`]. Returns `None` the moment `granted()` itself
-    /// reports success (live-rechecked, never assumed); otherwise `Some((label,
-    /// instruction))` naming the still-missing permission and what to do about it.
-    ///
-    /// `needs_relaunch_note` is `true` only for Screen Recording: unlike Accessibility, a
-    /// Screen Recording grant only takes effect for *this* process after it's relaunched, so
-    /// a still-ungranted read at the poll deadline doesn't necessarily mean the user didn't
-    /// act — ask (interactively) or assume (`--non-interactive`, since there's no one to
-    /// ask) that they did, and say so explicitly rather than reporting a plain "not granted".
-    pub(super) fn ensure_granted(
+    /// One macOS TCC pane `setup` guides through: its display label, its System Settings
+    /// deep-link URL, and the `/healthz` accessor for the grant it maps to (so the deadline
+    /// check can read the matching field back off [`super::fetch_health`]). Named fields
+    /// rather than a positional tuple so a consumer can't transpose the label and pane URL
+    /// (both `&'static str`) — the same anti-transposition reasoning as [`super::SetupArgs`]
+    /// and [`super::LaunchAgentFields`].
+    struct GrantPane {
         label: &'static str,
-        pane_url: &str,
-        remedy: &str,
-        granted: impl Fn() -> bool,
-        request: impl FnOnce() -> bool,
-        needs_relaunch_note: bool,
-        non_interactive: bool,
-    ) -> Option<(&'static str, String)> {
-        if granted() {
-            println!("  \u{2713} {label}: already granted");
-            return None;
-        }
-        if request() {
-            println!("  \u{2713} {label}: granted");
-            return None;
-        }
-        if let Err(e) = glass_macos::open_pane(pane_url) {
-            eprintln!(
-                "  note: couldn't open System Settings automatically ({e}); open Privacy & \
-                 Security > {label} manually."
+        pane_url: &'static str,
+        read: fn(&super::HealthStatus) -> Option<bool>,
+    }
+
+    /// The two macOS TCC panes `setup` guides the user through, paired with the `/healthz`
+    /// field each maps to. Named once so [`guide_enable_and_verify`] both opens the panes and
+    /// reads back the matching grant without re-typing the labels.
+    fn grant_panes() -> [GrantPane; 2] {
+        [
+            GrantPane {
+                label: "Screen Recording",
+                pane_url: glass_macos::screen_recording_pane_url(),
+                read: |h| h.screen_recording,
+            },
+            GrantPane {
+                label: "Accessibility",
+                pane_url: glass_macos::accessibility_pane_url(),
+                read: |h| h.accessibility,
+            },
+        ]
+    }
+
+    /// Guide the user to enable **GlassMcp.app** — the running LaunchAgent, its own TCC
+    /// responsible process — in the two Privacy panes, then verify by polling that agent's
+    /// `/healthz`. Called only after [`install_launch_agent`] confirms the agent is serving.
+    ///
+    /// This deliberately never calls `glass_macos::request_*`: those pop the consent dialog
+    /// *for the calling process*, so requesting from the terminal keys the grant to the
+    /// terminal, not to GlassMcp.app — the exact mis-attribution this flow exists to avoid.
+    /// Instead it opens each pane, prints the [`super::enable_instruction`] line, and waits
+    /// for the agent to report both grants held via [`super::fetch_health`] (live-read, never
+    /// assumed). Appends a `pending` entry per grant still missing at the [`POLL_TIMEOUT`]
+    /// deadline — an unreachable `/healthz` (a `None`) can confirm nothing, so it counts every
+    /// unconfirmed grant as pending rather than reporting a false success.
+    pub(super) fn guide_enable_and_verify(
+        app_path: &str,
+        addr: &str,
+        pending: &mut Vec<(&'static str, String)>,
+    ) {
+        let ready = |h: &super::HealthStatus| h.grants_ready();
+        // A re-run after the user already enabled both grants: confirm without popping the
+        // System Settings panes again.
+        if super::fetch_health(addr).as_ref().is_some_and(ready) {
+            println!(
+                "\n  \u{2713} GlassMcp.app already holds both grants (confirmed via /healthz)."
             );
+            return;
         }
-        let landed = poll_until(&granted, POLL_INTERVAL, POLL_TIMEOUT, || {
-            println!("  waiting for you to enable glass in the {label} pane…");
-        });
-        if landed {
-            println!("  \u{2713} {label}: granted");
-            return None;
-        }
-        if needs_relaunch_note {
-            let acted = non_interactive
-                || prompt_yes_no(&format!("Did you enable {label} in System Settings?"));
-            if acted {
-                let instruction = format!(
-                    "{label} changes take effect after a relaunch — enable glass, then run \
-                     `glass-mcp setup` again."
+
+        println!("\nEnable GlassMcp.app in System Settings (opening the two panes now):");
+        for GrantPane {
+            label, pane_url, ..
+        } in grant_panes()
+        {
+            if let Err(e) = glass_macos::open_pane(pane_url) {
+                eprintln!(
+                    "  note: couldn't open the {label} pane automatically ({e}); open Privacy \
+                     & Security > {label} manually."
                 );
-                println!("  \u{2717} {instruction}");
-                return Some((label, instruction));
+            }
+            println!("  {}", super::enable_instruction(label, app_path));
+        }
+
+        let landed = poll_until(
+            || super::fetch_health(addr).as_ref().is_some_and(ready),
+            POLL_INTERVAL,
+            POLL_TIMEOUT,
+            || println!("  waiting for GlassMcp.app to be enabled in both panes…"),
+        );
+        if landed {
+            println!("  \u{2713} both grants confirmed via GlassMcp.app's /healthz");
+            return;
+        }
+
+        // Deadline reached without both grants. Read `/healthz` once more to name the ones
+        // still missing; a `None` (unreachable) leaves every grant unconfirmed → all pending.
+        let health = super::fetch_health(addr);
+        for GrantPane {
+            label, read: field, ..
+        } in grant_panes()
+        {
+            if health.as_ref().and_then(field) != Some(true) {
+                let instruction = format!(
+                    "{} — then run `glass-mcp setup` again.",
+                    super::enable_instruction(label, app_path)
+                );
+                println!("  \u{2717} {label}: not yet enabled for GlassMcp.app.");
+                pending.push((label, instruction));
             }
         }
-        let instruction =
-            format!("{label}: not granted — {remedy}, then run `glass-mcp setup` again.");
-        println!("  \u{2717} {instruction}");
-        Some((label, instruction))
+    }
+
+    /// Resolve `$HOME`, or a single actionable error — needed to derive the plist path, the
+    /// log directory, and the filled plist's `home` field. [`restart_launch_agent`] doesn't
+    /// call this: it restarts via `launchctl kickstart -k`, which addresses the job by
+    /// `gui/<uid>/<label>` alone and never touches the plist.
+    fn home_dir() -> Result<String> {
+        std::env::var("HOME").map_err(|_| {
+            GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
+        })
     }
 
     /// Write the filled LaunchAgent plist to `~/Library/LaunchAgents/tech.fixedwidth.glass.plist`
@@ -500,12 +710,14 @@ mod macos_impl {
         app_bin: &str,
         addr: &str,
     ) -> Result<Option<(&'static str, String)>> {
-        let home = std::env::var("HOME").map_err(|_| {
-            GlassError::Backend("HOME is not set; can't resolve ~/Library/LaunchAgents".into())
-        })?;
-        let launch_agents_dir = Path::new(&home).join("Library/LaunchAgents");
+        let home = home_dir()?;
+        let plist_path = super::launch_agent_plist_path(&home);
+        // `plist_path`'s parent is always `~/Library/LaunchAgents` (see
+        // `super::launch_agent_plist_path`) — derive it rather than re-joining the path
+        // ourselves, so the two can't drift.
+        let launch_agents_dir = plist_path.parent().expect("plist_path has a parent dir");
         let logs_dir = Path::new(&home).join("Library/Logs/GlassMcp");
-        std::fs::create_dir_all(&launch_agents_dir)?;
+        std::fs::create_dir_all(launch_agents_dir)?;
         std::fs::create_dir_all(&logs_dir)?;
 
         let fields = super::LaunchAgentFields {
@@ -524,11 +736,10 @@ mod macos_impl {
                  drifted; refusing to write a broken plist."
             )));
         }
-        let plist_path = launch_agents_dir.join("tech.fixedwidth.glass.plist");
         std::fs::write(&plist_path, filled)?;
 
         let uid = self_uid();
-        let target = format!("gui/{uid}/tech.fixedwidth.glass");
+        let target = super::launch_agent_target(uid);
         // Idempotent (re)load. `bootstrap` fails with "already loaded" on a second run — which
         // the flow itself asks for, since a Screen Recording grant only takes effect after a
         // relaunch — and wouldn't pick up an `--addr` change. Unload first, ignoring the exit
@@ -552,8 +763,9 @@ mod macos_impl {
         }
 
         // `bootstrap` succeeding only means launchd accepted the job spec, not that the process
-        // came up serving: a port clash on `--addr` crash-loops under `KeepAlive=true` yet
-        // bootstrap still returns success. Confirm real liveness before claiming success.
+        // came up serving: e.g. a port clash on `--addr` fails the job (once — `KeepAlive` is
+        // `false`, so launchd won't keep retrying it) yet bootstrap still returns success.
+        // Confirm real liveness before claiming success.
         if launch_agent_is_serving(addr) {
             println!(
                 "\n  \u{2713} installed + started {target} ({})",
@@ -563,12 +775,72 @@ mod macos_impl {
         } else {
             let instruction = format!(
                 "LaunchAgent {target} loaded but isn't accepting connections on {addr} yet — \
-                 check ~/Library/Logs/GlassMcp/stderr.log (a port clash on --addr crash-loops \
-                 under KeepAlive), resolve it, then run `glass-mcp setup` again."
+                 check ~/Library/Logs/GlassMcp/stderr.log (e.g. a port clash on --addr), \
+                 resolve it, then run `glass-mcp setup` again."
             );
             println!("\n  \u{2717} {instruction}");
             Ok(Some(("LaunchAgent", instruction)))
         }
+    }
+
+    /// Restart the already-installed LaunchAgent so a fresh process re-reads TCC (the Screen
+    /// Recording grant is cached per-process at launch) — independent of `KeepAlive`, which is
+    /// `false` precisely so the LaunchAgent itself never respawns on its own after a user Quit.
+    ///
+    /// Uses `launchctl kickstart -k gui/<uid>/<label>`, *not* `bootout`+`bootstrap`: the
+    /// menu-bar app's "Restart" item runs this from *inside* the very LaunchAgent job it's
+    /// restarting, and `bootout` would SIGTERM that process directly — killing the caller
+    /// before `bootstrap` ever runs, with `KeepAlive=false` meaning launchd then never brings
+    /// it back. `kickstart -k` instead asks launchd itself (a separate, always-running
+    /// supervisor) to kill and restart the job in place, so it works even when the caller is
+    /// the job being restarted, and doesn't depend on `KeepAlive` at all. `kickstart -k`
+    /// requires the target job to already be loaded — true of its caller: the menu-bar app
+    /// *is* the running LaunchAgent job.
+    ///
+    /// Errors surface (`kickstart` failing to spawn, or exiting non-zero) rather than being
+    /// silently swallowed.
+    ///
+    /// Reached through [`super::restart_launch_agent`] from the menu-bar app's "Restart" item;
+    /// gated to the `network` feature to match it (see the forwarder's note), so it isn't dead
+    /// code in a plain macOS build where the menu bar isn't compiled.
+    #[cfg(feature = "network")]
+    pub(super) fn restart_launch_agent() -> Result<()> {
+        let target = super::launch_agent_target(self_uid());
+
+        let status = Command::new("launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(&target)
+            .status()
+            .map_err(|e| GlassError::Backend(format!("launchctl kickstart: {e}")))?;
+        if !status.success() {
+            return Err(GlassError::Backend(format!(
+                "launchctl kickstart -k exited {status} while restarting {target}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove the login LaunchAgent so glass stops auto-starting: delete the plist first (so a
+    /// later login can't `RunAtLoad` it even if `bootout` races), then bootout the running job.
+    /// `bootout` on an already-gone job is fine (its error is ignored, the same way
+    /// [`install_launch_agent`]'s idempotent-reload unload does); a plist-removal error is
+    /// surfaced — the caller shouldn't report success while the plist (and thus the
+    /// starts-at-login behavior) is still on disk.
+    pub(super) fn uninstall_launch_agent() -> Result<()> {
+        let home = home_dir()?;
+        let plist_path = super::launch_agent_plist_path(&home);
+        if plist_path.exists() {
+            std::fs::remove_file(&plist_path).map_err(|e| {
+                GlassError::Backend(format!("remove {}: {e}", plist_path.display()))
+            })?;
+        }
+        let target = super::launch_agent_target(self_uid());
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(target)
+            .status();
+        Ok(())
     }
 
     /// Bounded liveness probe for a just-bootstrapped agent: TCP-connect to `addr` on a
@@ -596,6 +868,77 @@ mod macos_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_health_response -----------------------------------------------------------
+
+    #[test]
+    fn parses_healthz_body_out_of_an_http_response() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+                   {\"ok\":true,\"screen_recording\":true,\"accessibility\":false}";
+        let h = super::parse_health_response(raw).unwrap();
+        assert_eq!(h.screen_recording, Some(true));
+        assert_eq!(h.accessibility, Some(false));
+        assert!(!h.grants_ready());
+    }
+
+    #[test]
+    fn parse_health_response_rejects_garbage() {
+        assert!(super::parse_health_response("not http").is_none());
+        assert!(super::parse_health_response("HTTP/1.1 500 X\r\n\r\nnope").is_none());
+    }
+
+    // --- enable_instruction --------------------------------------------------------------
+
+    #[test]
+    fn enable_instruction_names_the_app_and_path() {
+        let s = super::enable_instruction("Screen Recording", "/Applications/GlassMcp.app");
+        assert!(s.contains("GlassMcp.app"));
+        assert!(s.contains("Screen Recording"));
+        assert!(s.contains("/Applications/GlassMcp.app"));
+        assert!(!s.to_lowercase().contains("click allow")); // no phantom prompt
+    }
+
+    // --- app_bundle_path -----------------------------------------------------------------
+
+    #[test]
+    fn app_bundle_path_walks_up_to_the_dot_app_dir() {
+        assert_eq!(
+            app_bundle_path(Path::new(
+                "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"
+            )),
+            "/Applications/GlassMcp.app"
+        );
+        // A non-default install location is honored, not overwritten with the fallback.
+        assert_eq!(
+            app_bundle_path(Path::new("/opt/GlassMcp.app/Contents/MacOS/glass-mcp")),
+            "/opt/GlassMcp.app"
+        );
+    }
+
+    #[test]
+    fn app_bundle_path_falls_back_for_a_bare_binary() {
+        // A bare `cargo run` output isn't inside a bundle → name the default install path so
+        // the instruction still points somewhere concrete.
+        assert_eq!(
+            app_bundle_path(Path::new("/home/mpd/glass/target/release/glass-mcp")),
+            DEFAULT_APP_PATH
+        );
+    }
+
+    // --- launch_agent_target / launch_agent_plist_path (shared by install/restart) --------
+
+    #[test]
+    fn launch_agent_target_is_the_gui_uid_spec() {
+        assert_eq!(launch_agent_target(501), "gui/501/tech.fixedwidth.glass");
+    }
+
+    #[test]
+    fn launch_agent_plist_path_is_rooted_under_home_library_launchagents() {
+        assert_eq!(
+            launch_agent_plist_path("/Users/alice"),
+            Path::new("/Users/alice/Library/LaunchAgents/tech.fixedwidth.glass.plist")
+        );
+    }
 
     // --- registration_line ------------------------------------------------------------
 
@@ -683,6 +1026,20 @@ mod tests {
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stdout.log"));
         assert!(filled.contains("/Users/alice/Library/Logs/GlassMcp/stderr.log"));
         assert!(!filled.contains("/Users/YOU"));
+    }
+
+    // --- plist template shape (menu-bar launch, KeepAlive) --------------------------------
+
+    #[test]
+    fn plist_template_launches_menubar_and_does_not_keepalive() {
+        // The LaunchAgent must launch the visible menu-bar mode, and must not fight a user's
+        // Quit by relaunching (`KeepAlive=false`; `RunAtLoad` alone starts it at login).
+        // Normalize line endings first: on Windows the `.plist` can be checked out with CRLF,
+        // and the key/value assertions below span a line boundary (`</key>\n\t<…/>`).
+        let t = TEMPLATE.replace("\r\n", "\n");
+        assert!(t.contains("<string>--menubar</string>"));
+        assert!(t.contains("<key>KeepAlive</key>\n\t<false/>"));
+        assert!(!t.contains("<key>KeepAlive</key>\n\t<true/>"));
     }
 
     // --- surviving_placeholders (template-drift guard) -----------------------------------
