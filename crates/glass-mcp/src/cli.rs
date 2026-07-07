@@ -85,6 +85,9 @@ pub enum Command {
         #[arg(long)]
         addr: Option<String>,
     },
+    /// Remove the login LaunchAgent so glass stops starting at login (macOS). Then drag
+    /// GlassMcp.app to the Trash to remove the app itself.
+    Uninstall,
     /// Spike/diagnostic: poll the two TCC grants once a second in one long-lived process,
     /// so you can watch which flips live when granted (Accessibility) vs. stays stale until
     /// relaunch (Screen Recording). macOS-only; hidden from help.
@@ -255,6 +258,12 @@ mod tests {
             cli.command,
             Some(Command::Status { addr: Some(_) })
         ));
+    }
+
+    #[test]
+    fn uninstall_subcommand_parses() {
+        let cli = Cli::try_parse_from(["glass-mcp", "uninstall"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Uninstall)));
     }
 
     #[test]

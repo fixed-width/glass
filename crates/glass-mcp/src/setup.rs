@@ -457,6 +457,15 @@ pub(crate) fn restart_launch_agent() -> Result<()> {
     macos_impl::restart_launch_agent()
 }
 
+/// Remove the login LaunchAgent so glass stops auto-starting — a thin `pub(crate)` forwarder to
+/// [`macos_impl::uninstall_launch_agent`], for the same reason [`install_launch_agent`] above has
+/// one (a sibling module can't name the private `macos_impl` module at all regardless of an
+/// item's own visibility).
+#[cfg(target_os = "macos")]
+pub(crate) fn uninstall_launch_agent() -> Result<()> {
+    macos_impl::uninstall_launch_agent()
+}
+
 /// The macOS-only glue behind [`run`]'s grant flow: side-effecting (stdin/stdout, shelling
 /// out to `codesign`/`launchctl`, real TCC calls), unlike the pure helpers above it in this
 /// file. Kept in its own module so its `use` block doesn't have to be repeated per item, and
@@ -808,6 +817,28 @@ mod macos_impl {
                 "launchctl kickstart -k exited {status} while restarting {target}"
             )));
         }
+        Ok(())
+    }
+
+    /// Remove the login LaunchAgent so glass stops auto-starting: delete the plist first (so a
+    /// later login can't `RunAtLoad` it even if `bootout` races), then bootout the running job.
+    /// `bootout` on an already-gone job is fine (its error is ignored, the same way
+    /// [`install_launch_agent`]'s idempotent-reload unload does); a plist-removal error is
+    /// surfaced — the caller shouldn't report success while the plist (and thus the
+    /// starts-at-login behavior) is still on disk.
+    pub(super) fn uninstall_launch_agent() -> Result<()> {
+        let home = home_dir()?;
+        let plist_path = super::launch_agent_plist_path(&home);
+        if plist_path.exists() {
+            std::fs::remove_file(&plist_path).map_err(|e| {
+                GlassError::Backend(format!("remove {}: {e}", plist_path.display()))
+            })?;
+        }
+        let target = super::launch_agent_target(self_uid());
+        let _ = Command::new("launchctl")
+            .arg("bootout")
+            .arg(target)
+            .status();
         Ok(())
     }
 

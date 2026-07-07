@@ -2,7 +2,8 @@ use clap::Parser;
 use glass_mcp::cli::{Cli, Command};
 use glass_mcp::launch::NoArgLaunch;
 use glass_mcp::{
-    boot, launch, onboarding, run_debug_grants, run_doctor, run_env, run_status, run_stdio, setup,
+    boot, launch, onboarding, run_debug_grants, run_doctor, run_env, run_status, run_stdio,
+    run_uninstall, setup,
 };
 
 #[tokio::main]
@@ -127,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Status { addr }) => run_status(addr.as_deref()),
+        Some(Command::Uninstall) => run_uninstall(),
         Some(Command::DebugGrants) => run_debug_grants(),
     }
 }

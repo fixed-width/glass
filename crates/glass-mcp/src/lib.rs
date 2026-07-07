@@ -164,6 +164,23 @@ pub fn run_status(addr: Option<&str>) -> anyhow::Result<()> {
     status::run(addr)
 }
 
+/// Run the `uninstall` subcommand: stop + remove the login LaunchAgent, then print the "drag
+/// GlassMcp.app to the Trash" note. Doesn't touch the app bundle itself — only the LaunchAgent's
+/// stop/start-at-login registration, which is the part `glass-mcp` can actually reach; removing
+/// the `.app` is a Finder action the user does by hand.
+#[cfg(target_os = "macos")]
+pub fn run_uninstall() -> anyhow::Result<()> {
+    setup::uninstall_launch_agent()?;
+    println!("glass no longer starts at login. To remove the app, drag GlassMcp.app to the Trash.");
+    Ok(())
+}
+
+/// Non-macOS: no LaunchAgent to remove.
+#[cfg(not(target_os = "macos"))]
+pub fn run_uninstall() -> anyhow::Result<()> {
+    anyhow::bail!("uninstall is macOS-only")
+}
+
 /// Spike/diagnostic (`debug-grants`): poll the two TCC grants once a second in one long-lived
 /// process, so you can watch which flips live when granted in System Settings (Accessibility)
 /// vs. which stays stale until the process relaunches (Screen Recording — `CGPreflightScreen

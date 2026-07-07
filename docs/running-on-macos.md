@@ -372,6 +372,26 @@ No `sudo` is needed anywhere in this flow. See
 [packaging/macos/README.md](../packaging/macos/README.md) for the plist template
 and what each field means.
 
+## Uninstall
+
+```bash
+glass-mcp uninstall
+```
+
+Stops glass from starting at login: removes `~/Library/LaunchAgents/tech.fixedwidth.glass.plist`
+and boots out the running job. It doesn't touch the app bundle itself — drag `GlassMcp.app` to
+the Trash afterward to remove glass entirely. (The menu-bar app is planned to grow an "Uninstall
+glass…" item that does the same thing without a terminal.)
+
+Without the CLI (or on a build that predates it), the equivalent by hand:
+
+```bash
+launchctl bootout gui/$(id -u)/tech.fixedwidth.glass
+rm ~/Library/LaunchAgents/tech.fixedwidth.glass.plist
+```
+
+then drag `GlassMcp.app` to the Trash.
+
 ## Tools available on macOS
 
 Once both permissions are granted, the agent has `glass_start`,
