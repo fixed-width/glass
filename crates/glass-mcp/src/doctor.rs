@@ -140,7 +140,7 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     let android_selected = backend == "android";
     let mut android_checks = glass_android::doctor::checks(deep && android_selected);
     if !android_selected {
-        soften_inactive_android(&mut android_checks);
+        soften_inactive_android(&mut android_checks, deep);
     }
     sections.push(Section::new(
         "android",
@@ -177,10 +177,17 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
     Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
 
-/// When android isn't the active backend, its presence checks are advisory: downgrade any
-/// `Fail` to `Warn` (noting why) so a missing adb/emulator — irrelevant to the current
-/// backend — doesn't fail the overall diagnosis. The actual status is still reported.
-fn soften_inactive_android(checks: &mut [Check]) {
+/// When android isn't the active backend, its presence checks are advisory, so adjust them
+/// to read honestly for a user on another backend:
+/// - downgrade any `Fail` to `Warn` (noting why) so a missing adb/emulator — irrelevant to
+///   the current backend — doesn't fail the overall diagnosis, and
+/// - when `--deep` *was* requested, correct the deep-capture probes' skip reason: they were
+///   gated off because android isn't the selected backend, not because `--deep` was missing.
+///   The android crate only sees the collapsed `deep && android_selected` bool, so it emits
+///   its "run with --deep" hint (which the user already did); point at the real gate instead.
+///
+/// The actual status is still reported.
+fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
     for c in checks {
         if c.status == CheckStatus::Fail {
             c.status = CheckStatus::Warn;
@@ -188,6 +195,13 @@ fn soften_inactive_android(checks: &mut [Check]) {
                 "{} (only required when the android backend is selected)",
                 c.detail
             );
+        } else if deep_requested
+            && c.status == CheckStatus::Skip
+            && c.detail == glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
+        {
+            c.detail = "deep probes run only for the selected backend — set GLASS_BACKEND=android \
+                 to probe capture"
+                .to_string();
         }
     }
 }
@@ -328,7 +342,7 @@ mod tests {
             Check::new("agent", CheckStatus::Skip, "not configured"),
             Check::new("device", CheckStatus::Ok, "1 online"),
         ];
-        soften_inactive_android(&mut checks);
+        soften_inactive_android(&mut checks, false);
         assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
         assert!(checks[0]
             .detail
@@ -337,6 +351,47 @@ mod tests {
         assert_eq!(checks[1].status, CheckStatus::Warn); // Warn untouched
         assert_eq!(checks[2].status, CheckStatus::Skip); // Skip untouched
         assert_eq!(checks[3].status, CheckStatus::Ok); // Ok untouched
+    }
+
+    #[test]
+    fn inactive_android_deep_requested_corrects_capture_skip_message() {
+        // --deep WAS passed, but android isn't the selected backend, so its deep probes were
+        // gated off. The android crate can only emit its "run with --deep" hint (it sees the
+        // collapsed bool) — which is misleading, since the user already passed --deep. The
+        // aggregator must correct it to point at the real gate (GLASS_BACKEND), not the flag.
+        let mut checks = vec![Check::new(
+            "screencap",
+            CheckStatus::Skip,
+            glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL,
+        )];
+        soften_inactive_android(&mut checks, true);
+        assert_eq!(checks[0].status, CheckStatus::Skip); // still skipped, just honestly
+        assert!(
+            !checks[0].detail.contains("--deep"),
+            "must not tell the user to pass --deep — they already did: {}",
+            checks[0].detail
+        );
+        assert!(
+            checks[0].detail.contains("GLASS_BACKEND"),
+            "should point at the real gate: {}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn inactive_android_deep_not_requested_keeps_run_with_deep_hint() {
+        // --deep was NOT passed: the "run with --deep" hint is the correct next step, so it
+        // must be left intact (only the `deep_requested` case is misleading).
+        let mut checks = vec![Check::new(
+            "screencap",
+            CheckStatus::Skip,
+            glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL,
+        )];
+        soften_inactive_android(&mut checks, false);
+        assert_eq!(
+            checks[0].detail,
+            glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
+        );
     }
 
     #[test]

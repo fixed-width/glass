@@ -15,6 +15,12 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- `doctor --deep` no longer tells you to "run with --deep" for the Android `screencap` and
+  `uiautomator` probes when you already passed `--deep`. Those deep probes only run when
+  Android is the selected backend, so on another host backend the skip reason now points at
+  the real gate: "set `GLASS_BACKEND=android`".
+
 ## [0.3.1] - 2026-07-07
 
 ### Changed
