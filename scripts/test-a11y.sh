@@ -41,4 +41,9 @@ export XDG_RUNTIME_DIR="$A11Y_TEST_RUNTIME"
 
 # --test-threads=1: tests share glass's AT-SPI bus per process; parallel launches
 # cause bus instability (fixtures disconnecting race with new connections).
+#
+# glass-dbus-linux's PrivateBus tests (private bus + at-spi bring-up, including the
+# org.a11y.Status.ScreenReaderEnabled advertisement that accesskit-based apps gate on) run
+# under the same throwaway XDG_RUNTIME_DIR isolation.
+cargo test -p glass-dbus-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER"
 cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "$TEST_FILTER"

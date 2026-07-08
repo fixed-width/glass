@@ -201,6 +201,28 @@ trait A11yBus {
     fn get_address(&self) -> zbus::Result<String>;
 }
 
+/// `org.a11y.Status` — the interface accesskit watches for `ScreenReaderEnabled` — lives on
+/// the same `org.a11y.Bus` service, at `/org/a11y/bus`.
+const A11Y_BUS_SERVICE: &str = "org.a11y.Bus";
+const A11Y_BUS_PATH: &str = "/org/a11y/bus";
+const A11Y_STATUS_IFACE: &str = "org.a11y.Status";
+
+/// Advertise a screen reader on the private a11y bus (setting the `org.a11y.Status`
+/// `ScreenReaderEnabled` and `IsEnabled` properties true) so accesskit-based toolkits
+/// (egui/winit) activate their AT-SPI adapter and publish a tree; GTK/Qt register regardless.
+/// Best-effort: a read-only or absent Status interface just leaves such apps dormant (the
+/// prior behavior), so a failure here must not abort the launch. (`org.a11y.Status`'s typed
+/// proxy exposes getters only, so set the properties via the low-level `Proxy`.)
+async fn advertise_screen_reader(conn: &zbus::Connection) {
+    let Ok(status) =
+        zbus::Proxy::new(conn, A11Y_BUS_SERVICE, A11Y_BUS_PATH, A11Y_STATUS_IFACE).await
+    else {
+        return;
+    };
+    let _ = status.set_property("ScreenReaderEnabled", true).await;
+    let _ = status.set_property("IsEnabled", true).await;
+}
+
 fn resolve_a11y_address(session_addr: &str) -> Result<String> {
     // Run on a dedicated OS thread. `PrivateBus::start` is synchronous but is reached (via
     // `start_app`) from inside the MCP's multi-thread runtime. Building a runtime there
@@ -232,7 +254,10 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
                 let mut last_err: Option<String> = None;
                 for _ in 0..50 {
                     match proxy.get_address().await {
-                        Ok(a) if !a.is_empty() => return Ok(a),
+                        Ok(a) if !a.is_empty() => {
+                            advertise_screen_reader(&conn).await;
+                            return Ok(a);
+                        }
                         Ok(a) => last = a,
                         Err(e) => last_err = Some(e.to_string()),
                     }
@@ -314,5 +339,47 @@ mod tests {
             "a11y bus {a11y} escaped the private runtime dir {private_dir} \
              (activation inherited the ambient XDG_RUNTIME_DIR — isolation breach)"
         );
+    }
+
+    /// accesskit-based toolkits (egui/winit) register + publish their AT-SPI tree only when
+    /// `org.a11y.Status.ScreenReaderEnabled` is true — the signal a screen reader sends. glass's
+    /// private bus must advertise it, or such apps stay dormant and invisible to the reader
+    /// (while GTK, which doesn't gate on it, works). Read the flag back off the real
+    /// at-spi-bus-launcher to prove the setter took, not just local state.
+    #[test]
+    #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run under a throwaway XDG_RUNTIME_DIR (see test-a11y.sh)"]
+    fn private_bus_advertises_a_screen_reader_for_accesskit_apps() {
+        let bus = PrivateBus::start().expect("private bus");
+        let enabled = read_screen_reader_enabled(bus.session_bus_address())
+            .expect("read org.a11y.Status.ScreenReaderEnabled");
+        assert!(
+            enabled,
+            "glass's private a11y bus must advertise ScreenReaderEnabled=true"
+        );
+    }
+
+    fn read_screen_reader_enabled(session_addr: &str) -> Result<bool> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| GlassError::Backend(format!("runtime: {e}")))?;
+        rt.block_on(async {
+            let addr: zbus::Address = session_addr
+                .try_into()
+                .map_err(|e| GlassError::Backend(format!("bad session address: {e}")))?;
+            let conn = zbus::connection::Builder::address(addr)
+                .map_err(|e| GlassError::Backend(format!("session conn builder: {e}")))?
+                .build()
+                .await
+                .map_err(|e| GlassError::Backend(format!("connect session bus: {e}")))?;
+            let status =
+                zbus::Proxy::new(&conn, A11Y_BUS_SERVICE, A11Y_BUS_PATH, A11Y_STATUS_IFACE)
+                    .await
+                    .map_err(|e| GlassError::Backend(format!("org.a11y.Status proxy: {e}")))?;
+            status
+                .get_property::<bool>("ScreenReaderEnabled")
+                .await
+                .map_err(|e| GlassError::Backend(format!("get ScreenReaderEnabled: {e}")))
+        })
     }
 }
