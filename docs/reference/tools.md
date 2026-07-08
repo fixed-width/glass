@@ -33,9 +33,9 @@ Build, launch, and locate a native GUI app; returns its window geometry.
 - `build` (string) — shell command run in `cwd` before launching.
 - `cwd` (string) — working directory for `build` and `run`.
 - `env` (array of `[name, value]` pairs) — extra environment for the launched app.
-- `backend` (string) — `"x11"` or `"wayland"` (Linux), `"windows"` (Windows host), or `"android"`
-  (an AVD emulator, any host). Omit for the server default (`GLASS_BACKEND`, else `windows` on
-  Windows, else `x11`).
+- `backend` (string) — `"x11"` or `"wayland"` (Linux), `"windows"` (Windows host), `"macos"` (macOS
+  host), or `"android"` (an AVD emulator, any host). Omit for the server default (`GLASS_BACKEND`,
+  else `windows` on Windows, `macos` on macOS, else `x11`).
 - `sandbox` (string) — `"default"`, `"strict"`, or `"off"`. Omit for the server default
   (`GLASS_SANDBOX`, else `default`). See [explanation/containment.md](../explanation/containment.md).
 - `window_hint` (`{ title?, class? }`) — disambiguate which window is the app's when several appear,

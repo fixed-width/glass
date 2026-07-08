@@ -56,7 +56,7 @@ pub(crate) struct EnvVarDoc {
 pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_BACKEND", scope: EnvScope::All,
         purpose: "Default backend when glass_start omits `backend`",
-        default: "x11 (or windows on a Windows host)", secret: false },
+        default: "x11 (or windows on Windows, macos on macOS)", secret: false },
     EnvVarDoc { name: "GLASS_SANDBOX", scope: EnvScope::All,
         purpose: "Default containment level (off/default/strict)",
         default: "default", secret: false },
@@ -337,7 +337,7 @@ mod tests {
         // an unset non-secret shows (unset → default)
         assert!(out.contains("GLASS_BACKEND"), "{out}");
         assert!(
-            out.contains("(unset \u{2192} x11 (or windows on a Windows host))"),
+            out.contains("(unset \u{2192} x11 (or windows on Windows, macos on macOS))"),
             "{out}"
         );
         // standard-env + ignored-DISPLAY note present
