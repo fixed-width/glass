@@ -9,6 +9,7 @@
 
 mod capture;
 mod device;
+pub mod doctor;
 mod logs;
 mod simctl;
 mod target;
