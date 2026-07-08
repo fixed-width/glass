@@ -24,12 +24,14 @@ code doing what you asked, whereas the launched app is the thing under test.
 
 ## Per-OS mechanisms
 
-Containment is one idea with four implementations:
+Containment has a different implementation per OS:
 
 - **Linux** — [bubblewrap](https://github.com/containers/bubblewrap), which also needs unprivileged
   user namespaces enabled.
 - **Windows** — [Sandboxie](https://sandboxie-plus.com) (Classic, the free default, or Plus).
 - **Android** — the emulator VM itself; there is no separate containment step.
+- **iOS** — the Simulator itself is the isolation boundary; like Android, there is no separate
+  containment step (and no sandbox crate).
 - **macOS** — the OS's built-in **Seatbelt** sandbox (`sandbox_init`); nothing to install.
 
 ## The macOS Seatbelt profile

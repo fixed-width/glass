@@ -15,7 +15,7 @@ the choice is per-call, an agent can drive an X11 app and a Wayland app in the s
 server restart. The backend is built when the app is launched, so the server boots even on a host with
 no display or compositor at all.
 
-## The five backends
+## The six backends
 
 - **X11 (Linux)** — spawns its own private headless `Xvfb`, or attaches to a display you name.
 - **Wayland (Linux)** — spawns a private headless `sway` (a wlroots compositor) per session. sway also
@@ -24,6 +24,10 @@ no display or compositor at all.
   Automation), so it needs a logged-in session to render and capture.
 - **Android** — drives a native app in an AVD emulator over `adb`; host-OS-agnostic, since it just
   shells out to `adb`. The VM *is* the sandbox.
+- **iOS** — drives a native app on an iOS Simulator over `xcrun simctl`; macOS-host-only, since the
+  Simulator and `simctl` ship with Xcode. The Simulator *is* the sandbox. This backend captures, reads
+  logs, and drives the clipboard; pointer/keyboard input and the accessibility tree are not implemented
+  yet.
 - **macOS** — drives the logged-in Aqua session (ScreenCaptureKit capture, CGEvent input, AXUIElement
   windows), gated by macOS's privacy permissions.
 
@@ -48,7 +52,8 @@ persistent display you manage (handy for watching over VNC); and `:0` deliberate
 desktop — which only ever happens because you asked for it by name.
 
 On **Android**, the emulator provides the same isolation for free: glass can boot a headless AVD that
-is entirely separate from your session.
+is entirely separate from your session. On **iOS**, the Simulator gives the same result: glass boots it
+through `simctl` without opening the Simulator app, so the app it drives never appears on your desktop.
 
 On **Windows**, isolation is weaker. There is one interactive desktop, and even a virtual-display
 driver only adds a monitor to *that* desktop rather than walling the app off — for full isolation you

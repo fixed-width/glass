@@ -53,9 +53,9 @@ pub struct StartArgs {
     /// Program and arguments to launch; `run[0]` is the executable.
     pub run: Vec<String>,
     /// Backend to launch under: `"x11"` or `"wayland"` (Linux), `"windows"` (on a
-    /// Windows host), `"macos"` (on a macOS host), or `"android"` (an AVD emulator, any
-    /// host). Omit for the server default (`GLASS_BACKEND`, else `windows` on Windows,
-    /// `macos` on macOS, else x11).
+    /// Windows host), `"macos"` (on a macOS host), `"android"` (an AVD emulator, any
+    /// host), or `"ios"` (an iOS Simulator, macOS host). Omit for the server default
+    /// (`GLASS_BACKEND`, else `windows` on Windows, `macos` on macOS, else x11).
     pub backend: Option<String>,
     /// Containment level for the launched app: `"default"` (filesystem/process
     /// containment, network on), `"strict"` (also no network), or `"off"` (no

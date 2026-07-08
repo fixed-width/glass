@@ -87,6 +87,7 @@ remove glass entirely.
   behaviour are in [explanation/containment.md](../explanation/containment.md).
 - **Building from source** (contributors, unreleased checkouts): [build-from-source.md](build-from-source.md).
 - **Android** from a macOS host: [setup-android.md](setup-android.md).
+- **iOS** (the Simulator, on this macOS host): [setup-ios.md](setup-ios.md).
 
 ## Problems?
 
