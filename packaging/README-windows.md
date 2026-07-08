@@ -37,6 +37,11 @@ mkdir $env:USERPROFILE\bin -Force
 copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 ```
 
+> **First run — SmartScreen.** These binaries are not yet Authenticode-signed, so the first launch may
+> show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run anyway**.
+> It's a publisher-trust prompt, not a permission request — glass needs no permission grants on Windows
+> (see [docs/explanation/windows-permissions.md](../docs/explanation/windows-permissions.md)).
+
 ## 3. Verify your setup
 
 glass ships a built-in checker:

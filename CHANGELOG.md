@@ -15,6 +15,12 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- A [Windows access model](docs/explanation/windows-permissions.md) explanation: Windows needs no
+  per-app permission grants (unlike macOS), what actually gates access (interactive session, UAC/UIPI
+  integrity levels, SmartScreen on unsigned downloads), and how to get past the first-run SmartScreen
+  prompt.
+
 ### Changed
 - Installing the optional Android companions is simpler and better documented: the setup guide,
   `glass doctor`, and `glass-mcp env` now lead with the easiest path — download `glass-agent.jar`

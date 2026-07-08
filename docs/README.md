@@ -47,3 +47,4 @@ way it does? The explanations.
 - [Backends and display isolation](explanation/backends.md)
 - [Containment and sandboxing](explanation/containment.md)
 - [The macOS permission model](explanation/macos-permissions.md)
+- [The Windows access model](explanation/windows-permissions.md)

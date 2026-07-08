@@ -117,6 +117,43 @@ jobs:
           workspaces: .
       - name: Build
         run: cargo build --release -p glass-mcp --locked
+
+      # Windows Authenticode signing (Azure Trusted Signing). Until the Trusted Signing
+      # account is provisioned and its secrets are set, this SKIPS signing (exit 0) and
+      # still uploads the (unsigned) artifact — same as before. Secrets can't be read in a
+      # job-level `if:`, so we probe one here and gate the sign step on its output.
+      # Required secrets: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+      # WINDOWS_TRUSTED_SIGNING_ENDPOINT, WINDOWS_TRUSTED_SIGNING_ACCOUNT,
+      # WINDOWS_TRUSTED_SIGNING_CERT_PROFILE. Provisioning runbook: internal.
+      - name: Check signing credentials
+        id: creds
+        shell: pwsh
+        env:
+          SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          if ($env:SECRET) {
+            "present=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "present=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Output "::notice::Windows signing secrets not configured — shipping unsigned artifact."
+          }
+
+      - name: Sign glass-mcp.exe (Authenticode)
+        if: steps.creds.outputs.present == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.WINDOWS_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.WINDOWS_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.WINDOWS_TRUSTED_SIGNING_CERT_PROFILE }}
+          files-folder: target/release
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Package
         shell: pwsh
         run: |
