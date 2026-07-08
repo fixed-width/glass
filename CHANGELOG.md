@@ -15,6 +15,14 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- Documentation reorganized into a [Diátaxis](https://diataxis.fr) structure under
+  [`docs/`](docs/README.md): a getting-started [tutorial](docs/tutorial/first-drive.md),
+  task-focused how-to guides, complete reference (every tool, environment variable, and
+  CLI command), and explanations of how glass works. The `README` is now a concise landing
+  page. The old `docs/running-on-{linux,macos,windows}.md` guides moved to
+  `docs/how-to/setup-*.md` (redirects left at the old paths).
+
 ## [0.3.0] - 2026-07-07
 
 ### Added

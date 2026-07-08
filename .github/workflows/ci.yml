@@ -168,7 +168,7 @@ jobs:
       # (crates/glass-macos/tests/a11y.rs) and its Swift fixture — proves both build against
       # this runner's SDK without attempting the granted run (needs the Accessibility/Screen
       # Recording TCC grants and a WindowServer session the runner doesn't have; that
-      # happens out-of-band — see the script's own comments and docs/running-on-macos.md).
+      # happens out-of-band — see the script's own comments and docs/how-to/build-from-source.md).
       - run: ./scripts/test-macos-a11y.sh
       # glass-mcp is the shipped binary; only this job can build/lint/test/run its
       # cfg(target_os = "macos") wiring (Cargo.toml's macos dep, lib.rs's "macos" backend
@@ -178,7 +178,7 @@ jobs:
       # the only job that runs it. Capture/input tools still need a granted,
       # WindowServer-connected session the runner doesn't have, so those stay at
       # build/lint/headless-boot — the granted checks run on-box (see
-      # docs/running-on-macos.md).
+      # docs/how-to/build-from-source.md).
       - run: cargo build  -p glass-mcp --locked
       - run: cargo clippy -p glass-mcp --all-targets --locked -- -D warnings
       - run: cargo test   -p glass-mcp --locked

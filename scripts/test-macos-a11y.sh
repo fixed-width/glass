@@ -20,7 +20,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # `a11y_fixture.swift` uses a top-level `@main` type rather than unadorned top-level
 # statements, so it needs `-parse-as-library` — same gotcha `quadrants.swift` has, covered
-# in docs/running-on-macos.md's "headless / SSH setup" troubleshooting section. Building it
+# in docs/how-to/build-from-source.md's "headless / SSH setup" troubleshooting section. Building it
 # here only proves the fixture source is valid Swift; it is never executed by this script.
 echo "test-macos-a11y.sh: building a11y_fixture.swift..."
 swiftc -parse-as-library -o "$TMP/a11y_fixture" crates/glass-macos/fixture/a11y_fixture.swift

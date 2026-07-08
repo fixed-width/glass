@@ -252,7 +252,7 @@ fn macos_checks_from(
             .with_remedy(
                 "log in at the console for this account, then run glass-mcp as a gui/$(id -u) LaunchAgent: \
                  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/tech.fixedwidth.glass.plist` \
-                 (see docs/running-on-macos.md)",
+                 (see docs/how-to/build-from-source.md)",
             ),
         },
         // The `general` section already prints the resolved default backend

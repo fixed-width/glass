@@ -2,7 +2,7 @@
 
 Assembles `glass-mcp` into a signed macOS app bundle and (optionally) runs it as a
 per-user LaunchAgent. This is a quick reference for the files here; see
-[docs/running-on-macos.md](../../docs/running-on-macos.md) for the full setup
+[docs/how-to/build-from-source.md](../../docs/how-to/build-from-source.md) for the full setup
 guide (creating a signing identity, running `glass-mcp setup` to grant Screen
 Recording / Accessibility and install the run integration, connecting a client).
 
@@ -45,7 +45,7 @@ Accessibility (opening the exact System Settings pane and polling for you),
 then either installs this LaunchAgent (`--launchagent`, or answering yes when
 asked) or leaves nothing installed for an attended/stdio client (`--no-launchagent`),
 and confirms the result via `doctor`. See
-[docs/running-on-macos.md](../../docs/running-on-macos.md) for the full flow,
+[docs/how-to/build-from-source.md](../../docs/how-to/build-from-source.md) for the full flow,
 including the flags (`--non-interactive`, `--addr`) and the Screen-Recording
 relaunch nuance.
 

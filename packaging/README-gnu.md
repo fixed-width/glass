@@ -7,11 +7,11 @@ instead of asking you "does this look right?".
 
 This is the **Linux x86-64 (glibc)** build. (A prebuilt **Windows** build is also
 available — see [`packaging/README-windows.md`](README-windows.md). macOS has no prebuilt
-binary yet; build from source — see [docs/running-on-macos.md](../docs/running-on-macos.md).)
+binary yet; build from source — see [docs/how-to/build-from-source.md](../docs/how-to/build-from-source.md).)
 See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
 For Linux-specific display/compositor and containment setup, see
-[docs/running-on-linux.md](../docs/running-on-linux.md).
+[docs/how-to/setup-linux.md](../docs/how-to/setup-linux.md).
 
 > **Prefer the static build if you can.** A statically-linked build is also available
 > that needs no glibc version and no shared libs at all — only `xvfb`. Use this glibc
