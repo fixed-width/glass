@@ -61,9 +61,13 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // sections below — "macos" (the platform backend's own TCC posture), "sandbox" (Seatbelt
     // containment posture, mirroring the Linux/Windows "sandbox" sections), and
     // "accessibility (macos)" (the a11y-tool reader's readiness, kept separate from "macos" —
-    // see the comment there for why). Android is the exception: its crate is
-    // host-OS-agnostic and always compiled in, so its section is always emitted, gated
-    // at runtime (see below) rather than by cfg.
+    // see the comment there for why). Android is the exception: it shells out to a separate
+    // SDK's own tools (adb/emulator) rather than linking an OS framework, so it's
+    // host-OS-agnostic and always compiled in — its section is always emitted, gated at
+    // runtime (see below) rather than by cfg. iOS also shells out to a separate SDK's tools
+    // (`xcrun simctl`), but only macOS can actually run them, and `glass-ios` pulls in an
+    // `image` PNG codec chain that a non-macOS binary has no use for — so glass-mcp only
+    // depends on `glass-ios` on macOS, and its section is compiled in accordingly.
     let mut sections = vec![general, network];
 
     #[cfg(target_os = "linux")]
@@ -148,6 +152,21 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         android_checks,
     ));
 
+    // iOS Simulator backend: unlike android above, `glass-ios` is only a dependency of
+    // glass-mcp on macOS (the only host that can drive `xcrun simctl` — see this crate's
+    // Cargo.toml), so its section only exists in a macOS build. Soften Fails to Warns when
+    // ios isn't active so a Mac not currently driving iOS doesn't fail the overall doctor
+    // verdict.
+    #[cfg(target_os = "macos")]
+    {
+        let ios_selected = backend == "ios";
+        let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
+        if !ios_selected {
+            soften_inactive_ios(&mut ios_checks);
+        }
+        sections.push(Section::new("ios", Some("ios".into()), ios_checks));
+    }
+
     if let Some(report) = audit {
         sections.push(audit_section(report));
     }
@@ -177,33 +196,54 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
     Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
 
-/// When android isn't the active backend, its presence checks are advisory, so adjust them
-/// to read honestly for a user on another backend:
-/// - downgrade any `Fail` to `Warn` (noting why) so a missing adb/emulator — irrelevant to
-///   the current backend — doesn't fail the overall diagnosis, and
-/// - when `--deep` *was* requested, correct the deep-capture probes' skip reason: they were
-///   gated off because android isn't the selected backend, not because `--deep` was missing.
-///   The android crate only sees the collapsed `deep && android_selected` bool, so it emits
-///   its "run with --deep" hint (which the user already did); point at the real gate instead.
-///
-/// The actual status is still reported.
-fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
+/// Downgrade any `Fail` check to `Warn`, noting that it's only required when `backend` is
+/// selected — shared by [`soften_inactive_android`] and [`soften_inactive_ios`] so a missing
+/// tool for a backend the user isn't driving doesn't fail the overall diagnosis. The actual
+/// status is still reported, just softened.
+fn soften_inactive_fails(checks: &mut [Check], backend: &str) {
     for c in checks {
         if c.status == CheckStatus::Fail {
             c.status = CheckStatus::Warn;
             c.detail = format!(
-                "{} (only required when the android backend is selected)",
+                "{} (only required when the {backend} backend is selected)",
                 c.detail
             );
-        } else if deep_requested
-            && c.status == CheckStatus::Skip
-            && c.detail == glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
-        {
-            c.detail = "deep probes run only for the selected backend — set GLASS_BACKEND=android \
-                 to probe capture"
-                .to_string();
         }
     }
+}
+
+/// When android isn't the active backend, its presence checks are advisory, so adjust them
+/// to read honestly for a user on another backend: soften any `Fail` via
+/// [`soften_inactive_fails`], and, when `--deep` *was* requested, correct the deep-capture
+/// probes' skip reason — they were gated off because android isn't the selected backend, not
+/// because `--deep` was missing. The android crate only sees the collapsed
+/// `deep && android_selected` bool, so it emits its "run with --deep" hint (which the user
+/// already did); point at the real gate instead.
+fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
+    soften_inactive_fails(checks, "android");
+    if deep_requested {
+        for c in checks {
+            if c.status == CheckStatus::Skip
+                && c.detail == glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
+            {
+                c.detail =
+                    "deep probes run only for the selected backend — set GLASS_BACKEND=android \
+                     to probe capture"
+                        .to_string();
+            }
+        }
+    }
+}
+
+/// When ios isn't the active backend, its presence checks are advisory — same rationale as
+/// [`soften_inactive_android`], via the shared [`soften_inactive_fails`]. Unlike android, ios
+/// has no deep-probe skip message to correct: `glass_ios::doctor::checks` accepts `deep` only
+/// for signature parity (iOS has no expensive probe of its own), so it never emits a
+/// "run with --deep" hint that would need re-pointing. Only used from the macOS-only ios
+/// section above (see this crate's Cargo.toml for why `glass-ios` itself is macOS-only).
+#[cfg(target_os = "macos")]
+fn soften_inactive_ios(checks: &mut [Check]) {
+    soften_inactive_fails(checks, "ios");
 }
 
 /// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console
@@ -378,6 +418,26 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inactive_ios_fails_soften_to_warn() {
+        let mut checks = vec![
+            Check::new("xcode", CheckStatus::Fail, "no active developer directory")
+                .with_remedy("install Xcode from the App Store"),
+            Check::new("device", CheckStatus::Ok, "1 iPhone simulator(s) available"),
+        ];
+        soften_inactive_ios(&mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
+        assert!(checks[0]
+            .detail
+            .contains("only required when the ios backend is selected"));
+        assert_eq!(
+            checks[0].remedy.as_deref(),
+            Some("install Xcode from the App Store")
+        ); // remedy preserved
+        assert_eq!(checks[1].status, CheckStatus::Ok); // Ok untouched
+    }
+
     #[test]
     fn inactive_android_deep_not_requested_keeps_run_with_deep_hint() {
         // --deep was NOT passed: the "run with --deep" hint is the correct next step, so it
@@ -400,11 +460,12 @@ mod tests {
         // is asserted, so it's deterministic regardless of host.
         let d = diagnose(false);
         let titles: Vec<&str> = d.sections.iter().map(|s| s.title.as_str()).collect();
-        // Platform-gated backends compiled into THIS binary get a section; android is
-        // always present (host-OS-agnostic crate) via a runtime gate. No "not built into
-        // this binary" placeholders. Accessibility is per-OS (AT-SPI on Linux, UIA on
-        // Windows); macOS's grants (Screen Recording, Accessibility) live inside its own
-        // "macos" section rather than a separate accessibility section.
+        // Platform-gated backends compiled into THIS binary get a section; android is always
+        // present (a host-OS-agnostic crate) via a runtime gate. iOS is compiled into
+        // glass-mcp — and so gets a section — only on macOS (see this crate's Cargo.toml).
+        // No "not built into this binary" placeholders. Accessibility is per-OS (AT-SPI on
+        // Linux, UIA on Windows); macOS's grants (Screen Recording, Accessibility) live
+        // inside its own "macos" section rather than a separate accessibility section.
         #[cfg(target_os = "linux")]
         assert_eq!(
             titles,
@@ -439,13 +500,14 @@ mod tests {
                 "macos",
                 "sandbox",
                 "accessibility (macos)",
-                "android"
+                "android",
+                "ios"
             ]
         );
-        // Android's section is always present and non-empty — its basic presence checks now
-        // run unconditionally (deep probes gated to the selected backend; Fails softened to
-        // Warn when android isn't active). Asserting non-empty catches accidental removal of
-        // the section, without depending on which backend the ambient env resolves to.
+        // Android's section is always present and non-empty — its basic presence checks run
+        // unconditionally (deep probes gated to the selected backend; Fails softened to Warn
+        // when not active). Asserting non-empty catches accidental removal of the section,
+        // without depending on which backend the ambient env resolves to.
         let android = d
             .sections
             .iter()
@@ -453,6 +515,19 @@ mod tests {
             .expect("android section");
         assert_eq!(android.backend.as_deref(), Some("android"));
         assert!(!android.checks.is_empty());
+        // iOS's section follows the same non-empty shape, but only exists on macOS.
+        #[cfg(target_os = "macos")]
+        {
+            let ios = d
+                .sections
+                .iter()
+                .find(|s| s.title == "ios")
+                .expect("ios section");
+            assert_eq!(ios.backend.as_deref(), Some("ios"));
+            assert!(!ios.checks.is_empty());
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert!(!titles.contains(&"ios"));
         // The `network` section is always present (Ok when compiled in, else Skip).
         let net = d
             .sections

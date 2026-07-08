@@ -34,8 +34,8 @@ Build, launch, and locate a native GUI app; returns its window geometry.
 - `cwd` (string) — working directory for `build` and `run`.
 - `env` (array of `[name, value]` pairs) — extra environment for the launched app.
 - `backend` (string) — `"x11"` or `"wayland"` (Linux), `"windows"` (Windows host), `"macos"` (macOS
-  host), or `"android"` (an AVD emulator, any host). Omit for the server default (`GLASS_BACKEND`,
-  else `windows` on Windows, `macos` on macOS, else `x11`).
+  host), `"android"` (an AVD emulator, any host), or `"ios"` (an iOS Simulator, macOS host). Omit for
+  the server default (`GLASS_BACKEND`, else `windows` on Windows, `macos` on macOS, else `x11`).
 - `sandbox` (string) — `"default"`, `"strict"`, or `"off"`. Omit for the server default
   (`GLASS_SANDBOX`, else `default`). See [explanation/containment.md](../explanation/containment.md).
 - `window_hint` (`{ title?, class? }`) — disambiguate which window is the app's when several appear,
@@ -161,6 +161,9 @@ Returns `{matched, line{seq, stream, text}, cursor, elapsed_ms}`; resume reading
 `["ctrl"]`, `["ctrl","shift"]`) held during the action — enabling shift/ctrl-click multi-select,
 modified drags, and Ctrl+scroll.
 
+The input tools are not available on the **iOS** backend this release: `glass_click`, `glass_type`,
+`glass_key`, `glass_scroll`, and `glass_drag` return an unsupported error there.
+
 ### `glass_click`
 
 Click at window-relative coordinates.
@@ -257,14 +260,16 @@ Focus, resize, or move the active window, or read its geometry.
 - `x`, `y` (integer) — target position for `"move"`.
 - `width`, `height` (integer) — target size for `"resize"`.
 
-Resize/move are non-goals on Android (apps are full-screen).
+Resize/move are non-goals on Android and iOS (apps are full-screen); those backends serve `"focus"`
+and `"geometry"` but return an unsupported error for `"resize"`/`"move"`.
 
 ## Accessibility (semantic addressing)
 
 Deterministic, low-token element addressing that complements the pixel loop. Available where the app
 exposes an accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/game UIs); these tools
 **error** for an app with no accessible UI rather than return a fake tree, so fall back to
-`glass_screenshot` then. On Linux, start the app with `glass_start`'s `a11y:true`. See
+`glass_screenshot` then. On Linux, start the app with `glass_start`'s `a11y:true`. The **iOS** backend
+has no accessibility tree this release, so these tools return an unsupported error there. See
 [reference/platforms.md](platforms.md) for per-OS backends (AT-SPI / UI Automation / uiautomator / AX).
 
 ### `glass_a11y_snapshot`
@@ -325,7 +330,8 @@ Both act on the **app's** clipboard, isolated from your real clipboard on the pr
 backends, on a contained Windows app (a private boxed clipboard), and on a contained macOS app that
 isn't built with Apple's hardened runtime (a shim redirects it to a private pasteboard glass shares).
 A hardened-runtime macOS app (App Store / notarized) can't be redirected, so these return
-`Unsupported`; on Android they need the on-device agent. Only shared-desktop modes (`GLASS_DISPLAY=:0`,
+`Unsupported`; on Android they need the on-device agent; on iOS they act on the Simulator's own
+pasteboard, which is separate from the host's. Only shared-desktop modes (`GLASS_DISPLAY=:0`,
 or the Windows/macOS backend with `sandbox:off`) touch your **real** clipboard. See
 [explanation/containment.md](../explanation/containment.md#clipboard-isolation).
 

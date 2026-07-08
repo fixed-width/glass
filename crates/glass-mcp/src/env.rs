@@ -14,6 +14,7 @@ pub(crate) enum EnvScope {
     Linux,
     Windows,
     Android,
+    Ios,
     Network,
 }
 
@@ -26,19 +27,22 @@ impl EnvScope {
             EnvScope::Linux => "linux",
             EnvScope::Windows => "windows",
             EnvScope::Android => "android",
+            EnvScope::Ios => "ios",
             EnvScope::Network => "network",
         }
     }
 }
 
-/// Fixed group order for output: general → display servers → OS containment → android → network.
-const SCOPE_ORDER: [EnvScope; 7] = [
+/// Fixed group order for output: general → display servers → OS containment → android → ios →
+/// network.
+const SCOPE_ORDER: [EnvScope; 8] = [
     EnvScope::All,
     EnvScope::X11,
     EnvScope::Wayland,
     EnvScope::Linux,
     EnvScope::Windows,
     EnvScope::Android,
+    EnvScope::Ios,
     EnvScope::Network,
 ];
 
@@ -126,6 +130,15 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_ANDROID_A11Y", scope: EnvScope::Android,
         purpose: "auto|off \u{2014} disable the a11y service even when the APK is set",
         default: "auto", secret: false },
+    EnvVarDoc { name: "GLASS_IOS_UDID", scope: EnvScope::Ios,
+        purpose: "exact iOS Simulator UDID to drive when several are available",
+        default: "the newest booted/available iPhone simulator", secret: false },
+    EnvVarDoc { name: "GLASS_IOS_DEVICE", scope: EnvScope::Ios,
+        purpose: "device name to boot when none is running, e.g. \"iPhone 17\" or \"iPad Pro 13-inch\" (ignored if GLASS_IOS_UDID is set)",
+        default: "the newest available iPhone simulator", secret: false },
+    EnvVarDoc { name: "GLASS_SIMULATOR_KEEP", scope: EnvScope::Ios,
+        purpose: "leave a glass-booted iOS Simulator running at shutdown instead of stopping it",
+        default: "stop it", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -310,6 +323,9 @@ mod tests {
             "GLASS_ANDROID_AGENT",
             "GLASS_ANDROID_A11Y_APK",
             "GLASS_ANDROID_A11Y",
+            "GLASS_IOS_UDID",
+            "GLASS_IOS_DEVICE",
+            "GLASS_SIMULATOR_KEEP",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG",
             "GLASS_AUDIT_CONTENT",
@@ -355,7 +371,7 @@ mod tests {
             out.find(s)
                 .unwrap_or_else(|| panic!("missing {s} in:\n{out}"))
         };
-        // group order: all < x11 < wayland < linux < windows < android < network
+        // group order: all < x11 < wayland < linux < windows < android < ios < network
         assert!(idx("GLASS_BACKEND") < idx("GLASS_DISPLAY"));
         assert!(idx("GLASS_DISPLAY") < idx("GLASS_SWAY"));
         assert!(idx("GLASS_SWAY") < idx("GLASS_BWRAP"));
@@ -364,7 +380,9 @@ mod tests {
         assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_ANDROID_A11Y_APK"));
         // Use unique purpose snippets to distinguish A11Y_APK from A11Y (prefix-match hazard).
         assert!(idx("glass-a11y.apk") < idx("disable the a11y service"));
-        assert!(idx("disable the a11y service") < idx("GLASS_TOKEN"));
+        assert!(idx("disable the a11y service") < idx("GLASS_IOS_UDID"));
+        assert!(idx("GLASS_IOS_UDID") < idx("GLASS_SIMULATOR_KEEP"));
+        assert!(idx("GLASS_SIMULATOR_KEEP") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
     }

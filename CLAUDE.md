@@ -15,7 +15,9 @@ read logs, diff against baselines, wait-until-stable, and read/drive the accessi
 tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform` seam: X11
 and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
-on-device companion agent), macOS (ScreenCaptureKit capture, CGEvent input, AXUIElement
+on-device companion agent), iOS (native apps in the Simulator over `xcrun simctl`; this
+release: capture, logs, clipboard — no input/accessibility yet), macOS (ScreenCaptureKit
+capture, CGEvent input, AXUIElement
 windows/logs, accessibility tree, clipboard (isolated + working under containment for
 apps not built with hardened runtime, via a `DYLD_INSERT_LIBRARIES` swizzle shim;
 hardened-runtime apps fall back to unsupported), sandboxing (Seatbelt)).
@@ -24,7 +26,8 @@ hardened-runtime apps fall back to unsupported), sandboxing (Seatbelt)).
 
 Cargo workspace at the repo root. Crates: `glass-core` (platform-agnostic heart — the
 `Platform`/`Accessibility` seams, session, `Frame`, diff, stability, log buffer), the
-backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`), the a11y readers
+backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`, `glass-ios` (the iOS
+Simulator backend over `xcrun simctl`), `glass-macos`), the a11y readers
 (`glass-a11y-linux`, `glass-a11y-windows`, `glass-a11y-macos`; the Android `uiautomator`
 reader lives in `glass-android`), `glass-sandbox-linux`, `glass-sandbox-macos`, the `glass-mcp` server binary, and the
 `glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for two
