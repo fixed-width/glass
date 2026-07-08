@@ -9,5 +9,7 @@
 
 mod device;
 mod simctl;
+mod target;
 
 pub use simctl::Simctl;
+pub use target::{SimTarget, SimulatorRegistry};
