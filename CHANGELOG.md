@@ -16,6 +16,10 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- An [iOS Simulator backend](docs/how-to/setup-ios.md) (`GLASS_BACKEND=ios`, macOS only): launch, capture,
+  log streaming, and clipboard for native iOS apps in the Simulator, driven through `xcrun simctl`, plus a
+  `glass doctor` preflight for Xcode, an installed iOS runtime, and an available simulator. This release is
+  observe-oriented — tapping/typing and the accessibility tree are not yet available.
 - A [Windows access model](docs/explanation/windows-permissions.md) explanation: Windows needs no
   per-app permission grants (unlike macOS), what actually gates access (interactive session, UAC/UIPI
   integrity levels, SmartScreen on unsigned downloads), and how to get past the first-run SmartScreen
