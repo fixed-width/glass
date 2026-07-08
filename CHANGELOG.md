@@ -15,13 +15,24 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-07
+
 ### Changed
 - Documentation reorganized into a [Diátaxis](https://diataxis.fr) structure under
-  [`docs/`](docs/README.md): a getting-started [tutorial](docs/tutorial/first-drive.md),
-  task-focused how-to guides, complete reference (every tool, environment variable, and
-  CLI command), and explanations of how glass works. The `README` is now a concise landing
-  page. The old `docs/running-on-{linux,macos,windows}.md` guides moved to
-  `docs/how-to/setup-*.md` (redirects left at the old paths).
+  [`docs/`](docs/README.md): a getting-started [tutorial](docs/tutorial/first-drive.md)
+  that has an agent build and drive the interactive egui fixture end to end, task-focused
+  how-to guides, complete reference (every tool, environment variable, and CLI command),
+  and explanations of how glass works. The `README` is now a concise landing page. The old
+  `docs/running-on-{linux,macos,windows}.md` guides moved to `docs/how-to/setup-*.md`
+  (redirects left at the old paths).
+
+### Fixed
+- a11y: `a11y: true` now exposes the accessibility tree for **accesskit-based apps**
+  (egui/winit/Slint/Iced) on Linux — glass advertises a screen reader on its private
+  AT-SPI bus, which accesskit's adapter requires to activate. GTK/Qt were unaffected.
+- The default backend on a macOS host is documented correctly as `macos` — the `glass_start`
+  tool description, the `backend` parameter docs, and `glass-mcp env` previously named only
+  "windows on Windows, else x11".
 
 ## [0.3.0] - 2026-07-07
 
@@ -119,7 +130,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/fixed-width/glass/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/fixed-width/glass/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fixed-width/glass/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/fixed-width/glass/compare/v0.1.1...v0.1.2
