@@ -22,14 +22,12 @@
 //! (window discovery via ScreenCaptureKit), both held by the signed, granted `GlassProbe.app`
 //! bundle on this project's dev Mac (`mini`) — same granted-run procedure as
 //! `tests/capture.rs`: copy this built test binary into the bundle, re-sign, run via a
-//! `gui/501` LaunchAgent so it inherits the bundle's grants. See
-//! `.superpowers/sdd/objc2-spike-report.md`, `.superpowers/sdd/task-6-fix-report.md`, and
-//! `.superpowers/sdd/task-6-brief.md` for the exact procedure, and `scripts/test-macos.sh`'s
+//! `gui/501` LaunchAgent so it inherits the bundle's grants. See `scripts/test-macos.sh`'s
 //! `GLASS_MACOS_ONBOX` gate for how this fits the test scripts.
 //!
 //! **Additional runtime precondition beyond the two TCC grants: `mini`'s screen session
-//! must not be locked.** Task 6 debugging (see `.superpowers/sdd/task-6-report.md`)
-//! empirically proved that while the console session is locked
+//! must not be locked.** Debugging on `mini` empirically proved that while the console
+//! session is locked
 //! (`CGSSessionScreenIsLocked=1`), macOS's secure-input protection pins
 //! `NSWorkspace.frontmostApplication` to `loginwindow` and silently drops every synthetic
 //! CGEvent aimed at a background app — `NSRunningApplication.activate`/

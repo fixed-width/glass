@@ -3,7 +3,7 @@
 <!--
   gui/<uid> LaunchAgent template that runs the signed GlassMcp.app as
   `glass-mcp serve --http --menubar` — the visible menu-bar app, showing a
-  status item the user can Quit from (see docs/running-on-macos.md and
+  status item the user can Quit from (see docs/how-to/setup-macos.md and
   packaging/macos/README.md).
 
   KeepAlive is false so a user's Quit sticks: launchd won't relaunch the job
@@ -15,7 +15,7 @@
     - /Users/YOU  -> your home directory (also fix the app path if you didn't
                      install GlassMcp.app to /Applications).
   The bind address (127.0.0.1:7300) is loopback-only, so no bearer token is
-  required; see docs/running-on-macos.md for reaching it from another machine.
+  required; see docs/how-to/run-over-the-network.md for reaching it from another machine.
 -->
 <plist version="1.0">
 <dict>

@@ -304,7 +304,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
                      window). glass needs a real GUI login to request permissions and drive \
                      anything — log in at the console, or (once already granted) run \
                      glass-mcp as a `gui/{uid}` LaunchAgent instead (see \
-                     docs/running-on-macos.md). Then run `glass-mcp setup` again.",
+                     docs/how-to/build-from-source.md). Then run `glass-mcp setup` again.",
                     uid = macos_impl::self_uid(),
                 );
                 return Err(glass_core::GlassError::Backend(
@@ -522,7 +522,7 @@ mod macos_impl {
             println!(
                 "note: {} isn't inside a *.app/Contents/MacOS bundle — TCC grants are keyed \
                  to the bundle id + signing identity, so this build won't keep its grant \
-                 across a rebuild; see docs/running-on-macos.md.",
+                 across a rebuild; see docs/how-to/build-from-source.md.",
                 exe.display()
             );
         }
@@ -534,7 +534,7 @@ mod macos_impl {
                     println!(
                         "note: {} is ad hoc or unsigned — a TCC grant won't stick across \
                          rebuilds; sign it with a stable identity (see \
-                         docs/running-on-macos.md#1-create-a-signing-identity).",
+                         docs/how-to/build-from-source.md#create-a-signing-identity).",
                         exe.display()
                     );
                 }
@@ -1157,7 +1157,7 @@ mod tests {
     fn a_stable_identity_is_not_flagged() {
         // A real (non-adhoc) code-signing identity's report never contains "adhoc" or "not
         // signed" — this is the shape `codesign -dvv` produces for a self-signed cert made
-        // via Keychain Access (see docs/running-on-macos.md#1-create-a-signing-identity).
+        // via Keychain Access (see docs/how-to/build-from-source.md#create-a-signing-identity).
         let report = "Executable=/Applications/GlassMcp.app/Contents/MacOS/glass-mcp\n\
                        Identifier=tech.fixedwidth.glass\n\
                        Format=Mach-O thin (arm64)\n\

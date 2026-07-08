@@ -41,9 +41,8 @@
 //! discovery/capture, Accessibility for the AX snapshot in check 2), held by the signed,
 //! granted `GlassProbe.app` bundle on this project's dev Mac (`mini`) — same granted-run
 //! procedure as `capture.rs`/`input.rs`: copy this built test binary into the bundle,
-//! re-sign, run via a `gui/501` LaunchAgent so it inherits the bundle's grants. See
-//! `.superpowers/sdd/objc2-spike-report.md` and `.superpowers/sdd/task-6-brief.md` for the
-//! exact procedure. Check 2/3 additionally require `/System/Applications/TextEdit.app` to
+//! re-sign, run via a `gui/501` LaunchAgent so it inherits the bundle's grants.
+//! Check 2/3 additionally require `/System/Applications/TextEdit.app` to
 //! exist on the test machine (true on every stock macOS install) and, like `tests/input.rs`,
 //! an unlocked screen session (TextEdit's window must actually receive focus for the AX
 //! snapshot in check 2 to see real content).

@@ -4,8 +4,8 @@
 //!
 //! ## The reusable pattern: async completion-handler → channel bridge
 //!
-//! Proven end-to-end in `.superpowers/sdd/objc2-spike-report.md` against
-//! ScreenCaptureKit's nested `SCShareableContent` → `SCScreenshotManager` completion
+//! Proven end-to-end against ScreenCaptureKit's nested `SCShareableContent` →
+//! `SCScreenshotManager` completion
 //! handlers. The concrete `block2::RcBlock`s live at each call site (capture, display
 //! provisioning, etc. — Plan 2 tasks 2+), not here; this is the recipe they all follow:
 //!
@@ -76,7 +76,7 @@ use crate::permissions::Permission;
 static APP_KIT_INIT: Once = Once::new();
 
 /// `SCStreamErrorDomain`'s code for a declined Screen Recording TCC grant — observed
-/// verbatim in the spike's TCC-declined run (`.superpowers/sdd/objc2-spike-report.md`).
+/// verbatim in the spike's TCC-declined run.
 const TCC_DECLINE_CODE: isize = -3801;
 
 /// Touch `NSApplication.shared` exactly once to establish this process's connection to
@@ -89,8 +89,7 @@ const TCC_DECLINE_CODE: isize = -3801;
 /// one-time init has actually happened, this becomes a cheap, thread-agnostic no-op, so
 /// every call site that only cares "has `app_kit_init` run yet" (all of them — see below)
 /// can be reached from a non-main worker thread once startup has called
-/// [`init_main_thread`] once. See `.superpowers/sdd/thread0-research.md` and
-/// `.superpowers/sdd/thread0-spike-report.md` for why this is sound: the WindowServer
+/// [`init_main_thread`] once. This is sound because the WindowServer
 /// connection `NSApplication.sharedApplication` establishes is a process-wide, one-time
 /// resource, not a per-thread one.
 ///

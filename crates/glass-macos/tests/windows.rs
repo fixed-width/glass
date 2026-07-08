@@ -21,8 +21,7 @@
 //! capture, Accessibility for the AX window ops), held by the signed, granted `GlassProbe.app`
 //! bundle on this project's dev Mac (`mini`) — same granted-run procedure as `capture.rs`/
 //! `input.rs`: copy this built test binary into the bundle, re-sign, run via a `gui/501`
-//! LaunchAgent so it inherits the bundle's grants. See `.superpowers/sdd/objc2-spike-report.md`
-//! and `.superpowers/sdd/task-6-brief.md` for the exact procedure, and `scripts/test-macos.sh`'s
+//! LaunchAgent so it inherits the bundle's grants. See `scripts/test-macos.sh`'s
 //! `GLASS_MACOS_ONBOX` gate for how this fits the test scripts.
 //!
 //! **Additional runtime precondition beyond the two TCC grants: `mini`'s screen session must

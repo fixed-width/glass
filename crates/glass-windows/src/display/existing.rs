@@ -6,7 +6,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// Use whatever display the logged-in interactive session already presents — a real monitor,
 /// a dummy plug, or a virtual monitor from an indirect-display driver (e.g. mttvdd) on a
-/// headless box. No provisioning. See docs/running-on-windows.md.
+/// headless box. No provisioning. See docs/how-to/setup-windows.md.
 pub(crate) struct ExistingDesktop;
 
 impl DisplayProvider for ExistingDesktop {

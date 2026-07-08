@@ -16,9 +16,8 @@
 //! compiles and can run) will still fail at the grant check unless run in that granted
 //! context — the actual granted run copies this test binary into the granted
 //! `GlassProbe.app` bundle, re-signs it, and launches it via a `gui/501` LaunchAgent so it
-//! inherits the bundle's grants. See `.superpowers/sdd/objc2-spike-report.md` and
-//! `.superpowers/sdd/task-6-brief.md` for the exact procedure, and
-//! `scripts/test-macos.sh`'s `GLASS_MACOS_ONBOX` gate for how this fits the test scripts.
+//! inherits the bundle's grants. See `scripts/test-macos.sh`'s `GLASS_MACOS_ONBOX` gate
+//! for how this fits the test scripts.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {

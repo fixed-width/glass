@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assemble and codesign GlassMcp.app: a macOS app bundle wrapping the release
 # `glass-mcp` binary, so it can be granted Screen Recording / Accessibility once
-# and run as a `gui/<uid>` LaunchAgent (see docs/running-on-macos.md and
+# and run as a `gui/<uid>` LaunchAgent (see docs/how-to/build-from-source.md and
 # packaging/macos/README.md for the full setup).
 #
 #   ./packaging/macos/build-app.sh --identity "<signing identity>" [options]
@@ -84,7 +84,7 @@ if [ -z "$sign_identity" ]; then
   echo "       There is no default, so a build never lands ad-hoc-signed by accident:" >&2
   echo "       an ad-hoc signature (-s -) has no stable Designated Requirement, so" >&2
   echo "       Screen Recording / Accessibility grants would NOT survive a rebuild." >&2
-  echo "       See docs/running-on-macos.md for how to create a signing identity." >&2
+  echo "       See docs/how-to/build-from-source.md for how to create a signing identity." >&2
   exit 1
 fi
 
@@ -155,7 +155,7 @@ echo "==> codesigning (identity: $sign_identity, bundle id: $bundle_id)"
 # Non-interactive (SSH/CI) runs: if the keychain holding $sign_identity is locked,
 # codesign fails with errSecInternalComponent rather than an obviously-keychain-shaped
 # error — unlock it first with `security unlock-keychain -p <password> <keychain>`
-# (see docs/running-on-macos.md).
+# (see docs/how-to/build-from-source.md).
 codesign_args=(--force --options runtime -s "$sign_identity")
 if [ "$timestamp" -eq 1 ]; then
   codesign_args+=(--timestamp)

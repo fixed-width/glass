@@ -55,13 +55,13 @@ plist = "1"
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
 # modules still build on the Linux dev box with zero macOS deps. Versions pinned to
-# exactly what `.superpowers/sdd/objc2-spike-report.md` proved compiles + runs cleanly
+# exactly what the objc2 spike proved compiles + runs cleanly
 # (zero warnings) against the real frameworks on mini. Each `objc2-*` framework crate
 # gates its ObjC types behind per-type Cargo features; `default-features = false` +
 # an explicit minimal `features` list keeps unused framework bindings (AVFoundation,
 # Metal, CoreData, CloudKit, etc. — pulled in wholesale by each crate's `default`
-# feature set) out of the build entirely. See `.superpowers/sdd/feature-trim-report.md`
-# for how each list was derived and verified empirically on mini.
+# feature set) out of the build entirely. Each list was derived and verified empirically
+# on mini.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [

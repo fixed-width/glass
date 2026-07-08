@@ -1,7 +1,7 @@
 // The display-provisioning seam: where the target app renders for a session.
 // `ExistingDesktop` uses the display the interactive session already presents — a real
 // monitor, a dummy plug, or a virtual monitor from an indirect-display driver (e.g. mttvdd)
-// on a headless box. See docs/running-on-windows.md.
+// on a headless box. See docs/how-to/setup-windows.md.
 
 use glass_core::Result;
 
