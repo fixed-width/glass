@@ -64,12 +64,12 @@ thing you can add** when pointing an agent at glass.
 
 <!-- KEEP IN SYNC with docs/reference/platforms.md (the canonical matrix) and the code. -->
 
-| Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | macOS |
-|---|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ AX |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ Seatbelt |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | 🚧 |
+| Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
+|---|:--:|:--:|:--:|:--:|:--:|
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ◑ no input yet | ✓ |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | – | ✓ AX |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
 Full matrix, per-capability detail, and system requirements:
 [docs/reference/platforms.md](docs/reference/platforms.md). Transport is MCP over stdio (default) or

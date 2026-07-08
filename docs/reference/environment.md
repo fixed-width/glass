@@ -65,6 +65,18 @@ The companion files are auto-discovered next to the `glass-mcp` binary or in gla
 easiest setup is to drop `glass-agent.jar` / `glass-a11y.apk` there; the `*_JAR` / `*_APK` vars above only
 override that with an explicit path. Full setup is in [how-to/setup-android.md](../how-to/setup-android.md).
 
+## iOS
+
+| Variable | Purpose | Default | Scope |
+|---|---|---|---|
+| `GLASS_IOS_UDID` | Exact Simulator UDID to drive when several are available | the newest booted/available iPhone simulator | iOS |
+| `GLASS_IOS_DEVICE` | Device name to boot when none is running, e.g. `iPhone 17` (ignored if `GLASS_IOS_UDID` is set) | the newest available iPhone simulator | iOS |
+| `GLASS_SIMULATOR_KEEP` | Leave a glass-booted iOS Simulator running at shutdown instead of stopping it | stop it | iOS |
+
+Attach-or-boot works the same way as the Android group above: glass attaches to an already-booted
+Simulator, or boots the newest available iPhone simulator itself. Full setup is in
+[how-to/setup-ios.md](../how-to/setup-ios.md).
+
 ## Network transport
 
 | Variable | Purpose | Default | Scope |
