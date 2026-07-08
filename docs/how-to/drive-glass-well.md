@@ -11,8 +11,9 @@ several turns rediscovering the loop by trial and error. The habits that matter:
 - **Pace drags** so a frame-based GUI samples the motion, and **reach for multi-touch** where the app
   needs it.
 
-These are packaged as **glass-drive**, an open [Agent Skill](https://agentskills.io) that works across
-agents (Claude Code, Codex, Cursor, OpenCode, …):
+These are packaged as [**glass-drive**](https://github.com/fixed-width/skills), an open
+[Agent Skill](https://agentskills.io) that works across agents (Claude Code, Codex, Cursor,
+OpenCode, …):
 
 ```bash
 npx skills add fixed-width/skills -s glass-drive
