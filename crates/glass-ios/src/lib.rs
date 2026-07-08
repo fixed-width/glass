@@ -11,8 +11,10 @@ mod capture;
 mod device;
 pub mod doctor;
 mod logs;
+mod platform;
 mod simctl;
 mod target;
 
+pub use platform::IosPlatform;
 pub use simctl::Simctl;
 pub use target::{SimTarget, SimulatorRegistry};

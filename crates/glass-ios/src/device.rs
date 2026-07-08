@@ -1,17 +1,11 @@
 //! Parses `xcrun simctl list devices available --json` and decides whether to attach to a
 //! running simulator or boot one. Pure functions, no I/O — the command run and its output are
-//! wired in by the caller.
-//!
-//! These items are not yet called outside tests; a planned follow-up will use them to pick a
-//! device before driving it. Each carries a per-item `#[cfg_attr(not(test), allow(dead_code))]`
-//! so the lint stays live for any *new* code added here — remove each suppression once its item
-//! is wired in.
+//! wired in by the caller ([`crate::target::SimTarget::from_env`]).
 
 use glass_core::{GlassError, Result};
 use serde_json::Value;
 
 /// One entry from `xcrun simctl list devices available --json`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimDevice {
     pub udid: String,
@@ -22,7 +16,6 @@ pub struct SimDevice {
 }
 
 /// Where to attach or what to boot, decided by [`resolve`].
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolve {
     /// Attach to an already-running device by UDID.
@@ -34,7 +27,6 @@ pub enum Resolve {
 }
 
 /// Parse `xcrun simctl list devices available --json` into a flat device list.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_devices(json: &str) -> Result<Vec<SimDevice>> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::Backend(format!("simctl list JSON parse failed: {e}")))?;
@@ -68,7 +60,6 @@ pub fn parse_devices(json: &str) -> Result<Vec<SimDevice>> {
 
 /// Sort key so the newest runtime sorts last: compare the runtime identifier's version
 /// digits (iOS-26-5 > iOS-18-0). Falls back to 0 for an unrecognized identifier.
-#[cfg_attr(not(test), allow(dead_code))]
 fn runtime_rank(runtime: &str) -> (u32, u32) {
     let tail = runtime.rsplit("iOS-").next().unwrap_or(runtime);
     let mut it = tail.split('-').filter_map(|p| p.parse::<u32>().ok());
@@ -86,7 +77,6 @@ fn runtime_rank(runtime: &str) -> (u32, u32) {
 /// `max_by_key` keeps the *last* element on a tie, so both selections below iterate in
 /// reverse to make the *first*-listed device win a tie — one consistent policy across the
 /// attach and boot branches.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve(devices: &[SimDevice], want_udid: Option<&str>, want_name: Option<&str>) -> Resolve {
     if let Some(u) = want_udid {
         return Resolve::Attach(u.to_string());

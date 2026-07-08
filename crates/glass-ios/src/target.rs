@@ -98,13 +98,11 @@ impl SimTarget {
     }
 
     /// The `Simctl` client bound to the resolved device.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn simctl(&self) -> &Simctl {
         &self.simctl
     }
 
     /// The resolved device's UDID.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn udid(&self) -> &str {
         &self.udid
     }

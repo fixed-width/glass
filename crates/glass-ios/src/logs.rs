@@ -8,14 +8,9 @@ use std::sync::{Arc, Mutex};
 use glass_core::Stream;
 
 /// Thread-safe line buffer shared between the pump thread and `drain`.
-///
-/// Used directly by the unit test below; not yet constructed outside tests until
-/// `LogStream` is wired into a target.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Default)]
 pub struct SharedLog(Arc<Mutex<Vec<(Stream, String)>>>);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl SharedLog {
     /// Append a line. A poisoned lock means some other thread already panicked while
     /// holding it, so propagating here (rather than swallowing the line) surfaces that
@@ -31,26 +26,14 @@ impl SharedLog {
 }
 
 /// A running `xcrun simctl spawn <udid> log stream` whose lines feed a [`SharedLog`].
-///
-/// Not yet constructed anywhere; a planned follow-up attaches it to a target alongside
-/// capture and input.
-#[expect(
-    dead_code,
-    reason = "not wired in yet; a planned follow-up attaches it to a target"
-)]
 pub struct LogStream {
     child: Option<Child>,
     buf: SharedLog,
 }
 
-#[expect(
-    dead_code,
-    reason = "not wired in yet; a planned follow-up attaches it to a target"
-)]
 impl LogStream {
     /// Stream the device's unified log. `log stream` prints all system logs; that is
-    /// noisy but honest — callers filter. A planned follow-up can narrow it with
-    /// `--predicate`.
+    /// noisy but honest — callers filter.
     ///
     /// Best-effort: if `xcrun` fails to spawn, `child` is `None` and `drain` simply
     /// yields nothing, matching the sibling Android backend's behavior when `adb` is

@@ -10,16 +10,9 @@ use crate::simctl::Simctl;
 
 /// Capture the whole device screen as an RGBA `Frame` via `simctl io <udid> screenshot`.
 ///
-/// Not yet called outside tests (nothing wires a `Simctl`/UDID pair to it yet) and, unlike
-/// the pure helpers in `device.rs`/`target.rs`, it needs a real simulator so it has no unit
-/// test either — an unconditional `allow` is required rather than the `cfg_attr(not(test),
-/// ...)` used elsewhere in this crate for items a unit test does exercise. `expect` (rather
-/// than `allow`) keeps this self-removing: it will itself fail the lint gate once a caller
-/// wires this in and the dead-code warning stops firing.
-#[expect(
-    dead_code,
-    reason = "not wired in yet; no real simulator in unit tests"
-)]
+/// Unlike the pure helpers in `device.rs`/`target.rs`, this needs a real simulator, so it
+/// has no unit test — it is exercised by `IosPlatform` and covered by the on-simulator
+/// integration suite instead.
 pub fn screenshot(simctl: &Simctl, udid: &str) -> Result<Frame> {
     let tmp = tempfile::Builder::new()
         .suffix(".png")
