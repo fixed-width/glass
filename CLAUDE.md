@@ -15,7 +15,9 @@ read logs, diff against baselines, wait-until-stable, and read/drive the accessi
 tree — served over MCP (stdio, or `serve --http`). Backends behind a `Platform` seam: X11
 and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native apps in an AVD
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
-on-device companion agent), macOS (ScreenCaptureKit capture, CGEvent input, AXUIElement
+on-device companion agent), iOS (native apps in the Simulator over `xcrun simctl`; this
+release: capture, logs, clipboard — no input/accessibility yet), macOS (ScreenCaptureKit
+capture, CGEvent input, AXUIElement
 windows/logs, accessibility tree, clipboard (isolated + working under containment for
 apps not built with hardened runtime, via a `DYLD_INSERT_LIBRARIES` swizzle shim;
 hardened-runtime apps fall back to unsupported), sandboxing (Seatbelt)).

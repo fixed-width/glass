@@ -21,6 +21,7 @@ way it does? The explanations.
 - [Windows](how-to/setup-windows.md)
 - [macOS](how-to/setup-macos.md)
 - [Android](how-to/setup-android.md) — an AVD emulator, from any host
+- [iOS](how-to/setup-ios.md) — the Simulator, macOS host only
 
 **Connect and drive**
 

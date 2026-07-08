@@ -11,8 +11,9 @@ independently instead of asking the user "does this look right?".
 
 glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
 or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** backend, an
-**Android** backend (an AVD emulator, driven over `adb` from any host), and a **macOS** backend, behind
-a platform-agnostic core.
+**Android** backend (an AVD emulator, driven over `adb` from any host), an **iOS** backend (native
+apps in the Simulator over `xcrun simctl`; this release: capture, logs, clipboard — no
+input/accessibility yet), and a **macOS** backend, behind a platform-agnostic core.
 
 ## The loop in practice
 
@@ -44,6 +45,7 @@ pinned nightly installs automatically), then set up your host:
   no build needed)
 - **Android** — [docs/how-to/setup-android.md](docs/how-to/setup-android.md) (an AVD emulator, from any
   host)
+- **iOS** — [docs/how-to/setup-ios.md](docs/how-to/setup-ios.md) (the Simulator, macOS host only)
 
 Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
 the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
