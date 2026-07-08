@@ -18,7 +18,6 @@ network = [
 
 [dependencies]
 glass-android.workspace = true
-glass-ios.workspace = true
 glass-core.workspace = true
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
@@ -53,6 +52,11 @@ glass-a11y-windows = { path = "../glass-a11y-windows" }
 glass-macos = { path = "../glass-macos" }
 glass-a11y-macos = { path = "../glass-a11y-macos" }
 glass-sandbox-macos.workspace = true
+# The iOS Simulator backend links `image`'s `png` codec chain (see glass-ios/Cargo.toml);
+# macOS is the only host that can actually drive `xcrun simctl`, so keep that chain out of
+# the Linux/Windows glass-mcp binary. glass-ios stays a workspace member either way — its
+# own unit tests still run on every host.
+glass-ios = { path = "../glass-ios" }
 # `setup`'s `gui/<uid>` LaunchAgent install (`rustix::process::getuid`) — a safe syscall
 # wrapper, so no `unsafe` FFI is needed for this. Already a workspace dependency (glass-macos
 # uses it for process signals); the workspace-level `process` feature covers `getuid`.
