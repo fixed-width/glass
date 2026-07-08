@@ -7,6 +7,7 @@
 //! driver.
 #![forbid(unsafe_code)]
 
+mod device;
 mod simctl;
 
 pub use simctl::Simctl;
