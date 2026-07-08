@@ -7,6 +7,7 @@
 //! driver.
 #![forbid(unsafe_code)]
 
+mod capture;
 mod device;
 mod simctl;
 mod target;
