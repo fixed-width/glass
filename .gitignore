@@ -2,6 +2,10 @@
 /target
 **/*.rs.bk
 
+# glass-fixture-egui is excluded from the workspace (heavy egui deps), so it builds into its
+# own target/ (the first-drive tutorial has the agent build it). Its Cargo.lock is tracked.
+/crates/glass-fixture-egui/target/
+
 # glass working dir created in target projects
 .glass/
 
