@@ -28,7 +28,9 @@ explained in [explanation/backends.md](../explanation/backends.md) and
   [how-to/setup-linux.md](../how-to/setup-linux.md).
 - **Windows** — Windows 10 or 11, x86-64. No Visual C++ Redistributable needed (the binary statically
   links the VC++ runtime; the Universal CRT is built in). Drives apps on the interactive desktop, so
-  it needs a logged-in session. See [how-to/setup-windows.md](../how-to/setup-windows.md).
+  it needs a logged-in session. No permission grants are required — see
+  [explanation/windows-permissions.md](../explanation/windows-permissions.md). Setup:
+  [how-to/setup-windows.md](../how-to/setup-windows.md).
 - **macOS** — macOS 14 or later, developed and tested on Apple Silicon; the shipped `.dmg` is a
   universal binary (arm64 + x86_64), but Intel Macs aren't yet verified. Drives the logged-in Aqua
   session and is gated by the two TCC permissions. See [how-to/setup-macos.md](../how-to/setup-macos.md).

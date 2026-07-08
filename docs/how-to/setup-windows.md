@@ -34,6 +34,11 @@ copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 (Tagged releases attach a prebuilt Windows binary; to build it yourself see
 [build-from-source.md](build-from-source.md).)
 
+> **First run — SmartScreen.** Prebuilt binaries are not yet Authenticode-signed, so the first launch
+> may show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run
+> anyway**. This is a publisher-trust prompt, not a permission request — glass needs no permission
+> grants on Windows ([why](../explanation/windows-permissions.md)).
+
 ## Verify
 
 ```powershell
