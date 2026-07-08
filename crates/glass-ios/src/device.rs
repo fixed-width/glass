@@ -80,11 +80,12 @@ fn is_ios_family(runtime: &str) -> bool {
 ///
 /// Order: an explicit `want_udid` always wins (attach, trusting the caller). Otherwise
 /// prefer a device that is already `Booted`, restricted to the iOS family (so a booted
-/// watchOS/tvOS/visionOS simulator is never picked up), with an iPhone preferred over any
-/// other iOS-family device on a tie. Otherwise boot the newest available iOS-family device
-/// (again preferring an iPhone), or one matching `want_name` if given — `want_name` accepts
-/// any iOS-family device, e.g. an iPad, not just an iPhone. If nothing qualifies, return an
-/// actionable error.
+/// watchOS/tvOS/visionOS simulator is never picked up); among those an iPhone is preferred
+/// over any other iOS-family device (iPhone-ness is the primary key, so an older-runtime
+/// iPhone outranks a newer-runtime iPad), and the newest runtime breaks ties within a family.
+/// Otherwise boot the newest available iOS-family device (again preferring an iPhone), or one
+/// matching `want_name` if given — `want_name` accepts any iOS-family device, e.g. an iPad,
+/// not just an iPhone. If nothing qualifies, return an actionable error.
 ///
 /// `max_by_key` keeps the *last* element on a tie, so both selections below iterate in
 /// reverse to make the *first*-listed device win a tie — one consistent policy across the
