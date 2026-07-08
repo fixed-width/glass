@@ -56,12 +56,14 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_EMULATOR` | `emulator` binary (else resolved via `ANDROID_SDK_ROOT` / `ANDROID_HOME`) | SDK-resolved | Android |
 | `GLASS_EMULATOR_ARGS` | Extra flags passed when glass boots an emulator | — | Android |
 | `GLASS_EMULATOR_KEEP` | Keep a glass-booted emulator alive past shutdown | off | Android |
-| `GLASS_ANDROID_AGENT_JAR` | Path to `glass-agent.jar` (on-device agent: clipboard + high-fidelity input) | — (agent off) | Android |
+| `GLASS_ANDROID_AGENT_JAR` | Override path to `glass-agent.jar` (on-device agent: clipboard + high-fidelity input) | auto-discovered, else off | Android |
 | `GLASS_ANDROID_AGENT` | Set `off` to force the `adb` input path even when the jar is present | on when jar set | Android |
-| `GLASS_ANDROID_A11Y_APK` | Path to `glass-a11y.apk` (on-device AccessibilityService) | — (uiautomator) | Android |
+| `GLASS_ANDROID_A11Y_APK` | Override path to `glass-a11y.apk` (on-device AccessibilityService) | auto-discovered, else uiautomator | Android |
 | `GLASS_ANDROID_A11Y` | Set `off` to force `uiautomator` even when the APK is present | on when APK set | Android |
 
-Setup for the on-device companions is in [how-to/setup-android.md](../how-to/setup-android.md).
+The companion files are auto-discovered next to the `glass-mcp` binary or in glass's data dir, so the
+easiest setup is to drop `glass-agent.jar` / `glass-a11y.apk` there; the `*_JAR` / `*_APK` vars above only
+override that with an explicit path. Full setup is in [how-to/setup-android.md](../how-to/setup-android.md).
 
 ## Network transport
 

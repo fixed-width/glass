@@ -63,46 +63,51 @@ The `emulator` binary resolves from `GLASS_EMULATOR` / `ANDROID_SDK_ROOT` / `AND
 boot flags via `GLASS_EMULATOR_ARGS`; keep a glass-booted emulator alive past shutdown with
 `GLASS_EMULATOR_KEEP`. (All variables: [reference/environment.md](../reference/environment.md#android).)
 
-## Optional: on-device agent (clipboard + high-fidelity input)
+## Optional companions: clipboard, high-fidelity input, and a Compose-rich a11y tree
 
-Over plain `adb`, glass types with `input text`/`keyevent` and can't reach the system clipboard. A
-small companion — [glass-android-agent](https://github.com/fixed-width/glass-android-agent), a separate
-Apache-2.0 repo — closes both gaps: it runs on the device as a shell-uid `app_process` server and gives
-glass real `MotionEvent`/`KeyEvent` injection (faithful Unicode, plus multi-touch gestures via
-`glass_gesture`) and clipboard get/set.
+Two small optional companions — both from the one Apache-2.0
+[glass-android-agent](https://github.com/fixed-width/glass-android-agent) repo — sharpen the Android
+backend. glass pushes, launches, installs, and tears them down for you once the files are in place;
+without them it falls back to the plain-`adb` paths.
 
-Point `GLASS_ANDROID_AGENT_JAR` at its `glass-agent.jar`:
+**The easy way to install both:** download `glass-agent.jar` and `glass-a11y.apk` from the agent repo's
+[Releases](https://github.com/fixed-width/glass-android-agent/releases) and drop them in the **same
+directory as your `glass-mcp` binary**. glass finds them there automatically on start — no environment
+variables, no build step. Run `GLASS_BACKEND=android glass-mcp doctor` (below) to confirm they're picked
+up.
 
-- Download the prebuilt jar from the agent repo's
-  [Releases](https://github.com/fixed-width/glass-android-agent/releases), or
-- build it yourself: `./gradlew dex` in the agent repo produces `glass-agent.jar`.
+> On macOS, if you launch the notarized **GlassMcp.app**, put the two files in glass's data dir
+> (`~/Library/Application Support/glass`) instead — adding files inside the signed `.app` bundle breaks
+> its signature.
 
-glass pushes, launches, and tears the agent down for you. Without it, glass uses the `adb` input path
-and `glass_clipboard_*` report unsupported. Set `GLASS_ANDROID_AGENT=off` to force the `adb` paths even
-when the jar is present.
+### Agent — clipboard + high-fidelity input
 
-## Optional: on-device a11y service (Compose-rich tree + high-fidelity `set_value`)
+Over plain `adb`, glass types with `input text`/`keyevent` and can't reach the system clipboard. The
+agent closes both gaps: it runs on the device as a shell-uid `app_process` server and gives glass real
+`MotionEvent`/`KeyEvent` injection (faithful Unicode, plus multi-touch gestures via `glass_gesture`) and
+clipboard get/set. Without `glass-agent.jar`, glass uses the `adb` input path and `glass_clipboard_*`
+report unsupported. Set `GLASS_ANDROID_AGENT=off` to force the `adb` paths even when the jar is present.
 
-A second optional companion — also from
-[glass-android-agent](https://github.com/fixed-width/glass-android-agent) — sharpens semantic
-addressing. `glass_a11y_snapshot` works over plain `adb` via `uiautomator`, but `uiautomator` tends to
-flatten Jetpack Compose UIs, and `glass_set_value` falls back to keystroke simulation. The on-device
-**AccessibilityService** reads the live `AccessibilityNodeInfo` tree (so Compose semantics come
-through) and sets editable fields via the real `ACTION_SET_TEXT`.
+### A11y service — Compose-rich tree + high-fidelity `set_value`
 
-Point `GLASS_ANDROID_A11Y_APK` at its `glass-a11y.apk`:
-
-- Download the prebuilt APK from the agent repo's
-  [Releases](https://github.com/fixed-width/glass-android-agent/releases), or
-- build it yourself: `./gradlew :a11y:assembleDebug` in the agent repo.
-
-glass installs the APK, enables the service, connects, and restores the device's prior accessibility
-state on teardown — all automatically. Without it, glass uses the `uiautomator` reader. Set
-`GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present.
+`glass_a11y_snapshot` works over plain `adb` via `uiautomator`, but `uiautomator` tends to flatten
+Jetpack Compose UIs, and `glass_set_value` falls back to keystroke simulation. The on-device
+**AccessibilityService** reads the live `AccessibilityNodeInfo` tree (so Compose semantics come through)
+and sets editable fields via the real `ACTION_SET_TEXT`; glass enables it and restores the device's
+prior accessibility state on teardown. Without `glass-a11y.apk`, glass uses the `uiautomator` reader.
+Set `GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present.
 
 The service backs the **accessibility tree + `glass_set_value`**. Element *clicks* stay coordinate taps
 (precise, using the service's bounds) — Android's `ACTION_CLICK` is unreliable on Compose, so glass
 doesn't route clicks through it.
+
+### Other locations, and building from source
+
+glass auto-discovers `glass-agent.jar` / `glass-a11y.apk` next to the `glass-mcp` binary or in its data
+dir (`~/.local/share/glass` on Linux, `~/Library/Application Support/glass` on macOS, `%APPDATA%\glass`
+on Windows). To keep them anywhere else, point `GLASS_ANDROID_AGENT_JAR` / `GLASS_ANDROID_A11Y_APK` at an
+absolute path — an explicit path wins over auto-discovery. To build instead of download, in the agent
+repo: `./gradlew dex` produces the jar and `./gradlew :a11y:assembleDebug` the APK.
 
 ## Check the setup
 

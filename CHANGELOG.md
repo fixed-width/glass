@@ -15,6 +15,14 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- Installing the optional Android companions is simpler and better documented: the setup guide,
+  `glass doctor`, and `glass-mcp env` now lead with the easiest path — download `glass-agent.jar`
+  and `glass-a11y.apk` from the [glass-android-agent](https://github.com/fixed-width/glass-android-agent)
+  releases and drop them next to the `glass-mcp` binary, where glass discovers them automatically
+  (no environment variables, no build step). `GLASS_ANDROID_AGENT_JAR` / `GLASS_ANDROID_A11Y_APK`
+  are documented as overrides of that auto-discovery.
+
 ### Fixed
 - `doctor --deep` no longer tells you to "run with --deep" for the Android `screencap` and
   `uiautomator` probes when you already passed `--deep`. Those deep probes only run when
