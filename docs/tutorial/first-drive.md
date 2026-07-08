@@ -21,17 +21,17 @@ sudo apt-get install -y xvfb bubblewrap    # private display + the sandbox
 # and Rust, via https://rustup.rs
 ```
 
-## Step 1 — Build glass and the test app
+## Step 1 — Build glass
 
-From a clone of the glass repo:
+From a clone of the glass repo, build the server:
 
 ```bash
-cargo build --release -p glass-mcp -p glass-testapp
+cargo build --release -p glass-mcp
 ```
 
-This produces `target/release/glass-mcp` (the server) and `target/release/glass-testapp` (our target).
-The first build pulls the pinned nightly toolchain automatically, so it may take a few minutes; later
-builds are fast.
+This produces `target/release/glass-mcp`. The first build pulls the pinned nightly toolchain
+automatically, so it may take a few minutes; later builds are fast. You don't build the test app
+yourself — in Step 3 your agent builds it *through* glass, which is the whole point.
 
 Confirm the environment is ready:
 
@@ -55,17 +55,25 @@ Restart your agent so it picks up the new tools. From here on, **you talk to you
 language** and it calls the glass tools. We'll show each tool call and the exact result it returns, so
 you can follow along.
 
-## Step 3 — Launch the app (build → )
+## Step 3 — Build and launch the app (build →)
 
-Ask your agent: **"Use glass to launch `target/release/glass-testapp` on the x11 backend."** It calls:
+Run your agent from your glass checkout (so the relative paths below resolve), and ask it: **"Use
+glass to build and launch the test app — build with `cargo build --release -p glass-testapp` and run
+`target/release/glass-testapp` on the x11 backend."** It calls:
 
 ```jsonc
-glass_start { "run": ["target/release/glass-testapp"], "backend": "x11" }
+glass_start {
+  "build": "cargo build --release -p glass-testapp",
+  "run": ["target/release/glass-testapp"],
+  "backend": "x11"
+}
 // → { "x": 0, "y": 0, "width": 320, "height": 240 }
 ```
 
-glass built a private headless display, launched the app inside the sandbox, and found its window.
-The `320×240` geometry it returns is your confirmation the app is up.
+glass ran the build, spun up a private headless display, launched the freshly-built app inside the
+sandbox, and found its window. The `320×240` geometry it returns confirms the app compiled and came
+up. This is the **build** phase of the loop — your agent compiled the app itself, then drove it. (The
+build step always runs unsandboxed with your full toolchain; only the launched app is contained.)
 
 ## Step 4 — See it ( → see)
 
@@ -149,13 +157,12 @@ glass tears down the app and the private display it created.
 
 You watched an agent build, launch, see, drive, and verify a real GUI app entirely on its own — the
 loop that lets it debug UI code without stopping to ask you. You did it against a fixture, but nothing
-above changes when you point glass at your own app: swap the `run` command for your app's binary and
+above changes when you point glass at your own app: swap in your app's `build` and `run` commands and
 ask away.
 
 Two things to do next:
 
 - **Give your agent this loop permanently.** Install the [glass-drive skill](../how-to/drive-glass-well.md)
   so it arrives already knowing the cheap-verify habits you just saw, instead of rediscovering them.
-- **Drive your own app.** Point `glass_start` at your project's binary (add a `build` command to
-  rebuild first), and read [explanation/the-loop.md](../explanation/the-loop.md) for the thinking
-  behind the text-first workflow.
+- **Drive your own app.** Give `glass_start` your project's `build` command and binary, and read
+  [explanation/the-loop.md](../explanation/the-loop.md) for the thinking behind the text-first workflow.
