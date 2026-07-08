@@ -49,8 +49,10 @@ otherwise it boots the newest available iPhone simulator itself and shuts it dow
 shutdown.
 
 - `GLASS_IOS_UDID` — drive an exact device by UDID (see `xcrun simctl list devices`).
-- `GLASS_IOS_DEVICE` — boot a device by name, e.g. `"iPhone 17"`, when none is running (ignored
-  if `GLASS_IOS_UDID` is set).
+- `GLASS_IOS_DEVICE` — boot a device by name, e.g. `"iPhone 17"` or `"iPad Pro 13-inch"`, when
+  none is running (ignored if `GLASS_IOS_UDID` is set). Names any iOS-family simulator — iPhone or
+  iPad; watchOS, tvOS, and visionOS simulators are not eligible, whether attaching to an
+  already-booted one or booting one by name.
 - `GLASS_SIMULATOR_KEEP` — set to keep a glass-booted Simulator running past shutdown instead of
   shutting it down.
 

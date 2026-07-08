@@ -97,10 +97,7 @@ impl SimTarget {
                 u
             }
         };
-        Ok(Self {
-            simctl: base.bind(udid.clone()),
-            udid,
-        })
+        Ok(Self { simctl: base, udid })
     }
 
     /// The `Simctl` client bound to the resolved device.
@@ -111,6 +108,16 @@ impl SimTarget {
     /// The resolved device's UDID.
     pub fn udid(&self) -> &str {
         &self.udid
+    }
+
+    /// A `SimTarget` for `IosPlatform` unit tests that never touch a real simulator (a
+    /// `NoActiveSession`/state-machine guard fires before `target` is used).
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            simctl: Simctl::new(),
+            udid: "test-udid".to_string(),
+        }
     }
 }
 

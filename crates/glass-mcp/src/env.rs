@@ -134,7 +134,7 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
         purpose: "exact iOS Simulator UDID to drive when several are available",
         default: "the newest booted/available iPhone simulator", secret: false },
     EnvVarDoc { name: "GLASS_IOS_DEVICE", scope: EnvScope::Ios,
-        purpose: "device name to boot when none is running, e.g. \"iPhone 17\" (ignored if GLASS_IOS_UDID is set)",
+        purpose: "device name to boot when none is running, e.g. \"iPhone 17\" or \"iPad Pro 13-inch\" (ignored if GLASS_IOS_UDID is set)",
         default: "the newest available iPhone simulator", secret: false },
     EnvVarDoc { name: "GLASS_SIMULATOR_KEEP", scope: EnvScope::Ios,
         purpose: "leave a glass-booted iOS Simulator running at shutdown instead of stopping it",

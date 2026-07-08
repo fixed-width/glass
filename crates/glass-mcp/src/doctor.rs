@@ -190,51 +190,52 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
     Section::new("audit", None, vec![Check::new("audit log", status, detail)])
 }
 
-/// When android isn't the active backend, its presence checks are advisory, so adjust them
-/// to read honestly for a user on another backend:
-/// - downgrade any `Fail` to `Warn` (noting why) so a missing adb/emulator — irrelevant to
-///   the current backend — doesn't fail the overall diagnosis, and
-/// - when `--deep` *was* requested, correct the deep-capture probes' skip reason: they were
-///   gated off because android isn't the selected backend, not because `--deep` was missing.
-///   The android crate only sees the collapsed `deep && android_selected` bool, so it emits
-///   its "run with --deep" hint (which the user already did); point at the real gate instead.
-///
-/// The actual status is still reported.
-fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
+/// Downgrade any `Fail` check to `Warn`, noting that it's only required when `backend` is
+/// selected — shared by [`soften_inactive_android`] and [`soften_inactive_ios`] so a missing
+/// tool for a backend the user isn't driving doesn't fail the overall diagnosis. The actual
+/// status is still reported, just softened.
+fn soften_inactive_fails(checks: &mut [Check], backend: &str) {
     for c in checks {
         if c.status == CheckStatus::Fail {
             c.status = CheckStatus::Warn;
             c.detail = format!(
-                "{} (only required when the android backend is selected)",
+                "{} (only required when the {backend} backend is selected)",
                 c.detail
             );
-        } else if deep_requested
-            && c.status == CheckStatus::Skip
-            && c.detail == glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
-        {
-            c.detail = "deep probes run only for the selected backend — set GLASS_BACKEND=android \
-                 to probe capture"
-                .to_string();
+        }
+    }
+}
+
+/// When android isn't the active backend, its presence checks are advisory, so adjust them
+/// to read honestly for a user on another backend: soften any `Fail` via
+/// [`soften_inactive_fails`], and, when `--deep` *was* requested, correct the deep-capture
+/// probes' skip reason — they were gated off because android isn't the selected backend, not
+/// because `--deep` was missing. The android crate only sees the collapsed
+/// `deep && android_selected` bool, so it emits its "run with --deep" hint (which the user
+/// already did); point at the real gate instead.
+fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
+    soften_inactive_fails(checks, "android");
+    if deep_requested {
+        for c in checks {
+            if c.status == CheckStatus::Skip
+                && c.detail == glass_android::doctor::DEEP_NOT_REQUESTED_DETAIL
+            {
+                c.detail =
+                    "deep probes run only for the selected backend — set GLASS_BACKEND=android \
+                     to probe capture"
+                        .to_string();
+            }
         }
     }
 }
 
 /// When ios isn't the active backend, its presence checks are advisory — same rationale as
-/// [`soften_inactive_android`], downgrading any `Fail` to `Warn` so a missing Xcode/simctl
-/// irrelevant to the current backend doesn't fail the overall diagnosis. Unlike android, ios
+/// [`soften_inactive_android`], via the shared [`soften_inactive_fails`]. Unlike android, ios
 /// has no deep-probe skip message to correct: `glass_ios::doctor::checks` accepts `deep` only
 /// for signature parity (iOS has no expensive probe of its own), so it never emits a
 /// "run with --deep" hint that would need re-pointing.
 fn soften_inactive_ios(checks: &mut [Check]) {
-    for c in checks {
-        if c.status == CheckStatus::Fail {
-            c.status = CheckStatus::Warn;
-            c.detail = format!(
-                "{} (only required when the ios backend is selected)",
-                c.detail
-            );
-        }
-    }
+    soften_inactive_fails(checks, "ios");
 }
 
 /// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console

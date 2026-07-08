@@ -12,16 +12,21 @@ use glass_core::Stream;
 pub struct SharedLog(Arc<Mutex<Vec<(Stream, String)>>>);
 
 impl SharedLog {
-    /// Append a line. A poisoned lock means some other thread already panicked while
-    /// holding it, so propagating here (rather than swallowing the line) surfaces that
-    /// failure instead of silently continuing with a possibly-inconsistent buffer.
+    /// Append a line. A poisoned lock (some other thread already panicked while holding it)
+    /// simply drops the line rather than panicking here too, matching `glass-android`'s
+    /// `LogSink`.
     pub fn push(&self, stream: Stream, line: String) {
-        self.0.lock().expect("log lock").push((stream, line));
+        if let Ok(mut g) = self.0.lock() {
+            g.push((stream, line));
+        }
     }
 
     /// Take and clear all buffered lines.
     pub fn drain(&self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut *self.0.lock().expect("log lock"))
+        self.0
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 }
 
@@ -72,6 +77,8 @@ impl Drop for LogStream {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
+            // Reap it so it doesn't linger as a zombie once killed.
+            let _ = c.wait();
         }
     }
 }

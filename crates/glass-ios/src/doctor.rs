@@ -5,6 +5,8 @@
 //! Pure `build_checks(&Probe)` over observed state, plus the thin subprocess-probing
 //! `checks(deep)` entry point the aggregator calls.
 
+use std::process::Command;
+
 use glass_core::{Check, CheckStatus};
 
 /// Observed host state for the iOS doctor checks. Captured by `run`, consumed by the
@@ -97,8 +99,6 @@ fn device_check(p: &Probe) -> Check {
 /// not-ok with a remedy, rather than failing this function. `_deep` is accepted for
 /// signature parity with the other backends' doctors; iOS has no expensive deep probe.
 pub fn checks(_deep: bool) -> Vec<Check> {
-    use std::process::Command;
-
     let xcode_dir = Command::new("xcode-select")
         .arg("-p")
         .output()
@@ -168,6 +168,30 @@ mod tests {
         assert_eq!(xcode.status, CheckStatus::Fail);
         assert!(
             xcode.remedy.as_deref().unwrap().contains("full Xcode"),
+            "{:?}",
+            xcode.remedy
+        );
+        // CLT-only also means `simctl` itself is unavailable — assert that check fails too,
+        // not just `xcode`.
+        assert_eq!(
+            cs.iter().find(|c| c.name == "simctl").unwrap().status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn no_active_developer_directory_fails_with_install_xcode_remedy() {
+        let p = Probe {
+            xcode_dir: None,
+            simctl_ok: false,
+            runtimes: &[],
+            iphones: &[],
+        };
+        let cs = build_checks(&p);
+        let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
+        assert_eq!(xcode.status, CheckStatus::Fail);
+        assert!(
+            xcode.remedy.as_deref().unwrap().contains("Xcode"),
             "{:?}",
             xcode.remedy
         );

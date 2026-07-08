@@ -55,7 +55,7 @@ non-goals.
 
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs are implemented; the on-box path is exercised by a manual smoke test on a macOS
-host with a booted Simulator (this backend has no macOS CI runner yet, so only its host-independent
+host with a booted Simulator (no CI wiring on the macOS runner yet, so only its host-independent
 logic — device resolution, `simctl` argument construction, doctor checks — runs in CI). Window support
 is geometry/focus only: resize and move are unsupported, since Simulator apps, like a real device, are
 always fullscreen. Pointer/keyboard input and the accessibility tree are not implemented yet;

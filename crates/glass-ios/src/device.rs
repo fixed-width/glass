@@ -59,20 +59,32 @@ pub fn parse_devices(json: &str) -> Result<Vec<SimDevice>> {
 }
 
 /// Sort key so the newest runtime sorts last: compare the runtime identifier's version
-/// digits (iOS-26-5 > iOS-18-0). Falls back to 0 for an unrecognized identifier.
+/// digits (iOS-26-5 > iOS-18-0). Falls back to `(0, 0)` — oldest — for an unrecognized
+/// identifier, so a future change to Apple's runtime-id format ranks that device as oldest
+/// rather than failing resolution outright.
 fn runtime_rank(runtime: &str) -> (u32, u32) {
     let tail = runtime.rsplit("iOS-").next().unwrap_or(runtime);
     let mut it = tail.split('-').filter_map(|p| p.parse::<u32>().ok());
     (it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
+/// Is `runtime` an iOS (as opposed to watchOS/tvOS/visionOS) simulator runtime? The runtime
+/// identifier looks like `com.apple.CoreSimulator.SimRuntime.iOS-26-5`; the sibling platforms'
+/// identifiers (`watchOS-...`, `tvOS-...`, `xrOS-...`) do not contain the substring `iOS`.
+fn is_ios_family(runtime: &str) -> bool {
+    runtime.contains("iOS")
+}
+
 /// Decide whether to attach to a running simulator or boot one, given the current
 /// device list and the caller's optional UDID/name preference.
 ///
 /// Order: an explicit `want_udid` always wins (attach, trusting the caller). Otherwise
-/// prefer a device that is already `Booted` (an iPhone over any other booted device).
-/// Otherwise boot the newest available iPhone, or one matching `want_name` if given.
-/// If nothing qualifies, return an actionable error.
+/// prefer a device that is already `Booted`, restricted to the iOS family (so a booted
+/// watchOS/tvOS/visionOS simulator is never picked up), with an iPhone preferred over any
+/// other iOS-family device on a tie. Otherwise boot the newest available iOS-family device
+/// (again preferring an iPhone), or one matching `want_name` if given — `want_name` accepts
+/// any iOS-family device, e.g. an iPad, not just an iPhone. If nothing qualifies, return an
+/// actionable error.
 ///
 /// `max_by_key` keeps the *last* element on a tie, so both selections below iterate in
 /// reverse to make the *first*-listed device win a tie — one consistent policy across the
@@ -81,22 +93,24 @@ pub fn resolve(devices: &[SimDevice], want_udid: Option<&str>, want_name: Option
     if let Some(u) = want_udid {
         return Resolve::Attach(u.to_string());
     }
-    // Tie-break only bites when several iPhones are booted at once: the first-listed wins.
+    // Tie-break only bites when several iOS-family devices are booted at once: the
+    // first-listed wins, with an iPhone preferred over any other iOS-family device.
     if let Some(d) = devices
         .iter()
         .rev()
-        .filter(|d| d.state == "Booted")
+        .filter(|d| d.state == "Booted" && is_ios_family(&d.runtime))
         .max_by_key(|d| (d.name.starts_with("iPhone"), runtime_rank(&d.runtime)))
     {
         return Resolve::Attach(d.udid.clone());
     }
-    // A tie between two newest-runtime iPhones resolves to whichever came first in the listing.
+    // A tie between two newest-runtime iOS-family devices resolves to whichever came first
+    // in the listing, with an iPhone preferred over any other iOS-family device.
     let candidate = devices
         .iter()
         .rev()
-        .filter(|d| d.is_available && d.name.starts_with("iPhone"))
+        .filter(|d| d.is_available && is_ios_family(&d.runtime))
         .filter(|d| want_name.is_none_or(|n| d.name == n))
-        .max_by_key(|d| runtime_rank(&d.runtime));
+        .max_by_key(|d| (d.name.starts_with("iPhone"), runtime_rank(&d.runtime)));
     match candidate {
         Some(d) => Resolve::Boot(d.udid.clone()),
         None => Resolve::Error(match want_name {
@@ -175,5 +189,100 @@ mod tests {
     fn errors_when_no_iphone() {
         let d: Vec<SimDevice> = vec![];
         assert!(matches!(resolve(&d, None, None), Resolve::Error(_)));
+    }
+
+    #[test]
+    fn attach_prefers_first_listed_among_equal_rank_booted_iphones() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+              {"udid":"AAA","name":"iPhone 17","state":"Booted","isAvailable":true},
+              {"udid":"BBB","name":"iPhone 17 Pro","state":"Booted","isAvailable":true}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert_eq!(resolve(&d, None, None), Resolve::Attach("AAA".into()));
+    }
+
+    #[test]
+    fn booted_watch_is_not_attached_iphone_boots_instead() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.watchOS-10-4": [
+              {"udid":"WWW","name":"Apple Watch Series 9","state":"Booted","isAvailable":true}
+            ],
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+              {"udid":"AAA","name":"iPhone 17","state":"Shutdown","isAvailable":true}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert_eq!(resolve(&d, None, None), Resolve::Boot("AAA".into()));
+    }
+
+    #[test]
+    fn booted_watch_only_errors_when_no_iphone_available() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.watchOS-10-4": [
+              {"udid":"WWW","name":"Apple Watch Series 9","state":"Booted","isAvailable":true}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert!(matches!(resolve(&d, None, None), Resolve::Error(_)));
+    }
+
+    #[test]
+    fn explicit_device_name_boots_a_named_ipad() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+              {"udid":"III","name":"iPad Pro 13-inch","state":"Shutdown","isAvailable":true}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert_eq!(
+            resolve(&d, None, Some("iPad Pro 13-inch")),
+            Resolve::Boot("III".into())
+        );
+    }
+
+    #[test]
+    fn booted_ipad_is_attached_when_no_iphone_booted() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+              {"udid":"III","name":"iPad Pro 13-inch","state":"Booted","isAvailable":true}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert_eq!(resolve(&d, None, None), Resolve::Attach("III".into()));
+    }
+
+    #[test]
+    fn unavailable_iphone_with_nothing_else_errors() {
+        let json = r#"{
+          "devices": {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+              {"udid":"AAA","name":"iPhone 17","state":"Shutdown","isAvailable":false}
+            ]
+          }
+        }"#;
+        let d = parse_devices(json).unwrap();
+        assert!(matches!(resolve(&d, None, None), Resolve::Error(_)));
+    }
+
+    #[test]
+    fn parse_devices_rejects_non_json() {
+        assert!(parse_devices("not json").is_err());
+    }
+
+    #[test]
+    fn parse_devices_rejects_json_missing_devices_key() {
+        assert!(parse_devices(r#"{"foo":1}"#).is_err());
     }
 }
