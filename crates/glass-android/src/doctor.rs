@@ -265,7 +265,7 @@ fn agent_check(p: &Probe) -> Check {
         return Check::new(
             "agent",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_AGENT_JAR, or drop glass-agent.jar in the glass data dir, for clipboard + high-fidelity input)",
+            "not configured (optional — for clipboard + high-fidelity input: download glass-agent.jar from the glass-android-agent releases and drop it next to glass-mcp, or set GLASS_ANDROID_AGENT_JAR)",
         );
     };
     if !p.agent_jar_exists {
@@ -274,7 +274,7 @@ fn agent_check(p: &Probe) -> Check {
             CheckStatus::Warn,
             format!("GLASS_ANDROID_AGENT_JAR={jar} but no file there"),
         )
-        .with_remedy("build the agent (`./gradlew dex` in glass-android-agent), or fix the path");
+        .with_remedy("download glass-agent.jar from the glass-android-agent releases (or build it with `./gradlew dex`) and drop it next to glass-mcp, or fix the path");
     }
     // agent_deep is Some only when deep was requested (see probe); so None means
     // either not-deep (Ok configured) or deep-but-no-attachable-device (Skip).
@@ -315,7 +315,7 @@ fn a11y_check(p: &Probe) -> Check {
         return Check::new(
             "a11y-service",
             CheckStatus::Skip,
-            "not configured (optional — set GLASS_ANDROID_A11Y_APK, or drop glass-a11y.apk in the glass data dir, for a Compose-rich tree + high-fidelity set_value)",
+            "not configured (optional — for a Compose-rich tree + high-fidelity set_value: download glass-a11y.apk from the glass-android-agent releases and drop it next to glass-mcp, or set GLASS_ANDROID_A11Y_APK)",
         );
     };
     if !p.a11y_apk_exists {
@@ -324,7 +324,7 @@ fn a11y_check(p: &Probe) -> Check {
             CheckStatus::Warn,
             format!("GLASS_ANDROID_A11Y_APK={apk} but no file there"),
         )
-        .with_remedy("build the APK (`./gradlew :a11y:assembleDebug` in glass-android-agent), or fix the path");
+        .with_remedy("download glass-a11y.apk from the glass-android-agent releases (or build it with `./gradlew :a11y:assembleDebug`) and drop it next to glass-mcp, or fix the path");
     }
     // a11y_deep is Some only when deep was requested (see probe); so None means
     // either not-deep (Ok configured) or deep-but-no-attachable-device (Skip).
@@ -778,6 +778,8 @@ mod tests {
         let a = find(&a, "agent");
         assert_eq!(a.status, CheckStatus::Skip);
         assert!(a.detail.contains("GLASS_ANDROID_AGENT_JAR"));
+        // leads with the easy path: drop the prebuilt jar next to glass-mcp
+        assert!(a.detail.contains("next to glass-mcp"), "got {}", a.detail);
     }
 
     #[test]
@@ -788,7 +790,10 @@ mod tests {
         let a = build_checks(&p);
         let a = find(&a, "agent");
         assert_eq!(a.status, CheckStatus::Warn);
-        assert!(a.remedy.as_deref().unwrap().contains("gradlew"));
+        let remedy = a.remedy.as_deref().unwrap();
+        assert!(remedy.contains("gradlew"), "got {remedy}");
+        // the easy path (download prebuilt, drop next to glass-mcp) comes first
+        assert!(remedy.contains("next to glass-mcp"), "got {remedy}");
     }
 
     #[test]
@@ -849,6 +854,8 @@ mod tests {
         let a = find(&a, "a11y-service");
         assert_eq!(a.status, CheckStatus::Skip);
         assert!(a.detail.contains("GLASS_ANDROID_A11Y_APK"));
+        // leads with the easy path: drop the prebuilt apk next to glass-mcp
+        assert!(a.detail.contains("next to glass-mcp"), "got {}", a.detail);
     }
 
     #[test]
@@ -859,7 +866,10 @@ mod tests {
         let a = build_checks(&p);
         let a = find(&a, "a11y-service");
         assert_eq!(a.status, CheckStatus::Warn);
-        assert!(a.remedy.as_deref().unwrap().contains("gradlew"));
+        let remedy = a.remedy.as_deref().unwrap();
+        assert!(remedy.contains("gradlew"), "got {remedy}");
+        // the easy path (download prebuilt, drop next to glass-mcp) comes first
+        assert!(remedy.contains("next to glass-mcp"), "got {remedy}");
     }
 
     #[test]
