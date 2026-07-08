@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     // itself on that same calling thread — so this line runs synchronously on thread 0
     // during that first poll, strictly before `boot()`/`run_stdio()` below ever construct a
     // `GlassServer` and spawn its worker thread. See glass-macos's `ffi::app_kit_init` doc
-    // and `.superpowers/sdd/thread0-spike-report.md` for why one call here is sufficient —
+    // for why one call here is sufficient —
     // every later `MacosPlatform` call, from any thread, is a cheap no-op after this.
     #[cfg(target_os = "macos")]
     glass_macos::init_main_thread();

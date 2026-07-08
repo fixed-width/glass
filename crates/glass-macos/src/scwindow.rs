@@ -2,8 +2,8 @@
 //! active-window retargeting).
 //!
 //! Polls ScreenCaptureKit's `SCShareableContent` enumeration — the same async
-//! completion-handler API proven end-to-end in
-//! `.superpowers/sdd/objc2-spike-report.md` Part A — for the first on-screen window
+//! completion-handler API proven end-to-end in the objc2 spike — for the first on-screen
+//! window
 //! owned by one of a set of pids ([`find_window_for_pids`], the launched app's process
 //! set) or for the specific on-screen window with a given `CGWindowID` that is *also* owned
 //! by one of that same pid set ([`find_window_by_id`], `MacosPlatform`'s active window once

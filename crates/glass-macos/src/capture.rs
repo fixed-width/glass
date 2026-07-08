@@ -3,7 +3,7 @@
 //! Re-resolves the target window fresh on every call — a `Retained<SCWindow>` can't be
 //! held across calls or across the completion-handler's thread boundary (see
 //! `scwindow.rs`'s module doc) — via the nested async flow proven end-to-end in the objc2
-//! spike (`.superpowers/sdd/objc2-spike-report.md` Part A):
+//! spike:
 //! `SCShareableContent` → [`crate::scwindow::find_on_screen_window`]/
 //! [`crate::scwindow::find_on_screen_window_by_id`] (pid-set lookup for `capture_window`,
 //! exact-`CGWindowID` lookup for `capture_window_by_id` — see [`capture_resolved`]) →

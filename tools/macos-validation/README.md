@@ -2,8 +2,7 @@
 
 Throwaway, runnable scaffolding to **de-risk the glass macOS backend on a rented Mac
 before buying hardware or writing the real backend**. Covers the two highest-risk steps
-of the validation plan
-([`docs/superpowers/specs/2026-06-03-macos-validation-plan.md`](../../docs/superpowers/specs/2026-06-03-macos-validation-plan.md)):
+of the macOS backend validation plan:
 
 1. **`virtual_display.m`** — create an off-screen display via the private
    `CGVirtualDisplay` API (proves a headless Mac can host a capturable display).

@@ -27,9 +27,8 @@ cargo test -p glass-macos --lib "${1:-}"
 # and links; it needs the Screen Recording TCC grant to actually PASS, which only a
 # signed, granted app bundle holds — so the real run happens out-of-band, copying this
 # built binary into the granted GlassProbe.app bundle, re-signing, and launching via a
-# gui/501 LaunchAgent so it inherits the grant (see
-# .superpowers/sdd/objc2-spike-report.md and .superpowers/sdd/task-6-brief.md for the
-# exact procedure). Plain `./scripts/test-macos.sh` (no env set) never touches this.
+# gui/501 LaunchAgent so it inherits the grant. Plain `./scripts/test-macos.sh` (no env
+# set) never touches this.
 if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   echo "GLASS_MACOS_ONBOX=1: building the capture integration test binary..."
   cargo test -p glass-macos --test capture --no-run
@@ -37,8 +36,7 @@ if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   # Same story as `capture` above, for crates/glass-macos/tests/input.rs (the send_key/
   # send_pointer end-to-end proof) — building here just confirms it compiles and links; the
   # granted run needs both Screen Recording and Accessibility TCC grants, so it happens
-  # out-of-band via the same GlassProbe.app LaunchAgent procedure (see
-  # .superpowers/sdd/task-6-brief.md).
+  # out-of-band via the same GlassProbe.app LaunchAgent procedure.
   echo "GLASS_MACOS_ONBOX=1: building the input integration test binary..."
   cargo test -p glass-macos --test input --no-run
 
@@ -46,8 +44,7 @@ if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   # select_window/window(op) end-to-end proof, incl. the private CGWindowID<->AXUIElement
   # correlation) — building here just confirms it compiles and links; the granted run needs
   # both TCC grants (same as `input` above) plus an unlocked screen session, so it happens
-  # out-of-band via the same GlassProbe.app LaunchAgent procedure (see
-  # .superpowers/sdd/task-6-brief.md).
+  # out-of-band via the same GlassProbe.app LaunchAgent procedure.
   echo "GLASS_MACOS_ONBOX=1: building the window integration test binary..."
   cargo test -p glass-macos --test windows --no-run
 fi
