@@ -123,7 +123,7 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Build, launch, and locate a native GUI app; returns its window geometry. Optional `backend`: \"x11\" (headless Xvfb) or \"wayland\" (headless sway) on Linux, or \"windows\" on a Windows host, or \"android\" for an AVD emulator on any host; defaults to the host backend (windows on Windows, else x11). Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to an unrelated process (some packaged Windows apps)."
+        description = "Build, launch, and locate a native GUI app; returns its window geometry. Optional `backend`: \"x11\" (headless Xvfb) or \"wayland\" (headless sway) on Linux, or \"windows\" on a Windows host, or \"macos\" on a macOS host, or \"android\" for an AVD emulator on any host; defaults to the host backend (windows on Windows, macos on macOS, else x11). Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to an unrelated process (some packaged Windows apps)."
     )]
     async fn glass_start(
         &self,

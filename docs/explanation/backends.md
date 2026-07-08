@@ -9,7 +9,8 @@ setup differs.
 ## The backend is chosen per launch
 
 The backend is selected **per `glass_start`**, via its `backend` argument. When omitted it falls back
-to `GLASS_BACKEND`, then to the host default (`windows` on a Windows host, otherwise `x11`). Because
+to `GLASS_BACKEND`, then to the host default (`windows` on a Windows host, `macos` on a macOS host,
+otherwise `x11`). Because
 the choice is per-call, an agent can drive an X11 app and a Wayland app in the same session with no
 server restart. The backend is built when the app is launched, so the server boots even on a host with
 no display or compositor at all.

@@ -15,7 +15,7 @@ the argument wins when both are present.
 
 | Variable | Purpose | Default | Scope |
 |---|---|---|---|
-| `GLASS_BACKEND` | Default backend when `glass_start`'s `backend` is omitted | `windows` on a Windows host, else `x11` | all |
+| `GLASS_BACKEND` | Default backend when `glass_start`'s `backend` is omitted | `windows` on a Windows host, `macos` on a macOS host, else `x11` | all |
 | `GLASS_DISPLAY` | X11 display target: unset = spawn a private headless `Xvfb`; `:N` = attach to a display you manage; `:0` = drive your real desktop | unset (private `Xvfb`) | X11 |
 | `GLASS_XVFB` | `Xvfb` binary | `Xvfb` (on `PATH`) | X11 |
 | `GLASS_XVFB_SCREEN` | Private `Xvfb` screen geometry | `1280x800x24` | X11 |
