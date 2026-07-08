@@ -9,6 +9,7 @@
 
 mod capture;
 mod device;
+mod logs;
 mod simctl;
 mod target;
 
