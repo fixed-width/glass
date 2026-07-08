@@ -11,6 +11,13 @@ use crate::avd::{decide, parse_list_avds, resolve_emulator_bin, Action, Lifecycl
 use crate::axmap::check_dump_status;
 use crate::target::{parse_devices, Device};
 
+/// Skip detail the deep-capture checks (`screencap`, `uiautomator`) emit when `--deep`
+/// wasn't requested. Exposed so `glass-mcp` can recognise it and correct the wording when
+/// the flag *was* passed but android isn't the selected backend (the aggregator collapses
+/// `deep && android_selected` into the single bool this crate sees, so it can't tell the
+/// two cases apart itself). See `glass_mcp::doctor::soften_inactive_android`.
+pub const DEEP_NOT_REQUESTED_DETAIL: &str = "run with --deep to probe capture";
+
 /// Observed host state for the Android doctor checks. Captured by `probe`, consumed
 /// by the pure `build_checks` so all branch logic is unit-testable without subprocesses.
 struct Probe {
@@ -348,7 +355,7 @@ fn deep_checks(p: &Probe) -> (Check, Check) {
         return skip("skipped — adb unavailable");
     }
     if !p.deep_requested {
-        return skip("run with --deep to probe capture");
+        return skip(DEEP_NOT_REQUESTED_DETAIL);
     }
     let Some(d) = &p.deep else {
         return skip("no device selected to probe");
