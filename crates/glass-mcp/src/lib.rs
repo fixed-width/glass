@@ -50,7 +50,16 @@ pub fn make_platform(
     registry: &glass_android::EmulatorRegistry,
     agents: &glass_android::AgentRegistry,
     a11y: &glass_android::A11yServiceRegistry,
+    sim_registry: &glass_ios::SimulatorRegistry,
 ) -> Result<Backend> {
+    if backend == "ios" {
+        // No accessibility reader for the iOS Simulator backend yet.
+        let platform = glass_ios::IosPlatform::from_env(sim_registry)?;
+        return Ok(Backend {
+            platform: Box::new(platform),
+            accessibility: None,
+        });
+    }
     if backend == "android" {
         let platform = glass_android::AndroidPlatform::from_env(registry, agents)?;
         let get = |k: &str| std::env::var(k).ok();
@@ -93,11 +102,11 @@ pub fn make_platform(
         "macos" => Box::new(glass_macos::MacosPlatform::new()?),
         other => {
             #[cfg(target_os = "linux")]
-            let valid = "\"x11\", \"wayland\", or \"android\"";
+            let valid = "\"x11\", \"wayland\", \"android\", or \"ios\"";
             #[cfg(windows)]
-            let valid = "\"windows\" or \"android\"";
+            let valid = "\"windows\", \"android\", or \"ios\"";
             #[cfg(target_os = "macos")]
-            let valid = "\"macos\" or \"android\"";
+            let valid = "\"macos\", \"android\", or \"ios\"";
             return Err(GlassError::Backend(format!(
                 "unknown backend {other:?}; use {valid}"
             )));
@@ -127,11 +136,12 @@ pub fn make_platform(
 }
 
 /// Default backend name from `GLASS_BACKEND` (case-insensitive
-/// `wayland`/`windows`/`macos`/`x11`/`android`). Unset defaults to the windows backend on
-/// a Windows host, the macos backend on a macOS host, else X11.
+/// `wayland`/`windows`/`macos`/`x11`/`android`/`ios`). Unset defaults to the windows backend
+/// on a Windows host, the macos backend on a macOS host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
     match env {
         Some(v) if v.eq_ignore_ascii_case("android") => "android",
+        Some(v) if v.eq_ignore_ascii_case("ios") => "ios",
         Some(v) if v.eq_ignore_ascii_case("wayland") => "wayland",
         Some(v) if v.eq_ignore_ascii_case("windows") => "windows",
         Some(v) if v.eq_ignore_ascii_case("macos") => "macos",
@@ -266,11 +276,21 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let registry = glass_android::EmulatorRegistry::new();
     let agents = glass_android::AgentRegistry::new();
     let a11y = glass_android::A11yServiceRegistry::new();
+    let sim_registry = glass_ios::SimulatorRegistry::new();
     let reg_factory = registry.clone();
     let agents_factory = agents.clone();
     let a11y_factory = a11y.clone();
+    let sim_factory = sim_registry.clone();
     let mut glass = Glass::new(
-        Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory)),
+        Box::new(move |b| {
+            make_platform(
+                b,
+                &reg_factory,
+                &agents_factory,
+                &a11y_factory,
+                &sim_factory,
+            )
+        }),
         default,
         baselines,
         10_000,
@@ -279,6 +299,7 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
         a11y.shutdown();
         agents.shutdown();
         registry.kill_all();
+        sim_registry.shutdown_all();
     }));
     if let Some(sink) = audit {
         glass.set_audit_sink(sink);
@@ -317,6 +338,12 @@ mod tests {
     fn android_backend_is_selectable_by_name() {
         assert_eq!(super::default_backend(Some("android")), "android");
         assert_eq!(super::default_backend(Some("ANDROID")), "android");
+    }
+
+    #[test]
+    fn default_backend_accepts_ios() {
+        assert_eq!(default_backend(Some("ios")), "ios");
+        assert_eq!(default_backend(Some("IOS")), "ios");
     }
 
     #[test]

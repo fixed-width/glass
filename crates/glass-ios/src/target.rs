@@ -3,17 +3,22 @@
 //! one piece of I/O this crate performs proactively — running `bootstatus -b` to boot and
 //! wait for a device this crate chose to start.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use glass_core::{GlassError, Result};
 
 use crate::device::{parse_devices, resolve, Resolve};
 use crate::simctl::Simctl;
 
-/// Shuts down simulators glass booted, on drop, unless the user asked to keep them.
-#[derive(Default)]
+/// UDIDs of simulators glass booted itself, so they can be shut down explicitly rather than
+/// left running. Cloneable + `Send` (shared `Arc`); glass-mcp threads one clone into the
+/// platform factory (to register boots) and another into the `Glass` shutdown hook (to shut
+/// them down). No `Drop` impl: a clone going out of scope (e.g. the factory clone, dropped
+/// after each `glass_start`) must not shut down simulators that are still in use — only an
+/// explicit `shutdown_all` call does that.
+#[derive(Clone, Default)]
 pub struct SimulatorRegistry {
-    booted: Mutex<Vec<String>>,
+    booted: Arc<Mutex<Vec<String>>>,
 }
 
 impl SimulatorRegistry {
@@ -21,30 +26,31 @@ impl SimulatorRegistry {
         Self::default()
     }
 
-    /// Record a simulator UDID glass booted, so it gets shut down on drop.
+    /// Record a simulator UDID glass booted.
     pub fn register(&self, udid: String) {
-        // Recover a poisoned lock rather than panic: the vec is a plain list of UDIDs and a
-        // prior panic can't have left it in a state that matters for a best-effort sweep.
-        self.booted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(udid);
+        if let Ok(mut g) = self.booted.lock() {
+            g.push(udid);
+        }
     }
-}
 
-impl Drop for SimulatorRegistry {
-    fn drop(&mut self) {
-        let s = Simctl::new();
-        // Never panic inside drop: a panic here during unwind would abort the process. Recover
-        // a poisoned lock and shut down whatever UDIDs we recorded, ignoring per-command errors.
-        for udid in self
+    /// Shut down every registered simulator (`xcrun simctl shutdown <udid>`) and clear the
+    /// list. Best-effort: a simulator already stopped, or a host with no simulator support at
+    /// all, is fine — each shutdown's result is discarded.
+    pub fn shutdown_all(&self) {
+        let udids = self
             .booted
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        let s = Simctl::new();
+        for udid in udids {
             let _ = s.run(&["shutdown", &udid]);
         }
+    }
+
+    #[cfg(test)]
+    pub fn udids(&self) -> Vec<String> {
+        self.booted.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
@@ -70,8 +76,8 @@ pub struct SimTarget {
 impl SimTarget {
     /// Resolve a device from env/list (attach if one's already running or named, else boot
     /// the newest available iPhone), booting and waiting for it via `bootstatus -b` when
-    /// needed, and registering it in `reg` for shutdown-on-drop unless `GLASS_SIMULATOR_KEEP`
-    /// is set.
+    /// needed, and registering it in `reg` — for shutdown by a later `reg.shutdown_all()` call
+    /// — unless `GLASS_SIMULATOR_KEEP` is set.
     pub fn from_env(reg: &SimulatorRegistry) -> Result<Self> {
         let get = |k: &str| std::env::var(k).ok();
         let (want_udid, want_name, keep) = wants(&get);
@@ -134,5 +140,24 @@ mod tests {
     fn wants_empty_keep_is_false() {
         let g = getter(HashMap::from([("GLASS_SIMULATOR_KEEP", "")]));
         assert_eq!(wants(&g), (None, None, false));
+    }
+
+    #[test]
+    fn registry_records_udids_across_clones() {
+        let r = SimulatorRegistry::new();
+        let r2 = r.clone();
+        r.register("AAA".into());
+        r2.register("BBB".into());
+        assert_eq!(r.udids(), vec!["AAA".to_string(), "BBB".to_string()]);
+    }
+
+    #[test]
+    fn shutdown_all_clears_the_registry() {
+        let r = SimulatorRegistry::new();
+        r.register("AAA".into());
+        // Best-effort: `xcrun simctl shutdown` may fail in a CI sandbox with no real
+        // simulator, but the registry is cleared regardless.
+        r.shutdown_all();
+        assert!(r.udids().is_empty());
     }
 }

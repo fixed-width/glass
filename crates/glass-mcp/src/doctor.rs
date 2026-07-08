@@ -61,9 +61,10 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     // sections below — "macos" (the platform backend's own TCC posture), "sandbox" (Seatbelt
     // containment posture, mirroring the Linux/Windows "sandbox" sections), and
     // "accessibility (macos)" (the a11y-tool reader's readiness, kept separate from "macos" —
-    // see the comment there for why). Android is the exception: its crate is
-    // host-OS-agnostic and always compiled in, so its section is always emitted, gated
-    // at runtime (see below) rather than by cfg.
+    // see the comment there for why). Android and iOS are the exception: both crates shell
+    // out to a separate SDK's own tools (adb/emulator; xcrun simctl) rather than linking an
+    // OS framework, so they're host-OS-agnostic and always compiled in — their sections are
+    // always emitted, gated at runtime (see below) rather than by cfg.
     let mut sections = vec![general, network];
 
     #[cfg(target_os = "linux")]
@@ -148,6 +149,18 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         android_checks,
     ));
 
+    // iOS Simulator backend: same rationale as android above — the crate shells out to
+    // Apple's own `xcrun simctl`, so it's compiled in unconditionally rather than gated to
+    // macOS builds, and its basic presence checks run regardless of the selected backend.
+    // Soften Fails to Warns when ios isn't active so a missing Xcode/simctl on a non-macOS
+    // host (or a Mac not driving iOS) doesn't fail the overall doctor verdict.
+    let ios_selected = backend == "ios";
+    let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
+    if !ios_selected {
+        soften_inactive_ios(&mut ios_checks);
+    }
+    sections.push(Section::new("ios", Some("ios".into()), ios_checks));
+
     if let Some(report) = audit {
         sections.push(audit_section(report));
     }
@@ -202,6 +215,24 @@ fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
             c.detail = "deep probes run only for the selected backend — set GLASS_BACKEND=android \
                  to probe capture"
                 .to_string();
+        }
+    }
+}
+
+/// When ios isn't the active backend, its presence checks are advisory — same rationale as
+/// [`soften_inactive_android`], downgrading any `Fail` to `Warn` so a missing Xcode/simctl
+/// irrelevant to the current backend doesn't fail the overall diagnosis. Unlike android, ios
+/// has no deep-probe skip message to correct: `glass_ios::doctor::checks` accepts `deep` only
+/// for signature parity (iOS has no expensive probe of its own), so it never emits a
+/// "run with --deep" hint that would need re-pointing.
+fn soften_inactive_ios(checks: &mut [Check]) {
+    for c in checks {
+        if c.status == CheckStatus::Fail {
+            c.status = CheckStatus::Warn;
+            c.detail = format!(
+                "{} (only required when the ios backend is selected)",
+                c.detail
+            );
         }
     }
 }
@@ -379,6 +410,25 @@ mod tests {
     }
 
     #[test]
+    fn inactive_ios_fails_soften_to_warn() {
+        let mut checks = vec![
+            Check::new("xcode", CheckStatus::Fail, "no active developer directory")
+                .with_remedy("install Xcode from the App Store"),
+            Check::new("device", CheckStatus::Ok, "1 iPhone simulator(s) available"),
+        ];
+        soften_inactive_ios(&mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
+        assert!(checks[0]
+            .detail
+            .contains("only required when the ios backend is selected"));
+        assert_eq!(
+            checks[0].remedy.as_deref(),
+            Some("install Xcode from the App Store")
+        ); // remedy preserved
+        assert_eq!(checks[1].status, CheckStatus::Ok); // Ok untouched
+    }
+
+    #[test]
     fn inactive_android_deep_not_requested_keeps_run_with_deep_hint() {
         // --deep was NOT passed: the "run with --deep" hint is the correct next step, so it
         // must be left intact (only the `deep_requested` case is misleading).
@@ -400,9 +450,9 @@ mod tests {
         // is asserted, so it's deterministic regardless of host.
         let d = diagnose(false);
         let titles: Vec<&str> = d.sections.iter().map(|s| s.title.as_str()).collect();
-        // Platform-gated backends compiled into THIS binary get a section; android is
-        // always present (host-OS-agnostic crate) via a runtime gate. No "not built into
-        // this binary" placeholders. Accessibility is per-OS (AT-SPI on Linux, UIA on
+        // Platform-gated backends compiled into THIS binary get a section; android and ios
+        // are always present (host-OS-agnostic crates) via a runtime gate. No "not built
+        // into this binary" placeholders. Accessibility is per-OS (AT-SPI on Linux, UIA on
         // Windows); macOS's grants (Screen Recording, Accessibility) live inside its own
         // "macos" section rather than a separate accessibility section.
         #[cfg(target_os = "linux")]
@@ -415,7 +465,8 @@ mod tests {
                 "wayland",
                 "sandbox",
                 "accessibility (linux)",
-                "android"
+                "android",
+                "ios"
             ]
         );
         #[cfg(windows)]
@@ -427,7 +478,8 @@ mod tests {
                 "windows",
                 "sandbox",
                 "accessibility (windows)",
-                "android"
+                "android",
+                "ios"
             ]
         );
         #[cfg(target_os = "macos")]
@@ -439,13 +491,15 @@ mod tests {
                 "macos",
                 "sandbox",
                 "accessibility (macos)",
-                "android"
+                "android",
+                "ios"
             ]
         );
-        // Android's section is always present and non-empty — its basic presence checks now
-        // run unconditionally (deep probes gated to the selected backend; Fails softened to
-        // Warn when android isn't active). Asserting non-empty catches accidental removal of
-        // the section, without depending on which backend the ambient env resolves to.
+        // Android's and iOS's sections are always present and non-empty — their basic
+        // presence checks now run unconditionally (deep probes gated to the selected
+        // backend; Fails softened to Warn when not active). Asserting non-empty catches
+        // accidental removal of the section, without depending on which backend the
+        // ambient env resolves to.
         let android = d
             .sections
             .iter()
@@ -453,6 +507,13 @@ mod tests {
             .expect("android section");
         assert_eq!(android.backend.as_deref(), Some("android"));
         assert!(!android.checks.is_empty());
+        let ios = d
+            .sections
+            .iter()
+            .find(|s| s.title == "ios")
+            .expect("ios section");
+        assert_eq!(ios.backend.as_deref(), Some("ios"));
+        assert!(!ios.checks.is_empty());
         // The `network` section is always present (Ok when compiled in, else Skip).
         let net = d
             .sections
