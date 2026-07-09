@@ -31,6 +31,21 @@ pub mod proto {
     tonic::include_proto!("idb");
 }
 
+/// The top-level generated types downstream code uses, flattened onto `crate::idb`.
+///
+/// Nested types stay reachable at their generated module paths, e.g.
+/// `proto::hid_event::{HidPress, HidTouch, HidKey, HidSwipe, HidDirection}`,
+/// `proto::hid_event::hid_press_action::Action`, and
+/// `proto::accessibility_info_request::Format` — this re-export deliberately does
+/// not flatten the whole tree.
+// These are a stable surface for the sync client / input / accessibility code that
+// consumes this module; `allow(unused_imports)` because nothing references them yet.
+#[allow(unused_imports)]
+pub use proto::{
+    companion_service_client::CompanionServiceClient, AccessibilityInfoRequest,
+    AccessibilityInfoResponse, HidEvent, HidResponse, Point,
+};
+
 #[cfg(test)]
 mod tests {
     use super::proto;
