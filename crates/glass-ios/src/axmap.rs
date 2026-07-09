@@ -7,7 +7,9 @@
 //! `idb ui describe-all --nested --json` output (`tests/fixtures/describe_nested.json`):
 //! - role in `role` (AX-prefixed, e.g. `AXButton`; the sibling `type` field holds the
 //!   un-prefixed form `Button` and is not used here),
-//! - stable id in `AXUniqueId`, display label in `AXLabel`, value in `AXValue`,
+//! - stable id in `AXUniqueId`, display label in `AXLabel`, value in `AXValue`.
+//!   The id becomes the node `name` when present; a non-editable element's `AXLabel`
+//!   is then surfaced as its `value` so the visible text is not lost,
 //! - frame in the structured `frame` object `{x, y, width, height}` — note the
 //!   sibling `AXFrame` is a *stringified* CGRect (`"{{x, y}, {w, h}}"`), so the
 //!   structured `frame` is the one we read,
@@ -119,8 +121,22 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
     let ax_type = s("role").unwrap_or_default();
     let role = ax_role(&ax_type);
     let editable = matches!(role, AxRole::TextField | AxRole::TextArea);
+    let uid = s("AXUniqueId");
+    let label = s("AXLabel");
     // Prefer the stable identifier for semantic addressing; fall back to the label.
-    let name = s("AXUniqueId").or_else(|| s("AXLabel"));
+    let name = uid.clone().or_else(|| label.clone());
+    // An editable element's value is its text content (`AXValue`). A non-editable
+    // element whose stable id displaced its visible label out of `name` surfaces that
+    // label as the value instead, so its text stays observable — e.g. a status line
+    // whose text flips (READY→TAPPED) lives in `AXLabel`, not `AXValue`. With no id the
+    // label already is the name, so there is nothing left to surface.
+    let value = if editable {
+        s("AXValue")
+    } else if uid.is_some() {
+        label
+    } else {
+        None
+    };
     let states = AxStates {
         enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         visible: true,
@@ -141,7 +157,7 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
         role,
         raw_role: ax_type,
         name,
-        value: if editable { s("AXValue") } else { None },
+        value,
         states,
         bounds,
         children,
@@ -276,6 +292,25 @@ mod tests {
         assert_eq!(b.y, 1212);
         assert_eq!(b.width, 335);
         assert_eq!(b.height, 143);
+    }
+
+    #[test]
+    fn build_tree_surfaces_a_static_labels_text_as_value_when_the_id_shadows_it() {
+        let tree = built();
+        // statusLabel carries both a stable id ("statusLabel", used as the name) and a
+        // visible label ("READY"); the label is surfaced as the value so a caller can
+        // observe its text (and any later flip) rather than losing it behind the id.
+        let status = find_by_name(&tree.root, "statusLabel").expect("statusLabel present");
+        assert_eq!(status.value.as_deref(), Some("READY"));
+    }
+
+    #[test]
+    fn build_tree_leaves_value_empty_when_the_label_is_the_name() {
+        let tree = built();
+        // The application node has a null AXUniqueId, so its label became the name; the
+        // label is not also duplicated into the value.
+        assert_eq!(tree.root.children[0].name.as_deref(), Some("Glass Fixture"));
+        assert_eq!(tree.root.children[0].value, None);
     }
 
     #[test]
