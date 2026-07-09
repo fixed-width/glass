@@ -185,9 +185,9 @@ fn split_chord(chord: &str) -> Result<(Vec<Modifier>, String)> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .collect();
-    let (key, mods) = parts
+    let (key_name, mods) = parts
         .split_last()
-        .ok_or_else(|| GlassError::InvalidKey(chord.into()))?;
+        .ok_or_else(|| GlassError::InvalidKey(format!("empty chord {chord:?}")))?;
     let mut modifiers = Vec::new();
     for m in mods {
         modifiers.push(Modifier::from_name(m).ok_or_else(|| {
@@ -196,7 +196,7 @@ fn split_chord(chord: &str) -> Result<(Vec<Modifier>, String)> {
             ))
         })?);
     }
-    Ok((modifiers, key.to_string()))
+    Ok((modifiers, key_name.to_string()))
 }
 
 #[cfg(test)]
@@ -429,6 +429,54 @@ mod key_tests {
             key_seq(&evts),
             vec![(0xE0, true), (0x04, true), (0x04, false), (0xE0, false)]
         );
+    }
+
+    #[test]
+    fn chord_multi_modifier_releases_in_reverse() {
+        let inj = IdbInjector::new(3.0);
+        let evts = inj
+            .key_events(&KeyEvent::Chord("ctrl+shift+a".into()))
+            .unwrap();
+        // Ctrl down, Shift down, a down, a up, then modifiers up in reverse:
+        // Shift up, Ctrl up.
+        assert_eq!(
+            key_seq(&evts),
+            vec![
+                (0xE0, true),
+                (0xE1, true),
+                (0x04, true),
+                (0x04, false),
+                (0xE1, false),
+                (0xE0, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn chord_unknown_modifier_errors() {
+        let inj = IdbInjector::new(3.0);
+        assert!(matches!(
+            inj.key_events(&KeyEvent::Chord("hyper+x".into())),
+            Err(glass_core::GlassError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn chord_unknown_key_errors() {
+        let inj = IdbInjector::new(3.0);
+        assert!(matches!(
+            inj.key_events(&KeyEvent::Chord("ctrl+nope".into())),
+            Err(glass_core::GlassError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn chord_empty_errors() {
+        let inj = IdbInjector::new(3.0);
+        assert!(matches!(
+            inj.key_events(&KeyEvent::Chord("".into())),
+            Err(glass_core::GlassError::InvalidKey(_))
+        ));
     }
 
     #[test]
