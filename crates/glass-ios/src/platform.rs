@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
@@ -10,6 +11,9 @@ use glass_core::{
 };
 
 use crate::capture::screenshot;
+use crate::idb::client::IdbClient;
+use crate::idb::companion::IdbCompanion;
+use crate::injector::IdbInjector;
 use crate::logs::LogStream;
 use crate::target::{SimTarget, SimulatorRegistry};
 
@@ -18,13 +22,59 @@ struct RunningApp {
     bundle_id: String,
     geometry: WindowGeometry,
     logs: LogStream,
+    /// Builds HID events from glass input at the app's real, discovered point→pixel scale.
+    /// Built in `start_app` once that scale is known — and only when a `driver` is present
+    /// to discover it — so it never exists at a provisional scale. `None` in observe-only
+    /// mode (no companion): input is unsupported then, so no injector is built.
+    injector: Option<IdbInjector>,
+}
+
+/// The `idb_companion`-backed input/accessibility driver: the spawned companion process and
+/// a gRPC client that carries HID input to it. Optional on the platform — absent when
+/// `idb_companion` isn't installed (or failed to start), in which case the backend degrades
+/// to observe-only.
+struct IdbDriver {
+    /// Owns the `idb_companion` process bound to this simulator; killed on `Drop`.
+    companion: IdbCompanion,
+    /// gRPC client that injects HID input into the simulator.
+    client: IdbClient,
+}
+
+impl IdbDriver {
+    /// Spawn the companion for `udid` and connect an input client to its socket.
+    fn start(udid: &str) -> Result<IdbDriver> {
+        let companion = IdbCompanion::spawn(udid)?;
+        let client = IdbClient::connect(companion.socket())?;
+        Ok(IdbDriver { companion, client })
+    }
+
+    #[cfg(test)]
+    fn for_test() -> IdbDriver {
+        IdbDriver {
+            companion: IdbCompanion::for_test(),
+            client: IdbClient::for_test(),
+        }
+    }
 }
 
 /// Drives a native app on an iOS Simulator over `xcrun simctl`. A single foreground app at a
 /// time, reported as one fullscreen window; there is no window management to speak of.
+///
+/// Capture, logs, clipboard, and window queries run over `xcrun simctl` alone. Input
+/// (tap/type/swipe/scroll) and the accessibility tree additionally need an `idb_companion`
+/// [`IdbDriver`]; when the companion isn't available the backend degrades to observe-only:
+/// capture/logs/clipboard keep working, while input and the accessibility tree report a
+/// clear [`GlassError::Unsupported`]. The failure that disabled the driver is kept in
+/// `driver_error` and surfaced in that message.
 pub struct IosPlatform {
     target: SimTarget,
     app: Option<RunningApp>,
+    /// The input/accessibility driver, or `None` when `idb_companion` is unavailable
+    /// (observe-only mode).
+    driver: Option<IdbDriver>,
+    /// Why the driver is absent, kept to explain the `Unsupported` error on input/a11y use.
+    /// `Some` exactly when `driver` is `None` after a real start attempt.
+    driver_error: Option<String>,
 }
 
 /// The Simulator reports exactly one fullscreen window per running app.
@@ -64,15 +114,128 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 }
 
 impl IosPlatform {
-    /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars.
+    /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars, then
+    /// try to start its `idb_companion` input/accessibility driver.
+    ///
+    /// A driver start failure does NOT abort: the backend degrades to observe-only
+    /// (capture/logs/clipboard keep working) and the cause is kept so input and the
+    /// accessibility tree report a clear `Unsupported` when attempted. The degradation is
+    /// non-silent — it is logged once here, surfaced on use, and the doctor warns.
     pub fn from_env(reg: &SimulatorRegistry) -> Result<Self> {
         let target = SimTarget::from_env(reg)?;
-        Ok(Self { target, app: None })
+        let (driver, driver_error) = match IdbDriver::start(target.udid()) {
+            Ok(driver) => (Some(driver), None),
+            Err(e) => {
+                let cause = e.to_string();
+                eprintln!(
+                    "glass-ios: idb_companion unavailable — running observe-only \
+                     (capture/logs/clipboard); input and the accessibility tree are \
+                     disabled: {cause}"
+                );
+                (None, Some(cause))
+            }
+        };
+        Ok(Self {
+            target,
+            app: None,
+            driver,
+            driver_error,
+        })
     }
 
     fn running(&self) -> Result<&RunningApp> {
         self.app.as_ref().ok_or(GlassError::NoActiveSession)
     }
+
+    /// The input/accessibility driver, or a clear `Unsupported` when the companion is
+    /// absent (observe-only mode). The message carries the recorded cause so a caller sees
+    /// *why* input is disabled (not installed vs. installed-but-crashed).
+    fn driver(&self) -> Result<&IdbDriver> {
+        self.driver.as_ref().ok_or_else(|| {
+            GlassError::Unsupported(match &self.driver_error {
+                Some(cause) => {
+                    format!("iOS input and accessibility require idb_companion: {cause}")
+                }
+                None => "iOS input and accessibility require idb_companion \
+                         (install with: brew install idb-companion)"
+                    .into(),
+            })
+        })
+    }
+
+    /// The driver plus the running app's injector — the two pieces every input path needs.
+    /// `Unsupported` when there's no companion; `NoActiveSession` when no app is running.
+    /// (The injector is present whenever an app started with a driver available, so the
+    /// `driver()` check is the one that gates observe-only input.)
+    fn input(&self) -> Result<(&IdbDriver, &IdbInjector)> {
+        let driver = self.driver()?;
+        let injector = self.running()?.injector.as_ref().ok_or_else(|| {
+            GlassError::Backend(
+                "iOS input: injector uninitialized despite an available companion".into(),
+            )
+        })?;
+        Ok((driver, injector))
+    }
+
+    /// The Unix socket the backing `idb_companion` serves on, when a driver is present.
+    /// The accessibility reader connects a second client to this same socket.
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        self.driver.as_ref().map(|d| d.companion.socket())
+    }
+
+    /// Build an accessibility reader over a second client to the same companion socket, when
+    /// a driver is present. Returns `Ok(None)` in observe-only mode (no companion): the
+    /// accessibility tree, like input, needs the companion. A genuine connect failure while
+    /// the companion IS present is still propagated as `Err` rather than degraded away.
+    ///
+    /// The session holds the platform and the accessibility reader as separate boxed trait
+    /// objects, so the reader owns its own client rather than borrowing this one.
+    pub fn accessibility(&self) -> Result<Option<crate::a11y::IosA11y>> {
+        let Some(driver) = self.driver.as_ref() else {
+            return Ok(None);
+        };
+        let client = IdbClient::connect(driver.companion.socket())?;
+        Ok(Some(crate::a11y::IosA11y::new(client)))
+    }
+}
+
+/// Discover the device's point→pixel scale by dividing the capture's pixel width by the
+/// accessibility root's logical-point width. `describe` can briefly lag a launch, so the
+/// empty-tree (not-rendered-yet) case is retried a few times. A genuine describe/RPC error
+/// is NOT retried — it can't be fixed by waiting, and a timeout would cost the full deadline
+/// each attempt — so it is surfaced immediately with its cause. It never falls back to a
+/// placeholder: an undetermined scale would place every tap at the wrong point, so the
+/// failure surfaces as an error and the caller leaves the session unstarted.
+fn discover_scale(client: &IdbClient, frame_px_width: u32) -> Result<f64> {
+    const ATTEMPTS: usize = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+    for attempt in 0..ATTEMPTS {
+        match client.describe_all() {
+            Ok(json) => {
+                if let Some(scale) = crate::axmap::scale_from_width(&json, frame_px_width) {
+                    return Ok(scale);
+                }
+                // Parsed, but no positive root width yet: the app may still be rendering.
+                // This is the transient case worth retrying.
+            }
+            Err(e) => {
+                // A real describe/RPC failure (dead transport, unparseable JSON, a
+                // timeout). Retrying can't help and a timeout would cost the full deadline
+                // each attempt, so surface it now with its actual cause.
+                return Err(GlassError::Backend(format!(
+                    "could not determine the iOS display scale; last describe error: {e}"
+                )));
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    Err(GlassError::Backend(
+        "could not determine the iOS display scale from the accessibility tree; \
+         the app may not have finished rendering"
+            .into(),
+    ))
 }
 
 impl Platform for IosPlatform {
@@ -124,8 +287,7 @@ impl Platform for IosPlatform {
 
         // Capture once, purely to learn the device's pixel dimensions for the geometry we
         // report. These are device *pixels* (the screenshot's raw resolution), not UIKit
-        // points — the two differ by the device's point-to-pixel scale factor, which will
-        // matter once pointer input is added.
+        // points — the two differ by the device's point-to-pixel scale factor.
         let frame = screenshot(self.target.simctl(), udid)?;
         let geometry = WindowGeometry {
             x: 0,
@@ -133,16 +295,34 @@ impl Platform for IosPlatform {
             width: frame.width,
             height: frame.height,
         };
+        // With a driver present, learn the point→pixel scale and build the injector at it
+        // before reporting the app as running, so no tap is ever issued at an unverified
+        // scale (`describe` reports point frames while the screenshot is in pixels; their
+        // ratio is the scale). On scale-discovery failure the app is left unregistered (no
+        // active session) rather than driven at a wrong scale. In observe-only mode (no
+        // companion) there is no injector — input is unsupported — but geometry is still
+        // reported so capture/logs/clipboard work.
+        let injector = match &self.driver {
+            Some(driver) => Some(IdbInjector::new(discover_scale(
+                &driver.client,
+                frame.width,
+            )?)),
+            None => None,
+        };
         self.app = Some(RunningApp {
             bundle_id,
             geometry: geometry.clone(),
             logs: LogStream::spawn(udid),
+            injector,
         });
         Ok(geometry)
     }
 
     fn stop_app(&mut self) -> Result<()> {
         if let Some(app) = self.app.take() {
+            // Best-effort teardown: the app may already be gone (it crashed, or a prior
+            // launch's `--terminate-running-process` killed it), so a failing `terminate`
+            // is not an error — dropping the session is the goal, and it is idempotent.
             let _ = self
                 .target
                 .simctl()
@@ -160,16 +340,19 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "pointer input on the iOS backend".into(),
-        ))
+    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        let (driver, injector) = self.input()?;
+        let events = injector.pointer_events(event)?;
+        if events.is_empty() {
+            // A `Move` has no touch equivalent, so there is nothing to inject.
+            return Ok(());
+        }
+        driver.client.hid(events)
     }
 
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "keyboard input on the iOS backend".into(),
-        ))
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        let (driver, injector) = self.input()?;
+        driver.client.hid(injector.key_events(event)?)
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -285,11 +468,14 @@ mod tests {
 }
 
 /// State-machine tests: `IosPlatform` built directly (bypassing `from_env`) with a fake
-/// `RunningApp` (or none), so none of these touch a real simulator — `xcrun` is never
-/// invoked, only the pure in-memory branching.
+/// `RunningApp` (or none) and a stub driver (or none), so none of these touch a real
+/// simulator or `idb_companion` — `xcrun` is never invoked and no RPC is made, only the
+/// pure in-memory branching (session guards, driver presence, the `Move`-is-a-noop
+/// short-circuit, the input-error surface).
 #[cfg(test)]
 mod state_machine_tests {
     use super::*;
+    use glass_core::MouseButton;
 
     fn geometry() -> WindowGeometry {
         WindowGeometry {
@@ -300,6 +486,8 @@ mod state_machine_tests {
         }
     }
 
+    /// A running app with a driver present: input reaches the injector (its RPC would fail,
+    /// but these tests only exercise events that error or short-circuit before any RPC).
     fn running_platform() -> IosPlatform {
         IosPlatform {
             target: SimTarget::for_test(),
@@ -307,31 +495,140 @@ mod state_machine_tests {
                 bundle_id: "tech.fixedwidth.demo".into(),
                 geometry: geometry(),
                 logs: LogStream::spawn("fake"),
+                injector: Some(IdbInjector::new(1.0)),
             }),
+            driver: Some(IdbDriver::for_test()),
+            driver_error: None,
         }
     }
 
+    /// A driver present but no app started: the session guard is what fires.
     fn idle_platform() -> IosPlatform {
         IosPlatform {
             target: SimTarget::for_test(),
             app: None,
+            driver: Some(IdbDriver::for_test()),
+            driver_error: None,
+        }
+    }
+
+    /// Observe-only: no companion, so a running app has no injector. Capture/logs/clipboard
+    /// would work; input and the accessibility reader degrade.
+    fn observe_only_platform() -> IosPlatform {
+        IosPlatform {
+            target: SimTarget::for_test(),
+            app: Some(RunningApp {
+                bundle_id: "tech.fixedwidth.demo".into(),
+                geometry: geometry(),
+                logs: LogStream::spawn("fake"),
+                injector: None,
+            }),
+            driver: None,
+            driver_error: Some(
+                "idb_companion not found (install: brew install idb-companion)".into(),
+            ),
+        }
+    }
+
+    fn tap() -> PointerEvent {
+        PointerEvent::Click {
+            x: 1,
+            y: 1,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
         }
     }
 
     #[test]
-    fn send_pointer_is_unsupported() {
+    fn send_pointer_move_is_a_noop_when_running() {
+        // A `Move` maps to no touch events, so it short-circuits to `Ok` without needing
+        // the companion — no RPC is issued.
         let mut p = running_platform();
-        let err = p
-            .send_pointer(&PointerEvent::Move { x: 1, y: 1 })
-            .unwrap_err();
-        assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+        assert!(p.send_pointer(&PointerEvent::Move { x: 1, y: 1 }).is_ok());
     }
 
     #[test]
-    fn send_key_is_unsupported() {
+    fn send_pointer_with_no_active_session_errors() {
+        // A driver is present, so the `running()` guard is what fires: even a real tap is
+        // rejected with no active app.
+        let mut p = idle_platform();
+        assert!(matches!(
+            p.send_pointer(&tap()).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+    }
+
+    #[test]
+    fn send_key_with_no_active_session_errors() {
+        let mut p = idle_platform();
+        assert!(matches!(
+            p.send_key(&KeyEvent::Text("hi".into())).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+    }
+
+    #[test]
+    fn send_pointer_gesture_is_unsupported_while_running() {
+        // A multi-touch gesture reaches the injector (driver + app present) and is rejected
+        // as Unsupported there — not dropped silently.
         let mut p = running_platform();
-        let err = p.send_key(&KeyEvent::Text("hi".into())).unwrap_err();
-        assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+        let g = PointerEvent::Gesture {
+            pointers: vec![],
+            duration_ms: 100,
+        };
+        assert!(matches!(
+            p.send_pointer(&g).unwrap_err(),
+            GlassError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn send_key_unknown_chord_is_invalid_key_while_running() {
+        // An unknown modifier in a chord is an InvalidKey from the injector, again reached
+        // only because the driver + app are present.
+        let mut p = running_platform();
+        assert!(matches!(
+            p.send_key(&KeyEvent::Chord("hyper+x".into())).unwrap_err(),
+            GlassError::InvalidKey(_)
+        ));
+    }
+
+    #[test]
+    fn send_pointer_without_a_driver_is_unsupported() {
+        // Observe-only: input degrades to a clear Unsupported (not a hard session error),
+        // even though an app is running.
+        let mut p = observe_only_platform();
+        assert!(matches!(
+            p.send_pointer(&tap()).unwrap_err(),
+            GlassError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn send_key_without_a_driver_is_unsupported() {
+        let mut p = observe_only_platform();
+        assert!(matches!(
+            p.send_key(&KeyEvent::Text("hi".into())).unwrap_err(),
+            GlassError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn accessibility_is_none_without_a_driver() {
+        // With no companion, there is no accessibility reader — and no connect is attempted
+        // (Ok(None), not an error), so observe-only start-up never blocks on it.
+        let p = observe_only_platform();
+        assert!(p
+            .accessibility()
+            .expect("no connect is attempted without a driver")
+            .is_none());
+    }
+
+    #[test]
+    fn socket_path_is_none_without_a_driver() {
+        let p = observe_only_platform();
+        assert!(p.socket_path().is_none());
     }
 
     #[test]

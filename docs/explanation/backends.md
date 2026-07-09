@@ -26,8 +26,8 @@ no display or compositor at all.
   shells out to `adb`. The VM *is* the sandbox.
 - **iOS** — drives a native app on an iOS Simulator over `xcrun simctl`; macOS-host-only, since the
   Simulator and `simctl` ship with Xcode. The Simulator *is* the sandbox. This backend captures, reads
-  logs, and drives the clipboard; pointer/keyboard input and the accessibility tree are not implemented
-  yet.
+  logs, and drives the clipboard; with `idb_companion` installed it also taps, types, swipes, scrolls,
+  and reads the accessibility tree. Multi-touch gestures are not supported yet.
 - **macOS** — drives the logged-in Aqua session (ScreenCaptureKit capture, CGEvent input, AXUIElement
   windows), gated by macOS's privacy permissions.
 

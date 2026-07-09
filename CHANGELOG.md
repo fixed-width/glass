@@ -17,9 +17,11 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 - An [iOS Simulator backend](docs/how-to/setup-ios.md) (`GLASS_BACKEND=ios`, macOS only): launch, capture,
-  log streaming, and clipboard for native iOS apps in the Simulator, driven through `xcrun simctl`, plus a
-  `glass doctor` preflight for Xcode, an installed iOS runtime, and an available simulator. This release is
-  observe-oriented — tapping/typing and the accessibility tree are not yet available.
+  log streaming, and clipboard for native iOS apps in the Simulator, driven through `xcrun simctl`, plus
+  input (tap/click, type, swipe, scroll) and the accessibility tree (snapshot, click-element, set-value)
+  over [`idb_companion`](docs/how-to/setup-ios.md#input--accessibility) when it is installed. Includes a
+  `glass doctor` preflight for Xcode, an installed iOS runtime, an available simulator, and `idb_companion`.
+  Multi-touch gestures (`glass_gesture`) are not supported on the Simulator yet.
 - A [Windows access model](docs/explanation/windows-permissions.md) explanation: Windows needs no
   per-app permission grants (unlike macOS), what actually gates access (interactive session, UAC/UIPI
   integrity levels, SmartScreen on unsigned downloads), and how to get past the first-run SmartScreen

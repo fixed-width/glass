@@ -161,6 +161,12 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     {
         let ios_selected = backend == "ios";
         let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
+        // idb_companion drives input and the accessibility reader; only worth reporting
+        // when ios is actually the backend in play, mirroring how android's deep probes
+        // are gated to `android_selected` above.
+        if ios_selected {
+            ios_checks.push(idb_companion_check(idb_companion_present()));
+        }
         if !ios_selected {
             soften_inactive_ios(&mut ios_checks);
         }
@@ -244,6 +250,48 @@ fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
 #[cfg(target_os = "macos")]
 fn soften_inactive_ios(checks: &mut [Check]) {
     soften_inactive_fails(checks, "ios");
+}
+
+/// Whether `idb_companion` — the process that serves iOS Simulator input and the
+/// accessibility tree — is resolvable, and the remedy to show when it isn't. Pure: takes
+/// the already-resolved fact so it's unit-tested without touching PATH/env;
+/// [`idb_companion_present`] gathers the real fact on macOS, the only host that runs it.
+/// A missing binary is a `Warn`, not a `Fail`: `glass_ios::doctor::checks` already fails
+/// the run over a genuinely broken iOS setup (no Xcode, no simulator); this just flags a
+/// companion tool that's one `brew install` away. Its only caller is macOS-only (above);
+/// kept out of `#[cfg]` (instead of gating the fn itself) so the test below still runs in
+/// CI on every host.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn idb_companion_check(found: bool) -> Check {
+    if found {
+        Check::new(
+            "idb_companion",
+            CheckStatus::Ok,
+            "idb_companion found — input + accessibility are available",
+        )
+    } else {
+        Check::new(
+            "idb_companion",
+            CheckStatus::Warn,
+            "idb_companion not found — input + accessibility are unavailable",
+        )
+        .with_remedy("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
+    }
+}
+
+/// Real-environment probe for [`idb_companion_check`]: is `idb_companion` resolvable —
+/// `GLASS_IDB_COMPANION` naming an existing file, or `idb_companion` found on `PATH`?
+/// Mirrors `glass_ios`'s own resolution of the same binary (`idb::companion::companion_bin`),
+/// duplicated here because that module is private to `glass-ios`.
+#[cfg(target_os = "macos")]
+fn idb_companion_present() -> bool {
+    let bin = glass_core::tool_path("GLASS_IDB_COMPANION", "idb_companion");
+    if bin.contains('/') {
+        std::path::Path::new(&bin).is_file()
+    } else {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file()))
+    }
 }
 
 /// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console
@@ -372,6 +420,19 @@ fn macos_a11y_checks(accessibility_granted: bool) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idb_companion_check_warns_when_absent_and_oks_when_present() {
+        let absent = idb_companion_check(false);
+        assert_eq!(absent.status, CheckStatus::Warn);
+        assert_eq!(
+            absent.remedy.as_deref(),
+            Some("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
+        );
+        let present = idb_companion_check(true);
+        assert_eq!(present.status, CheckStatus::Ok);
+        assert_eq!(present.remedy, None);
+    }
 
     #[test]
     fn inactive_android_fails_soften_to_warn() {
