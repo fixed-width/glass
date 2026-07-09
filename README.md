@@ -12,8 +12,8 @@ independently instead of asking the user "does this look right?".
 glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
 or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** backend, an
 **Android** backend (an AVD emulator, driven over `adb` from any host), an **iOS** backend (native
-apps in the Simulator over `xcrun simctl`; this release: capture, logs, clipboard — no
-input/accessibility yet), and a **macOS** backend, behind a platform-agnostic core.
+apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`;
+multi-touch gestures excepted), and a **macOS** backend, behind a platform-agnostic core.
 
 ## The loop in practice
 
@@ -66,8 +66,8 @@ thing you can add** when pointing an agent at glass.
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
 |---|:--:|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ◑ no input yet | ✓ |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | – | ✓ AX |
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 

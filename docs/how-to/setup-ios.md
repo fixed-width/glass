@@ -7,9 +7,10 @@ unlike the Android backend, there is no cross-host story here.
 Select the backend per launch with `glass_start`'s `backend: "ios"`, or make it the default with
 `GLASS_BACKEND=ios`.
 
-> This release observes iOS apps — launch, screenshot, logs, clipboard. Tapping/typing and the
-> accessibility tree are not yet available; `glass_click`/`glass_type`/`glass_key` and the a11y
-> tools return an unsupported error on this backend.
+> The iOS backend captures, reads logs, drives the clipboard, and — with `idb_companion` installed
+> (see [Input & accessibility](#input--accessibility)) — taps, types, swipes, scrolls, and reads the
+> accessibility tree. Multi-touch gestures (`glass_gesture`) are the one exception, not yet supported
+> on the Simulator.
 
 ## Install Xcode and a Simulator runtime
 
@@ -72,12 +73,39 @@ glass_start { "backend": "ios", "run": ["tech.example.YourApp"] }
 The Simulator reports one fullscreen window per app — there's no window management (resize/move
 are unsupported, matching a real device).
 
+## Input & accessibility
+
+Tapping, typing, swiping, scrolling, and reading the accessibility tree run over
+[`idb_companion`](https://github.com/facebook/idb), Meta's iOS automation companion. glass spawns and
+manages one per Simulator and shuts it down again on stop; you only need the binary installed:
+
+```bash
+brew tap facebook/fb
+brew trust facebook/fb
+brew install idb-companion
+```
+
+With `idb_companion` on `PATH`, these tools work against the Simulator:
+
+- **Input** — `glass_click`, `glass_type`, `glass_key`, `glass_scroll`, and `glass_drag` map to
+  synthetic touches and keystrokes.
+- **Accessibility** — `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_click_element`,
+  `glass_set_value`, `glass_wait_for_element`, and `glass_scroll_to_element` read and drive the
+  Simulator's accessibility tree.
+
+Multi-touch gestures (`glass_gesture` — pinch, rotate, two-finger swipe) are not supported on the
+Simulator yet. If `idb_companion` isn't installed, the input and accessibility tools return an
+unsupported error, while capture, logs, and clipboard keep working.
+
+Set `GLASS_IDB_COMPANION` to the `idb_companion` binary's path if it isn't on `PATH` (or to pin a
+specific build).
+
 ## Check the setup
 
 ```bash
 GLASS_BACKEND=ios glass-mcp doctor
 ```
 
-Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, and an iPhone
-simulator is available — each failing check comes with its own remedy (the commands above). Then
-[connect your agent](connect-an-agent.md).
+Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, an iPhone
+simulator is available, and `idb_companion` is installed (for input + accessibility) — each failing
+check comes with its own remedy (the commands above). Then [connect your agent](connect-an-agent.md).

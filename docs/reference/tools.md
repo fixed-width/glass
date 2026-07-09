@@ -161,8 +161,10 @@ Returns `{matched, line{seq, stream, text}, cursor, elapsed_ms}`; resume reading
 `["ctrl"]`, `["ctrl","shift"]`) held during the action — enabling shift/ctrl-click multi-select,
 modified drags, and Ctrl+scroll.
 
-The input tools are not available on the **iOS** backend this release: `glass_click`, `glass_type`,
-`glass_key`, `glass_scroll`, and `glass_drag` return an unsupported error there.
+On the **iOS** backend `glass_click`, `glass_type`, `glass_key`, `glass_scroll`, and `glass_drag`
+drive the Simulator over `idb_companion` (install it — see
+[setup-ios.md](../how-to/setup-ios.md#input--accessibility)); only multi-touch `glass_gesture` is
+unsupported there.
 
 ### `glass_click`
 
@@ -221,7 +223,8 @@ two-finger swipe = two parallel segments; a `from==to` pointer is held in place.
 - `duration_ms` (integer, default 250) — gesture span.
 
 **Android only** (requires the on-device agent — `adb`'s `input` has no multi-touch command). The
-`adb` fallback and the desktop backends refuse rather than degrade to a single pointer.
+`adb` fallback, the iOS Simulator backend, and the desktop backends refuse rather than degrade to a
+single pointer.
 
 ### `glass_do`
 
@@ -269,8 +272,9 @@ Deterministic, low-token element addressing that complements the pixel loop. Ava
 exposes an accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/game UIs); these tools
 **error** for an app with no accessible UI rather than return a fake tree, so fall back to
 `glass_screenshot` then. On Linux, start the app with `glass_start`'s `a11y:true`. The **iOS** backend
-has no accessibility tree this release, so these tools return an unsupported error there. See
-[reference/platforms.md](platforms.md) for per-OS backends (AT-SPI / UI Automation / uiautomator / AX).
+reads the Simulator's accessibility tree over `idb_companion` (install it — see
+[setup-ios.md](../how-to/setup-ios.md#input--accessibility)). See
+[reference/platforms.md](platforms.md) for per-OS backends (AT-SPI / UI Automation / uiautomator / AX / idb).
 
 ### `glass_a11y_snapshot`
 

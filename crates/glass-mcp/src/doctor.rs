@@ -275,7 +275,7 @@ pub(crate) fn idb_companion_check(found: bool) -> Check {
             CheckStatus::Warn,
             "idb_companion not found — input + accessibility are unavailable",
         )
-        .with_remedy("brew tap facebook/fb && brew install idb-companion")
+        .with_remedy("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
     }
 }
 
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(absent.status, CheckStatus::Warn);
         assert_eq!(
             absent.remedy.as_deref(),
-            Some("brew tap facebook/fb && brew install idb-companion")
+            Some("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
         );
         let present = idb_companion_check(true);
         assert_eq!(present.status, CheckStatus::Ok);

@@ -6,8 +6,8 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
 |---|:--:|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ◑ § | ✓ ‡ |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | – | ✓ AX |
+| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ✓ § | ✓ ‡ |
+| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
 | Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
 
@@ -54,14 +54,18 @@ a11y falls back to `uiautomator`. Window resize/move (apps are full-screen) and 
 non-goals.
 
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
-clipboard, and logs are implemented; the on-box path is exercised by a manual smoke test on a macOS
-host with a booted Simulator (no CI wiring on the macOS runner yet, so only its host-independent
-logic — device resolution, `simctl` argument construction, doctor checks — runs in CI). Window support
-is geometry/focus only: resize and move are unsupported, since Simulator apps, like a real device, are
-always fullscreen. Pointer/keyboard input and the accessibility tree are not implemented yet;
-`glass_click`/`glass_type`/`glass_key` and the a11y tools return an unsupported error on this backend.
-Containment has no separate glass-managed step, the same as Android — the Simulator's per-app data
-container is the isolation boundary.
+clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the
+accessibility tree (snapshot, click-element, set-value) run over `idb_companion` (`brew install
+idb-companion`), which glass spawns and manages per Simulator. Multi-touch gestures (`glass_gesture`)
+are the exception — not supported on the Simulator yet. Without `idb_companion` the input and
+accessibility tools return an unsupported error; capture, logs, and clipboard keep working. Window
+support is geometry/focus only: resize and move are unsupported, since Simulator apps, like a real
+device, are always fullscreen. The host-independent logic — device resolution, `simctl`/`idb`
+argument construction, JSON→tree mapping, doctor checks — runs in CI; the on-box path (input landing
+at the right coordinate, the a11y tree, clear-then-type) is exercised by `#[ignore]`d integration
+tests on a macOS host with a booted Simulator (no CI wiring on the macOS runner yet). Containment has
+no separate glass-managed step, the same as Android — the Simulator's per-app data container is the
+isolation boundary.
 
 **‡ macOS** capture, input, windows, clipboard, and logs are built and CI-tested (ScreenCaptureKit
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and
@@ -81,8 +85,9 @@ optional on-device companions (an agent for clipboard + high-fidelity input, and
 AccessibilityService for a Compose-rich a11y tree + high-fidelity `set_value`); built and unit-tested
 in CI and validated on-device. An **iOS** backend drives native apps on an iOS Simulator over `xcrun
 simctl` — capture, clipboard, logs, and a managed Simulator (attach-or-boot, matching the Android
-emulator's model); window support is geometry/focus only, and pointer/keyboard input and the
-accessibility tree are not implemented yet. Its host-independent logic is unit-tested in CI; the
-on-box path against a real Simulator is exercised manually on a macOS host. The **macOS** backend
+emulator's model); window support is geometry/focus only. Pointer/keyboard input and the accessibility
+tree run over `idb_companion` (multi-touch gestures excepted). Its host-independent logic is
+unit-tested in CI; the on-box path against a real Simulator is exercised by `#[ignore]`d integration
+tests on a macOS host. The **macOS** backend
 (ScreenCaptureKit capture, CGEvent input, AXUIElement windows/logs, an AXUIElement accessibility tree,
 and Seatbelt process containment) is built and CI-tested.

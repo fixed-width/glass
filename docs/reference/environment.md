@@ -72,6 +72,7 @@ override that with an explicit path. Full setup is in [how-to/setup-android.md](
 | `GLASS_IOS_UDID` | Exact Simulator UDID to drive when several are available | the newest booted/available iPhone simulator | iOS |
 | `GLASS_IOS_DEVICE` | Device name to boot when none is running, e.g. `iPhone 17` or `iPad Pro 13-inch` (ignored if `GLASS_IOS_UDID` is set) | the newest available iPhone simulator | iOS |
 | `GLASS_SIMULATOR_KEEP` | Leave a glass-booted iOS Simulator running at shutdown instead of stopping it | stop it | iOS |
+| `GLASS_IDB_COMPANION` | Path to the `idb_companion` binary (input + accessibility for the Simulator backend) | `idb_companion` (found on `PATH`) | iOS |
 
 Attach-or-boot works the same way as the Android group above: glass attaches to an already-booted
 Simulator, or boots the newest available iPhone simulator itself. `GLASS_IOS_DEVICE` names any
