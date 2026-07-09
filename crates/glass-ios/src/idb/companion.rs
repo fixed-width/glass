@@ -7,12 +7,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 
-// A later increment wires `IosPlatform` to own an `IdbCompanion` (spawning it once a
-// simulator UDID is resolved); until then nothing in-crate calls this beyond its own
-// tests, and the `idb` module is crate-private, so `pub` alone does not exempt it from
-// `dead_code`.
 /// `GLASS_IDB_COMPANION`, else `idb_companion` on PATH.
-#[allow(dead_code)]
 pub fn companion_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
     get("GLASS_IDB_COMPANION")
         .filter(|s| !s.is_empty())
@@ -22,13 +17,11 @@ pub fn companion_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
 /// Owns one `idb_companion` child process and the Unix socket it serves gRPC
 /// on. Killing + reaping the child on `Drop` mirrors glass-android's
 /// `AgentRegistry`/`AgentProc`.
-#[allow(dead_code)]
 pub struct IdbCompanion {
     child: Child,
     sock: PathBuf,
 }
 
-#[allow(dead_code)]
 impl IdbCompanion {
     /// Spawn `idb_companion` bound to `udid`, and block until its gRPC socket
     /// is accepting connections (or return a `Backend` error). A failed spawn
@@ -69,6 +62,23 @@ impl IdbCompanion {
     pub fn socket(&self) -> &Path {
         &self.sock
     }
+
+    /// A stub companion for `IosPlatform` unit tests that build a platform without a
+    /// real `idb_companion`. The child is a trivial process (so `Drop` has something to
+    /// reap) and the socket path is a placeholder these tests never connect to.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> IdbCompanion {
+        let child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn `true` for a stub test companion");
+        IdbCompanion {
+            child,
+            sock: PathBuf::from("/nonexistent/glass-idb-test.sock"),
+        }
+    }
 }
 
 impl Drop for IdbCompanion {
@@ -85,7 +95,6 @@ impl Drop for IdbCompanion {
 /// ECONNREFUSED immediately if the socket file exists but nothing is listening yet.
 /// That keeps each poll attempt bounded so the outer `deadline` is respected; the
 /// first real RPC carries its own timeout as a backstop.
-#[allow(dead_code)] // only called from `spawn`, itself unused until a later increment
 fn wait_for_socket(sock: &Path, deadline: Instant) -> Result<()> {
     loop {
         if std::os::unix::net::UnixStream::connect(sock).is_ok() {

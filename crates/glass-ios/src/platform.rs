@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
@@ -10,6 +11,9 @@ use glass_core::{
 };
 
 use crate::capture::screenshot;
+use crate::idb::client::IdbClient;
+use crate::idb::companion::IdbCompanion;
+use crate::injector::IdbInjector;
 use crate::logs::LogStream;
 use crate::target::{SimTarget, SimulatorRegistry};
 
@@ -22,9 +26,25 @@ struct RunningApp {
 
 /// Drives a native app on an iOS Simulator over `xcrun simctl`. A single foreground app at a
 /// time, reported as one fullscreen window; there is no window management to speak of.
+///
+/// Input (tap/type/swipe/scroll) and the accessibility tree run over an owned
+/// `idb_companion`: the [`IdbCompanion`] process is spawned for the resolved simulator and
+/// killed when this platform drops; [`IdbClient`] carries HID input to it, and
+/// [`IdbInjector`] builds those HID events at the discovered point→pixel [`scale`].
 pub struct IosPlatform {
     target: SimTarget,
     app: Option<RunningApp>,
+    /// Owns the `idb_companion` process bound to this simulator; killed on `Drop`.
+    companion: IdbCompanion,
+    /// gRPC client that injects HID input into the simulator.
+    client: IdbClient,
+    /// Builds HID events from glass input at the current point→pixel `scale`.
+    injector: IdbInjector,
+    /// Device point→pixel scale, discovered in `start_app` from the launch screenshot's
+    /// pixel width versus the accessibility root's logical-point width. Provisionally
+    /// `1.0` until then; input is gated by `running()` so none is issued before a real
+    /// scale is known.
+    scale: f64,
 }
 
 /// The Simulator reports exactly one fullscreen window per running app.
@@ -64,14 +84,71 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 }
 
 impl IosPlatform {
-    /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars.
+    /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars, then
+    /// spawn its `idb_companion` and open the input/accessibility client.
     pub fn from_env(reg: &SimulatorRegistry) -> Result<Self> {
         let target = SimTarget::from_env(reg)?;
-        Ok(Self { target, app: None })
+        let companion = IdbCompanion::spawn(target.udid())?;
+        let client = IdbClient::connect(companion.socket())?;
+        // Provisional; `start_app` refines it once a screenshot and the accessibility root
+        // frame are available. Input before then is gated by `running()`.
+        let scale = 1.0;
+        Ok(Self {
+            target,
+            app: None,
+            companion,
+            client,
+            injector: IdbInjector::new(scale),
+            scale,
+        })
     }
 
     fn running(&self) -> Result<&RunningApp> {
         self.app.as_ref().ok_or(GlassError::NoActiveSession)
+    }
+
+    /// Discover the device's point→pixel scale by dividing the capture's pixel width by
+    /// the accessibility root's logical-point width. `describe` can briefly lag a launch,
+    /// so this retries a few times before giving up. It never falls back to a placeholder:
+    /// an undetermined scale would place every tap at the wrong point, so the failure
+    /// surfaces as an error and the caller leaves the session unstarted.
+    fn discover_scale(&self, frame_px_width: u32) -> Result<f64> {
+        const ATTEMPTS: usize = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+        for attempt in 0..ATTEMPTS {
+            if let Some(scale) = self
+                .client
+                .accessibility_info(None, true)
+                .ok()
+                .and_then(|json| crate::axmap::root_point_width(&json))
+                .filter(|pt_w| *pt_w > 0.0)
+                .map(|pt_w| f64::from(frame_px_width) / pt_w)
+            {
+                return Ok(scale);
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+        Err(GlassError::Backend(
+            "could not determine the iOS display scale from the accessibility tree; \
+             the app may not have finished rendering"
+                .into(),
+        ))
+    }
+
+    /// The Unix socket the backing `idb_companion` serves on. The accessibility reader
+    /// connects a second client to this same socket.
+    pub fn socket_path(&self) -> &std::path::Path {
+        self.companion.socket()
+    }
+
+    /// Build an accessibility reader over a second client to the same companion socket.
+    /// The session holds the platform and the accessibility reader as separate boxed
+    /// trait objects, so the reader owns its own client rather than borrowing this one.
+    pub fn accessibility(&self) -> Result<crate::a11y::IosA11y> {
+        let client = IdbClient::connect(self.companion.socket())?;
+        Ok(crate::a11y::IosA11y::new(client, self.scale))
     }
 }
 
@@ -127,6 +204,13 @@ impl Platform for IosPlatform {
         // points — the two differ by the device's point-to-pixel scale factor, which will
         // matter once pointer input is added.
         let frame = screenshot(self.target.simctl(), udid)?;
+        // Learn the point→pixel scale before reporting the app as running, so no tap is
+        // ever issued at an unverified scale. `describe` reports point frames while the
+        // screenshot is in pixels; their ratio is the scale. On failure the app is left
+        // unregistered (no active session) rather than driven at a wrong scale.
+        let scale = self.discover_scale(frame.width)?;
+        self.scale = scale;
+        self.injector = IdbInjector::new(scale);
         let geometry = WindowGeometry {
             x: 0,
             y: 0,
@@ -160,16 +244,19 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "pointer input on the iOS backend".into(),
-        ))
+    fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
+        self.running()?;
+        let events = self.injector.pointer_events(event)?;
+        if events.is_empty() {
+            // A `Move` has no touch equivalent, so there is nothing to inject.
+            return Ok(());
+        }
+        self.client.hid(events)
     }
 
-    fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
-        Err(GlassError::Unsupported(
-            "keyboard input on the iOS backend".into(),
-        ))
+    fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
+        self.running()?;
+        self.client.hid(self.injector.key_events(event)?)
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -285,11 +372,13 @@ mod tests {
 }
 
 /// State-machine tests: `IosPlatform` built directly (bypassing `from_env`) with a fake
-/// `RunningApp` (or none), so none of these touch a real simulator — `xcrun` is never
-/// invoked, only the pure in-memory branching.
+/// `RunningApp` (or none) and stub companion/client, so none of these touch a real
+/// simulator or `idb_companion` — `xcrun` is never invoked and no RPC is made, only the
+/// pure in-memory branching (session guards, the `Move`-is-a-noop short-circuit).
 #[cfg(test)]
 mod state_machine_tests {
     use super::*;
+    use glass_core::MouseButton;
 
     fn geometry() -> WindowGeometry {
         WindowGeometry {
@@ -308,6 +397,10 @@ mod state_machine_tests {
                 geometry: geometry(),
                 logs: LogStream::spawn("fake"),
             }),
+            companion: IdbCompanion::for_test(),
+            client: IdbClient::for_test(),
+            injector: IdbInjector::new(1.0),
+            scale: 1.0,
         }
     }
 
@@ -315,23 +408,49 @@ mod state_machine_tests {
         IosPlatform {
             target: SimTarget::for_test(),
             app: None,
+            companion: IdbCompanion::for_test(),
+            client: IdbClient::for_test(),
+            injector: IdbInjector::new(1.0),
+            scale: 1.0,
+        }
+    }
+
+    fn tap() -> PointerEvent {
+        PointerEvent::Click {
+            x: 1,
+            y: 1,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
         }
     }
 
     #[test]
-    fn send_pointer_is_unsupported() {
+    fn send_pointer_move_is_a_noop_when_running() {
+        // A `Move` maps to no touch events, so it short-circuits to `Ok` without needing
+        // the companion — no RPC is issued.
         let mut p = running_platform();
-        let err = p
-            .send_pointer(&PointerEvent::Move { x: 1, y: 1 })
-            .unwrap_err();
-        assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+        assert!(p.send_pointer(&PointerEvent::Move { x: 1, y: 1 }).is_ok());
     }
 
     #[test]
-    fn send_key_is_unsupported() {
-        let mut p = running_platform();
-        let err = p.send_key(&KeyEvent::Text("hi".into())).unwrap_err();
-        assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+    fn send_pointer_with_no_active_session_errors() {
+        // The `running()` guard fires before the injector/client, so even a real tap is
+        // rejected with no active app.
+        let mut p = idle_platform();
+        assert!(matches!(
+            p.send_pointer(&tap()).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+    }
+
+    #[test]
+    fn send_key_with_no_active_session_errors() {
+        let mut p = idle_platform();
+        assert!(matches!(
+            p.send_key(&KeyEvent::Text("hi".into())).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
     }
 
     #[test]

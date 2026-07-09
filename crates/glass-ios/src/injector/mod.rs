@@ -10,12 +10,9 @@ const SCROLL_STEP_PX: i32 = 120;
 /// Default swipe duration (seconds) for drags that don't specify one, and scrolls.
 const SWIPE_SECS: f64 = 0.3;
 
-// Nothing in-crate calls this yet; `injector` is a private module, so `pub` alone
-// does not exempt it from the `dead_code` lint.
 /// Builds idb `HIDEvent`s from glass input. `scale` converts window-relative
 /// pixels (glass's coordinate space, matching the capture `Frame`) to the logical
 /// points idb expects: `point = pixel / scale`.
-#[allow(dead_code)]
 pub struct IdbInjector {
     scale: f64,
 }
@@ -77,7 +74,6 @@ fn key(code: u16, down: bool) -> proto::HidEvent {
     }
 }
 
-#[allow(dead_code)]
 impl IdbInjector {
     pub fn new(scale: f64) -> Self {
         IdbInjector { scale }

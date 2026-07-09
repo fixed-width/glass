@@ -60,10 +60,6 @@ fn map_timed<T, E: std::fmt::Display>(
     }
 }
 
-// The input and accessibility backend code that drives these RPCs lands in later
-// increments; until then the methods have no in-crate caller (the `idb` module is
-// crate-private, so `pub` alone does not exempt them from `dead_code`).
-#[allow(dead_code)]
 impl IdbClient {
     /// Connect to `idb_companion`'s gRPC over the Unix socket at `sock`.
     pub fn connect(sock: &Path) -> Result<IdbClient> {
@@ -96,6 +92,27 @@ impl IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
         })
+    }
+
+    /// A client whose channel is never dialed (lazy), for `IosPlatform` unit tests that
+    /// build a platform without a live companion. Any RPC on it would fail; these tests
+    /// exercise only the platform's state machine and never issue one.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> IdbClient {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime for the stub test client");
+        // `connect_lazy` never dials, but it wires up the connector inside a runtime
+        // context, so build the channel while `rt` is entered.
+        let channel = {
+            let _guard = rt.enter();
+            Endpoint::from_static("http://127.0.0.1:0").connect_lazy()
+        };
+        IdbClient {
+            rt,
+            client: CompanionServiceClient::new(channel),
+        }
     }
 
     /// `accessibility_info`: `point=None` describes the whole screen (describe-all);

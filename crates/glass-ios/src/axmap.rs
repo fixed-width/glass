@@ -85,6 +85,28 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
     Ok(AxTree { root, count: 0 })
 }
 
+/// The widest top-level element's logical-point width from idb's nested
+/// `accessibility_info` JSON — the describe root's `frame.width`. This is the point
+/// counterpart to the capture frame's pixel width, so dividing the two yields the
+/// device's point→pixel scale (`scale = pixel_width / point_width`).
+///
+/// Reads the structured `frame` object, matching [`build_tree`]: the sibling `AXFrame`
+/// is a stringified CGRect, not a number, so it is deliberately ignored. Returns `None`
+/// when the JSON does not parse, carries no top-level element, or no element has a
+/// numeric `frame.width` — the caller treats that as "scale undetermined" rather than
+/// assuming a default.
+pub fn root_point_width(json: &str) -> Option<f64> {
+    fn frame_width(n: &Value) -> Option<f64> {
+        n.get("frame")?.get("width")?.as_f64()
+    }
+    let v: Value = serde_json::from_str(json).ok()?;
+    match v {
+        Value::Array(a) => a.iter().filter_map(frame_width).reduce(f64::max),
+        obj @ Value::Object(_) => frame_width(&obj),
+        _ => None,
+    }
+}
+
 fn map_node(n: &Value, scale: f64) -> AxNode {
     // Read a string field, collapsing both a JSON `null` (missing/non-string) and an
     // empty string to `None` so absent and blank values are treated alike.
@@ -275,5 +297,42 @@ mod tests {
         // A bare scalar is neither an element object nor an array of elements.
         let err = build_tree("42", SCALE, &win()).unwrap_err();
         assert!(matches!(err, GlassError::AccessibilityUnavailable(_)));
+    }
+
+    #[test]
+    fn root_point_width_reads_widest_frame() {
+        let j = r#"[{"frame":{"x":0,"y":0,"width":402,"height":874}}]"#;
+        assert_eq!(root_point_width(j), Some(402.0));
+    }
+
+    #[test]
+    fn root_point_width_picks_the_widest_top_level_element() {
+        let j = r#"[{"frame":{"width":320}},{"frame":{"width":402}}]"#;
+        assert_eq!(root_point_width(j), Some(402.0));
+    }
+
+    #[test]
+    fn root_point_width_reads_a_single_object_root() {
+        let j = r#"{"frame":{"width":390}}"#;
+        assert_eq!(root_point_width(j), Some(390.0));
+    }
+
+    #[test]
+    fn root_point_width_is_none_without_a_numeric_frame_width() {
+        // `AXFrame` is a stringified CGRect, not a number, and there is no structured
+        // `frame` here — so there is no usable width to read.
+        let j = r#"[{"AXFrame":"{{0, 0}, {402, 874}}"}]"#;
+        assert_eq!(root_point_width(j), None);
+    }
+
+    #[test]
+    fn root_point_width_is_none_on_malformed_json() {
+        assert_eq!(root_point_width("not json"), None);
+    }
+
+    #[test]
+    fn root_point_width_matches_the_fixture_application_width() {
+        // The real describe-all fixture's application root is 402 logical points wide.
+        assert_eq!(root_point_width(FIXTURE), Some(402.0));
     }
 }
