@@ -12,6 +12,10 @@
 //!   sibling `AXFrame` is a *stringified* CGRect (`"{{x, y}, {w, h}}"`), so the
 //!   structured `frame` is the one we read,
 //! - `enabled` bool, and nested elements in `children`.
+//!
+//! idb's `accessibility_info` exposes no per-element focus state (there is no focus
+//! key anywhere in the output), so [`AxStates::focused`] is always false from this
+//! backend — a known limitation.
 use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree};
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
@@ -82,6 +86,8 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
 }
 
 fn map_node(n: &Value, scale: f64) -> AxNode {
+    // Read a string field, collapsing both a JSON `null` (missing/non-string) and an
+    // empty string to `None` so absent and blank values are treated alike.
     let s = |k: &str| {
         n.get(k)
             .and_then(Value::as_str)
@@ -96,7 +102,9 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
     let states = AxStates {
         enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         visible: true,
-        focused: n.get("AXFocused").and_then(Value::as_bool).unwrap_or(false),
+        // idb's accessibility_info exposes no per-element focus state, so `focused`
+        // is always false here (a known limitation of this backend).
+        focused: false,
         editable,
         ..AxStates::default()
     };
@@ -123,11 +131,14 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
 fn frame_to_rect(f: &Value, scale: f64) -> Option<AxRect> {
     let g = |k: &str| f.get(k).and_then(Value::as_f64);
     let (x, y, w, h) = (g("x")?, g("y")?, g("width")?, g("height")?);
+    // Round to the nearest pixel before casting: `as` truncates toward zero, which
+    // loses a pixel on fractional-point frames (e.g. 145.333pt × 3 = 435.9999… would
+    // truncate to 435 instead of 436).
     Some(AxRect {
-        x: (x * scale) as i32,
-        y: (y * scale) as i32,
-        width: (w * scale).max(0.0) as u32,
-        height: (h * scale).max(0.0) as u32,
+        x: (x * scale).round() as i32,
+        y: (y * scale).round() as i32,
+        width: (w * scale).round().max(0.0) as u32,
+        height: (h * scale).round().max(0.0) as u32,
     })
 }
 
@@ -229,6 +240,20 @@ mod tests {
         let b = status.bounds.expect("statusLabel has bounds");
         assert_eq!(b.x, 387);
         assert_eq!(b.width, 432);
+    }
+
+    #[test]
+    fn build_tree_rounds_fractional_point_frames_to_nearest_pixel() {
+        let tree = built();
+        // tapButton logical frame x=145.33333…, y=404, w=111.66666…, h=47.66666…; ×3 gives
+        // 435.9999…/1212/335.0/143.0. Truncation would drop x to 435 and w to 334 — rounding
+        // must land x=436 and w=335. This is the case exact-integer frames sidestep.
+        let button = find_by_name(&tree.root, "tapButton").expect("tapButton present");
+        let b = button.bounds.expect("tapButton has bounds");
+        assert_eq!(b.x, 436);
+        assert_eq!(b.y, 1212);
+        assert_eq!(b.width, 335);
+        assert_eq!(b.height, 143);
     }
 
     #[test]
