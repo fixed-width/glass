@@ -3,7 +3,7 @@
 //! against a stale id landing on a different element), focuses it, clears it, and
 //! types the new text via synthetic HID input.
 use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree};
-use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
+use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry};
 
 use crate::axmap;
 use crate::idb::client::IdbClient;
@@ -13,17 +13,38 @@ use crate::injector::IdbInjector;
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
     client: IdbClient,
-    injector: IdbInjector,
-    scale: f64,
+}
+
+/// The point→pixel scale for a describe response: the capture window's pixel width over
+/// the describe root's logical-point width. Computed per describe rather than cached,
+/// because this reader is built before the app launches — when the real scale is still
+/// unknown — so a scale frozen at construction would be wrong. `None` if the tree carries
+/// no positive root width.
+fn scale_from(json: &str, window: &WindowGeometry) -> Option<f64> {
+    axmap::root_point_width(json)
+        .filter(|w| *w > 0.0)
+        .map(|pt| f64::from(window.width) / pt)
 }
 
 impl IosA11y {
-    pub fn new(client: IdbClient, scale: f64) -> Self {
-        IosA11y {
-            client,
-            injector: IdbInjector::new(scale),
-            scale,
-        }
+    pub fn new(client: IdbClient) -> Self {
+        IosA11y { client }
+    }
+
+    /// One describe round-trip: fetch the accessibility JSON, derive the point→pixel
+    /// scale from `ctx.window` (pixels, valid once the app has started) and the describe
+    /// root's point width, and map the id-assigned tree. Returns the tree and the scale,
+    /// since `set_value` needs the same scale to place synthetic input.
+    fn describe(&self, ctx: &AxContext) -> Result<(AxTree, f64)> {
+        let json = self.client.accessibility_info(None, true)?;
+        let scale = scale_from(&json, &ctx.window).ok_or_else(|| {
+            GlassError::Backend(
+                "could not determine the iOS accessibility scale from the tree".into(),
+            )
+        })?;
+        let mut tree = axmap::build_tree(&json, scale, &ctx.window)?;
+        tree.assign_ids();
+        Ok((tree, scale))
     }
 }
 
@@ -49,20 +70,20 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
 
 impl Accessibility for IosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let json = self.client.accessibility_info(None, true)?;
-        let mut tree = axmap::build_tree(&json, self.scale, &ctx.window)?;
-        tree.assign_ids();
-        Ok(tree)
+        Ok(self.describe(ctx)?.0)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        // `snapshot` already runs `assign_ids`; the ids here are final, not walked again.
-        let tree = self.snapshot(ctx)?;
+        // One describe yields both the id-assigned tree and the scale to place input at;
+        // the ids here are final, not walked again.
+        let (tree, scale) = self.describe(ctx)?;
         let bounds = verify(&tree, target)?;
         let (cx, cy) = bounds
             .clamped_center(ctx.window.width, ctx.window.height)
             .ok_or_else(|| GlassError::Backend("a11y set_value: element not on screen".into()))?;
-        // Focus by tapping the element, select-all + delete to clear, then type.
+        // Focus by tapping the element, select-all + delete to clear, then type — all
+        // through an injector at this describe's scale.
+        let injector = IdbInjector::new(scale);
         let tap = PointerEvent::Click {
             x: cx,
             y: cy,
@@ -70,19 +91,13 @@ impl Accessibility for IosA11y {
             count: 1,
             modifiers: vec![],
         };
-        self.client.hid(self.injector.pointer_events(&tap)?)?;
-        self.client.hid(
-            self.injector
-                .key_events(&KeyEvent::Chord("super+a".into()))?,
-        )?;
-        self.client.hid(
-            self.injector
-                .key_events(&KeyEvent::Chord("Delete".into()))?,
-        )?;
-        self.client.hid(
-            self.injector
-                .key_events(&KeyEvent::Text(text.to_string()))?,
-        )?;
+        self.client.hid(injector.pointer_events(&tap)?)?;
+        self.client
+            .hid(injector.key_events(&KeyEvent::Chord("super+a".into()))?)?;
+        self.client
+            .hid(injector.key_events(&KeyEvent::Chord("Delete".into()))?)?;
+        self.client
+            .hid(injector.key_events(&KeyEvent::Text(text.to_string()))?)?;
         Ok(())
     }
 }
@@ -127,6 +142,28 @@ mod tests {
         let mut t = AxTree { root, count: 0 };
         t.assign_ids();
         t
+    }
+
+    fn window_px(width: u32) -> WindowGeometry {
+        WindowGeometry {
+            x: 0,
+            y: 0,
+            width,
+            height: 2622,
+        }
+    }
+
+    #[test]
+    fn scale_from_divides_window_pixels_by_root_point_width() {
+        // A 1206px-wide capture over a 402pt describe root is the ×3 backing scale — the
+        // real value this reader must recover per call, not the provisional 1.0.
+        let json = r#"[{"frame":{"width":402}}]"#;
+        assert_eq!(scale_from(json, &window_px(1206)), Some(3.0));
+    }
+
+    #[test]
+    fn scale_from_is_none_without_a_root_point_width() {
+        assert_eq!(scale_from("[]", &window_px(1206)), None);
     }
 
     #[test]

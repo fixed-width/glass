@@ -30,7 +30,7 @@ struct RunningApp {
 /// Input (tap/type/swipe/scroll) and the accessibility tree run over an owned
 /// `idb_companion`: the [`IdbCompanion`] process is spawned for the resolved simulator and
 /// killed when this platform drops; [`IdbClient`] carries HID input to it, and
-/// [`IdbInjector`] builds those HID events at the discovered point→pixel [`scale`].
+/// [`IdbInjector`] builds those HID events at the discovered point→pixel scale.
 pub struct IosPlatform {
     target: SimTarget,
     app: Option<RunningApp>,
@@ -38,13 +38,10 @@ pub struct IosPlatform {
     companion: IdbCompanion,
     /// gRPC client that injects HID input into the simulator.
     client: IdbClient,
-    /// Builds HID events from glass input at the current point→pixel `scale`.
+    /// Builds HID events from glass input at the device's point→pixel scale. Built
+    /// provisionally at `1.0` and rebuilt in `start_app` once the real scale is
+    /// discovered; input before then is gated by `running()`.
     injector: IdbInjector,
-    /// Device point→pixel scale, discovered in `start_app` from the launch screenshot's
-    /// pixel width versus the accessibility root's logical-point width. Provisionally
-    /// `1.0` until then; input is gated by `running()` so none is issued before a real
-    /// scale is known.
-    scale: f64,
 }
 
 /// The Simulator reports exactly one fullscreen window per running app.
@@ -90,16 +87,14 @@ impl IosPlatform {
         let target = SimTarget::from_env(reg)?;
         let companion = IdbCompanion::spawn(target.udid())?;
         let client = IdbClient::connect(companion.socket())?;
-        // Provisional; `start_app` refines it once a screenshot and the accessibility root
-        // frame are available. Input before then is gated by `running()`.
-        let scale = 1.0;
         Ok(Self {
             target,
             app: None,
             companion,
             client,
-            injector: IdbInjector::new(scale),
-            scale,
+            // Provisional scale; `start_app` rebuilds the injector once it discovers the
+            // real scale. Input before then is gated by `running()`.
+            injector: IdbInjector::new(1.0),
         })
     }
 
@@ -148,7 +143,7 @@ impl IosPlatform {
     /// trait objects, so the reader owns its own client rather than borrowing this one.
     pub fn accessibility(&self) -> Result<crate::a11y::IosA11y> {
         let client = IdbClient::connect(self.companion.socket())?;
-        Ok(crate::a11y::IosA11y::new(client, self.scale))
+        Ok(crate::a11y::IosA11y::new(client))
     }
 }
 
@@ -209,7 +204,6 @@ impl Platform for IosPlatform {
         // screenshot is in pixels; their ratio is the scale. On failure the app is left
         // unregistered (no active session) rather than driven at a wrong scale.
         let scale = self.discover_scale(frame.width)?;
-        self.scale = scale;
         self.injector = IdbInjector::new(scale);
         let geometry = WindowGeometry {
             x: 0,
@@ -400,7 +394,6 @@ mod state_machine_tests {
             companion: IdbCompanion::for_test(),
             client: IdbClient::for_test(),
             injector: IdbInjector::new(1.0),
-            scale: 1.0,
         }
     }
 
@@ -411,7 +404,6 @@ mod state_machine_tests {
             companion: IdbCompanion::for_test(),
             client: IdbClient::for_test(),
             injector: IdbInjector::new(1.0),
-            scale: 1.0,
         }
     }
 
