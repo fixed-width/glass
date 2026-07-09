@@ -10,6 +10,7 @@ mod capture;
 mod device;
 pub mod doctor;
 mod idb;
+mod injector;
 mod logs;
 mod platform;
 mod simctl;
