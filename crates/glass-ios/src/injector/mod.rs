@@ -9,9 +9,8 @@ const SCROLL_STEP_PX: i32 = 120;
 /// Default swipe duration (seconds) for drags that don't specify one, and scrolls.
 const SWIPE_SECS: f64 = 0.3;
 
-// A later increment wires `IosPlatform::pointer` to this (Task 9); until then nothing
-// in-crate calls it beyond its own tests, and the `injector` module is crate-private,
-// so `pub` alone does not exempt it from `dead_code`.
+// Nothing in-crate calls this yet; `injector` is a private module, so `pub` alone
+// does not exempt it from the `dead_code` lint.
 /// Builds idb `HIDEvent`s from glass input. `scale` converts window-relative
 /// pixels (glass's coordinate space, matching the capture `Frame`) to the logical
 /// points idb expects: `point = pixel / scale`.
@@ -114,6 +113,7 @@ impl IdbInjector {
 mod pointer_tests {
     use super::*;
     use glass_core::{MouseButton, PointerEvent};
+    use proto::hid_event::{HidDirection, HidSwipe};
 
     fn touch_points(evts: &[proto::HidEvent]) -> Vec<(f64, f64)> {
         // Extract (x,y) from each press-touch event, in order.
@@ -133,6 +133,39 @@ mod pointer_tests {
             .collect()
     }
 
+    fn touch_directions(evts: &[proto::HidEvent]) -> Vec<i32> {
+        // Extract the DOWN/UP direction of each press-touch event, in order.
+        evts.iter()
+            .filter_map(|e| match &e.event {
+                Some(proto::hid_event::Event::Press(p)) => match &p.action {
+                    Some(a) => match &a.action {
+                        Some(proto::hid_event::hid_press_action::Action::Touch(_)) => {
+                            Some(p.direction)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn swipes(evts: &[proto::HidEvent]) -> Vec<&HidSwipe> {
+        evts.iter()
+            .filter_map(|e| match &e.event {
+                Some(proto::hid_event::Event::Swipe(s)) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn swipe_ends(s: &HidSwipe) -> ((f64, f64), (f64, f64)) {
+        let start = s.start.as_ref().map(|p| (p.x, p.y)).unwrap();
+        let end = s.end.as_ref().map(|p| (p.x, p.y)).unwrap();
+        (start, end)
+    }
+
     #[test]
     fn click_is_touch_down_up_in_points() {
         let inj = IdbInjector::new(3.0);
@@ -146,6 +179,37 @@ mod pointer_tests {
         let evts = inj.pointer_events(&e).unwrap();
         // One down + one up at the same point, px/scale = 100,200.
         assert_eq!(touch_points(&evts), vec![(100.0, 200.0), (100.0, 200.0)]);
+        // ...and in DOWN-then-UP order (points alone wouldn't catch a swap).
+        assert_eq!(
+            touch_directions(&evts),
+            vec![HidDirection::Down as i32, HidDirection::Up as i32]
+        );
+    }
+
+    #[test]
+    fn click_count_repeats_down_up_per_count() {
+        let inj = IdbInjector::new(3.0);
+        let e = PointerEvent::Click {
+            x: 300,
+            y: 600,
+            button: MouseButton::Left,
+            count: 3,
+            modifiers: vec![],
+        };
+        let evts = inj.pointer_events(&e).unwrap();
+        // Each count yields a down + an up: 2 * count touch events.
+        assert_eq!(touch_points(&evts).len(), 6);
+        assert_eq!(
+            touch_directions(&evts),
+            vec![
+                HidDirection::Down as i32,
+                HidDirection::Up as i32,
+                HidDirection::Down as i32,
+                HidDirection::Up as i32,
+                HidDirection::Down as i32,
+                HidDirection::Up as i32,
+            ]
+        );
     }
 
     #[test]
@@ -178,10 +242,47 @@ mod pointer_tests {
             duration_ms: 250,
         };
         let evts = inj.pointer_events(&e).unwrap();
-        let swipes: Vec<_> = evts
-            .iter()
-            .filter(|e| matches!(&e.event, Some(proto::hid_event::Event::Swipe(_))))
-            .collect();
+        let swipes = swipes(&evts);
         assert_eq!(swipes.len(), 1);
+        // Endpoints scaled px/3, and duration in seconds (250ms -> 0.25s).
+        assert_eq!(swipe_ends(swipes[0]), ((10.0, 20.0), (100.0, 200.0)));
+        assert_eq!(swipes[0].duration, 0.25);
+    }
+
+    #[test]
+    fn drag_without_duration_uses_default() {
+        let inj = IdbInjector::new(3.0);
+        let e = PointerEvent::Drag {
+            from_x: 30,
+            from_y: 60,
+            to_x: 300,
+            to_y: 600,
+            button: MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 0,
+        };
+        let evts = inj.pointer_events(&e).unwrap();
+        let swipes = swipes(&evts);
+        assert_eq!(swipes.len(), 1);
+        assert_eq!(swipes[0].duration, SWIPE_SECS);
+    }
+
+    #[test]
+    fn scroll_emits_swipe_opposite_the_wheel() {
+        let inj = IdbInjector::new(3.0);
+        let e = PointerEvent::Scroll {
+            x: 150,
+            y: 150,
+            dx: 0,
+            dy: 1,
+            modifiers: vec![],
+        };
+        let evts = inj.pointer_events(&e).unwrap();
+        let swipes = swipes(&evts);
+        assert_eq!(swipes.len(), 1);
+        // Anchored at the point (50,50); ends one SCROLL_STEP_PX up the y-axis
+        // (150 - 1*120 = 30 px -> 10 pt), i.e. opposite the +dy wheel direction.
+        assert_eq!(swipe_ends(swipes[0]), ((50.0, 50.0), (50.0, 10.0)));
+        assert_eq!(swipes[0].duration, SWIPE_SECS);
     }
 }
