@@ -1,9 +1,13 @@
 //! Synchronous wrapper over idb's async gRPC `CompanionService`. glass-core's
 //! `Platform`/`Accessibility` seams are synchronous, so this owns a private
-//! current-thread tokio runtime (like glass-android's sync `conn.rs` over a
-//! socket) and blocks on each RPC. Transport is a Unix-domain socket that
-//! `idb_companion --grpc-domain-sock` listens on.
+//! current-thread tokio runtime and blocks on each RPC. Transport is a
+//! Unix-domain socket that `idb_companion --grpc-domain-sock` listens on.
+//!
+//! See [`IdbClient`] for the threading invariant that `block_on` imposes, and
+//! [`CONNECT_TIMEOUT`]/[`RPC_TIMEOUT`] for the deadlines that keep a wedged
+//! companion from hanging the caller.
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use glass_core::{GlassError, Result};
 use tokio::runtime::Runtime;
@@ -12,12 +16,48 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use super::proto;
 use proto::companion_service_client::CompanionServiceClient;
 
+/// Deadline for establishing the connection (dial + HTTP/2 handshake).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for a single RPC. 30s mirrors glass-android's socket timeout.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Blocking handle to `idb_companion`'s gRPC service.
+///
+/// **Threading invariant:** must be driven from a thread with *no* ambient tokio
+/// runtime. Each method calls [`Runtime::block_on`], which panics ("Cannot start a
+/// runtime from within a runtime") if a tokio runtime is already active on the
+/// calling thread. glass-mcp dispatches every tool body on a dedicated, non-tokio
+/// `glass-platform` thread, which satisfies this. Unlike `glass-a11y-linux`'s
+/// AT-SPI reader (a fresh thread + current-thread runtime per call), the persistent
+/// tonic `Channel` here is bound to `rt` and owned for the client's lifetime, so it
+/// cannot be re-created per call — hence the invariant is documented rather than
+/// enforced by re-threading.
+///
 /// `Debug` so callers can `?`/`unwrap` a `Result<IdbClient>`; both fields are
 /// `Debug` (`Runtime`, and the tonic client over a `Channel`).
 #[derive(Debug)]
 pub struct IdbClient {
     rt: Runtime,
     client: CompanionServiceClient<Channel>,
+}
+
+/// Fold a `timeout(op).await` outcome into a `Result`: the inner error becomes a
+/// `Backend` carrying it, an elapsed deadline becomes a `Backend` timeout error.
+/// Generic over the inner error so it serves both `connect` (`transport::Error`)
+/// and the RPCs (`tonic::Status`).
+fn map_timed<T, E: std::fmt::Display>(
+    op: &str,
+    deadline: Duration,
+    outcome: std::result::Result<std::result::Result<T, E>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(GlassError::Backend(format!("{op}: {e}"))),
+        Err(_elapsed) => Err(GlassError::Backend(format!(
+            "{op} timed out after {}s",
+            deadline.as_secs()
+        ))),
+    }
 }
 
 // The input and accessibility backend code that drives these RPCs lands in later
@@ -33,8 +73,8 @@ impl IdbClient {
             .map_err(|e| GlassError::Backend(format!("idb: tokio runtime: {e}")))?;
         let path: PathBuf = sock.to_path_buf();
         // The URI is ignored by the custom connector; the connector dials the UDS.
-        let channel = rt
-            .block_on(async move {
+        let outcome = rt.block_on(async move {
+            tokio::time::timeout(CONNECT_TIMEOUT, async move {
                 Endpoint::try_from("http://[::]:50051")?
                     .connect_with_connector(tower::service_fn(move |_: Uri| {
                         let path = path.clone();
@@ -45,7 +85,13 @@ impl IdbClient {
                     }))
                     .await
             })
-            .map_err(|e| GlassError::Backend(format!("idb: connect {}: {e}", sock.display())))?;
+            .await
+        });
+        let channel = map_timed(
+            &format!("idb: connect {}", sock.display()),
+            CONNECT_TIMEOUT,
+            outcome,
+        )?;
         Ok(IdbClient {
             rt,
             client: CompanionServiceClient::new(channel),
@@ -64,10 +110,10 @@ impl IdbClient {
             },
         };
         let mut client = self.client.clone();
-        let resp = self
-            .rt
-            .block_on(async move { client.accessibility_info(req).await })
-            .map_err(|e| GlassError::Backend(format!("idb accessibility_info: {e}")))?;
+        let outcome = self.rt.block_on(async move {
+            tokio::time::timeout(RPC_TIMEOUT, client.accessibility_info(req)).await
+        });
+        let resp = map_timed("idb accessibility_info", RPC_TIMEOUT, outcome)?;
         Ok(resp.into_inner().json)
     }
 
@@ -75,12 +121,11 @@ impl IdbClient {
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
     pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
         let mut client = self.client.clone();
-        self.rt
-            .block_on(async move {
-                let stream = tokio_stream::iter(events);
-                client.hid(stream).await
-            })
-            .map_err(|e| GlassError::Backend(format!("idb hid: {e}")))?;
+        let outcome = self.rt.block_on(async move {
+            let stream = tokio_stream::iter(events);
+            tokio::time::timeout(RPC_TIMEOUT, client.hid(stream)).await
+        });
+        map_timed("idb hid", RPC_TIMEOUT, outcome)?;
         Ok(())
     }
 }
@@ -94,5 +139,24 @@ mod tests {
         // A UDS path that does not exist -> a structured Backend error, no panic. Runs on Linux.
         let err = IdbClient::connect(std::path::Path::new("/nonexistent/idb.sock")).unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn connect_to_socket_that_is_not_grpc_errors_cleanly() {
+        // A live UDS whose peer accepts then drops (no HTTP/2) -> the handshake
+        // fails and maps to a structured Backend error, not a panic or a hang.
+        // Exercises the connect error-mapping path against a real socket.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("idb.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let accepter = std::thread::spawn(move || {
+            // Accept one connection and immediately drop it, closing the peer.
+            let _ = listener.accept();
+        });
+
+        let err = IdbClient::connect(&sock).unwrap_err();
+        assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
+
+        accepter.join().expect("accepter thread");
     }
 }
