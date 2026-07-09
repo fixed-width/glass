@@ -30,7 +30,9 @@ impl IosA11y {
 /// Re-walk to `target.id`, confirm role+name (and bounds when known), return its
 /// window-relative pixel bounds. Errors if the element drifted or vanished.
 fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
-    let node = tree.find(target.id).ok_or(GlassError::AxUnsupported)?;
+    let node = tree
+        .find(target.id)
+        .ok_or(GlassError::AxElementNotFound(target.id.0))?;
     if !target.matches(node.role, node.name.as_deref()) {
         return Err(GlassError::Backend(
             "a11y set_value: element at that id changed since the snapshot; re-snapshot".into(),
@@ -159,6 +161,50 @@ mod tests {
             role: AxRole::TextField,
             name: Some("inputField".into()),
             bounds: Some(r),
+        };
+        assert!(verify(&tree, &target).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_missing_id() {
+        let r = AxRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 30,
+        };
+        // The tree only has ids 0 (root) and 1 (the field); id 9 resolves to nothing.
+        let tree = tree_with(leaf(0, AxRole::TextField, "inputField", r));
+        let target = AxTarget {
+            id: AxNodeId(9),
+            role: AxRole::TextField,
+            name: Some("inputField".into()),
+            bounds: Some(r),
+        };
+        assert!(verify(&tree, &target).is_err());
+    }
+
+    #[test]
+    fn verify_rejects_bounds_drift() {
+        let r = AxRect {
+            x: 10,
+            y: 20,
+            width: 100,
+            height: 30,
+        };
+        let tree = tree_with(leaf(0, AxRole::TextField, "inputField", r));
+        // Same role+name, but the target's captured bounds sit far from the node's —
+        // beyond the tolerance, so a drifted id landing on a same-role element is rejected.
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("inputField".into()),
+            bounds: Some(AxRect {
+                x: 200,
+                y: 400,
+                width: 100,
+                height: 30,
+            }),
         };
         assert!(verify(&tree, &target).is_err());
     }
