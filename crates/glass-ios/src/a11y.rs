@@ -181,7 +181,12 @@ mod tests {
             name: Some("inputField".into()),
             bounds: Some(r),
         };
-        assert!(verify(&tree, &target).is_err());
+        // Pin the variant: an unresolved id must report AxElementNotFound (naming the id),
+        // not the generic AxUnsupported — both are `Err`, so `.is_err()` alone wouldn't guard it.
+        assert!(matches!(
+            verify(&tree, &target),
+            Err(GlassError::AxElementNotFound(id)) if id == target.id.0
+        ));
     }
 
     #[test]
