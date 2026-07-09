@@ -42,7 +42,12 @@ glass-dbus-linux = { path = "crates/glass-dbus-linux" }
 atspi = { version = "0.30", features = ["tokio"] }
 atspi-common = "0.14"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+prost = "0.13"
+tokio-stream = "0.1"
+tonic-build = { version = "0.12", default-features = false, features = ["prost"] }
+protox = "0.7"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }

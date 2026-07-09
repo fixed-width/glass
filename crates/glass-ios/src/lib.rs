@@ -9,6 +9,7 @@
 mod capture;
 mod device;
 pub mod doctor;
+mod idb;
 mod logs;
 mod platform;
 mod simctl;
