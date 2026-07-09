@@ -25,7 +25,6 @@ use serde_json::Value;
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
 /// Unrecognized roles become [`AxRole::Other`]; the caller preserves the native
 /// string in [`AxNode::raw_role`].
-#[allow(dead_code)]
 pub fn ax_role(ax_type: &str) -> AxRole {
     match ax_type {
         "AXButton" => AxRole::Button,
@@ -55,7 +54,6 @@ pub fn ax_role(ax_type: &str) -> AxRole {
 /// Returns [`GlassError::AccessibilityUnavailable`] if the JSON does not parse or
 /// its root is neither an element object nor an array of elements — a malformed
 /// response never yields an empty tree passed off as success.
-#[allow(dead_code)]
 pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxTree> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
@@ -107,6 +105,20 @@ pub fn root_point_width(json: &str) -> Option<f64> {
         obj @ Value::Object(_) => frame_width(&obj),
         _ => None,
     }
+}
+
+/// The device's point→pixel scale for a describe response: the capture's pixel width
+/// (`frame_px_width`) over the describe root's logical-point width (from
+/// [`root_point_width`]), i.e. `scale = frame_px_width / root_point_width`.
+///
+/// Returns `None` when the tree carries no *positive* root width — a non-positive width
+/// can't yield a usable scale, so callers treat `None` as "scale undetermined" rather
+/// than dividing by it. Shared by the accessibility reader and the platform's scale
+/// discovery so both compute the ratio one way.
+pub fn scale_from_width(json: &str, frame_px_width: u32) -> Option<f64> {
+    root_point_width(json)
+        .filter(|w| *w > 0.0)
+        .map(|pt| f64::from(frame_px_width) / pt)
 }
 
 fn map_node(n: &Value, scale: f64) -> AxNode {
@@ -369,5 +381,20 @@ mod tests {
     fn root_point_width_matches_the_fixture_application_width() {
         // The real describe-all fixture's application root is 402 logical points wide.
         assert_eq!(root_point_width(FIXTURE), Some(402.0));
+    }
+
+    #[test]
+    fn scale_from_width_divides_pixels_by_root_point_width() {
+        // 1206px capture over a 402pt describe root is the ×3 backing scale.
+        let json = r#"[{"frame":{"width":402}}]"#;
+        assert_eq!(scale_from_width(json, 1206), Some(3.0));
+    }
+
+    #[test]
+    fn scale_from_width_is_none_without_a_positive_root_width() {
+        // No usable width (empty tree) and a non-positive width both yield None, so no
+        // caller ever divides by a zero-or-negative point width.
+        assert_eq!(scale_from_width("[]", 1206), None);
+        assert_eq!(scale_from_width(r#"[{"frame":{"width":0}}]"#, 1206), None);
     }
 }

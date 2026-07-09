@@ -55,11 +55,15 @@ pub fn make_platform(
     #[cfg(target_os = "macos")]
     if backend == "ios" {
         let platform = glass_ios::IosPlatform::from_env(sim_registry)?;
-        // The reader opens its own client to the same idb_companion socket the
-        // platform is already bound to, so the two can be boxed as independent
-        // trait objects.
-        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-            Some(Box::new(platform.accessibility()?));
+        // The accessibility tree needs idb_companion. When it's present, the reader opens
+        // its own client to the same socket the platform is bound to, so the two are boxed
+        // as independent trait objects; when it's absent the backend runs observe-only
+        // (capture/logs/clipboard) with no reader, so input and the tree report Unsupported
+        // and the doctor warns. A genuine connect failure while the companion IS present is
+        // still propagated here rather than degraded to observe-only.
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> = platform
+            .accessibility()?
+            .map(|a| Box::new(a) as Box<dyn glass_core::Accessibility + Send>);
         return Ok(Backend {
             platform: Box::new(platform),
             accessibility,

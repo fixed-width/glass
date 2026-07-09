@@ -115,16 +115,13 @@ impl IdbClient {
         }
     }
 
-    /// `accessibility_info`: `point=None` describes the whole screen (describe-all);
-    /// `nested=true` requests the hierarchical format. Returns the response `json`.
-    pub fn accessibility_info(&self, point: Option<(f64, f64)>, nested: bool) -> Result<String> {
+    /// Describe the whole accessibility tree: idb's `accessibility_info` over the entire
+    /// screen (no point) in the nested/hierarchical format. Returns the response `json`.
+    pub fn describe_all(&self) -> Result<String> {
+        self.ensure_off_runtime("idb accessibility_info")?;
         let req = proto::AccessibilityInfoRequest {
-            point: point.map(|(x, y)| proto::Point { x, y }),
-            format: if nested {
-                proto::accessibility_info_request::Format::Nested as i32
-            } else {
-                proto::accessibility_info_request::Format::Legacy as i32
-            },
+            point: None,
+            format: proto::accessibility_info_request::Format::Nested as i32,
         };
         let mut client = self.client.clone();
         let outcome = self.rt.block_on(async move {
@@ -137,6 +134,7 @@ impl IdbClient {
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
     pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
+        self.ensure_off_runtime("idb hid")?;
         let mut client = self.client.clone();
         let outcome = self.rt.block_on(async move {
             let stream = tokio_stream::iter(events);
@@ -145,11 +143,48 @@ impl IdbClient {
         map_timed("idb hid", RPC_TIMEOUT, outcome)?;
         Ok(())
     }
+
+    /// Guard the `block_on` threading invariant (see the type doc): calling an RPC from a
+    /// thread that already has an active tokio runtime would panic inside
+    /// [`Runtime::block_on`]. Turn that future wiring mistake into a structured error so it
+    /// surfaces as a clean failure rather than a panic.
+    fn ensure_off_runtime(&self, op: &str) -> Result<()> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(GlassError::Backend(format!(
+                "{op}: idb client called from within an async runtime \
+                 (it must run on a thread with no ambient tokio runtime)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_timed_folds_an_elapsed_deadline_into_a_backend_timeout() {
+        // Produce a real `tokio::time::error::Elapsed` from a timeout that fires over a
+        // never-ready future, then assert `map_timed` maps it to a Backend timeout error
+        // (the branch the transport-error tests below don't cover).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime");
+        let outcome: std::result::Result<std::result::Result<(), String>, _> = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                std::future::pending::<std::result::Result<(), String>>(),
+            )
+            .await
+        });
+        let err = map_timed("idb hid", Duration::from_secs(30), outcome).unwrap_err();
+        assert!(
+            matches!(err, GlassError::Backend(ref msg) if msg.contains("timed out after 30s")),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn connect_to_missing_socket_errors_cleanly() {

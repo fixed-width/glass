@@ -1,12 +1,9 @@
-#![forbid(unsafe_code)]
-
 //! US-ASCII → USB HID Usage Table (Keyboard/Keypad page 0x07) mapping for the iOS
 //! backend's synthetic keyboard. Unmapped characters return None so the caller can
 //! surface a clear "unsupported character" error rather than silently drop it.
 use glass_core::Modifier;
 
 /// HID usage id + whether Shift must be held, for a printable US-ASCII char.
-#[allow(dead_code)]
 pub fn char_usage(c: char) -> Option<(u16, bool)> {
     Some(match c {
         'a'..='z' => (0x04 + (c as u16 - 'a' as u16), false),
@@ -52,33 +49,36 @@ pub fn char_usage(c: char) -> Option<(u16, bool)> {
 }
 
 /// HID usage for a named key used in chords.
-#[allow(dead_code)]
 pub fn keyname_usage(name: &str) -> Option<u16> {
     let named = match name {
-        "Return" | "Enter" => 0x28,
-        "Escape" | "Esc" => 0x29,
-        "BackSpace" | "Backspace" => 0x2A,
-        "Tab" => 0x2B,
-        "space" | "Space" => 0x2C,
-        "Delete" | "Del" => 0x4C, // forward delete
-        "Right" => 0x4F,
-        "Left" => 0x50,
-        "Down" => 0x51,
-        "Up" => 0x52,
-        "Home" => 0x4A,
-        "End" => 0x4D,
-        _ => 0,
+        "Return" | "Enter" => Some(0x28),
+        "Escape" | "Esc" => Some(0x29),
+        "BackSpace" | "Backspace" => Some(0x2A),
+        "Tab" => Some(0x2B),
+        "space" | "Space" => Some(0x2C),
+        "Delete" | "Del" => Some(0x4C), // forward delete
+        "Right" => Some(0x4F),
+        "Left" => Some(0x50),
+        "Down" => Some(0x51),
+        "Up" => Some(0x52),
+        "Home" => Some(0x4A),
+        "End" => Some(0x4D),
+        _ => None,
     };
-    if named != 0 {
-        return Some(named);
+    if let Some(usage) = named {
+        return Some(usage);
     }
-    // F1..F12 -> 0x3A..0x45
-    if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()) {
-        if (1..=12).contains(&n) {
-            return Some(0x3A + (n - 1));
-        }
+    // F1..F12 -> 0x3A..0x45.
+    if let Some(n) = name
+        .strip_prefix('F')
+        .and_then(|n| n.parse::<u16>().ok())
+        .filter(|n| (1..=12).contains(n))
+    {
+        return Some(0x3A + (n - 1));
     }
-    // A single printable char, case-sensitive (usage only; caller adds Shift from the flag).
+    // A single printable char maps to its base HID usage. The Shift flag `char_usage`
+    // returns is dropped here: in a chord, Shift is expressed as an explicit `shift+`
+    // modifier, not inferred from the final key's name.
     let mut chars = name.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) => char_usage(c).map(|(u, _)| u),
@@ -87,7 +87,6 @@ pub fn keyname_usage(name: &str) -> Option<u16> {
 }
 
 /// HID usage for a modifier key (left-hand variants).
-#[allow(dead_code)]
 pub fn modifier_usage(m: Modifier) -> u16 {
     match m {
         Modifier::Control => 0xE0,

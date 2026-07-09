@@ -19,15 +19,14 @@ pub struct IosA11y {
 /// the describe root's logical-point width. Computed per describe rather than cached,
 /// because this reader is built before the app launches — when the real scale is still
 /// unknown — so a scale frozen at construction would be wrong. `None` if the tree carries
-/// no positive root width.
+/// no positive root width. Delegates to [`axmap::scale_from_width`] so the reader and the
+/// platform's scale discovery compute the ratio one way.
 fn scale_from(json: &str, window: &WindowGeometry) -> Option<f64> {
-    axmap::root_point_width(json)
-        .filter(|w| *w > 0.0)
-        .map(|pt| f64::from(window.width) / pt)
+    axmap::scale_from_width(json, window.width)
 }
 
 impl IosA11y {
-    pub fn new(client: IdbClient) -> Self {
+    pub(crate) fn new(client: IdbClient) -> Self {
         IosA11y { client }
     }
 
@@ -36,7 +35,7 @@ impl IosA11y {
     /// root's point width, and map the id-assigned tree. Returns the tree and the scale,
     /// since `set_value` needs the same scale to place synthetic input.
     fn describe(&self, ctx: &AxContext) -> Result<(AxTree, f64)> {
-        let json = self.client.accessibility_info(None, true)?;
+        let json = self.client.describe_all()?;
         let scale = scale_from(&json, &ctx.window).ok_or_else(|| {
             GlassError::Backend(
                 "could not determine the iOS accessibility scale from the tree".into(),

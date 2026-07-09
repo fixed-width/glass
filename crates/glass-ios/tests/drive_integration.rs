@@ -122,7 +122,8 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
 
     let mut a11y = platform
         .accessibility()
-        .expect("accessibility(): second idb client to the same companion socket");
+        .expect("accessibility(): connect a second idb client to the same companion socket")
+        .expect("companion present on this on-box run, so a reader is available");
     let ctx = AxContext {
         pids: vec![],
         window: window.clone(),

@@ -20,9 +20,13 @@ tokio = { workspace = true }
 tokio-stream.workspace = true
 # Direct deps for dialing idb's gRPC over a Unix-domain socket: `tower::service_fn`
 # builds the custom UDS connector and `hyper_util::rt::TokioIo` adapts the
-# `tokio::net::UnixStream` to hyper's IO traits. tonic 0.12 already pulls both
-# transitively; naming them here (unifying on tower 0.5.3 / hyper-util 0.1.20) lets
-# `client.rs` reference them directly.
+# `tokio::net::UnixStream` to hyper's IO traits. tonic 0.12 pulls both transitively.
+# `hyper-util` unifies on the single version tonic already uses (0.1.x); `tower` does NOT —
+# tonic's transport pins tower 0.4, so naming 0.5 here adds a SECOND, un-merged `tower` to
+# the tree (both 0.4.13 and 0.5.3 coexist). That's harmless: `connect_with_connector` only
+# needs the `Service` impl that `tower::service_fn` produces, and that impl is
+# version-independent — it's backed by the shared `tower-service` crate — so the 0.4/0.5
+# split never reaches the call site.
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 

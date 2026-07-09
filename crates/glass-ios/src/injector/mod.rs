@@ -24,14 +24,15 @@ fn point(x_px: i32, y_px: i32, scale: f64) -> proto::Point {
     }
 }
 
-fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
-    use proto::hid_event::{
-        hid_press_action::Action, Event, HidDirection, HidPress, HidPressAction, HidTouch,
-    };
+/// Wrap a press action (touch or key) in a `HidEvent` at the given direction
+/// (`down` = press, else release). The single place that maps `down` to the proto's
+/// `HidDirection`, shared by [`touch`] and [`key`].
+fn press(action: proto::hid_event::hid_press_action::Action, down: bool) -> proto::HidEvent {
+    use proto::hid_event::{Event, HidDirection, HidPress, HidPressAction};
     proto::HidEvent {
         event: Some(Event::Press(HidPress {
             action: Some(HidPressAction {
-                action: Some(Action::Touch(HidTouch { point: Some(pt) })),
+                action: Some(action),
             }),
             direction: if down {
                 HidDirection::Down as i32
@@ -40,6 +41,11 @@ fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
             },
         })),
     }
+}
+
+fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
+    use proto::hid_event::{hid_press_action::Action, HidTouch};
+    press(Action::Touch(HidTouch { point: Some(pt) }), down)
 }
 
 fn swipe(from: proto::Point, to: proto::Point, secs: f64) -> proto::HidEvent {
@@ -55,27 +61,26 @@ fn swipe(from: proto::Point, to: proto::Point, secs: f64) -> proto::HidEvent {
 }
 
 fn key(code: u16, down: bool) -> proto::HidEvent {
-    use proto::hid_event::{
-        hid_press_action::Action, Event, HidDirection, HidKey, HidPress, HidPressAction,
-    };
-    proto::HidEvent {
-        event: Some(Event::Press(HidPress {
-            action: Some(HidPressAction {
-                action: Some(Action::Key(HidKey {
-                    keycode: code as u64,
-                })),
-            }),
-            direction: if down {
-                HidDirection::Down as i32
-            } else {
-                HidDirection::Up as i32
-            },
-        })),
-    }
+    use proto::hid_event::{hid_press_action::Action, HidKey};
+    press(
+        Action::Key(HidKey {
+            keycode: code as u64,
+        }),
+        down,
+    )
 }
 
 impl IdbInjector {
-    pub fn new(scale: f64) -> Self {
+    /// Build an injector for a device whose point→pixel scale is `scale`. `scale` must be
+    /// finite and positive — it is a divisor for every coordinate, and callers only reach
+    /// here with a scale derived from a positive root width (see `axmap::scale_from_width`),
+    /// so the `debug_assert` documents that precondition and catches a future regression in
+    /// debug builds.
+    pub(crate) fn new(scale: f64) -> Self {
+        debug_assert!(
+            scale.is_finite() && scale > 0.0,
+            "IdbInjector scale must be finite and positive, got {scale}"
+        );
         IdbInjector { scale }
     }
 
@@ -88,6 +93,8 @@ impl IdbInjector {
         let s = self.scale;
         Ok(match *e {
             PointerEvent::Move { .. } => vec![], // touch has no hover
+            // A touch has no modifier concept (unlike a mouse click with Ctrl/Shift
+            // held), so any `modifiers` on the event are intentionally not applied.
             PointerEvent::Click { x, y, count, .. } => {
                 let mut v = Vec::new();
                 for _ in 0..count.max(1) {
@@ -201,40 +208,30 @@ mod pointer_tests {
     use glass_core::{MouseButton, PointerEvent};
     use proto::hid_event::{HidDirection, HidSwipe};
 
-    fn touch_points(evts: &[proto::HidEvent]) -> Vec<(f64, f64)> {
-        // Extract (x,y) from each press-touch event, in order.
+    fn touch_events(evts: &[proto::HidEvent]) -> Vec<((f64, f64), i32)> {
+        // Extract ((x,y), direction) from each press-touch event, in order — the single
+        // walk `touch_points`/`touch_directions` project out of.
         evts.iter()
             .filter_map(|e| match &e.event {
-                Some(proto::hid_event::Event::Press(p)) => match &p.action {
-                    Some(a) => match &a.action {
+                Some(proto::hid_event::Event::Press(p)) => {
+                    match p.action.as_ref().and_then(|a| a.action.as_ref()) {
                         Some(proto::hid_event::hid_press_action::Action::Touch(t)) => {
-                            t.point.as_ref().map(|pt| (pt.x, pt.y))
+                            t.point.as_ref().map(|pt| ((pt.x, pt.y), p.direction))
                         }
                         _ => None,
-                    },
-                    None => None,
-                },
+                    }
+                }
                 _ => None,
             })
             .collect()
     }
 
+    fn touch_points(evts: &[proto::HidEvent]) -> Vec<(f64, f64)> {
+        touch_events(evts).into_iter().map(|(pt, _)| pt).collect()
+    }
+
     fn touch_directions(evts: &[proto::HidEvent]) -> Vec<i32> {
-        // Extract the DOWN/UP direction of each press-touch event, in order.
-        evts.iter()
-            .filter_map(|e| match &e.event {
-                Some(proto::hid_event::Event::Press(p)) => match &p.action {
-                    Some(a) => match &a.action {
-                        Some(proto::hid_event::hid_press_action::Action::Touch(_)) => {
-                            Some(p.direction)
-                        }
-                        _ => None,
-                    },
-                    None => None,
-                },
-                _ => None,
-            })
-            .collect()
+        touch_events(evts).into_iter().map(|(_, dir)| dir).collect()
     }
 
     fn swipes(evts: &[proto::HidEvent]) -> Vec<&HidSwipe> {
@@ -313,6 +310,31 @@ mod pointer_tests {
             inj.pointer_events(&g),
             Err(glass_core::GlassError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn click_modifiers_are_ignored_for_touch() {
+        // Touch has no modifier concept, so a click carrying modifiers produces exactly
+        // the same touch events as one without — the `modifiers` are intentionally dropped.
+        let inj = IdbInjector::new(3.0);
+        let base = PointerEvent::Click {
+            x: 300,
+            y: 600,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        };
+        let with_mods = PointerEvent::Click {
+            x: 300,
+            y: 600,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![glass_core::Modifier::Control, glass_core::Modifier::Shift],
+        };
+        assert_eq!(
+            touch_events(&inj.pointer_events(&base).unwrap()),
+            touch_events(&inj.pointer_events(&with_mods).unwrap())
+        );
     }
 
     #[test]

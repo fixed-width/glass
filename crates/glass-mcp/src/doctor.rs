@@ -267,7 +267,7 @@ pub(crate) fn idb_companion_check(found: bool) -> Check {
         Check::new(
             "idb_companion",
             CheckStatus::Ok,
-            "idb_companion is on PATH — input + accessibility are available",
+            "idb_companion found — input + accessibility are available",
         )
     } else {
         Check::new(
