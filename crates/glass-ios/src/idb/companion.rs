@@ -7,14 +7,12 @@ use std::time::{Duration, Instant};
 
 use glass_core::{GlassError, Result};
 
-use super::client::IdbClient;
-
 // A later increment wires `IosPlatform` to own an `IdbCompanion` (spawning it once a
 // simulator UDID is resolved); until then nothing in-crate calls this beyond its own
 // tests, and the `idb` module is crate-private, so `pub` alone does not exempt it from
 // `dead_code`.
-#[allow(dead_code)]
 /// `GLASS_IDB_COMPANION`, else `idb_companion` on PATH.
+#[allow(dead_code)]
 pub fn companion_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
     get("GLASS_IDB_COMPANION")
         .filter(|s| !s.is_empty())
@@ -40,6 +38,8 @@ impl IdbCompanion {
         let get = |k: &str| std::env::var(k).ok();
         let bin = companion_bin(&get);
         // A per-companion socket under the temp dir; unique by pid to avoid collisions.
+        // Invariant: one live companion per UDID per process — a same-UDID re-spawn in
+        // this process reuses the path, and the pre-spawn remove_file makes that self-healing.
         let sock =
             std::env::temp_dir().join(format!("glass-idb-{udid}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
@@ -80,12 +80,15 @@ impl Drop for IdbCompanion {
 }
 
 /// Poll until `idb_companion`'s gRPC socket accepts a connection, or `deadline`.
-/// A successful [`IdbClient::connect`] means the gRPC server is up, since the
-/// connector does the h2 handshake eagerly.
+/// A raw Unix-domain connect is near-instant: it accepts once the companion is
+/// serving (it binds its gRPC server to the socket before accepting) and returns
+/// ECONNREFUSED immediately if the socket file exists but nothing is listening yet.
+/// That keeps each poll attempt bounded so the outer `deadline` is respected; the
+/// first real RPC carries its own timeout as a backstop.
 #[allow(dead_code)] // only called from `spawn`, itself unused until a later increment
 fn wait_for_socket(sock: &Path, deadline: Instant) -> Result<()> {
     loop {
-        if sock.exists() && IdbClient::connect(sock).is_ok() {
+        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -124,5 +127,17 @@ mod tests {
         let err =
             wait_for_socket(missing, Instant::now() + Duration::from_millis(150)).unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn wait_for_socket_returns_ok_when_listening() {
+        use std::time::{Duration, Instant};
+        // A bound listener is enough: the kernel accepts the connect into its backlog,
+        // so the raw UDS probe succeeds without an accept thread. Proves the ready path
+        // on Linux, with no real idb_companion.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("idb.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        wait_for_socket(&sock, Instant::now() + Duration::from_secs(2)).expect("socket ready");
     }
 }
