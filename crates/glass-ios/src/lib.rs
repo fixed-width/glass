@@ -6,6 +6,7 @@
 //! not implemented yet.
 #![forbid(unsafe_code)]
 
+mod a11y;
 mod axmap;
 mod capture;
 mod device;
@@ -17,6 +18,7 @@ mod platform;
 mod simctl;
 mod target;
 
+pub use a11y::IosA11y;
 pub use platform::IosPlatform;
 pub use simctl::Simctl;
 pub use target::{SimTarget, SimulatorRegistry};
