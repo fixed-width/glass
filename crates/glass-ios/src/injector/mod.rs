@@ -1,8 +1,9 @@
 pub mod keymap;
 
-use glass_core::{GlassError, PointerEvent, Result};
+use glass_core::{GlassError, KeyEvent, Modifier, PointerEvent, Result};
 
 use crate::idb::proto;
+use keymap::{char_usage, keyname_usage, modifier_usage};
 
 /// Pixels of swipe travel per scroll "click" (matches glass-android's tunable).
 const SCROLL_STEP_PX: i32 = 120;
@@ -52,6 +53,26 @@ fn swipe(from: proto::Point, to: proto::Point, secs: f64) -> proto::HidEvent {
             end: Some(to),
             delta: 0.0,
             duration: secs,
+        })),
+    }
+}
+
+fn key(code: u16, down: bool) -> proto::HidEvent {
+    use proto::hid_event::{
+        hid_press_action::Action, Event, HidDirection, HidKey, HidPress, HidPressAction,
+    };
+    proto::HidEvent {
+        event: Some(Event::Press(HidPress {
+            action: Some(HidPressAction {
+                action: Some(Action::Key(HidKey {
+                    keycode: code as u64,
+                })),
+            }),
+            direction: if down {
+                HidDirection::Down as i32
+            } else {
+                HidDirection::Up as i32
+            },
         })),
     }
 }
@@ -107,6 +128,75 @@ impl IdbInjector {
             }
         })
     }
+
+    /// Maps one glass `KeyEvent` to the idb HID key events that reproduce it. `Text`
+    /// types each char in turn: a Shift down/up bracketing the key down/up when the
+    /// char needs it, nothing otherwise. `Chord` (e.g. `"ctrl+shift+a"`) holds every
+    /// modifier down, presses the final key, then releases the modifiers in reverse
+    /// order. An unmappable text char is `Unsupported`; an unknown chord key or
+    /// modifier name is `InvalidKey` — neither is dropped silently.
+    pub fn key_events(&self, e: &KeyEvent) -> Result<Vec<proto::HidEvent>> {
+        match e {
+            KeyEvent::Text(s) => {
+                let mut v = Vec::new();
+                for c in s.chars() {
+                    let (usage, shift) = char_usage(c).ok_or_else(|| {
+                        GlassError::Unsupported(format!(
+                            "cannot type {c:?} on the iOS backend (US-ASCII only)"
+                        ))
+                    })?;
+                    if shift {
+                        v.push(key(modifier_usage(Modifier::Shift), true));
+                    }
+                    v.push(key(usage, true));
+                    v.push(key(usage, false));
+                    if shift {
+                        v.push(key(modifier_usage(Modifier::Shift), false));
+                    }
+                }
+                Ok(v)
+            }
+            KeyEvent::Chord(chord) => {
+                let (mods, key_name) = split_chord(chord)?;
+                let usage = keyname_usage(&key_name).ok_or_else(|| {
+                    GlassError::InvalidKey(format!("unknown key {key_name:?} in {chord:?}"))
+                })?;
+                let mut v = Vec::new();
+                for m in &mods {
+                    v.push(key(modifier_usage(*m), true));
+                }
+                v.push(key(usage, true));
+                v.push(key(usage, false));
+                for m in mods.iter().rev() {
+                    v.push(key(modifier_usage(*m), false));
+                }
+                Ok(v)
+            }
+        }
+    }
+}
+
+/// Splits a chord like `"ctrl+shift+a"` into its modifiers and final key name.
+/// Modifier tokens use glass-core's `Modifier` vocabulary; the final key is looked
+/// up with `keyname_usage`.
+fn split_chord(chord: &str) -> Result<(Vec<Modifier>, String)> {
+    let parts: Vec<&str> = chord
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let (key, mods) = parts
+        .split_last()
+        .ok_or_else(|| GlassError::InvalidKey(chord.into()))?;
+    let mut modifiers = Vec::new();
+    for m in mods {
+        modifiers.push(Modifier::from_name(m).ok_or_else(|| {
+            GlassError::InvalidKey(format!(
+                "unknown modifier {m:?} in {chord:?} (use ctrl/shift/alt/super/cmd)"
+            ))
+        })?);
+    }
+    Ok((modifiers, key.to_string()))
 }
 
 #[cfg(test)]
@@ -284,5 +374,69 @@ mod pointer_tests {
         // (150 - 1*120 = 30 px -> 10 pt), i.e. opposite the +dy wheel direction.
         assert_eq!(swipe_ends(swipes[0]), ((50.0, 50.0), (50.0, 10.0)));
         assert_eq!(swipes[0].duration, SWIPE_SECS);
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use glass_core::KeyEvent;
+
+    fn key_seq(evts: &[proto::HidEvent]) -> Vec<(u64, bool)> {
+        // (keycode, is_down) for each press-key event, in order.
+        evts.iter()
+            .filter_map(|e| match &e.event {
+                Some(proto::hid_event::Event::Press(p)) => {
+                    let down = p.direction == proto::hid_event::HidDirection::Down as i32;
+                    match p.action.as_ref().and_then(|a| a.action.as_ref()) {
+                        Some(proto::hid_event::hid_press_action::Action::Key(k)) => {
+                            Some((k.keycode, down))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_lowercase_is_down_up() {
+        let inj = IdbInjector::new(3.0);
+        let evts = inj.key_events(&KeyEvent::Text("ab".into())).unwrap();
+        assert_eq!(
+            key_seq(&evts),
+            vec![(0x04, true), (0x04, false), (0x05, true), (0x05, false)]
+        );
+    }
+
+    #[test]
+    fn text_uppercase_wraps_shift() {
+        let inj = IdbInjector::new(3.0);
+        let evts = inj.key_events(&KeyEvent::Text("A".into())).unwrap();
+        // shift down, a down, a up, shift up
+        assert_eq!(
+            key_seq(&evts),
+            vec![(0xE1, true), (0x04, true), (0x04, false), (0xE1, false)]
+        );
+    }
+
+    #[test]
+    fn chord_ctrl_a() {
+        let inj = IdbInjector::new(3.0);
+        let evts = inj.key_events(&KeyEvent::Chord("ctrl+a".into())).unwrap();
+        assert_eq!(
+            key_seq(&evts),
+            vec![(0xE0, true), (0x04, true), (0x04, false), (0xE0, false)]
+        );
+    }
+
+    #[test]
+    fn text_unmapped_char_errors() {
+        let inj = IdbInjector::new(3.0);
+        assert!(matches!(
+            inj.key_events(&KeyEvent::Text("€".into())),
+            Err(glass_core::GlassError::Unsupported(_))
+        ));
     }
 }
