@@ -54,11 +54,15 @@ pub fn make_platform(
 ) -> Result<Backend> {
     #[cfg(target_os = "macos")]
     if backend == "ios" {
-        // No accessibility reader for the iOS Simulator backend yet.
         let platform = glass_ios::IosPlatform::from_env(sim_registry)?;
+        // The reader opens its own client to the same idb_companion socket the
+        // platform is already bound to, so the two can be boxed as independent
+        // trait objects.
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(platform.accessibility()?));
         return Ok(Backend {
             platform: Box::new(platform),
-            accessibility: None,
+            accessibility,
         });
     }
     if backend == "android" {
