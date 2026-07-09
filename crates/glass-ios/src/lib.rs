@@ -6,6 +6,7 @@
 //! not implemented yet.
 #![forbid(unsafe_code)]
 
+mod axmap;
 mod capture;
 mod device;
 pub mod doctor;
