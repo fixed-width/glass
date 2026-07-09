@@ -14,6 +14,18 @@ pub fn companion_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
         .unwrap_or_else(|| "idb_companion".to_string())
 }
 
+/// The Unix-domain socket path the companion is told to serve on, under `dir`.
+/// Kept deliberately short: macOS caps `sun_path` at 104 bytes and its per-user temp
+/// dir (`/var/folders/…/T/`) already spends ~50 of them, so a longer name makes the
+/// companion refuse to bind (`unixDomainSocketPathTooLong`). The file name therefore
+/// carries only a UDID prefix — enough to tell simulators apart when debugging — plus
+/// this process's pid. Uniqueness rests on the pid (one companion per process), so a
+/// same-process re-spawn reuses the path and the pre-spawn `remove_file` self-heals it.
+fn socket_path(dir: &Path, udid: &str, pid: u32) -> PathBuf {
+    let udid_prefix: String = udid.chars().take(8).collect();
+    dir.join(format!("glass-idb-{udid_prefix}-{pid}.sock"))
+}
+
 /// Owns one `idb_companion` child process and the Unix socket it serves gRPC
 /// on. Killing + reaping the child on `Drop` mirrors glass-android's
 /// `AgentRegistry`/`AgentProc`.
@@ -30,11 +42,7 @@ impl IdbCompanion {
     pub fn spawn(udid: &str) -> Result<IdbCompanion> {
         let get = |k: &str| std::env::var(k).ok();
         let bin = companion_bin(&get);
-        // A per-companion socket under the temp dir; unique by pid to avoid collisions.
-        // Invariant: one live companion per UDID per process — a same-UDID re-spawn in
-        // this process reuses the path, and the pre-spawn remove_file makes that self-healing.
-        let sock =
-            std::env::temp_dir().join(format!("glass-idb-{udid}-{}.sock", std::process::id()));
+        let sock = socket_path(&std::env::temp_dir(), udid, std::process::id());
         let _ = std::fs::remove_file(&sock);
         let child = Command::new(&bin)
             .args(["--udid", udid, "--grpc-domain-sock"])
@@ -127,6 +135,22 @@ mod tests {
             "/opt/idb_companion"
         );
         assert_eq!(companion_bin(&with(HashMap::new())), "idb_companion");
+    }
+
+    #[test]
+    fn socket_path_stays_within_the_macos_sun_path_limit() {
+        // macOS's per-user temp dir is long and `sun_path` caps at 104 bytes; a longer
+        // path makes idb_companion refuse to bind (unixDomainSocketPathTooLong), so the
+        // built path must stay under the cap even with a full 36-char simulator UDID and a
+        // large pid. This is the exact shape `spawn` passes to `--grpc-domain-sock`.
+        let dir = Path::new("/var/folders/2g/t424cmtn67j0txp_3hj67k980000gn/T");
+        let p = socket_path(dir, "42C037FF-28A3-415E-BBCB-B2A17004E566", u32::MAX);
+        assert!(
+            p.as_os_str().len() <= 104,
+            "socket path {} is {} bytes, over the 104-byte sun_path limit",
+            p.display(),
+            p.as_os_str().len()
+        );
     }
 
     #[test]
