@@ -142,21 +142,22 @@ mod tests {
     }
 
     #[test]
-    fn connect_to_socket_that_is_not_grpc_errors_cleanly() {
-        // A live UDS whose peer accepts then drops (no HTTP/2) -> the handshake
-        // fails and maps to a structured Backend error, not a panic or a hang.
-        // Exercises the connect error-mapping path against a real socket.
+    fn connect_to_dead_socket_errors_cleanly() {
+        // A UDS path that exists but has no listener behind it — the "stale idb
+        // socket" case (companion died, leaving its socket file). `connect` is
+        // refused at the transport layer (ECONNREFUSED) and maps to a structured
+        // Backend error, no panic, promptly.
+        //
+        // Deterministic by construction: bind then immediately drop the listener,
+        // so the socket file lingers with nothing listening. There is no live peer,
+        // hence no accept-vs-handshake timing race (an earlier version raced on
+        // whether tonic's h2 preface write buffered before the peer's reset).
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("idb.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-        let accepter = std::thread::spawn(move || {
-            // Accept one connection and immediately drop it, closing the peer.
-            let _ = listener.accept();
-        });
-
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        }
         let err = IdbClient::connect(&sock).unwrap_err();
         assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
-
-        accepter.join().expect("accepter thread");
     }
 }
