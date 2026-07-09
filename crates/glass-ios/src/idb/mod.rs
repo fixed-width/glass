@@ -25,6 +25,8 @@
 // prost/tonic output is machine-generated and isn't held to our lint gate: it trips
 // `dead_code` for messages no rpc references (e.g. `OpenUrlResponse`, since upstream's
 // `open_url` returns `OpenUrlRequest`) and clippy's stylistic lints don't apply here.
+pub mod client;
+
 #[allow(clippy::all, clippy::pedantic, dead_code)]
 pub mod proto {
     // The vendored proto declares `package idb;`, so the generated file is `idb.rs`.

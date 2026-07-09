@@ -1197,6 +1197,7 @@ name = "glass-ios"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "hyper-util",
  "image",
  "prost",
  "protox",
@@ -1206,6 +1207,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tower 0.5.3",
 ]
 
 [[package]]
