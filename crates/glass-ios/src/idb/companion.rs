@@ -64,8 +64,20 @@ impl IdbCompanion {
     /// or a socket that never comes up leaves no child behind: both paths
     /// kill + reap before returning `Err`.
     pub fn spawn(udid: &str) -> Result<IdbCompanion> {
-        let get = |k: &str| std::env::var(k).ok();
-        let bin = companion_bin(&get);
+        Self::spawn_with(udid, &|k| std::env::var(k).ok(), SOCKET_READY_TIMEOUT)
+    }
+
+    /// [`spawn`](Self::spawn) with the companion-binary env resolution and the socket-ready
+    /// deadline injected — the seam that makes the failure-cleanup path testable without a
+    /// real simulator. A test points `GLASS_IDB_COMPANION` at a stub through `get_env`
+    /// *without* mutating this process's environment (which would race parallel tests), and
+    /// passes a short `ready_timeout` so a stub that never serves its socket fails fast.
+    fn spawn_with(
+        udid: &str,
+        get_env: &dyn Fn(&str) -> Option<String>,
+        ready_timeout: Duration,
+    ) -> Result<IdbCompanion> {
+        let bin = companion_bin(get_env);
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         let sock = socket_path(&dir, udid, pid);
@@ -112,7 +124,7 @@ impl IdbCompanion {
             stderr_log,
         };
         // From here any failure must kill+reap the child, so a failed spawn never leaks it.
-        if let Err(e) = this.await_socket(Instant::now() + SOCKET_READY_TIMEOUT) {
+        if let Err(e) = this.await_socket(Instant::now() + ready_timeout) {
             let _ = this.child.kill();
             let _ = this.child.wait();
             return Err(e);
@@ -260,5 +272,90 @@ mod tests {
         let sock = dir.path().join("idb.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         assert!(socket_ready(&sock));
+    }
+
+    #[test]
+    fn spawn_reaps_the_child_when_the_socket_never_opens() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("stub_companion");
+        let pidfile = dir.path().join("child.pid");
+        // A stub that records its own pid, then sleeps without ever opening the gRPC socket,
+        // so `await_socket` can only time out. `exec` preserves the pid, so the recorded pid
+        // is exactly the child `spawn_with` owns and must kill+reap on the failure path.
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho $$ > {pidfile:?}\nexec sleep 10\n"),
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // Point GLASS_IDB_COMPANION at the stub through the injected getter — never through
+        // this process's real env, which would race parallel tests. A short ready deadline
+        // keeps the never-served socket from costing the full production timeout.
+        let stub_path = stub.to_str().expect("utf-8 stub path").to_string();
+        let get_env = |k: &str| (k == "GLASS_IDB_COMPANION").then(|| stub_path.clone());
+        const READY: Duration = Duration::from_millis(500);
+        // A unique udid keeps this test's socket file name from colliding with another test
+        // in the same process (the socket path is keyed on the udid prefix + this pid).
+        const UDID: &str = "REAPTEST-0000-0000-0000-000000000000";
+
+        // Retry past a transient ETXTBSY on the freshly-written stub: a sibling test thread's
+        // fork can momentarily hold the write fd open, racing our exec. This affects only the
+        // just-written fixture, never the installed idb_companion (same rationale as doctor).
+        let mut err = None;
+        for _ in 0..100 {
+            match IdbCompanion::spawn_with(UDID, &get_env, READY) {
+                Ok(_) => panic!("stub never opens a socket, so spawn_with must fail"),
+                Err(GlassError::Backend(m)) if m.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("spawn_with kept returning ETXTBSY after 100 retries");
+        assert!(
+            matches!(&err, GlassError::Backend(m) if m.contains("never opened its socket")),
+            "expected a socket-timeout failure, got: {err:?}"
+        );
+
+        // The stub records its pid before sleeping, and reaching the timeout above means it
+        // got that far; read it back, briefly tolerating a slow start under load.
+        let start = Instant::now();
+        let pid = loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    break t.to_string();
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "stub never recorded its pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        // The heart of the test: after the failure the child must be gone — killed AND reaped
+        // — not left running or lingering as a zombie. `kill -0` succeeds for a live *or*
+        // zombie pid and fails (ESRCH) only once it is fully reaped, so a still-signalable
+        // pid means `spawn_with` leaked it.
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            // Silence its stderr: on the expected (reaped) path `kill -0` prints
+            // "No such process", which would clutter passing-test output. The `.success()`
+            // check below is what the assertion reads.
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(
+            !alive,
+            "spawn_with leaked child pid {pid}: it was not killed+reaped on the failure path"
+        );
     }
 }
