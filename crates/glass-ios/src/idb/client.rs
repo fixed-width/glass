@@ -41,6 +41,32 @@ pub struct IdbClient {
     client: CompanionServiceClient<Channel>,
 }
 
+/// Deadline for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
+/// its `duration` seconds on the device and holds the streaming RPC open at least
+/// that long, so a flat [`RPC_TIMEOUT`] aborts any gesture longer than it mid-stream
+/// (issue #116). Budget the summed event durations plus [`RPC_TIMEOUT`] of margin: a
+/// long drag runs to completion, yet a wedged companion is still bounded, now relative
+/// to the expected work. An instantaneous `HidPress` (tap, key chord) contributes
+/// nothing, so those streams keep the flat deadline. A non-finite or non-positive
+/// `duration` is dropped so a malformed event can't poison the sum.
+fn hid_timeout(events: &[proto::HidEvent]) -> Duration {
+    use proto::hid_event::Event;
+    let device_secs: f64 = events
+        .iter()
+        .filter_map(|e| match e.event.as_ref()? {
+            // Every variant that runs over wall-clock time carries a `duration` (seconds).
+            Event::Swipe(s) => Some(s.duration),
+            Event::Delay(d) => Some(d.duration),
+            Event::Pinch(p) => Some(p.duration),
+            Event::Press(_) => None,
+        })
+        .filter(|secs| secs.is_finite() && *secs > 0.0)
+        .sum();
+    // `try_from_secs_f64` rejects a NaN/inf/overflowing sum (→ ZERO), and
+    // `saturating_add` caps the total at `Duration::MAX`; the result never panics.
+    RPC_TIMEOUT.saturating_add(Duration::try_from_secs_f64(device_secs).unwrap_or(Duration::ZERO))
+}
+
 /// Fold a `timeout(op).await` outcome into a `Result`: the inner error becomes a
 /// `Backend` carrying it, an elapsed deadline becomes a `Backend` timeout error.
 /// Generic over the inner error so it serves both `connect` (`transport::Error`)
@@ -135,12 +161,15 @@ impl IdbClient {
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
     pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
         self.ensure_off_runtime("idb hid")?;
+        // Derive the deadline from the gesture's own duration so a long swipe isn't
+        // aborted mid-stream by a flat timeout (issue #116); see [`hid_timeout`].
+        let timeout = hid_timeout(&events);
         let mut client = self.client.clone();
         let outcome = self.rt.block_on(async move {
             let stream = tokio_stream::iter(events);
-            tokio::time::timeout(RPC_TIMEOUT, client.hid(stream)).await
+            tokio::time::timeout(timeout, client.hid(stream)).await
         });
-        map_timed("idb hid", RPC_TIMEOUT, outcome)?;
+        map_timed("idb hid", timeout, outcome)?;
         Ok(())
     }
 
@@ -184,6 +213,102 @@ mod tests {
             matches!(err, GlassError::Backend(ref msg) if msg.contains("timed out after 30s")),
             "{err:?}"
         );
+    }
+
+    fn swipe_event(duration: f64) -> proto::HidEvent {
+        use proto::hid_event::{Event, HidSwipe};
+        proto::HidEvent {
+            event: Some(Event::Swipe(HidSwipe {
+                start: None,
+                end: None,
+                delta: 0.0,
+                duration,
+            })),
+        }
+    }
+
+    fn touch_event() -> proto::HidEvent {
+        use proto::hid_event::{Event, HidPress};
+        proto::HidEvent {
+            event: Some(Event::Press(HidPress {
+                action: None,
+                direction: 0,
+            })),
+        }
+    }
+
+    fn delay_event(duration: f64) -> proto::HidEvent {
+        use proto::hid_event::{Event, HidDelay};
+        proto::HidEvent {
+            event: Some(Event::Delay(HidDelay { duration })),
+        }
+    }
+
+    fn pinch_event(duration: f64) -> proto::HidEvent {
+        use proto::hid_event::{Event, HidPinch};
+        proto::HidEvent {
+            event: Some(Event::Pinch(HidPinch {
+                center: None,
+                scale: 1.0,
+                duration,
+                radius: 0.0,
+            })),
+        }
+    }
+
+    #[test]
+    fn hid_timeout_of_a_stream_without_swipes_is_the_base_deadline() {
+        // A tap or key chord carries no swipe, so it keeps the flat base deadline.
+        assert_eq!(hid_timeout(&[touch_event(), touch_event()]), RPC_TIMEOUT);
+    }
+
+    #[test]
+    fn hid_timeout_extends_the_base_deadline_by_a_long_swipe_duration() {
+        // A 45s swipe would trip a flat 30s deadline mid-gesture (issue #116); the
+        // deadline must cover the swipe plus the base margin.
+        assert_eq!(
+            hid_timeout(&[swipe_event(45.0)]),
+            RPC_TIMEOUT + Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn hid_timeout_sums_the_durations_of_multiple_swipes() {
+        assert_eq!(
+            hid_timeout(&[swipe_event(10.0), swipe_event(20.0)]),
+            RPC_TIMEOUT + Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn hid_timeout_extends_the_base_deadline_by_a_long_delay_duration() {
+        // A `HidDelay` plays out over wall-clock time on the device just like a swipe,
+        // so a long delay must extend the deadline too (else issue #116 recurs).
+        assert_eq!(
+            hid_timeout(&[delay_event(45.0)]),
+            RPC_TIMEOUT + Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn hid_timeout_extends_the_base_deadline_by_a_long_pinch_duration() {
+        // A `HidPinch` (multi-touch) also runs over its `duration`; budget it as well.
+        assert_eq!(
+            hid_timeout(&[pinch_event(45.0)]),
+            RPC_TIMEOUT + Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn hid_timeout_ignores_a_swipe_with_a_non_finite_duration() {
+        // Defensive: a NaN/inf duration must not poison the deadline arithmetic.
+        assert_eq!(hid_timeout(&[swipe_event(f64::NAN)]), RPC_TIMEOUT);
+        assert_eq!(hid_timeout(&[swipe_event(f64::INFINITY)]), RPC_TIMEOUT);
+    }
+
+    #[test]
+    fn hid_timeout_ignores_a_swipe_with_a_negative_duration() {
+        assert_eq!(hid_timeout(&[swipe_event(-5.0)]), RPC_TIMEOUT);
     }
 
     #[test]
