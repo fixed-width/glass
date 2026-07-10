@@ -505,3 +505,620 @@ impl Glass {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::session::test_support::*;
+
+    #[test]
+    fn wait_stable_settles_on_repeated_frame() {
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        // a, b, then b repeats forever (FakePlatform repeats the last frame).
+        let platform = FakePlatform::new(2, 2).with_frames(vec![a, b.clone()]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                window: None,
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(outcome.frame, b);
+    }
+
+    #[test]
+    fn wait_stable_times_out_when_never_settling() {
+        // Two alternating frames that never repeat -> never stable.
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [1, 1, 1, 255]);
+        let mut frames = Vec::new();
+        for _ in 0..50 {
+            frames.push(a.clone());
+            frames.push(b.clone());
+        }
+        let platform = FakePlatform::new(2, 2).with_frames(frames);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 5,
+                tolerance: 0,
+                timeout_ms: 0, // give up after the first non-settling capture
+                stability_region: None,
+                window: None,
+            })
+            .unwrap();
+        assert!(!outcome.settled);
+    }
+
+    #[test]
+    fn wait_stable_settles_using_only_the_stability_region() {
+        // The 2x2 top-left region is constant black; only pixel (3,3) changes,
+        // so the FULL frames all differ. Settling can only happen if the settle
+        // decision looks at the region alone — and the returned frame is full.
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4).with_frames(vec![f0, f1, f2.clone()]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }),
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            outcome.settled,
+            "constant region should settle despite the changing corner"
+        );
+        assert_eq!(
+            outcome.frame, f2,
+            "wait_stable returns the FULL frame, not the cropped region"
+        );
+    }
+
+    #[test]
+    fn wait_stable_polls_only_the_region_and_captures_full_once() {
+        // Region constant, corner changing -> settles on the region; the returned
+        // frame is a full capture, and every poll captured ONLY the region.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1, f2])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: Some(region),
+                window: None,
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(
+            (outcome.frame.width, outcome.frame.height),
+            (4, 4),
+            "returns the full window"
+        );
+        let calls = log.lock().unwrap();
+        let (last, polls) = calls.split_last().expect("at least one capture");
+        assert!(
+            polls.iter().all(|c| *c == Some(region)),
+            "polls capture only the region: {polls:?}"
+        );
+        assert_eq!(*last, None, "final capture is the full window");
+    }
+
+    #[test]
+    fn wait_stable_without_region_captures_full_each_poll() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![a, b])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                window: None,
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        let calls = log.lock().unwrap();
+        assert!(
+            calls.iter().all(|c| c.is_none()),
+            "no-region captures are full: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn wait_stable_rejects_out_of_bounds_stability_region() {
+        let platform =
+            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let err = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: Some(Region {
+                    x: 0,
+                    y: 0,
+                    width: 99,
+                    height: 1,
+                }),
+                window: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GlassError::InvalidRegion(_)));
+    }
+
+    #[test]
+    fn wait_stable_with_window_id_uses_capture_window_and_leaves_active_untouched() {
+        // Window B is constant, so it settles immediately; watching it must go
+        // through capture_window (never capture_frame), and must not disturb the
+        // active window (A).
+        let a = WindowInfo {
+            id: WindowId(1),
+            title: Some("A".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: true,
+        };
+        let b = WindowInfo {
+            id: WindowId(2),
+            title: Some("B".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 100,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: false,
+        };
+        let frame_b = Frame::solid(4, 4, [3, 3, 3, 255]);
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let capture_window_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_windows(vec![a.clone(), b])
+            .with_capture_log(capture_log.clone())
+            .with_capture_window_log(capture_window_log.clone())
+            .with_window_frame(WindowId(2), frame_b.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.select_window(WindowId(1)).unwrap(); // A is active
+
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                window: Some(WindowId(2)),
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(outcome.frame, frame_b);
+        assert_eq!(
+            g.geometry().unwrap(),
+            a.geometry,
+            "active window is still A after watching B"
+        );
+        assert!(
+            capture_log.lock().unwrap().is_empty(),
+            "watching a specific window must not go through capture_frame"
+        );
+        assert!(!capture_window_log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_for_element_matches_state_and_returns_node() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                role: Some(AxRole::Button),
+                value_contains: None,
+                condition: ElementCondition::Enabled,
+                interval_ms: 0,
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        assert!(o.matched);
+        let e = o.element.expect("matched element");
+        assert_eq!(e.id, AxNodeId(1));
+        assert_eq!(e.name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn wait_for_element_times_out_soft() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                role: None,
+                value_contains: None,
+                condition: ElementCondition::Checked, // never true in the fixed tree
+                interval_ms: 0,
+                timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(!o.matched);
+        assert!(o.element.is_none());
+    }
+
+    #[test]
+    fn wait_for_element_disappears_is_matched_when_absent() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                condition: ElementCondition::Disappears,
+                interval_ms: 0,
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert!(o.element.is_none());
+    }
+
+    #[test]
+    fn wait_for_element_errors_when_a11y_unsupported() {
+        let mut g = glass_with(FakePlatform::new(40, 30)); // no accessibility reader
+        g.start(&spec()).unwrap();
+        let err = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("x".into()),
+                role: None,
+                value_contains: None,
+                condition: ElementCondition::Appears,
+                interval_ms: 0,
+                timeout_ms: 1000,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GlassError::AxUnsupported));
+    }
+
+    #[test]
+    fn scroll_to_element_returns_already_visible_without_scrolling() {
+        // The target is present in the current view → return it immediately, steps=0,
+        // and no scroll is issued.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree()); // fake_tree has Button "Save"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert_eq!(out.steps, 0);
+        assert!(!out.reversed);
+        assert_eq!(out.element.unwrap().name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn scroll_to_element_absent_sweeps_both_ends_then_reports_unmatched() {
+        // The target never appears and the a11y tree's outline never changes (the
+        // fixture tree is fixed), so each direction saturates after one step. The
+        // sweep must terminate (not hang), reversed, matched:false.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree()); // no node named "Ghost"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: ScrollDirection::Down,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert!(out.element.is_none());
+        assert!(out.reversed, "must have reversed to sweep the other end");
+        // One saturating step per direction: no motion breaks each sweep immediately.
+        assert_eq!(out.steps, 2);
+    }
+
+    #[test]
+    fn wait_for_region_changes_matches_on_divergence() {
+        // Reference captured at start = black; next frame = white -> "changes".
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(2, 2).with_frames(vec![a, b]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                window: None,
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert!(o.changed_pct > 0.0);
+    }
+
+    #[test]
+    fn wait_for_region_changes_times_out_when_static() {
+        // One frame, repeated -> reference == every poll -> never changes.
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let platform = FakePlatform::new(2, 2).with_frames(vec![a]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                window: None,
+            })
+            .unwrap();
+        assert!(!o.matched);
+    }
+
+    #[test]
+    fn wait_for_region_matches_converges_to_baseline() {
+        // save baseline from black; then poll white, then black -> "matches" on black.
+        let black = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let white = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let platform =
+            FakePlatform::new(2, 2).with_frames(vec![black.clone(), white, black.clone()]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.save_baseline("b").unwrap(); // consumes frame #1 (black)
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: Some("b".into()),
+                region: None,
+                until: RegionUntil::Matches,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                window: None,
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert_eq!(o.changed_pct, 0.0);
+    }
+
+    #[test]
+    fn wait_for_region_with_window_id_uses_capture_window_and_leaves_active_untouched() {
+        // Window B is constant, so it matches its own initial capture immediately;
+        // watching it must go through capture_window (never capture_frame), and
+        // must not disturb the active window (A).
+        let a = WindowInfo {
+            id: WindowId(1),
+            title: Some("A".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: true,
+        };
+        let b = WindowInfo {
+            id: WindowId(2),
+            title: Some("B".into()),
+            class: None,
+            geometry: WindowGeometry {
+                x: 100,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            active: false,
+        };
+        let frame_b = Frame::solid(4, 4, [5, 5, 5, 255]);
+        let capture_log = Arc::new(Mutex::new(Vec::new()));
+        let capture_window_log = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(4, 4)
+            .with_windows(vec![a.clone(), b])
+            .with_capture_log(capture_log.clone())
+            .with_capture_window_log(capture_window_log.clone())
+            .with_window_frame(WindowId(2), frame_b);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.select_window(WindowId(1)).unwrap(); // A is active
+
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Matches,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                window: Some(WindowId(2)),
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert_eq!(o.changed_pct, 0.0);
+        assert_eq!(
+            g.geometry().unwrap(),
+            a.geometry,
+            "active window is still A after watching B"
+        );
+        assert!(
+            capture_log.lock().unwrap().is_empty(),
+            "watching a specific window must not go through capture_frame"
+        );
+        assert!(
+            capture_window_log.lock().unwrap().len() >= 2,
+            "reference capture + at least one poll"
+        );
+    }
+
+    #[test]
+    fn wait_for_log_matches_existing_from_cursor_zero() {
+        let platform =
+            FakePlatform::new(10, 10).with_logs(vec![(Stream::Stdout, "export complete")]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_log(&WaitLogParams {
+                contains: "complete".into(),
+                stream: None,
+                cursor: Some(0), // scan from the beginning
+                interval_ms: 0,
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        assert!(o.matched);
+        let line = o.line.expect("matched line");
+        assert_eq!(line.text, "export complete");
+        assert_eq!(o.cursor, line.seq + 1);
+    }
+
+    #[test]
+    fn wait_for_log_default_cursor_skips_old_lines_and_times_out() {
+        // The line already in the buffer is "old" (before the default start cursor),
+        // so a default-cursor wait does not match it.
+        let platform = FakePlatform::new(10, 10).with_logs(vec![(Stream::Stdout, "old line")]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_log(&WaitLogParams {
+                contains: "old line".into(),
+                stream: None,
+                cursor: None, // default = end-at-start
+                interval_ms: 0,
+                timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(!o.matched);
+        assert!(o.line.is_none());
+        // Footgun guard: the line WAS in the buffer (seq 0) before the default start
+        // cursor, so the timeout must say so and point at cursor:0 — not fail silently.
+        let note = o
+            .note
+            .expect("timeout note when the substring was already buffered");
+        assert!(
+            note.contains("cursor:0"),
+            "note should point at cursor:0, got: {note}"
+        );
+        assert!(
+            note.contains("seq 0"),
+            "note should cite the buffered seq, got: {note}"
+        );
+    }
+
+    #[test]
+    fn wait_for_log_match_cursor_resumes_after_matched_line() {
+        // Two lines; match the FIRST -> resume cursor is just after it (1), not the end (2).
+        let platform = FakePlatform::new(10, 10).with_logs(vec![
+            (Stream::Stdout, "first hit"),
+            (Stream::Stdout, "second"),
+        ]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_log(&WaitLogParams {
+                contains: "first".into(),
+                stream: None,
+                cursor: Some(0),
+                interval_ms: 0,
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        assert!(o.matched);
+        assert_eq!(o.line.unwrap().seq, 0);
+        assert_eq!(
+            o.cursor, 1,
+            "resume cursor is just after the matched line, not the buffer end"
+        );
+    }
+
+    #[test]
+    fn scroll_direction_opposite_and_dy() {
+        assert_eq!(ScrollDirection::Down.opposite(), ScrollDirection::Up);
+        assert_eq!(ScrollDirection::Up.opposite(), ScrollDirection::Down);
+        // Down = wheel-down = positive notches; Up = negative.
+        assert_eq!(ScrollDirection::Down.dy(3), 3);
+        assert_eq!(ScrollDirection::Up.dy(3), -3);
+        // An absurd step saturates instead of overflowing/panicking.
+        assert_eq!(ScrollDirection::Down.dy(u32::MAX), i32::MAX);
+        assert_eq!(ScrollDirection::Up.dy(u32::MAX), -i32::MAX);
+        assert_eq!(
+            ScrollDirection::from_name("DOWN"),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(ScrollDirection::from_name("up"), Some(ScrollDirection::Up));
+        assert_eq!(ScrollDirection::from_name("sideways"), None);
+    }
+}

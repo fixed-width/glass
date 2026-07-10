@@ -98,3 +98,122 @@ impl Glass {
         Ok(self.require_active()?.geometry.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::session::test_support::*;
+
+    #[test]
+    fn operations_require_an_active_session() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        assert!(matches!(
+            g.screenshot(None, None).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+        assert!(matches!(g.stop().unwrap_err(), GlassError::NoActiveSession));
+        assert!(matches!(
+            g.key(&KeyEvent::Chord("ctrl+s".into())).unwrap_err(),
+            GlassError::NoActiveSession
+        ));
+    }
+
+    #[test]
+    fn start_sets_geometry_and_buffers_initial_logs() {
+        let platform = FakePlatform::new(80, 60).with_logs(vec![(Stream::Stdout, "ready")]);
+        let mut g = glass_with(platform);
+        let geom = g.start(&spec()).unwrap();
+        assert_eq!(
+            geom,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 60
+            }
+        );
+        let (lines, _) = g.logs(0, 10, None, None).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "ready");
+    }
+
+    #[test]
+    fn shutdown_runs_the_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = fired.clone();
+        let mut g =
+            glass_with_factory(Box::new(|_b| Err(GlassError::Backend("no backend".into()))));
+        g.set_shutdown_hook(Box::new(move || f.store(true, Ordering::SeqCst)));
+        g.shutdown();
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "shutdown should invoke the hook"
+        );
+    }
+
+    #[test]
+    fn start_on_passes_backend_name_to_factory() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let factory: PlatformFactory = Box::new(move |backend| {
+            seen2.lock().unwrap().push(backend.to_string());
+            Ok(Backend::display_only(Box::new(FakePlatform::new(10, 10))))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap(); // default ("x11")
+        g.start_on("wayland", &spec()).unwrap(); // explicit
+        assert_eq!(*seen.lock().unwrap(), vec!["x11", "wayland"]);
+    }
+
+    #[test]
+    fn second_start_stops_the_first_backend() {
+        let stops = Arc::new(Mutex::new(0u32));
+        let stops2 = stops.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).counting_stops(stops2.clone()),
+            )))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+        g.start(&spec()).unwrap(); // should stop the first backend
+        assert_eq!(*stops.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn shutdown_stops_active_session_and_is_idempotent() {
+        let stops = Arc::new(Mutex::new(0u32));
+        let stops2 = stops.clone();
+        let factory: PlatformFactory = Box::new(move |_backend| {
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).counting_stops(stops2.clone()),
+            )))
+        });
+        let mut g = glass_with_factory(factory);
+        g.start(&spec()).unwrap();
+        g.shutdown();
+        assert_eq!(
+            *stops.lock().unwrap(),
+            1,
+            "shutdown calls stop_app exactly once"
+        );
+        assert!(
+            matches!(g.stop().unwrap_err(), GlassError::NoActiveSession),
+            "the session is cleared after shutdown"
+        );
+        // Idempotent: a second shutdown with nothing active is a harmless no-op.
+        g.shutdown();
+        assert_eq!(
+            *stops.lock().unwrap(),
+            1,
+            "no extra stop_app on an empty shutdown"
+        );
+    }
+
+    #[test]
+    fn shutdown_without_active_session_is_noop() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        g.shutdown(); // must not panic and must not error
+    }
+}

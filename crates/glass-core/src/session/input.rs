@@ -81,3 +81,52 @@ impl Glass {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::session::test_support::*;
+
+    #[test]
+    fn pointer_out_of_bounds_is_rejected_before_backend() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        g.start(&spec()).unwrap();
+        let err = g.pointer(&PointerEvent::Click {
+            x: 10, // valid range is 0..=9
+            y: 5,
+            button: crate::platform::MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        });
+        assert!(matches!(
+            err.unwrap_err(),
+            GlassError::CoordOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn gesture_out_of_bounds_segment_is_rejected() {
+        let mut g = glass_with(FakePlatform::new(100, 80));
+        g.start(&spec()).unwrap();
+        let ev = PointerEvent::Gesture {
+            pointers: vec![
+                Segment {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 20,
+                    to_y: 20,
+                },
+                Segment {
+                    from_x: 10,
+                    from_y: 10,
+                    to_x: 200,
+                    to_y: 20,
+                }, // to_x out of 100-wide window
+            ],
+            duration_ms: 100,
+        };
+        assert!(matches!(
+            g.pointer(&ev),
+            Err(GlassError::CoordOutOfBounds { .. })
+        ));
+    }
+}
