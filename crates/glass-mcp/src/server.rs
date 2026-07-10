@@ -532,7 +532,7 @@ impl ServerHandler for GlassServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
@@ -586,6 +586,128 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.into_owned())
             .collect()
+    }
+
+    /// Strip `(...)` spans (depth-aware) so backtick *literals* inside type/default
+    /// annotations — `` `0.1` ``, `` `{x,y,width,height}` `` — don't count as params.
+    fn strip_parens(s: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        for c in s.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Collect the contents of each `` `backtick` `` span, in order.
+    fn backtick_tokens(s: &str) -> Vec<String> {
+        let mut toks = Vec::new();
+        let mut rest = s;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start + 1..];
+            match after.find('`') {
+                Some(end) => {
+                    toks.push(after[..end].to_string());
+                    rest = &after[end + 1..];
+                }
+                None => break,
+            }
+        }
+        toks
+    }
+
+    /// Parameter names documented under a tool's ``### `tool` `` section: the backtick
+    /// tokens at the head of each `- ` bullet (before the ` — ` description dash, with
+    /// `(...)` stripped). Handles shared (`` `x`, `y` ``) and `/`-joined bullets.
+    fn documented_params(tool: &str) -> BTreeSet<String> {
+        let heading = format!("### `{tool}`");
+        let mut lines = TOOLS_MD.lines();
+        for line in lines.by_ref() {
+            if line.trim_end() == heading {
+                break;
+            }
+        }
+
+        // Fold each bullet (a `- ` line plus its indented continuation lines) into one
+        // logical string; a blank line or non-indented prose line ends the current bullet.
+        let mut bullets: Vec<String> = Vec::new();
+        let mut in_bullet = false;
+        for line in lines.by_ref() {
+            if line.starts_with("## ") || line.starts_with("### ") {
+                break; // next section
+            }
+            if let Some(rest) = line.trim_end().strip_prefix("- ") {
+                bullets.push(rest.trim().to_string());
+                in_bullet = true;
+            } else if line.trim().is_empty() {
+                in_bullet = false;
+            } else if in_bullet && line.starts_with(char::is_whitespace) {
+                let last = bullets
+                    .last_mut()
+                    .expect("in_bullet implies a bullet exists");
+                last.push(' ');
+                last.push_str(line.trim());
+            } else {
+                in_bullet = false; // non-indented prose ends the list
+            }
+        }
+
+        let mut params = BTreeSet::new();
+        for bullet in bullets {
+            if !bullet.starts_with('`') {
+                continue; // only backtick-leading bullets document parameters
+            }
+            let head = bullet.split(" — ").next().unwrap_or(&bullet);
+            for tok in backtick_tokens(&strip_parens(head)) {
+                params.insert(tok);
+            }
+        }
+        params
+    }
+
+    /// Top-level parameter names each tool advertises, straight from the registry's
+    /// `input_schema.properties` — the same schema MCP shows agents. Correct across
+    /// serde renames (`return_` → `"return"`); no hand-maintained list to drift.
+    fn registered_params() -> BTreeMap<String, BTreeSet<String>> {
+        GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                let params = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(|v| v.as_object())
+                    .map(|props| props.keys().cloned().collect::<BTreeSet<String>>())
+                    .unwrap_or_default();
+                (tool.name.into_owned(), params)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_reference_documents_every_parameter() {
+        let mut problems: Vec<String> = Vec::new();
+        for (tool, schema_params) in &registered_params() {
+            let documented = documented_params(tool);
+            let undocumented: Vec<_> = schema_params.difference(&documented).collect();
+            let phantom: Vec<_> = documented.difference(schema_params).collect();
+            if !undocumented.is_empty() || !phantom.is_empty() {
+                problems.push(format!(
+                    "  {tool}: in schema but undocumented: {undocumented:?}; \
+                     in docs but not a real param: {phantom:?}"
+                ));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "docs/reference/tools.md parameter lists are out of sync with the #[tool] registry:\n{}",
+            problems.join("\n")
+        );
     }
 
     #[test]
