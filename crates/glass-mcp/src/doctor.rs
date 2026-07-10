@@ -161,11 +161,17 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     {
         let ios_selected = backend == "ios";
         let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
-        // idb_companion drives input and the accessibility reader; only worth reporting
-        // when ios is actually the backend in play, mirroring how android's deep probes
-        // are gated to `android_selected` above.
+        // The companion drives input + the accessibility reader; only worth reporting when
+        // ios is actually the backend in play, mirroring android's gated deep probes. On
+        // --deep, probe it for real (spawn against a booted sim, else a bounded self-test);
+        // otherwise just report resolvable-on-PATH presence.
         if ios_selected {
-            ios_checks.push(idb_companion_check(idb_companion_present()));
+            let companion = if deep {
+                companion_deep_check(glass_ios::doctor::probe_companion())
+            } else {
+                idb_companion_check(glass_ios::doctor::companion_present())
+            };
+            ios_checks.push(companion);
         }
         if !ios_selected {
             soften_inactive_ios(&mut ios_checks);
@@ -280,7 +286,7 @@ pub(crate) fn idb_companion_check(found: bool) -> Check {
 }
 
 /// The Fail check for an absent `idb_companion`, shared by the passive presence path and the
-/// `--deep` probe's CompanionProbe::NotFound mapping.
+/// `--deep` probe's `CompanionProbe::NotFound` mapping.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn idb_companion_not_found_check() -> Check {
     Check::new(
@@ -291,18 +297,42 @@ fn idb_companion_not_found_check() -> Check {
     .with_remedy(IDB_COMPANION_REMEDY)
 }
 
-/// Real-environment probe for [`idb_companion_check`]: is `idb_companion` resolvable —
-/// `GLASS_IDB_COMPANION` naming an existing file, or `idb_companion` found on `PATH`?
-/// Mirrors `glass_ios`'s own resolution of the same binary (`idb::companion::companion_bin`),
-/// duplicated here because that module is private to `glass-ios`.
+/// Map a `--deep` iOS companion probe ([`glass_ios::doctor::probe_companion`]) to a `Check`.
+/// Pure — the probe's I/O is done by the caller — so it's unit-tested per variant without a
+/// real companion. Broken (`FailedToStart`/`SelfTestFailed`) or missing (`NotFound`) ⇒ Fail:
+/// iOS cannot drive apps without the companion. Unverified (`SelfTestOk` — the binary runs but
+/// no booted simulator was available to exercise a real start) ⇒ Warn. macOS-gated: it names a
+/// `glass-ios` type, and glass-mcp only depends on glass-ios on macOS (mirrors `macos_checks_from`).
 #[cfg(target_os = "macos")]
-fn idb_companion_present() -> bool {
-    let bin = glass_core::tool_path("GLASS_IDB_COMPANION", "idb_companion");
-    if bin.contains('/') {
-        std::path::Path::new(&bin).is_file()
-    } else {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file()))
+pub(crate) fn companion_deep_check(probe: glass_ios::doctor::CompanionProbe) -> Check {
+    use glass_ios::doctor::CompanionProbe;
+    match probe {
+        CompanionProbe::Started => Check::new(
+            "idb_companion",
+            CheckStatus::Ok,
+            "started and served its gRPC socket — input + accessibility are available",
+        ),
+        CompanionProbe::SelfTestOk => Check::new(
+            "idb_companion",
+            CheckStatus::Warn,
+            "binary runs, but no booted simulator was available to verify a real start — \
+             boot one and re-run with --deep to exercise the companion",
+        ),
+        CompanionProbe::FailedToStart(cause) => Check::new(
+            "idb_companion",
+            CheckStatus::Fail,
+            format!(
+                "failed to start: {cause} — input + accessibility are unavailable (iOS is observe-only)"
+            ),
+        )
+        .with_remedy(IDB_COMPANION_REMEDY),
+        CompanionProbe::SelfTestFailed(cause) => Check::new(
+            "idb_companion",
+            CheckStatus::Fail,
+            format!("binary failed to execute: {cause} — input + accessibility are unavailable"),
+        )
+        .with_remedy(IDB_COMPANION_REMEDY),
+        CompanionProbe::NotFound => idb_companion_not_found_check(),
     }
 }
 
@@ -642,6 +672,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_companion_fails_the_ios_verdict() {
+        // A Fail companion check in the ios section must escalate the overall verdict to Fail
+        // (exit code 1) when ios is the backend — iOS is unusable without the companion.
+        let ios = Section::new("ios", Some("ios".into()), vec![idb_companion_check(false)]);
+        let d = Diagnosis::new(vec![ios]);
+        assert_eq!(d.overall("ios"), CheckStatus::Fail);
+        assert_eq!(d.exit_code("ios"), 1);
+    }
+
+    #[test]
     fn diagnose_with_audit_reports_posture() {
         let on = crate::audit::AuditReport {
             enabled: true,
@@ -841,6 +881,41 @@ mod tests {
                 c.remedy_action.as_deref(),
                 Some(format!("open {}", glass_macos::accessibility_pane_url()).as_str())
             );
+        }
+
+        #[test]
+        fn companion_deep_check_maps_every_probe_outcome() {
+            use glass_ios::doctor::CompanionProbe;
+
+            let started = companion_deep_check(CompanionProbe::Started);
+            assert_eq!(started.status, CheckStatus::Ok);
+            assert_eq!(started.remedy, None);
+
+            let unverified = companion_deep_check(CompanionProbe::SelfTestOk);
+            assert_eq!(unverified.status, CheckStatus::Warn);
+
+            let broken =
+                companion_deep_check(CompanionProbe::FailedToStart("exited 1: boom".into()));
+            assert_eq!(broken.status, CheckStatus::Fail);
+            assert!(
+                broken.detail.contains("boom"),
+                "cause must surface: {}",
+                broken.detail
+            );
+            assert_eq!(broken.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
+
+            let unrunnable =
+                companion_deep_check(CompanionProbe::SelfTestFailed("spawn: nope".into()));
+            assert_eq!(unrunnable.status, CheckStatus::Fail);
+            assert!(
+                unrunnable.detail.contains("nope"),
+                "cause must surface: {}",
+                unrunnable.detail
+            );
+
+            let missing = companion_deep_check(CompanionProbe::NotFound);
+            assert_eq!(missing.status, CheckStatus::Fail);
+            assert_eq!(missing.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
         }
     }
 }
