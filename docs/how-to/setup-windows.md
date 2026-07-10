@@ -24,6 +24,10 @@ install directory. `GLASS_WIN_SANDBOX_PROVIDER` (`auto`|`sandboxie`|`none`) sele
 
 ## Install the binary
 
+Download `glass-mcp-*-x86_64-windows.zip` from the
+[Releases page](https://github.com/fixed-width/glass/releases/latest) and extract it. (The full asset
+list is in [reference/platforms.md](../reference/platforms.md#release-artifacts).)
+
 Copy `glass-mcp.exe` somewhere on your PATH, e.g. `%USERPROFILE%\bin`:
 
 ```powershell
@@ -31,8 +35,12 @@ mkdir $env:USERPROFILE\bin -Force
 copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 ```
 
-(Tagged releases attach a prebuilt Windows binary; to build it yourself see
-[build-from-source.md](build-from-source.md).)
+`%USERPROFILE%\bin` is not on `PATH` by default, so `glass-mcp` won't be found afterwards —
+add the directory via Windows' Environment Variables settings and open a new terminal, or
+copy `glass-mcp.exe` into a directory that's already on `PATH` instead.
+
+If you want to hack on glass or are on an architecture with no published asset,
+[build from source](build-from-source.md) instead.
 
 > **First run — SmartScreen.** Prebuilt binaries are not yet Authenticode-signed, so the first launch
 > may show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run

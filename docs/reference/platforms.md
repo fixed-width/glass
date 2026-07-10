@@ -43,6 +43,21 @@ explained in [explanation/backends.md](../explanation/backends.md) and
   of scope, matching the Android backend's emulator-only stance. See
   [how-to/setup-ios.md](../how-to/setup-ios.md).
 
+## Release artifacts
+
+Every tagged release attaches these assets, where `<tag>` is the release tag (e.g. `v0.3.1`):
+
+| Platform | Asset |
+|---|---|
+| macOS (universal) | `glass-mcp-<tag>-universal-apple-darwin.dmg` — notarized; also `glass-mcp-<tag>-universal-apple-darwin.zip` of `GlassMcp.app` |
+| Linux x86-64 (glibc) | `glass-mcp-<tag>-x86_64-linux-gnu.tar.gz` |
+| Linux x86-64 (static) | `glass-mcp-<tag>-x86_64-linux-musl.tar.gz` — no glibc dependency (Alpine and other musl distros) |
+| Windows x86-64 | `glass-mcp-<tag>-x86_64-windows.zip` |
+
+Each asset is accompanied by a `.sha256` checksum file, and every release carries Sigstore build
+provenance attestations. No aarch64 Linux asset is published; that architecture is built from source
+(see [how-to/build-from-source.md](../how-to/build-from-source.md)).
+
 ## Notes
 
 **† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass
