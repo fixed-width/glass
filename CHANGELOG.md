@@ -34,6 +34,9 @@ internal refactors, CI, or test-only changes.
   releases and drop them next to the `glass-mcp` binary, where glass discovers them automatically
   (no environment variables, no build step). `GLASS_ANDROID_AGENT_JAR` / `GLASS_ANDROID_A11Y_APK`
   are documented as overrides of that auto-discovery.
+- Installing glass now starts from the Releases page rather than a source build: `README.md`,
+  `docs/how-to/setup-linux.md`, and `docs/how-to/setup-windows.md` lead with the prebuilt binary.
+- `docs/reference/platforms.md` documents the assets each release attaches.
 
 ### Fixed
 - `doctor --deep` no longer tells you to "run with --deep" for the Android `screencap` and

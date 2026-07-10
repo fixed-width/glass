@@ -34,8 +34,8 @@ screenshots cost no vision tokens. Why the loop is shaped this way:
 
 ## Install at a glance
 
-Build the server with `cargo build --release -p glass-mcp` (Rust via [rustup](https://rustup.rs); the
-pinned nightly installs automatically), then set up your host:
+Download the latest build for your platform from the
+[Releases page](https://github.com/fixed-width/glass/releases/latest), then set up your host:
 
 - **Linux** — [docs/how-to/setup-linux.md](docs/how-to/setup-linux.md) (X11 or Wayland; `Xvfb` /
   `sway` + bubblewrap)
@@ -46,6 +46,10 @@ pinned nightly installs automatically), then set up your host:
 - **Android** — [docs/how-to/setup-android.md](docs/how-to/setup-android.md) (an AVD emulator, from any
   host)
 - **iOS** — [docs/how-to/setup-ios.md](docs/how-to/setup-ios.md) (the Simulator, macOS host only)
+
+Every asset is listed in [docs/reference/platforms.md](docs/reference/platforms.md#release-artifacts).
+Prefer to compile, or on an architecture with no published asset? See
+[docs/how-to/build-from-source.md](docs/how-to/build-from-source.md) — it is a single `cargo build`.
 
 Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
 the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
