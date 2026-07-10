@@ -532,6 +532,7 @@ impl ServerHandler for GlassServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn first_text(r: &CallToolResult) -> String {
         r.content[0].as_text().expect("text content").text.clone()
@@ -561,5 +562,45 @@ mod tests {
             "an Ok must surface as a success result"
         );
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
+    }
+
+    /// The tool reference is the only user-facing list of glass's tools. Bind it to the
+    /// registry so a tool added, removed, or renamed in code cannot silently diverge from
+    /// the documentation.
+    const TOOLS_MD: &str = include_str!("../../../docs/reference/tools.md");
+
+    /// Tool names are keyed off level-3 headings wrapping the name in backticks. Prose also
+    /// mentions a `glass_wait_for_*` family glob, which a looser scan would report as a tool.
+    fn documented_tools() -> BTreeSet<String> {
+        TOOLS_MD
+            .lines()
+            .filter_map(|line| line.strip_prefix("### `"))
+            .filter_map(|rest| rest.strip_suffix('`'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn registered_tools() -> BTreeSet<String> {
+        GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tool_reference_documents_exactly_the_registry() {
+        let documented = documented_tools();
+        let registered = registered_tools();
+
+        let undocumented: Vec<_> = registered.difference(&documented).collect();
+        let phantom: Vec<_> = documented.difference(&registered).collect();
+
+        assert!(
+            undocumented.is_empty() && phantom.is_empty(),
+            "docs/reference/tools.md is out of sync with the #[tool] registry\n  \
+             registered but undocumented: {undocumented:?}\n  \
+             documented but not registered: {phantom:?}"
+        );
     }
 }
