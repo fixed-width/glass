@@ -5,9 +5,13 @@
 //! Pure `build_checks(&Probe)` over observed state, plus the thin subprocess-probing
 //! `checks(deep)` entry point the aggregator calls.
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use glass_core::{Check, CheckStatus};
+
+use crate::idb::companion::companion_bin;
 
 /// Observed host state for the iOS doctor checks. Captured by `run`, consumed by the
 /// pure `checks` so all branch logic is unit-testable without subprocesses.
@@ -137,6 +141,105 @@ pub fn checks(_deep: bool) -> Vec<Check> {
     })
 }
 
+/// Outcome of the `--deep` iOS `idb_companion` health probe (see [`probe_companion`]). Pure
+/// data — the aggregator (`glass-mcp`) maps it to a `Check`. `NotFound` means the binary is
+/// unresolvable; `Started`/`FailedToStart` come from a real spawn against an already-booted
+/// simulator; `SelfTestOk`/`SelfTestFailed` come from the bounded `--version` fallback used
+/// when no simulator is booted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompanionProbe {
+    NotFound,
+    Started,
+    FailedToStart(String),
+    SelfTestOk,
+    SelfTestFailed(String),
+}
+
+/// Self-test flag. `idb_companion --version` needs no simulator, exits promptly with status
+/// 0, and prints a build-info line (confirmed against idb-companion 1.1.8). It may print a
+/// benign objc dyld warning to *stderr* while still exiting 0, so success keys on the exit
+/// status — never on empty stderr.
+#[cfg_attr(not(test), allow(dead_code))]
+const SELF_TEST_ARG: &str = "--version";
+/// Backstop only: `--version` returns near-instantly, so this bounds a wedged/hung binary.
+#[cfg_attr(not(test), allow(dead_code))]
+const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll interval while waiting for the self-test child to exit.
+#[cfg_attr(not(test), allow(dead_code))]
+const SELF_TEST_POLL: Duration = Duration::from_millis(50);
+
+/// Run the companion's bounded `--version` self-test: does the binary actually execute? Used
+/// only when no simulator is booted (so a real spawn isn't possible without booting one).
+/// Captures stderr to a temp file — a file can't fill and block, mirroring `IdbCompanion` —
+/// and surfaces it as the cause on failure. Success ⇒ [`CompanionProbe::SelfTestOk`].
+///
+/// Not yet called from `checks()` — the probe orchestration that picks between a real spawn
+/// and this fallback lands in a follow-up change.
+#[allow(dead_code)]
+fn self_test() -> CompanionProbe {
+    self_test_with(&companion_bin(&|k| std::env::var(k).ok()))
+}
+
+/// [`self_test`] against an explicit binary path — the testable seam (no env / no real
+/// companion needed).
+#[cfg_attr(not(test), allow(dead_code))]
+fn self_test_with(bin: &str) -> CompanionProbe {
+    // A uniquely-named temp file (rather than a name keyed on this process's pid) — several
+    // self-tests can run concurrently in one process, e.g. this module's own tests running in
+    // parallel, and a pid-only name would let them collide on the same log file.
+    let log = match tempfile::NamedTempFile::new() {
+        Ok(f) => f,
+        Err(e) => return CompanionProbe::SelfTestFailed(format!("create self-test log: {e}")),
+    };
+    let stderr = match log.reopen() {
+        Ok(f) => f,
+        Err(e) => return CompanionProbe::SelfTestFailed(format!("create self-test log: {e}")),
+    };
+    let mut child = match Command::new(bin)
+        .arg(SELF_TEST_ARG)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return CompanionProbe::SelfTestFailed(format!("spawn {bin} {SELF_TEST_ARG}: {e}"))
+        }
+    };
+    let deadline = Instant::now() + SELF_TEST_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break CompanionProbe::SelfTestOk,
+            Ok(Some(status)) => {
+                let stderr = read_trimmed(log.path()).filter(|s| !s.is_empty());
+                break CompanionProbe::SelfTestFailed(match stderr {
+                    Some(s) => format!("{SELF_TEST_ARG} exited {status}: {s}"),
+                    None => format!("{SELF_TEST_ARG} exited {status}"),
+                });
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break CompanionProbe::SelfTestFailed(format!(
+                    "{SELF_TEST_ARG} timed out after {SELF_TEST_TIMEOUT:?}"
+                ));
+            }
+            Ok(None) => std::thread::sleep(SELF_TEST_POLL),
+            Err(e) => break CompanionProbe::SelfTestFailed(format!("try_wait: {e}")),
+        }
+    }
+    // `log` (a `NamedTempFile`) removes its file on drop here.
+}
+
+/// Read a file and trim it, or `None` if it can't be read.
+#[cfg_attr(not(test), allow(dead_code))]
+fn read_trimmed(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +317,49 @@ mod tests {
             cs.iter().find(|c| c.name == "device").unwrap().status,
             CheckStatus::Fail
         );
+    }
+
+    #[test]
+    fn self_test_ok_when_binary_exits_zero() {
+        // `/bin/echo --version` prints and exits 0 regardless of args — stands in for a
+        // healthy idb_companion whose real `--version` also exits 0.
+        assert_eq!(self_test_with("/bin/echo"), CompanionProbe::SelfTestOk);
+    }
+
+    #[test]
+    fn self_test_fails_and_captures_cause_on_nonzero_exit() {
+        // A fake binary that writes to stderr and exits non-zero: the probe must surface both
+        // the exit status and the captured stderr as the cause. idb_companion prints a benign
+        // objc warning to stderr while still exiting 0, so success keys on exit status — this
+        // asserts the *failure* branch does read stderr for the cause.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake_companion");
+        std::fs::write(&script, "#!/bin/sh\necho 'boom-from-stderr' >&2\nexit 3\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        match self_test_with(script.to_str().unwrap()) {
+            CompanionProbe::SelfTestFailed(cause) => {
+                assert!(
+                    cause.contains("boom-from-stderr"),
+                    "cause missing stderr: {cause}"
+                );
+                assert!(cause.contains('3'), "cause missing exit status: {cause}");
+            }
+            other => panic!("expected SelfTestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_test_fails_when_binary_is_unspawnable() {
+        match self_test_with("/nonexistent/definitely-not-a-binary") {
+            CompanionProbe::SelfTestFailed(cause) => {
+                assert!(
+                    cause.contains("spawn"),
+                    "cause should name the spawn failure: {cause}"
+                );
+            }
+            other => panic!("expected SelfTestFailed, got {other:?}"),
+        }
     }
 }
