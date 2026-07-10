@@ -252,15 +252,20 @@ fn soften_inactive_ios(checks: &mut [Check]) {
     soften_inactive_fails(checks, "ios");
 }
 
-/// Whether `idb_companion` — the process that serves iOS Simulator input and the
-/// accessibility tree — is resolvable, and the remedy to show when it isn't. Pure: takes
-/// the already-resolved fact so it's unit-tested without touching PATH/env;
-/// [`idb_companion_present`] gathers the real fact on macOS, the only host that runs it.
-/// A missing binary is a `Warn`, not a `Fail`: `glass_ios::doctor::checks` already fails
-/// the run over a genuinely broken iOS setup (no Xcode, no simulator); this just flags a
-/// companion tool that's one `brew install` away. Its only caller is macOS-only (above);
-/// kept out of `#[cfg]` (instead of gating the fn itself) so the test below still runs in
-/// CI on every host.
+/// The shared `idb_companion` install remedy.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const IDB_COMPANION_REMEDY: &str =
+    "brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion";
+
+/// The check for a resolvable/unresolvable `idb_companion` on the *passive* (non-`--deep`)
+/// path — takes the already-resolved presence fact so it's unit-tested without touching
+/// PATH/env; `glass_ios::doctor::companion_present` gathers the real fact on macOS. A missing
+/// companion is a **Fail**, not a Warn: unlike android — which keeps barebones function
+/// without its companions — the iOS companion is required to drive apps at all, so without it
+/// iOS is observe-only (unusable for development). Because this check is only added when iOS
+/// is the *selected* backend, the Fail reddens the verdict only for someone actually driving
+/// iOS. Kept out of `#[cfg]` (only its caller is macOS-only) so the test still runs on every
+/// host.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn idb_companion_check(found: bool) -> Check {
     if found {
@@ -270,13 +275,20 @@ pub(crate) fn idb_companion_check(found: bool) -> Check {
             "idb_companion found — input + accessibility are available",
         )
     } else {
-        Check::new(
-            "idb_companion",
-            CheckStatus::Warn,
-            "idb_companion not found — input + accessibility are unavailable",
-        )
-        .with_remedy("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
+        idb_companion_not_found_check()
     }
+}
+
+/// The Fail check for an absent `idb_companion`, shared by the passive presence path and the
+/// `--deep` probe's CompanionProbe::NotFound mapping.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn idb_companion_not_found_check() -> Check {
+    Check::new(
+        "idb_companion",
+        CheckStatus::Fail,
+        "idb_companion not found — input + accessibility are unavailable (iOS cannot drive apps)",
+    )
+    .with_remedy(IDB_COMPANION_REMEDY)
 }
 
 /// Real-environment probe for [`idb_companion_check`]: is `idb_companion` resolvable —
@@ -422,13 +434,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idb_companion_check_warns_when_absent_and_oks_when_present() {
+    fn idb_companion_check_fails_when_absent_and_oks_when_present() {
+        // The iOS companion is *required* to drive apps (unlike android's optional companions);
+        // without it iOS is observe-only, which is not a usable dev workflow — so absent is a
+        // Fail, not a Warn.
         let absent = idb_companion_check(false);
-        assert_eq!(absent.status, CheckStatus::Warn);
-        assert_eq!(
-            absent.remedy.as_deref(),
-            Some("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
-        );
+        assert_eq!(absent.status, CheckStatus::Fail);
+        assert_eq!(absent.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
         let present = idb_companion_check(true);
         assert_eq!(present.status, CheckStatus::Ok);
         assert_eq!(present.remedy, None);
