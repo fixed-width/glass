@@ -5,11 +5,26 @@ private headless display, so there is no desktop or window manager to configure.
 prerequisites and the per-backend specifics; for *why* the display model works this way, see
 [explanation/backends.md](../explanation/backends.md).
 
+## Install the binary
+
+Download the latest Linux build from the
+[Releases page](https://github.com/fixed-width/glass/releases/latest) and extract it:
+
+```bash
+tar xzf glass-mcp-*-x86_64-linux-gnu.tar.gz
+cd glass-mcp-*-x86_64-linux-gnu
+```
+
+Use the `…-x86_64-linux-musl.tar.gz` build instead if you need a fully static binary with no glibc
+dependency — Alpine, or any musl distro. If you are on an architecture with no published asset (an
+aarch64 host, say), [build from source](build-from-source.md) instead; that is also the path if you
+want to hack on glass. The full asset list is in
+[reference/platforms.md](../reference/platforms.md#release-artifacts).
+
 ## Prerequisites
 
-**Rust**, via [rustup](https://rustup.rs). glass pins a nightly toolchain in `rust-toolchain.toml`;
-rustup installs it automatically on the first build. (To build the binary, see
-[build-from-source.md](build-from-source.md); tagged releases also attach prebuilt Linux binaries.)
+glass needs a display dependency for your backend and a containment runtime, both covered below.
+Nothing else — the released binary is self-contained.
 
 ## X11 (the default)
 
