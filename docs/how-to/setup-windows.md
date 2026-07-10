@@ -35,6 +35,9 @@ mkdir $env:USERPROFILE\bin -Force
 copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 ```
 
+If you want to hack on glass or are on an architecture with no published asset,
+[build from source](build-from-source.md) instead.
+
 > **First run — SmartScreen.** Prebuilt binaries are not yet Authenticode-signed, so the first launch
 > may show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run
 > anyway**. This is a publisher-trust prompt, not a permission request — glass needs no permission
