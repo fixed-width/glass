@@ -22,6 +22,10 @@ mkdir -p ~/.local/bin
 cp glass-mcp ~/.local/bin/glass-mcp
 ```
 
+If `glass-mcp` is not found afterwards, start a new login shell — many distributions add
+`~/.local/bin` to `PATH` only when it already exists at login — or add the directory to your `PATH`
+yourself.
+
 Use the `…-x86_64-linux-musl.tar.gz` build instead if you need a fully static binary with no glibc
 dependency — Alpine, or any musl distro. If you are on an architecture with no published asset (an
 aarch64 host, say), [build from source](build-from-source.md) instead; that is also the path if you
