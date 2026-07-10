@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use glass_core::{Check, CheckStatus};
+use glass_core::{Check, CheckStatus, GlassError};
 
 use crate::device::{parse_devices, resolve, Resolve, SimDevice};
 use crate::idb::companion::{companion_bin, IdbCompanion};
@@ -263,10 +263,22 @@ pub fn probe_companion() -> CompanionProbe {
                 drop(companion);
                 CompanionProbe::Started
             }
-            // The error already embeds the companion's captured stderr.
-            Err(e) => CompanionProbe::FailedToStart(e.to_string()),
+            // The error already embeds the companion's captured stderr; strip the redundant
+            // `GlassError::Backend` Display prefix (the mapping frames it "failed to start: …").
+            Err(e) => CompanionProbe::FailedToStart(spawn_cause(e)),
         },
         None => self_test(),
+    }
+}
+
+/// The human cause from a failed [`IdbCompanion::spawn`], stripped of `GlassError::Backend`'s
+/// `"backend error: "` Display prefix — the doctor already frames it as "failed to start: …",
+/// so the prefix would read redundantly in user-facing output. Any other variant falls back
+/// to its full Display.
+fn spawn_cause(e: GlassError) -> String {
+    match e {
+        GlassError::Backend(msg) => msg,
+        other => other.to_string(),
     }
 }
 
@@ -294,6 +306,18 @@ fn booted_from(devices: &[SimDevice]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::device::SimDevice;
+
+    #[test]
+    fn spawn_cause_strips_backend_error_prefix() {
+        // `FailedToStart` detail is framed "failed to start: {cause}", so the
+        // `GlassError::Backend` Display prefix ("backend error: ") would read redundantly.
+        assert_eq!(
+            spawn_cause(GlassError::Backend(
+                "idb_companion exited (exit status: 1) before serving its socket".into()
+            )),
+            "idb_companion exited (exit status: 1) before serving its socket"
+        );
+    }
 
     fn dev(udid: &str, name: &str, state: &str) -> SimDevice {
         SimDevice {
