@@ -1,6 +1,10 @@
 //! End-to-end: drive glass-mcp over HTTP against the testapp under Xvfb. `#[ignore]d`;
 //! run via `./scripts/test-x11.sh network_screenshot_over_http`.
 
+// This test needs one `unsafe { env::set_var }` for pre-spawn setup (see the `// SAFETY:` note
+// below), so it opts out of the workspace `unsafe_code = "deny"`.
+#![allow(unsafe_code)]
+
 mod common;
 
 use std::time::Duration;

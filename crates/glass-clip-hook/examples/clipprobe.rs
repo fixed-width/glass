@@ -10,6 +10,10 @@
 //! v1 hook detours. Windows-only; a no-op elsewhere so the Linux dev box stays green.
 //!   cargo build -p glass-clip-hook --release --example clipprobe
 
+// On-box FFI probe: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
+// `// SAFETY:`-documented).
+#![allow(unsafe_code)]
+
 #[cfg(windows)]
 use glass_clip_hook::{HGlobalLock, OwnedHGlobal};
 

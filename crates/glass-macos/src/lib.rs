@@ -6,6 +6,11 @@
 //! modules and the `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off macOS
 //! the crate exposes only the pure modules.
 
+// FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
+// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
+// modules below stay `unsafe`-free by convention.
+#![allow(unsafe_code)]
+
 pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested
