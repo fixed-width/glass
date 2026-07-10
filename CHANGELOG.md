@@ -42,6 +42,10 @@ internal refactors, CI, or test-only changes.
 - `docs/reference/platforms.md` documents the assets each release attaches.
 
 ### Fixed
+- On the iOS Simulator backend, a `glass_drag` (or any `idb` HID gesture) longer than 30s no
+  longer aborts mid-swipe with a timeout error. The per-gesture RPC deadline now scales with the
+  gesture's own duration plus a margin, instead of a flat 30s, so a long drag runs to completion
+  while a wedged companion is still bounded.
 - `doctor --deep` no longer tells you to "run with --deep" for the Android `screencap` and
   `uiautomator` probes when you already passed `--deep`. Those deep probes only run when
   Android is the selected backend, so on another host backend the skip reason now points at
