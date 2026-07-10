@@ -50,6 +50,8 @@ internal refactors, CI, or test-only changes.
   `uiautomator` probes when you already passed `--deep`. Those deep probes only run when
   Android is the selected backend, so on another host backend the skip reason now points at
   the real gate: "set `GLASS_BACKEND=android`".
+- The `glass_diff` tool reference now documents its `region` parameter — a window-relative scoped
+  diff that also makes the reported `bbox` region-relative — which had been usable but undocumented.
 
 ## [0.3.1] - 2026-07-07
 

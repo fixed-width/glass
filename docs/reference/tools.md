@@ -78,6 +78,9 @@ Diff the current frame against a named baseline; returns change stats and a boun
 - `tolerance` (integer 0–255, default `0`) — per-channel tolerance for `mode:"exact"`.
 - `include_image` (boolean, default false) — also return the current frame cropped to the changed
   region. No image is returned when nothing changed.
+- `region` (`{x,y,width,height}`) — window-relative sub-rectangle to diff; omit to diff the whole
+  window. Scopes the comparison (and the reported `bbox`, which becomes region-relative) to just
+  this area — the way to ask "did *only* this part change?".
 
 Returns `changed_pct` and a `bbox`; only attaches an image when `include_image:true` and something
 changed.
@@ -139,7 +142,8 @@ baseline), then return text metrics.
   one, without changing which window subsequent ops target.
 
 Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
-an approved design without spending vision tokens.
+an approved design without spending vision tokens. For the non-blocking case — one already-captured
+frame instead of polling — `glass_diff` takes the same `region`.
 
 ### `glass_wait_for_log`
 
