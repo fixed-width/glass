@@ -161,11 +161,17 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     {
         let ios_selected = backend == "ios";
         let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
-        // idb_companion drives input and the accessibility reader; only worth reporting
-        // when ios is actually the backend in play, mirroring how android's deep probes
-        // are gated to `android_selected` above.
+        // The companion drives input + the accessibility reader; only worth reporting when
+        // ios is actually the backend in play, mirroring android's gated deep probes. On
+        // --deep, probe it for real (spawn against a booted sim, else a bounded self-test);
+        // otherwise just report resolvable-on-PATH presence.
         if ios_selected {
-            ios_checks.push(idb_companion_check(idb_companion_present()));
+            let companion = if deep {
+                companion_deep_check(glass_ios::doctor::probe_companion())
+            } else {
+                idb_companion_check(glass_ios::doctor::companion_present())
+            };
+            ios_checks.push(companion);
         }
         if !ios_selected {
             soften_inactive_ios(&mut ios_checks);
@@ -252,15 +258,20 @@ fn soften_inactive_ios(checks: &mut [Check]) {
     soften_inactive_fails(checks, "ios");
 }
 
-/// Whether `idb_companion` — the process that serves iOS Simulator input and the
-/// accessibility tree — is resolvable, and the remedy to show when it isn't. Pure: takes
-/// the already-resolved fact so it's unit-tested without touching PATH/env;
-/// [`idb_companion_present`] gathers the real fact on macOS, the only host that runs it.
-/// A missing binary is a `Warn`, not a `Fail`: `glass_ios::doctor::checks` already fails
-/// the run over a genuinely broken iOS setup (no Xcode, no simulator); this just flags a
-/// companion tool that's one `brew install` away. Its only caller is macOS-only (above);
-/// kept out of `#[cfg]` (instead of gating the fn itself) so the test below still runs in
-/// CI on every host.
+/// The shared `idb_companion` install remedy.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const IDB_COMPANION_REMEDY: &str =
+    "brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion";
+
+/// The check for a resolvable/unresolvable `idb_companion` on the *passive* (non-`--deep`)
+/// path — takes the already-resolved presence fact so it's unit-tested without touching
+/// PATH/env; `glass_ios::doctor::companion_present` gathers the real fact on macOS. A missing
+/// companion is a **Fail**, not a Warn: unlike android — which keeps barebones function
+/// without its companions — the iOS companion is required to drive apps at all, so without it
+/// iOS is observe-only (unusable for development). Because this check is only added when iOS
+/// is the *selected* backend, the Fail reddens the verdict only for someone actually driving
+/// iOS. Kept out of `#[cfg]` (only its caller is macOS-only) so the test still runs on every
+/// host.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn idb_companion_check(found: bool) -> Check {
     if found {
@@ -270,27 +281,58 @@ pub(crate) fn idb_companion_check(found: bool) -> Check {
             "idb_companion found — input + accessibility are available",
         )
     } else {
-        Check::new(
-            "idb_companion",
-            CheckStatus::Warn,
-            "idb_companion not found — input + accessibility are unavailable",
-        )
-        .with_remedy("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
+        idb_companion_not_found_check()
     }
 }
 
-/// Real-environment probe for [`idb_companion_check`]: is `idb_companion` resolvable —
-/// `GLASS_IDB_COMPANION` naming an existing file, or `idb_companion` found on `PATH`?
-/// Mirrors `glass_ios`'s own resolution of the same binary (`idb::companion::companion_bin`),
-/// duplicated here because that module is private to `glass-ios`.
+/// The Fail check for an absent `idb_companion`, shared by the passive presence path and the
+/// `--deep` probe's `CompanionProbe::NotFound` mapping.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn idb_companion_not_found_check() -> Check {
+    Check::new(
+        "idb_companion",
+        CheckStatus::Fail,
+        "idb_companion not found — input + accessibility are unavailable (iOS cannot drive apps)",
+    )
+    .with_remedy(IDB_COMPANION_REMEDY)
+}
+
+/// Map a `--deep` iOS companion probe ([`glass_ios::doctor::probe_companion`]) to a `Check`.
+/// Pure — the probe's I/O is done by the caller — so it's unit-tested per variant without a
+/// real companion. Broken (`FailedToStart`/`SelfTestFailed`) or missing (`NotFound`) ⇒ Fail:
+/// iOS cannot drive apps without the companion. Unverified (`SelfTestOk` — the binary runs but
+/// no booted simulator was available to exercise a real start) ⇒ Warn. macOS-gated: it names a
+/// `glass-ios` type, and glass-mcp only depends on glass-ios on macOS (mirrors `macos_checks_from`).
 #[cfg(target_os = "macos")]
-fn idb_companion_present() -> bool {
-    let bin = glass_core::tool_path("GLASS_IDB_COMPANION", "idb_companion");
-    if bin.contains('/') {
-        std::path::Path::new(&bin).is_file()
-    } else {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file()))
+pub(crate) fn companion_deep_check(probe: glass_ios::doctor::CompanionProbe) -> Check {
+    use glass_ios::doctor::CompanionProbe;
+    match probe {
+        CompanionProbe::Started => Check::new(
+            "idb_companion",
+            CheckStatus::Ok,
+            "started and served its gRPC socket — input + accessibility are available",
+        ),
+        CompanionProbe::SelfTestOk => Check::new(
+            "idb_companion",
+            CheckStatus::Warn,
+            "binary runs, but no booted simulator was available to verify a real start — \
+             boot one and re-run with --deep to exercise the companion",
+        ),
+        CompanionProbe::FailedToStart(cause) => Check::new(
+            "idb_companion",
+            CheckStatus::Fail,
+            format!(
+                "failed to start: {cause} — input + accessibility are unavailable (iOS is observe-only)"
+            ),
+        )
+        .with_remedy(IDB_COMPANION_REMEDY),
+        CompanionProbe::SelfTestFailed(cause) => Check::new(
+            "idb_companion",
+            CheckStatus::Fail,
+            format!("binary failed to execute: {cause} — input + accessibility are unavailable"),
+        )
+        .with_remedy(IDB_COMPANION_REMEDY),
+        CompanionProbe::NotFound => idb_companion_not_found_check(),
     }
 }
 
@@ -422,13 +464,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idb_companion_check_warns_when_absent_and_oks_when_present() {
+    fn idb_companion_check_fails_when_absent_and_oks_when_present() {
+        // The iOS companion is *required* to drive apps (unlike android's optional companions);
+        // without it iOS is observe-only, which is not a usable dev workflow — so absent is a
+        // Fail, not a Warn.
         let absent = idb_companion_check(false);
-        assert_eq!(absent.status, CheckStatus::Warn);
-        assert_eq!(
-            absent.remedy.as_deref(),
-            Some("brew tap facebook/fb && brew trust facebook/fb && brew install idb-companion")
-        );
+        assert_eq!(absent.status, CheckStatus::Fail);
+        assert_eq!(absent.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
         let present = idb_companion_check(true);
         assert_eq!(present.status, CheckStatus::Ok);
         assert_eq!(present.remedy, None);
@@ -627,6 +669,16 @@ mod tests {
         );
         #[cfg(not(feature = "network"))]
         let _ = placeholder; // network shows its own Skip line in the stdio-only build
+    }
+
+    #[test]
+    fn missing_companion_fails_the_ios_verdict() {
+        // A Fail companion check in the ios section must escalate the overall verdict to Fail
+        // (exit code 1) when ios is the backend — iOS is unusable without the companion.
+        let ios = Section::new("ios", Some("ios".into()), vec![idb_companion_check(false)]);
+        let d = Diagnosis::new(vec![ios]);
+        assert_eq!(d.overall("ios"), CheckStatus::Fail);
+        assert_eq!(d.exit_code("ios"), 1);
     }
 
     #[test]
@@ -829,6 +881,41 @@ mod tests {
                 c.remedy_action.as_deref(),
                 Some(format!("open {}", glass_macos::accessibility_pane_url()).as_str())
             );
+        }
+
+        #[test]
+        fn companion_deep_check_maps_every_probe_outcome() {
+            use glass_ios::doctor::CompanionProbe;
+
+            let started = companion_deep_check(CompanionProbe::Started);
+            assert_eq!(started.status, CheckStatus::Ok);
+            assert_eq!(started.remedy, None);
+
+            let unverified = companion_deep_check(CompanionProbe::SelfTestOk);
+            assert_eq!(unverified.status, CheckStatus::Warn);
+
+            let broken =
+                companion_deep_check(CompanionProbe::FailedToStart("exited 1: boom".into()));
+            assert_eq!(broken.status, CheckStatus::Fail);
+            assert!(
+                broken.detail.contains("boom"),
+                "cause must surface: {}",
+                broken.detail
+            );
+            assert_eq!(broken.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
+
+            let unrunnable =
+                companion_deep_check(CompanionProbe::SelfTestFailed("spawn: nope".into()));
+            assert_eq!(unrunnable.status, CheckStatus::Fail);
+            assert!(
+                unrunnable.detail.contains("nope"),
+                "cause must surface: {}",
+                unrunnable.detail
+            );
+
+            let missing = companion_deep_check(CompanionProbe::NotFound);
+            assert_eq!(missing.status, CheckStatus::Fail);
+            assert_eq!(missing.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
         }
     }
 }
