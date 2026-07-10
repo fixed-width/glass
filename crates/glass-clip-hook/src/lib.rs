@@ -6,6 +6,11 @@
 //! host-side [`store`], reused by `glass-windows`. Only [`hook`] is Win32 — the rest is pure
 //! and unit-tested on the Linux dev box.
 
+// FFI backend: the Win32 hook needs `unsafe`, so this crate opts out of the workspace
+// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
+// `proto`/`store`/codec modules stay `unsafe`-free by convention.
+#![allow(unsafe_code)]
+
 pub mod proto;
 pub mod store;
 

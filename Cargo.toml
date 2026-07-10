@@ -18,8 +18,14 @@ publish = false
 # (CI still adds `-D warnings` to also catch rustc warnings). The `all` group sits at
 # priority -1 so any specific lint override below it wins on conflict.
 [workspace.lints.rust]
-future_incompatible = "warn"
-nonstandard_style = "deny"
+# The two groups sit at priority -1 so the specific `unsafe_code` lint below wins on conflict
+# (clippy's `lint_groups_priority` otherwise flags the ambiguous same-priority ordering).
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+# Enforce the CLAUDE.md "avoid unsafe" invariant: pure crates carry no `unsafe` at all. The six
+# FFI backends (glass-macos/-windows/-clip-hook/-a11y-macos/-sandbox-macos/-clip-shim-macos) opt
+# back in per-target with a documented `#![allow(unsafe_code)]`; every site has a `// SAFETY:`.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

@@ -11,6 +11,9 @@
 //! name from the host side; the real general pasteboard — and anything else on the desktop
 //! — is never touched.
 #![cfg_attr(not(target_os = "macos"), allow(unused_crate_dependencies))]
+// FFI shim: the `NSPasteboard` swizzle IMP needs `unsafe`, so this crate opts out of the
+// workspace `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md).
+#![allow(unsafe_code)]
 
 #[cfg(target_os = "macos")]
 mod imp {

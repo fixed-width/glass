@@ -9,6 +9,10 @@
 //! On non-Windows hosts it is a no-op, so `cargo test` / `clippy --all-targets` stay green on the
 //! Linux dev box.
 
+// On-box FFI harness: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
+// `// SAFETY:`-documented).
+#![allow(unsafe_code)]
+
 fn main() {
     #[cfg(windows)]
     imp::run();

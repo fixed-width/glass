@@ -5,6 +5,9 @@
 //! (`--test-threads=1`) and by a process-global lock (so a direct `cargo test --ignored` is safe too)
 //! since each spawns apps/windows.
 #![cfg(windows)]
+// On-box E2E: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
+// `// SAFETY:`-documented).
+#![allow(unsafe_code)]
 
 use std::sync::Mutex;
 use std::time::Duration;

@@ -5,6 +5,11 @@
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
 //! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi`.
 
+// FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
+// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
+// modules below stay `unsafe`-free by convention.
+#![allow(unsafe_code)]
+
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)

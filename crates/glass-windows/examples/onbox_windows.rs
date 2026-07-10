@@ -7,6 +7,10 @@
 //! unavailable, default/strict report `SandboxUnavailable` (fail-closed). No-op off Windows.
 //! Run: cargo run -p glass-windows --example onbox_windows
 
+// On-box FFI harness: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
+// `// SAFETY:`-documented).
+#![allow(unsafe_code)]
+
 fn main() {
     #[cfg(windows)]
     imp::run();

@@ -5,6 +5,11 @@
 //! elsewhere, so `glass doctor` can report on this crate from any host. Mirrors
 //! `glass-sandbox-linux`'s split (pure `wrap_argv` + OS mechanism).
 
+// FFI backend: the `sandbox_init` mechanism needs `unsafe`, so this crate opts out of the
+// workspace `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The
+// pure `profile`/`doctor` modules stay `unsafe`-free by convention.
+#![allow(unsafe_code)]
+
 pub mod doctor;
 pub mod profile;
 
