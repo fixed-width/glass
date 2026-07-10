@@ -1,9 +1,9 @@
 # Set up glass on Linux
 
 Linux has two backends — **X11** (the default) and **Wayland** (a headless sway). Both spawn their own
-private headless display, so there is no desktop or window manager to configure. This guide covers the
-prerequisites and the per-backend specifics; for *why* the display model works this way, see
-[explanation/backends.md](../explanation/backends.md).
+private headless display, so there is no desktop or window manager to configure. This guide covers
+installing the binary, the prerequisites, and the per-backend specifics; for *why* the display model
+works this way, see [explanation/backends.md](../explanation/backends.md).
 
 ## Install the binary
 
@@ -13,6 +13,13 @@ Download the latest Linux build from the
 ```bash
 tar xzf glass-mcp-*-x86_64-linux-gnu.tar.gz
 cd glass-mcp-*-x86_64-linux-gnu
+```
+
+Put `glass-mcp` somewhere on your PATH, e.g. `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin
+cp glass-mcp ~/.local/bin/glass-mcp
 ```
 
 Use the `…-x86_64-linux-musl.tar.gz` build instead if you need a fully static binary with no glibc
