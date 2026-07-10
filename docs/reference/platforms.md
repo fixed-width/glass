@@ -49,7 +49,7 @@ Every tagged release attaches these assets, where `<tag>` is the release tag (e.
 
 | Platform | Asset |
 |---|---|
-| macOS (universal) | `glass-mcp-<tag>-universal-apple-darwin.dmg` — notarized; also a `.zip` of `GlassMcp.app` |
+| macOS (universal) | `glass-mcp-<tag>-universal-apple-darwin.dmg` — notarized; also `glass-mcp-<tag>-universal-apple-darwin.zip` of `GlassMcp.app` |
 | Linux x86-64 (glibc) | `glass-mcp-<tag>-x86_64-linux-gnu.tar.gz` |
 | Linux x86-64 (static) | `glass-mcp-<tag>-x86_64-linux-musl.tar.gz` — no glibc dependency (Alpine and other musl distros) |
 | Windows x86-64 | `glass-mcp-<tag>-x86_64-windows.zip` |

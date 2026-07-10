@@ -35,6 +35,10 @@ mkdir $env:USERPROFILE\bin -Force
 copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 ```
 
+`%USERPROFILE%\bin` is not on `PATH` by default, so `glass-mcp` won't be found afterwards —
+add the directory via Windows' Environment Variables settings and open a new terminal, or
+copy `glass-mcp.exe` into a directory that's already on `PATH` instead.
+
 If you want to hack on glass or are on an architecture with no published asset,
 [build from source](build-from-source.md) instead.
 
