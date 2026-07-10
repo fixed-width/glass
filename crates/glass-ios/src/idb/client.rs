@@ -194,22 +194,30 @@ mod tests {
     }
 
     #[test]
-    fn connect_to_dead_socket_errors_cleanly() {
-        // A UDS path that exists but has no listener behind it — the "stale idb
-        // socket" case (companion died, leaving its socket file). `connect` is
-        // refused at the transport layer (ECONNREFUSED) and maps to a structured
-        // Backend error, no panic, promptly.
-        //
-        // Deterministic by construction: bind then immediately drop the listener,
-        // so the socket file lingers with nothing listening. There is no live peer,
-        // hence no accept-vs-handshake timing race (an earlier version raced on
-        // whether tonic's h2 preface write buffered before the peer's reset).
+    fn dead_socket_is_handled_cleanly_at_connect_or_first_rpc() {
+        // A stale socket file — the companion died, leaving its socket behind. Whether the
+        // failure surfaces at `connect` or at the first RPC is a tonic/HTTP-2 timing detail:
+        // `connect` can return `Ok` once the stream dials and the client preface is buffered,
+        // before the peer's reset is observed. `connect` makes no promise to reject a dead
+        // socket — liveness is really validated earlier (the companion's `await_socket` at
+        // spawn) and backstopped by `RPC_TIMEOUT` on the first RPC. What we guarantee, and
+        // assert here deterministically so it can't flake on connect's timing, is that a dead
+        // socket is handled cleanly: a structured `Backend` error, never a panic, at one of
+        // those two points (`map_timed` folds every RPC transport error/timeout into `Backend`).
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("idb.sock");
         {
             let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         }
-        let err = IdbClient::connect(&sock).unwrap_err();
-        assert!(matches!(err, glass_core::GlassError::Backend(_)), "{err:?}");
+        match IdbClient::connect(&sock) {
+            // Refused at the transport layer — the common case.
+            Err(GlassError::Backend(_)) => {}
+            // `connect` optimistically succeeded; the first RPC must then fail cleanly.
+            Ok(client) => assert!(
+                matches!(client.describe_all(), Err(GlassError::Backend(_))),
+                "first RPC on a dead socket must be a clean Backend error"
+            ),
+            Err(other) => panic!("unexpected non-Backend error from connect: {other:?}"),
+        }
     }
 }
