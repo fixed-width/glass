@@ -440,17 +440,33 @@ mod tests {
         let script = dir.path().join("fake_companion");
         std::fs::write(&script, "#!/bin/sh\necho 'boom-from-stderr' >&2\nexit 3\n").expect("write");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let bin = script.to_str().unwrap();
 
-        match self_test_with(script.to_str().unwrap()) {
-            CompanionProbe::SelfTestFailed(cause) => {
-                assert!(
-                    cause.contains("boom-from-stderr"),
-                    "cause missing stderr: {cause}"
-                );
-                assert!(cause.contains('3'), "cause missing exit status: {cause}");
+        // Retry past a transient ETXTBSY ("Text file busy", os error 26): `cargo test` runs
+        // tests on parallel threads, and a sibling thread's `Command::spawn` (fork) can
+        // momentarily inherit the write fd of the just-written fixture, so exec'ing it races
+        // until that fork execs and closes the fd. This affects only a freshly-written test
+        // fixture, never the already-installed real idb_companion, so the retry lives here
+        // rather than in `self_test_with`.
+        let mut cause = None;
+        for _ in 0..100 {
+            match self_test_with(bin) {
+                CompanionProbe::SelfTestFailed(c) if c.contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                CompanionProbe::SelfTestFailed(c) => {
+                    cause = Some(c);
+                    break;
+                }
+                other => panic!("expected SelfTestFailed, got {other:?}"),
             }
-            other => panic!("expected SelfTestFailed, got {other:?}"),
         }
+        let cause = cause.expect("self_test_with kept returning ETXTBSY after 100 retries");
+        assert!(
+            cause.contains("boom-from-stderr"),
+            "cause missing stderr: {cause}"
+        );
+        assert!(cause.contains('3'), "cause missing exit status: {cause}");
     }
 
     #[test]
