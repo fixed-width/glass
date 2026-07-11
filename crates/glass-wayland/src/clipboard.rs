@@ -763,4 +763,23 @@ mod tests {
         let got = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT).expect("read ok");
         assert_eq!(got, b"clip!");
     }
+
+    #[test]
+    fn pick_mime_prefers_charset_utf8_then_plain_then_utf8_string() {
+        use super::{pick_mime, MIME_PLAIN, MIME_UTF8, MIME_UTF8_STR};
+        let list = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // Preference order wins over the order the owner advertised them in.
+        assert_eq!(pick_mime(&list(&[MIME_PLAIN, MIME_UTF8])), Some(MIME_UTF8));
+        // Falls through to text/plain when the charset form is absent.
+        assert_eq!(
+            pick_mime(&list(&[MIME_UTF8_STR, MIME_PLAIN])),
+            Some(MIME_PLAIN)
+        );
+        // Falls through to UTF8_STRING when it is the only text form offered.
+        assert_eq!(pick_mime(&list(&[MIME_UTF8_STR])), Some(MIME_UTF8_STR));
+        // No text representation offered -> None (get short-circuits to an empty string).
+        assert_eq!(pick_mime(&list(&["image/png", "text/html"])), None);
+        assert_eq!(pick_mime(&[]), None);
+    }
 }

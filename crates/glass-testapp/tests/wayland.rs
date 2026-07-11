@@ -484,6 +484,18 @@ fn clipboard_set_then_get_roundtrips() {
     p.stop_app().ok();
 }
 
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn clipboard_get_with_no_selection_returns_empty() {
+    // Nothing has set the selection on this freshly-spawned compositor, so no data-control offer
+    // exists. `get_clipboard` must report an empty clipboard (Ok("")), not error.
+    let mut p = WaylandPlatform::new().unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
+    assert!(drain_until(&mut p, "READY", READY_TRIES), "no READY");
+    assert_eq!(p.get_clipboard().unwrap(), "");
+    p.stop_app().ok();
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox integration tests (bwrap + sway)
 // ---------------------------------------------------------------------------

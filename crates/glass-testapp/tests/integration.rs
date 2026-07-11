@@ -891,6 +891,124 @@ fn clipboard_get_reads_a_foreign_owner() {
     p.stop_app().ok();
 }
 
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn clipboard_get_with_no_owner_returns_empty() {
+    // On a fresh server nobody owns CLIPBOARD, so no SelectionNotify ever arrives. `get_clipboard`
+    // must treat that as an empty clipboard (Ok("")), not hang or error.
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    assert_eq!(p.get_clipboard().unwrap(), "");
+    p.stop_app().ok();
+}
+
+/// Ask whoever owns CLIPBOARD to convert the selection to `target` (by atom name), reading the reply
+/// on a private connection. Returns the granted property reply, or `None` if the owner refused
+/// (SelectionNotify with `property == NONE`). Mirrors how a real paste client (GTK/Qt/xclip) probes
+/// an owner — the inverse of `serve_clipboard_once`, which plays the owner.
+fn request_clipboard_target(
+    display: &str,
+    target: &[u8],
+) -> Option<x11rb::protocol::xproto::GetPropertyReply> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::*;
+
+    let (conn, screen_num) = x11rb::connect(Some(display)).expect("request: connect");
+    let root = conn.setup().roots[screen_num].root;
+    let screen = &conn.setup().roots[screen_num];
+    let intern = |name: &[u8]| conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+    let clipboard = intern(b"CLIPBOARD");
+    let target_atom = intern(target);
+    let prop = intern(b"GLASS_TEST_REQ");
+
+    let win = conn.generate_id().unwrap();
+    conn.create_window(
+        0,
+        win,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        screen.root_visual,
+        &CreateWindowAux::default(),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    conn.convert_selection(win, clipboard, target_atom, prop, x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
+    conn.flush().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let result = loop {
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        match conn.poll_for_event() {
+            Ok(Some(x11rb::protocol::Event::SelectionNotify(notify)))
+                if notify.requestor == win =>
+            {
+                if notify.property == x11rb::NONE {
+                    break None;
+                }
+                break Some(
+                    conn.get_property(true, win, notify.property, AtomEnum::ANY, 0, u32::MAX / 4)
+                        .unwrap()
+                        .reply()
+                        .unwrap(),
+                );
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => break None,
+        }
+    };
+    conn.destroy_window(win).unwrap().check().ok();
+    conn.flush().ok();
+    result
+}
+
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn clipboard_owner_answers_targets_and_refuses_unknown_target() {
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.set_clipboard("glass-owns-this").unwrap(); // glass now owns CLIPBOARD
+
+    // A real paste client asks TARGETS first to discover the offered formats. glass must answer with
+    // an ATOM list that advertises UTF8_STRING — otherwise external apps can't find the text to paste.
+    let reply = request_clipboard_target(&xvfb.display, b"TARGETS")
+        .expect("TARGETS must be granted, not refused");
+    let advertised: Vec<u32> = reply
+        .value32()
+        .expect("a TARGETS reply is a 32-bit ATOM list")
+        .collect();
+    let (conn, _n) = x11rb::connect(Some(&xvfb.display)).unwrap();
+    let utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    assert!(
+        advertised.contains(&utf8),
+        "TARGETS must advertise UTF8_STRING; got {advertised:?}"
+    );
+
+    // A target glass does not offer must be refused with property == NONE (not a bogus grant).
+    assert!(
+        request_clipboard_target(&xvfb.display, b"image/png").is_none(),
+        "an unsupported target must be refused with property == NONE"
+    );
+    p.stop_app().ok();
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox integration tests (bwrap + Xvfb)
 // ---------------------------------------------------------------------------
