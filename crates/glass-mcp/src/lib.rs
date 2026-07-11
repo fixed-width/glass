@@ -278,10 +278,20 @@ pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
     std::process::exit(diag.exit_code(backend));
 }
 
+/// Directory for visual baselines. Deliberately **absolute** and under the system temp dir:
+/// baselines are per-session (they do not outlive a `glass_start`), and a cwd-relative path
+/// breaks when glass runs with a read-only working directory — e.g. a `.app`/LaunchAgent glass
+/// launched by launchd, whose cwd is `/`, where the old cwd-relative store failed every
+/// `glass_baseline_save` with a read-only-filesystem error. `std::env::temp_dir()` is always
+/// writable and honors `TMPDIR`.
+fn default_baseline_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("glass").join("baselines")
+}
+
 /// Build the `Glass` session manager, installing the audit sink if one is configured.
 pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
-    let baselines = BaselineStore::new(".glass/baselines");
+    let baselines = BaselineStore::new(default_baseline_dir());
     let registry = glass_android::EmulatorRegistry::new();
     let agents = glass_android::AgentRegistry::new();
     let a11y = glass_android::A11yServiceRegistry::new();
@@ -360,6 +370,13 @@ mod tests {
     fn default_backend_accepts_ios() {
         assert_eq!(default_backend(Some("ios")), "ios");
         assert_eq!(default_backend(Some("IOS")), "ios");
+    }
+
+    #[test]
+    fn baseline_dir_is_absolute_so_it_survives_a_read_only_cwd() {
+        // A cwd-relative baseline dir fails every save when glass runs with cwd `/` (a launchd
+        // `.app`/LaunchAgent). The default must be absolute.
+        assert!(super::default_baseline_dir().is_absolute());
     }
 
     #[test]

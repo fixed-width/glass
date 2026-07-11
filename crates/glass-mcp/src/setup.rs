@@ -1028,6 +1028,22 @@ mod tests {
         assert!(!filled.contains("/Users/YOU"));
     }
 
+    #[test]
+    fn fill_launch_agent_pins_a_writable_working_directory() {
+        // launchd's default cwd `/` is read-only and breaks glass_baseline_save; the LaunchAgent
+        // must pin a writable WorkingDirectory (the resolved home).
+        let filled = fill_launch_agent(
+            TEMPLATE,
+            LaunchAgentFields {
+                app_bin: "/opt/glass/glass-mcp",
+                addr: "127.0.0.1:7300",
+                home: "/Users/alice",
+            },
+        )
+        .replace("\r\n", "\n");
+        assert!(filled.contains("<key>WorkingDirectory</key>\n\t<string>/Users/alice</string>"));
+    }
+
     // --- plist template shape (menu-bar launch, KeepAlive) --------------------------------
 
     #[test]

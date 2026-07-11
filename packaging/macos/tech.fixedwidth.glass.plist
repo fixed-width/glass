@@ -32,6 +32,14 @@
 		<string>127.0.0.1:7300</string>
 	</array>
 
+	<!--
+	  A writable working directory. launchd otherwise starts the job with cwd `/` (a
+	  read-only sealed volume), which makes glass_baseline_save / glass_diff fail with a
+	  read-only-filesystem error. The home dir is always writable.
+	-->
+	<key>WorkingDirectory</key>
+	<string>/Users/YOU</string>
+
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>GLASS_BACKEND</key>
