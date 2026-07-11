@@ -17,6 +17,11 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- iOS: a log line an app emits at launch — before its first frame (e.g. an `applicationDidFinishLaunching`
+  / `App.init` `os_log`) — is now captured, so you can gate readiness on it with `glass_wait_for_log`.
+  Previously the unified-log stream attached only after the app had already launched, so launch-time lines
+  were lost to the live tail; the stream now starts before launch and the launch waits until it is
+  delivering.
 - iOS: a Homebrew-installed `idb_companion` is now found automatically even when glass is launched by
   launchd (the `.app` / LaunchAgent), whose minimal `PATH` omits Homebrew's bindir — so input and the
   accessibility tree work without setting `GLASS_IDB_COMPANION` by hand.
