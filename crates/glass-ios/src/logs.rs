@@ -58,9 +58,11 @@ impl SharedLog {
     /// absent stream returns `false` at once rather than burning the full `timeout`.
     pub fn wait_ready(&self, timeout: Duration) -> bool {
         let (lock, cv) = &*self.0;
-        let Ok(guard) = lock.lock() else {
-            return false;
-        };
+        // Recover the guard on poison rather than bailing to `false`: the lock holders run no
+        // panic-prone code so poison is unreachable, but were it ever poisoned the real
+        // `first_line` state is still the honest answer — symmetric with the post-wait
+        // recovery below.
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let guard = match cv
             .wait_timeout_while(guard, timeout, |inner| !inner.first_line && !inner.finished)
         {
