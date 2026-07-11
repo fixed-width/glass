@@ -634,27 +634,6 @@ fn tap(s: &mut ActiveSession, kb: &ZwpVirtualKeyboardV1, kc: u32) -> Result<()> 
     Ok(())
 }
 
-/// `TypeSink` for Wayland: types each character by uploading a one-key keymap (the char's
-/// keysym at keycode 1) and tapping it, self-committed per key — exactly the chord sink's
-/// shape. A heavy client (e.g. a browser) ignores keys tapped under a multi-key keymap it
-/// hasn't adopted, or flushed only once at the end. See glass_core::run_type.
-struct WaylandTypeSink<'a> {
-    s: &'a mut ActiveSession,
-    kb: ZwpVirtualKeyboardV1,
-}
-
-impl glass_core::TypeSink for WaylandTypeSink<'_> {
-    fn character(&mut self, c: char) -> Result<()> {
-        let ks = glass_core::keys::keysym_for_text(c);
-        upload_keymap(
-            &mut *self.s,
-            &self.kb,
-            &crate::keyboard::build_keymap(&[ks]),
-        )?;
-        tap(&mut *self.s, &self.kb, 1)
-    }
-}
-
 /// XKB real-modifier mask for a chord's modifiers (standard `include "complete"`
 /// order: Shift, Lock, Control, Mod1=Alt, ..., Mod4=Super).
 fn modifier_mask(mods: &[glass_core::keys::Modifier]) -> u32 {
@@ -1207,15 +1186,25 @@ impl Platform for WaylandPlatform {
         let kb = session.keyboard.clone();
         match event {
             KeyEvent::Text(text) => {
-                // Per-character, self-committed typing (a 1-key keymap + tap, roundtripped
-                // per key) so a heavy client receives a long string instead of dropping a
-                // batch — see glass_core::run_type and WaylandTypeSink. The per-key roundtrip
-                // is the pacing, so no extra inter-character dwell is needed.
-                let mut sink = WaylandTypeSink {
-                    s: &mut *session,
-                    kb,
-                };
-                glass_core::run_type(&mut sink, text, std::time::Duration::ZERO)?;
+                // Upload one keymap per chunk (each distinct keysym at its own keycode), then
+                // tap the planned keycode for every character. The keymap stays fixed while a
+                // chunk's key events are delivered, so a client that resolves keysyms lazily
+                // (e.g. an X11 app under Xwayland querying the keymap per press) can't read a
+                // neighbouring character by racing a mid-string keymap swap — the flake that a
+                // fresh keymap on the *same* keycode per character exhibited under load. Each
+                // tap self-commits (roundtrip + settle), which also paces a heavy client; the
+                // one keymap upload per chunk replaces one upload per character. See
+                // crate::keyboard::plan_type.
+                for chunk in crate::keyboard::plan_type(text) {
+                    upload_keymap(
+                        &mut *session,
+                        &kb,
+                        &crate::keyboard::build_keymap(&chunk.keysyms),
+                    )?;
+                    for kc in chunk.taps {
+                        tap(&mut *session, &kb, kc)?;
+                    }
+                }
             }
             KeyEvent::Chord(c) => {
                 let (mods, keysym) = parse_chord(c)?; // validates before any traffic

@@ -28,6 +28,11 @@ internal refactors, CI, or test-only changes.
   `glass_click_element` then refused). The result gains a `direction` field.
 
 ### Fixed
+- Wayland: text entry (`glass_type` and a typed `KeyEvent::Text`) is reliable under heavy machine
+  load. The backend now uploads one keymap per string — each character at its own keycode — instead
+  of swapping a single-keycode keymap for every character; previously, under load, a target that
+  resolves keysyms lazily (an X11 app under Xwayland) could read a keystroke as the adjacent
+  character.
 - iOS: a log line an app emits at launch — before its first frame (e.g. an `applicationDidFinishLaunching`
   / `App.init` `os_log`) — is now captured, so you can gate readiness on it with `glass_wait_for_log`.
   Previously the unified-log stream attached only after the app had already launched, so launch-time lines

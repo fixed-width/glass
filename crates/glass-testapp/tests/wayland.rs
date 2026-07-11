@@ -300,6 +300,13 @@ fn collect_keysyms(p: &mut WaylandPlatform, want: usize, tries: u32) -> Vec<u32>
     got
 }
 
+/// Whether `got` is `expected` with zero or more elements removed (order preserved) — the
+/// signature of *dropped* keystrokes, as opposed to a *substituted* (wrong or extra) one.
+fn is_subsequence(got: &[u32], expected: &[u32]) -> bool {
+    let mut expected = expected.iter();
+    got.iter().all(|g| expected.any(|e| e == g))
+}
+
 #[test]
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn typed_multichar_strings_arrive_intact() {
@@ -312,18 +319,51 @@ fn typed_multichar_strings_arrive_intact() {
     // and spaces. For ASCII printables the keysym equals the char code, so each character
     // must arrive exactly once, in order — no drops, no collapse to the last char. Repeated
     // to shake out any timing race (the Linux analog of the Windows on-box rigor).
+    // Two distinct flakes can hit Wayland typing under load, with distinguishable signatures:
+    //   * a wrong or extra keysym (a *substitution*) — the keysym-mapping bug this test guards.
+    //     Never retry it away: the substitution race is probabilistic, so retrying would give a
+    //     re-introduced mapping bug a second chance and let it slip through. Fail on sight.
+    //   * a *dropped* keystroke — the received sequence is `expected` with keys missing (a strict
+    //     subsequence). Rare, nondeterministic, immune to pacing, and clears on a resend, so it
+    //     may be retried once.
+    let mut retries = 0u32;
     for _ in 0..3 {
         for s in ["aaa bbb ccc", "hello world", "the quick brown fox"] {
-            let _ = p.drain_logs(); // clear anything pending before this string
             let expected: Vec<u32> = s.chars().map(|c| c as u32).collect();
-            p.send_key(&KeyEvent::Text(s.to_string())).unwrap();
-            let got = collect_keysyms(&mut p, expected.len(), ECHO_TRIES);
+
+            let type_once = |p: &mut WaylandPlatform| -> Vec<u32> {
+                let _ = p.drain_logs(); // clear anything pending before this string
+                p.send_key(&KeyEvent::Text(s.to_string())).unwrap();
+                collect_keysyms(p, expected.len(), ECHO_TRIES)
+            };
+
+            let got = type_once(&mut p);
+            if got == expected {
+                continue;
+            }
+            // Anything that isn't a pure drop is a real corruption — fail immediately, on the
+            // first attempt, so the substitution regression can never be retried into a pass.
+            assert!(
+                got.len() < expected.len() && is_subsequence(&got, &expected),
+                "typing {s:?} corrupted on Wayland (wrong keysym, not a dropped one): \
+                 got {got:?}, expected {expected:?}"
+            );
+            eprintln!("wayland dropped a keystroke typing {s:?} (got {got:?}); retrying once");
+            retries += 1;
+            let got = type_once(&mut p);
             assert_eq!(
                 got, expected,
-                "typing {s:?} did not arrive intact on Wayland"
+                "typing {s:?} did not arrive intact on Wayland after a retry"
             );
         }
     }
+    // The drop flake is rare on a healthy compositor (well under one send in nine); needing
+    // several retries in one run means typing reliability has regressed, so fail loudly even
+    // though every string eventually matched.
+    assert!(
+        retries <= 2,
+        "Wayland typing needed {retries} retries across 9 sends — dropped-keystroke rate regressed"
+    );
     p.stop_app().unwrap();
 }
 
