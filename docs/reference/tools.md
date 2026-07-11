@@ -330,28 +330,30 @@ element isn't editable, changed since the snapshot, or the app exposes no access
 
 ### `glass_scroll_to_element`
 
-Scroll a container until an accessibility element becomes visible, then return it as text. In a
-virtualized list only the on-screen rows exist in the a11y tree, so an off-screen row can't be clicked
-until it's scrolled into view; this collapses the scroll-and-snapshot loop into one call. Errors if the
-app exposes no accessibility tree.
+Scroll a container on **either axis** until an accessibility element is **on-screen**, then
+return it as text. The element must be actually visible (intersecting the viewport), not merely
+present in the a11y tree — so the returned `id` is usable with `glass_click_element` even for a
+non-virtualized container (a horizontal toolbar) whose off-screen items are always in the tree.
+Errors if the app exposes no accessibility tree.
 
-- `name` (string) — substring of the target's accessible name (selector); `name` and/or `role` is
-  required.
+- `name` (string) — substring of the target's accessible name (selector); `name` and/or `role`
+  is required.
 - `role` (string) — role filter, e.g. `"ListItem"`, `"Button"` (selector).
 - `value_contains` (string) — additionally require the matched element's value to contain this
   substring; not a standalone selector.
-- `direction` (string, default `down`) — primary sweep direction (`"down"`/`"up"`); the search
-  reverses to the other end if the target isn't found first. **Vertical only** — this tool cannot
-  drive a *horizontal* container. To reach an off-screen item in a horizontal `ScrollView` (e.g. an
-  overflowing toolbar), pan it yourself with `glass_scroll` `dx` (or a `glass_drag` swipe), snapshot,
-  then `glass_click_element`.
-- `x`, `y` (integer) — scroll anchor (window-relative); default to the window center. Set both to aim
-  the wheel at a specific scrollable container.
-- `step` (integer, default 3) — wheel notches per scroll step; larger covers distance faster but risks
-  stepping past a row's realized band.
+- `direction` (string) — `"up"`/`"down"` (vertical) or `"left"`/`"right"` (horizontal). **Omit
+  to infer** the direction from the target's off-screen position (e.g. an item at `x ≥ width`
+  scrolls right); inference falls back to a vertical `down`→`up` sweep when the target isn't in
+  the tree yet (a virtualized list). The search reverses to the other end if not found first.
+- `x`, `y` (integer) — scroll anchor (window-relative). By default the swipe anchors on the
+  target's own row/column, so a container that isn't centered in the window (a top toolbar) is
+  driven correctly; set both to override (e.g. for an empty-tree virtualized list where there's
+  no target row to anchor on yet).
+- `step` (integer, default 3) — wheel notches per scroll step.
 - `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms, element{id, role, name, bounds, states}, scrolled{steps, reversed}}` —
+Returns `{matched, elapsed_ms, element{id, role, name, bounds, states}, scrolled{steps,
+reversed, direction}}` — `direction` is the resolved (possibly inferred) sweep direction, and
 the `id` is usable with `glass_click_element`.
 
 ## Clipboard

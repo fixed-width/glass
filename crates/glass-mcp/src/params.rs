@@ -263,11 +263,14 @@ pub struct ScrollToElementArgs {
     /// Additionally require the matched element's `value` to contain this substring.
     /// Not a standalone selector — `name` and/or `role` is still required.
     pub value_contains: Option<String>,
-    /// Primary sweep direction: "down" (default) or "up". The search reverses to the
-    /// other end if the target isn't found first.
+    /// Sweep direction: "up"/"down" (vertical) or "left"/"right" (horizontal).
+    /// Omit to infer it from the target's off-screen position (falls back to a
+    /// vertical down→up sweep when the target isn't in the a11y tree yet). The
+    /// search reverses to the other end if the target isn't found first.
     pub direction: Option<String>,
-    /// Scroll anchor x (window-relative). Defaults with `y` to the window center;
-    /// set both to point the wheel at a specific scrollable container.
+    /// Scroll anchor x (window-relative). By default the swipe anchors on the target's
+    /// own row/column (falling back to the window center if it isn't in the a11y tree
+    /// yet); set both `x` and `y` to point the wheel at a specific container instead.
     pub x: Option<i32>,
     /// Scroll anchor y (window-relative). See `x`.
     pub y: Option<i32>,

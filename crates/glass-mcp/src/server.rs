@@ -418,19 +418,22 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Scroll a container until an accessibility element becomes visible, then \
-                       return it (text-only, no image). For a virtualized list only on-screen \
-                       rows exist in the a11y tree, so an off-screen row can't be clicked until \
-                       scrolled to; this collapses the scroll+snapshot loop into one call. Select \
-                       by `name` (accessible-name substring) and/or `role` (e.g. \"ListItem\"); \
-                       optional `value_contains`. `direction` \"down\" (default) or \"up\" — it \
-                       sweeps that way to the end, then reverses to cover the other end. Optional \
-                       `x`,`y` aim the wheel at a specific container (default: window center); \
-                       `step` sets wheel notches per move (default 3). Returns \
-                       {matched,elapsed_ms,element{id,role,name,bounds,states},scrolled{steps,reversed}} \
-                       — the id is usable with glass_click_element. Returns {matched:false} if the \
-                       element never appears after sweeping both ends or `timeout_ms` (default \
-                       20000). Errors if the app exposes no accessibility tree."
+        description = "Scroll a container (any axis) until an accessibility element is on-screen, \
+                       then return it (text-only, no image). Requires the element to be actually \
+                       visible — not merely present in the a11y tree — so the returned id is usable \
+                       with glass_click_element. Select by `name` (accessible-name substring) \
+                       and/or `role` (e.g. \"Button\"); optional `value_contains`. `direction`: \
+                       \"up\"/\"down\"/\"left\"/\"right\"; omit to infer it from the target's \
+                       off-screen position (falls back to a vertical down→up sweep when the target \
+                       isn't in the tree yet). It sweeps that way to the end, then reverses. \
+                       Optional `x`,`y` aim the swipe at a specific container; by default it anchors \
+                       on the target's own row/column so a container that isn't window-centered \
+                       (e.g. a top toolbar) is still driven. `step` sets wheel notches per move \
+                       (default 3). Returns {matched,elapsed_ms,element{id,role,name,bounds,states},\
+                       scrolled{steps,reversed,direction}} — the id is usable with \
+                       glass_click_element. Returns {matched:false} if it never becomes visible \
+                       after sweeping both ends or `timeout_ms` (default 20000). Errors if the app \
+                       exposes no accessibility tree."
     )]
     async fn glass_scroll_to_element(
         &self,

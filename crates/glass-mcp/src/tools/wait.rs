@@ -96,7 +96,7 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         "matched": o.matched,
         "elapsed_ms": o.elapsed_ms,
         "element": element,
-        "scrolled": { "steps": o.steps, "reversed": o.reversed },
+        "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
     })
     .to_string();
     Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
