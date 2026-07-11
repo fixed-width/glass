@@ -197,9 +197,28 @@ Scroll at window-relative coordinates by wheel notches.
 
 - `x`, `y` (integer, **required**) — window-relative point.
 - `dx`, `dy` (integer) — horizontal/vertical scroll in **wheel notches** (discrete clicks — small
-  integers like 1–5, not pixels). Positive `dy` is wheel-down, negative wheel-up; glass clicks
-  `|dy|` times. How an app maps a notch to its view (lines, pixels, zoom) is the app's choice.
+  integers like 1–5, not pixels). Positive `dy` is wheel-down, negative wheel-up; positive `dx`
+  reveals content to the **right**, negative to the left. glass clicks `|dx|`/`|dy|` times. How an
+  app maps a notch to its view (lines, pixels, zoom) is the app's choice.
 - `modifiers` (array of string) — keys held during the scroll.
+
+> **On touch backends (Android, iOS), `glass_scroll` is a real one-finger swipe — it is *input*,
+> not an inert viewport nudge.** There is no wheel on touch; glass reproduces a scroll as a finger
+> drag anchored at `x,y`, travelling roughly `notches × 120 px` opposite the wheel direction (the
+> resulting pan is then amplified and made non-linear by the view's fling/deceleration, so it is not
+> a fixed distance per notch). Three things follow:
+>
+> - **It can mutate app state.** Over an *interactive* surface — a drawing canvas, a slider, a
+>   swipe-to-act row — the swipe registers as input (e.g. commits a stroke). Scroll from an inert
+>   part of the container, or start the anchor on a non-actionable element.
+> - **A scroll against the container's edge is an expected no-op.** At a scroll boundary there is
+>   nothing to reveal in that direction, so nothing moves — and the tool still returns `ok`. That is
+>   not a failure or a dropped `dx`; scroll the other way, or from a position that has room.
+> - **Verify a pan by the accessibility tree, not a whole-window diff.** A thin container (a
+>   toolbar) pans only a small fraction of the window, so `glass_diff`'s `changed_pct` barely moves
+>   even when the scroll worked. Snapshot before/after and compare a container element's `bounds`
+>   (they shift by the pan distance); items scrolled off-screen keep reporting `bounds` outside
+>   `[0,width)`, which is the tell that it panned.
 
 ### `glass_drag`
 
@@ -322,7 +341,10 @@ app exposes no accessibility tree.
 - `value_contains` (string) — additionally require the matched element's value to contain this
   substring; not a standalone selector.
 - `direction` (string, default `down`) — primary sweep direction (`"down"`/`"up"`); the search
-  reverses to the other end if the target isn't found first.
+  reverses to the other end if the target isn't found first. **Vertical only** — this tool cannot
+  drive a *horizontal* container. To reach an off-screen item in a horizontal `ScrollView` (e.g. an
+  overflowing toolbar), pan it yourself with `glass_scroll` `dx` (or a `glass_drag` swipe), snapshot,
+  then `glass_click_element`.
 - `x`, `y` (integer) — scroll anchor (window-relative); default to the window center. Set both to aim
   the wheel at a specific scrollable container.
 - `step` (integer, default 3) — wheel notches per scroll step; larger covers distance faster but risks
