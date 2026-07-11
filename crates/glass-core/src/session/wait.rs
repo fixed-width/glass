@@ -1015,6 +1015,40 @@ mod tests {
     }
 
     #[test]
+    fn scroll_to_element_realizes_mid_sweep_with_unknown_bounds() {
+        // Unlike `scroll_to_element_bounds_unknown_returns_without_scrolling` (the
+        // pre-sweep early return), here the target is absent from the first
+        // snapshot — forcing a scroll — and only realizes, bounds-unknown, on the
+        // second. The in-loop `ready` check must accept it and stop (steps >= 1),
+        // not keep sweeping to the cap because it can never see an on-screen center.
+        let absent = tree_with(100, 100, vec![]);
+        let realized = tree_with(
+            100,
+            100,
+            vec![AxNode {
+                name: Some("Ghost".into()),
+                ..ax_node(1, AxRole::Button, None, vec![])
+            }],
+        );
+        let mut g = glass_with_a11y_seq(FakePlatform::new(100, 100), vec![absent, realized]);
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert!(out.steps >= 1, "target realized only after scrolling");
+        assert!(out.element.unwrap().bounds.is_none());
+    }
+
+    #[test]
     fn scroll_to_element_absent_with_omitted_direction_defaults_to_down() {
         // Omitted direction + a target never in the tree: inference has nothing to go
         // on, so the sweep falls back to the vertical down→up axis and reports it.

@@ -349,7 +349,8 @@ Errors if the app exposes no accessibility tree.
   target's own row/column, so a container that isn't centered in the window (a top toolbar) is
   driven correctly; set both to override (e.g. for an empty-tree virtualized list where there's
   no target row to anchor on yet).
-- `step` (integer, default 3) — wheel notches per scroll step.
+- `step` (integer, default 3) — wheel notches per scroll step. A calibration escape hatch —
+  larger covers distance faster but risks stepping past a row's/column's realized band.
 - `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
 
 Returns `{matched, elapsed_ms, element{id, role, name, bounds, states}, scrolled{steps,
