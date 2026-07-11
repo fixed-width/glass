@@ -199,6 +199,12 @@ impl IosPlatform {
     }
 }
 
+/// How long [`Platform::start_app`] waits for the unified-log stream to prove itself live
+/// before launching the app. A booted simulator emits system log lines continuously, so this
+/// is reached in milliseconds in practice; the cap only bounds a pathologically quiet or
+/// failed stream so launch is never blocked for long.
+const LOG_STREAM_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How many times [`retry_for_scale`] polls for a positive scale before giving up.
 const SCALE_ATTEMPTS: usize = 3;
 /// How long [`retry_for_scale`] waits between polls while the tree is still empty.
@@ -278,6 +284,22 @@ impl Platform for IosPlatform {
         if let Some(path) = install {
             self.target.simctl().run(&["install", udid, &path])?;
         }
+
+        // Start the unified-log stream BEFORE launching, and do not launch until its
+        // subscription is provably live. `log stream` is a live tail with no backlog, so a
+        // subscription that attaches after `simctl launch` misses the app's launch-time lines
+        // (an `onAppear` / `applicationDidFinishLaunching` `os_log`). Gating launch on a
+        // confirmed-live stream closes that race. Logs stay best-effort: a stream that never
+        // comes up does not fail the launch — it only means a launch-time line may be missed,
+        // which is noted rather than swallowed.
+        let logs = LogStream::spawn(udid);
+        if !logs.wait_until_ready(LOG_STREAM_READY_TIMEOUT) {
+            eprintln!(
+                "glass-ios: unified-log stream not confirmed live before launch; a \
+                 launch-time log line may be missed"
+            );
+        }
+
         // `SIMCTL_CHILD_<KEY>` is Apple's convention for passing environment variables through
         // `simctl launch` to the launched process, so `spec.env` is set that way rather than on
         // this (glass's own) process.
@@ -328,7 +350,7 @@ impl Platform for IosPlatform {
         self.app = Some(RunningApp {
             bundle_id,
             geometry: geometry.clone(),
-            logs: LogStream::spawn(udid),
+            logs,
             injector,
         });
         Ok(geometry)
