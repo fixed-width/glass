@@ -105,6 +105,28 @@ minimal `PATH` that omits Homebrew's bindir — also probes the standard Homebre
 `GLASS_IDB_COMPANION` to the binary's path only to override that — an install elsewhere, or to pin a
 specific build.
 
+## Clipboard
+
+`glass_clipboard_get` and `glass_clipboard_set` act on the **Simulator's own** pasteboard (separate
+from your host's) over `simctl`, and work without `idb_companion`.
+
+One iOS policy to expect: when the **app under test** reads a pasteboard that *another* app wrote —
+which is exactly `glass_clipboard_set` followed by an in-app paste — iOS raises a SpringBoard
+**paste-consent** alert (*"YourApp would like to paste from …"*) and the **first read returns
+`nil`**. So a set-then-paste is a **two-step** flow:
+
+1. `glass_clipboard_set { "text": "…" }`, then drive the app control that reads
+   `UIPasteboard.general`.
+2. That first read comes back empty and the consent alert appears. glass surfaces it in the
+   accessibility tree — the frontmost app's name briefly blanks to `" "` while SpringBoard's alert is
+   up — so `glass_a11y_snapshot`, then `glass_click_element` the **Allow Paste** button.
+3. Drive the control again; the app now reads the value (the grant sticks, so the retry doesn't
+   re-prompt).
+
+Expect the modal: a bare `glass_wait_for_log` on the paste times out on the first tap and looks like
+a dropped clipboard when it is really the consent gate. `glass_clipboard_get` is unaffected — it
+reads the pasteboard over `simctl`, not through an in-app `UIPasteboard` read, so it never prompts.
+
 ## Check the setup
 
 ```bash

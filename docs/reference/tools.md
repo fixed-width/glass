@@ -380,6 +380,11 @@ Write text to the clipboard so the app can paste it.
 
 - `text` (string, **required**) — the text to write.
 
+> **iOS paste-consent:** when the app then reads a pasteboard glass wrote (`glass_clipboard_set` → an
+> in-app `UIPasteboard` read), iOS raises a SpringBoard consent alert and the *first* read returns
+> nothing. Click **Allow Paste** (it appears in the a11y tree) and retry — the two-step flow is in
+> [setup-ios.md](../how-to/setup-ios.md#clipboard).
+
 ## Logs & diagnostics
 
 ### `glass_logs`
