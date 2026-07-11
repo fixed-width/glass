@@ -57,9 +57,11 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         None => None,
     };
     let direction = match a.direction.as_deref() {
-        None => ScrollDirection::Down,
-        Some(d) => ScrollDirection::from_name(d)
-            .ok_or_else(|| format!("unknown direction '{d}' (use down/up)"))?,
+        None => None,
+        Some(d) => Some(
+            ScrollDirection::from_name(d)
+                .ok_or_else(|| format!("unknown direction '{d}' (use up/down/left/right)"))?,
+        ),
     };
     // Anchor: both x and y, or neither (window center). One without the other is a
     // caller mistake worth naming rather than silently half-defaulting.
