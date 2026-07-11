@@ -57,12 +57,15 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         None => None,
     };
     let direction = match a.direction.as_deref() {
-        None => ScrollDirection::Down,
-        Some(d) => ScrollDirection::from_name(d)
-            .ok_or_else(|| format!("unknown direction '{d}' (use down/up)"))?,
+        None => None,
+        Some(d) => Some(
+            ScrollDirection::from_name(d)
+                .ok_or_else(|| format!("unknown direction '{d}' (use up/down/left/right)"))?,
+        ),
     };
-    // Anchor: both x and y, or neither (window center). One without the other is a
-    // caller mistake worth naming rather than silently half-defaulting.
+    // Anchor: both x and y, or neither (default: the target's own row/column). One
+    // without the other is a caller mistake worth naming rather than silently
+    // half-defaulting.
     let anchor = match (a.x, a.y) {
         (Some(x), Some(y)) => Some((x, y)),
         (None, None) => None,
@@ -94,7 +97,7 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         "matched": o.matched,
         "elapsed_ms": o.elapsed_ms,
         "element": element,
-        "scrolled": { "steps": o.steps, "reversed": o.reversed },
+        "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
     })
     .to_string();
     Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
@@ -193,7 +196,7 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
 mod tests {
     use super::*;
     use crate::tools::testutil::*;
-    use glass_core::AppSpec;
+    use glass_core::{AppSpec, AxNode, AxNodeId, AxRect, AxStates, AxTree};
 
     #[test]
     fn scroll_to_element_requires_a_selector() {
@@ -220,8 +223,128 @@ mod tests {
         assert!(err.contains("name") && err.contains("role"), "got: {err}");
     }
 
-    fn started_a11y() -> Glass {
-        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+    fn scroll_args() -> ScrollToElementArgs {
+        ScrollToElementArgs {
+            name: None,
+            role: None,
+            value_contains: None,
+            direction: None,
+            x: None,
+            y: None,
+            step: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn scroll_to_element_rejects_unknown_direction() {
+        let mut g = started_a11y();
+        let mut a = scroll_args();
+        a.name = Some("Save".into());
+        a.direction = Some("sideways".into());
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+        assert!(err.contains("up/down/left/right"), "got: {err}");
+    }
+
+    #[test]
+    fn scroll_to_element_output_includes_resolved_direction() {
+        // Save is already on-screen and direction is omitted, so the resolved axis
+        // falls back to the default vertical sweep and is serialized under
+        // `scrolled.direction` — guarding `as_str` and the shape of the JSON output.
+        // This alone can't discriminate the `None`-inference wiring itself (see
+        // `scroll_to_element_infers_right_direction_for_offscreen_element` below):
+        // an on-screen target resolves to the same "down" default whether `None`
+        // correctly falls through to inference-then-default, or a regression just
+        // hardcodes `Some(Down)`.
+        let mut g = started_a11y();
+        let mut a = scroll_args();
+        a.name = Some("Save".into());
+        let out = scroll_to_element(&mut g, &a).unwrap();
+        match &out.0[0] {
+            OutContent::Text(t) => {
+                assert!(t.contains("\"scrolled\""), "got: {t}");
+                assert!(
+                    t.contains("\"direction\":\"down\""),
+                    "resolved direction must be serialized; got: {t}"
+                );
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    /// Like `fake_tree()`'s "Save" but placed off-screen to the right of the
+    /// 100-wide window (x=200, past `win_w`). The tree is static — snapshot never
+    /// changes — so a sweep saturates immediately in both directions and the
+    /// target never realizes on-screen.
+    fn fake_tree_offscreen_right() -> AxTree {
+        let button = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "push button".into(),
+            name: Some("Save".into()),
+            value: None,
+            states: AxStates {
+                focusable: true,
+                enabled: true,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 200,
+                y: 10,
+                width: 20,
+                height: 20,
+            }),
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            children: vec![button],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn scroll_to_element_infers_right_direction_for_offscreen_element() {
+        // Save sits off-screen to the right; `direction` is omitted. The static
+        // fixture tree never changes, so the sweep saturates after one step per
+        // direction without ever realizing Save on-screen — `matched:false`. But
+        // `scrolled.direction` reports the *resolved* direction regardless of
+        // `matched` (see `scroll_to_element`'s shared `outcome` tail), so asserting
+        // "direction":"right" here genuinely guards the `None`-inference wiring: a
+        // `None => Some(Down)` regression would report "down" instead, which this
+        // test would catch and the on-screen test above would not.
+        let mut g = started_a11y_with(fake_tree_offscreen_right());
+        let mut a = scroll_args();
+        a.name = Some("Save".into());
+        let out = scroll_to_element(&mut g, &a).unwrap();
+        match &out.0[0] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.contains("\"matched\":false"),
+                    "off-screen target never realizes in the static tree; got: {t}"
+                );
+                assert!(
+                    t.contains("\"direction\":\"right\""),
+                    "resolved direction must be inferred from the off-screen bounds; got: {t}"
+                );
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    fn started_a11y_with(tree: AxTree) -> Glass {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), tree);
         g.start(&AppSpec {
             build: None,
             run: vec!["x".into()],
@@ -234,6 +357,10 @@ mod tests {
         })
         .unwrap();
         g
+    }
+
+    fn started_a11y() -> Glass {
+        started_a11y_with(fake_tree())
     }
 
     fn elem_args() -> WaitForElementArgs {

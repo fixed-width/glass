@@ -16,6 +16,17 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- `glass_scroll_to_element` now drives **horizontal** containers, not just vertical: `direction`
+  accepts `left`/`right` as well as `up`/`down`, and when omitted it **infers** the direction from
+  the target's off-screen position. It anchors the scroll on the target's own row/column, so a
+  container that isn't centered in the window (e.g. a top toolbar) is driven correctly.
+
+### Changed
+- `glass_scroll_to_element` returns an element only once it is actually **on-screen** — previously
+  it could return one that was present in the accessibility tree but off-screen (which
+  `glass_click_element` then refused). The result gains a `direction` field.
+
 ### Fixed
 - iOS: a log line an app emits at launch — before its first frame (e.g. an `applicationDidFinishLaunching`
   / `App.init` `os_log`) — is now captured, so you can gate readiness on it with `glass_wait_for_log`.
