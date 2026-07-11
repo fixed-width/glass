@@ -7,15 +7,16 @@ and glass adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!--
 Maintenance: add entries under [Unreleased] as user-facing changes merge to
-master. At release time, rename [Unreleased] to the new version with its date,
-add a fresh empty [Unreleased] above it, and update the compare links at the
+master. At release time, rename [Unreleased] to the new version with its UTC
+release date (the GitHub release's `published_at` date, so the changelog matches
+the site's release list), add a fresh empty [Unreleased] above it, and update the compare links at the
 bottom. Keep entries user-facing — what changed for someone using glass — not
 internal refactors, CI, or test-only changes.
 -->
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-07-10
+## [0.4.0] - 2026-07-11
 
 ### Added
 - An [iOS Simulator backend](docs/how-to/setup-ios.md) (`GLASS_BACKEND=ios`, macOS only): launch, capture,
@@ -55,7 +56,7 @@ internal refactors, CI, or test-only changes.
 - The `glass_diff` tool reference now documents its `region` parameter — a window-relative scoped
   diff that also makes the reported `bbox` region-relative — which had been usable but undocumented.
 
-## [0.3.1] - 2026-07-07
+## [0.3.1] - 2026-07-08
 
 ### Changed
 - Documentation reorganized into a [Diátaxis](https://diataxis.fr) structure under
@@ -134,7 +135,7 @@ internal refactors, CI, or test-only changes.
 - Share one SIMD pixel-swizzle kernel across the X11, Windows, and Wayland
   capture paths for faster frame conversion.
 
-## [0.1.1] - 2026-06-17
+## [0.1.1] - 2026-06-18
 
 ### Added
 - **Linux accessibility (opt-in).** An `a11y` flag starts a private AT-SPI
