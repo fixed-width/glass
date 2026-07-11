@@ -133,6 +133,58 @@ impl ScrollDirection {
     }
 }
 
+/// The direction to scroll to bring an off-screen element into view: whichever
+/// window edge its bounds lie fully past. `None` when the bounds already
+/// intersect the viewport (nothing to infer). Off two edges at once → the larger
+/// overflow wins. Used when the caller omits `direction`.
+///
+/// Not yet wired into `scroll_to_element`'s direction resolution; exercised only
+/// by its own unit tests until then.
+#[cfg_attr(not(test), allow(dead_code))]
+fn offscreen_direction(b: &AxRect, win_w: i32, win_h: i32) -> Option<ScrollDirection> {
+    let w = b.width as i32;
+    let h = b.height as i32;
+    [
+        (ScrollDirection::Right, b.x >= win_w, b.x - win_w + 1),
+        (ScrollDirection::Left, b.x + w <= 0, -(b.x + w) + 1),
+        (ScrollDirection::Down, b.y >= win_h, b.y - win_h + 1),
+        (ScrollDirection::Up, b.y + h <= 0, -(b.y + h) + 1),
+    ]
+    .into_iter()
+    .filter(|&(_, off, _)| off)
+    .max_by_key(|&(_, _, mag)| mag)
+    .map(|(dir, _, _)| dir)
+}
+
+/// Where to anchor the scroll swipe. An explicit anchor wins upstream; here, if
+/// the target node's bounds are known, anchor on its *perpendicular* center so the
+/// swipe lands on the container's band even when the target is off-screen along
+/// the sweep axis (its off-axis coordinate is still on-screen); otherwise the
+/// window center.
+///
+/// Not yet wired into `scroll_to_element`'s anchor resolution; exercised only by
+/// its own unit tests until then.
+#[cfg_attr(not(test), allow(dead_code))]
+fn scroll_anchor(
+    dir: ScrollDirection,
+    bounds: Option<AxRect>,
+    win_w: i32,
+    win_h: i32,
+) -> (i32, i32) {
+    match bounds {
+        Some(b) => {
+            let cx = (b.x + b.width as i32 / 2).clamp(0, (win_w - 1).max(0));
+            let cy = (b.y + b.height as i32 / 2).clamp(0, (win_h - 1).max(0));
+            if dir.is_horizontal() {
+                (win_w / 2, cy)
+            } else {
+                (cx, win_h / 2)
+            }
+        }
+        None => (win_w / 2, win_h / 2),
+    }
+}
+
 /// Parameters for [`Glass::scroll_to_element`].
 #[derive(Clone, Debug)]
 pub struct ScrollToElementParams {
@@ -537,6 +589,7 @@ impl Glass {
 
 #[cfg(test)]
 mod tests {
+    use super::{offscreen_direction, scroll_anchor};
     use crate::session::test_support::*;
 
     #[test]
@@ -1158,5 +1211,92 @@ mod tests {
         assert_eq!(ScrollDirection::from_name("Right"), Some(Right));
         assert_eq!(ScrollDirection::from_name("sideways"), None);
         assert_eq!(Right.as_str(), "right");
+    }
+
+    #[test]
+    fn offscreen_direction_picks_the_edge() {
+        // Fully past the right edge (x >= win_w).
+        let r = AxRect {
+            x: 1300,
+            y: 250,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(
+            offscreen_direction(&r, 1206, 2622),
+            Some(ScrollDirection::Right)
+        );
+        // Fully past the left edge (x + w <= 0).
+        let l = AxRect {
+            x: -300,
+            y: 250,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(
+            offscreen_direction(&l, 1206, 2622),
+            Some(ScrollDirection::Left)
+        );
+        // Past the bottom edge.
+        let d = AxRect {
+            x: 100,
+            y: 3000,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(
+            offscreen_direction(&d, 1206, 2622),
+            Some(ScrollDirection::Down)
+        );
+        // Intersects the viewport → nothing to infer.
+        let on = AxRect {
+            x: 100,
+            y: 100,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(offscreen_direction(&on, 1206, 2622), None);
+        // Off two edges at once → larger overflow wins (right ~2001 vs down ~501).
+        let both = AxRect {
+            x: 3206,
+            y: 3122,
+            width: 10,
+            height: 10,
+        };
+        assert_eq!(
+            offscreen_direction(&both, 1206, 2622),
+            Some(ScrollDirection::Right)
+        );
+    }
+
+    #[test]
+    fn scroll_anchor_lands_on_the_container_band() {
+        // Horizontal sweep: anchor x = window center, y = the element's row center.
+        let h = AxRect {
+            x: 2000,
+            y: 250,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Right, Some(h), 1206, 2622),
+            (603, 280)
+        );
+        // Vertical sweep: anchor x = the element's column center, y = window center.
+        let v = AxRect {
+            x: 300,
+            y: 2000,
+            width: 100,
+            height: 60,
+        };
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Down, Some(v), 1206, 2622),
+            (350, 1311)
+        );
+        // No bounds → window center.
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Down, None, 1206, 2622),
+            (603, 1311)
+        );
     }
 }

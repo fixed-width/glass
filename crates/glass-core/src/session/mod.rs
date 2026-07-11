@@ -2,7 +2,7 @@
 //! its operations are grouped into submodules (each adds an `impl Glass` block).
 
 use crate::accessibility::{
-    element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRole, AxTarget, AxTree,
+    element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree,
     ElementCondition, ElementInfo, ElementMatch,
 };
 use crate::baseline::BaselineStore;
