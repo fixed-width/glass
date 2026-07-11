@@ -15,6 +15,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-10
+
 ### Added
 - An [iOS Simulator backend](docs/how-to/setup-ios.md) (`GLASS_BACKEND=ios`, macOS only): launch, capture,
   log streaming, and clipboard for native iOS apps in the Simulator, driven through `xcrun simctl`, plus
@@ -168,7 +170,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/fixed-width/glass/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/fixed-width/glass/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/fixed-width/glass/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fixed-width/glass/compare/v0.1.2...v0.2.0
