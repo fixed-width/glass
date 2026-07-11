@@ -88,7 +88,9 @@ brew install idb-companion
 With `idb_companion` on `PATH`, these tools work against the Simulator:
 
 - **Input** — `glass_click`, `glass_type`, `glass_key`, `glass_scroll`, and `glass_drag` map to
-  synthetic touches and keystrokes.
+  synthetic touches and keystrokes. As on any touch backend, `glass_scroll` is delivered as a real
+  one-finger swipe (it is *input*, not an inert wheel event), so over an interactive surface it can
+  mutate app state — see [`glass_scroll`](../reference/tools.md#glass_scroll).
 - **Accessibility** — `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_click_element`,
   `glass_set_value`, `glass_wait_for_element`, and `glass_scroll_to_element` read and drive the
   Simulator's accessibility tree.
