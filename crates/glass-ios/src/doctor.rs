@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use glass_core::{Check, CheckStatus, GlassError};
 
 use crate::device::{parse_devices, resolve, Resolve, SimDevice};
-use crate::idb::companion::{companion_bin, IdbCompanion};
+use crate::idb::companion::{companion_bin, companion_present_with, IdbCompanion};
 use crate::simctl::Simctl;
 
 /// Observed host state for the iOS doctor checks. Captured by `run`, consumed by the
@@ -238,13 +238,7 @@ fn read_trimmed(path: &Path) -> Option<String> {
 /// (non-`--deep`) presence signal, and the `NotFound` gate for [`probe_companion`]. Uses the
 /// same [`companion_bin`] resolution the runtime spawn does.
 pub fn companion_present() -> bool {
-    let bin = companion_bin(&|k| std::env::var(k).ok());
-    if bin.contains('/') {
-        Path::new(&bin).is_file()
-    } else {
-        std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(&bin).is_file()))
-    }
+    companion_present_with(&|k| std::env::var(k).ok(), &|p| p.is_file())
 }
 
 /// The `--deep` iOS companion health probe: does `idb_companion` actually start? Reuses the

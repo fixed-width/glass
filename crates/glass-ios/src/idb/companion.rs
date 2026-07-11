@@ -80,6 +80,21 @@ fn on_path(
         .find(|p| exists(p))
 }
 
+/// Whether the companion resolves to an existing binary — the testable core of the doctor's
+/// presence check, mirroring [`companion_bin`]'s resolution so the two never drift: an explicit
+/// `GLASS_IDB_COMPANION` path must exist (a bare name must be on `PATH`); otherwise auto-discovery
+/// (`PATH`, then Homebrew prefixes) must find one. `get`/`exists` are seams for tests.
+pub(crate) fn companion_present_with(
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> bool {
+    match get("GLASS_IDB_COMPANION").filter(|s| !s.is_empty()) {
+        Some(bin) if bin.contains('/') => exists(Path::new(&bin)),
+        Some(bin) => on_path(&bin, get, exists).is_some(),
+        None => discover_companion(get, exists).is_some(),
+    }
+}
+
 /// The Unix-domain socket path the companion is told to serve on, under `dir`.
 /// Kept deliberately short: macOS caps `sun_path` at [`SUN_PATH_MAX`] bytes and its
 /// per-user temp dir (`/var/folders/…/T/`) already spends ~50 of them, so a longer name
@@ -342,6 +357,34 @@ mod tests {
             discover_companion(&env(&[("PATH", "/usr/bin:/bin")]), &|_: &Path| false),
             None
         );
+    }
+
+    #[test]
+    fn present_with_validates_that_an_override_path_exists() {
+        let get = env(&[("GLASS_IDB_COMPANION", "/opt/idb_companion")]);
+        assert!(companion_present_with(&get, &|p: &Path| p == Path::new("/opt/idb_companion")));
+        assert!(!companion_present_with(&get, &|_: &Path| false));
+    }
+
+    #[test]
+    fn present_with_resolves_a_bare_name_override_on_path() {
+        let get = env(&[("GLASS_IDB_COMPANION", "my_idb"), ("PATH", "/usr/bin:/bin")]);
+        assert!(companion_present_with(&get, &|p: &Path| p == Path::new("/bin/my_idb")));
+    }
+
+    #[test]
+    fn present_with_finds_homebrew_when_off_path() {
+        let get = env(&[("PATH", "/usr/bin:/bin")]);
+        assert!(companion_present_with(&get, &|p: &Path| p
+            == Path::new("/opt/homebrew/bin/idb_companion")));
+    }
+
+    #[test]
+    fn present_with_is_false_when_absent_everywhere() {
+        assert!(!companion_present_with(
+            &env(&[("PATH", "/usr/bin")]),
+            &|_: &Path| false
+        ));
     }
 
     #[test]

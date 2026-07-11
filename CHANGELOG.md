@@ -16,6 +16,13 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- iOS: a Homebrew-installed `idb_companion` is now found automatically even when glass is launched by
+  launchd (the `.app` / LaunchAgent), whose minimal `PATH` omits Homebrew's bindir — so input and the
+  accessibility tree work without setting `GLASS_IDB_COMPANION` by hand.
+- Visual baselines (`glass_baseline_save` / `glass_diff`) are written to an absolute, always-writable
+  location instead of a working-directory-relative one that failed under launchd's read-only `/` cwd.
+
 ## [0.4.0] - 2026-07-11
 
 ### Added

@@ -97,8 +97,11 @@ Multi-touch gestures (`glass_gesture` — pinch, rotate, two-finger swipe) are n
 Simulator yet. If `idb_companion` isn't installed, the input and accessibility tools return an
 unsupported error, while capture, logs, and clipboard keep working.
 
-Set `GLASS_IDB_COMPANION` to the `idb_companion` binary's path if it isn't on `PATH` (or to pin a
-specific build).
+glass finds `idb_companion` on `PATH`, and — because a `.app` / LaunchAgent launch runs with a
+minimal `PATH` that omits Homebrew's bindir — also probes the standard Homebrew locations
+(`/opt/homebrew/bin`, `/usr/local/bin`), so a `brew install` is picked up with no extra setup. Set
+`GLASS_IDB_COMPANION` to the binary's path only to override that — an install elsewhere, or to pin a
+specific build.
 
 ## Check the setup
 

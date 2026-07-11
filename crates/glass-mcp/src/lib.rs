@@ -279,13 +279,21 @@ pub fn run_doctor(deep: bool, json: bool, audit_log: Option<&str>) -> ! {
 }
 
 /// Directory for visual baselines. Deliberately **absolute** and under the system temp dir:
-/// baselines are per-session (they do not outlive a `glass_start`), and a cwd-relative path
-/// breaks when glass runs with a read-only working directory — e.g. a `.app`/LaunchAgent glass
-/// launched by launchd, whose cwd is `/`, where the old cwd-relative store failed every
+/// baselines are per-session (they do not outlive the process), and a cwd-relative path breaks
+/// when glass runs with a read-only working directory — e.g. a `.app`/LaunchAgent glass launched
+/// by launchd, whose cwd is `/`, where the old cwd-relative store failed every
 /// `glass_baseline_save` with a read-only-filesystem error. `std::env::temp_dir()` is always
 /// writable and honors `TMPDIR`.
+///
+/// **Scoped by process id** (like the iOS companion's socket path): the base temp dir can be
+/// shared across users (Linux `/tmp`), so an unscoped `…/glass/baselines` would let concurrent
+/// sessions clobber each other's baselines by name and, on a multi-user host, leave the directory
+/// owned by whoever ran glass first — readable by others and un-writable by everyone else. A
+/// per-pid segment gives each server its own store owned by the user running it.
 fn default_baseline_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("glass").join("baselines")
+    std::env::temp_dir()
+        .join(format!("glass-{}", std::process::id()))
+        .join("baselines")
 }
 
 /// Build the `Glass` session manager, installing the audit sink if one is configured.
@@ -377,6 +385,16 @@ mod tests {
         // A cwd-relative baseline dir fails every save when glass runs with cwd `/` (a launchd
         // `.app`/LaunchAgent). The default must be absolute.
         assert!(super::default_baseline_dir().is_absolute());
+    }
+
+    #[test]
+    fn baseline_dir_is_process_scoped_so_concurrent_sessions_dont_collide() {
+        // The temp root can be shared across users/sessions; a per-pid segment keeps each
+        // server's baselines separate and user-owned.
+        let dir = super::default_baseline_dir();
+        assert!(dir
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
     }
 
     #[test]
