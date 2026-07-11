@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -140,18 +139,6 @@ pub fn build_sway_command(
         cmd.current_dir(dir);
     }
     cmd
-}
-
-/// Pipe a child stream's lines into the shared log sink (background thread).
-pub fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
-    std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 #[cfg(test)]
