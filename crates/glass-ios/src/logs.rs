@@ -8,15 +8,26 @@ use std::time::Duration;
 
 use glass_core::Stream;
 
+/// Does `line` look like a real `log stream --style compact` entry, as opposed to the tool's
+/// own startup output? Compact entries begin with an ISO-ish timestamp (`2026-07-11 ...`), so a
+/// leading ASCII digit distinguishes them from the `Timestamp  Ty Process[PID:TID]` column
+/// header and the `getpwuid_r ...` warning the `log` tool prints *before* it begins streaming.
+/// Readiness keys off this so the launch gate opens only once logd is actually delivering, not
+/// merely once the tool has announced itself.
+fn is_log_entry(line: &str) -> bool {
+    line.as_bytes().first().is_some_and(u8::is_ascii_digit)
+}
+
 /// Buffered lines plus the one-shot readiness flags the pump thread signals.
 #[derive(Default)]
 struct Inner {
     lines: Vec<(Stream, String)>,
-    /// Set once the pump delivers its first line: the `log stream` subscription is active, so
-    /// the stream is provably live.
-    first_line: bool,
+    /// Set once the pump delivers a genuine log entry (per [`is_log_entry`]): logd is actually
+    /// delivering, so the subscription is active and the stream is provably live. The tool's
+    /// header/warning banner does not set this.
+    saw_entry: bool,
     /// Set once the pump's read loop ends (EOF) — the child died / produced nothing — or when
-    /// there is no child at all. Distinct from `first_line` so a dead stream unblocks a waiter
+    /// there is no child at all. Distinct from `saw_entry` so a dead stream unblocks a waiter
     /// without ever claiming to be live.
     finished: bool,
 }
@@ -29,13 +40,15 @@ pub struct SharedLog(Arc<(Mutex<Inner>, Condvar)>);
 impl SharedLog {
     /// Append a line. A poisoned lock (some other thread already panicked while holding it)
     /// simply drops the line rather than panicking here too, matching `glass-android`'s
-    /// `LogSink`. The first line also flips the readiness signal and wakes any waiter.
+    /// `LogSink`. The first *genuine log entry* (not the tool's header/warning banner) also
+    /// flips the readiness signal and wakes any waiter.
     pub fn push(&self, stream: Stream, line: String) {
         let (lock, cv) = &*self.0;
         if let Ok(mut inner) = lock.lock() {
+            let is_entry = is_log_entry(&line);
             inner.lines.push((stream, line));
-            if !inner.first_line {
-                inner.first_line = true;
+            if is_entry && !inner.saw_entry {
+                inner.saw_entry = true;
                 cv.notify_all();
             }
         }
@@ -53,23 +66,23 @@ impl SharedLog {
         }
     }
 
-    /// Block until the stream proves live (a first line arrived), or is known dead (EOF / no
-    /// child), or `timeout` elapses. Returns `true` only when a line was seen. A dead or
-    /// absent stream returns `false` at once rather than burning the full `timeout`.
+    /// Block until the stream proves live (a genuine log entry arrived), or is known dead (EOF
+    /// / no child), or `timeout` elapses. Returns `true` only when a real entry was seen. A
+    /// dead or absent stream returns `false` at once rather than burning the full `timeout`.
     pub fn wait_ready(&self, timeout: Duration) -> bool {
         let (lock, cv) = &*self.0;
         // Recover the guard on poison rather than bailing to `false`: the lock holders run no
         // panic-prone code so poison is unreachable, but were it ever poisoned the real
-        // `first_line` state is still the honest answer — symmetric with the post-wait
-        // recovery below.
+        // `saw_entry` state is still the honest answer — symmetric with the post-wait recovery
+        // below.
         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let guard = match cv
-            .wait_timeout_while(guard, timeout, |inner| !inner.first_line && !inner.finished)
+            .wait_timeout_while(guard, timeout, |inner| !inner.saw_entry && !inner.finished)
         {
             Ok((guard, _)) => guard,
             Err(poisoned) => poisoned.into_inner().0,
         };
-        guard.first_line
+        guard.saw_entry
     }
 
     /// Take and clear all buffered lines.
@@ -126,10 +139,10 @@ impl LogStream {
         Self { child, buf }
     }
 
-    /// Block until the stream is confirmed live (its first line arrived), or known dead / not
-    /// spawned, or `timeout` elapses. Returns `true` only when the stream proved live. Used to
-    /// gate `simctl launch` on an active subscription so launch-time log lines are not lost to
-    /// the live-tail race.
+    /// Block until the stream is confirmed live (a genuine log entry arrived — not just the
+    /// tool's startup banner), or known dead / not spawned, or `timeout` elapses. Returns
+    /// `true` only when the stream proved live. Used to gate `simctl launch` on an active
+    /// subscription so launch-time log lines are not lost to the live-tail race.
     pub fn wait_until_ready(&self, timeout: Duration) -> bool {
         self.buf.wait_ready(timeout)
     }
@@ -179,12 +192,43 @@ mod tests {
         assert!(!buf.wait_ready(Duration::ZERO));
     }
 
+    /// A representative `log stream --style compact` entry line (starts with a timestamp).
+    const ENTRY: &str = "2026-07-11 10:03:28.611 A  backboardd[2823:28ff3] hello";
+
     #[test]
-    fn wait_ready_is_true_after_a_line() {
-        // One delivered line proves the subscription is active — the stream is live.
+    fn wait_ready_is_true_after_a_real_entry() {
+        // A genuine timestamped entry proves the logd subscription is delivering — live.
         let buf = SharedLog::default();
-        buf.push(Stream::Stdout, "some system line".into());
+        buf.push(Stream::Stdout, ENTRY.into());
         assert!(buf.wait_ready(Duration::ZERO));
+    }
+
+    #[test]
+    fn wait_ready_ignores_the_stream_header_and_warning() {
+        // `log stream --style compact` prints a "Timestamp  Ty Process[PID:TID]" column
+        // header and a "getpwuid_r ..." tool warning before any real entry. Those are the
+        // tool announcing itself, NOT proof the logd subscription is active, so they must not
+        // flip readiness — otherwise the launch gate could open before the stream is truly
+        // live and lose the app's launch-time line (the #136 race).
+        let buf = SharedLog::default();
+        buf.push(
+            Stream::Stdout,
+            "getpwuid_r did not find a match for uid 501".into(),
+        );
+        buf.push(
+            Stream::Stdout,
+            "Timestamp               Ty Process[PID:TID]".into(),
+        );
+        assert!(
+            !buf.wait_ready(Duration::ZERO),
+            "the header/warning banner must not count as live"
+        );
+        // The lines are still buffered — only the readiness signal ignores them.
+        buf.push(Stream::Stdout, ENTRY.into());
+        assert!(
+            buf.wait_ready(Duration::ZERO),
+            "a real entry after the banner proves live"
+        );
     }
 
     #[test]
@@ -198,10 +242,10 @@ mod tests {
 
     #[test]
     fn wait_ready_wakes_when_a_line_arrives() {
-        // A line pushed from another thread wakes a blocked waiter well before the cap.
+        // A real entry pushed from another thread wakes a blocked waiter well before the cap.
         let buf = SharedLog::default();
         let other = buf.clone();
-        std::thread::spawn(move || other.push(Stream::Stdout, "some system line".into()));
+        std::thread::spawn(move || other.push(Stream::Stdout, ENTRY.into()));
         assert!(buf.wait_ready(Duration::from_secs(2)));
     }
 }
