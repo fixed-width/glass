@@ -823,4 +823,49 @@ mod key_tests {
             Err(GlassError::InvalidKey(_))
         ));
     }
+
+    #[test]
+    fn android_keycode_maps_named_keys_letters_digits_and_function_keys() {
+        // Named X keysyms -> their Android KEYCODE_* — pins the whole match table so a wrong
+        // constant (e.g. Up/Down swapped) fails here rather than only misbehaving on a device.
+        let named = [
+            (0xff0d_u32, 66_u32), // Return    -> ENTER
+            (0xff1b, 111),        // Escape    -> ESCAPE
+            (0xff09, 61),         // Tab       -> TAB
+            (0xff08, 67),         // Backspace -> DEL
+            (0xffff, 112),        // Delete    -> FORWARD_DEL
+            (0x0020, 62),         // space     -> SPACE
+            (0xff52, 19),         // Up        -> DPAD_UP
+            (0xff54, 20),         // Down      -> DPAD_DOWN
+            (0xff51, 21),         // Left      -> DPAD_LEFT
+            (0xff53, 22),         // Right     -> DPAD_RIGHT
+            (0xff50, 122),        // Home      -> MOVE_HOME
+            (0xff57, 123),        // End       -> MOVE_END
+        ];
+        for (keysym, code) in named {
+            assert_eq!(
+                android_keycode(keysym),
+                Some(code),
+                "keysym {keysym:#06x} should map to {code}"
+            );
+        }
+        // ASCII letter/digit shortcuts and the F1..F12 range endpoints.
+        assert_eq!(android_keycode(u32::from('a')), Some(29)); // KEYCODE_A
+        assert_eq!(android_keycode(u32::from('z')), Some(29 + 25));
+        assert_eq!(android_keycode(u32::from('0')), Some(7)); // KEYCODE_0
+        assert_eq!(android_keycode(u32::from('9')), Some(16));
+        assert_eq!(android_keycode(0xffbe), Some(131)); // F1
+        assert_eq!(android_keycode(0xffc9), Some(142)); // F12
+                                                        // An unmapped keysym yields None (so the chord path reports InvalidKey).
+        assert_eq!(android_keycode(0xff67), None); // Menu — not mapped
+    }
+
+    #[test]
+    fn meta_keycode_maps_each_modifier_to_its_left_variant() {
+        use glass_core::Modifier;
+        assert_eq!(meta_keycode(Modifier::Control), 113); // CTRL_LEFT
+        assert_eq!(meta_keycode(Modifier::Shift), 59); // SHIFT_LEFT
+        assert_eq!(meta_keycode(Modifier::Alt), 57); // ALT_LEFT
+        assert_eq!(meta_keycode(Modifier::Super), 117); // META_LEFT
+    }
 }
