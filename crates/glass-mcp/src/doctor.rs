@@ -160,22 +160,18 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     #[cfg(target_os = "macos")]
     {
         let ios_selected = backend == "ios";
-        let mut ios_checks = glass_ios::doctor::checks(deep && ios_selected);
-        // The companion drives input + the accessibility reader; only worth reporting when
-        // ios is actually the backend in play, mirroring android's gated deep probes. On
-        // --deep, probe it for real (spawn against a booted sim, else a bounded self-test);
-        // otherwise just report resolvable-on-PATH presence.
-        if ios_selected {
-            let companion = if deep {
-                companion_deep_check(glass_ios::doctor::probe_companion())
-            } else {
-                idb_companion_check(glass_ios::doctor::companion_present())
-            };
-            ios_checks.push(companion);
-        }
-        if !ios_selected {
-            soften_inactive_ios(&mut ios_checks);
-        }
+        let base = glass_ios::doctor::checks(deep && ios_selected);
+        // The companion gates all iOS input + accessibility, so its status is *always* surfaced —
+        // an operator driving iOS per-call from a macos-default server still needs to see it. Only
+        // the expensive --deep spawn probe is gated to the selected backend (mirroring android's
+        // gated deep probes): spawn against a booted sim (else a bounded self-test) when driving
+        // iOS with --deep, otherwise just report resolvable-on-PATH presence.
+        let companion = if ios_selected && deep {
+            companion_deep_check(glass_ios::doctor::probe_companion())
+        } else {
+            idb_companion_check(glass_ios::doctor::companion_present())
+        };
+        let ios_checks = ios_checks_assembled(base, companion, ios_selected);
         sections.push(Section::new("ios", Some("ios".into()), ios_checks));
     }
 
@@ -209,7 +205,7 @@ fn audit_section(report: &crate::audit::AuditReport) -> Section {
 }
 
 /// Downgrade any `Fail` check to `Warn`, noting that it's only required when `backend` is
-/// selected — shared by [`soften_inactive_android`] and [`soften_inactive_ios`] so a missing
+/// selected — shared by [`soften_inactive_android`] and [`ios_checks_assembled`] so a missing
 /// tool for a backend the user isn't driving doesn't fail the overall diagnosis. The actual
 /// status is still reported, just softened.
 fn soften_inactive_fails(checks: &mut [Check], backend: &str) {
@@ -247,15 +243,23 @@ fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
     }
 }
 
-/// When ios isn't the active backend, its presence checks are advisory — same rationale as
-/// [`soften_inactive_android`], via the shared [`soften_inactive_fails`]. Unlike android, ios
-/// has no deep-probe skip message to correct: `glass_ios::doctor::checks` accepts `deep` only
-/// for signature parity (iOS has no expensive probe of its own), so it never emits a
-/// "run with --deep" hint that would need re-pointing. Only used from the macOS-only ios
-/// section above (see this crate's Cargo.toml for why `glass-ios` itself is macOS-only).
-#[cfg(target_os = "macos")]
-fn soften_inactive_ios(checks: &mut [Check]) {
-    soften_inactive_fails(checks, "ios");
+/// Assemble the `[ios]` section: the base toolchain checks (`glass_ios::doctor::checks`) plus the
+/// always-present `idb_companion` check, then — when ios isn't the selected backend — soften any
+/// `Fail` to an advisory `Warn` via the shared [`soften_inactive_fails`], so a missing tool for a
+/// backend the user isn't driving doesn't fail the overall diagnosis. The companion line is
+/// appended unconditionally: it gates all iOS input + a11y, so an operator must see its status even
+/// when driving iOS per-call from a macos-default server, where an absent companion then reads as
+/// that advisory `Warn` rather than an omitted line. Unlike android, `glass_ios::doctor::checks`
+/// emits no "run with --deep" skip line, so there is no skip message to re-point. Pure over its
+/// inputs (no OS probes) so this behaviour is unit-tested on every host, not only macOS; kept out
+/// of `#[cfg]` (only its caller is macOS-only), mirroring [`idb_companion_check`].
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn ios_checks_assembled(mut base: Vec<Check>, companion: Check, ios_selected: bool) -> Vec<Check> {
+    base.push(companion);
+    if !ios_selected {
+        soften_inactive_fails(&mut base, "ios");
+    }
+    base
 }
 
 /// The shared `idb_companion` install remedy.
@@ -521,24 +525,95 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn inactive_ios_fails_soften_to_warn() {
-        let mut checks = vec![
+    fn ios_section_always_includes_companion_and_softens_when_inactive() {
+        // #135: the idb_companion line must appear even when ios isn't the selected backend, and an
+        // absent companion must read as an advisory Warn there — not a Fail that reddens the overall
+        // verdict, and not an omitted line that reads like "not found".
+        let base = vec![
+            Check::new(
+                "xcode",
+                CheckStatus::Ok,
+                "active developer dir: /Applications/Xcode.app",
+            ),
+            Check::new("device", CheckStatus::Ok, "1 iPhone simulator(s) available"),
+        ];
+        let checks = ios_checks_assembled(base, idb_companion_check(false), false);
+        let companion = checks
+            .iter()
+            .find(|c| c.name == "idb_companion")
+            .expect("idb_companion line must be present when ios is inactive");
+        assert_eq!(companion.status, CheckStatus::Warn); // softened from Fail
+        assert!(
+            companion
+                .detail
+                .contains("only required when the ios backend is selected"),
+            "{}",
+            companion.detail
+        );
+        assert_eq!(companion.remedy.as_deref(), Some(IDB_COMPANION_REMEDY)); // remedy preserved
+    }
+
+    #[test]
+    fn ios_section_companion_stays_fail_when_selected() {
+        // When ios IS the selected backend, an absent companion stays a Fail — iOS is unusable
+        // without it — so it reddens the overall verdict (cf. missing_companion_fails_the_ios_verdict).
+        let base = vec![Check::new(
+            "device",
+            CheckStatus::Ok,
+            "1 iPhone simulator(s) available",
+        )];
+        let checks = ios_checks_assembled(base, idb_companion_check(false), true);
+        let companion = checks
+            .iter()
+            .find(|c| c.name == "idb_companion")
+            .expect("idb_companion line");
+        assert_eq!(companion.status, CheckStatus::Fail);
+        assert_eq!(companion.remedy.as_deref(), Some(IDB_COMPANION_REMEDY));
+    }
+
+    #[test]
+    fn ios_checks_assembled_softens_base_fails_when_inactive() {
+        // Base toolchain Fails become advisory Warns when ios isn't the selected backend (a missing
+        // Xcode shouldn't fail the run for a macos/desktop user). Replaces the old
+        // inactive_ios_fails_soften_to_warn, now that softening lives in ios_checks_assembled.
+        let base = vec![
             Check::new("xcode", CheckStatus::Fail, "no active developer directory")
                 .with_remedy("install Xcode from the App Store"),
             Check::new("device", CheckStatus::Ok, "1 iPhone simulator(s) available"),
         ];
-        soften_inactive_ios(&mut checks);
-        assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
-        assert!(checks[0]
+        let checks = ios_checks_assembled(base, idb_companion_check(true), false);
+        let xcode = checks.iter().find(|c| c.name == "xcode").unwrap();
+        assert_eq!(xcode.status, CheckStatus::Warn); // Fail → Warn
+        assert!(xcode
             .detail
             .contains("only required when the ios backend is selected"));
         assert_eq!(
-            checks[0].remedy.as_deref(),
+            xcode.remedy.as_deref(),
             Some("install Xcode from the App Store")
         ); // remedy preserved
-        assert_eq!(checks[1].status, CheckStatus::Ok); // Ok untouched
+        assert_eq!(
+            checks.iter().find(|c| c.name == "device").unwrap().status,
+            CheckStatus::Ok
+        ); // Ok untouched
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diagnose_ios_section_always_has_companion_line() {
+        // The real aggregator path: regardless of the ambient GLASS_BACKEND (ios selected or not),
+        // the [ios] section carries an idb_companion check — the #135 regression guard.
+        let d = diagnose(false);
+        let ios = d
+            .sections
+            .iter()
+            .find(|s| s.title == "ios")
+            .expect("ios section");
+        assert!(
+            ios.checks.iter().any(|c| c.name == "idb_companion"),
+            "ios section must always include an idb_companion check: {:?}",
+            ios.checks
+        );
     }
 
     #[test]

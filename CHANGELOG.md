@@ -22,6 +22,11 @@ internal refactors, CI, or test-only changes.
   accessibility tree work without setting `GLASS_IDB_COMPANION` by hand.
 - Visual baselines (`glass_baseline_save` / `glass_diff`) are written to an absolute, always-writable
   location instead of a working-directory-relative one that failed under launchd's read-only `/` cwd.
+- iOS: `glass doctor` now always shows the `idb_companion` status in the `[ios]` section, even when
+  iOS isn't the selected backend (e.g. a `.app` / LaunchAgent server defaulting to `GLASS_BACKEND=macos`
+  while iOS is driven per-call). Previously the line was omitted unless `GLASS_BACKEND=ios`, so its
+  absence read like "not found" for the input/accessibility precondition. When iOS isn't the active
+  backend an absent companion is reported as an advisory warning rather than a hard failure.
 
 ## [0.4.0] - 2026-07-11
 
