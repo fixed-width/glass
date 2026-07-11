@@ -275,7 +275,7 @@ pub struct ScrollToElementArgs {
     /// Scroll anchor y (window-relative). See `x`.
     pub y: Option<i32>,
     /// Wheel notches per scroll step (default 3). A calibration escape hatch — larger
-    /// covers distance faster but risks stepping past a row's realized band.
+    /// covers distance faster but risks stepping past a row's/column's realized band.
     pub step: Option<u32>,
     /// Give up after this long (default 20000ms); returns `{matched:false}`.
     pub timeout_ms: Option<u64>,

@@ -137,14 +137,17 @@ impl ScrollDirection {
 /// window edge its bounds lie fully past. `None` when the bounds already
 /// intersect the viewport (nothing to infer). Off two edges at once → the larger
 /// overflow wins. Used when the caller omits `direction`.
-fn offscreen_direction(b: &AxRect, win_w: i32, win_h: i32) -> Option<ScrollDirection> {
-    let w = b.width as i32;
-    let h = b.height as i32;
+fn offscreen_direction(b: AxRect, win_w: u32, win_h: u32) -> Option<ScrollDirection> {
+    // Compute overflow magnitudes in `i64` so bounds near `i32::MAX` can't wrap; the
+    // tie-break only needs relative magnitude, not the exact pixel distance.
+    let (win_w, win_h) = (i64::from(win_w), i64::from(win_h));
+    let (x, y) = (i64::from(b.x), i64::from(b.y));
+    let (w, h) = (i64::from(b.width), i64::from(b.height));
     [
-        (ScrollDirection::Right, b.x >= win_w, b.x - win_w + 1),
-        (ScrollDirection::Left, b.x + w <= 0, -(b.x + w) + 1),
-        (ScrollDirection::Down, b.y >= win_h, b.y - win_h + 1),
-        (ScrollDirection::Up, b.y + h <= 0, -(b.y + h) + 1),
+        (ScrollDirection::Right, x >= win_w, x - win_w + 1),
+        (ScrollDirection::Left, x + w <= 0, -(x + w) + 1),
+        (ScrollDirection::Down, y >= win_h, y - win_h + 1),
+        (ScrollDirection::Up, y + h <= 0, -(y + h) + 1),
     ]
     .into_iter()
     .filter(|&(_, off, _)| off)
@@ -160,9 +163,10 @@ fn offscreen_direction(b: &AxRect, win_w: i32, win_h: i32) -> Option<ScrollDirec
 fn scroll_anchor(
     dir: ScrollDirection,
     bounds: Option<AxRect>,
-    win_w: i32,
-    win_h: i32,
+    win_w: u32,
+    win_h: u32,
 ) -> (i32, i32) {
+    let (win_w, win_h) = (win_w as i32, win_h as i32);
     match bounds {
         Some(b) => {
             let cx = (b.x + b.width as i32 / 2).clamp(0, (win_w - 1).max(0));
@@ -186,7 +190,9 @@ pub struct ScrollToElementParams {
     /// Sweep direction; `None` = infer from the target's off-screen bounds
     /// (falling back to `Down`→`Up` when the target isn't in the tree yet).
     pub direction: Option<ScrollDirection>,
-    /// Scroll anchor (window-relative). `None` → the active window's center.
+    /// Scroll anchor (window-relative). `None` derives the anchor from the target's
+    /// own row/column (via the private `scroll_anchor` helper), falling back to the
+    /// active window's center only when the target's bounds are unknown.
     pub anchor: Option<(i32, i32)>,
     /// Wheel notches issued per scroll step.
     pub step: u32,
@@ -337,15 +343,18 @@ impl Glass {
     }
 
     /// Scroll a container (at `anchor`, default derived from the target's own bounds
-    /// — see [`scroll_anchor`] — else the active window's center) until an element
-    /// matching name/role/value realizes in the a11y tree *and* is actually on-screen
-    /// (its bounds intersect the viewport — see [`AxRect::clamped_center`]; a11y trees
-    /// can report a node's bounds before it is scrolled into view), then return it —
-    /// its id is from the final snapshot, so it is immediately `click_element`-able.
+    /// — see the private `scroll_anchor` helper — else the active window's center)
+    /// until an element matching name/role/value realizes in the a11y tree *and* is
+    /// actually on-screen (its bounds intersect the viewport — see
+    /// [`AxRect::clamped_center`]; a11y trees can report a node's bounds before it is
+    /// scrolled into view), then return it — its id is from the final snapshot, so it
+    /// is immediately `click_element`-able. A matched element whose bounds are unknown
+    /// (`bounds: None`, from a backend that can't read geometry) is returned as-is:
+    /// scrolling can't populate the bounds, so there is nothing to bring into view.
     /// `direction` picks the primary sweep axis explicitly; when omitted it is
-    /// inferred from the target's current off-screen bounds (see
-    /// [`offscreen_direction`]), falling back to `Down` when the target isn't in the
-    /// tree yet. For a virtualized list the target row is absent from the tree until
+    /// inferred from the target's current off-screen bounds (see the private
+    /// `offscreen_direction` helper), falling back to `Down` when the target isn't in
+    /// the tree yet. For a virtualized list the target row is absent from the tree until
     /// scrolled into range; this checks the current view, sweeps the primary
     /// direction to its end, then reverses to cover the other end. End-of-scroll is
     /// detected from the accessibility tree: when a scroll step leaves the tree's
@@ -363,7 +372,12 @@ impl Glass {
     /// primary direction and returns `{matched:false}` instead of reversing; pass the
     /// `direction` the target actually lies in to avoid the wasted sweep. (2) A very
     /// long list can exceed `timeout_ms` before a distant target scrolls into range —
-    /// raise `timeout_ms`, or `step` to cover more per move.
+    /// raise `timeout_ms`, or `step` to cover more per move. (3) With `direction`
+    /// omitted, inferring the axis needs the target's current bounds; when the target
+    /// isn't in the a11y tree yet (a not-yet-realized virtualized item) there is
+    /// nothing to infer from and the sweep defaults to vertical (`down`→`up`) — pass
+    /// `direction` explicitly for a horizontal container whose target isn't realized
+    /// yet.
     pub fn scroll_to_element(
         &mut self,
         params: &ScrollToElementParams,
@@ -371,11 +385,15 @@ impl Glass {
         self.require_active()?;
         let start = std::time::Instant::now();
         let geo = self.geometry()?;
-        let (gw, gh) = (geo.width as i32, geo.height as i32);
-        let visible = |info: &ElementInfo| {
-            info.bounds
-                .and_then(|b| b.clamped_center(geo.width, geo.height))
-                .is_some()
+        // Return a match once scrolling can't improve its visibility: it has an
+        // on-screen clickable center, or its bounds are unknown (a backend that can't
+        // read an element's geometry keeps `bounds: None` — scrolling won't populate
+        // them, and `click_element` reports that state honestly). Only a known
+        // off-screen element (bounds present but no on-screen intersection) is worth
+        // scrolling past.
+        let ready = |info: &ElementInfo| match info.bounds {
+            Some(b) => b.clamped_center(geo.width, geo.height).is_some(),
+            None => true,
         };
 
         // One pre-sweep snapshot serves four jobs: early return if already visible,
@@ -387,26 +405,28 @@ impl Glass {
         // target's off-screen bounds, else the default vertical sweep.
         let primary = params.direction.unwrap_or_else(|| {
             found0_bounds
-                .and_then(|b| offscreen_direction(&b, gw, gh))
+                .and_then(|b| offscreen_direction(b, geo.width, geo.height))
                 .unwrap_or(ScrollDirection::Down)
         });
 
-        if let Some(info) = &found0 {
-            if visible(info) {
-                return Ok(ScrollToElementOutcome {
-                    matched: true,
-                    element: Some(info.clone()),
-                    elapsed_ms: start.elapsed().as_millis() as u64,
-                    steps: 0,
-                    reversed: false,
-                    direction: primary,
-                });
-            }
+        // Every return shares this tail (elapsed_ms/direction); only the matched flag,
+        // element, step count, and reversed flag vary.
+        let outcome = |matched, element, steps, reversed| ScrollToElementOutcome {
+            matched,
+            element,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            steps,
+            reversed,
+            direction: primary,
+        };
+
+        if let Some(info) = found0.filter(|i| ready(i)) {
+            return Ok(outcome(true, Some(info), 0, false));
         }
 
         let (ax, ay) = params
             .anchor
-            .unwrap_or_else(|| scroll_anchor(primary, found0_bounds, gw, gh));
+            .unwrap_or_else(|| scroll_anchor(primary, found0_bounds, geo.width, geo.height));
 
         let mut steps: u32 = 0;
         for (i, dir) in [primary, primary.opposite()].into_iter().enumerate() {
@@ -415,14 +435,7 @@ impl Glass {
                 if start.elapsed().as_millis() as u64 >= params.timeout_ms
                     || steps >= SCROLL_TO_MAX_STEPS
                 {
-                    return Ok(ScrollToElementOutcome {
-                        matched: false,
-                        element: None,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                        steps,
-                        reversed,
-                        direction: primary,
-                    });
+                    return Ok(outcome(false, None, steps, reversed));
                 }
                 let (dx, dy) = dir.delta(params.step);
                 self.pointer(&PointerEvent::Scroll {
@@ -433,20 +446,11 @@ impl Glass {
                     modifiers: vec![],
                 })?;
                 steps += 1;
-                // Let the scrolled rows realize in the a11y tree before re-reading.
+                // Let the scrolled rows/columns realize in the a11y tree before re-reading.
                 std::thread::sleep(std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS));
                 let (found, outline) = self.snapshot_match_outline(params)?;
-                if let Some(info) = found {
-                    if visible(&info) {
-                        return Ok(ScrollToElementOutcome {
-                            matched: true,
-                            element: Some(info),
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                            steps,
-                            reversed,
-                            direction: primary,
-                        });
-                    }
+                if let Some(info) = found.filter(|i| ready(i)) {
+                    return Ok(outcome(true, Some(info), steps, reversed));
                 }
                 // No change in the a11y tree ⇒ the container did not advance ⇒ this
                 // end is reached; sweep the opposite direction.
@@ -457,14 +461,7 @@ impl Glass {
                 }
             }
         }
-        Ok(ScrollToElementOutcome {
-            matched: false,
-            element: None,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            steps,
-            reversed: true,
-            direction: primary,
-        })
+        Ok(outcome(false, None, steps, true))
     }
 
     /// Snapshot the current view once; return the matched element (if the selector is
@@ -985,10 +982,88 @@ mod tests {
         assert_eq!(out.direction, ScrollDirection::Down);
     }
 
+    #[test]
+    fn scroll_to_element_bounds_unknown_returns_without_scrolling() {
+        // A matched element whose backend can't read its geometry keeps `bounds:
+        // None`. Scrolling can never populate the bounds, so the match must return
+        // immediately (steps == 0) and issue no scroll — not sweep to the cap and
+        // report a misleading `matched:false`.
+        let scrolls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_scroll_log(scrolls.clone());
+        // A Button with no bounds (a backend that can't read geometry keeps it None).
+        let tree = tree_with(100, 100, vec![ax_node(1, AxRole::Button, None, vec![])]);
+        let mut g = glass_with_a11y(platform, tree);
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: None,
+                role: Some(AxRole::Button),
+                value_contains: None,
+                direction: None,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert_eq!(out.steps, 0);
+        assert!(out.element.unwrap().bounds.is_none());
+        assert!(
+            scrolls.lock().unwrap().is_empty(),
+            "a bounds-unknown match must not trigger any scroll"
+        );
+    }
+
+    #[test]
+    fn scroll_to_element_absent_with_omitted_direction_defaults_to_down() {
+        // Omitted direction + a target never in the tree: inference has nothing to go
+        // on, so the sweep falls back to the vertical down→up axis and reports it.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree()); // no node named "Ghost"
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: None,
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert_eq!(out.direction, ScrollDirection::Down);
+    }
+
+    #[test]
+    fn scroll_to_element_absent_horizontal_sweeps_both_ends_then_reports_unmatched() {
+        // The horizontal mirror of the vertical absent sweep: the target never
+        // appears and the outline never changes, so each end saturates after one
+        // step and the sweep terminates reversed, matched:false.
+        let platform = FakePlatform::new(100, 100);
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Right),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert!(out.reversed, "must have reversed to sweep the other end");
+        assert_eq!(out.steps, 2);
+        assert_eq!(out.direction, ScrollDirection::Right);
+    }
+
     // A horizontal toolbar (thin band at y≈250) whose "ZoomIn" button is at
     // `zoomin_x`, off the right edge until scrolled into the 1206-wide viewport.
     fn toolbar_tree(zoomin_x: i32) -> AxTree {
-        use crate::session::test_support::{named_node, tree_with};
         tree_with(
             1206,
             2622,
@@ -1021,7 +1096,6 @@ mod tests {
 
     #[test]
     fn scroll_to_element_horizontal_returns_only_when_on_screen() {
-        use crate::session::test_support::{glass_with_a11y_seq, FakePlatform};
         // Snapshot 0: ZoomIn off the right edge (x=1600). 1: still off (x=1300).
         // 2: on-screen (x=1000). Require-visible must skip 0 and 1, return at 2.
         let trees = vec![toolbar_tree(1600), toolbar_tree(1300), toolbar_tree(1000)];
@@ -1052,7 +1126,6 @@ mod tests {
 
     #[test]
     fn scroll_to_element_infers_right_and_anchors_on_the_row() {
-        use crate::session::test_support::{glass_with_a11y_seq, FakePlatform};
         let scrolls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let platform = FakePlatform::new(1206, 2622).with_scroll_log(scrolls.clone());
         // Off right, then on-screen. No `direction` → must infer Right.
@@ -1095,12 +1168,11 @@ mod tests {
 
     #[test]
     fn scroll_to_element_infers_down_when_target_below() {
-        use crate::session::test_support::{glass_with_a11y_seq, FakePlatform};
         // A single vertical-list item below the fold, then on-screen. No direction.
-        let below = crate::session::test_support::tree_with(
+        let below = tree_with(
             1206,
             2622,
-            vec![crate::session::test_support::named_node(
+            vec![named_node(
                 1,
                 AxRole::Button,
                 "Deep",
@@ -1112,10 +1184,10 @@ mod tests {
                 },
             )],
         );
-        let on = crate::session::test_support::tree_with(
+        let on = tree_with(
             1206,
             2622,
-            vec![crate::session::test_support::named_node(
+            vec![named_node(
                 1,
                 AxRole::Button,
                 "Deep",
@@ -1142,6 +1214,15 @@ mod tests {
             .unwrap();
         assert!(out.matched);
         assert_eq!(out.direction, ScrollDirection::Down);
+        assert!(
+            out.steps >= 1,
+            "must have scrolled past the off-screen snapshot"
+        );
+        let b = out.element.unwrap().bounds.unwrap();
+        assert!(
+            b.clamped_center(1206, 2622).is_some(),
+            "returned element is on-screen"
+        );
     }
 
     #[test]
@@ -1391,9 +1472,14 @@ mod tests {
         assert!(!Down.is_horizontal() && !Up.is_horizontal());
 
         assert_eq!(ScrollDirection::from_name("DOWN"), Some(Down));
+        assert_eq!(ScrollDirection::from_name("up"), Some(Up));
         assert_eq!(ScrollDirection::from_name("left"), Some(Left));
         assert_eq!(ScrollDirection::from_name("Right"), Some(Right));
         assert_eq!(ScrollDirection::from_name("sideways"), None);
+
+        assert_eq!(Down.as_str(), "down");
+        assert_eq!(Up.as_str(), "up");
+        assert_eq!(Left.as_str(), "left");
         assert_eq!(Right.as_str(), "right");
     }
 
@@ -1407,7 +1493,7 @@ mod tests {
             height: 60,
         };
         assert_eq!(
-            offscreen_direction(&r, 1206, 2622),
+            offscreen_direction(r, 1206, 2622),
             Some(ScrollDirection::Right)
         );
         // Fully past the left edge (x + w <= 0).
@@ -1418,7 +1504,7 @@ mod tests {
             height: 60,
         };
         assert_eq!(
-            offscreen_direction(&l, 1206, 2622),
+            offscreen_direction(l, 1206, 2622),
             Some(ScrollDirection::Left)
         );
         // Past the bottom edge.
@@ -1429,7 +1515,7 @@ mod tests {
             height: 60,
         };
         assert_eq!(
-            offscreen_direction(&d, 1206, 2622),
+            offscreen_direction(d, 1206, 2622),
             Some(ScrollDirection::Down)
         );
         // Intersects the viewport → nothing to infer.
@@ -1439,7 +1525,7 @@ mod tests {
             width: 100,
             height: 60,
         };
-        assert_eq!(offscreen_direction(&on, 1206, 2622), None);
+        assert_eq!(offscreen_direction(on, 1206, 2622), None);
         // Off two edges at once → larger overflow wins (right ~2001 vs down ~501).
         let both = AxRect {
             x: 3206,
@@ -1448,7 +1534,7 @@ mod tests {
             height: 10,
         };
         assert_eq!(
-            offscreen_direction(&both, 1206, 2622),
+            offscreen_direction(both, 1206, 2622),
             Some(ScrollDirection::Right)
         );
     }

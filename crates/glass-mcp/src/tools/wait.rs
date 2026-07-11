@@ -63,8 +63,9 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
                 .ok_or_else(|| format!("unknown direction '{d}' (use up/down/left/right)"))?,
         ),
     };
-    // Anchor: both x and y, or neither (window center). One without the other is a
-    // caller mistake worth naming rather than silently half-defaulting.
+    // Anchor: both x and y, or neither (default: the target's own row/column). One
+    // without the other is a caller mistake worth naming rather than silently
+    // half-defaulting.
     let anchor = match (a.x, a.y) {
         (Some(x), Some(y)) => Some((x, y)),
         (None, None) => None,
@@ -220,6 +221,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("name") && err.contains("role"), "got: {err}");
+    }
+
+    fn scroll_args() -> ScrollToElementArgs {
+        ScrollToElementArgs {
+            name: None,
+            role: None,
+            value_contains: None,
+            direction: None,
+            x: None,
+            y: None,
+            step: None,
+            timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn scroll_to_element_rejects_unknown_direction() {
+        let mut g = started_a11y();
+        let mut a = scroll_args();
+        a.name = Some("Save".into());
+        a.direction = Some("sideways".into());
+        let err = scroll_to_element(&mut g, &a).unwrap_err();
+        assert!(err.contains("up/down/left/right"), "got: {err}");
+    }
+
+    #[test]
+    fn scroll_to_element_output_includes_resolved_direction() {
+        // Save is already on-screen and direction is omitted, so the resolved axis
+        // falls back to the default vertical sweep and is serialized under
+        // `scrolled.direction` — guarding the `None`-inference wiring and `as_str`,
+        // which no core test exercises through the JSON output.
+        let mut g = started_a11y();
+        let mut a = scroll_args();
+        a.name = Some("Save".into());
+        let out = scroll_to_element(&mut g, &a).unwrap();
+        match &out.0[0] {
+            OutContent::Text(t) => {
+                assert!(t.contains("\"scrolled\""), "got: {t}");
+                assert!(
+                    t.contains("\"direction\":\"down\""),
+                    "resolved direction must be serialized; got: {t}"
+                );
+            }
+            _ => panic!("expected text"),
+        }
     }
 
     fn started_a11y() -> Glass {

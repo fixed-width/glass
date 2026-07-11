@@ -335,23 +335,35 @@ pub(crate) fn glass_with(platform: FakePlatform) -> Glass {
     Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
 }
 
-pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
+/// Shared `Glass`-construction boilerplate for the a11y builders: a one-shot
+/// factory yielding a `Backend` over `platform` + `accessibility`.
+fn glass_with_backend(
+    platform: FakePlatform,
+    accessibility: Box<dyn Accessibility + Send>,
+) -> Glass {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("baselines");
     std::mem::forget(dir);
     let mut held: Option<Backend> = Some(Backend {
         platform: Box::new(platform),
-        accessibility: Some(Box::new(FakeAccessibility {
-            tree,
-            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            set_fail: false,
-        })),
+        accessibility: Some(accessibility),
     });
     let factory: PlatformFactory = Box::new(move |_backend| {
         held.take()
             .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
     });
     Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+}
+
+pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
+    glass_with_backend(
+        platform,
+        Box::new(FakeAccessibility {
+            tree,
+            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            set_fail: false,
+        }),
+    )
 }
 
 /// An `Accessibility` that returns a scripted sequence of trees — one per
@@ -374,30 +386,17 @@ impl Accessibility for SeqAccessibility {
 }
 
 pub(crate) fn glass_with_a11y_seq(platform: FakePlatform, trees: Vec<AxTree>) -> Glass {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("baselines");
-    std::mem::forget(dir);
-    let mut held: Option<Backend> = Some(Backend {
-        platform: Box::new(platform),
-        accessibility: Some(Box::new(SeqAccessibility { trees, idx: 0 })),
-    });
-    let factory: PlatformFactory = Box::new(move |_backend| {
-        held.take()
-            .ok_or_else(|| GlassError::Backend("test factory called twice".into()))
-    });
-    Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
+    debug_assert!(
+        !trees.is_empty(),
+        "glass_with_a11y_seq needs at least one tree (snapshot indexes trees.len() - 1)"
+    );
+    glass_with_backend(platform, Box::new(SeqAccessibility { trees, idx: 0 }))
 }
 
 pub(crate) fn named_node(id: u32, role: AxRole, name: &str, bounds: AxRect) -> AxNode {
     AxNode {
-        id: AxNodeId(id),
-        role,
-        raw_role: format!("{role:?}"),
         name: Some(name.into()),
-        value: None,
-        states: AxStates::default(),
-        bounds: Some(bounds),
-        children: vec![],
+        ..ax_node(id, role, Some(bounds), vec![])
     }
 }
 
