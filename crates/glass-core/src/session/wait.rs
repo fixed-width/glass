@@ -69,38 +69,66 @@ const SCROLL_TO_MAX_STEPS: u32 = 500;
 /// misfire as premature saturation.
 const SCROLL_TO_SETTLE_MS: u64 = 250;
 
-/// A vertical scroll sweep direction.
+/// A scroll sweep direction. `Down`/`Up` sweep vertically, `Left`/`Right`
+/// horizontally. `Right`/`Down` reveal content to the right/below (a positive
+/// wheel delta — see [`ScrollDirection::delta`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollDirection {
     Down,
     Up,
+    Left,
+    Right,
 }
 
 impl ScrollDirection {
-    /// The other sweep direction.
+    /// The opposite sweep direction (`Down`↔`Up`, `Left`↔`Right`).
     pub fn opposite(self) -> ScrollDirection {
         match self {
             ScrollDirection::Down => ScrollDirection::Up,
             ScrollDirection::Up => ScrollDirection::Down,
+            ScrollDirection::Left => ScrollDirection::Right,
+            ScrollDirection::Right => ScrollDirection::Left,
         }
     }
-    /// Signed vertical wheel delta (notches): `Down` is positive (wheel-down),
-    /// `Up` negative. Saturates a huge `step` to `i32::MAX` so an absurd caller
-    /// value can't overflow (a plain `step as i32` would wrap, and `-(i32::MIN)`
-    /// panics in debug) — real steps are single digits.
-    pub fn dy(self, step: u32) -> i32 {
+
+    /// Signed `(dx, dy)` wheel delta (notches) for one step. `Right`/`Down` are
+    /// positive (reveal content to the right/below), `Left`/`Up` negative. A huge
+    /// `step` saturates to `i32::MAX` so an absurd caller value can't overflow
+    /// (a plain `step as i32` would wrap, and `-(i32::MIN)` panics in debug) —
+    /// real steps are single digits.
+    pub fn delta(self, step: u32) -> (i32, i32) {
         let s = i32::try_from(step).unwrap_or(i32::MAX);
         match self {
-            ScrollDirection::Down => s,
-            ScrollDirection::Up => -s,
+            ScrollDirection::Down => (0, s),
+            ScrollDirection::Up => (0, -s),
+            ScrollDirection::Right => (s, 0),
+            ScrollDirection::Left => (-s, 0),
         }
     }
+
+    /// `true` for a horizontal sweep (`Left`/`Right`).
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, ScrollDirection::Left | ScrollDirection::Right)
+    }
+
     /// Parse from a tool string (case-insensitive). `None` for unknown.
     pub fn from_name(s: &str) -> Option<ScrollDirection> {
         match s.to_ascii_lowercase().as_str() {
             "down" => Some(ScrollDirection::Down),
             "up" => Some(ScrollDirection::Up),
+            "left" => Some(ScrollDirection::Left),
+            "right" => Some(ScrollDirection::Right),
             _ => None,
+        }
+    }
+
+    /// The lowercase tool name (`"down"`/`"up"`/`"left"`/`"right"`), for output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScrollDirection::Down => "down",
+            ScrollDirection::Up => "up",
+            ScrollDirection::Left => "left",
+            ScrollDirection::Right => "right",
         }
     }
 }
@@ -325,11 +353,12 @@ impl Glass {
                         reversed,
                     });
                 }
+                let (dx, dy) = dir.delta(params.step);
                 self.pointer(&PointerEvent::Scroll {
                     x: ax,
                     y: ay,
-                    dx: 0,
-                    dy: dir.dy(params.step),
+                    dx,
+                    dy,
                     modifiers: vec![],
                 })?;
                 steps += 1;
@@ -1105,20 +1134,29 @@ mod tests {
     }
 
     #[test]
-    fn scroll_direction_opposite_and_dy() {
-        assert_eq!(ScrollDirection::Down.opposite(), ScrollDirection::Up);
-        assert_eq!(ScrollDirection::Up.opposite(), ScrollDirection::Down);
-        // Down = wheel-down = positive notches; Up = negative.
-        assert_eq!(ScrollDirection::Down.dy(3), 3);
-        assert_eq!(ScrollDirection::Up.dy(3), -3);
+    fn scroll_direction_delta_opposite_names() {
+        use ScrollDirection::*;
+        assert_eq!(Down.opposite(), Up);
+        assert_eq!(Up.opposite(), Down);
+        assert_eq!(Left.opposite(), Right);
+        assert_eq!(Right.opposite(), Left);
+
+        // Right/Down are positive; Left/Up negative. (dx, dy).
+        assert_eq!(Down.delta(3), (0, 3));
+        assert_eq!(Up.delta(3), (0, -3));
+        assert_eq!(Right.delta(3), (3, 0));
+        assert_eq!(Left.delta(3), (-3, 0));
         // An absurd step saturates instead of overflowing/panicking.
-        assert_eq!(ScrollDirection::Down.dy(u32::MAX), i32::MAX);
-        assert_eq!(ScrollDirection::Up.dy(u32::MAX), -i32::MAX);
-        assert_eq!(
-            ScrollDirection::from_name("DOWN"),
-            Some(ScrollDirection::Down)
-        );
-        assert_eq!(ScrollDirection::from_name("up"), Some(ScrollDirection::Up));
+        assert_eq!(Right.delta(u32::MAX), (i32::MAX, 0));
+        assert_eq!(Left.delta(u32::MAX), (-i32::MAX, 0));
+
+        assert!(Left.is_horizontal() && Right.is_horizontal());
+        assert!(!Down.is_horizontal() && !Up.is_horizontal());
+
+        assert_eq!(ScrollDirection::from_name("DOWN"), Some(Down));
+        assert_eq!(ScrollDirection::from_name("left"), Some(Left));
+        assert_eq!(ScrollDirection::from_name("Right"), Some(Right));
         assert_eq!(ScrollDirection::from_name("sideways"), None);
+        assert_eq!(Right.as_str(), "right");
     }
 }
