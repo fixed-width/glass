@@ -19,11 +19,65 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long to wait for the companion to open its socket before giving up.
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `GLASS_IDB_COMPANION`, else `idb_companion` on PATH.
+/// Standard Homebrew `idb_companion` locations, probed when it is not on `PATH`. A `.app` or
+/// LaunchAgent glass is launched by launchd with a minimal `PATH` that omits Homebrew's bindir,
+/// so a `brew install idb-companion` would otherwise be invisible and input/accessibility would
+/// go dark with no way for the user to fix it short of setting an env var. Apple-silicon prefix
+/// first, then Intel.
+const HOMEBREW_COMPANION_PATHS: [&str; 2] = [
+    "/opt/homebrew/bin/idb_companion",
+    "/usr/local/bin/idb_companion",
+];
+
+/// The program to hand `Command::new` for the companion spawn. `GLASS_IDB_COMPANION` wins
+/// verbatim (an explicit override is trusted — a wrong path surfaces a clear spawn error);
+/// otherwise `idb_companion` is auto-discovered on `PATH`, then in Homebrew's standard prefixes;
+/// failing all that, the bare name is returned so the spawn fails with the actionable
+/// "install idb_companion" error rather than a silent no-op.
 pub fn companion_bin(get: &dyn Fn(&str) -> Option<String>) -> String {
-    get("GLASS_IDB_COMPANION")
-        .filter(|s| !s.is_empty())
+    companion_program(get, &|p| p.is_file())
+}
+
+/// [`companion_bin`] with the filesystem-existence check injected, so tests can drive resolution
+/// without touching the real environment.
+fn companion_program(
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> String {
+    if let Some(explicit) = get("GLASS_IDB_COMPANION").filter(|s| !s.is_empty()) {
+        return explicit;
+    }
+    discover_companion(get, exists)
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "idb_companion".to_string())
+}
+
+/// Auto-discover `idb_companion` when `GLASS_IDB_COMPANION` is unset: on `PATH` first, then in
+/// the standard Homebrew prefixes ([`HOMEBREW_COMPANION_PATHS`]). `None` if it is nowhere to be
+/// found. `get`/`exists` are seams so tests drive it deterministically.
+fn discover_companion(
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    on_path("idb_companion", get, exists).or_else(|| {
+        HOMEBREW_COMPANION_PATHS
+            .iter()
+            .copied()
+            .map(PathBuf::from)
+            .find(|p| exists(p))
+    })
+}
+
+/// The first `PATH` entry containing a file named `name`, if any.
+fn on_path(
+    name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let path = get("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| exists(p))
 }
 
 /// The Unix-domain socket path the companion is told to serve on, under `dir`.
@@ -225,18 +279,69 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Build an env getter from a fixed set of pairs.
+    fn env(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<&'static str, &'static str> = pairs.iter().copied().collect();
+        move |k: &str| m.get(k).map(|s| s.to_string())
+    }
+
     #[test]
-    fn companion_bin_prefers_env_then_default() {
-        let with =
-            |m: HashMap<&'static str, &'static str>| move |k: &str| m.get(k).map(|s| s.to_string());
+    fn companion_program_uses_the_env_override_verbatim() {
+        // An explicit override is trusted even when the file is absent — the spawn surfaces the error.
         assert_eq!(
-            companion_bin(&with(HashMap::from([(
-                "GLASS_IDB_COMPANION",
-                "/opt/idb_companion"
-            )]))),
+            companion_program(
+                &env(&[("GLASS_IDB_COMPANION", "/opt/idb_companion")]),
+                &|_: &Path| false,
+            ),
             "/opt/idb_companion"
         );
-        assert_eq!(companion_bin(&with(HashMap::new())), "idb_companion");
+    }
+
+    #[test]
+    fn companion_program_falls_back_to_the_bare_name_when_nothing_resolves() {
+        assert_eq!(
+            companion_program(&env(&[("PATH", "/usr/bin:/bin")]), &|_: &Path| false),
+            "idb_companion"
+        );
+    }
+
+    #[test]
+    fn discover_prefers_path_over_homebrew() {
+        let exists = |p: &Path| {
+            p == Path::new("/usr/bin/idb_companion")
+                || p == Path::new("/opt/homebrew/bin/idb_companion")
+        };
+        assert_eq!(
+            discover_companion(&env(&[("PATH", "/usr/bin")]), &exists),
+            Some(PathBuf::from("/usr/bin/idb_companion"))
+        );
+    }
+
+    #[test]
+    fn discover_finds_homebrew_when_off_path() {
+        // launchd's minimal PATH omits Homebrew's bindir; discovery still finds the brew install.
+        let exists = |p: &Path| p == Path::new("/opt/homebrew/bin/idb_companion");
+        assert_eq!(
+            discover_companion(&env(&[("PATH", "/usr/bin:/bin")]), &exists),
+            Some(PathBuf::from("/opt/homebrew/bin/idb_companion"))
+        );
+    }
+
+    #[test]
+    fn discover_prefers_apple_silicon_over_intel_prefix() {
+        // Both prefixes "exist"; the arm64 prefix is chosen first.
+        assert_eq!(
+            discover_companion(&env(&[]), &|_: &Path| true),
+            Some(PathBuf::from("/opt/homebrew/bin/idb_companion"))
+        );
+    }
+
+    #[test]
+    fn discover_is_none_when_absent_everywhere() {
+        assert_eq!(
+            discover_companion(&env(&[("PATH", "/usr/bin:/bin")]), &|_: &Path| false),
+            None
+        );
     }
 
     #[test]

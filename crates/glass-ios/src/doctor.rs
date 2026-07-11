@@ -234,9 +234,9 @@ fn read_trimmed(path: &Path) -> Option<String> {
 }
 
 /// Is the companion binary resolvable — `GLASS_IDB_COMPANION` naming an existing file, or
-/// `idb_companion` found on `PATH`? The passive (non-`--deep`) presence signal, and the
-/// `NotFound` gate for [`probe_companion`]. Uses the same [`companion_bin`] resolution the
-/// runtime spawn does.
+/// `idb_companion` found on `PATH` or in Homebrew's standard prefixes? The passive
+/// (non-`--deep`) presence signal, and the `NotFound` gate for [`probe_companion`]. Uses the
+/// same [`companion_bin`] resolution the runtime spawn does.
 pub fn companion_present() -> bool {
     let bin = companion_bin(&|k| std::env::var(k).ok());
     if bin.contains('/') {
