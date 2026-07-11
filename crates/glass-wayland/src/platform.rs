@@ -34,7 +34,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 
 use std::collections::HashMap;
 
-use crate::command::{build_sway_command, spawn_reader, sway_config, LogSink};
+use crate::command::{build_sway_command, sway_config, LogSink};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
 
@@ -516,10 +516,10 @@ fn bring_up_session(
         .spawn()
         .map_err(|e| GlassError::AppNotStarted(format!("spawn sway: {e}")))?;
     if let Some(out) = child.stdout.take() {
-        spawn_reader(out, Stream::Stdout, logs.clone());
+        glass_proc_linux::spawn_reader(out, Stream::Stdout, logs.clone());
     }
     if let Some(err) = child.stderr.take() {
-        spawn_reader(err, Stream::Stderr, logs.clone());
+        glass_proc_linux::spawn_reader(err, Stream::Stderr, logs.clone());
     }
 
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));

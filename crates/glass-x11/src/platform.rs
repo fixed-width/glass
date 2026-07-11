@@ -1,4 +1,3 @@
-use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,7 +6,7 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
-use glass_proc_linux::proc_tree_pids;
+use glass_proc_linux::{proc_tree_pids, spawn_reader};
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::*;
@@ -705,18 +704,6 @@ fn note_if_clipped(rect: &crate::coords::ClippedRect) {
             rect.w, rect.h, rect.sx, rect.sy
         );
     }
-}
-
-fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, sink: LogSink) {
-    std::thread::spawn(move || {
-        let buf = BufReader::new(reader);
-        for line in buf.lines() {
-            match line {
-                Ok(text) => sink.lock().expect("log sink mutex").push((stream, text)),
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 // The process-tree walk (`/proc`-based) that maps the spawned child to the
