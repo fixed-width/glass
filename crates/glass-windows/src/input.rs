@@ -307,6 +307,14 @@ impl glass_core::TypeSink for WindowsTypeSink {
 
 /// Inject a pointer event into the active window. Coordinates are window-relative.
 pub(crate) fn send_pointer(active_hwnd: isize, event: &PointerEvent) -> Result<()> {
+    // `Gesture` (multi-touch) can never succeed on this backend; reject it before
+    // `focus_window`/`extended_frame_bounds`, so it fails fast with `Unsupported` and without
+    // raising the target window or masking the call-shape error behind an unrelated
+    // frame-bounds `Backend` error (mirrors the macOS backend's early check). The
+    // `PointerEvent::Gesture` match arm below stays for exhaustiveness.
+    if matches!(event, PointerEvent::Gesture { .. }) {
+        return Err(crate::unsupported_multi_touch());
+    }
     let hwnd = raw_to_hwnd(active_hwnd);
     // Raise+focus first so input lands on the target (best-effort, like the probe).
     let _ = crate::windows::focus_window(hwnd);
@@ -470,4 +478,31 @@ fn keysym_to_vk(keysym: u32) -> Option<VIRTUAL_KEY> {
         return Some(VIRTUAL_KEY((r as u16) & 0x00ff));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A gesture must fail fast with the clean `Unsupported` before any window lookup: a dummy
+    // hwnd (no frame bounds) still yields the backend-named message, not a `Backend` error —
+    // this is the behavior the early check in `send_pointer` guarantees.
+    #[test]
+    fn gesture_fails_fast_with_unsupported_before_frame_bounds() {
+        let err = send_pointer(
+            0,
+            &PointerEvent::Gesture {
+                pointers: vec![],
+                duration_ms: 0,
+            },
+        );
+        assert!(
+            matches!(&err, Err(GlassError::Unsupported(_))),
+            "expected Unsupported, got {err:?}"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("windows backend"), "{msg}");
+        assert!(msg.contains("multi_touch"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+    }
 }
