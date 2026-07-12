@@ -144,20 +144,26 @@ pub fn make_platform(
     })
 }
 
-/// Default backend name from `GLASS_BACKEND` (case-insensitive
-/// `wayland`/`windows`/`macos`/`x11`/`android`/`ios`). Unset defaults to the windows backend
-/// on a Windows host, the macos backend on a macOS host, else X11.
+/// The canonical list of backend names glass accepts. Single source of truth: the
+/// `backend` param doc, the description guard, and `default_backend` all key off this.
+/// Adding a backend is one edit here (plus its `make_platform` arm).
+pub const BACKENDS: &[&str] = &["x11", "wayland", "windows", "macos", "android", "ios"];
+
+/// Default backend name from `GLASS_BACKEND` (case-insensitive; one of [`BACKENDS`]).
+/// Unset defaults to the windows backend on a Windows host, the macos backend on a macOS
+/// host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
-    match env {
-        Some(v) if v.eq_ignore_ascii_case("android") => "android",
-        Some(v) if v.eq_ignore_ascii_case("ios") => "ios",
-        Some(v) if v.eq_ignore_ascii_case("wayland") => "wayland",
-        Some(v) if v.eq_ignore_ascii_case("windows") => "windows",
-        Some(v) if v.eq_ignore_ascii_case("macos") => "macos",
-        Some(v) if v.eq_ignore_ascii_case("x11") => "x11",
-        None if cfg!(windows) => "windows",
-        None if cfg!(target_os = "macos") => "macos",
-        _ => "x11",
+    if let Some(v) = env {
+        if let Some(b) = BACKENDS.iter().find(|b| v.eq_ignore_ascii_case(b)) {
+            return b;
+        }
+    }
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "x11"
     }
 }
 
@@ -413,5 +419,24 @@ mod tests {
         assert_eq!(default_backend(None), "macos");
         #[cfg(not(any(windows, target_os = "macos")))]
         assert_eq!(default_backend(None), "x11");
+    }
+
+    #[test]
+    fn backends_list_is_the_source_of_truth_default_resolves_each() {
+        // BACKENDS is the single list of accepted backend names.
+        assert_eq!(
+            super::BACKENDS,
+            &["x11", "wayland", "windows", "macos", "android", "ios"]
+        );
+        // default_backend must resolve every listed name (either case) to itself, so the
+        // resolver can never disagree with the list.
+        for b in super::BACKENDS {
+            assert_eq!(super::default_backend(Some(b)), *b, "lower {b}");
+            assert_eq!(
+                super::default_backend(Some(&b.to_uppercase())),
+                *b,
+                "upper {b}"
+            );
+        }
     }
 }
