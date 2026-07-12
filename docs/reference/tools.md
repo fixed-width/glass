@@ -240,14 +240,15 @@ Move the pointer to window-relative coordinates.
 
 Perform a multi-touch gesture: 2–10 pointers, each a straight `from→to` segment, all down together
 at `t=0` and up at `duration_ms`. Pinch = two pointers toward/apart; rotate = two on an arc;
-two-finger swipe = two parallel segments; a `from==to` pointer is held in place.
+two-finger swipe = two parallel segments; a `from==to` pointer is held in place. Multi-touch isn't
+available on every backend — it returns a clear `Unsupported` error where the active backend can't
+do it.
 
 - `pointers` (array of `{ from{x,y}, to{x,y} }`, **required**) — 2–10 window-relative segments.
 - `duration_ms` (integer, default 250) — gesture span.
 
-**Android only** (requires the on-device agent — `adb`'s `input` has no multi-touch command). The
-`adb` fallback, the iOS Simulator backend, and the desktop backends refuse rather than degrade to a
-single pointer.
+**Platform notes:** multi-touch is currently implemented on the Android backend (via the optional
+on-device companion agent); other backends return `Unsupported`.
 
 ### `glass_do`
 
@@ -359,26 +360,39 @@ the `id` is usable with `glass_click_element`.
 
 ## Clipboard
 
-Both act on the **app's** clipboard, isolated from your real clipboard on the private Xvfb/sway
-backends, on a contained Windows app (a private boxed clipboard), and on a contained macOS app that
-isn't built with Apple's hardened runtime (a shim redirects it to a private pasteboard glass shares).
-A hardened-runtime macOS app (App Store / notarized) can't be redirected, so these return
-`Unsupported`; on Android they need the on-device agent; on iOS they act on the Simulator's own
-pasteboard, which is separate from the host's. Only shared-desktop modes (`GLASS_DISPLAY=:0`,
-or the Windows/macOS backend with `sandbox:off`) touch your **real** clipboard. See
-[explanation/containment.md](../explanation/containment.md#clipboard-isolation).
+Both act on the app's clipboard. How isolated that is from your real desktop clipboard — or whether
+it *is* your real clipboard — depends on the backend and sandbox; see the Platform notes on each tool
+below, and [explanation/containment.md](../explanation/containment.md#clipboard-isolation) for the
+mechanism.
 
 ### `glass_clipboard_get`
 
-Read the clipboard as text (`""` if empty). No parameters. Also the cheap text-extraction path:
+Read the app's clipboard as text (`""` if empty). No parameters. Also the cheap text-extraction path:
 `glass_do` `ctrl+a` then `ctrl+c`, then read here — faster and token-free versus OCR for any app
-with selectable text.
+with selectable text. Returns `Unsupported` where the backend can't provide clipboard access.
+
+**Platform notes:** clipboard containment depends on the backend and sandbox. On the private headless
+Linux displays and a contained Windows app, the clipboard is a private box isolated from your real
+system clipboard. In shared-desktop mode (`GLASS_DISPLAY=:0`) or an uncontained backend
+(`sandbox: off`), get/set act on your **real** system clipboard — snapshot with `glass_clipboard_get`
+first to preserve it. On a contained macOS app **not** built with the hardened runtime, glass
+redirects to a private pasteboard it shares (isolated, fully working); a hardened-runtime app (App
+Store / notarized) can't be redirected and returns Unsupported.
 
 ### `glass_clipboard_set`
 
-Write text to the clipboard so the app can paste it.
+Write text to the app's clipboard so it can paste it. Returns `Unsupported` where the backend can't
+provide clipboard access.
 
 - `text` (string, **required**) — the text to write.
+
+**Platform notes:** clipboard containment depends on the backend and sandbox. On the private headless
+Linux displays and a contained Windows app, the clipboard is a private box isolated from your real
+system clipboard. In shared-desktop mode (`GLASS_DISPLAY=:0`) or an uncontained backend
+(`sandbox: off`), get/set act on your **real** system clipboard — snapshot with `glass_clipboard_get`
+first to preserve it. On a contained macOS app **not** built with the hardened runtime, glass
+redirects to a private pasteboard it shares (isolated, fully working); a hardened-runtime app (App
+Store / notarized) can't be redirected and returns Unsupported.
 
 > **iOS paste-consent:** when the app then reads a pasteboard glass wrote (`glass_clipboard_set` → an
 > in-app `UIPasteboard` read), iOS raises a SpringBoard consent alert and the *first* read returns
@@ -398,11 +412,13 @@ Read captured stdout/stderr log lines with a resumable cursor.
 
 ### `glass_doctor`
 
-Diagnose the glass environment (display dependency, containment runtime, software GL, external tool
-paths) and report per-check status with a remedy for anything missing. Use it to self-diagnose a
-`glass_start` failure.
+Diagnose the glass environment and report per-check status with a remedy for anything missing. Use
+it to self-diagnose a `glass_start` failure.
 
 - `deep` (boolean, default false) — also spawn and tear down the default backend's headless display
   to verify it actually starts (slower).
+
+**Platform notes:** on Linux the checks cover the headless display servers (Xvfb for x11, sway for
+wayland) and software GL; the report names exactly the checks it ran for the selected backend.
 
 Mirrors the `glass-mcp doctor` CLI — see [reference/cli.md](cli.md).

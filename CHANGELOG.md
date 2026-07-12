@@ -26,6 +26,10 @@ internal refactors, CI, or test-only changes.
 - `glass_scroll_to_element` returns an element only once it is actually **on-screen** — previously
   it could return one that was present in the accessibility tree but off-screen (which
   `glass_click_element` then refused). The result gains a `direction` field.
+- The MCP tool descriptions and `get_info` are now backend-neutral (no per-platform text or
+  duplicated backend list); the accepted backends are documented once on the `glass_start`
+  `backend` param, and the per-OS clipboard/gesture/doctor specifics are collected in the
+  [tools reference](docs/reference/tools.md)'s per-tool **Platform notes**.
 
 ### Fixed
 - Wayland: text entry (`glass_type` and a typed `KeyEvent::Text`) is reliable under heavy machine
