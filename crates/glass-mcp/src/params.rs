@@ -38,8 +38,7 @@ pub struct ScreenshotArgs {
 pub struct WindowHintArgs {
     /// Case-insensitive substring matched against window titles. Used to pick the
     /// right window when several appear, and — since it ignores the process tree —
-    /// to locate a window the launched process hands off to an unrelated process
-    /// (e.g. some packaged Windows apps).
+    /// to locate a window the launched process hands off to an unrelated process.
     pub title: Option<String>,
     /// Exact window-class match. Same purpose as `title` but more stable, since
     /// class names rarely carry the dynamic prefixes/suffixes that titles do.
@@ -66,8 +65,8 @@ pub struct StartArgs {
     pub env: Vec<(String, String)>,
     /// Optional `{ title?, class? }` to disambiguate which window is the app's when
     /// more than one appears, or to find a window the launched process hands off to
-    /// an unrelated process (some packaged Windows apps). Omit to take the first
-    /// window owned by the launched process or a descendant it can follow.
+    /// an unrelated process. Omit to take the first window owned by the launched
+    /// process or a descendant it can follow.
     pub window_hint: Option<WindowHintArgs>,
     pub timeout_ms: Option<u64>,
     /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
@@ -154,8 +153,8 @@ pub struct DragArgs {
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
     /// Span the drag's motion over this many milliseconds so a frame-based GUI
-    /// (egui/winit) samples the path across multiple frames (and registers the
-    /// drag even while it repaints). Default 200. Lower = faster but coarser.
+    /// samples the path across multiple frames (and registers the drag even while
+    /// it repaints). Default 200. Lower = faster but coarser.
     pub duration_ms: Option<u64>,
 }
 
