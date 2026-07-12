@@ -154,9 +154,11 @@ pub const BACKENDS: &[&str] = &["x11", "wayland", "windows", "macos", "android",
 /// host, else X11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
     if let Some(v) = env {
-        if let Some(b) = BACKENDS.iter().find(|b| v.eq_ignore_ascii_case(b)) {
-            return b;
-        }
+        return BACKENDS
+            .iter()
+            .find(|b| v.eq_ignore_ascii_case(b))
+            .copied()
+            .unwrap_or("x11");
     }
     if cfg!(windows) {
         "windows"
