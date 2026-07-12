@@ -248,8 +248,10 @@ impl Platform for AndroidPlatform {
                 app.window = window.clone();
                 Ok(window)
             }
-            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::Unsupported(
-                "window resize/move (Android apps are full-screen)".into(),
+            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
+                "window_move_resize",
+                crate::BACKEND,
+                crate::capabilities().window_move_resize.note,
             )),
         }
     }
