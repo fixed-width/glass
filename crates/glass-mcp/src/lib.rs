@@ -147,6 +147,11 @@ pub fn make_platform(
 /// The canonical list of backend names glass accepts. Single source of truth: the
 /// `backend` param doc, the description guard, and `default_backend` all key off this.
 /// Adding a backend is one edit here (plus its `make_platform` arm).
+///
+/// Membership here is a backend-*name* vocabulary fact, not a this-host-*buildable* fact:
+/// `make_platform`'s `#[cfg(...)]`-gated arms are the host-availability authority, so a
+/// backend that's named here but unavailable on the current host (e.g. `"windows"` on a
+/// Linux build) errors there, when actually constructed — not in `default_backend`.
 pub const BACKENDS: &[&str] = &["x11", "wayland", "windows", "macos", "android", "ios"];
 
 /// Default backend name from `GLASS_BACKEND` (case-insensitive; one of [`BACKENDS`]).

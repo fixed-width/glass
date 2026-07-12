@@ -557,6 +557,54 @@ mod tests {
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
     }
 
+    // "windows" is excluded from `banned` below (collides with the plain noun, e.g.
+    // glass_list_windows). These phrases name the Windows *backend* specifically and don't
+    // occur as innocent noun usage, so match them directly.
+    const WINDOWS_BACKEND_PHRASES: &[&str] = &["windows backend", "windows host", "on windows"];
+
+    /// True if `text` names a Windows-*backend* phrase. Each phrase must appear as a run of
+    /// CONSECUTIVE words (same word-boundary tokenizer as `names` below), case-insensitively —
+    /// a raw substring match would false-positive on e.g. "repositi·on windows".
+    fn names_windows_backend(text: &str) -> bool {
+        let words: Vec<&str> = text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        WINDOWS_BACKEND_PHRASES.iter().any(|phrase| {
+            let needle: Vec<&str> = phrase.split(' ').collect();
+            words.windows(needle.len()).any(|run| {
+                run.iter()
+                    .zip(&needle)
+                    .all(|(w, n)| w.eq_ignore_ascii_case(n))
+            })
+        })
+    }
+
+    #[test]
+    fn windows_backend_phrase_is_flagged_not_the_plain_noun() {
+        for phrase in [
+            "Only supported on the Windows backend.",
+            "runs on Windows host",
+            "available on Windows",
+        ] {
+            assert!(
+                names_windows_backend(phrase),
+                "should flag windows-backend phrase: {phrase:?}"
+            );
+        }
+        for phrase in [
+            "tile the windows",
+            "lists top-level windows",
+            "reposition windows to tile them",
+            "position windows on the screen",
+        ] {
+            assert!(
+                !names_windows_backend(phrase),
+                "should not flag the plain noun: {phrase:?}"
+            );
+        }
+    }
+
     /// A session runs one backend, so naming a backend in a description is a mode-conditional
     /// the agent can't resolve — and even a single named gate rots the day another backend
     /// gains the capability. Which backends support a capability is a runtime property, not
@@ -564,34 +612,46 @@ mod tests {
     /// e.g. glass_list_windows) plus the two Linux display servers that ARE those backends.
     #[test]
     fn descriptions_name_no_backend() {
-        let mut banned: Vec<String> = crate::BACKENDS
+        let banned: Vec<&str> = crate::BACKENDS
             .iter()
-            .filter(|b| **b != "windows")
-            .map(|b| b.to_string())
+            .copied()
+            .filter(|&b| b != "windows")
+            .chain(["xvfb", "sway"])
             .collect();
-        banned.push("xvfb".to_string());
-        banned.push("sway".to_string());
 
         // Case-insensitive, word-boundary match so "ios" can't hit inside another word.
         fn names(text: &str, tok: &str) -> bool {
-            text.to_ascii_lowercase()
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|w| w == tok)
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w.eq_ignore_ascii_case(tok))
         }
 
         let mut problems: Vec<String> = Vec::new();
         for tool in GlassServer::tool_router().list_all() {
-            let desc = tool.description.as_deref().unwrap_or("");
+            // A tool with no description gives the guard nothing to check — that's a gap in
+            // the guard, not a pass, so it's a recorded problem rather than silently ok.
+            let desc = match tool.description.as_deref() {
+                Some(d) if !d.is_empty() => d,
+                _ => {
+                    problems.push(format!("  {}: has no description to check", tool.name));
+                    continue;
+                }
+            };
             for tok in &banned {
                 if names(desc, tok) {
                     problems.push(format!("  {}: names backend '{tok}'", tool.name));
                 }
+            }
+            if names_windows_backend(desc) {
+                problems.push(format!("  {}: names the Windows backend", tool.name));
             }
         }
         for tok in &banned {
             if names(SERVER_INSTRUCTIONS, tok) {
                 problems.push(format!("  get_info: names backend '{tok}'"));
             }
+        }
+        if names_windows_backend(SERVER_INSTRUCTIONS) {
+            problems.push("  get_info: names the Windows backend".to_string());
         }
         assert!(
             problems.is_empty(),
@@ -765,9 +825,10 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("backend param has a description")
             .to_ascii_lowercase();
-        let missing: Vec<&&str> = crate::BACKENDS
+        let missing: Vec<&str> = crate::BACKENDS
             .iter()
-            .filter(|b| !doc.contains(**b))
+            .copied()
+            .filter(|b| !doc.contains(*b))
             .collect();
         assert!(
             missing.is_empty(),
