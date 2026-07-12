@@ -125,8 +125,10 @@ impl IdbInjector {
                 vec![swipe(point(x, y, s), point(ex, ey, s), SWIPE_SECS)]
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::Unsupported(
-                    "multi-touch gestures are not supported by the iOS backend yet".into(),
+                return Err(GlassError::unsupported(
+                    "multi_touch",
+                    crate::BACKEND,
+                    crate::capabilities().multi_touch.note,
                 ))
             }
         })

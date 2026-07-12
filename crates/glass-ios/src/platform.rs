@@ -442,8 +442,10 @@ impl Platform for IosPlatform {
         let geometry = self.running()?.geometry.clone();
         match op {
             WindowOp::Geometry | WindowOp::Focus => Ok(geometry),
-            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::Unsupported(
-                "window resize/move (iOS Simulator apps are fullscreen)".into(),
+            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
+                "window_move_resize",
+                crate::BACKEND,
+                crate::capabilities().window_move_resize.note,
             )),
         }
     }

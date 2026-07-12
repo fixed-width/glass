@@ -26,6 +26,9 @@ pub use target::{SimTarget, SimulatorRegistry};
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus, Support};
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "ios";
+
 /// This backend's live capability map. `input`/`accessibility` need `idb_companion` —
 /// gated on [`doctor::companion_present`], the same presence signal the runtime spawn
 /// resolves.
@@ -96,5 +99,33 @@ mod capability_tests {
             Some("paste needs on-screen consent (Allow Paste)")
         );
         assert_eq!(c.window_move_resize.status, Support::Unsupported);
+    }
+}
+
+#[cfg(test)]
+mod unsupported_message_tests {
+    #[test]
+    fn multi_touch_unsupported_message_names_the_ios_backend_with_note() {
+        let msg = glass_core::GlassError::unsupported(
+            "multi_touch",
+            crate::BACKEND,
+            crate::capabilities().multi_touch.note,
+        )
+        .to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("single-contact"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+    }
+
+    #[test]
+    fn window_move_resize_unsupported_message_names_the_ios_backend() {
+        let msg = glass_core::GlassError::unsupported(
+            "window_move_resize",
+            crate::BACKEND,
+            crate::capabilities().window_move_resize.note,
+        )
+        .to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("full-screen"), "{msg}");
     }
 }
