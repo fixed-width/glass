@@ -83,8 +83,10 @@ pub(crate) fn send_pointer(
     // that can never succeed (also keeps `focus`'s now-fallible missing-process check, fix
     // 4, from masking this call-shape error behind an unrelated `AppExited`).
     if matches!(event, PointerEvent::Gesture { .. }) {
-        return Err(GlassError::Unsupported(
-            "multi-touch gesture is not supported on macOS".into(),
+        return Err(GlassError::unsupported(
+            "multi_touch",
+            crate::BACKEND,
+            crate::capabilities().multi_touch.note,
         ));
     }
     focus(pid)?;
@@ -173,8 +175,10 @@ pub(crate) fn send_pointer(
         // match stays exhaustive over `PointerEvent`'s variants and a future variant added
         // to the enum still forces an explicit decision at this call site.
         PointerEvent::Gesture { .. } => {
-            return Err(GlassError::Unsupported(
-                "multi-touch gesture is not supported on macOS".into(),
+            return Err(GlassError::unsupported(
+                "multi_touch",
+                crate::BACKEND,
+                crate::capabilities().multi_touch.note,
             ));
         }
     }

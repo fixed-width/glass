@@ -85,6 +85,9 @@ pub use permissions::{
 #[cfg(target_os = "macos")]
 pub use session::{session_locked, session_state, SessionState};
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "macos";
+
 // Kept last: a `#[cfg(test)]` module must not be followed by other items
 // (clippy::items_after_test_module), and the macOS-gated `pub use`s above are absent off
 // macOS — so this test module goes at the end of the file where nothing can follow it.
@@ -101,5 +104,17 @@ mod capability_tests {
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(c.accessibility.status, Support::Supported);
         assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+
+    #[test]
+    fn multi_touch_unsupported_message_names_the_macos_backend() {
+        let msg = glass_core::GlassError::unsupported(
+            "multi_touch",
+            crate::BACKEND,
+            crate::capabilities().multi_touch.note,
+        )
+        .to_string();
+        assert!(msg.contains("macos backend"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 }
