@@ -6,10 +6,10 @@
 //! backend's `capabilities()` literal then fails to compile until it supplies that field,
 //! so no backend can silently omit a capability.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Whether an operation can be performed right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Support {
     /// Works right now.
@@ -57,6 +57,28 @@ pub struct CapabilityMap {
     pub clipboard: CapabilityStatus,
     pub accessibility: CapabilityStatus,
     pub window_move_resize: CapabilityStatus,
+}
+
+impl CapabilityMap {
+    /// Every (operation-name, status) pair, in report order. The exhaustive destructure (no
+    /// `..`) extends the named-field completeness guarantee into rendering: adding a field to
+    /// `CapabilityMap` fails THIS to compile until it is listed here too.
+    pub fn entries(&self) -> [(&'static str, CapabilityStatus); 5] {
+        let CapabilityMap {
+            input,
+            multi_touch,
+            clipboard,
+            accessibility,
+            window_move_resize,
+        } = *self;
+        [
+            ("input", input),
+            ("multi_touch", multi_touch),
+            ("clipboard", clipboard),
+            ("accessibility", accessibility),
+            ("window_move_resize", window_move_resize),
+        ]
+    }
 }
 
 #[cfg(test)]

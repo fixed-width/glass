@@ -440,8 +440,9 @@ Each of the five operations — `input`, `multi_touch`, `clipboard`, `accessibil
 `window_move_resize` — carries a live `status`, one of four states: `supported` (works now),
 `degraded` (works now at reduced fidelity/coverage — `note` says what's lost and how to restore
 it), `requires_setup` (a setup step is missing right now — `note` says what), or `unsupported`
-(this backend never does it). `note` is present for `degraded`, `requires_setup`, and some
-`unsupported` cases; absent for plain `supported`.
+(this backend never does it). `note` is present when there's something to explain (what's
+degraded/missing, or a caveat — even a plain `supported` op can carry one, e.g. iOS `clipboard`
+being supported but needing on-screen paste consent); omitted otherwise.
 
 Every entry also carries `tools`: the MCP tools that operation gates, so a
 `degraded`/`requires_setup`/`unsupported` entry tells you exactly which calls to expect trouble

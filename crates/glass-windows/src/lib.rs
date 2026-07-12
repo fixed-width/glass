@@ -70,22 +70,6 @@ mod windows;
 #[cfg(windows)]
 pub use backend::WindowsPlatform;
 
-#[cfg(test)]
-mod capability_tests {
-    use super::capabilities;
-    use glass_core::capability::Support;
-
-    #[test]
-    fn desktop_constant_capability_map() {
-        let c = capabilities();
-        assert_eq!(c.input.status, Support::Supported);
-        assert_eq!(c.multi_touch.status, Support::Unsupported);
-        assert_eq!(c.clipboard.status, Support::Supported);
-        assert_eq!(c.accessibility.status, Support::Supported);
-        assert_eq!(c.window_move_resize.status, Support::Supported);
-    }
-}
-
 #[cfg(windows)]
 mod backend {
     use std::sync::{Arc, Mutex};
@@ -375,5 +359,21 @@ mod backend {
                 app.kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::capabilities;
+    use glass_core::capability::Support;
+
+    #[test]
+    fn desktop_constant_capability_map() {
+        let c = capabilities();
+        assert_eq!(c.input.status, Support::Supported);
+        assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(c.clipboard.status, Support::Supported);
+        assert_eq!(c.accessibility.status, Support::Supported);
+        assert_eq!(c.window_move_resize.status, Support::Supported);
     }
 }

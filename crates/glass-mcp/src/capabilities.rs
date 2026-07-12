@@ -44,18 +44,20 @@ fn tools_for(op: &str) -> &'static [&'static str] {
         .iter()
         .find(|(name, _)| *name == op)
         .map(|(_, t)| *t)
-        .unwrap_or(&[])
+        .unwrap_or_else(|| panic!("no OPERATION_TOOLS entry for operation {op:?}"))
 }
 
-/// One rendered operation entry: the live status/note + the tools it gates.
+/// One rendered operation entry: the live status/note (via `CapabilityStatus`'s own
+/// serialization — single source for the `note`-omit policy) + the tools it gates.
 fn entry(op: &str, st: &CapabilityStatus) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    m.insert("status".into(), serde_json::to_value(st.status).unwrap());
-    if let Some(note) = st.note {
-        m.insert("note".into(), serde_json::Value::String(note.to_string()));
-    }
-    m.insert("tools".into(), serde_json::to_value(tools_for(op)).unwrap());
-    serde_json::Value::Object(m)
+    let mut v = serde_json::to_value(st).expect("CapabilityStatus serializes");
+    v.as_object_mut()
+        .expect("CapabilityStatus serializes to a JSON object")
+        .insert(
+            "tools".into(),
+            serde_json::to_value(tools_for(op)).expect("tool list serializes"),
+        );
+    v
 }
 
 /// A backend's capability report on this host.
@@ -123,17 +125,18 @@ pub fn render_json(backend: Option<&str>) -> Result<String, String> {
     let report =
         capabilities_for(name).expect("render_json resolved name to a canonical BACKENDS entry");
     let json = match report {
-        CapabilityReport::Available(map) => serde_json::json!({
-            "backend": name,
-            "available": true,
-            "capabilities": {
-                "input": entry("input", &map.input),
-                "multi_touch": entry("multi_touch", &map.multi_touch),
-                "clipboard": entry("clipboard", &map.clipboard),
-                "accessibility": entry("accessibility", &map.accessibility),
-                "window_move_resize": entry("window_move_resize", &map.window_move_resize),
-            },
-        }),
+        CapabilityReport::Available(map) => {
+            let caps: serde_json::Map<String, serde_json::Value> = map
+                .entries()
+                .iter()
+                .map(|(op, st)| ((*op).to_string(), entry(op, st)))
+                .collect();
+            serde_json::json!({
+                "backend": name,
+                "available": true,
+                "capabilities": caps,
+            })
+        }
         CapabilityReport::NotOnThisHost => serde_json::json!({
             "backend": name,
             "available": false,
@@ -248,5 +251,51 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&render_json(None).unwrap()).unwrap();
         assert_eq!(v["backend"], default);
+    }
+
+    // android/x11 are both compiled in on Linux (android is host-OS-agnostic; x11 is a
+    // Linux-only dependency — see Cargo.toml). Gated like `render_json_not_on_this_host_shape`
+    // so it compiles out (not fails) on the macOS/Windows CI legs that also run this suite.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_attaches_notes_and_tools_on_the_shipped_path() {
+        // degraded/requires_setup carry a note; the note rides the rendered JSON.
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(Some("android")).unwrap()).unwrap();
+        assert_eq!(v["capabilities"]["input"]["status"], "degraded");
+        assert!(v["capabilities"]["input"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("GLASS_ANDROID_AGENT_JAR"));
+        assert!(v["capabilities"]["input"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "glass_type"));
+        // a plain `supported` op omits `note`.
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(Some("x11")).unwrap()).unwrap();
+        assert_eq!(v["capabilities"]["input"]["status"], "supported");
+        assert!(v["capabilities"]["input"].get("note").is_none());
+    }
+
+    #[test]
+    fn operation_tools_covers_every_rendered_operation() {
+        use glass_core::capability::{CapabilityMap, CapabilityStatus};
+        let dummy = CapabilityMap {
+            input: CapabilityStatus::supported(),
+            multi_touch: CapabilityStatus::supported(),
+            clipboard: CapabilityStatus::supported(),
+            accessibility: CapabilityStatus::supported(),
+            window_move_resize: CapabilityStatus::supported(),
+        };
+        let rendered: std::collections::BTreeSet<&str> =
+            dummy.entries().iter().map(|(op, _)| *op).collect();
+        let mapped: std::collections::BTreeSet<&str> =
+            OPERATION_TOOLS.iter().map(|(op, _)| *op).collect();
+        assert_eq!(
+            rendered, mapped,
+            "OPERATION_TOOLS keys must match the operations render emits"
+        );
     }
 }
