@@ -10,6 +10,8 @@
 // modules below stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
 
+use glass_core::capability::{CapabilityMap, CapabilityStatus};
+
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
@@ -36,6 +38,18 @@ pub(crate) fn disclose_clip_disabled(dll: &str) {
     });
 }
 
+/// This backend's capability map. All cells are code-constant here (desktop
+/// accessibility is reported Supported when the backend ships an a11y reader; per-OS
+/// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
+pub fn capabilities() -> CapabilityMap {
+    CapabilityMap {
+        multi_touch: CapabilityStatus::unsupported(None),
+        clipboard: CapabilityStatus::supported(),
+        accessibility: CapabilityStatus::supported(),
+        window_move_resize: CapabilityStatus::supported(),
+    }
+}
+
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]
@@ -53,6 +67,21 @@ mod windows;
 
 #[cfg(windows)]
 pub use backend::WindowsPlatform;
+
+#[cfg(test)]
+mod capability_tests {
+    use super::capabilities;
+    use glass_core::capability::Support;
+
+    #[test]
+    fn desktop_constant_capability_map() {
+        let c = capabilities();
+        assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(c.clipboard.status, Support::Supported);
+        assert_eq!(c.accessibility.status, Support::Supported);
+        assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+}
 
 #[cfg(windows)]
 mod backend {
