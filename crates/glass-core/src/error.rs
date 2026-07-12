@@ -85,7 +85,7 @@ pub enum GlassError {
     #[error("{0}")]
     SandboxUnavailable(String),
 
-    #[error("{0} is not supported by this backend")]
+    #[error("{0}")]
     Unsupported(String),
 
     /// A required OS permission is not granted. Carries which permission and how to
@@ -99,6 +99,26 @@ pub enum GlassError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl GlassError {
+    /// Runtime "this operation is unsupported on the active backend" error, worded
+    /// consistently and generated from the backend's own capability map.
+    ///
+    /// `operation` is the [`crate::CapabilityMap`] field key (e.g. `"multi_touch"`) so
+    /// the message matches exactly what `glass_capabilities` prints — the agent can
+    /// cross-reference the two. `backend` is the **active** backend's name. `note` is that
+    /// capability's own note (single source), folded in when present. Always points the
+    /// agent at `glass_capabilities`.
+    pub fn unsupported(operation: &str, backend: &str, note: Option<&str>) -> Self {
+        use std::fmt::Write as _;
+        let mut msg = format!("{operation} is not supported by the {backend} backend");
+        if let Some(n) = note {
+            let _ = write!(msg, " ({n})");
+        }
+        msg.push_str("; call glass_capabilities to see what this backend can do");
+        GlassError::Unsupported(msg)
+    }
 }
 
 /// Convenience alias used throughout glass-core.
@@ -168,9 +188,43 @@ mod tests {
 
     #[test]
     fn unsupported_message_is_actionable() {
+        // Default trait impls that cannot know the active backend keep the generic phrase.
         assert_eq!(
-            GlassError::Unsupported("clipboard".into()).to_string(),
+            GlassError::Unsupported("clipboard is not supported by this backend".into())
+                .to_string(),
             "clipboard is not supported by this backend"
+        );
+    }
+
+    #[test]
+    fn unsupported_display_is_the_raw_payload() {
+        assert_eq!(
+            GlassError::Unsupported("anything at all".into()).to_string(),
+            "anything at all"
+        );
+    }
+
+    #[test]
+    fn unsupported_constructor_names_backend_and_points_at_capabilities() {
+        let e = GlassError::unsupported("multi_touch", "x11", None);
+        assert_eq!(
+            e.to_string(),
+            "multi_touch is not supported by the x11 backend; \
+             call glass_capabilities to see what this backend can do"
+        );
+    }
+
+    #[test]
+    fn unsupported_constructor_folds_in_the_note_when_present() {
+        let e = GlassError::unsupported(
+            "window_move_resize",
+            "android",
+            Some("apps are full-screen"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "window_move_resize is not supported by the android backend (apps are full-screen); \
+             call glass_capabilities to see what this backend can do"
         );
     }
 

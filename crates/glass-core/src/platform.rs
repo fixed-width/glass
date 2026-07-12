@@ -188,7 +188,9 @@ pub trait Platform {
     /// whole window. `WindowNotFound` if `id` is not currently one of the app's
     /// windows. Default: unsupported.
     fn capture_window(&mut self, _id: WindowId, _region: Option<&Region>) -> Result<Frame> {
-        Err(GlassError::Unsupported("capture_window".into()))
+        Err(GlassError::Unsupported(
+            "capture_window is not supported by this backend".into(),
+        ))
     }
 
     /// Inject a pointer event (coordinates are window-relative).
@@ -199,12 +201,16 @@ pub trait Platform {
 
     /// Read the clipboard as UTF-8 text ("" if it holds no text).
     fn get_clipboard(&mut self) -> Result<String> {
-        Err(GlassError::Unsupported("clipboard".into()))
+        Err(GlassError::Unsupported(
+            "clipboard is not supported by this backend".into(),
+        ))
     }
     /// Write UTF-8 text to the clipboard. On X11/Wayland this installs a
     /// session-lived serving owner; it is torn down on `stop_app`.
     fn set_clipboard(&mut self, _text: &str) -> Result<()> {
-        Err(GlassError::Unsupported("clipboard".into()))
+        Err(GlassError::Unsupported(
+            "clipboard is not supported by this backend".into(),
+        ))
     }
 
     /// Perform a window operation, returning the resulting geometry.
