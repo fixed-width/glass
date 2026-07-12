@@ -1,32 +1,12 @@
 //! Backend capability descriptors: which operations an agent can perform right now.
 //!
 //! A [`CapabilityMap`] is produced per backend (each backend crate's `capabilities()`)
-//! and surfaced by the `glass_capabilities` MCP tool. The map's named fields make
-//! capability completeness a compile-time guarantee: add a [`Capability`] variant and
-//! every `CapabilityMap` literal fails to compile until it fills the new field.
+//! and surfaced by the `glass_capabilities` MCP tool. `CapabilityMap`'s named fields are
+//! the completeness authority: a capability is added by adding a field, and every
+//! backend's `capabilities()` literal then fails to compile until it supplies that field,
+//! so no backend can silently omit a capability.
 
 use serde::{Deserialize, Serialize};
-
-/// The operations whose availability varies by backend or environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    MultiTouch,
-    Clipboard,
-    Accessibility,
-    WindowMoveResize,
-}
-
-impl Capability {
-    /// Every capability, for consumers/tests that iterate the set. The named fields of
-    /// [`CapabilityMap`] remain the completeness authority.
-    pub const ALL: &'static [Capability] = &[
-        Capability::MultiTouch,
-        Capability::Clipboard,
-        Capability::Accessibility,
-        Capability::WindowMoveResize,
-    ];
-}
 
 /// Whether an operation can be performed right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,18 +74,5 @@ mod tests {
         );
         assert_eq!(v["window_move_resize"]["status"], "unsupported");
         assert_eq!(v["window_move_resize"]["note"], "full-screen");
-    }
-
-    #[test]
-    fn capability_all_lists_every_variant_snake_case() {
-        assert_eq!(Capability::ALL.len(), 4);
-        assert_eq!(
-            serde_json::to_value(Capability::MultiTouch).unwrap(),
-            "multi_touch"
-        );
-        assert_eq!(
-            serde_json::to_value(Capability::WindowMoveResize).unwrap(),
-            "window_move_resize"
-        );
     }
 }

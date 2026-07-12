@@ -44,7 +44,7 @@ pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Section};
 
 pub mod capability;
-pub use capability::{Capability, CapabilityMap, CapabilityStatus, Support};
+pub use capability::{CapabilityMap, CapabilityStatus, Support};
 
 pub mod stability;
 pub use stability::StabilityTracker;

@@ -73,6 +73,10 @@ mod capability_tests {
     fn constant_cells_are_fixed() {
         let c = capabilities_with(true);
         assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(
+            c.multi_touch.note,
+            Some("idb provides single-contact touch only")
+        );
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(
             c.clipboard.note,

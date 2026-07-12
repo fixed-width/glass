@@ -15,37 +15,42 @@ pub enum CapabilityReport {
     NotOnThisHost,
 }
 
-/// Dispatch to the compiled-in backend's `capabilities()`. Expects a canonical
-/// [`crate::BACKENDS`] name; unknown names fall through to `NotOnThisHost` (the tool
-/// validates the name and errors before calling — see [`render_json`]).
-pub fn capabilities_for(backend: &str) -> CapabilityReport {
+/// Dispatch to the compiled-in backend's `capabilities()`.
+///
+/// `None` ⇒ `backend` is not a known [`crate::BACKENDS`] name. `Some(NotOnThisHost)` ⇒ a
+/// known backend name that isn't compiled into this binary. `Some(Available(_))` ⇒
+/// compiled into this binary, with its live capability map.
+pub fn capabilities_for(backend: &str) -> Option<CapabilityReport> {
+    if !crate::BACKENDS.contains(&backend) {
+        return None;
+    }
     // android is always compiled in (it shells out to adb; host-OS-agnostic).
     if backend == "android" {
-        return CapabilityReport::Available(glass_android::capabilities());
+        return Some(CapabilityReport::Available(glass_android::capabilities()));
     }
     #[cfg(target_os = "linux")]
     {
         match backend {
-            "x11" => return CapabilityReport::Available(glass_x11::capabilities()),
-            "wayland" => return CapabilityReport::Available(glass_wayland::capabilities()),
+            "x11" => return Some(CapabilityReport::Available(glass_x11::capabilities())),
+            "wayland" => return Some(CapabilityReport::Available(glass_wayland::capabilities())),
             _ => {}
         }
     }
     #[cfg(windows)]
     {
         if backend == "windows" {
-            return CapabilityReport::Available(glass_windows::capabilities());
+            return Some(CapabilityReport::Available(glass_windows::capabilities()));
         }
     }
     #[cfg(target_os = "macos")]
     {
         match backend {
-            "macos" => return CapabilityReport::Available(glass_macos::capabilities()),
-            "ios" => return CapabilityReport::Available(glass_ios::capabilities()),
+            "macos" => return Some(CapabilityReport::Available(glass_macos::capabilities())),
+            "ios" => return Some(CapabilityReport::Available(glass_ios::capabilities())),
             _ => {}
         }
     }
-    CapabilityReport::NotOnThisHost
+    Some(CapabilityReport::NotOnThisHost)
 }
 
 /// Resolve `backend` (None => the default backend) and render the report as JSON text.
@@ -55,6 +60,7 @@ pub fn render_json(backend: Option<&str>) -> Result<String, String> {
         Some(v) => crate::BACKENDS
             .iter()
             .find(|b| v.eq_ignore_ascii_case(b))
+            .copied()
             .ok_or_else(|| {
                 format!(
                     "unknown backend {v:?}; use one of: {}",
@@ -63,7 +69,9 @@ pub fn render_json(backend: Option<&str>) -> Result<String, String> {
             })?,
         None => crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()),
     };
-    let json = match capabilities_for(name) {
+    let report =
+        capabilities_for(name).expect("render_json resolved name to a canonical BACKENDS entry");
+    let json = match report {
         CapabilityReport::Available(map) => serde_json::json!({
             "backend": name,
             "available": true,
@@ -87,22 +95,22 @@ mod tests {
         // android is always compiled in (host-OS-agnostic).
         assert!(matches!(
             capabilities_for("android"),
-            CapabilityReport::Available(_)
+            Some(CapabilityReport::Available(_))
         ));
 
         #[cfg(target_os = "linux")]
         {
             assert!(matches!(
                 capabilities_for("x11"),
-                CapabilityReport::Available(_)
+                Some(CapabilityReport::Available(_))
             ));
             assert!(matches!(
                 capabilities_for("wayland"),
-                CapabilityReport::Available(_)
+                Some(CapabilityReport::Available(_))
             ));
             for b in ["windows", "macos", "ios"] {
                 assert!(
-                    matches!(capabilities_for(b), CapabilityReport::NotOnThisHost),
+                    matches!(capabilities_for(b), Some(CapabilityReport::NotOnThisHost)),
                     "{b}"
                 );
             }
@@ -111,11 +119,11 @@ mod tests {
         {
             assert!(matches!(
                 capabilities_for("windows"),
-                CapabilityReport::Available(_)
+                Some(CapabilityReport::Available(_))
             ));
             for b in ["x11", "wayland", "macos", "ios"] {
                 assert!(
-                    matches!(capabilities_for(b), CapabilityReport::NotOnThisHost),
+                    matches!(capabilities_for(b), Some(CapabilityReport::NotOnThisHost)),
                     "{b}"
                 );
             }
@@ -124,17 +132,19 @@ mod tests {
         {
             for b in ["macos", "ios"] {
                 assert!(
-                    matches!(capabilities_for(b), CapabilityReport::Available(_)),
+                    matches!(capabilities_for(b), Some(CapabilityReport::Available(_))),
                     "{b}"
                 );
             }
             for b in ["x11", "wayland", "windows"] {
                 assert!(
-                    matches!(capabilities_for(b), CapabilityReport::NotOnThisHost),
+                    matches!(capabilities_for(b), Some(CapabilityReport::NotOnThisHost)),
                     "{b}"
                 );
             }
         }
+
+        assert!(capabilities_for("nope").is_none());
 
         // Every canonical name resolves without panicking.
         for b in crate::BACKENDS {
@@ -168,5 +178,17 @@ mod tests {
         assert_eq!(v["available"], false);
         assert!(v["reason"].as_str().unwrap().contains("host: linux"));
         assert!(v.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn render_json_none_resolves_to_the_default_backend() {
+        let default = crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
+        // Omitting `backend` is identical to naming the resolved default.
+        assert_eq!(
+            render_json(None).unwrap(),
+            render_json(Some(default)).unwrap()
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_json(None).unwrap()).unwrap();
+        assert_eq!(v["backend"], default);
     }
 }
