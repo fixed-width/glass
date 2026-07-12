@@ -31,6 +31,9 @@ pub use target::{AdbTarget, AttachedDevice};
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "android";
+
 /// This backend's live capability map. `input` degrades and `multi_touch`/`clipboard`
 /// need the on-device agent — gated on [`agent::agent_enabled`], the same predicate the
 /// runtime uses to pick `AgentInjector` vs `ShellInjector`, so this can't disagree with
@@ -71,6 +74,16 @@ fn capabilities_with(agent: bool, a11y_apk: bool) -> CapabilityMap {
         },
         window_move_resize: CapabilityStatus::unsupported(Some("apps are full-screen")),
     }
+}
+
+/// The `Unsupported` error this backend returns for window move/resize — one source for
+/// the call site (`window()`'s `Resize`/`Move` arm) and its test.
+pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
+    glass_core::GlassError::unsupported(
+        "window_move_resize",
+        BACKEND,
+        capabilities().window_move_resize.note,
+    )
 }
 
 #[cfg(test)]
@@ -114,5 +127,13 @@ mod capability_tests {
             .unwrap()
             .contains("GLASS_ANDROID_A11Y_APK"));
         assert_eq!(c.window_move_resize.status, Support::Unsupported);
+    }
+
+    #[test]
+    fn window_move_resize_unsupported_message_names_the_android_backend() {
+        let msg = crate::unsupported_window_move_resize().to_string();
+        assert!(msg.contains("android backend"), "{msg}");
+        assert!(msg.contains("full-screen"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 }

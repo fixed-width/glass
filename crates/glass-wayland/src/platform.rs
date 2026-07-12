@@ -1169,9 +1169,7 @@ impl Platform for WaylandPlatform {
                 glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::Unsupported(
-                    "multi-touch gestures are only supported on the android backend".into(),
-                ));
+                return Err(crate::unsupported_multi_touch());
             }
         }
         session

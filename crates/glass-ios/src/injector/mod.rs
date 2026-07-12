@@ -87,8 +87,10 @@ impl IdbInjector {
     /// Maps one glass `PointerEvent` to the idb HID events that reproduce it as a
     /// touch: a `Click` is a touch DOWN then UP at the same point (repeated `count`
     /// times); a `Drag`/`Scroll` is a single swipe; a `Move` is empty — touch has no
-    /// hover state to emit. `Gesture` (multi-touch) is not implemented yet and
-    /// returns `Unsupported` rather than silently dropping the pointers.
+    /// hover state to emit. `Gesture` (multi-touch) returns `Unsupported` rather than
+    /// silently dropping the pointers: idb's raw-touch primitive is single-contact
+    /// (a second concurrent DOWN relocates the same finger), so there is no general
+    /// N-finger primitive to map it to.
     pub fn pointer_events(&self, e: &PointerEvent) -> Result<Vec<proto::HidEvent>> {
         let s = self.scale;
         Ok(match *e {
@@ -125,8 +127,10 @@ impl IdbInjector {
                 vec![swipe(point(x, y, s), point(ex, ey, s), SWIPE_SECS)]
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::Unsupported(
-                    "multi-touch gestures are not supported by the iOS backend yet".into(),
+                return Err(GlassError::unsupported(
+                    "multi_touch",
+                    crate::BACKEND,
+                    crate::capabilities().multi_touch.note,
                 ))
             }
         })
@@ -306,10 +310,13 @@ mod pointer_tests {
             pointers: vec![],
             duration_ms: 100,
         };
-        assert!(matches!(
-            inj.pointer_events(&g),
-            Err(glass_core::GlassError::Unsupported(_))
-        ));
+        let err = inj.pointer_events(&g).unwrap_err();
+        assert!(matches!(err, glass_core::GlassError::Unsupported(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("multi_touch"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(msg.contains("single-contact"), "{msg}");
     }
 
     #[test]

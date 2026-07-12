@@ -319,6 +319,65 @@ mod tests {
         assert!(v["capabilities"]["input"].get("note").is_none());
     }
 
+    /// Ties each compiled-in backend's `glass_<x>::BACKEND` const to this crate's own
+    /// registry ([`crate::BACKENDS`]) and dispatch ([`capabilities_for`]) — so a backend
+    /// crate renaming its `BACKEND` const (a drifting third copy of the backend name,
+    /// alongside `BACKENDS` and the `capabilities_for` match arms) fails here instead of
+    /// silently reporting `NotOnThisHost` at runtime. Gated exactly like `capabilities_for`
+    /// itself: android is always compiled in; the rest per host OS.
+    mod backend_const_matches_registry {
+        use super::*;
+
+        #[test]
+        fn android() {
+            assert!(crate::BACKENDS.contains(&glass_android::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_android::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn x11_and_wayland() {
+            assert!(crate::BACKENDS.contains(&glass_x11::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_x11::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+            assert!(crate::BACKENDS.contains(&glass_wayland::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_wayland::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows() {
+            assert!(crate::BACKENDS.contains(&glass_windows::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_windows::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_and_ios() {
+            assert!(crate::BACKENDS.contains(&glass_macos::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_macos::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+            assert!(crate::BACKENDS.contains(&glass_ios::BACKEND));
+            assert!(matches!(
+                capabilities_for(glass_ios::BACKEND),
+                Some(CapabilityReport::Available(_))
+            ));
+        }
+    }
+
     #[test]
     fn operation_tools_covers_every_rendered_operation() {
         use glass_core::capability::{CapabilityMap, CapabilityStatus};

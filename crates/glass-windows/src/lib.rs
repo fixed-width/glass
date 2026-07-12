@@ -24,6 +24,9 @@ pub mod onbox_support;
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
 pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box // env-resolved paths shared by the on-box examples + tests; host-tested
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "windows";
+
 /// One-time stderr note when a contained app can't get a private clipboard (hook DLL missing):
 /// the app's clipboard is disabled to protect the user's — never a silent revert to sharing it.
 #[cfg(windows)]
@@ -50,6 +53,15 @@ pub fn capabilities() -> CapabilityMap {
         accessibility: CapabilityStatus::supported(),
         window_move_resize: CapabilityStatus::supported(),
     }
+}
+
+/// The `Unsupported` error this backend returns for a multi-touch gesture — one source
+/// for the call site (`send_pointer`'s `Gesture` arm) and its test.
+// Consumed only by the cfg(windows) `input::send_pointer` and the Linux unit test, so a
+// non-test Linux build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, capabilities().multi_touch.note)
 }
 
 #[cfg(windows)]
@@ -375,5 +387,13 @@ mod capability_tests {
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(c.accessibility.status, Support::Supported);
         assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+
+    #[test]
+    fn multi_touch_unsupported_message_names_this_backend_not_android() {
+        let msg = crate::unsupported_multi_touch().to_string();
+        assert!(msg.contains("windows backend"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(!msg.contains("android"), "{msg}");
     }
 }

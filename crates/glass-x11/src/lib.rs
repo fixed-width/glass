@@ -14,6 +14,9 @@ pub mod xvfb;
 pub use platform::X11Platform;
 pub use xvfb::Xvfb;
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "x11";
+
 /// This backend's capability map. All cells are code-constant here (desktop
 /// accessibility is reported Supported when the backend ships an a11y reader; per-OS
 /// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
@@ -25,6 +28,12 @@ pub fn capabilities() -> CapabilityMap {
         accessibility: CapabilityStatus::supported(),
         window_move_resize: CapabilityStatus::supported(),
     }
+}
+
+/// The `Unsupported` error this backend returns for a multi-touch gesture — one source
+/// for the call site (`send_pointer`'s `Gesture` arm) and its test.
+pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, capabilities().multi_touch.note)
 }
 
 #[cfg(test)]
@@ -40,5 +49,13 @@ mod capability_tests {
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(c.accessibility.status, Support::Supported);
         assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+
+    #[test]
+    fn multi_touch_unsupported_message_names_this_backend_not_android() {
+        let msg = crate::unsupported_multi_touch().to_string();
+        assert!(msg.contains("x11 backend"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(!msg.contains("android"), "{msg}");
     }
 }

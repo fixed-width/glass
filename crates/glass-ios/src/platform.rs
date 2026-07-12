@@ -442,8 +442,10 @@ impl Platform for IosPlatform {
         let geometry = self.running()?.geometry.clone();
         match op {
             WindowOp::Geometry | WindowOp::Focus => Ok(geometry),
-            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::Unsupported(
-                "window resize/move (iOS Simulator apps are fullscreen)".into(),
+            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
+                "window_move_resize",
+                crate::BACKEND,
+                crate::capabilities().window_move_resize.note,
             )),
         }
     }
@@ -741,6 +743,11 @@ mod state_machine_tests {
             })
             .unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("window_move_resize"), "{msg}");
+        assert!(msg.contains("full-screen"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 
     #[test]
@@ -748,6 +755,11 @@ mod state_machine_tests {
         let mut p = running_platform();
         let err = p.window(&WindowOp::Move { x: 1, y: 1 }).unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("window_move_resize"), "{msg}");
+        assert!(msg.contains("full-screen"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 
     #[test]

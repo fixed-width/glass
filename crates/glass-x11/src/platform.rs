@@ -1033,9 +1033,7 @@ impl Platform for X11Platform {
                 glass_core::run_drag(&mut sink, &gesture)?;
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::Unsupported(
-                    "multi-touch gestures are only supported on the android backend".into(),
-                ));
+                return Err(crate::unsupported_multi_touch());
             }
         }
         self.conn
