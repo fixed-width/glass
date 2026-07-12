@@ -17,18 +17,50 @@ pub fn diagnose_with_audit(deep: bool, report: &crate::audit::AuditReport) -> Di
     diagnose_inner(deep, Some(report))
 }
 
-fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diagnosis {
-    let backend = crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref());
+/// The "default backend" line of the `general` section. `Warn` (not `Ok`) when `GLASS_BACKEND`
+/// is *set* to an unrecognized value — surfacing the silent host-default fallback that
+/// [`crate::default_backend`] would otherwise make invisibly — and echoing the raw value so a
+/// typo is obvious. `Ok` when unset or a recognized name. Pure in `raw` (the read
+/// `GLASS_BACKEND` value), so the `Warn` branch is unit-testable without touching the process
+/// environment.
+fn default_backend_check(raw: Option<&str>) -> Check {
+    let backend = crate::default_backend(raw);
+    match raw {
+        // `{v:?}` (not `{v}`) so an empty or whitespace value is still visible in the message
+        // instead of collapsing to a blank — matching `boot`'s warning.
+        Some(v) if crate::backend_env_unrecognized(raw) => Check::new(
+            "default backend",
+            CheckStatus::Warn,
+            format!(
+                "{backend} (GLASS_BACKEND = {v:?} is not a recognized backend; using {backend})"
+            ),
+        )
+        .with_remedy(format!(
+            "unset GLASS_BACKEND or set it to one of: {}",
+            crate::BACKENDS.join(", ")
+        )),
+        Some(v) => Check::new(
+            "default backend",
+            CheckStatus::Ok,
+            format!("{backend} (GLASS_BACKEND = {v})"),
+        ),
+        None => Check::new(
+            "default backend",
+            CheckStatus::Ok,
+            format!("{backend} (GLASS_BACKEND unset)"),
+        ),
+    }
+}
 
-    let backend_detail = match std::env::var("GLASS_BACKEND") {
-        Ok(v) => format!("{backend} (GLASS_BACKEND = {v})"),
-        Err(_) => format!("{backend} (GLASS_BACKEND unset)"),
-    };
+fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diagnosis {
+    let raw = std::env::var("GLASS_BACKEND").ok();
+    let backend = crate::default_backend(raw.as_deref());
+
     let general = Section::new(
         "general",
         None,
         vec![
-            Check::new("default backend", CheckStatus::Ok, backend_detail),
+            default_backend_check(raw.as_deref()),
             Check::new("glass", CheckStatus::Ok, env!("CARGO_PKG_VERSION")),
         ],
     );
@@ -466,6 +498,37 @@ fn macos_a11y_checks(accessibility_granted: bool) -> Vec<Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_backend_check_warns_only_on_a_set_but_unrecognized_value() {
+        // Recognized name → Ok, echoing the value.
+        let ok = default_backend_check(Some("wayland"));
+        assert_eq!(ok.status, CheckStatus::Ok);
+        assert!(ok.detail.contains("wayland"), "detail: {}", ok.detail);
+        // Unset → Ok (the legitimate host-default case).
+        assert_eq!(default_backend_check(None).status, CheckStatus::Ok);
+        // Set-but-unknown → Warn, surfacing the raw value so the typo is visible instead of a
+        // silent host-default fallback, and carrying a remedy listing the valid backends.
+        let warn = default_backend_check(Some("andriod"));
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.detail.contains("andriod"), "detail: {}", warn.detail);
+        assert!(warn.remedy.is_some(), "expected a remedy on the warning");
+    }
+
+    #[test]
+    fn unrecognized_backend_warns_but_doctor_still_exits_zero() {
+        // The #148 contract: a mis-set GLASS_BACKEND must *surface* (Warn) yet not *fail*
+        // doctor. Pin the composition — the `general` section is critical (backend None), so a
+        // regression that made this check `Fail`, or moved it to a non-critical section, would
+        // silently flip the exit code with the isolated per-check tests still green.
+        let diag = Diagnosis::new(vec![Section::new(
+            "general",
+            None,
+            vec![default_backend_check(Some("andriod"))],
+        )]);
+        assert_eq!(diag.overall("x11"), CheckStatus::Warn);
+        assert_eq!(diag.exit_code("x11"), 0);
+    }
 
     #[test]
     fn idb_companion_check_fails_when_absent_and_oks_when_present() {

@@ -156,16 +156,28 @@ pub fn make_platform(
 pub const BACKENDS: &[&str] = &["x11", "wayland", "windows", "macos", "android", "ios"];
 
 /// Default backend name from `GLASS_BACKEND` (case-insensitive; one of [`BACKENDS`]).
-/// Unset defaults to the windows backend on a Windows host, the macos backend on a macOS
-/// host, else X11.
+/// Both *unset* and *set-but-unrecognized* fall back to `host_default_backend` — the windows
+/// backend on a Windows host, the macos backend on a macOS host, else X11. The unrecognized
+/// case is additionally surfaced (a `boot` warning / `glass_doctor` `Warn`, via
+/// `backend_env_unrecognized`) so a mis-set backend can't pass unnoticed, but a typo still
+/// lands on the same backend an unset var would rather than surprising a mac/windows host with
+/// x11.
 pub fn default_backend(env: Option<&str>) -> &'static str {
-    if let Some(v) = env {
-        return BACKENDS
-            .iter()
-            .find(|b| v.eq_ignore_ascii_case(b))
-            .copied()
-            .unwrap_or("x11");
-    }
+    env.and_then(recognized_backend)
+        .unwrap_or_else(host_default_backend)
+}
+
+/// The single backend-recognition predicate: the canonical [`BACKENDS`] entry `v` names
+/// (case-insensitively), or `None`. `default_backend`, `backend_env_unrecognized`, and
+/// `capabilities::render_json` all key off this one function, so "which values are recognized"
+/// can never drift between the resolver and the code that warns about a mis-set value.
+pub(crate) fn recognized_backend(v: &str) -> Option<&'static str> {
+    BACKENDS.iter().find(|b| v.eq_ignore_ascii_case(b)).copied()
+}
+
+/// The backend to use when `GLASS_BACKEND` gives no usable name: the windows backend on a
+/// Windows host, the macos backend on a macOS host, else X11.
+fn host_default_backend() -> &'static str {
     if cfg!(windows) {
         "windows"
     } else if cfg!(target_os = "macos") {
@@ -173,6 +185,15 @@ pub fn default_backend(env: Option<&str>) -> &'static str {
     } else {
         "x11"
     }
+}
+
+/// True when `GLASS_BACKEND` is *set* to a value `recognized_backend` doesn't match — the case
+/// where `default_backend` falls back to the host default instead of honoring the request (a
+/// typo like `andriod`, or a backend name from a newer glass). Distinct from *unset* (`None`),
+/// which legitimately means "use the host default". Callers surface this — a `boot` startup
+/// warning, a `glass_doctor` `Warn` — so a mis-set backend can't pass unnoticed.
+pub(crate) fn backend_env_unrecognized(env: Option<&str>) -> bool {
+    matches!(env, Some(v) if recognized_backend(v).is_none())
 }
 
 /// `glass-mcp env [--json]`: print glass's configuration env vars (secrets redacted).
@@ -312,7 +333,19 @@ fn default_baseline_dir() -> std::path::PathBuf {
 
 /// Build the `Glass` session manager, installing the audit sink if one is configured.
 pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
-    let default = default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()).to_string();
+    let raw = std::env::var("GLASS_BACKEND").ok();
+    let default = default_backend(raw.as_deref()).to_string();
+    if backend_env_unrecognized(raw.as_deref()) {
+        // `default_backend` fell back to the host default because GLASS_BACKEND holds an
+        // unrecognized value; say so rather than launching a surprising backend silently.
+        // (stdout carries the MCP protocol, so diagnostics go to stderr.)
+        eprintln!(
+            "glass: GLASS_BACKEND={:?} is not a recognized backend; defaulting to {default}. \
+             Recognized backends: {}.",
+            raw.as_deref().unwrap_or_default(),
+            BACKENDS.join(", "),
+        );
+    }
     let baselines = BaselineStore::new(default_baseline_dir());
     let registry = glass_android::EmulatorRegistry::new();
     let agents = glass_android::AgentRegistry::new();
@@ -420,13 +453,42 @@ mod tests {
         assert_eq!(default_backend(Some("macos")), "macos");
         assert_eq!(default_backend(Some("MACOS")), "macos");
         assert_eq!(default_backend(Some("x11")), "x11");
-        assert_eq!(default_backend(Some("nonsense")), "x11");
         #[cfg(windows)]
         assert_eq!(default_backend(None), "windows");
         #[cfg(target_os = "macos")]
         assert_eq!(default_backend(None), "macos");
         #[cfg(not(any(windows, target_os = "macos")))]
         assert_eq!(default_backend(None), "x11");
+        // A set-but-unrecognized value falls to the host default — the same backend an unset
+        // var resolves to — not a hardcoded x11 that would surprise a mac/windows host.
+        assert_eq!(default_backend(Some("nonsense")), default_backend(None));
+    }
+
+    #[test]
+    fn backend_env_unrecognized_flags_only_set_but_unknown() {
+        use super::backend_env_unrecognized as unrec;
+        // Unset is the legitimate "host default" case — not a warning.
+        assert!(!unrec(None));
+        // Every recognized name (either case) is accepted silently.
+        for b in super::BACKENDS {
+            assert!(!unrec(Some(b)), "lower {b}");
+            assert!(!unrec(Some(&b.to_uppercase())), "upper {b}");
+        }
+        // A typo or a backend name from a newer glass is flagged, as is an empty value.
+        assert!(unrec(Some("andriod")));
+        assert!(unrec(Some("vnc")));
+        assert!(unrec(Some("")));
+        // No trimming: a stray space/newline (env-file or copy-paste) is unrecognized, so it
+        // warns + host-defaults rather than being silently accepted. Pins the no-trim contract.
+        assert!(unrec(Some("wayland ")));
+        assert!(unrec(Some(" x11")));
+    }
+
+    #[test]
+    fn host_default_backend_is_itself_a_recognized_backend() {
+        // `default_backend`'s fallback must be a real BACKENDS entry, or the resolver could
+        // hand `make_platform`/`capabilities_for` a name they'd reject.
+        assert!(super::BACKENDS.contains(&super::host_default_backend()));
     }
 
     #[test]

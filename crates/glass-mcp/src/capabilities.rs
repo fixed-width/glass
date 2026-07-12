@@ -109,22 +109,38 @@ pub fn capabilities_for(backend: &str) -> Option<CapabilityReport> {
 /// Resolve `backend` (None => the default backend) and render the report as JSON text.
 /// `Err` names the valid backends when `backend` is an unrecognized value.
 pub fn render_json(backend: Option<&str>) -> Result<String, String> {
+    render_json_resolved(backend, std::env::var("GLASS_BACKEND").ok().as_deref())
+}
+
+/// Pure core of [`render_json`], with the `GLASS_BACKEND` value passed in (`env`) so the
+/// default-resolution branch is testable without mutating the process environment. `env` is
+/// consulted only when `backend` is `None`.
+fn render_json_resolved(backend: Option<&str>, env: Option<&str>) -> Result<String, String> {
+    // A `None` caller with a set-but-unrecognized GLASS_BACKEND resolves to the host default;
+    // surface that in the report the way `boot`/`doctor` do, rather than reporting the wrong
+    // backend's capabilities with no indication the requested one was dropped.
+    let mut warning: Option<String> = None;
     let name: &'static str = match backend {
-        Some(v) => crate::BACKENDS
-            .iter()
-            .find(|b| v.eq_ignore_ascii_case(b))
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "unknown backend {v:?}; use one of: {}",
-                    crate::BACKENDS.join(", ")
-                )
-            })?,
-        None => crate::default_backend(std::env::var("GLASS_BACKEND").ok().as_deref()),
+        Some(v) => crate::recognized_backend(v).ok_or_else(|| {
+            format!(
+                "unknown backend {v:?}; use one of: {}",
+                crate::BACKENDS.join(", ")
+            )
+        })?,
+        None => {
+            if crate::backend_env_unrecognized(env) {
+                warning = Some(format!(
+                    "GLASS_BACKEND={:?} is not a recognized backend; reporting {} instead",
+                    env.unwrap_or_default(),
+                    crate::default_backend(env),
+                ));
+            }
+            crate::default_backend(env)
+        }
     };
     let report =
         capabilities_for(name).expect("render_json resolved name to a canonical BACKENDS entry");
-    let json = match report {
+    let mut json = match report {
         CapabilityReport::Available(map) => {
             let caps: serde_json::Map<String, serde_json::Value> = map
                 .entries()
@@ -143,6 +159,11 @@ pub fn render_json(backend: Option<&str>) -> Result<String, String> {
             "reason": format!("not in this glass build (host: {})", std::env::consts::OS),
         }),
     };
+    if let Some(w) = warning {
+        json.as_object_mut()
+            .expect("capability report is a JSON object")
+            .insert("warning".to_string(), serde_json::Value::String(w));
+    }
     Ok(serde_json::to_string(&json).expect("capability report serializes"))
 }
 
@@ -239,6 +260,25 @@ mod tests {
         assert_eq!(v["available"], false);
         assert!(v["reason"].as_str().unwrap().contains("host: linux"));
         assert!(v.get("capabilities").is_none());
+    }
+
+    #[test]
+    fn render_json_resolved_warns_on_unrecognized_env_backend() {
+        // No explicit backend + a typo'd GLASS_BACKEND: report the host default's caps, but
+        // attach a `warning` naming the dropped value so the fallback isn't silent (#148).
+        let host_default = crate::default_backend(None);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json_resolved(None, Some("andriod")).unwrap()).unwrap();
+        assert_eq!(v["backend"], host_default);
+        let warn = v["warning"].as_str().expect("warning field present");
+        assert!(warn.contains("andriod"), "warning: {warn}");
+
+        // A recognized value (or unset) attaches no warning — normal output is unchanged.
+        for env in [Some("android"), None] {
+            let v: serde_json::Value =
+                serde_json::from_str(&render_json_resolved(None, env).unwrap()).unwrap();
+            assert!(v.get("warning").is_none(), "unexpected warning for {env:?}");
+        }
     }
 
     #[test]
