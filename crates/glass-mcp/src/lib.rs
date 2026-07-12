@@ -2,6 +2,7 @@
 //! path is reachable from integration tests.
 
 pub mod audit;
+pub mod capabilities;
 pub mod cli;
 pub mod doctor;
 mod env;
