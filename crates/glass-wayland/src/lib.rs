@@ -15,6 +15,9 @@ pub mod swayipc;
 
 pub use platform::WaylandPlatform;
 
+/// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
+pub const BACKEND: &str = "wayland";
+
 /// This backend's capability map. All cells are code-constant here (desktop
 /// accessibility is reported Supported when the backend ships an a11y reader; per-OS
 /// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
@@ -41,5 +44,18 @@ mod capability_tests {
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(c.accessibility.status, Support::Supported);
         assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+
+    #[test]
+    fn multi_touch_unsupported_message_names_this_backend_not_android() {
+        let msg = glass_core::GlassError::unsupported(
+            "multi_touch",
+            crate::BACKEND,
+            crate::capabilities().multi_touch.note,
+        )
+        .to_string();
+        assert!(msg.contains("wayland backend"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(!msg.contains("android"), "{msg}");
     }
 }
