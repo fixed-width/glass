@@ -747,6 +747,34 @@ mod tests {
         );
     }
 
+    /// The `backend` param doc is the single place the backend list is spelled out for agents.
+    /// Lock it to BACKENDS so a backend added in code can't ship undocumented — the bug that
+    /// left `ios` out of glass_start's description text.
+    #[test]
+    fn backend_param_documents_every_backend() {
+        let start = GlassServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "glass_start")
+            .expect("glass_start is registered");
+        let doc = start
+            .input_schema
+            .get("properties")
+            .and_then(|v| v.get("backend"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .expect("backend param has a description")
+            .to_ascii_lowercase();
+        let missing: Vec<&&str> = crate::BACKENDS
+            .iter()
+            .filter(|b| !doc.contains(**b))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the `backend` param doc must name every backend in BACKENDS; missing: {missing:?}"
+        );
+    }
+
     #[test]
     fn tool_reference_documents_exactly_the_registry() {
         let documented = documented_tools();
