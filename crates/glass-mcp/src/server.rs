@@ -298,11 +298,16 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Report which operations (multi-touch, clipboard, accessibility, \
+        description = "Report which operations (input, multi-touch, clipboard, accessibility, \
                        window move/resize) can be performed right now on a backend, and any \
                        setup a blocked one needs — so you can check before acting instead of \
-                       hitting an Unsupported error. Pass `backend` to query a specific \
-                       backend by name; omit for the active one. Static — no session required."
+                       hitting an Unsupported error. Each operation reports a live `status` \
+                       (`supported`, `degraded` — works now at reduced fidelity, `note` says \
+                       what's lost; `requires_setup` — a setup step is missing, `note` says \
+                       what; or `unsupported` — this backend never does it) plus the `tools` \
+                       it gates, so a degraded or blocked operation names exactly which tool \
+                       calls to expect trouble from. Pass `backend` to query a specific backend \
+                       by name; omit for the active one. Static — no session required."
     )]
     async fn glass_capabilities(
         &self,
@@ -892,5 +897,23 @@ mod tests {
              registered but undocumented: {undocumented:?}\n  \
              documented but not registered: {phantom:?}"
         );
+    }
+
+    /// `glass_capabilities`'s per-operation tool lists (`OPERATION_TOOLS`, single-sourced in
+    /// `capabilities.rs`) must each name a tool actually in the registry — otherwise the
+    /// reported `tools` array would point an agent at a tool that doesn't exist. `tool_router`
+    /// is only reachable from this module (see `registered_tools` above), so the test lives
+    /// here rather than alongside the table in `capabilities.rs`.
+    #[test]
+    fn every_mapped_tool_is_a_registered_tool() {
+        let registered = registered_tools();
+        for (op, tools) in crate::capabilities::OPERATION_TOOLS {
+            for t in *tools {
+                assert!(
+                    registered.contains(*t),
+                    "operation {op:?} maps to unregistered tool {t:?}"
+                );
+            }
+        }
     }
 }

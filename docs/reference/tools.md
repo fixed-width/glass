@@ -434,15 +434,33 @@ before `glass_start`.
 
 Returns JSON. For a backend compiled into this binary:
 
-`{ "backend", "available": true, "capabilities": { <capability>: { "status", "note"? } } }`
+`{ "backend", "available": true, "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
 
-where each capability (`multi_touch`, `clipboard`, `accessibility`, `window_move_resize`) has a
-`status` of `supported`, `requires_setup` (a setup step is missing now — `note` says what), or
-`unsupported` (this backend never does it). For a valid backend **not** built into the running
-binary: `{ "backend", "available": false, "reason": "..." }`.
+Each of the five operations — `input`, `multi_touch`, `clipboard`, `accessibility`,
+`window_move_resize` — carries a live `status`, one of four states: `supported` (works now),
+`degraded` (works now at reduced fidelity/coverage — `note` says what's lost and how to restore
+it), `requires_setup` (a setup step is missing right now — `note` says what), or `unsupported`
+(this backend never does it). `note` is present for `degraded`, `requires_setup`, and some
+`unsupported` cases; absent for plain `supported`.
 
-**Platform notes:** availability is live. android `multi_touch`/`clipboard` need the on-device
-agent (`GLASS_ANDROID_AGENT_JAR`) and iOS `accessibility` needs `idb_companion`, so those read
+Every entry also carries `tools`: the MCP tools that operation gates, so a
+`degraded`/`requires_setup`/`unsupported` entry tells you exactly which calls to expect trouble
+from:
+
+- **input** → `glass_type`, `glass_click`, `glass_key`, `glass_drag`, `glass_scroll`,
+  `glass_move`, `glass_do`
+- **multi_touch** → `glass_gesture`
+- **clipboard** → `glass_clipboard_get`, `glass_clipboard_set`
+- **accessibility** → `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_click_element`,
+  `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
+- **window_move_resize** → `glass_window`
+
+For a valid backend **not** built into the running binary:
+`{ "backend", "available": false, "reason": "..." }`.
+
+**Platform notes:** availability is live. android `input` is `degraded` (adb-only injection
+unless the on-device agent is set up) and its `multi_touch`/`clipboard` need that same agent
+(`GLASS_ANDROID_AGENT_JAR`); iOS `accessibility` needs `idb_companion`; those read
 `requires_setup` until set up. Desktop-backend `accessibility` is reported `supported` when the
 backend ships an a11y reader; whether a given window exposes a tree, and per-OS grants (the macOS
 accessibility permission, the Linux AT-SPI stack), are surfaced by `glass_doctor` and when you call

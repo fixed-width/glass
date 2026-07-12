@@ -17,11 +17,15 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
-- `glass_capabilities` — a new tool reporting which operations (multi-touch, clipboard,
+- `glass_capabilities` — a new tool reporting which operations (input, multi-touch, clipboard,
   accessibility, window move/resize) can be performed right now on a backend, and any setup a
   blocked one needs, so an agent can check before acting instead of hitting an Unsupported error.
-  Takes an optional `backend` (defaults to the active one); a backend not built into the running
-  binary reports `available: false`.
+  Each operation reports a live status — `supported`, `degraded` (works now at reduced fidelity,
+  e.g. Android's adb-only input without its on-device agent), `requires_setup`, or `unsupported`
+  — plus the specific tools that operation gates (e.g. `accessibility` names
+  `glass_a11y_snapshot`, `glass_click_element`, and friends), so a degraded or blocked entry
+  points straight at the tool calls it affects. Takes an optional `backend` (defaults to the
+  active one); a backend not built into the running binary reports `available: false`.
 - `glass_scroll_to_element` now drives **horizontal** containers, not just vertical: `direction`
   accepts `left`/`right` as well as `up`/`down`, and when omitted it **infers** the direction from
   the target's off-screen position. It anchors the scroll on the target's own row/column, so a
