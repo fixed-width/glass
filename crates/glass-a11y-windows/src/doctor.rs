@@ -2,12 +2,36 @@
 //! `a11y_checks` maps gathered facts to `Check`s and is unit-tested without UIA; `checks`
 //! gathers the real environment (UIA is creatable).
 
+use glass_core::capability::CapabilityStatus;
 use glass_core::{Check, CheckStatus};
 
 /// Probe whether UI Automation is usable.
 pub fn checks(_deep: bool) -> Vec<Check> {
     let uia_ok = probe_uia();
     a11y_checks(uia_ok)
+}
+
+/// Live: is UI Automation creatable right now? This is the desktop-`accessibility` capability
+/// signal for the Windows backend — the *same* [`probe_uia`] the doctor's check reads, so
+/// `glass_capabilities` and `glass doctor` can't drift. `false` off Windows (the backend is
+/// never dispatched there; the map still compiles for host unit tests).
+pub fn accessibility_available() -> bool {
+    probe_uia().is_ok()
+}
+
+/// The desktop-`accessibility` capability cell for the Windows backend, from the
+/// UIA-availability signal. Kept next to [`probe_uia`] so the note stays with the failure
+/// knowledge it describes. The note hedges the cause (UIA can fail to initialize for reasons
+/// beyond Session 0); the doctor's check carries the exact underlying error.
+pub const fn accessibility_capability(available: bool) -> CapabilityStatus {
+    if available {
+        CapabilityStatus::supported()
+    } else {
+        CapabilityStatus::requires_setup(
+            "UI Automation could not be initialized (commonly a non-interactive Session 0 \
+             context); run glass in an interactive desktop session",
+        )
+    }
 }
 
 /// Pure: build the a11y checks from gathered facts. `uia` is the result of actually
@@ -54,6 +78,12 @@ fn probe_uia() -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accessibility_available_matches_uia_probe() {
+        // The capability signal must read the *same* probe the doctor's check uses — one
+        // source, so `glass_capabilities` and `glass doctor` can't disagree.
+        assert_eq!(accessibility_available(), probe_uia().is_ok());
+    }
     #[test]
     fn uia_ok_is_ok() {
         assert_eq!(a11y_checks(Ok(())).len(), 1);

@@ -462,7 +462,9 @@ For a valid backend **not** built into the running binary:
 **Platform notes:** availability is live. android `input` is `degraded` (adb-only injection
 unless the on-device agent is set up) and its `multi_touch`/`clipboard` need that same agent
 (`GLASS_ANDROID_AGENT_JAR`); iOS `accessibility` needs `idb_companion`; those read
-`requires_setup` until set up. Desktop-backend `accessibility` is reported `supported` when the
-backend ships an a11y reader; whether a given window exposes a tree, and per-OS grants (the macOS
-accessibility permission, the Linux AT-SPI stack), are surfaced by `glass_doctor` and when you call
-the a11y tools.
+`requires_setup` until set up. Desktop-backend `accessibility` is live too: it reads
+`requires_setup` when the enabling stack isn't ready — the Linux AT-SPI runtime isn't installed,
+the macOS Accessibility grant isn't held, or Windows UI Automation can't initialize (e.g. a
+non-interactive Session 0) — and `supported` once it is. Whether a given *window* then exposes a
+tree is still app-dependent (bare canvas/game UIs don't), surfaced when you call the a11y tools;
+`glass_doctor` reports the same per-OS readiness in more detail.
