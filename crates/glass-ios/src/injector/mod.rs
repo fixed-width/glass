@@ -308,10 +308,13 @@ mod pointer_tests {
             pointers: vec![],
             duration_ms: 100,
         };
-        assert!(matches!(
-            inj.pointer_events(&g),
-            Err(glass_core::GlassError::Unsupported(_))
-        ));
+        let err = inj.pointer_events(&g).unwrap_err();
+        assert!(matches!(err, glass_core::GlassError::Unsupported(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("ios backend"), "{msg}");
+        assert!(msg.contains("multi_touch"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(msg.contains("single-contact"), "{msg}");
     }
 
     #[test]

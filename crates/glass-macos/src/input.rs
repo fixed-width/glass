@@ -593,6 +593,10 @@ mod tests {
             matches!(&err, Err(GlassError::Unsupported(_))),
             "expected Unsupported, got {err:?}"
         );
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("macos backend"), "{msg}");
+        assert!(msg.contains("multi_touch"), "{msg}");
+        assert!(msg.contains("glass_capabilities"), "{msg}");
     }
 
     #[test]
