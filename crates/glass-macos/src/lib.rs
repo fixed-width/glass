@@ -4,12 +4,14 @@
 //! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`],
 //! [`shim_path`]) is crate-level and unit-tested on the Linux dev box; the OS-touching
 //! modules and the `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off macOS
-//! the crate exposes only the pure modules.
+//! the crate exposes only the pure modules and the code-constant [`capabilities`] map.
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
 // modules below stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
+
+use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
@@ -51,6 +53,20 @@ mod session;
 pub use backend::MacosPlatform;
 #[cfg(target_os = "macos")]
 pub use ffi::init_main_thread;
+
+/// This backend's capability map. All cells are code-constant here (desktop
+/// accessibility is reported Supported when the backend ships an a11y reader; per-OS
+/// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
+pub fn capabilities() -> CapabilityMap {
+    CapabilityMap {
+        input: CapabilityStatus::supported(),
+        multi_touch: CapabilityStatus::unsupported(None),
+        clipboard: CapabilityStatus::supported(),
+        accessibility: CapabilityStatus::supported(),
+        window_move_resize: CapabilityStatus::supported(),
+    }
+}
+
 // `doctor`-facing predicates (glass-mcp's doctor.rs): the two TCC grants (+ the exact
 // remedy text `preflight`'s `PermissionDenied` error also uses, so the two can't drift)
 // and the console session's three-way state (unlocked/locked/no-session-attached).
@@ -68,3 +84,22 @@ pub use permissions::{
 };
 #[cfg(target_os = "macos")]
 pub use session::{session_locked, session_state, SessionState};
+
+// Kept last: a `#[cfg(test)]` module must not be followed by other items
+// (clippy::items_after_test_module), and the macOS-gated `pub use`s above are absent off
+// macOS — so this test module goes at the end of the file where nothing can follow it.
+#[cfg(test)]
+mod capability_tests {
+    use super::capabilities;
+    use glass_core::capability::Support;
+
+    #[test]
+    fn desktop_constant_capability_map() {
+        let c = capabilities();
+        assert_eq!(c.input.status, Support::Supported);
+        assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(c.clipboard.status, Support::Supported);
+        assert_eq!(c.accessibility.status, Support::Supported);
+        assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+}

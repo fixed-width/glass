@@ -3,12 +3,15 @@
 //! v1 drives the interactive desktop. The OS-touching modules and the
 //! `WindowsPlatform` impl are gated per-item with `#[cfg(windows)]` (not a
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
-//! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi`.
+//! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi` and the
+//! code-constant [`capabilities`] map.
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
 // modules below stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
+
+use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
@@ -34,6 +37,19 @@ pub(crate) fn disclose_clip_disabled(dll: &str) {
              reinstall to enable it."
         );
     });
+}
+
+/// This backend's capability map. All cells are code-constant here (desktop
+/// accessibility is reported Supported when the backend ships an a11y reader; per-OS
+/// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
+pub fn capabilities() -> CapabilityMap {
+    CapabilityMap {
+        input: CapabilityStatus::supported(),
+        multi_touch: CapabilityStatus::unsupported(None),
+        clipboard: CapabilityStatus::supported(),
+        accessibility: CapabilityStatus::supported(),
+        window_move_resize: CapabilityStatus::supported(),
+    }
 }
 
 #[cfg(windows)]
@@ -343,5 +359,21 @@ mod backend {
                 app.kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::capabilities;
+    use glass_core::capability::Support;
+
+    #[test]
+    fn desktop_constant_capability_map() {
+        let c = capabilities();
+        assert_eq!(c.input.status, Support::Supported);
+        assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(c.clipboard.status, Support::Supported);
+        assert_eq!(c.accessibility.status, Support::Supported);
+        assert_eq!(c.window_move_resize.status, Support::Supported);
     }
 }

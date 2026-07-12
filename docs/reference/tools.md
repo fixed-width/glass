@@ -422,3 +422,47 @@ it to self-diagnose a `glass_start` failure.
 wayland) and software GL; the report names exactly the checks it ran for the selected backend.
 
 Mirrors the `glass-mcp doctor` CLI — see [reference/cli.md](cli.md).
+
+### `glass_capabilities`
+
+Report which operations can be performed **right now** on a backend — so you can check before you
+act, instead of discovering an `Unsupported` error by trying. Static: no session required, works
+before `glass_start`.
+
+- `backend` (string, optional) — which backend to report: `x11`, `wayland`, `windows`, `macos`,
+  `android`, `ios`. Omit for the active/default backend.
+
+Returns JSON. For a backend compiled into this binary:
+
+`{ "backend", "available": true, "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
+
+Each of the five operations — `input`, `multi_touch`, `clipboard`, `accessibility`,
+`window_move_resize` — carries a live `status`, one of four states: `supported` (works now),
+`degraded` (works now at reduced fidelity/coverage — `note` says what's lost and how to restore
+it), `requires_setup` (a setup step is missing right now — `note` says what), or `unsupported`
+(this backend never does it). `note` is present when there's something to explain (what's
+degraded/missing, or a caveat — even a plain `supported` op can carry one, e.g. iOS `clipboard`
+being supported but needing on-screen paste consent); omitted otherwise.
+
+Every entry also carries `tools`: the MCP tools that operation gates, so a
+`degraded`/`requires_setup`/`unsupported` entry tells you exactly which calls to expect trouble
+from:
+
+- **input** → `glass_type`, `glass_click`, `glass_key`, `glass_drag`, `glass_scroll`,
+  `glass_move`, `glass_do`
+- **multi_touch** → `glass_gesture`
+- **clipboard** → `glass_clipboard_get`, `glass_clipboard_set`
+- **accessibility** → `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_click_element`,
+  `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
+- **window_move_resize** → `glass_window`
+
+For a valid backend **not** built into the running binary:
+`{ "backend", "available": false, "reason": "..." }`.
+
+**Platform notes:** availability is live. android `input` is `degraded` (adb-only injection
+unless the on-device agent is set up) and its `multi_touch`/`clipboard` need that same agent
+(`GLASS_ANDROID_AGENT_JAR`); iOS `accessibility` needs `idb_companion`; those read
+`requires_setup` until set up. Desktop-backend `accessibility` is reported `supported` when the
+backend ships an a11y reader; whether a given window exposes a tree, and per-OS grants (the macOS
+accessibility permission, the Linux AT-SPI stack), are surfaced by `glass_doctor` and when you call
+the a11y tools.

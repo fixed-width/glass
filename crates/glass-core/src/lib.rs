@@ -43,6 +43,9 @@ pub use diff::{diff, diff_perceptual, region_satisfied, BBox, DiffResult, Region
 pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Section};
 
+pub mod capability;
+pub use capability::{CapabilityMap, CapabilityStatus, Support};
+
 pub mod stability;
 pub use stability::StabilityTracker;
 
