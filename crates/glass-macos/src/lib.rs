@@ -66,20 +66,6 @@ pub fn capabilities() -> CapabilityMap {
     }
 }
 
-#[cfg(test)]
-mod capability_tests {
-    use super::capabilities;
-    use glass_core::capability::Support;
-
-    #[test]
-    fn desktop_constant_capability_map() {
-        let c = capabilities();
-        assert_eq!(c.multi_touch.status, Support::Unsupported);
-        assert_eq!(c.clipboard.status, Support::Supported);
-        assert_eq!(c.accessibility.status, Support::Supported);
-        assert_eq!(c.window_move_resize.status, Support::Supported);
-    }
-}
 // `doctor`-facing predicates (glass-mcp's doctor.rs): the two TCC grants (+ the exact
 // remedy text `preflight`'s `PermissionDenied` error also uses, so the two can't drift)
 // and the console session's three-way state (unlocked/locked/no-session-attached).
@@ -97,3 +83,21 @@ pub use permissions::{
 };
 #[cfg(target_os = "macos")]
 pub use session::{session_locked, session_state, SessionState};
+
+// Kept last: a `#[cfg(test)]` module must not be followed by other items
+// (clippy::items_after_test_module), and the macOS-gated `pub use`s above are absent off
+// macOS — so this test module goes at the end of the file where nothing can follow it.
+#[cfg(test)]
+mod capability_tests {
+    use super::capabilities;
+    use glass_core::capability::Support;
+
+    #[test]
+    fn desktop_constant_capability_map() {
+        let c = capabilities();
+        assert_eq!(c.multi_touch.status, Support::Unsupported);
+        assert_eq!(c.clipboard.status, Support::Supported);
+        assert_eq!(c.accessibility.status, Support::Supported);
+        assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+}
