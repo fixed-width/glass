@@ -422,3 +422,28 @@ it to self-diagnose a `glass_start` failure.
 wayland) and software GL; the report names exactly the checks it ran for the selected backend.
 
 Mirrors the `glass-mcp doctor` CLI — see [reference/cli.md](cli.md).
+
+### `glass_capabilities`
+
+Report which operations can be performed **right now** on a backend — so you can check before you
+act, instead of discovering an `Unsupported` error by trying. Static: no session required, works
+before `glass_start`.
+
+- `backend` (string, optional) — which backend to report: `x11`, `wayland`, `windows`, `macos`,
+  `android`, `ios`. Omit for the active/default backend.
+
+Returns JSON. For a backend compiled into this binary:
+
+`{ "backend", "available": true, "capabilities": { <capability>: { "status", "note"? } } }`
+
+where each capability (`multi_touch`, `clipboard`, `accessibility`, `window_move_resize`) has a
+`status` of `supported`, `requires_setup` (a setup step is missing now — `note` says what), or
+`unsupported` (this backend never does it). For a valid backend **not** built into the running
+binary: `{ "backend", "available": false, "reason": "..." }`.
+
+**Platform notes:** availability is live. android `multi_touch`/`clipboard` need the on-device
+agent (`GLASS_ANDROID_AGENT_JAR`) and iOS `accessibility` needs `idb_companion`, so those read
+`requires_setup` until set up. Desktop-backend `accessibility` is reported `supported` when the
+backend ships an a11y reader; whether a given window exposes a tree, and per-OS grants (the macOS
+accessibility permission, the Linux AT-SPI stack), are surfaced by `glass_doctor` and when you call
+the a11y tools.

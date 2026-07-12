@@ -334,6 +334,15 @@ pub struct DoctorArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CapabilitiesArgs {
+    /// Which backend to report: `x11`, `wayland`, `windows`, `macos`, `android`, or
+    /// `ios`. Omit for the active/default backend (`GLASS_BACKEND`, else the host
+    /// default). A valid name for a backend not built into this binary reports
+    /// `available: false`.
+    pub backend: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DiffArgs {
     pub name: String,
     /// `"perceptual"` (default) or `"exact"`.

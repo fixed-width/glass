@@ -298,6 +298,22 @@ impl GlassServer {
     }
 
     #[tool(
+        description = "Report which operations (multi-touch, clipboard, accessibility, \
+                       window move/resize) can be performed right now on a backend, and any \
+                       setup a blocked one needs — so you can check before acting instead of \
+                       hitting an Unsupported error. Pass `backend` to query a specific \
+                       backend by name; omit for the active one. Static — no session required."
+    )]
+    async fn glass_capabilities(
+        &self,
+        Parameters(a): Parameters<CapabilitiesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        Ok(map_tool_result(
+            crate::capabilities::render_json(a.backend.as_deref()).map(ToolOutput::text),
+        ))
+    }
+
+    #[tool(
         description = "List the app's top-level windows: id, title, class, geometry, and which is active. Returns a JSON array. Window ids are not stable across calls — re-list after windows open/close instead of caching ids."
     )]
     async fn glass_list_windows(&self) -> Result<CallToolResult, McpError> {
@@ -555,6 +571,32 @@ mod tests {
             "an Ok must surface as a success result"
         );
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
+    }
+
+    /// android is always compiled in (host-OS-agnostic), so it's a stable choice for
+    /// exercising the registered handler end to end without depending on the host OS.
+    #[tokio::test]
+    async fn glass_capabilities_returns_json_for_the_active_backend() {
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        let report = crate::audit::report_from_config(None, |_| None);
+        let server = GlassServer::new(glass, report);
+
+        let out = server
+            .glass_capabilities(Parameters(CapabilitiesArgs {
+                backend: Some("android".into()),
+            }))
+            .await
+            .unwrap();
+
+        let text = first_text(&out);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["backend"], "android");
+        assert_eq!(v["available"], true);
+        assert_eq!(
+            v["capabilities"]["window_move_resize"]["status"],
+            "unsupported"
+        );
     }
 
     // "windows" is excluded from `banned` below (collides with the plain noun, e.g.
