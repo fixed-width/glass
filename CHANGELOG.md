@@ -61,6 +61,12 @@ internal refactors, CI, or test-only changes.
   while iOS is driven per-call). Previously the line was omitted unless `GLASS_BACKEND=ios`, so its
   absence read like "not found" for the input/accessibility precondition. When iOS isn't the active
   backend an absent companion is reported as an advisory warning rather than a hard failure.
+- A `GLASS_BACKEND` set to an unrecognized value (a typo like `andriod`, or a name from a newer
+  glass) is no longer silently ignored: `boot` logs a one-line stderr warning naming the value and
+  the recognized backends, `glass doctor`'s "default backend" check reports a non-fatal `Warn` with
+  a remedy, and `glass_capabilities` attaches a `warning` field. The fallback also now resolves to
+  the host default (macos/windows/x11) rather than a hardcoded x11, so a typo on a mac/Windows host
+  no longer drops to an x11 that host can't drive.
 
 ## [0.4.0] - 2026-07-11
 
