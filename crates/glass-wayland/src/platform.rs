@@ -1169,11 +1169,7 @@ impl Platform for WaylandPlatform {
                 glass_core::run_scroll(&mut sink, !modifiers.is_empty())?;
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::unsupported(
-                    "multi_touch",
-                    crate::BACKEND,
-                    crate::capabilities().multi_touch.note,
-                ));
+                return Err(crate::unsupported_multi_touch());
             }
         }
         session

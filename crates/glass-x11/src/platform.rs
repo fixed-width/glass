@@ -1033,11 +1033,7 @@ impl Platform for X11Platform {
                 glass_core::run_drag(&mut sink, &gesture)?;
             }
             PointerEvent::Gesture { .. } => {
-                return Err(GlassError::unsupported(
-                    "multi_touch",
-                    crate::BACKEND,
-                    crate::capabilities().multi_touch.note,
-                ));
+                return Err(crate::unsupported_multi_touch());
             }
         }
         self.conn

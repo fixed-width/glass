@@ -76,6 +76,16 @@ fn capabilities_with(agent: bool, a11y_apk: bool) -> CapabilityMap {
     }
 }
 
+/// The `Unsupported` error this backend returns for window move/resize — one source for
+/// the call site (`window()`'s `Resize`/`Move` arm) and its test.
+pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
+    glass_core::GlassError::unsupported(
+        "window_move_resize",
+        BACKEND,
+        capabilities().window_move_resize.note,
+    )
+}
+
 #[cfg(test)]
 mod capability_tests {
     use super::*;
@@ -121,12 +131,7 @@ mod capability_tests {
 
     #[test]
     fn window_move_resize_unsupported_message_names_the_android_backend() {
-        let msg = glass_core::GlassError::unsupported(
-            "window_move_resize",
-            crate::BACKEND,
-            crate::capabilities().window_move_resize.note,
-        )
-        .to_string();
+        let msg = crate::unsupported_window_move_resize().to_string();
         assert!(msg.contains("android backend"), "{msg}");
         assert!(msg.contains("full-screen"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");

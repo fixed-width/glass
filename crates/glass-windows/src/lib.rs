@@ -55,6 +55,12 @@ pub fn capabilities() -> CapabilityMap {
     }
 }
 
+/// The `Unsupported` error this backend returns for a multi-touch gesture — one source
+/// for the call site (`send_pointer`'s `Gesture` arm) and its test.
+pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, capabilities().multi_touch.note)
+}
+
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]
@@ -382,12 +388,7 @@ mod capability_tests {
 
     #[test]
     fn multi_touch_unsupported_message_names_this_backend_not_android() {
-        let msg = glass_core::GlassError::unsupported(
-            "multi_touch",
-            crate::BACKEND,
-            crate::capabilities().multi_touch.note,
-        )
-        .to_string();
+        let msg = crate::unsupported_multi_touch().to_string();
         assert!(msg.contains("windows backend"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
         assert!(!msg.contains("android"), "{msg}");

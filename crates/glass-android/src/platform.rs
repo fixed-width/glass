@@ -248,11 +248,9 @@ impl Platform for AndroidPlatform {
                 app.window = window.clone();
                 Ok(window)
             }
-            WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
-                "window_move_resize",
-                crate::BACKEND,
-                crate::capabilities().window_move_resize.note,
-            )),
+            WindowOp::Resize { .. } | WindowOp::Move { .. } => {
+                Err(crate::unsupported_window_move_resize())
+            }
         }
     }
 
