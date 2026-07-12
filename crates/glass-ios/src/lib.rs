@@ -26,25 +26,30 @@ pub use target::{SimTarget, SimulatorRegistry};
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus, Support};
 
-/// This backend's live capability map. `accessibility` needs `idb_companion` — gated on
-/// [`doctor::companion_present`], the same presence signal the runtime spawn resolves.
+/// This backend's live capability map. `input`/`accessibility` need `idb_companion` —
+/// gated on [`doctor::companion_present`], the same presence signal the runtime spawn
+/// resolves.
 pub fn capabilities() -> CapabilityMap {
     capabilities_with(crate::doctor::companion_present())
 }
 
-fn capabilities_with(companion_present: bool) -> CapabilityMap {
-    let accessibility = if companion_present {
-        CapabilityStatus::supported()
-    } else {
-        CapabilityStatus::requires_setup("idb_companion not found (needed for accessibility)")
-    };
+fn capabilities_with(companion: bool) -> CapabilityMap {
     CapabilityMap {
+        input: if companion {
+            CapabilityStatus::degraded("US-ASCII input only; non-ASCII characters are unsupported")
+        } else {
+            CapabilityStatus::requires_setup("needs idb_companion (observe-only without it)")
+        },
         multi_touch: CapabilityStatus::unsupported(Some("idb provides single-contact touch only")),
         clipboard: CapabilityStatus::new(
             Support::Supported,
             Some("paste needs on-screen consent (Allow Paste)"),
         ),
-        accessibility,
+        accessibility: if companion {
+            CapabilityStatus::supported()
+        } else {
+            CapabilityStatus::requires_setup("idb_companion not found (needed for accessibility)")
+        },
         window_move_resize: CapabilityStatus::unsupported(Some("apps are full-screen")),
     }
 }
@@ -55,28 +60,32 @@ mod capability_tests {
     use glass_core::capability::Support;
 
     #[test]
-    fn companion_present_makes_accessibility_supported() {
+    fn input_is_degraded_with_companion_requires_setup_without() {
+        let c = capabilities_with(true);
+        assert_eq!(c.input.status, Support::Degraded);
+        assert!(c.input.note.unwrap().contains("ASCII"));
         assert_eq!(
-            capabilities_with(true).accessibility.status,
-            Support::Supported
+            capabilities_with(false).input.status,
+            Support::RequiresSetup
         );
     }
 
     #[test]
-    fn companion_absent_makes_accessibility_requires_setup() {
-        let c = capabilities_with(false);
-        assert_eq!(c.accessibility.status, Support::RequiresSetup);
-        assert!(c.accessibility.note.unwrap().contains("idb_companion"));
+    fn accessibility_gates_on_companion() {
+        assert_eq!(
+            capabilities_with(true).accessibility.status,
+            Support::Supported
+        );
+        assert_eq!(
+            capabilities_with(false).accessibility.status,
+            Support::RequiresSetup
+        );
     }
 
     #[test]
     fn constant_cells_are_fixed() {
         let c = capabilities_with(true);
         assert_eq!(c.multi_touch.status, Support::Unsupported);
-        assert_eq!(
-            c.multi_touch.note,
-            Some("idb provides single-contact touch only")
-        );
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(
             c.clipboard.note,

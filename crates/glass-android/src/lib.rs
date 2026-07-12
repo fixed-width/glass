@@ -31,25 +31,44 @@ pub use target::{AdbTarget, AttachedDevice};
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
-/// This backend's live capability map. `multi_touch`/`clipboard` need the on-device
-/// agent — gated on [`agent::agent_enabled`], the same predicate the runtime uses to
-/// pick `AgentInjector` vs `ShellInjector`, so this can't disagree with real behavior.
+/// This backend's live capability map. `input` degrades and `multi_touch`/`clipboard`
+/// need the on-device agent — gated on [`agent::agent_enabled`], the same predicate the
+/// runtime uses to pick `AgentInjector` vs `ShellInjector`, so this can't disagree with
+/// real behavior. `accessibility` degrades without the a11y APK — gated on
+/// [`a11y_service::a11y_apk`], the same predicate the runtime uses to pick the Compose-rich
+/// reader vs the basic `uiautomator` one.
 pub fn capabilities() -> CapabilityMap {
-    capabilities_with(crate::agent::agent_enabled(&|k| std::env::var(k).ok()))
+    let get = |k: &str| std::env::var(k).ok();
+    capabilities_with(
+        crate::agent::agent_enabled(&get),
+        crate::a11y_service::a11y_apk(&get).is_some(),
+    )
 }
 
-fn capabilities_with(agent_enabled: bool) -> CapabilityMap {
-    let gated = if agent_enabled {
+fn capabilities_with(agent: bool, a11y_apk: bool) -> CapabilityMap {
+    let agent_gated = if agent {
         CapabilityStatus::supported()
     } else {
-        CapabilityStatus::requires_setup(
-            "on-device agent not detected; set GLASS_ANDROID_AGENT_JAR",
-        )
+        CapabilityStatus::requires_setup("needs the on-device agent; set GLASS_ANDROID_AGENT_JAR")
     };
     CapabilityMap {
-        multi_touch: gated,
-        clipboard: gated,
-        accessibility: CapabilityStatus::supported(),
+        input: if agent {
+            CapabilityStatus::supported()
+        } else {
+            CapabilityStatus::degraded(
+                "adb input only; set GLASS_ANDROID_AGENT_JAR for high-fidelity input",
+            )
+        },
+        multi_touch: agent_gated,
+        clipboard: agent_gated,
+        accessibility: if a11y_apk {
+            CapabilityStatus::supported()
+        } else {
+            CapabilityStatus::degraded(
+                "basic uiautomator tree only; set GLASS_ANDROID_A11Y_APK for the Compose tree + \
+                 high-fidelity set_value",
+            )
+        },
         window_move_resize: CapabilityStatus::unsupported(Some("apps are full-screen")),
     }
 }
@@ -60,32 +79,40 @@ mod capability_tests {
     use glass_core::capability::Support;
 
     #[test]
-    fn agent_present_makes_multi_touch_and_clipboard_supported() {
-        let c = capabilities_with(true);
-        assert_eq!(c.multi_touch.status, Support::Supported);
-        assert_eq!(c.clipboard.status, Support::Supported);
-        assert!(c.multi_touch.note.is_none());
+    fn input_degrades_without_the_agent() {
+        assert_eq!(
+            capabilities_with(true, true).input.status,
+            Support::Supported
+        );
+        let c = capabilities_with(false, true);
+        assert_eq!(c.input.status, Support::Degraded);
+        assert!(c.input.note.unwrap().contains("GLASS_ANDROID_AGENT_JAR"));
     }
 
     #[test]
-    fn agent_absent_makes_them_requires_setup_with_env_hint() {
-        let c = capabilities_with(false);
+    fn multi_touch_and_clipboard_require_the_agent() {
+        let c = capabilities_with(false, true);
         assert_eq!(c.multi_touch.status, Support::RequiresSetup);
         assert_eq!(c.clipboard.status, Support::RequiresSetup);
-        assert!(c
-            .multi_touch
-            .note
-            .unwrap()
-            .contains("GLASS_ANDROID_AGENT_JAR"));
+        assert_eq!(
+            capabilities_with(true, true).multi_touch.status,
+            Support::Supported
+        );
     }
 
     #[test]
-    fn constant_cells_do_not_depend_on_the_agent() {
-        for signal in [true, false] {
-            let c = capabilities_with(signal);
-            assert_eq!(c.accessibility.status, Support::Supported);
-            assert_eq!(c.window_move_resize.status, Support::Unsupported);
-            assert_eq!(c.window_move_resize.note, Some("apps are full-screen"));
-        }
+    fn accessibility_degrades_without_the_a11y_apk() {
+        assert_eq!(
+            capabilities_with(true, true).accessibility.status,
+            Support::Supported
+        );
+        let c = capabilities_with(true, false);
+        assert_eq!(c.accessibility.status, Support::Degraded);
+        assert!(c
+            .accessibility
+            .note
+            .unwrap()
+            .contains("GLASS_ANDROID_A11Y_APK"));
+        assert_eq!(c.window_move_resize.status, Support::Unsupported);
     }
 }

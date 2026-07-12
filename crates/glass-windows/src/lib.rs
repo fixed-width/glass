@@ -44,6 +44,7 @@ pub(crate) fn disclose_clip_disabled(dll: &str) {
 /// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
 pub fn capabilities() -> CapabilityMap {
     CapabilityMap {
+        input: CapabilityStatus::supported(),
         multi_touch: CapabilityStatus::unsupported(None),
         clipboard: CapabilityStatus::supported(),
         accessibility: CapabilityStatus::supported(),
@@ -77,6 +78,7 @@ mod capability_tests {
     #[test]
     fn desktop_constant_capability_map() {
         let c = capabilities();
+        assert_eq!(c.input.status, Support::Supported);
         assert_eq!(c.multi_touch.status, Support::Unsupported);
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(c.accessibility.status, Support::Supported);
