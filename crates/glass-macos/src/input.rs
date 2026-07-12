@@ -86,7 +86,7 @@ pub(crate) fn send_pointer(
         return Err(GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::capabilities().multi_touch.note,
+            crate::MULTI_TOUCH.note,
         ));
     }
     focus(pid)?;

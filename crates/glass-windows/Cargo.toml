@@ -14,6 +14,10 @@ bench = false
 [dependencies]
 glass-core.workspace = true
 glass-clip-hook = { path = "../glass-clip-hook" }
+# The desktop-a11y capability signal (UI Automation creatable) reuses the a11y reader's own
+# `probe_uia`. Cross-platform dep: the crate's Windows-only bits are cfg(windows)-gated, so it
+# compiles on the Linux host where `capabilities()` is unit-tested.
+glass-a11y-windows = { path = "../glass-a11y-windows" }
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2"
@@ -33,10 +37,10 @@ windows = { version = "0.62", features = [
 ] }
 
 # The onbox examples + tests set Per-Monitor-V2 awareness at runtime (they carry no manifest); the
-# on-box a11y tests (tests/onbox.rs) also drive the UIA reader to validate the accessibility path.
+# on-box a11y tests (tests/onbox.rs) also drive the UIA reader (a normal dependency, above) to
+# validate the accessibility path.
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
-glass-a11y-windows = { path = "../glass-a11y-windows" }
 
 # The pixel conversion is cross-platform, so its bench builds and runs everywhere.
 [dev-dependencies]

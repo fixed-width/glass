@@ -8,7 +8,29 @@
 
 use std::time::Duration;
 
+use glass_core::capability::CapabilityStatus;
 use glass_core::{Check, CheckStatus};
+
+/// Live: is the AT-SPI bus launcher installed, so glass can spawn its private a11y bus?
+/// This is the desktop-a11y capability signal for the Linux backends — the *same* fact the
+/// doctor's head "a11y" check reads (both go through [`find_registry`]), so `glass_capabilities`
+/// and `glass doctor` can't drift. It is only a precondition ("glass can do a11y at all"), never
+/// a promise that a given window exposes a tree — that's up to the app.
+pub fn accessibility_launcher_present() -> bool {
+    find_registry().is_some()
+}
+
+/// The desktop-`accessibility` capability cell for a Linux backend, from the launcher-present
+/// signal. Shared by glass-x11 and glass-wayland (identical stacks) so their note can't drift.
+pub const fn accessibility_capability(launcher_present: bool) -> CapabilityStatus {
+    if launcher_present {
+        CapabilityStatus::supported()
+    } else {
+        CapabilityStatus::requires_setup(
+            "AT-SPI not installed; install at-spi2-core so glass can spawn its private a11y bus",
+        )
+    }
+}
 
 /// Read `/proc` for dbus-daemon entries (impure). Errors degrade to an empty list.
 fn read_proc_entries() -> Vec<ProcEntry> {
@@ -95,7 +117,7 @@ fn gather_host_a11y() -> HostA11yFacts {
 
 /// Probe whether the AT-SPI accessibility stack is usable.
 pub fn checks() -> Vec<Check> {
-    a11y_checks(find_registry().is_some(), &gather_host_a11y())
+    a11y_checks(accessibility_launcher_present(), &gather_host_a11y())
 }
 
 /// Health of the *host* (operator's desktop) AT-SPI bus — distinct from glass's private bus.
@@ -237,11 +259,26 @@ fn find_registry() -> Option<std::path::PathBuf> {
         "/usr/libexec/at-spi-bus-launcher",
         "/usr/lib/at-spi2-core/at-spi-bus-launcher",
         "/usr/lib/at-spi2/at-spi-bus-launcher",
-        "/usr/lib/x86_64-linux-gnu/at-spi2-core/at-spi-bus-launcher",
     ];
-    CANDIDATES
+    find_launcher(CANDIDATES, "/usr/lib")
+}
+
+/// Find the launcher among `fixed` absolute paths, then (if none hit) by scanning
+/// `multiarch_root/<triplet>/at-spi2-core/at-spi-bus-launcher`. The triplet directory is
+/// arch-specific (`x86_64-linux-gnu`, `aarch64-linux-gnu`, …), so scanning rather than
+/// hardcoding one arch keeps the AT-SPI-present signal correct on non-x86_64 hosts.
+fn find_launcher(fixed: &[&str], multiarch_root: &str) -> Option<std::path::PathBuf> {
+    if let Some(p) = fixed
         .iter()
         .map(std::path::PathBuf::from)
+        .find(|p| p.is_file())
+    {
+        return Some(p);
+    }
+    std::fs::read_dir(multiarch_root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join("at-spi2-core/at-spi-bus-launcher"))
         .find(|p| p.is_file())
 }
 
@@ -274,6 +311,64 @@ fn probe_a11y_bus() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::capability::Support;
+
+    // ---- capability signal (shared with glass-x11 / glass-wayland `capabilities()`) ----
+    #[test]
+    fn launcher_present_predicate_matches_find_registry() {
+        // The capability signal must be the *same* fact the doctor's head check reads —
+        // one source, so `glass_capabilities` and `glass doctor` can't disagree.
+        assert_eq!(accessibility_launcher_present(), find_registry().is_some());
+    }
+
+    #[test]
+    fn accessibility_capability_supported_when_launcher_present() {
+        let c = accessibility_capability(true);
+        assert_eq!(c.status, Support::Supported);
+        assert!(c.note.is_none());
+    }
+
+    #[test]
+    fn accessibility_capability_requires_setup_when_launcher_absent() {
+        let c = accessibility_capability(false);
+        assert_eq!(c.status, Support::RequiresSetup);
+        assert!(c.note.unwrap().contains("at-spi2-core"));
+    }
+
+    // ---- launcher discovery (impure FS scan, driven with a tempdir) ----
+    #[test]
+    fn find_launcher_prefers_a_present_fixed_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("at-spi-bus-launcher");
+        std::fs::write(&fixed, b"").unwrap();
+        let fixed_str = fixed.to_str().unwrap();
+        assert_eq!(
+            find_launcher(&[fixed_str], "/nonexistent-root"),
+            Some(fixed)
+        );
+    }
+
+    #[test]
+    fn find_launcher_scans_any_multiarch_triplet_dir() {
+        // The launcher under an arbitrary <triplet>/at-spi2-core/ dir must be found — not just
+        // x86_64 (regression guard: an aarch64 host must not report AT-SPI missing).
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root
+            .path()
+            .join("aarch64-linux-gnu/at-spi2-core/at-spi-bus-launcher");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, b"").unwrap();
+        assert_eq!(
+            find_launcher(&[], root.path().to_str().unwrap()),
+            Some(launcher)
+        );
+    }
+
+    #[test]
+    fn find_launcher_none_when_absent() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(find_launcher(&[], root.path().to_str().unwrap()), None);
+    }
 
     // ---- pure helpers ----
     #[test]

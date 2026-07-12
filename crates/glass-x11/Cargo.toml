@@ -13,6 +13,12 @@ bench = false
 
 [dependencies]
 glass-core.workspace = true
+# The desktop-a11y capability signal (AT-SPI launcher present) lives with the a11y reader
+# and its doctor. This backend->a11y-reader direction mirrors glass-windows -> glass-a11y-windows
+# (which is acyclic). Here it forms a Cargo-legal *dev*-dependency cycle: glass-a11y-linux
+# dev-depends back on this crate (for its integration tests), and Cargo permits a cycle whose
+# reverse edge is a dev-dependency.
+glass-a11y-linux.workspace = true
 glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
 glass-dbus-linux.workspace = true

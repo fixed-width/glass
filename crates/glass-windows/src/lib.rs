@@ -4,7 +4,7 @@
 //! `WindowsPlatform` impl are gated per-item with `#[cfg(windows)]` (not a
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
 //! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi` and the
-//! code-constant [`capabilities`] map.
+//! [`capabilities`] map (whose `accessibility` cell is live; every other cell is constant).
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
@@ -42,18 +42,30 @@ pub(crate) fn disclose_clip_disabled(dll: &str) {
     });
 }
 
-/// This backend's capability map. All cells are code-constant here (desktop
-/// accessibility is reported Supported when the backend ships an a11y reader; per-OS
-/// grants — macOS TCC, Linux AT-SPI — are surfaced by `glass_doctor`).
+/// This backend's capability map. Every cell but `accessibility` is code-constant; the
+/// `accessibility` cell is live — gated on whether UI Automation is creatable right now
+/// (`glass_a11y_windows::doctor::accessibility_available`), the same probe `glass_doctor`
+/// reads, so a Session-0/non-interactive context where UIA can't initialize reports
+/// `requires_setup` rather than a confident `supported`.
 pub fn capabilities() -> CapabilityMap {
+    capabilities_with(glass_a11y_windows::doctor::accessibility_available())
+}
+
+fn capabilities_with(a11y_available: bool) -> CapabilityMap {
     CapabilityMap {
         input: CapabilityStatus::supported(),
-        multi_touch: CapabilityStatus::unsupported(None),
+        multi_touch: MULTI_TOUCH,
         clipboard: CapabilityStatus::supported(),
-        accessibility: CapabilityStatus::supported(),
+        accessibility: glass_a11y_windows::doctor::accessibility_capability(a11y_available),
         window_move_resize: CapabilityStatus::supported(),
     }
 }
+
+/// Multi-touch is a code-constant `Unsupported` on this desktop backend. One source for both
+/// the capability map and the gesture-rejection error ([`unsupported_multi_touch`]) — so the
+/// error path reads a `const` note instead of routing through the now-live `capabilities()`,
+/// which probes the a11y stack.
+const MULTI_TOUCH: CapabilityStatus = CapabilityStatus::unsupported(None);
 
 /// The `Unsupported` error this backend returns for a multi-touch gesture — one source
 /// for the call site (`send_pointer`'s `Gesture` arm) and its test.
@@ -61,7 +73,7 @@ pub fn capabilities() -> CapabilityMap {
 // non-test Linux build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
-    glass_core::GlassError::unsupported("multi_touch", BACKEND, capabilities().multi_touch.note)
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note)
 }
 
 #[cfg(windows)]
@@ -376,17 +388,38 @@ mod backend {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::capabilities;
+    use super::{capabilities, capabilities_with};
     use glass_core::capability::Support;
 
     #[test]
-    fn desktop_constant_capability_map() {
-        let c = capabilities();
+    fn constant_capability_cells() {
+        // Everything but `accessibility` is code-constant on this desktop backend.
+        let c = capabilities_with(true);
         assert_eq!(c.input.status, Support::Supported);
         assert_eq!(c.multi_touch.status, Support::Unsupported);
         assert_eq!(c.clipboard.status, Support::Supported);
-        assert_eq!(c.accessibility.status, Support::Supported);
         assert_eq!(c.window_move_resize.status, Support::Supported);
+    }
+
+    #[test]
+    fn accessibility_is_live_on_ui_automation() {
+        assert_eq!(
+            capabilities_with(true).accessibility.status,
+            Support::Supported
+        );
+        let absent = capabilities_with(false).accessibility;
+        assert_eq!(absent.status, Support::RequiresSetup);
+        assert!(absent.note.unwrap().contains("Session 0"));
+    }
+
+    #[test]
+    fn public_capabilities_reads_the_live_uia_signal() {
+        // No parallel probe: the public map's `accessibility` cell is exactly what the
+        // shared UIA-availability signal produces.
+        assert_eq!(
+            capabilities().accessibility,
+            capabilities_with(glass_a11y_windows::doctor::accessibility_available()).accessibility
+        );
     }
 
     #[test]
