@@ -87,8 +87,10 @@ impl IdbInjector {
     /// Maps one glass `PointerEvent` to the idb HID events that reproduce it as a
     /// touch: a `Click` is a touch DOWN then UP at the same point (repeated `count`
     /// times); a `Drag`/`Scroll` is a single swipe; a `Move` is empty — touch has no
-    /// hover state to emit. `Gesture` (multi-touch) is not implemented yet and
-    /// returns `Unsupported` rather than silently dropping the pointers.
+    /// hover state to emit. `Gesture` (multi-touch) returns `Unsupported` rather than
+    /// silently dropping the pointers: idb's raw-touch primitive is single-contact
+    /// (a second concurrent DOWN relocates the same finger), so there is no general
+    /// N-finger primitive to map it to.
     pub fn pointer_events(&self, e: &PointerEvent) -> Result<Vec<proto::HidEvent>> {
         let s = self.scale;
         Ok(match *e {

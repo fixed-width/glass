@@ -103,13 +103,15 @@ pub enum GlassError {
 
 impl GlassError {
     /// Runtime "this operation is unsupported on the active backend" error, worded
-    /// consistently and generated from the backend's own capability map.
+    /// consistently.
     ///
-    /// `operation` is the [`crate::CapabilityMap`] field key (e.g. `"multi_touch"`) so
-    /// the message matches exactly what `glass_capabilities` prints — the agent can
-    /// cross-reference the two. `backend` is the **active** backend's name. `note` is that
-    /// capability's own note (single source), folded in when present. Always points the
-    /// agent at `glass_capabilities`.
+    /// Callers pass the capability's own key and `note` (read from that backend's
+    /// [`crate::CapabilityMap`]), so the message stays in sync with that backend's
+    /// capability map without this constructor reaching into it itself. `operation` is
+    /// the [`crate::CapabilityMap`] field key (e.g. `"multi_touch"`); the message embeds
+    /// it verbatim, so it is the exact key `glass_capabilities` lists — the agent can
+    /// cross-reference the two. `backend` is the **active** backend's name. `note` is
+    /// folded in when present. Always points the agent at `glass_capabilities`.
     pub fn unsupported(operation: &str, backend: &str, note: Option<&str>) -> Self {
         use std::fmt::Write as _;
         let mut msg = format!("{operation} is not supported by the {backend} backend");

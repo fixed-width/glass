@@ -116,5 +116,6 @@ mod capability_tests {
         .to_string();
         assert!(msg.contains("macos backend"), "{msg}");
         assert!(msg.contains("glass_capabilities"), "{msg}");
+        assert!(!msg.contains("android"), "{msg}");
     }
 }

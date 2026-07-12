@@ -4,7 +4,8 @@
 //! platform-specific — it shells out. The Simulator is the isolation boundary,
 //! so there is no sandbox machinery here. The backend drives input (tap, type,
 //! swipe, scroll) and reads the accessibility tree via `idb_companion`;
-//! multi-touch gestures are not yet supported.
+//! multi-touch gestures are unsupported — `idb`'s raw-touch primitive is
+//! single-contact, with no general N-finger primitive to drive them.
 #![forbid(unsafe_code)]
 
 mod a11y;

@@ -39,10 +39,11 @@ internal refactors, CI, or test-only changes.
   duplicated backend list); the accepted backends are documented once on the `glass_start`
   `backend` param, and the per-OS clipboard/gesture/doctor specifics are collected in the
   [tools reference](docs/reference/tools.md)'s per-tool **Platform notes**.
-- When an operation isn't available on the active backend, the `Unsupported` error now names that
-  backend and points at `glass_capabilities` (which lists what the backend can do), instead of a
-  terse or sometimes misleading message — for example gesture/multi-touch on the desktop backends
-  no longer claims it is "only supported on the android backend".
+- Operation-unsupported errors now name the active backend and point at `glass_capabilities`
+  (which lists what the backend can do), instead of a terse or sometimes misleading message.
+  This covers gesture/multi-touch (every backend) and window resize/move (the mobile backends)
+  — for example the desktop backends no longer claim gestures are "only supported on the
+  android backend".
 
 ### Fixed
 - Wayland: text entry (`glass_type` and a typed `KeyEvent::Text`) is reliable under heavy machine

@@ -57,6 +57,9 @@ pub fn capabilities() -> CapabilityMap {
 
 /// The `Unsupported` error this backend returns for a multi-touch gesture — one source
 /// for the call site (`send_pointer`'s `Gesture` arm) and its test.
+// Consumed only by the cfg(windows) `input::send_pointer` and the Linux unit test, so a
+// non-test Linux build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
     glass_core::GlassError::unsupported("multi_touch", BACKEND, capabilities().multi_touch.note)
 }
