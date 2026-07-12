@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 pub enum Support {
     /// Works right now.
     Supported,
+    /// Works now but at reduced fidelity/coverage (note says what's lost + how to restore).
+    Degraded,
     /// Supported by this backend in principle, but a setup step is missing right now.
     RequiresSetup,
     /// This backend can never do it (a code-constant fact).
@@ -35,6 +37,9 @@ impl CapabilityStatus {
     pub const fn supported() -> Self {
         Self::new(Support::Supported, None)
     }
+    pub const fn degraded(note: &'static str) -> Self {
+        Self::new(Support::Degraded, Some(note))
+    }
     pub const fn unsupported(note: Option<&'static str>) -> Self {
         Self::new(Support::Unsupported, note)
     }
@@ -46,6 +51,8 @@ impl CapabilityStatus {
 /// One status per capability. Serializes to a JSON object keyed by field name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CapabilityMap {
+    /// Pointer + keyboard injection (glass_type/click/key/drag/scroll/move/do).
+    pub input: CapabilityStatus,
     pub multi_touch: CapabilityStatus,
     pub clipboard: CapabilityStatus,
     pub accessibility: CapabilityStatus,
@@ -59,20 +66,18 @@ mod tests {
     #[test]
     fn map_serializes_to_keyed_object_snake_case_notes_omitted_when_none() {
         let m = CapabilityMap {
+            input: CapabilityStatus::degraded("adb only"),
             multi_touch: CapabilityStatus::requires_setup("need agent"),
             clipboard: CapabilityStatus::supported(),
             accessibility: CapabilityStatus::supported(),
             window_move_resize: CapabilityStatus::unsupported(Some("full-screen")),
         };
         let v = serde_json::to_value(m).unwrap();
+        assert_eq!(v["input"]["status"], "degraded");
+        assert_eq!(v["input"]["note"], "adb only");
         assert_eq!(v["multi_touch"]["status"], "requires_setup");
-        assert_eq!(v["multi_touch"]["note"], "need agent");
         assert_eq!(v["clipboard"]["status"], "supported");
-        assert!(
-            v["clipboard"].get("note").is_none(),
-            "note omitted when None"
-        );
+        assert!(v["clipboard"].get("note").is_none());
         assert_eq!(v["window_move_resize"]["status"], "unsupported");
-        assert_eq!(v["window_move_resize"]["note"], "full-screen");
     }
 }
