@@ -3,7 +3,8 @@
 //! v1 drives the interactive desktop. The OS-touching modules and the
 //! `WindowsPlatform` impl are gated per-item with `#[cfg(windows)]` (not a
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
-//! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi`.
+//! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi` and the
+//! code-constant [`capabilities`] map.
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
