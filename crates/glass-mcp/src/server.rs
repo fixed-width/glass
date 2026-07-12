@@ -123,7 +123,7 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Build, launch, and locate a native GUI app; returns its window geometry. Optional `backend`: \"x11\" (headless Xvfb) or \"wayland\" (headless sway) on Linux, or \"windows\" on a Windows host, or \"macos\" on a macOS host, or \"android\" for an AVD emulator on any host; defaults to the host backend (windows on Windows, macos on macOS, else x11). Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to an unrelated process (some packaged Windows apps)."
+        description = "Build, launch, and locate a native GUI app; returns its window geometry. Choose a backend with the `backend` param (defaults to the host); pass `a11y` to enable the accessibility tools. Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to another process."
     )]
     async fn glass_start(
         &self,
@@ -210,7 +210,8 @@ impl GlassServer {
                        segment in window-relative px, all down together at t=0 and up at \
                        duration_ms. Pinch = two pointers toward/apart; rotate = two on an arc; \
                        two-finger swipe = two parallel segments; a from==to pointer is held. \
-                       Android backend only (needs the on-device agent)."
+                       Multi-touch isn't available on every backend — it returns a clear \
+                       Unsupported error where the active backend can't do it."
     )]
     async fn glass_gesture(
         &self,
@@ -236,34 +237,18 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Read the clipboard as text (\"\" if empty). Acts on the app's clipboard — \
-                       isolated from your real clipboard on the private Xvfb/sway backends and on \
-                       a contained Windows app (a private boxed clipboard). Also the cheap \
-                       text-extraction path: glass_do ctrl+a then ctrl+c, then read here (beats \
-                       OCR for selectable text). On a contained macOS app (sandbox: Default/Strict), \
-                       an app not built with Apple's hardened runtime (e.g. a debug or unsigned \
-                       build) is transparently redirected to a private pasteboard glass shares — \
-                       isolated from your real clipboard and fully working; an app that runs under \
-                       hardened runtime (App Store / notarized) can't be redirected, so this returns \
-                       Unsupported. Uncontained (sandbox: off) reads your REAL system clipboard."
+        description = "Read the app's clipboard as text (\"\" if empty). Also the cheap \
+                       text-extraction path: glass_do ctrl+a then ctrl+c, then read here \
+                       (beats OCR for selectable text). Returns Unsupported where the backend \
+                       can't provide clipboard access."
     )]
     async fn glass_clipboard_get(&self) -> Result<CallToolResult, McpError> {
         self.run(tools::clipboard_get).await
     }
 
     #[tool(
-        description = "Write text to the clipboard so the app can paste it. Isolated from your \
-                       real clipboard on the private Xvfb/sway backends and on a contained Windows \
-                       app (a private boxed clipboard); only shared-desktop modes (GLASS_DISPLAY=:0, \
-                       or the Windows backend with sandbox=off) write your real clipboard — \
-                       snapshot with glass_clipboard_get first if needed. On a contained macOS app \
-                       (sandbox: Default/Strict), an app not built with Apple's hardened runtime \
-                       (e.g. a debug or unsigned build) is transparently redirected to a private \
-                       pasteboard glass shares — isolated from your real clipboard and fully \
-                       working; an app that runs under hardened runtime (App Store / notarized) \
-                       can't be redirected, so this returns Unsupported. Uncontained (sandbox: off) \
-                       writes your REAL system clipboard — \
-                       snapshot with glass_clipboard_get first if you need to preserve it."
+        description = "Write text to the app's clipboard so it can paste it. Returns \
+                       Unsupported where the backend can't provide clipboard access."
     )]
     async fn glass_clipboard_set(
         &self,
@@ -291,10 +276,10 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Diagnose the glass environment (Xvfb, sway, software GL) and report \
-                       per-check status + how to fix anything missing. Use this to self-diagnose \
-                       a glass_start failure. Optional `deep`: also spawn+tear-down the default \
-                       backend's headless display to verify it actually starts."
+        description = "Diagnose the glass environment and report per-check status + how to \
+                       fix anything missing. Use this to self-diagnose a glass_start failure. \
+                       Optional `deep`: also spin up and tear down the default backend's \
+                       headless display to verify it starts."
     )]
     async fn glass_doctor(
         &self,
@@ -491,44 +476,49 @@ impl GlassServer {
     }
 }
 
+/// Server-level instructions shown once to the agent, describing glass's tool loop.
+/// Must not name a backend (see `descriptions_name_no_backend`): capability support is a
+/// runtime property, not documentation.
+const SERVER_INSTRUCTIONS: &str =
+    "glass gives you a build → see → interact → debug loop over a real native GUI \
+     app — no app integration needed. One active session; tools target it implicitly; \
+     choose a backend at glass_start (defaults to the host; see the `backend` param).\n\n\
+     Loop: glass_start launches the app and captures its logs; glass_screenshot to see \
+     it; glass_click / glass_type / glass_key / glass_scroll / glass_drag (and \
+     glass_gesture for multi-touch where supported) to interact \
+     (coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left); \
+     glass_wait_stable to let a render settle before you look or compare; glass_logs \
+     for the app's stdout/stderr.\n\n\
+     Verify cheaply on the CPU: glass_baseline_save a good frame, act, then \
+     glass_wait_stable with include_image=false and glass_diff, which returns \
+     changed_pct and a bbox as TEXT (no image). Only call glass_diff with \
+     include_image=true (a cropped image of the changed region) when changed_pct shows \
+     something moved — don't screenshot to check every step.\n\n\
+     Wait for a specific condition instead of polling with screenshots: \
+     glass_wait_for_element (until a UI element reaches a state, e.g. Save becomes \
+     enabled — returns the element id for glass_click_element), glass_wait_for_region \
+     (until a region changes, or matches a saved baseline), glass_wait_for_log (until \
+     a log line appears). All return text only and time out softly with \
+     {matched:false} — branch on that rather than retrying blindly.\n\n\
+     Batch a known input sequence into one call with glass_do (actions: click/type/key/\
+     move/drag/scroll/settle), with an optional text-first `then` observe \
+     (settle/diff/screenshot) — fewer round-trips, and it fails fast naming the action \
+     that broke.\n\n\
+     Semantic addressing (when the app exposes an accessibility tree): \
+     glass_a11y_snapshot returns the elements as text (#id, role, name, \
+     window-relative bounds); glass_click_element clicks one by #id \
+     and glass_set_value writes an editable element's value by #id. Prefer \
+     this over pixel-hunting when it works; it errors for canvas/black-box \
+     apps, so fall back to screenshots then.\n\n\
+     Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
+     failed capture or input returns a message, never a blank or stale frame; fix the \
+     cause instead of retrying blindly.";
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GlassServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "glass gives you a build → see → interact → debug loop over a real native GUI \
-                 app — no app integration needed. One active session; tools target it implicitly; \
-                 choose a backend (x11 or wayland) at glass_start.\n\n\
-                 Loop: glass_start launches the app and captures its logs; glass_screenshot to see \
-                 it; glass_click / glass_type / glass_key / glass_scroll / glass_drag (and \
-                 glass_gesture for android multi-touch) to interact \
-                 (coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left); \
-                 glass_wait_stable to let a render settle before you look or compare; glass_logs \
-                 for the app's stdout/stderr.\n\n\
-                 Verify cheaply on the CPU: glass_baseline_save a good frame, act, then \
-                 glass_wait_stable with include_image=false and glass_diff, which returns \
-                 changed_pct and a bbox as TEXT (no image). Only call glass_diff with \
-                 include_image=true (a cropped image of the changed region) when changed_pct shows \
-                 something moved — don't screenshot to check every step.\n\n\
-                 Wait for a specific condition instead of polling with screenshots: \
-                 glass_wait_for_element (until a UI element reaches a state, e.g. Save becomes \
-                 enabled — returns the element id for glass_click_element), glass_wait_for_region \
-                 (until a region changes, or matches a saved baseline), glass_wait_for_log (until \
-                 a log line appears). All return text only and time out softly with \
-                 {matched:false} — branch on that rather than retrying blindly.\n\n\
-                 Batch a known input sequence into one call with glass_do (actions: click/type/key/\
-                 move/drag/scroll/settle), with an optional text-first `then` observe \
-                 (settle/diff/screenshot) — fewer round-trips, and it fails fast naming the action \
-                 that broke.\n\n\
-                 Semantic addressing (when the app exposes an accessibility tree): \
-                 glass_a11y_snapshot returns the elements as text (#id, role, name, \
-                 window-relative bounds); glass_click_element clicks one by #id \
-                 and glass_set_value writes an editable element's value by #id. Prefer \
-                 this over pixel-hunting when it works; it errors for canvas/black-box \
-                 apps, so fall back to screenshots then.\n\n\
-                 Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
-                 failed capture or input returns a message, never a blank or stale frame; fix the \
-                 cause instead of retrying blindly.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
@@ -565,6 +555,50 @@ mod tests {
             "an Ok must surface as a success result"
         );
         assert!(first_text(&r).contains("done"), "got {:?}", first_text(&r));
+    }
+
+    /// A session runs one backend, so naming a backend in a description is a mode-conditional
+    /// the agent can't resolve — and even a single named gate rots the day another backend
+    /// gains the capability. Which backends support a capability is a runtime property, not
+    /// documentation. Vocabulary = BACKENDS minus "windows" (collides with the plain noun,
+    /// e.g. glass_list_windows) plus the two Linux display servers that ARE those backends.
+    #[test]
+    fn descriptions_name_no_backend() {
+        let mut banned: Vec<String> = crate::BACKENDS
+            .iter()
+            .filter(|b| **b != "windows")
+            .map(|b| b.to_string())
+            .collect();
+        banned.push("xvfb".to_string());
+        banned.push("sway".to_string());
+
+        // Case-insensitive, word-boundary match so "ios" can't hit inside another word.
+        fn names(text: &str, tok: &str) -> bool {
+            text.to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == tok)
+        }
+
+        let mut problems: Vec<String> = Vec::new();
+        for tool in GlassServer::tool_router().list_all() {
+            let desc = tool.description.as_deref().unwrap_or("");
+            for tok in &banned {
+                if names(desc, tok) {
+                    problems.push(format!("  {}: names backend '{tok}'", tool.name));
+                }
+            }
+        }
+        for tok in &banned {
+            if names(SERVER_INSTRUCTIONS, tok) {
+                problems.push(format!("  get_info: names backend '{tok}'"));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "tool descriptions/instructions must not name a backend \
+             (capability support is dynamic, not documentation):\n{}",
+            problems.join("\n")
+        );
     }
 
     /// The tool reference is the only user-facing list of glass's tools. Bind it to the
