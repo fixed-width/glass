@@ -76,6 +76,12 @@ internal refactors, CI, or test-only changes.
   a remedy, and `glass_capabilities` attaches a `warning` field. The fallback also now resolves to
   the host default (macos/windows/x11) rather than a hardcoded x11, so a typo on a mac/Windows host
   no longer drops to an x11 that host can't drive.
+- `serve --http`: reconnecting an agent no longer fails with "another session is active". A
+  Streamable-HTTP session is decoupled from its TCP connection and lingers until an explicit
+  shutdown or a 5-minute idle timeout, so a client that dropped without cleanly disconnecting used
+  to be locked out of its own server until that timeout expired. A new client now takes over the
+  single live slot (last-client-wins), evicting the stale session, so reconnects succeed
+  immediately.
 
 ## [0.4.0] - 2026-07-11
 
