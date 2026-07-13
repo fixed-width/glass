@@ -1,9 +1,9 @@
-//! On-box (LOTUS) deterministic validation of the private-clipboard hook. `#[ignore]`d — it needs
+//! On-box deterministic validation of the private-clipboard hook. `#[ignore]`d — it needs
 //! Sandboxie running, the built `glass_clip_hook.dll` (path in `GLASS_CLIP_HOOK_DLL`), and the built
 //! `clipprobe` example. No GUI / interactive desktop is needed: the probe only calls user32
 //! clipboard APIs, so it runs over SSH. Run on the box with:
 //! ```text
-//!   set GLASS_CLIP_HOOK_DLL=C:\Users\mpd\glass\target\release\glass_clip_hook.dll
+//!   set GLASS_CLIP_HOOK_DLL=C:\Users\<user>\glass\target\release\glass_clip_hook.dll
 //!   cargo test -p glass-windows --release private_clipboard_isolation -- --ignored --nocapture
 //! ```
 

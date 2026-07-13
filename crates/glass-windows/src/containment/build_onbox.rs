@@ -1,4 +1,4 @@
-//! On-box (LOTUS) validation that the build step runs UNCONFINED even under Sandboxie
+//! On-box validation that the build step runs UNCONFINED even under Sandboxie
 //! containment — only the launched *run* is the security boundary. Completes the Windows
 //! follow-on of `2026-06-11-unsandbox-build-design`. `#[ignore]`d: needs Sandboxie. No window is
 //! launched, so this runs over SSH (no interactive desktop required).

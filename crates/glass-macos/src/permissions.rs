@@ -252,6 +252,6 @@ mod tests {
     // OS consent dialog), which is unsafe to trigger unattended in CI — a headless runner
     // has no user to click through it, and a real one shouldn't have its TCC state
     // mutated by every test run. Their FFI plumbing is verified by hand against the
-    // granted mini (see the workspace's macOS de-risking notes); `open_pane` is likewise
+    // granted dev Mac; `open_pane` is likewise
     // side-effecting (launches System Settings) and not called here for the same reason.
 }

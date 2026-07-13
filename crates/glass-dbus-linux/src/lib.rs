@@ -311,10 +311,10 @@ mod tests {
     /// Regression: the private a11y bus must stay inside our private runtime dir even
     /// when `org.a11y.Bus` is brought up by **D-Bus activation** rather than the launcher
     /// we spawn directly. We force that path by pointing `GLASS_ATSPI_LAUNCHER` at a no-op
-    /// (`/bin/true` exits without claiming the name — exactly the zombie a dogfood run
-    /// produced), so the session bus must activate the real launcher itself. If the
+    /// (`/bin/true` exits without claiming the name — exactly the zombie observed in
+    /// practice), so the session bus must activate the real launcher itself. If the
     /// activated launcher escapes to the ambient `XDG_RUNTIME_DIR`, it attaches to the
-    /// host accessibility bus — breaking isolation and (as that run showed) wedging on the
+    /// host accessibility bus — breaking isolation and (as observed) wedging on the
     /// contended host bus. Run this under a throwaway `XDG_RUNTIME_DIR` (test-a11y.sh does)
     /// so "ambient" is a sacrificial dir, never the operator's real `/run/user/UID`.
     #[test]

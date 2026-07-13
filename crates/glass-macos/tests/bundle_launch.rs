@@ -39,7 +39,7 @@
 //!
 //! Needs the same two TCC grants as `tests/input.rs` (Screen Recording for window
 //! discovery/capture, Accessibility for the AX snapshot in check 2), held by the signed,
-//! granted `GlassProbe.app` bundle on this project's dev Mac (`mini`) — same granted-run
+//! granted `GlassProbe.app` bundle on this project's dev Mac — same granted-run
 //! procedure as `capture.rs`/`input.rs`: copy this built test binary into the bundle,
 //! re-sign, run via a `gui/501` LaunchAgent so it inherits the bundle's grants.
 //! Check 2/3 additionally require `/System/Applications/TextEdit.app` to
@@ -470,7 +470,7 @@ mod macos_main {
         // `swiftc` can never skip the handoff/fail-closed checks and a missing `TextEdit.app`
         // can never skip the foreground check. Failures fail the run; skips are reported
         // distinctly (SKIPPED, never counted as a pass) and do not block the PASS banner for
-        // the checks that did run and pass. On the mini both preconditions are present, so
+        // the checks that did run and pass. On the dev Mac both preconditions are present, so
         // all three run.
         let mut failures = Vec::new();
         let mut skips = Vec::new();

@@ -27,7 +27,7 @@
 //!
 //! Needs the Accessibility (and Screen Recording, for `MacosPlatform::new`'s preflight) TCC
 //! grants, which only the signed, granted `GlassProbe.app` bundle holds on this project's
-//! dev Mac (`mini`) — see `capture.rs`'s module doc and `scripts/test-macos.sh` for how the
+//! dev Mac — see `capture.rs`'s module doc and `scripts/test-macos.sh` for how the
 //! granted run copies this binary into that bundle. The fixture binary path is taken from
 //! `GLASS_A11Y_FIXTURE_BIN` when set (the granted run pre-builds it); otherwise this builds
 //! `fixture/a11y_fixture.swift` with `swiftc`, or skips if neither is available.

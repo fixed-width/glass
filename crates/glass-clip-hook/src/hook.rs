@@ -1,4 +1,4 @@
-//! user32 clipboard detours + the pipe client (cfg windows; runtime-validated on LOTUS).
+//! user32 clipboard detours + the pipe client (cfg windows; runtime-validated on a real Windows host).
 //!
 //! Emulates a per-app clipboard backed by the host store. The detours NEVER call the real
 //! clipboard APIs (the box also has `OpenClipboard=n`), so the user's clipboard is untouched.
@@ -8,7 +8,7 @@
 //! data only — delayed rendering (`SetClipboardData(_, NULL)`) and OLE are out of scope.
 //!
 //! Compile-time verified by cross-compiling to `x86_64-pc-windows-gnu`. Runtime interception is
-//! finalized on a real Windows box (LOTUS); the detour table is authored complete so that on-box
+//! finalized on a real Windows box; the detour table is authored complete so that on-box
 //! work is debugging, not authoring.
 
 use std::sync::OnceLock;
