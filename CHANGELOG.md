@@ -16,6 +16,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-13
+
 ### Added
 - `glass_capabilities` — a new tool reporting which operations (input, multi-touch, clipboard,
   accessibility, window move/resize) can be performed right now on a backend, and any setup a
@@ -238,7 +240,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/fixed-width/glass/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fixed-width/glass/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/fixed-width/glass/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/fixed-width/glass/compare/v0.2.0...v0.3.0
