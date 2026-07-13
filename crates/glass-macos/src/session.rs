@@ -13,7 +13,7 @@
 //! calling process: it isn't "returns NULL whenever you're on a bare SSH shell" — a
 //! bare-SSH `doctor` run on a box where an account IS logged in at the console still
 //! sees that account's real (locked/unlocked) session dict, same as a GUI-launched
-//! process would (verified by hand: `doctor` run over plain SSH against the `mini`
+//! process would (verified by hand: `doctor` run over plain SSH against the dev Mac
 //! host, logged-in-but-unattended, reported the true unlocked state, not NoSession).
 //! What NULL actually signals is "capture/input have nothing to attach to *regardless
 //! of who calls this*" — which is not "a present, unlocked session" and so

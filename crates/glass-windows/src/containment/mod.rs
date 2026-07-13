@@ -9,12 +9,12 @@ mod clip_server;
 #[cfg(windows)]
 mod sandboxie;
 
-// On-box (LOTUS) deterministic validation of the private-clipboard hook. Compiled only for the
+// On-box deterministic validation of the private-clipboard hook. Compiled only for the
 // Windows test profile; the tests inside are `#[ignore]`d (need Sandboxie + the built DLL).
 #[cfg(all(test, windows))]
 mod clip_onbox;
 
-// On-box (LOTUS) validation that the build step runs unconfined even under Sandboxie. `#[ignore]`d
+// On-box validation that the build step runs unconfined even under Sandboxie. `#[ignore]`d
 // (needs Sandboxie); launches no window, so it runs over SSH.
 #[cfg(all(test, windows))]
 mod build_onbox;

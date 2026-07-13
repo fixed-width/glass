@@ -282,7 +282,7 @@ pub(crate) fn agent_pointer(origin: &WindowGeometry, event: &PointerEvent) -> Ve
                 .saturating_sub(dy.saturating_mul(SCROLL_STEP_PX))
                 .clamp(origin.y, hi_y);
             // Interpolate so the swipe carries real velocity (a fling), not a single jump —
-            // a 2-point swipe under-scrolls and stalls on long lists (dogfood #17).
+            // a 2-point swipe under-scrolls and stalls on long lists.
             vec![agent_path(cx, cy, ex, ey, SWIPE_MS)]
         }
         PointerEvent::Gesture { .. } => vec![], // handled by AgentInjector::pointer directly
@@ -427,7 +427,7 @@ mod agent_inject_tests {
             }
         );
         // Real ACTION_MOVE samples between DOWN and UP — a 2-point path is swallowed by
-        // Android touch-slop (onDragStart fires at the end coordinate). See dogfood F8.
+        // Android touch-slop (onDragStart fires at the end coordinate).
         assert!(
             path.len() >= 8,
             "expected interpolated samples, got {}",
@@ -480,7 +480,7 @@ mod agent_inject_tests {
             }
         );
         // Interpolated samples give the swipe real velocity → a fling, so deep scrolls
-        // don't stall. Dogfood finding #17.
+        // don't stall.
         assert!(
             path.len() >= 8,
             "scroll should fling with interpolated samples, got {}",

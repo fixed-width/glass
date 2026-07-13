@@ -19,12 +19,12 @@
 //!
 //! Needs the same two TCC grants as `tests/input.rs` (Screen Recording for window discovery/
 //! capture, Accessibility for the AX window ops), held by the signed, granted `GlassProbe.app`
-//! bundle on this project's dev Mac (`mini`) — same granted-run procedure as `capture.rs`/
+//! bundle on this project's dev Mac — same granted-run procedure as `capture.rs`/
 //! `input.rs`: copy this built test binary into the bundle, re-sign, run via a `gui/501`
 //! LaunchAgent so it inherits the bundle's grants. See `scripts/test-macos.sh`'s
 //! `GLASS_MACOS_ONBOX` gate for how this fits the test scripts.
 //!
-//! **Additional runtime precondition beyond the two TCC grants: `mini`'s screen session must
+//! **Additional runtime precondition beyond the two TCC grants: the Mac's screen session must
 //! not be locked** — same secure-input restriction `tests/input.rs`'s module doc documents in
 //! detail (a locked screen silently drops synthetic input and pins frontmost-app queries to
 //! `loginwindow`). `select_window`/`window(op)` both activate/raise the target window, so this

@@ -8,7 +8,7 @@
 //! denied; we fully substitute them.
 //!
 //! Compile-time verified by cross-compiling to `x86_64-pc-windows-gnu`. Whether the detours
-//! actually intercept at runtime is finalized on a real Windows box (LOTUS).
+//! actually intercept at runtime is finalized on a real Windows box.
 
 use std::cell::{Cell, RefCell};
 

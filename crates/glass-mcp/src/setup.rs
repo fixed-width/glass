@@ -920,7 +920,7 @@ mod tests {
         // A bare `cargo run` output isn't inside a bundle → name the default install path so
         // the instruction still points somewhere concrete.
         assert_eq!(
-            app_bundle_path(Path::new("/home/mpd/glass/target/release/glass-mcp")),
+            app_bundle_path(Path::new("/home/u/glass/target/release/glass-mcp")),
             DEFAULT_APP_PATH
         );
     }
@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn rejects_a_bare_cargo_build_output_path() {
         assert!(!is_inside_app_bundle(Path::new(
-            "/home/mpd/glass/target/release/glass-mcp"
+            "/home/u/glass/target/release/glass-mcp"
         )));
     }
 

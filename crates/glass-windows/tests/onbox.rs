@@ -458,7 +458,7 @@ fn onbox_clipboard_roundtrip() {
     );
 }
 
-// The dogfood found that a CONTAINED app's own clipboard write was invisible to glass: glass set/get
+// A CONTAINED app's own clipboard write was invisible to glass: glass set/get
 // round-tripped and glass->app paste worked, but the app's ctx.copy_text (-> arboard -> user32
 // SetClipboardData, detoured into the private store) read back empty. This reproduces it with the
 // fixture auto-copying a sentinel under Sandboxie, and isolates the app-write path from the store

@@ -20,13 +20,13 @@
 //!
 //! Needs the Accessibility TCC grant (CGEvent posting) in addition to Screen Recording
 //! (window discovery via ScreenCaptureKit), both held by the signed, granted `GlassProbe.app`
-//! bundle on this project's dev Mac (`mini`) — same granted-run procedure as
+//! bundle on this project's dev Mac — same granted-run procedure as
 //! `tests/capture.rs`: copy this built test binary into the bundle, re-sign, run via a
 //! `gui/501` LaunchAgent so it inherits the bundle's grants. See `scripts/test-macos.sh`'s
 //! `GLASS_MACOS_ONBOX` gate for how this fits the test scripts.
 //!
-//! **Additional runtime precondition beyond the two TCC grants: `mini`'s screen session
-//! must not be locked.** Debugging on `mini` empirically proved that while the console
+//! **Additional runtime precondition beyond the two TCC grants: the Mac's screen session
+//! must not be locked.** Debugging empirically proved that while the console
 //! session is locked
 //! (`CGSSessionScreenIsLocked=1`), macOS's secure-input protection pins
 //! `NSWorkspace.frontmostApplication` to `loginwindow` and silently drops every synthetic
@@ -291,7 +291,7 @@ mod macos_main {
         // the content DOWN" convention (see input.rs's module doc / glass-x11's
         // `scroll_button(5=down,4=up, dy)`). `MacScrollSink::wheel` posts `wheel1 = -dy`, but
         // what `NSEvent.scrollingDeltaY` the window server ultimately delivers to the fixture
-        // also depends on `mini`'s **natural-scrolling** system setting
+        // also depends on the target Mac's **natural-scrolling** system setting
         // (`com.apple.swipescrolldirection`), which inverts the effective on-screen direction
         // independent of anything `input.rs` controls. So only `read_scroll`'s non-zero check
         // is hard-asserted here — the SIGN itself is recorded via `println!` rather than
@@ -314,7 +314,7 @@ mod macos_main {
         println!(
             "send_pointer(Scroll) OK: sent dx=0,dy=5 (glass 'scroll down') -> fixture reported \
              scrollingDeltaX={reported_dx},scrollingDeltaY={reported_dy} (sign depends on \
-             mini's natural-scrolling setting — see this file's module doc)"
+             the target Mac's natural-scrolling setting — see this file's module doc)"
         );
 
         Ok(())

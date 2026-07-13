@@ -12,7 +12,7 @@
 //! real main thread.
 //!
 //! Needs the Screen Recording TCC grant, which only a signed, granted app bundle holds on
-//! this project's dev Mac (`mini`). A plain `cargo test --test capture` build (this file
+//! this project's dev Mac. A plain `cargo test --test capture` build (this file
 //! compiles and can run) will still fail at the grant check unless run in that granted
 //! context — the actual granted run copies this test binary into the granted
 //! `GlassProbe.app` bundle, re-signs it, and launches it via a `gui/501` LaunchAgent so it
