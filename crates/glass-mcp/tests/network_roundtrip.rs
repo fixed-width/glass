@@ -1,5 +1,5 @@
 //! Always-on network-transport tests: a real MCP handshake + tool call over HTTP,
-//! plus auth and single-client enforcement. Display-free (uses glass_doctor).
+//! plus auth and single-live-session takeover. Display-free (uses glass_doctor).
 
 #![cfg(feature = "network")]
 
@@ -76,10 +76,22 @@ async fn rejects_missing_token() {
 }
 
 #[tokio::test]
-async fn second_client_is_rejected() {
+async fn second_client_takes_over() {
     let url = start_server(Some("tok")).await;
-    let _c1 = ().serve(client_transport(&url, Some("tok"))).await.expect("first client");
-    // Second initialize must fail while the first session is live.
-    let c2 = ().serve(client_transport(&url, Some("tok"))).await;
-    assert!(c2.is_err(), "second concurrent client must be rejected");
+    let c1 = ().serve(client_transport(&url, Some("tok"))).await.expect("first client");
+    // A second client takes over the single live slot instead of being rejected —
+    // this is the reconnect path (a client that dropped without a clean DELETE
+    // would otherwise be locked out of its own server until the zombie expired).
+    let c2 = ().serve(client_transport(&url, Some("tok"))).await.expect("second client takes over");
+    // The newcomer is fully live over the taken-over slot.
+    c2.call_tool(CallToolRequestParams::new("glass_doctor"))
+        .await
+        .expect("taken-over session serves calls");
+    // c1's session was evicted server-side (its next request would 404). We don't
+    // assert on c1 here: the rmcp client transparently re-initializes on a 404, so
+    // a c1 call would silently heal into a fresh session rather than surface the
+    // eviction. The one-live-slot invariant is covered precisely by the
+    // session_gate unit tests; this test's job is the real-path reconnect admission.
+    let _ = c1;
+    c2.cancel().await.ok();
 }
