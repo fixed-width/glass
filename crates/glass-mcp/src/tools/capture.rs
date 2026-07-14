@@ -157,7 +157,7 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
     let (lines, cursor) = glass
         .logs(
             a.cursor.unwrap_or(0),
-            a.max_lines.unwrap_or(200),
+            a.max_lines.unwrap_or(200) as usize,
             stream,
             a.contains.as_deref(),
         )

@@ -365,7 +365,7 @@ pub struct DiffArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsArgs {
     pub cursor: Option<u64>,
-    pub max_lines: Option<usize>,
+    pub max_lines: Option<u32>,
     /// "stdout", "stderr", or "both" (default).
     pub stream: Option<String>,
     pub contains: Option<String>,
@@ -461,6 +461,13 @@ mod tests {
     fn logs_args_default_to_none() {
         let a: LogsArgs = serde_json::from_str("{}").unwrap();
         assert!(a.cursor.is_none() && a.stream.is_none());
+    }
+
+    #[test]
+    fn logs_max_lines_is_u32() {
+        let a: LogsArgs = serde_json::from_str(r#"{"max_lines": 50}"#).unwrap();
+        let n: Option<u32> = a.max_lines; // compile-time: field is Option<u32>
+        assert_eq!(n, Some(50));
     }
 
     #[test]
