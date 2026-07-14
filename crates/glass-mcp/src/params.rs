@@ -439,6 +439,13 @@ mod tests {
     }
 
     #[test]
+    fn start_env_rejects_array_of_pairs() {
+        // Locks the breaking change from the old `[["K","V"]]` array-of-pairs shape to the
+        // `{"K":"V"}` object: the array shape must no longer deserialize.
+        assert!(serde_json::from_str::<StartArgs>(r#"{"run":["app"],"env":[["K","V"]]}"#).is_err());
+    }
+
+    #[test]
     fn click_args_parse_with_optionals() {
         let a: ClickArgs =
             serde_json::from_str(r#"{"x":3,"y":4,"button":"right","count":2}"#).unwrap();

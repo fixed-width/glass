@@ -547,6 +547,20 @@ impl ServerHandler for GlassServer {
     }
 }
 
+/// The live `#[tool]` registry's names. The doc-sync guard tests below bind
+/// `docs/reference/tools.md` to this; [`crate::tools::testutil::assert_envelope`] binds a
+/// test's expected envelope `tool` string to it too, so a co-typo shared between a tool impl
+/// and its test (e.g. both saying `"glass_stop"` when the registered name is `"glass_stopp"`)
+/// fails loudly instead of passing green.
+#[cfg(test)]
+pub(crate) fn registered_tools() -> std::collections::BTreeSet<String> {
+    GlassServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,14 +787,6 @@ mod tests {
             .filter_map(|line| line.strip_prefix("### `"))
             .filter_map(|rest| rest.strip_suffix('`'))
             .map(str::to_owned)
-            .collect()
-    }
-
-    fn registered_tools() -> BTreeSet<String> {
-        GlassServer::tool_router()
-            .list_all()
-            .into_iter()
-            .map(|tool| tool.name.into_owned())
             .collect()
     }
 

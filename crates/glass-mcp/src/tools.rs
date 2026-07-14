@@ -323,6 +323,8 @@ pub(crate) mod testutil {
         WindowInfo, WindowOp,
     };
 
+    use super::{OutContent, ToolOutput};
+
     #[derive(Default)]
     pub struct FakePlatform {
         pub geometry: WindowGeometry,
@@ -574,6 +576,28 @@ pub(crate) mod testutil {
         });
         Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
     }
+
+    /// Parse content block `i` as the `{ok,tool,result}` envelope.
+    pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
+        let OutContent::Text(t) = &out.0[i] else {
+            panic!("expected envelope text at block {i}")
+        };
+        serde_json::from_str(t).expect("envelope must be valid JSON")
+    }
+
+    /// Assert block 0 is the success envelope for `tool` — and that `tool` is a REGISTERED
+    /// `#[tool]` name, so a co-typo shared between the tool impl's envelope literal and the
+    /// test's expected string (both say `"glass_stopp"`) still fails loudly. Returns `result`.
+    pub(crate) fn assert_envelope(out: &ToolOutput, tool: &str) -> serde_json::Value {
+        let v = envelope_at(out, 0);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], serde_json::json!(tool), "envelope: {v}");
+        assert!(
+            crate::server::registered_tools().iter().any(|t| t == tool),
+            "envelope tool {tool:?} is not a registered #[tool]"
+        );
+        v["result"].clone()
+    }
 }
 
 #[cfg(test)]
@@ -581,18 +605,6 @@ mod tests {
     use super::testutil::*;
     use super::*;
     use glass_core::{AppSpec, SandboxLevel};
-
-    /// Parse `out.0[0]` as the leading envelope, assert its `ok`/`tool` shape,
-    /// and return the parsed value so a test can read `result.*` off it.
-    fn envelope_value(out: &ToolOutput, tool: &str) -> serde_json::Value {
-        let OutContent::Text(t) = &out.0[0] else {
-            panic!("expected envelope text as the first item")
-        };
-        let v: serde_json::Value = serde_json::from_str(t).expect("envelope must be valid JSON");
-        assert_eq!(v["ok"], json!(true), "envelope: {v}");
-        assert_eq!(v["tool"], json!(tool), "envelope: {v}");
-        v
-    }
 
     fn start_args() -> StartArgs {
         StartArgs {
@@ -630,9 +642,9 @@ mod tests {
     fn start_returns_geometry_json() {
         let mut g = glass_with(FakePlatform::new(80, 60));
         let out = start(&mut g, &start_args()).unwrap();
-        let v = envelope_value(&out, "glass_start");
-        assert_eq!(v["result"]["width"], json!(80));
-        assert_eq!(v["result"]["height"], json!(60));
+        let v = assert_envelope(&out, "glass_start");
+        assert_eq!(v["width"], json!(80));
+        assert_eq!(v["height"], json!(60));
     }
 
     #[test]
@@ -663,6 +675,15 @@ mod tests {
     }
 
     #[test]
+    fn stop_running_session_returns_empty_envelope() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        start(&mut g, &start_args()).unwrap();
+        let out = stop(&mut g).unwrap();
+        let v = assert_envelope(&out, "glass_stop");
+        assert_eq!(v, json!({}), "envelope: {v}");
+    }
+
+    #[test]
     fn window_resize_requires_dimensions() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         start(&mut g, &start_args()).unwrap();
@@ -688,9 +709,9 @@ mod tests {
             height: Some(44),
         };
         let out = window(&mut g, &a).unwrap();
-        let v = envelope_value(&out, "glass_window");
-        assert_eq!(v["result"]["width"], json!(33));
-        assert_eq!(v["result"]["height"], json!(44));
+        let v = assert_envelope(&out, "glass_window");
+        assert_eq!(v["width"], json!(33));
+        assert_eq!(v["height"], json!(44));
     }
 
     #[test]
@@ -733,7 +754,7 @@ mod tests {
         })
         .unwrap();
         let out = a11y_snapshot(&mut g).unwrap();
-        envelope_value(&out, "glass_a11y_snapshot");
+        assert_envelope(&out, "glass_a11y_snapshot");
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
@@ -796,8 +817,8 @@ mod tests {
             },
         )
         .unwrap();
-        let v = envelope_value(&out, "glass_set_value");
-        assert_eq!(v["result"]["id"], json!(1), "envelope: {v}");
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
         // unknown id surfaces the actionable message
         let err = set_value(
             &mut g,
@@ -1027,9 +1048,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.0.len(), 1, "just the envelope, no siblings");
-        let v = envelope_value(&out, "glass_click_element");
-        assert_eq!(v["result"]["id"], json!(1), "envelope: {v}");
-        assert!(v["result"]["observed"].is_null(), "envelope: {v}");
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert!(v["observed"].is_null(), "envelope: {v}");
 
         let out2 = click_element(
             &mut g,
@@ -1072,10 +1093,10 @@ mod tests {
             2,
             "envelope + exactly one sibling (the a11y outline)"
         );
-        let v = envelope_value(&out, "glass_click_element");
-        assert_eq!(v["result"]["id"], json!(1), "envelope: {v}");
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
         assert!(
-            v["result"]["observed"].is_null(),
+            v["observed"].is_null(),
             "snapshot doesn't populate `observed`: {v}"
         );
         match &out.0[1] {
@@ -1120,13 +1141,9 @@ mod tests {
             1,
             "settle folds into `result.observed`, no extra sibling"
         );
-        let v = envelope_value(&out, "glass_click_element");
-        assert_eq!(v["result"]["id"], json!(1), "envelope: {v}");
-        assert_eq!(
-            v["result"]["observed"]["settled"],
-            json!(true),
-            "envelope: {v}"
-        );
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
     }
 
     #[test]
@@ -1141,12 +1158,37 @@ mod tests {
             },
         )
         .unwrap();
-        let v = envelope_value(&out, "glass_set_value");
-        assert_eq!(v["result"]["id"], json!(1), "envelope: {v}");
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
         assert!(
             matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
             "outline appended"
         );
+    }
+
+    #[test]
+    fn set_value_return_settle_folds_into_observed() {
+        use glass_core::Frame;
+        // Mirrors `return_settle_appends_settled_text` for `click_element`: wait_stable
+        // needs frames; one solid frame (repeated by the fake) settles.
+        let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let out = set_value(
+            &mut g,
+            &SetValueArgs {
+                id: 1,
+                text: "x".into(),
+                return_: Some("settle".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folds into `result.observed`, no extra sibling"
+        );
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
     }
 
     #[test]
@@ -1165,8 +1207,8 @@ mod tests {
         .unwrap();
 
         let out = list_windows(&mut g).unwrap();
-        let v = envelope_value(&out, "glass_list_windows");
-        assert_eq!(v["result"]["count"], json!(1), "envelope: {v}");
+        let v = assert_envelope(&out, "glass_list_windows");
+        assert_eq!(v["count"], json!(1), "envelope: {v}");
         let text = match &out.0[1] {
             OutContent::Text(t) => t.clone(),
             _ => panic!("expected text"),
@@ -1192,7 +1234,10 @@ mod tests {
             "json should include geometry width: {text}"
         );
 
-        assert!(select_window(&mut g, &SelectWindowArgs { id: 0 }).is_ok());
+        let out = select_window(&mut g, &SelectWindowArgs { id: 0 }).unwrap();
+        let v = assert_envelope(&out, "glass_select_window");
+        assert_eq!(v["width"], json!(320), "envelope: {v}");
+        assert_eq!(v["height"], json!(240), "envelope: {v}");
         assert!(select_window(&mut g, &SelectWindowArgs { id: 42 }).is_err());
     }
 

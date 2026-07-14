@@ -115,8 +115,8 @@ pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::start as start_tool;
     use crate::tools::testutil::*;
-    use crate::tools::{start as start_tool, OutContent};
 
     fn started() -> Glass {
         let mut g = glass_with(FakePlatform::new(100, 100));
@@ -135,18 +135,11 @@ mod tests {
         g
     }
 
-    fn result_json(out: &ToolOutput) -> serde_json::Value {
-        let OutContent::Text(t) = &out.0[0] else {
-            panic!("expected text")
-        };
-        serde_json::from_str(t).unwrap()
-    }
-
+    /// These input tools all return an empty `result` on success; assert the envelope
+    /// shape (ok/tool/registered) plus that emptiness in one call.
     fn assert_ok(out: &ToolOutput, tool: &str) {
-        let v = result_json(out);
-        assert_eq!(v["ok"], serde_json::json!(true));
-        assert_eq!(v["tool"], serde_json::json!(tool));
-        assert_eq!(v["result"], serde_json::json!({}));
+        let v = assert_envelope(out, tool);
+        assert_eq!(v, serde_json::json!({}), "envelope result: {v}");
     }
 
     #[test]
@@ -160,6 +153,13 @@ mod tests {
             modifiers: None,
         };
         assert_ok(&click(&mut g, &a).unwrap(), "glass_click");
+    }
+
+    #[test]
+    fn move_in_bounds_ok() {
+        let mut g = started();
+        let a = MoveArgs { x: 10, y: 20 };
+        assert_ok(&mouse_move(&mut g, &a).unwrap(), "glass_move");
     }
 
     #[test]
