@@ -9,7 +9,7 @@ use glass_core::{
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{OutContent, ToolOutput, ToolResult};
+use crate::tools::{envelope, OutContent, ToolOutput, ToolResult};
 
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
     if a.name.is_none() && a.role.is_none() {
@@ -43,9 +43,8 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
             "states": e.states.active(),
         })
     });
-    let body =
-        json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element }).to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    let body = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element });
+    Ok(ToolOutput::result("glass_wait_for_element", body))
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
@@ -98,9 +97,8 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
         "elapsed_ms": o.elapsed_ms,
         "element": element,
         "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
-    })
-    .to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    });
+    Ok(ToolOutput::result("glass_scroll_to_element", body))
 }
 
 pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
@@ -151,7 +149,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         ));
         image_produced = true;
     }
-    out.push(OutContent::Text(meta.to_string()));
+    out.push(OutContent::Text(envelope("glass_wait_for_region", meta)));
     if image_produced {
         out.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
     }
@@ -187,9 +185,7 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
     if let Some(note) = &o.note {
         body["note"] = json!(note);
     }
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(
-        &body.to_string(),
-    )))
+    Ok(ToolOutput::result("glass_wait_for_log", body))
 }
 
 #[cfg(test)]
@@ -408,17 +404,17 @@ mod tests {
         let out = wait_for_element(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
+                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
+                assert_eq!(v["result"]["element"]["id"], json!(1), "envelope: {v}");
+                assert_eq!(
+                    v["result"]["element"]["name"],
+                    json!("Save"),
+                    "envelope: {v}"
                 );
-                assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
-                );
-                assert!(t.contains("\"matched\":true"), "got: {t}");
-                assert!(t.contains("\"id\":1"), "got: {t}");
-                assert!(t.contains("\"name\":\"Save\""), "got: {t}");
             }
             _ => panic!("expected text"),
         }
@@ -434,16 +430,12 @@ mod tests {
         let out = wait_for_element(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
-                );
-                assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
-                );
-                assert!(t.contains("\"matched\":false"), "got: {t}");
-                assert!(t.contains("\"element\":null"), "got: {t}");
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
+                assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
+                assert!(v["result"]["element"].is_null(), "envelope: {v}");
             }
             _ => panic!("expected text"),
         }
@@ -528,17 +520,19 @@ mod tests {
         match out.0.last().unwrap() {
             OutContent::Text(t) => {
                 let v: serde_json::Value = serde_json::from_str(t).unwrap();
-                assert_eq!(v["matched"], true, "got: {t}");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_wait_for_region"), "envelope: {v}");
+                assert_eq!(v["result"]["matched"], true, "got: {t}");
                 assert_eq!(
-                    v["bbox"]["x"], 2,
+                    v["result"]["bbox"]["x"], 2,
                     "bbox x must be window-relative; got: {t}"
                 );
                 assert_eq!(
-                    v["bbox"]["y"], 2,
+                    v["result"]["bbox"]["y"], 2,
                     "bbox y must be window-relative; got: {t}"
                 );
-                assert_eq!(v["bbox"]["width"], 2, "got: {t}");
-                assert_eq!(v["bbox"]["height"], 2, "got: {t}");
+                assert_eq!(v["result"]["bbox"]["width"], 2, "got: {t}");
+                assert_eq!(v["result"]["bbox"]["height"], 2, "got: {t}");
             }
             _ => panic!("expected text"),
         }
@@ -612,16 +606,16 @@ mod tests {
         let out = wait_for_log(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
+                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
+                assert_eq!(
+                    v["result"]["line"]["text"],
+                    json!("build done"),
+                    "envelope: {v}"
                 );
-                assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
-                );
-                assert!(t.contains("\"matched\":true"), "got: {t}");
-                assert!(t.contains("\"text\":\"build done\""), "got: {t}");
             }
             _ => panic!("expected text"),
         }
@@ -667,16 +661,12 @@ mod tests {
         let out = wait_for_log(&mut g, &a).unwrap();
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(
-                    t.starts_with(crate::untrusted::NOTE),
-                    "must be marked untrusted: {t}"
-                );
-                assert!(
-                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "enveloped: {t}"
-                );
-                assert!(t.contains("\"matched\":false"), "got: {t}");
-                assert!(t.contains("\"line\":null"), "got: {t}");
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
+                assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
+                assert!(v["result"]["line"].is_null(), "envelope: {v}");
             }
             _ => panic!("expected text"),
         }
