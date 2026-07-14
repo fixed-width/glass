@@ -573,7 +573,10 @@ mod tests {
 
     #[test]
     fn map_tool_result_marks_ok_as_success() {
-        let r = map_tool_result(Ok(ToolOutput::text("done")));
+        let r = map_tool_result(Ok(ToolOutput::result(
+            "glass_test",
+            serde_json::json!("done"),
+        )));
         assert_eq!(
             r.is_error,
             Some(false),

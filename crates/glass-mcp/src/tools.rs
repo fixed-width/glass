@@ -27,10 +27,6 @@ pub enum OutContent {
 pub struct ToolOutput(pub Vec<OutContent>);
 
 impl ToolOutput {
-    pub fn text(s: impl Into<String>) -> Self {
-        ToolOutput(vec![OutContent::Text(s.into())])
-    }
-
     /// Wrap a tool's trusted result payload in the uniform 1.0 success envelope
     /// as the sole leading content block.
     pub fn result(tool: &str, result: serde_json::Value) -> Self {
