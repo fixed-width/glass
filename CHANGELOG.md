@@ -16,6 +16,18 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- **Every tool now returns a uniform result envelope.** On success, a tool's leading text block is
+  `{"ok": true, "tool": "<name>", "result": { … }}`, with the tool-specific fields under `result`.
+  Text the target app controls (the accessibility outline, log lines, clipboard contents, window
+  titles, and a matched element or log line) continues to arrive in its own block wrapped in the
+  untrusted marker — never inside `result`. Image tools return the image block first, then the
+  envelope, then the image note. An agent that read a tool's bare top-level JSON should now read the
+  fields under `result`.
+- **`glass_start`'s `env` is now a JSON object** `{ "KEY": "VALUE" }` instead of an array of
+  `[key, value]` pairs.
+- **`glass_logs`'s `max_lines` is a plain integer** (a `u32`).
+
 ## [0.5.0] - 2026-07-13
 
 ### Added
