@@ -15,6 +15,7 @@ pub(crate) enum EnvScope {
     Windows,
     Android,
     Ios,
+    Macos,
     Network,
 }
 
@@ -28,14 +29,15 @@ impl EnvScope {
             EnvScope::Windows => "windows",
             EnvScope::Android => "android",
             EnvScope::Ios => "ios",
+            EnvScope::Macos => "macos",
             EnvScope::Network => "network",
         }
     }
 }
 
 /// Fixed group order for output: general → display servers → OS containment → android → ios →
-/// network.
-const SCOPE_ORDER: [EnvScope; 8] = [
+/// macos → network.
+const SCOPE_ORDER: [EnvScope; 9] = [
     EnvScope::All,
     EnvScope::X11,
     EnvScope::Wayland,
@@ -43,6 +45,7 @@ const SCOPE_ORDER: [EnvScope; 8] = [
     EnvScope::Windows,
     EnvScope::Android,
     EnvScope::Ios,
+    EnvScope::Macos,
     EnvScope::Network,
 ];
 
@@ -85,12 +88,21 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_SH", scope: EnvScope::Linux,
         purpose: "Shell used to run spec.build",
         default: "sh", secret: false },
+    EnvVarDoc { name: "GLASS_DBUS_DAEMON", scope: EnvScope::Linux,
+        purpose: "dbus-daemon binary for the private AT-SPI bus (a11y: true launches)",
+        default: "dbus-daemon (on PATH)", secret: false },
+    EnvVarDoc { name: "GLASS_ATSPI_LAUNCHER", scope: EnvScope::Linux,
+        purpose: "at-spi-bus-launcher binary; explicit value skips discovery (fail-closed if wrong)",
+        default: "auto-discovered (well-known install paths)", secret: false },
     EnvVarDoc { name: "GLASS_WIN_SANDBOX_PROVIDER", scope: EnvScope::Windows,
         purpose: "In-OS containment provider (auto/sandboxie/none)",
         default: "auto", secret: false },
     EnvVarDoc { name: "GLASS_SANDBOXIE_DIR", scope: EnvScope::Windows,
         purpose: "Sandboxie install directory",
         default: "%ProgramFiles%\\Sandboxie (auto-detected)", secret: false },
+    EnvVarDoc { name: "GLASS_CLIP_HOOK_DLL", scope: EnvScope::Windows,
+        purpose: "Path to the private-clipboard hook DLL (glass_clip_hook.dll) injected into a Sandboxie-boxed app",
+        default: "next to glass-mcp, else Layer-2 (DLL) clipboard isolation is unavailable", secret: false },
     EnvVarDoc { name: "GLASS_TYPE_DWELL_MS", scope: EnvScope::Windows,
         purpose: "Inter-character typing dwell (ms); raise if rapid Unicode injection corrupts, lower for speed",
         default: "60", secret: false },
@@ -142,6 +154,9 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_IDB_COMPANION", scope: EnvScope::Ios,
         purpose: "path to the idb_companion binary (input + accessibility for the iOS Simulator backend)",
         default: "idb_companion (found on PATH)", secret: false },
+    EnvVarDoc { name: "GLASS_CLIP_SHIM_DYLIB", scope: EnvScope::Macos,
+        purpose: "Override discovery of the injected clipboard-isolation shim (libglass_clip_shim_macos.dylib)",
+        default: "auto-discovered (bundled Frameworks/, next to glass-mcp, or the build's target dir)", secret: false },
     EnvVarDoc { name: "GLASS_TOKEN", scope: EnvScope::Network,
         purpose: "Bearer token for the serve --http transport",
         default: "(none)", secret: true },
@@ -154,6 +169,35 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
     EnvVarDoc { name: "GLASS_AUDIT_PREFIX_LEN", scope: EnvScope::All,
         purpose: "Chars of plaintext prefix kept in redacted audit content (0 = none)",
         default: "8", secret: false },
+];
+
+/// `GLASS_*`-prefixed names read (or, for `GLASS_CLIP`, merely spelled) somewhere in the
+/// workspace that are deliberately **not** part of the user-facing override surface, so the
+/// `code_reads_match_registry_or_internal_allowlist` guard test below doesn't require them in
+/// [`GLASS_ENV`]. Each is a var glass **sets** for its own child/shim process (IPC plumbing) or
+/// reads only to force a code path in a test — never an operator override. Keep this list
+/// exact: an addition here should be accompanied by a one-line reason, same as the entries
+/// below.
+///
+/// Only consumed by the guard test (`#[cfg(test)]`): it documents the internal surface but has
+/// no production reader, so it would otherwise be flagged dead code in a non-test build.
+#[cfg(test)]
+pub(crate) const INTERNAL_ENV: &[&str] = &[
+    // Not actually an environment variable: the X11 CLIPBOARD-selection transfer atom name
+    // interned in glass-x11/src/clipboard.rs (`b"GLASS_CLIP"`). It shares the `GLASS_` prefix
+    // the guard test scans for, so it needs an entry here even though `std::env::var` never
+    // touches it.
+    "GLASS_CLIP",
+    // Per-launch named-pasteboard name: glass sets this on the injected app's env
+    // (glass-macos/src/process.rs) for the clip shim (glass-clip-shim-macos) to read; not an
+    // operator-facing override.
+    "GLASS_CLIP_PASTEBOARD",
+    // Clipboard-hook pipe name: glass sets this in the generated Sandboxie launch.cmd
+    // (glass-windows) for glass-clip-hook's injected DLL to read; not an operator override.
+    "GLASS_CLIP_PIPE",
+    // Forces a test-only AX-geometry fallback path (glass-macos/src/axwindow.rs); read only to
+    // exercise that path in an integration test, not a supported way to configure glass.
+    "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK",
 ];
 
 /// Standard (non-`GLASS_*`) env glass reads at runtime — reference only.
@@ -311,8 +355,11 @@ mod tests {
             "GLASS_WAYLAND_SCREEN",
             "GLASS_BWRAP",
             "GLASS_SH",
+            "GLASS_DBUS_DAEMON",
+            "GLASS_ATSPI_LAUNCHER",
             "GLASS_WIN_SANDBOX_PROVIDER",
             "GLASS_SANDBOXIE_DIR",
+            "GLASS_CLIP_HOOK_DLL",
             "GLASS_TYPE_DWELL_MS",
             "GLASS_ADB",
             "GLASS_ANDROID_SERIAL",
@@ -330,6 +377,7 @@ mod tests {
             "GLASS_IOS_DEVICE",
             "GLASS_SIMULATOR_KEEP",
             "GLASS_IDB_COMPANION",
+            "GLASS_CLIP_SHIM_DYLIB",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG",
             "GLASS_AUDIT_CONTENT",
@@ -375,20 +423,24 @@ mod tests {
             out.find(s)
                 .unwrap_or_else(|| panic!("missing {s} in:\n{out}"))
         };
-        // group order: all < x11 < wayland < linux < windows < android < ios < network
+        // group order: all < x11 < wayland < linux < windows < android < ios < macos < network
         assert!(idx("GLASS_BACKEND") < idx("GLASS_DISPLAY"));
         assert!(idx("GLASS_DISPLAY") < idx("GLASS_SWAY"));
         assert!(idx("GLASS_SWAY") < idx("GLASS_BWRAP"));
-        assert!(idx("GLASS_BWRAP") < idx("GLASS_WIN_SANDBOX_PROVIDER"));
+        assert!(idx("GLASS_BWRAP") < idx("GLASS_DBUS_DAEMON"));
+        assert!(idx("GLASS_DBUS_DAEMON") < idx("GLASS_ATSPI_LAUNCHER"));
+        assert!(idx("GLASS_ATSPI_LAUNCHER") < idx("GLASS_WIN_SANDBOX_PROVIDER"));
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_ANDROID_AGENT_JAR"));
         assert!(idx("GLASS_ANDROID_AGENT_JAR") < idx("GLASS_ANDROID_A11Y_APK"));
         // Use unique purpose snippets to distinguish A11Y_APK from A11Y (prefix-match hazard).
         assert!(idx("glass-a11y.apk") < idx("disable the a11y service"));
         assert!(idx("disable the a11y service") < idx("GLASS_IOS_UDID"));
         assert!(idx("GLASS_IOS_UDID") < idx("GLASS_SIMULATOR_KEEP"));
-        assert!(idx("GLASS_SIMULATOR_KEEP") < idx("GLASS_TOKEN"));
+        assert!(idx("GLASS_SIMULATOR_KEEP") < idx("GLASS_CLIP_SHIM_DYLIB"));
+        assert!(idx("GLASS_CLIP_SHIM_DYLIB") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
+        assert!(idx("GLASS_SANDBOXIE_DIR") < idx("GLASS_CLIP_HOOK_DLL"));
     }
 
     #[test]
@@ -431,5 +483,118 @@ mod tests {
         let sandbox = glass.iter().find(|e| e["name"] == "GLASS_SANDBOX").unwrap();
         assert_eq!(sandbox["current"], "strict");
         assert_eq!(sandbox["scope"], "all");
+    }
+
+    /// Every `GLASS_[A-Z0-9_]+` name that appears as a **quoted** literal in `text` — e.g.
+    /// `"GLASS_BACKEND"` or the byte-string `b"GLASS_CLIP"` — but not a bare identifier like
+    /// `GLASS_ENV` (no surrounding quotes), and not a `GLASS_`-prefixed run that continues past
+    /// the closing quote (e.g. an interpolated format string) — not `env::var`-shaped, so
+    /// deliberately not caught here; see the unit test below for the exact edge cases.
+    fn quoted_glass_var_names(text: &str) -> Vec<&str> {
+        // Built at runtime rather than written as the literal `"GLASS_` here, so this
+        // function's own source line doesn't self-match when `code_reads_match_registry_or_
+        // internal_allowlist` (below) scans this very file.
+        let needle = format!("{}GLASS_", '"');
+        let mut found = Vec::new();
+        let mut pos = 0;
+        while let Some(rel) = text[pos..].find(needle.as_str()) {
+            let name_start = pos + rel + 1; // skip the opening quote, land on 'G'
+            let rest = &text[name_start..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                .unwrap_or(rest.len());
+            if rest.as_bytes().get(name_len) == Some(&b'"') {
+                found.push(&rest[..name_len]);
+            }
+            pos = name_start + name_len;
+        }
+        found
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files_under(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The freeze mechanism: every `GLASS_*` name read anywhere in the workspace must be either
+    /// documented in [`GLASS_ENV`] (the user-facing override surface) or explicitly listed in
+    /// [`INTERNAL_ENV`] (plumbing/test-only) — never silently undocumented, so a new var can't
+    /// drift out of the guarantee the way `GLASS_DBUS_DAEMON`/`GLASS_ATSPI_LAUNCHER` did before
+    /// this test existed. Scans every crate's `*/src/**/*.rs`; `tests/`/`fixture/` directories
+    /// sit beside, not under, a crate's `src/`, so they're excluded simply by starting each
+    /// crate's walk at `src/` rather than by name-matching directories.
+    #[test]
+    fn code_reads_match_registry_or_internal_allowlist() {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent() // crates/
+            .and_then(|p| p.parent()) // workspace root
+            .expect("crates/glass-mcp is two levels under the workspace root");
+        let crates_dir = workspace_root.join("crates");
+
+        let mut offenders = Vec::new();
+        for crate_entry in std::fs::read_dir(&crates_dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", crates_dir.display()))
+            .flatten()
+        {
+            let src_dir = crate_entry.path().join("src");
+            if !src_dir.is_dir() {
+                continue;
+            }
+            let mut files = Vec::new();
+            rust_files_under(&src_dir, &mut files);
+            for file in files {
+                let text = std::fs::read_to_string(&file)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+                for var in quoted_glass_var_names(&text) {
+                    let registered = GLASS_ENV.iter().any(|d| d.name == var);
+                    let internal = INTERNAL_ENV.contains(&var);
+                    if !registered && !internal {
+                        offenders.push(format!(
+                            "{var} is read in {} but not in the GLASS_ENV registry or \
+                             INTERNAL_ENV allowlist — add it to one",
+                            file.display()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
+    #[test]
+    fn quoted_glass_var_names_ignores_bare_identifiers_and_partial_matches() {
+        // A bare identifier (GLASS_ENV, unquoted) must not match...
+        assert_eq!(
+            quoted_glass_var_names("GLASS_ENV.iter()"),
+            Vec::<&str>::new()
+        );
+        // ...but a real quoted literal must. (Using a registered name here, rather than a made-up
+        // one, so this fixture doesn't itself need an INTERNAL_ENV entry to satisfy the guard
+        // test below when it scans this file's own source.)
+        assert_eq!(
+            quoted_glass_var_names(r#"std::env::var("GLASS_BACKEND")"#),
+            vec!["GLASS_BACKEND"]
+        );
+        // A byte-string literal counts too (this is how the X11 atom name GLASS_CLIP is caught).
+        assert_eq!(
+            quoted_glass_var_names(r#"b"GLASS_CLIP""#),
+            vec!["GLASS_CLIP"]
+        );
+        // Text that continues past the GLASS_-prefixed run before the closing quote (e.g. an
+        // interpolated format string) is not treated as an env-var-shaped literal.
+        assert_eq!(
+            quoted_glass_var_names(r#""GLASS_CLIP_PIPE={pipe}""#),
+            Vec::<&str>::new()
+        );
     }
 }

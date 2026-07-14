@@ -34,6 +34,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
+| `GLASS_CLIP_HOOK_DLL` | Private-clipboard hook DLL (`glass_clip_hook.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
 
 `default` and `strict` are fail-closed; the levels and per-OS mechanisms are explained in
 [explanation/containment.md](../explanation/containment.md).
@@ -45,6 +46,17 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_SH` | Shell used to run `glass_start`'s `build` command | `sh` (on `PATH`) | all |
 | `GLASS_TYPE_DWELL_MS` | Per-key dwell for synthetic typing, to stay ahead of the OS input-pipeline race; raise on a slow/loaded host, lower for speed | `60` | Windows |
 
+## Linux accessibility
+
+| Variable | Purpose | Default | Scope |
+|---|---|---|---|
+| `GLASS_DBUS_DAEMON` | `dbus-daemon` binary for the private AT-SPI bus | `dbus-daemon` (on `PATH`) | Linux |
+| `GLASS_ATSPI_LAUNCHER` | `at-spi-bus-launcher` binary; forces this one and skips discovery (fails closed if wrong) | auto-discovered (well-known install paths) | Linux |
+
+Only used when a launch requests `a11y: true` (see [reference/tools.md](tools.md)): glass spawns a
+private D-Bus session bus and AT-SPI bus per launch rather than touching your desktop's shared
+accessibility bus.
+
 ## Android
 
 | Variable | Purpose | Default | Scope |
@@ -55,6 +67,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_ANDROID_LIFECYCLE` | Set `attach` to force attach-only (never boot an AVD) | attach-or-boot | Android |
 | `GLASS_EMULATOR` | `emulator` binary (else resolved via `ANDROID_SDK_ROOT` / `ANDROID_HOME`) | SDK-resolved | Android |
 | `GLASS_EMULATOR_ARGS` | Extra flags passed when glass boots an emulator | — | Android |
+| `GLASS_EMULATOR_BOOT_TIMEOUT_MS` | Max wait for a booting emulator to reach `sys.boot_completed` | `120000` | Android |
 | `GLASS_EMULATOR_KEEP` | Keep a glass-booted emulator alive past shutdown | off | Android |
 | `GLASS_ANDROID_AGENT_JAR` | Override path to `glass-agent.jar` (on-device agent: clipboard + high-fidelity input) | auto-discovered, else off | Android |
 | `GLASS_ANDROID_AGENT` | Set `off` to force the `adb` input path even when the jar is present | on when jar set | Android |
@@ -79,6 +92,15 @@ Simulator, or boots the newest available iPhone simulator itself. `GLASS_IOS_DEV
 iOS-family simulator (iPhone or iPad); watchOS, tvOS, and visionOS simulators are never eligible,
 whether attaching to an already-booted one or booting one by name. Full setup is in
 [how-to/setup-ios.md](../how-to/setup-ios.md).
+
+## macOS clipboard
+
+| Variable | Purpose | Default | Scope |
+|---|---|---|---|
+| `GLASS_CLIP_SHIM_DYLIB` | Override discovery of the injected clipboard-isolation shim (`libglass_clip_shim_macos.dylib`) | auto-discovered (bundled `Frameworks/`, next to `glass-mcp`, or the build's target dir) | macOS |
+
+Only affects `default`/`strict` containment on an injectable (non-hardened-runtime) app; see
+[explanation/containment.md](../explanation/containment.md) for how the shim isolates the clipboard.
 
 ## Network transport
 
