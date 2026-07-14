@@ -61,8 +61,9 @@ pub struct StartArgs {
     /// containment). Omit for the server default (`GLASS_SANDBOX`, else `default`).
     pub sandbox: Option<String>,
     pub cwd: Option<String>,
+    /// Extra environment variables for the launched app, as a `{ "KEY": "VALUE" }` object.
     #[serde(default)]
-    pub env: Vec<(String, String)>,
+    pub env: std::collections::BTreeMap<String, String>,
     /// Optional `{ title?, class? }` to disambiguate which window is the app's when
     /// more than one appears, or to find a window the launched process hands off to
     /// an unrelated process. Omit to take the first window owned by the launched
@@ -421,6 +422,20 @@ mod tests {
         assert_eq!(a.run, vec!["./app".to_string()]);
         assert!(a.env.is_empty());
         assert!(a.build.is_none());
+    }
+
+    #[test]
+    fn start_env_deserializes_as_object() {
+        let a: StartArgs =
+            serde_json::from_str(r#"{"run":["app"],"env":{"K":"V","A":"B"}}"#).unwrap();
+        assert_eq!(a.env.get("K").map(String::as_str), Some("V"));
+        assert_eq!(a.env.get("A").map(String::as_str), Some("B"));
+    }
+
+    #[test]
+    fn start_env_defaults_to_empty_when_omitted() {
+        let a: StartArgs = serde_json::from_str(r#"{"run":["app"]}"#).unwrap();
+        assert!(a.env.is_empty());
     }
 
     #[test]

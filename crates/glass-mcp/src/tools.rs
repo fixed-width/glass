@@ -80,7 +80,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         build: a.build.clone(),
         run: a.run.clone(),
         cwd: a.cwd.clone().map(PathBuf::from),
-        env: a.env.clone(),
+        env: a.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         window_hint: a.window_hint.as_ref().map(|h| WindowHint {
             title: h.title.clone(),
             class: h.class.clone(),
@@ -586,7 +586,7 @@ mod tests {
             backend: None,
             sandbox: None,
             cwd: None,
-            env: vec![],
+            env: std::collections::BTreeMap::new(),
             window_hint: None,
             timeout_ms: None,
             a11y: None,

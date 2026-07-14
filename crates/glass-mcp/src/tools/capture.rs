@@ -195,7 +195,7 @@ mod tests {
             backend: None,
             sandbox: None,
             cwd: None,
-            env: vec![],
+            env: std::collections::BTreeMap::new(),
             window_hint: None,
             timeout_ms: None,
             a11y: None,
