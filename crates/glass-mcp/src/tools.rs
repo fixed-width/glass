@@ -30,6 +30,30 @@ impl ToolOutput {
     pub fn text(s: impl Into<String>) -> Self {
         ToolOutput(vec![OutContent::Text(s.into())])
     }
+
+    /// Wrap a tool's trusted result payload in the uniform 1.0 success envelope
+    /// as the sole leading content block.
+    // `expect(dead_code)` doesn't fit: nothing calls this outside `mod tests` yet, so
+    // dead_code fires on the plain lib target but not the cfg(test) one, and `expect`
+    // demands the lint fire in every compilation. Later tool-surface-freeze tasks wire
+    // this into the tool handlers, which will make `allow` unneeded — remove it then.
+    #[allow(dead_code)]
+    pub fn result(tool: &str, result: serde_json::Value) -> Self {
+        ToolOutput(vec![OutContent::Text(envelope(tool, result))])
+    }
+
+    /// Envelope block first, then app-controlled/image sibling blocks unchanged.
+    #[allow(dead_code)]
+    pub fn result_with(tool: &str, result: serde_json::Value, mut extra: Vec<OutContent>) -> Self {
+        let mut v = vec![OutContent::Text(envelope(tool, result))];
+        v.append(&mut extra);
+        ToolOutput(v)
+    }
+}
+
+/// Serialize the success envelope. `ok` is always true — errors take the `Err` path.
+fn envelope(tool: &str, result: serde_json::Value) -> String {
+    serde_json::json!({ "ok": true, "tool": tool, "result": result }).to_string()
 }
 
 /// Tool result: Ok(content) or Err(agent-readable message).
@@ -1049,5 +1073,28 @@ mod tests {
 
         assert!(select_window(&mut g, &SelectWindowArgs { id: 0 }).is_ok());
         assert!(select_window(&mut g, &SelectWindowArgs { id: 42 }).is_err());
+    }
+
+    #[test]
+    fn result_envelope_is_leading_and_shaped() {
+        let out = ToolOutput::result("glass_stop", serde_json::json!({}));
+        let OutContent::Text(t) = &out.0[0] else {
+            panic!("expected text")
+        };
+        let v: serde_json::Value = serde_json::from_str(t).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["tool"], serde_json::json!("glass_stop"));
+        assert_eq!(v["result"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn result_with_puts_envelope_first_then_extra() {
+        let out = ToolOutput::result_with(
+            "glass_screenshot",
+            serde_json::json!({ "width": 4, "height": 4 }),
+            vec![OutContent::Image(vec![1, 2, 3])],
+        );
+        assert!(matches!(out.0[0], OutContent::Text(_)), "envelope leads");
+        assert!(matches!(out.0[1], OutContent::Image(_)), "extra follows");
     }
 }
