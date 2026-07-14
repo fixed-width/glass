@@ -27,14 +27,14 @@ pub fn click(glass: &mut Glass, a: &ClickArgs) -> ToolResult {
             modifiers,
         })
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_click", serde_json::json!({})))
 }
 
 pub fn mouse_move(glass: &mut Glass, a: &MoveArgs) -> ToolResult {
     glass
         .pointer(&PointerEvent::Move { x: a.x, y: a.y })
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_move", serde_json::json!({})))
 }
 
 pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
@@ -51,7 +51,7 @@ pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
             duration_ms: a.duration_ms.unwrap_or(200).min(10_000),
         })
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_drag", serde_json::json!({})))
 }
 
 pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
@@ -81,7 +81,7 @@ pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
             duration_ms: a.duration_ms.unwrap_or(250).min(10_000),
         })
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_gesture", serde_json::json!({})))
 }
 
 pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
@@ -95,21 +95,21 @@ pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
             modifiers,
         })
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_scroll", serde_json::json!({})))
 }
 
 pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
     glass
         .key(&KeyEvent::Text(a.text.clone()))
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_type", serde_json::json!({})))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
     glass
         .key(&KeyEvent::Chord(a.chord.clone()))
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("ok"))
+    Ok(ToolOutput::result("glass_key", serde_json::json!({})))
 }
 
 #[cfg(test)]
@@ -135,11 +135,18 @@ mod tests {
         g
     }
 
-    fn text(out: &ToolOutput) -> &str {
-        match &out.0[0] {
-            OutContent::Text(t) => t,
-            _ => panic!("expected text"),
-        }
+    fn result_json(out: &ToolOutput) -> serde_json::Value {
+        let OutContent::Text(t) = &out.0[0] else {
+            panic!("expected text")
+        };
+        serde_json::from_str(t).unwrap()
+    }
+
+    fn assert_ok(out: &ToolOutput, tool: &str) {
+        let v = result_json(out);
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["tool"], serde_json::json!(tool));
+        assert_eq!(v["result"], serde_json::json!({}));
     }
 
     #[test]
@@ -152,7 +159,7 @@ mod tests {
             count: None,
             modifiers: None,
         };
-        assert_eq!(text(&click(&mut g, &a).unwrap()), "ok");
+        assert_ok(&click(&mut g, &a).unwrap(), "glass_click");
     }
 
     #[test]
@@ -184,21 +191,19 @@ mod tests {
     #[test]
     fn type_and_key_ok() {
         let mut g = started();
-        assert_eq!(
-            text(&type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap()),
-            "ok"
+        assert_ok(
+            &type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap(),
+            "glass_type",
         );
-        assert_eq!(
-            text(
-                &key(
-                    &mut g,
-                    &KeyArgs {
-                        chord: "ctrl+s".into()
-                    }
-                )
-                .unwrap()
-            ),
-            "ok"
+        assert_ok(
+            &key(
+                &mut g,
+                &KeyArgs {
+                    chord: "ctrl+s".into(),
+                },
+            )
+            .unwrap(),
+            "glass_key",
         );
     }
 
@@ -214,7 +219,7 @@ mod tests {
             modifiers: None,
             duration_ms: None,
         };
-        assert_eq!(text(&drag(&mut g, &d).unwrap()), "ok");
+        assert_ok(&drag(&mut g, &d).unwrap(), "glass_drag");
         let s = ScrollArgs {
             x: 5,
             y: 6,
@@ -222,7 +227,7 @@ mod tests {
             dy: Some(2),
             modifiers: None,
         };
-        assert_eq!(text(&scroll(&mut g, &s).unwrap()), "ok");
+        assert_ok(&scroll(&mut g, &s).unwrap(), "glass_scroll");
     }
 
     #[test]
@@ -241,7 +246,7 @@ mod tests {
             ],
             duration_ms: Some(120),
         };
-        assert_eq!(text(&gesture(&mut g, &a).unwrap()), "ok");
+        assert_ok(&gesture(&mut g, &a).unwrap(), "glass_gesture");
     }
 
     #[test]
@@ -267,7 +272,7 @@ mod tests {
             count: None,
             modifiers: Some(vec!["ctrl".into()]),
         };
-        assert_eq!(text(&click(&mut g, &ok).unwrap()), "ok");
+        assert_ok(&click(&mut g, &ok).unwrap(), "glass_click");
         let bad = ClickArgs {
             x: 1,
             y: 1,
