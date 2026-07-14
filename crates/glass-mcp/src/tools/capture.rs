@@ -4,7 +4,7 @@ use glass_core::{frame_to_webp, Frame, Glass, Region, Stream};
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{envelope, OutContent, ToolOutput, ToolResult};
+use crate::tools::{OutContent, ToolOutput, ToolResult};
 
 /// Crop the captured frame to the requested region, or return it whole.
 fn crop_frame(frame: Frame, region: Option<&RegionArgs>) -> Result<Frame, String> {
@@ -27,11 +27,12 @@ pub fn screenshot(glass: &mut Glass, a: &ScreenshotArgs) -> ToolResult {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(envelope("glass_screenshot", meta)),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_screenshot",
+        Some(img),
+        meta,
+        vec![],
+    ))
 }
 
 pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
@@ -70,11 +71,12 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(envelope("glass_wait_stable", meta)),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_wait_stable",
+        Some(img),
+        meta,
+        vec![],
+    ))
 }
 
 pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
@@ -123,8 +125,7 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     // Opt-in: when something changed, attach the current frame cropped to the
     // changed region (token-minimal, exactly what differs). Nothing changed ->
     // no image.
-    let mut out = Vec::new();
-    let mut image_produced = false;
+    let mut image = None;
     if a.include_image.unwrap_or(false) {
         if let Some(b) = r.bbox {
             let region = Region {
@@ -134,17 +135,10 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
                 height: b.height,
             };
             let cropped = current.crop(&region).map_err(|e| e.to_string())?;
-            out.push(OutContent::Image(
-                frame_to_webp(&cropped).map_err(|e| e.to_string())?,
-            ));
-            image_produced = true;
+            image = Some(frame_to_webp(&cropped).map_err(|e| e.to_string())?);
         }
     }
-    out.push(OutContent::Text(envelope("glass_diff", body)));
-    if image_produced {
-        out.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
-    }
-    Ok(ToolOutput(out))
+    Ok(ToolOutput::image_result("glass_diff", image, body, vec![]))
 }
 
 pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {

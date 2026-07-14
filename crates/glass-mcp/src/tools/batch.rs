@@ -11,18 +11,30 @@ use crate::tools::{
 
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
 /// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
+///
+/// settle/diff/screenshot are glass's own functions and always emit an `{ok,tool,result}`
+/// envelope block — that's an internal invariant, not something driven by untrusted app
+/// input. So a sub-tool output with no envelope block is a bug in glass itself, and this
+/// panics rather than silently defaulting to `{}` (a silent `{}` here would mask a broken
+/// invariant behind a plausible-looking empty result).
 fn split_sub(out: ToolOutput) -> (serde_json::Value, Vec<OutContent>) {
-    let mut result = json!({});
+    let mut result = None;
     let mut siblings = Vec::new();
     for c in out.0 {
         match c {
             OutContent::Text(t) => match serde_json::from_str::<serde_json::Value>(&t) {
-                Ok(v) if v.get("result").is_some() => result = v["result"].clone(),
+                // Require the real envelope shape (`ok` + `tool`), not just any JSON
+                // object that happens to have a `result` key — a future JSON-shaped
+                // untrusted sibling must not be misclassified as the envelope.
+                Ok(v) if v.get("ok").is_some() && v.get("tool").is_some() => {
+                    result = Some(v["result"].clone());
+                }
                 _ => siblings.push(OutContent::Text(t)), // e.g. IMAGE_NOTE (not JSON)
             },
             img => siblings.push(img),
         }
     }
+    let result = result.expect("glass_do sub-tool must emit an {ok,tool,result} envelope");
     (result, siblings)
 }
 
@@ -348,5 +360,45 @@ mod tests {
         assert!(err.contains("all 1 actions executed"), "got: {err}");
         assert!(err.contains("terminal observe failed"), "got: {err}");
         assert!(err.contains("baseline"), "got: {err}");
+    }
+
+    #[test]
+    fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
+        // A well-formed sub-tool output (screenshot's shape): [Image, envelope, IMAGE_NOTE].
+        // The envelope carries a `result` key alongside `ok`/`tool`; a bare JSON object
+        // with only a `result` key (no `ok`/`tool`) must NOT match the tightened
+        // predicate — it's included here as a leading sibling to prove that.
+        let out = ToolOutput(vec![
+            OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
+            OutContent::Image(vec![1, 2, 3]),
+            OutContent::Text(
+                json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } })
+                    .to_string(),
+            ),
+            OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
+        ]);
+        let (result, siblings) = split_sub(out);
+        assert_eq!(
+            result,
+            json!({ "width": 4 }),
+            "real envelope's result extracted"
+        );
+        assert_eq!(
+            siblings.len(),
+            3,
+            "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
+        );
+        assert!(
+            matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
+            "JSON with `result` but no ok/tool is not misclassified as the envelope"
+        );
+        assert!(
+            matches!(siblings[1], OutContent::Image(_)),
+            "image sibling preserved"
+        );
+        assert!(
+            matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
+            "IMAGE_NOTE sibling preserved"
+        );
     }
 }

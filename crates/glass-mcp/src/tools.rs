@@ -39,10 +39,32 @@ impl ToolOutput {
         v.append(&mut extra);
         ToolOutput(v)
     }
+
+    /// Capture-style result: the image block (when present) leads, then the envelope,
+    /// then any extra sibling blocks, then the trailing IMAGE_NOTE — emitted only when an
+    /// image was attached.
+    pub fn image_result(
+        tool: &str,
+        image: Option<Vec<u8>>,
+        result: serde_json::Value,
+        mut siblings: Vec<OutContent>,
+    ) -> Self {
+        let has_image = image.is_some();
+        let mut v = Vec::new();
+        if let Some(img) = image {
+            v.push(OutContent::Image(img));
+        }
+        v.push(OutContent::Text(envelope(tool, result)));
+        v.append(&mut siblings);
+        if has_image {
+            v.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
+        }
+        ToolOutput(v)
+    }
 }
 
 /// Serialize the success envelope. `ok` is always true — errors take the `Err` path.
-pub(crate) fn envelope(tool: &str, result: serde_json::Value) -> String {
+fn envelope(tool: &str, result: serde_json::Value) -> String {
     serde_json::json!({ "ok": true, "tool": tool, "result": result }).to_string()
 }
 
@@ -257,15 +279,12 @@ pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(envelope(
-            "glass_a11y_marks",
-            serde_json::json!({ "count": marks.len() }),
-        )),
-        OutContent::Text(crate::untrusted::wrap_untrusted(&legend)),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_a11y_marks",
+        Some(img),
+        serde_json::json!({ "count": marks.len() }),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&legend))],
+    ))
 }
 
 pub(crate) fn parse_button(s: Option<&str>) -> Result<MouseButton, String> {

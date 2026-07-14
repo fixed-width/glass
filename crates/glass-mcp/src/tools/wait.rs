@@ -9,7 +9,7 @@ use glass_core::{
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{envelope, OutContent, ToolOutput, ToolResult};
+use crate::tools::{OutContent, ToolOutput, ToolResult};
 
 pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult {
     if a.name.is_none() && a.role.is_none() {
@@ -156,19 +156,17 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         "bbox": bbox,
         "elapsed_ms": o.elapsed_ms,
     });
-    let mut out = Vec::new();
-    let mut image_produced = false;
-    if o.matched && a.include_image.unwrap_or(false) {
-        out.push(OutContent::Image(
-            frame_to_webp(&o.frame).map_err(|e| e.to_string())?,
-        ));
-        image_produced = true;
-    }
-    out.push(OutContent::Text(envelope("glass_wait_for_region", meta)));
-    if image_produced {
-        out.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
-    }
-    Ok(ToolOutput(out))
+    let image = if o.matched && a.include_image.unwrap_or(false) {
+        Some(frame_to_webp(&o.frame).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    Ok(ToolOutput::image_result(
+        "glass_wait_for_region",
+        image,
+        meta,
+        vec![],
+    ))
 }
 
 pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
