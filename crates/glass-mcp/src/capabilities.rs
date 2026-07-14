@@ -106,16 +106,26 @@ pub fn capabilities_for(backend: &str) -> Option<CapabilityReport> {
     Some(CapabilityReport::NotOnThisHost)
 }
 
+/// Resolve `backend` (None => the default backend) and render the report as a JSON value
+/// (used by the MCP tool's envelope). `Err` names the valid backends when `backend` is an
+/// unrecognized value.
+pub fn render_value(backend: Option<&str>) -> Result<serde_json::Value, String> {
+    render_value_resolved(backend, std::env::var("GLASS_BACKEND").ok().as_deref())
+}
+
 /// Resolve `backend` (None => the default backend) and render the report as JSON text.
 /// `Err` names the valid backends when `backend` is an unrecognized value.
 pub fn render_json(backend: Option<&str>) -> Result<String, String> {
-    render_json_resolved(backend, std::env::var("GLASS_BACKEND").ok().as_deref())
+    render_value(backend).map(|v| v.to_string())
 }
 
-/// Pure core of [`render_json`], with the `GLASS_BACKEND` value passed in (`env`) so the
+/// Pure core of [`render_value`], with the `GLASS_BACKEND` value passed in (`env`) so the
 /// default-resolution branch is testable without mutating the process environment. `env` is
 /// consulted only when `backend` is `None`.
-fn render_json_resolved(backend: Option<&str>, env: Option<&str>) -> Result<String, String> {
+fn render_value_resolved(
+    backend: Option<&str>,
+    env: Option<&str>,
+) -> Result<serde_json::Value, String> {
     // A `None` caller with a set-but-unrecognized GLASS_BACKEND resolves to the host default;
     // surface that in the report the way `boot`/`doctor` do, rather than reporting the wrong
     // backend's capabilities with no indication the requested one was dropped.
@@ -139,7 +149,7 @@ fn render_json_resolved(backend: Option<&str>, env: Option<&str>) -> Result<Stri
         }
     };
     let report =
-        capabilities_for(name).expect("render_json resolved name to a canonical BACKENDS entry");
+        capabilities_for(name).expect("render_value resolved name to a canonical BACKENDS entry");
     let mut json = match report {
         CapabilityReport::Available(map) => {
             let caps: serde_json::Map<String, serde_json::Value> = map
@@ -164,7 +174,7 @@ fn render_json_resolved(backend: Option<&str>, env: Option<&str>) -> Result<Stri
             .expect("capability report is a JSON object")
             .insert("warning".to_string(), serde_json::Value::String(w));
     }
-    Ok(serde_json::to_string(&json).expect("capability report serializes"))
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -234,6 +244,23 @@ mod tests {
     }
 
     #[test]
+    fn render_value_returns_a_json_object_not_a_string() {
+        let v = render_value(Some("android")).unwrap();
+        assert!(v.is_object(), "expected a JSON object, got {v:?}");
+        assert_eq!(v["backend"], "android");
+        assert_eq!(v["available"], true);
+    }
+
+    #[test]
+    fn render_value_matches_render_json_parsed() {
+        // render_json is a thin string wrapper over render_value; the two must agree.
+        let value = render_value(Some("android")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(Some("android")).unwrap()).unwrap();
+        assert_eq!(value, parsed);
+    }
+
+    #[test]
     fn render_json_shapes_available_and_canonicalizes() {
         let v: serde_json::Value =
             serde_json::from_str(&render_json(Some("ANDROID")).unwrap()).unwrap();
@@ -263,20 +290,18 @@ mod tests {
     }
 
     #[test]
-    fn render_json_resolved_warns_on_unrecognized_env_backend() {
+    fn render_value_resolved_warns_on_unrecognized_env_backend() {
         // No explicit backend + a typo'd GLASS_BACKEND: report the host default's caps, but
         // attach a `warning` naming the dropped value so the fallback isn't silent (#148).
         let host_default = crate::default_backend(None);
-        let v: serde_json::Value =
-            serde_json::from_str(&render_json_resolved(None, Some("andriod")).unwrap()).unwrap();
+        let v = render_value_resolved(None, Some("andriod")).unwrap();
         assert_eq!(v["backend"], host_default);
         let warn = v["warning"].as_str().expect("warning field present");
         assert!(warn.contains("andriod"), "warning: {warn}");
 
         // A recognized value (or unset) attaches no warning — normal output is unchanged.
         for env in [Some("android"), None] {
-            let v: serde_json::Value =
-                serde_json::from_str(&render_json_resolved(None, env).unwrap()).unwrap();
+            let v = render_value_resolved(None, env).unwrap();
             assert!(v.get("warning").is_none(), "unexpected warning for {env:?}");
         }
     }

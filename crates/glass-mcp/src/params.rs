@@ -61,8 +61,9 @@ pub struct StartArgs {
     /// containment). Omit for the server default (`GLASS_SANDBOX`, else `default`).
     pub sandbox: Option<String>,
     pub cwd: Option<String>,
+    /// Extra environment variables for the launched app, as a `{ "KEY": "VALUE" }` object.
     #[serde(default)]
-    pub env: Vec<(String, String)>,
+    pub env: std::collections::BTreeMap<String, String>,
     /// Optional `{ title?, class? }` to disambiguate which window is the app's when
     /// more than one appears, or to find a window the launched process hands off to
     /// an unrelated process. Omit to take the first window owned by the launched
@@ -364,7 +365,7 @@ pub struct DiffArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsArgs {
     pub cursor: Option<u64>,
-    pub max_lines: Option<usize>,
+    pub max_lines: Option<u32>,
     /// "stdout", "stderr", or "both" (default).
     pub stream: Option<String>,
     pub contains: Option<String>,
@@ -424,6 +425,27 @@ mod tests {
     }
 
     #[test]
+    fn start_env_deserializes_as_object() {
+        let a: StartArgs =
+            serde_json::from_str(r#"{"run":["app"],"env":{"K":"V","A":"B"}}"#).unwrap();
+        assert_eq!(a.env.get("K").map(String::as_str), Some("V"));
+        assert_eq!(a.env.get("A").map(String::as_str), Some("B"));
+    }
+
+    #[test]
+    fn start_env_defaults_to_empty_when_omitted() {
+        let a: StartArgs = serde_json::from_str(r#"{"run":["app"]}"#).unwrap();
+        assert!(a.env.is_empty());
+    }
+
+    #[test]
+    fn start_env_rejects_array_of_pairs() {
+        // Locks the breaking change from the old `[["K","V"]]` array-of-pairs shape to the
+        // `{"K":"V"}` object: the array shape must no longer deserialize.
+        assert!(serde_json::from_str::<StartArgs>(r#"{"run":["app"],"env":[["K","V"]]}"#).is_err());
+    }
+
+    #[test]
     fn click_args_parse_with_optionals() {
         let a: ClickArgs =
             serde_json::from_str(r#"{"x":3,"y":4,"button":"right","count":2}"#).unwrap();
@@ -446,6 +468,13 @@ mod tests {
     fn logs_args_default_to_none() {
         let a: LogsArgs = serde_json::from_str("{}").unwrap();
         assert!(a.cursor.is_none() && a.stream.is_none());
+    }
+
+    #[test]
+    fn logs_max_lines_is_u32() {
+        let a: LogsArgs = serde_json::from_str(r#"{"max_lines": 50}"#).unwrap();
+        let n: Option<u32> = a.max_lines; // compile-time: field is Option<u32>
+        assert_eq!(n, Some(50));
     }
 
     #[test]

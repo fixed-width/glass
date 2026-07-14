@@ -27,11 +27,12 @@ pub fn screenshot(glass: &mut Glass, a: &ScreenshotArgs) -> ToolResult {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(meta.to_string()),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_screenshot",
+        Some(img),
+        meta,
+        vec![],
+    ))
 }
 
 pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
@@ -60,7 +61,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
-        return Ok(ToolOutput::text(meta.to_string()));
+        return Ok(ToolOutput::result("glass_wait_stable", meta));
     }
 
     let frame = crop_frame(outcome.frame, a.region.as_ref())?;
@@ -70,16 +71,20 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
     }
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(meta.to_string()),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_wait_stable",
+        Some(img),
+        meta,
+        vec![],
+    ))
 }
 
 pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
     glass.save_baseline(&a.name).map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text(format!("saved baseline '{}'", a.name)))
+    Ok(ToolOutput::result(
+        "glass_baseline_save",
+        json!({ "name": a.name }),
+    ))
 }
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
@@ -116,13 +121,11 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     if let Some(rr) = a.region.as_ref() {
         body["region"] = json!({ "x": rr.x, "y": rr.y, "width": rr.width, "height": rr.height });
     }
-    let text = OutContent::Text(body.to_string());
 
     // Opt-in: when something changed, attach the current frame cropped to the
     // changed region (token-minimal, exactly what differs). Nothing changed ->
     // no image.
-    let mut out = Vec::new();
-    let mut image_produced = false;
+    let mut image = None;
     if a.include_image.unwrap_or(false) {
         if let Some(b) = r.bbox {
             let region = Region {
@@ -132,17 +135,10 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
                 height: b.height,
             };
             let cropped = current.crop(&region).map_err(|e| e.to_string())?;
-            out.push(OutContent::Image(
-                frame_to_webp(&cropped).map_err(|e| e.to_string())?,
-            ));
-            image_produced = true;
+            image = Some(frame_to_webp(&cropped).map_err(|e| e.to_string())?);
         }
     }
-    out.push(text);
-    if image_produced {
-        out.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
-    }
-    Ok(ToolOutput(out))
+    Ok(ToolOutput::image_result("glass_diff", image, body, vec![]))
 }
 
 pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
@@ -155,7 +151,7 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
     let (lines, cursor) = glass
         .logs(
             a.cursor.unwrap_or(0),
-            a.max_lines.unwrap_or(200),
+            a.max_lines.unwrap_or(200) as usize,
             stream,
             a.contains.as_deref(),
         )
@@ -170,8 +166,12 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
             })
         })
         .collect();
-    let body = json!({ "lines": json_lines, "cursor": cursor }).to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    let body = json!({ "lines": json_lines }).to_string();
+    Ok(ToolOutput::result_with(
+        "glass_logs",
+        json!({ "cursor": cursor }),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+    ))
 }
 
 #[cfg(test)]
@@ -189,7 +189,7 @@ mod tests {
             backend: None,
             sandbox: None,
             cwd: None,
-            env: vec![],
+            env: std::collections::BTreeMap::new(),
             window_hint: None,
             timeout_ms: None,
             a11y: None,
@@ -211,10 +211,14 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out.0[0], OutContent::Image(_)));
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"width\":4")),
-            _ => panic!("expected meta text"),
-        }
+        // The image leads, so the envelope is the second block; parsing it (rather than a
+        // substring check) catches the envelope wrapper being dropped — a bare
+        // `{"width":4,...}` meta block would still substring-match `"width":4`.
+        let v = envelope_at(&out, 1);
+        assert_eq!(v["ok"], json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], json!("glass_screenshot"), "envelope: {v}");
+        assert_eq!(v["result"]["width"], json!(4), "envelope: {v}");
+        assert_eq!(v["result"]["height"], json!(4), "envelope: {v}");
         if let OutContent::Image(bytes) = &out.0[0] {
             let decoded = glass_core::frame_from_webp(bytes).unwrap();
             assert_eq!((decoded.width, decoded.height), (4, 4));
@@ -238,14 +242,12 @@ mod tests {
             window_id: None,
         };
         let out = screenshot(&mut g, &a).unwrap();
-        match &out.0[1] {
-            OutContent::Text(t) => {
-                assert!(t.contains("\"width\":2"));
-                assert!(t.contains("\"height\":2"));
-                assert!(t.contains("\"x\":1"));
-            }
-            _ => panic!("expected meta text"),
-        }
+        let v = envelope_at(&out, 1);
+        assert_eq!(v["ok"], json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], json!("glass_screenshot"), "envelope: {v}");
+        assert_eq!(v["result"]["width"], json!(2), "envelope: {v}");
+        assert_eq!(v["result"]["height"], json!(2), "envelope: {v}");
+        assert_eq!(v["result"]["x"], json!(1), "envelope: {v}");
         if let OutContent::Image(bytes) = &out.0[0] {
             let decoded = glass_core::frame_from_webp(bytes).unwrap();
             assert_eq!((decoded.width, decoded.height), (2, 2));
@@ -377,13 +379,16 @@ mod tests {
         let mut changed = base.clone();
         changed.pixels[0] = 255;
         let mut g = started_with(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
-        baseline_save(
+        let out = baseline_save(
             &mut g,
             &BaselineSaveArgs {
                 name: "main".into(),
             },
         )
         .unwrap();
+        let v = assert_envelope(&out, "glass_baseline_save");
+        assert_eq!(v["name"], json!("main"), "envelope: {v}");
+
         let out = diff(
             &mut g,
             &DiffArgs {
@@ -396,10 +401,8 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("\"changed_pixels\":1")),
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_diff");
+        assert_eq!(v["changed_pixels"], json!(1), "envelope: {v}");
     }
 
     #[test]
@@ -427,16 +430,13 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => {
-                assert!(
-                    t.contains("\"changed_pixels\":0"),
-                    "region excludes change: {t}"
-                );
-                assert!(t.contains("\"region\":{"), "region echoed: {t}");
-            }
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_diff");
+        assert_eq!(v["changed_pixels"], json!(0), "region excludes change: {v}");
+        assert_eq!(
+            v["region"],
+            json!({ "x": 0, "y": 0, "width": 2, "height": 2 }),
+            "region echoed: {v}"
+        );
     }
 
     #[test]
@@ -459,10 +459,8 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("\"changed_pixels\":1")),
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_diff");
+        assert_eq!(v["changed_pixels"], json!(1), "envelope: {v}");
         // unknown mode is rejected (no silent fallback)
         let err = diff(
             &mut g,
@@ -515,7 +513,11 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
+        // envelope leads, carrying the cursor
+        let v = assert_envelope(&out, "glass_logs");
+        assert_eq!(v["cursor"], json!(1), "envelope: {v}");
+        // untrusted lines sibling follows, carrying the app-controlled lines
+        match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
                     t.starts_with(crate::untrusted::NOTE),
@@ -526,9 +528,8 @@ mod tests {
                     "enveloped: {t}"
                 );
                 assert!(t.contains("\"text\":\"ready\""));
-                assert!(t.contains("\"cursor\":1"));
             }
-            _ => panic!("expected text"),
+            _ => panic!("expected untrusted lines text as second item"),
         }
     }
 
@@ -567,16 +568,10 @@ mod tests {
             1,
             "text-only should emit a single content item"
         );
-        match &out.0[0] {
-            OutContent::Text(t) => {
-                assert!(t.contains("\"settled\":true"), "got: {t}");
-                assert!(
-                    t.contains("\"width\":4") && t.contains("\"height\":4"),
-                    "got: {t}"
-                );
-            }
-            _ => panic!("expected text-only, got an image"),
-        }
+        let v = assert_envelope(&out, "glass_wait_stable");
+        assert_eq!(v["settled"], json!(true), "envelope: {v}");
+        assert_eq!(v["width"], json!(4), "envelope: {v}");
+        assert_eq!(v["height"], json!(4), "envelope: {v}");
     }
 
     #[test]
@@ -610,10 +605,13 @@ mod tests {
             }
             _ => panic!("expected image first"),
         }
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"changed_pixels\":1"), "got: {t}"),
-            _ => panic!("expected metrics text"),
-        }
+        // The image leads, so the envelope is the second block; parse it (rather than a
+        // substring check) so a dropped envelope wrapper can't hide behind a matching
+        // top-level `"changed_pixels":1` field.
+        let v = envelope_at(&out, 1);
+        assert_eq!(v["ok"], json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], json!("glass_diff"), "envelope: {v}");
+        assert_eq!(v["result"]["changed_pixels"], json!(1), "envelope: {v}");
     }
 
     #[test]

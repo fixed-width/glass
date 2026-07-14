@@ -9,6 +9,35 @@ use crate::tools::{
     ToolOutput, ToolResult,
 };
 
+/// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
+/// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
+///
+/// settle/diff/screenshot are glass's own functions and always emit an `{ok,tool,result}`
+/// envelope block — that's an internal invariant, not something driven by untrusted app
+/// input. So a sub-tool output with no envelope block is a bug in glass itself, and this
+/// panics rather than silently defaulting to `{}` (a silent `{}` here would mask a broken
+/// invariant behind a plausible-looking empty result).
+fn split_sub(out: ToolOutput) -> (serde_json::Value, Vec<OutContent>) {
+    let mut result = None;
+    let mut siblings = Vec::new();
+    for c in out.0 {
+        match c {
+            OutContent::Text(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+                // Require the real envelope shape (`ok` + `tool`), not just any JSON
+                // object that happens to have a `result` key — a future JSON-shaped
+                // untrusted sibling must not be misclassified as the envelope.
+                Ok(v) if v.get("ok").is_some() && v.get("tool").is_some() => {
+                    result = Some(v["result"].clone());
+                }
+                _ => siblings.push(OutContent::Text(t)), // e.g. IMAGE_NOTE (not JSON)
+            },
+            img => siblings.push(img),
+        }
+    }
+    let result = result.expect("glass_do sub-tool must emit an {ok,tool,result} envelope");
+    (result, siblings)
+}
+
 /// Build a text-only `WaitStableArgs` from a `SettleArgs` (no image, no crop).
 fn settle_args(s: &SettleArgs) -> WaitStableArgs {
     WaitStableArgs {
@@ -52,28 +81,42 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
         }
     }
 
-    let mut out = vec![OutContent::Text(json!({ "executed": n }).to_string())];
+    let mut result = json!({ "executed": n });
+    let mut siblings = Vec::new();
     if let Some(then) = &a.then {
-        let mut items = run_then(glass, then)
+        let (meta, sib) = run_then(glass, then)
             .map_err(|msg| format!("all {n} actions executed; terminal observe failed: {msg}"))?;
-        out.append(&mut items);
+        result["then"] = meta;
+        siblings = sib;
     }
-    Ok(ToolOutput(out))
+    Ok(ToolOutput::result_with("glass_do", result, siblings))
 }
 
-/// Run the terminal observe in fixed order: settle → diff → screenshot.
-fn run_then(glass: &mut Glass, then: &ThenArgs) -> Result<Vec<OutContent>, String> {
-    let mut items = Vec::new();
+/// Run the terminal observe in fixed order: settle → diff → screenshot. Returns
+/// the `then` metadata object (each ran sub-tool's `result` payload keyed by
+/// name) and the collected image/IMAGE_NOTE sibling blocks, in run order.
+fn run_then(
+    glass: &mut Glass,
+    then: &ThenArgs,
+) -> Result<(serde_json::Value, Vec<OutContent>), String> {
+    let mut meta = json!({});
+    let mut siblings = Vec::new();
     if let Some(s) = &then.settle {
-        items.extend(wait_stable(glass, &settle_args(s))?.0);
+        let (r, mut sib) = split_sub(wait_stable(glass, &settle_args(s))?);
+        meta["settle"] = r;
+        siblings.append(&mut sib);
     }
     if let Some(d) = &then.diff {
-        items.extend(diff(glass, d)?.0);
+        let (r, mut sib) = split_sub(diff(glass, d)?);
+        meta["diff"] = r;
+        siblings.append(&mut sib);
     }
     if let Some(sc) = &then.screenshot {
-        items.extend(screenshot(glass, sc)?.0);
+        let (r, mut sib) = split_sub(screenshot(glass, sc)?);
+        meta["screenshot"] = r;
+        siblings.append(&mut sib);
     }
-    Ok(items)
+    Ok((meta, siblings))
 }
 
 #[cfg(test)]
@@ -81,7 +124,7 @@ mod tests {
     use super::*;
     use crate::tools::start as start_tool;
     use crate::tools::testutil::*;
-    use crate::tools::OutContent;
+    use crate::tools::{baseline_save, OutContent};
     use glass_core::Frame;
     use std::sync::{Arc, Mutex};
 
@@ -93,7 +136,7 @@ mod tests {
             backend: None,
             sandbox: None,
             cwd: None,
-            env: vec![],
+            env: std::collections::BTreeMap::new(),
             window_hint: None,
             timeout_ms: None,
             a11y: None,
@@ -136,10 +179,8 @@ mod tests {
             *log.lock().unwrap(),
             vec!["click(10,20)", "type(alice)", "key(Tab)"]
         );
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("\"executed\":3"), "got: {t}"),
-            _ => panic!("expected executed text"),
-        }
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["executed"], json!(3));
     }
 
     #[test]
@@ -206,11 +247,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out.0.len(), 2, "executed text + settle text, no image");
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"settled\":true"), "got: {t}"),
-            _ => panic!("expected settle text, not an image"),
-        }
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folded into the envelope, no separate/image block"
+        );
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["then"]["settle"]["settled"], json!(true));
     }
 
     #[test]
@@ -232,22 +275,20 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(&out.0[0], OutContent::Text(t) if t.contains("\"executed\":1")));
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["executed"], json!(1));
+        assert_eq!(result["then"]["screenshot"]["width"], json!(4));
         assert!(
             matches!(out.0[1], OutContent::Image(_)),
             "screenshot image appended"
         );
         assert_eq!(
             out.0.len(),
-            4,
-            "executed text + screenshot image + dims text + IMAGE_NOTE"
+            3,
+            "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
         );
         assert!(
-            matches!(&out.0[2], OutContent::Text(t) if t.contains("\"width\":4")),
-            "dims text after image"
-        );
-        assert!(
-            matches!(&out.0[3], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
             "IMAGE_NOTE last"
         );
     }
@@ -276,10 +317,86 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"settled\":false"), "got: {t}"),
-            _ => panic!("expected settle text"),
-        }
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["then"]["settle"]["settled"], json!(false));
+    }
+
+    #[test]
+    fn then_diff_reports_change_text_only() {
+        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let mut changed = base.clone();
+        changed.pixels[0] = 255;
+        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
+        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
+        let out = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![click(0, 0)],
+                then: Some(ThenArgs {
+                    settle: None,
+                    diff: Some(DiffArgs {
+                        region: None,
+                        name: "m".into(),
+                        mode: None,
+                        threshold: None,
+                        tolerance: None,
+                        include_image: Some(false),
+                    }),
+                    screenshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "no image -> the envelope alone, no nested envelope"
+        );
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
+    }
+
+    #[test]
+    fn then_diff_with_image_appends_image_sibling() {
+        let base = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let mut changed = base.clone();
+        changed.pixels[0] = 255;
+        let mut g = started(FakePlatform::new(2, 2).with_frames(vec![base, changed]));
+        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
+        let out = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![click(0, 0)],
+                then: Some(ThenArgs {
+                    settle: None,
+                    diff: Some(DiffArgs {
+                        region: None,
+                        name: "m".into(),
+                        mode: None,
+                        threshold: None,
+                        tolerance: None,
+                        include_image: Some(true),
+                    }),
+                    screenshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["then"]["diff"]["changed_pixels"], json!(1));
+        assert_eq!(
+            out.0.len(),
+            3,
+            "envelope + diff image + IMAGE_NOTE (metrics folded into result.then.diff)"
+        );
+        assert!(
+            matches!(out.0[1], OutContent::Image(_)),
+            "diff's changed-region image rides alongside as a sibling"
+        );
+        assert!(
+            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+            "IMAGE_NOTE follows the image"
+        );
     }
 
     #[test]
@@ -308,5 +425,45 @@ mod tests {
         assert!(err.contains("all 1 actions executed"), "got: {err}");
         assert!(err.contains("terminal observe failed"), "got: {err}");
         assert!(err.contains("baseline"), "got: {err}");
+    }
+
+    #[test]
+    fn split_sub_requires_ok_and_tool_and_keeps_siblings() {
+        // A well-formed sub-tool output (screenshot's shape): [Image, envelope, IMAGE_NOTE].
+        // The envelope carries a `result` key alongside `ok`/`tool`; a bare JSON object
+        // with only a `result` key (no `ok`/`tool`) must NOT match the tightened
+        // predicate — it's included here as a leading sibling to prove that.
+        let out = ToolOutput(vec![
+            OutContent::Text(json!({ "result": "not the real envelope" }).to_string()),
+            OutContent::Image(vec![1, 2, 3]),
+            OutContent::Text(
+                json!({ "ok": true, "tool": "glass_screenshot", "result": { "width": 4 } })
+                    .to_string(),
+            ),
+            OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
+        ]);
+        let (result, siblings) = split_sub(out);
+        assert_eq!(
+            result,
+            json!({ "width": 4 }),
+            "real envelope's result extracted"
+        );
+        assert_eq!(
+            siblings.len(),
+            3,
+            "the fake-envelope text, image, and IMAGE_NOTE all ride as siblings"
+        );
+        assert!(
+            matches!(&siblings[0], OutContent::Text(t) if t.contains("not the real envelope")),
+            "JSON with `result` but no ok/tool is not misclassified as the envelope"
+        );
+        assert!(
+            matches!(siblings[1], OutContent::Image(_)),
+            "image sibling preserved"
+        );
+        assert!(
+            matches!(&siblings[2], OutContent::Text(t) if t == crate::untrusted::IMAGE_NOTE),
+            "IMAGE_NOTE sibling preserved"
+        );
     }
 }

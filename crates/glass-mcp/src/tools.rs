@@ -27,16 +27,52 @@ pub enum OutContent {
 pub struct ToolOutput(pub Vec<OutContent>);
 
 impl ToolOutput {
-    pub fn text(s: impl Into<String>) -> Self {
-        ToolOutput(vec![OutContent::Text(s.into())])
+    /// Wrap a tool's trusted result payload in the uniform 1.0 success envelope
+    /// as the sole leading content block.
+    pub fn result(tool: &str, result: serde_json::Value) -> Self {
+        ToolOutput(vec![OutContent::Text(envelope(tool, result))])
     }
+
+    /// Envelope block first, then app-controlled/image sibling blocks unchanged.
+    pub fn result_with(tool: &str, result: serde_json::Value, mut extra: Vec<OutContent>) -> Self {
+        let mut v = vec![OutContent::Text(envelope(tool, result))];
+        v.append(&mut extra);
+        ToolOutput(v)
+    }
+
+    /// Capture-style result: the image block (when present) leads, then the envelope,
+    /// then any extra sibling blocks, then the trailing IMAGE_NOTE — emitted only when an
+    /// image was attached.
+    pub fn image_result(
+        tool: &str,
+        image: Option<Vec<u8>>,
+        result: serde_json::Value,
+        mut siblings: Vec<OutContent>,
+    ) -> Self {
+        let has_image = image.is_some();
+        let mut v = Vec::new();
+        if let Some(img) = image {
+            v.push(OutContent::Image(img));
+        }
+        v.push(OutContent::Text(envelope(tool, result)));
+        v.append(&mut siblings);
+        if has_image {
+            v.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
+        }
+        ToolOutput(v)
+    }
+}
+
+/// Serialize the success envelope. `ok` is always true — errors take the `Err` path.
+fn envelope(tool: &str, result: serde_json::Value) -> String {
+    serde_json::json!({ "ok": true, "tool": tool, "result": result }).to_string()
 }
 
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
 
-fn geometry_json(g: &WindowGeometry) -> String {
-    json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height }).to_string()
+fn geometry_value(g: &WindowGeometry) -> serde_json::Value {
+    json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height })
 }
 
 /// Resolve the sandbox level: explicit arg → `GLASS_SANDBOX` env → `Default`.
@@ -62,7 +98,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         build: a.build.clone(),
         run: a.run.clone(),
         cwd: a.cwd.clone().map(PathBuf::from),
-        env: a.env.clone(),
+        env: a.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         window_hint: a.window_hint.as_ref().map(|h| WindowHint {
             title: h.title.clone(),
             class: h.class.clone(),
@@ -76,12 +112,12 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         None => glass.start(&spec),
     }
     .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text(geometry_json(&geo)))
+    Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
 }
 
 pub fn stop(glass: &mut Glass) -> ToolResult {
     glass.stop().map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text("stopped"))
+    Ok(ToolOutput::result("glass_stop", serde_json::json!({})))
 }
 
 pub fn window(glass: &mut Glass, a: &WindowArgs) -> ToolResult {
@@ -103,7 +139,7 @@ pub fn window(glass: &mut Glass, a: &WindowArgs) -> ToolResult {
         other => return Err(format!("unknown window op '{other}'")),
     };
     let geo = glass.window(&op).map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text(geometry_json(&geo)))
+    Ok(ToolOutput::result("glass_window", geometry_value(&geo)))
 }
 
 pub fn list_windows(glass: &mut Glass) -> ToolResult {
@@ -124,67 +160,108 @@ pub fn list_windows(glass: &mut Glass) -> ToolResult {
         })
         .collect();
     let body = serde_json::Value::Array(arr).to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    Ok(ToolOutput::result_with(
+        "glass_list_windows",
+        serde_json::json!({ "count": windows.len() }),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+    ))
 }
 
 pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
     let geo = glass
         .select_window(WindowId(a.id))
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text(geometry_json(&geo)))
+    Ok(ToolOutput::result(
+        "glass_select_window",
+        geometry_value(&geo),
+    ))
 }
 
 pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
     let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
     let body = tree.to_outline();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    Ok(ToolOutput::result_with(
+        "glass_a11y_snapshot",
+        serde_json::json!({}),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+    ))
 }
 
-/// A text-only `wait_stable` (default knobs, no image) for the `return:"settle"` observe.
-fn settle_text_only_args() -> WaitStableArgs {
-    WaitStableArgs {
-        interval_ms: None,
-        settle_frames: None,
-        tolerance: None,
-        timeout_ms: None,
-        region: None,
+/// Defaults matching the text-only settle the observe used before.
+fn settle_params() -> glass_core::WaitStableParams {
+    glass_core::WaitStableParams {
+        interval_ms: 100,
+        settle_frames: 3,
+        tolerance: 0,
+        timeout_ms: 5000,
         stability_region: None,
-        include_image: Some(false),
-        window_id: None,
+        window: None,
     }
 }
 
-/// Append the optional post-action observe (`return`) to a tool's output.
-fn append_return(
+/// Apply the optional `return` observe. `settle` → `Some(metadata)` to merge under
+/// `result.observed`; `snapshot` → an untrusted outline sibling to append; none/absent
+/// → neither. Calls the `Glass` methods directly (not the `a11y_snapshot`/`wait_stable`
+/// tool functions) so a composed observe never nests another envelope. Unknown value
+/// → `Err` (unchanged rejection).
+fn resolve_return(
     glass: &mut Glass,
     ret: Option<&str>,
-    out: &mut Vec<OutContent>,
-) -> Result<(), String> {
+) -> Result<(Option<serde_json::Value>, Vec<OutContent>), String> {
     match ret {
-        None | Some("none") => {}
-        Some("settle") => out.extend(wait_stable(glass, &settle_text_only_args())?.0),
-        Some("snapshot") => out.extend(a11y_snapshot(glass)?.0),
-        Some(o) => return Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
+        None | Some("none") => Ok((None, vec![])),
+        Some("settle") => {
+            let o = glass
+                .wait_stable(&settle_params())
+                .map_err(|e| e.to_string())?;
+            Ok((
+                Some(serde_json::json!({
+                    "settled": o.settled,
+                    "saw_motion": o.saw_motion,
+                    "observed_ms": o.observed_ms,
+                })),
+                vec![],
+            ))
+        }
+        Some("snapshot") => {
+            let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
+            Ok((
+                None,
+                vec![OutContent::Text(crate::untrusted::wrap_untrusted(
+                    &tree.to_outline(),
+                ))],
+            ))
+        }
+        Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
     }
-    Ok(())
 }
 
 pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
     glass
         .click_element(AxNodeId(a.id))
         .map_err(|e| e.to_string())?;
-    let mut out = vec![OutContent::Text(format!("clicked element #{}", a.id))];
-    append_return(glass, a.return_.as_deref(), &mut out)?;
-    Ok(ToolOutput(out))
+    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+    let mut result = serde_json::json!({ "id": a.id });
+    if let Some(o) = observed {
+        result["observed"] = o;
+    }
+    Ok(ToolOutput::result_with(
+        "glass_click_element",
+        result,
+        extra,
+    ))
 }
 
 pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> ToolResult {
     glass
         .set_value(AxNodeId(a.id), &a.text)
         .map_err(|e| e.to_string())?;
-    let mut out = vec![OutContent::Text(format!("set value of element #{}", a.id))];
-    append_return(glass, a.return_.as_deref(), &mut out)?;
-    Ok(ToolOutput(out))
+    let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
+    let mut result = serde_json::json!({ "id": a.id });
+    if let Some(o) = observed {
+        result["observed"] = o;
+    }
+    Ok(ToolOutput::result_with("glass_set_value", result, extra))
 }
 
 pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
@@ -202,11 +279,12 @@ pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok(ToolOutput(vec![
-        OutContent::Image(img),
-        OutContent::Text(crate::untrusted::wrap_untrusted(&legend)),
-        OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
-    ]))
+    Ok(ToolOutput::image_result(
+        "glass_a11y_marks",
+        Some(img),
+        serde_json::json!({ "count": marks.len() }),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&legend))],
+    ))
 }
 
 pub(crate) fn parse_button(s: Option<&str>) -> Result<MouseButton, String> {
@@ -244,6 +322,8 @@ pub(crate) mod testutil {
         PlatformFactory, PointerEvent, Region, Result, Stream, WindowGeometry, WindowId,
         WindowInfo, WindowOp,
     };
+
+    use super::{OutContent, ToolOutput};
 
     #[derive(Default)]
     pub struct FakePlatform {
@@ -496,6 +576,28 @@ pub(crate) mod testutil {
         });
         Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
     }
+
+    /// Parse content block `i` as the `{ok,tool,result}` envelope.
+    pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
+        let OutContent::Text(t) = &out.0[i] else {
+            panic!("expected envelope text at block {i}")
+        };
+        serde_json::from_str(t).expect("envelope must be valid JSON")
+    }
+
+    /// Assert block 0 is the success envelope for `tool` — and that `tool` is a REGISTERED
+    /// `#[tool]` name, so a co-typo shared between the tool impl's envelope literal and the
+    /// test's expected string (both say `"glass_stopp"`) still fails loudly. Returns `result`.
+    pub(crate) fn assert_envelope(out: &ToolOutput, tool: &str) -> serde_json::Value {
+        let v = envelope_at(out, 0);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], serde_json::json!(tool), "envelope: {v}");
+        assert!(
+            crate::server::registered_tools().iter().any(|t| t == tool),
+            "envelope tool {tool:?} is not a registered #[tool]"
+        );
+        v["result"].clone()
+    }
 }
 
 #[cfg(test)]
@@ -511,7 +613,7 @@ mod tests {
             backend: None,
             sandbox: None,
             cwd: None,
-            env: vec![],
+            env: std::collections::BTreeMap::new(),
             window_hint: None,
             timeout_ms: None,
             a11y: None,
@@ -540,13 +642,9 @@ mod tests {
     fn start_returns_geometry_json() {
         let mut g = glass_with(FakePlatform::new(80, 60));
         let out = start(&mut g, &start_args()).unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => {
-                assert!(t.contains("\"width\":80"));
-                assert!(t.contains("\"height\":60"));
-            }
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_start");
+        assert_eq!(v["width"], json!(80));
+        assert_eq!(v["height"], json!(60));
     }
 
     #[test]
@@ -558,10 +656,31 @@ mod tests {
     }
 
     #[test]
+    fn start_rejects_unknown_sandbox() {
+        // Locks rejection at the `glass_start` tool boundary (not just the
+        // `resolve_sandbox`/`SandboxLevel::FromStr` units below it) — an unknown
+        // `sandbox` must not be silently coerced to the default level.
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        let mut a = start_args();
+        a.sandbox = Some("bogus".into());
+        let err = start(&mut g, &a).unwrap_err();
+        assert!(err.contains("unknown sandbox level"), "got: {err}");
+    }
+
+    #[test]
     fn stop_without_session_errors_with_message() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         let err = stop(&mut g).unwrap_err();
         assert!(err.contains("no active session"));
+    }
+
+    #[test]
+    fn stop_running_session_returns_empty_envelope() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        start(&mut g, &start_args()).unwrap();
+        let out = stop(&mut g).unwrap();
+        let v = assert_envelope(&out, "glass_stop");
+        assert_eq!(v, json!({}), "envelope: {v}");
     }
 
     #[test]
@@ -590,12 +709,24 @@ mod tests {
             height: Some(44),
         };
         let out = window(&mut g, &a).unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => {
-                assert!(t.contains("\"width\":33") && t.contains("\"height\":44"))
-            }
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_window");
+        assert_eq!(v["width"], json!(33));
+        assert_eq!(v["height"], json!(44));
+    }
+
+    #[test]
+    fn window_rejects_unknown_op() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        start(&mut g, &start_args()).unwrap();
+        let a = WindowArgs {
+            op: "levitate".into(),
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+        };
+        let err = window(&mut g, &a).unwrap_err();
+        assert!(err.contains("unknown window op"), "got: {err}");
     }
 
     #[test]
@@ -623,7 +754,8 @@ mod tests {
         })
         .unwrap();
         let out = a11y_snapshot(&mut g).unwrap();
-        match &out.0[0] {
+        assert_envelope(&out, "glass_a11y_snapshot");
+        match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
                     t.starts_with(crate::untrusted::NOTE),
@@ -685,10 +817,8 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("set value of element #1"), "msg: {t}"),
-            _ => panic!("expected text"),
-        }
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
         // unknown id surfaces the actionable message
         let err = set_value(
             &mut g,
@@ -811,14 +941,21 @@ mod tests {
             matches!(out.0[0], OutContent::Image(_)),
             "first item is the image"
         );
-        match &out.0[1] {
+        let OutContent::Text(t) = &out.0[1] else {
+            panic!("expected envelope text as the second item")
+        };
+        let v: serde_json::Value = serde_json::from_str(t).expect("envelope must be valid JSON");
+        assert_eq!(v["ok"], json!(true), "envelope: {v}");
+        assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
+        assert_eq!(v["result"]["count"], json!(1), "envelope: {v}");
+        match &out.0[2] {
             OutContent::Text(t) => assert!(t.contains("#1 Button \"Save\""), "legend: {t}"),
             _ => panic!("expected legend text"),
         }
     }
 
     #[test]
-    fn a11y_marks_legend_enveloped_and_image_note_present() {
+    fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
         use glass_core::Frame;
         let platform =
             FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
@@ -835,14 +972,29 @@ mod tests {
         })
         .unwrap();
         let out = a11y_marks(&mut g).unwrap();
-        // [Image, legend-Text (enveloped), IMAGE_NOTE-Text]
+        // [Image, envelope-Text, legend-Text (untrusted-wrapped), IMAGE_NOTE-Text]
         assert!(
-            out.0.len() >= 3,
-            "expected [Image, legend, IMAGE_NOTE], got {} items",
+            out.0.len() >= 4,
+            "expected [Image, envelope, legend, IMAGE_NOTE], got {} items",
             out.0.len()
         );
-        // legend must be enveloped
+        assert!(
+            matches!(out.0[0], OutContent::Image(_)),
+            "image leads: {:?}",
+            out.0
+        );
+        // the trusted envelope comes right after the image
         match &out.0[1] {
+            OutContent::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_a11y_marks"), "envelope: {v}");
+            }
+            _ => panic!("expected envelope text as second item"),
+        }
+        // legend must be untrusted-wrapped
+        match &out.0[2] {
             OutContent::Text(t) => {
                 assert!(
                     t.starts_with(crate::untrusted::NOTE),
@@ -850,14 +1002,14 @@ mod tests {
                 );
                 assert!(
                     t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
-                    "legend must be in envelope: {t}"
+                    "legend must be untrusted-wrapped: {t}"
                 );
                 assert!(
                     t.contains("#1 Button"),
                     "legend must still contain element: {t}"
                 );
             }
-            _ => panic!("expected legend text as second item"),
+            _ => panic!("expected legend text as third item"),
         }
         // IMAGE_NOTE must be present
         let has_note = out
@@ -895,7 +1047,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out.0.len(), 1);
+        assert_eq!(out.0.len(), 1, "just the envelope, no siblings");
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert!(v["observed"].is_null(), "envelope: {v}");
+
         let out2 = click_element(
             &mut g,
             &ClickElementArgs {
@@ -935,12 +1091,14 @@ mod tests {
         assert_eq!(
             out.0.len(),
             2,
-            "snapshot return appends exactly one item (the a11y outline)"
+            "envelope + exactly one sibling (the a11y outline)"
         );
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("clicked element #1"), "got: {t}"),
-            _ => panic!("expected confirmation text"),
-        }
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert!(
+            v["observed"].is_null(),
+            "snapshot doesn't populate `observed`: {v}"
+        );
         match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
@@ -978,10 +1136,14 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"settled\":true"), "got: {t}"),
-            _ => panic!("expected settle text"),
-        }
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folds into `result.observed`, no extra sibling"
+        );
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
     }
 
     #[test]
@@ -996,14 +1158,37 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("set value of element #1"), "got: {t}"),
-            _ => panic!("expected confirmation"),
-        }
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
         assert!(
             matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
             "outline appended"
         );
+    }
+
+    #[test]
+    fn set_value_return_settle_folds_into_observed() {
+        use glass_core::Frame;
+        // Mirrors `return_settle_appends_settled_text` for `click_element`: wait_stable
+        // needs frames; one solid frame (repeated by the fake) settles.
+        let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let out = set_value(
+            &mut g,
+            &SetValueArgs {
+                id: 1,
+                text: "x".into(),
+                return_: Some("settle".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folds into `result.observed`, no extra sibling"
+        );
+        let v = assert_envelope(&out, "glass_set_value");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
     }
 
     #[test]
@@ -1022,7 +1207,9 @@ mod tests {
         .unwrap();
 
         let out = list_windows(&mut g).unwrap();
-        let text = match &out.0[0] {
+        let v = assert_envelope(&out, "glass_list_windows");
+        assert_eq!(v["count"], json!(1), "envelope: {v}");
+        let text = match &out.0[1] {
             OutContent::Text(t) => t.clone(),
             _ => panic!("expected text"),
         };
@@ -1047,7 +1234,33 @@ mod tests {
             "json should include geometry width: {text}"
         );
 
-        assert!(select_window(&mut g, &SelectWindowArgs { id: 0 }).is_ok());
+        let out = select_window(&mut g, &SelectWindowArgs { id: 0 }).unwrap();
+        let v = assert_envelope(&out, "glass_select_window");
+        assert_eq!(v["width"], json!(320), "envelope: {v}");
+        assert_eq!(v["height"], json!(240), "envelope: {v}");
         assert!(select_window(&mut g, &SelectWindowArgs { id: 42 }).is_err());
+    }
+
+    #[test]
+    fn result_envelope_is_leading_and_shaped() {
+        let out = ToolOutput::result("glass_stop", serde_json::json!({}));
+        let OutContent::Text(t) = &out.0[0] else {
+            panic!("expected text")
+        };
+        let v: serde_json::Value = serde_json::from_str(t).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["tool"], serde_json::json!("glass_stop"));
+        assert_eq!(v["result"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn result_with_puts_envelope_first_then_extra() {
+        let out = ToolOutput::result_with(
+            "glass_screenshot",
+            serde_json::json!({ "width": 4, "height": 4 }),
+            vec![OutContent::Image(vec![1, 2, 3])],
+        );
+        assert!(matches!(out.0[0], OutContent::Text(_)), "envelope leads");
+        assert!(matches!(out.0[1], OutContent::Image(_)), "extra follows");
     }
 }
