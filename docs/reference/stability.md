@@ -29,6 +29,10 @@ Within a major version, these are stable — glass will not change them incompat
   [Environment variables](environment.md).
 - **Type conventions** — element ids are `u32`, window ids are `u64`, input coordinates are signed
   `i32` (window-relative), and region coordinates are unsigned `u32`.
+- **Release-artifact names and layout** — the `glass-mcp-<tag>-<platform>.<ext>` assets on the
+  [Releases](https://github.com/fixed-width/glass/releases) page, their per-platform suffixes, and the
+  accompanying `.sha256` files. An installer or script can depend on the download-URL pattern. See
+  [Platform support](platforms.md#release-artifacts) for the exact names.
 
 ## What is not covered
 

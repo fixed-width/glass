@@ -58,6 +58,10 @@ Each asset is accompanied by a `.sha256` checksum file, and every release carrie
 provenance attestations. No aarch64 Linux asset is published; that architecture is built from source
 (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
 
+These asset names are **stable across the 1.x series** — an installer or script can depend on the
+`glass-mcp-<tag>-<platform>.<ext>` pattern and the per-platform suffixes above. See
+[Stability and versioning](stability.md) for the guarantee.
+
 ## Notes
 
 **† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass
