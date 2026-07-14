@@ -629,6 +629,18 @@ mod tests {
     }
 
     #[test]
+    fn start_rejects_unknown_sandbox() {
+        // Locks rejection at the `glass_start` tool boundary (not just the
+        // `resolve_sandbox`/`SandboxLevel::FromStr` units below it) — an unknown
+        // `sandbox` must not be silently coerced to the default level.
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        let mut a = start_args();
+        a.sandbox = Some("bogus".into());
+        let err = start(&mut g, &a).unwrap_err();
+        assert!(err.contains("unknown sandbox level"), "got: {err}");
+    }
+
+    #[test]
     fn stop_without_session_errors_with_message() {
         let mut g = glass_with(FakePlatform::new(10, 10));
         let err = stop(&mut g).unwrap_err();
@@ -664,6 +676,21 @@ mod tests {
         let v = envelope_value(&out, "glass_window");
         assert_eq!(v["result"]["width"], json!(33));
         assert_eq!(v["result"]["height"], json!(44));
+    }
+
+    #[test]
+    fn window_rejects_unknown_op() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        start(&mut g, &start_args()).unwrap();
+        let a = WindowArgs {
+            op: "levitate".into(),
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+        };
+        let err = window(&mut g, &a).unwrap_err();
+        assert!(err.contains("unknown window op"), "got: {err}");
     }
 
     #[test]
