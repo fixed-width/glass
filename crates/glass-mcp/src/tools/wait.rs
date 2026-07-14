@@ -33,18 +33,37 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
     };
     let o = glass.wait_for_element(&params).map_err(|e| e.to_string())?;
-    let element = o.element.map(|e| {
-        json!({
-            "id": e.id.0,
-            "role": format!("{:?}", e.role),
-            "name": e.name,
-            "value": e.value,
-            "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
-            "states": e.states.active(),
-        })
-    });
-    let body = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms, "element": element });
-    Ok(ToolOutput::result("glass_wait_for_element", body))
+    // `matched`/`elapsed_ms` are glass-derived and stay trusted; the matched element
+    // carries app-controlled name/value, so it rides in an untrusted sibling.
+    let result = json!({ "matched": o.matched, "elapsed_ms": o.elapsed_ms });
+    let extra = element_sibling(o.element);
+    Ok(ToolOutput::result_with(
+        "glass_wait_for_element",
+        result,
+        extra,
+    ))
+}
+
+/// The matched a11y element as an untrusted sibling block (empty when nothing
+/// matched). Its `name`/`value` are app-controlled, so they must never ride in the
+/// trusted `result` envelope.
+fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> {
+    match element {
+        Some(e) => {
+            let json = json!({
+                "id": e.id.0,
+                "role": format!("{:?}", e.role),
+                "name": e.name,
+                "value": e.value,
+                "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
+                "states": e.states.active(),
+            });
+            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
+                &json.to_string(),
+            ))]
+        }
+        None => vec![],
+    }
 }
 
 pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResult {
@@ -82,23 +101,19 @@ pub fn scroll_to_element(glass: &mut Glass, a: &ScrollToElementArgs) -> ToolResu
     let o = glass
         .scroll_to_element(&params)
         .map_err(|e| e.to_string())?;
-    let element = o.element.map(|e| {
-        json!({
-            "id": e.id.0,
-            "role": format!("{:?}", e.role),
-            "name": e.name,
-            "value": e.value,
-            "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
-            "states": e.states.active(),
-        })
-    });
-    let body = json!({
+    // `matched`/`elapsed_ms`/`scrolled` are glass-computed and stay trusted; the
+    // matched element carries app-controlled name/value, so it rides untrusted.
+    let result = json!({
         "matched": o.matched,
         "elapsed_ms": o.elapsed_ms,
-        "element": element,
         "scrolled": { "steps": o.steps, "reversed": o.reversed, "direction": o.direction.as_str() },
     });
-    Ok(ToolOutput::result("glass_scroll_to_element", body))
+    let extra = element_sibling(o.element);
+    Ok(ToolOutput::result_with(
+        "glass_scroll_to_element",
+        result,
+        extra,
+    ))
 }
 
 pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
@@ -174,18 +189,27 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
     };
     let o = glass.wait_for_log(&params).map_err(|e| e.to_string())?;
-    let line = o.line.map(|l| {
-        json!({
-            "seq": l.seq,
-            "stream": match l.stream { Stream::Stdout => "stdout", Stream::Stderr => "stderr" },
-            "text": l.text,
-        })
-    });
-    let mut body = json!({ "matched": o.matched, "line": line, "cursor": o.cursor, "elapsed_ms": o.elapsed_ms });
+    // `matched`/`cursor`/`elapsed_ms`/`note` are glass-generated and stay trusted;
+    // the matched line carries app-controlled text, so it rides untrusted.
+    let mut result =
+        json!({ "matched": o.matched, "cursor": o.cursor, "elapsed_ms": o.elapsed_ms });
     if let Some(note) = &o.note {
-        body["note"] = json!(note);
+        result["note"] = json!(note);
     }
-    Ok(ToolOutput::result("glass_wait_for_log", body))
+    let extra = match o.line {
+        Some(l) => {
+            let json = json!({
+                "seq": l.seq,
+                "stream": match l.stream { Stream::Stdout => "stdout", Stream::Stderr => "stderr" },
+                "text": l.text,
+            });
+            vec![OutContent::Text(crate::untrusted::wrap_untrusted(
+                &json.to_string(),
+            ))]
+        }
+        None => vec![],
+    };
+    Ok(ToolOutput::result_with("glass_wait_for_log", result, extra))
 }
 
 #[cfg(test)]
@@ -256,15 +280,38 @@ mod tests {
         let mut a = scroll_args();
         a.name = Some("Save".into());
         let out = scroll_to_element(&mut g, &a).unwrap();
+        // `scrolled` is glass-computed and stays in the trusted result.
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(t.contains("\"scrolled\""), "got: {t}");
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
+                assert_eq!(
+                    v["result"]["scrolled"]["direction"],
+                    json!("down"),
+                    "resolved direction must be serialized in result; got: {v}"
+                );
                 assert!(
-                    t.contains("\"direction\":\"down\""),
-                    "resolved direction must be serialized; got: {t}"
+                    v["result"]["element"].is_null(),
+                    "app element must not ride in the trusted result: {v}"
                 );
             }
             _ => panic!("expected text"),
+        }
+        // Save is on-screen -> matched -> the element rides as an untrusted sibling.
+        match &out.0[1] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
+                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+            }
+            _ => panic!("expected untrusted element sibling"),
         }
     }
 
@@ -324,15 +371,24 @@ mod tests {
         let mut a = scroll_args();
         a.name = Some("Save".into());
         let out = scroll_to_element(&mut g, &a).unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "no match -> single envelope block, no untrusted sibling"
+        );
         match &out.0[0] {
             OutContent::Text(t) => {
-                assert!(
-                    t.contains("\"matched\":false"),
-                    "off-screen target never realizes in the static tree; got: {t}"
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(
+                    v["result"]["matched"],
+                    json!(false),
+                    "off-screen target never realizes in the static tree; got: {v}"
                 );
-                assert!(
-                    t.contains("\"direction\":\"right\""),
-                    "resolved direction must be inferred from the off-screen bounds; got: {t}"
+                assert_eq!(
+                    v["result"]["scrolled"]["direction"],
+                    json!("right"),
+                    "resolved direction must be inferred from the off-screen bounds; got: {v}"
                 );
             }
             _ => panic!("expected text"),
@@ -402,6 +458,8 @@ mod tests {
         a.role = Some("Button".into());
         a.condition = Some("enabled".into());
         let out = wait_for_element(&mut g, &a).unwrap();
+        // Trusted scalars ride in the envelope result; the app-controlled element
+        // does NOT.
         match &out.0[0] {
             OutContent::Text(t) => {
                 let v: serde_json::Value =
@@ -409,14 +467,29 @@ mod tests {
                 assert_eq!(v["ok"], json!(true), "envelope: {v}");
                 assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
                 assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
-                assert_eq!(v["result"]["element"]["id"], json!(1), "envelope: {v}");
-                assert_eq!(
-                    v["result"]["element"]["name"],
-                    json!("Save"),
-                    "envelope: {v}"
+                assert!(v["result"]["elapsed_ms"].is_number(), "envelope: {v}");
+                assert!(
+                    v["result"]["element"].is_null(),
+                    "app element must not ride in the trusted result: {v}"
                 );
             }
             _ => panic!("expected text"),
+        }
+        // The matched element (app-controlled name/value) rides in an untrusted sibling.
+        match &out.0[1] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
+                assert!(t.contains("\"id\":1"), "element id: {t}");
+                assert!(t.contains("\"name\":\"Save\""), "app-controlled name: {t}");
+            }
+            _ => panic!("expected untrusted element sibling"),
         }
     }
 
@@ -428,6 +501,11 @@ mod tests {
         a.condition = Some("checked".into()); // never true
         a.timeout_ms = Some(0);
         let out = wait_for_element(&mut g, &a).unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "no match -> single envelope block, no untrusted sibling"
+        );
         match &out.0[0] {
             OutContent::Text(t) => {
                 let v: serde_json::Value =
@@ -435,7 +513,6 @@ mod tests {
                 assert_eq!(v["ok"], json!(true), "envelope: {v}");
                 assert_eq!(v["tool"], json!("glass_wait_for_element"), "envelope: {v}");
                 assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
-                assert!(v["result"]["element"].is_null(), "envelope: {v}");
             }
             _ => panic!("expected text"),
         }
@@ -604,6 +681,7 @@ mod tests {
             timeout_ms: Some(1000),
         };
         let out = wait_for_log(&mut g, &a).unwrap();
+        // Trusted scalars ride in the envelope result; the app-controlled line does NOT.
         match &out.0[0] {
             OutContent::Text(t) => {
                 let v: serde_json::Value =
@@ -611,13 +689,31 @@ mod tests {
                 assert_eq!(v["ok"], json!(true), "envelope: {v}");
                 assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
                 assert_eq!(v["result"]["matched"], json!(true), "envelope: {v}");
-                assert_eq!(
-                    v["result"]["line"]["text"],
-                    json!("build done"),
-                    "envelope: {v}"
+                assert!(v["result"]["cursor"].is_number(), "cursor scalar: {v}");
+                assert!(
+                    v["result"]["line"].is_null(),
+                    "app line must not ride in the trusted result: {v}"
                 );
             }
             _ => panic!("expected text"),
+        }
+        // The matched line (app-controlled text) rides in an untrusted sibling.
+        match &out.0[1] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE),
+                    "must be marked untrusted: {t}"
+                );
+                assert!(
+                    t.contains("⟦untrusted:") && t.contains("⟦/untrusted:"),
+                    "enveloped: {t}"
+                );
+                assert!(
+                    t.contains("\"text\":\"build done\""),
+                    "app-controlled log text: {t}"
+                );
+            }
+            _ => panic!("expected untrusted line sibling"),
         }
     }
 
@@ -659,6 +755,11 @@ mod tests {
             timeout_ms: Some(0),
         };
         let out = wait_for_log(&mut g, &a).unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "no match -> single envelope block, no untrusted sibling"
+        );
         match &out.0[0] {
             OutContent::Text(t) => {
                 let v: serde_json::Value =
@@ -666,7 +767,6 @@ mod tests {
                 assert_eq!(v["ok"], json!(true), "envelope: {v}");
                 assert_eq!(v["tool"], json!("glass_wait_for_log"), "envelope: {v}");
                 assert_eq!(v["result"]["matched"], json!(false), "envelope: {v}");
-                assert!(v["result"]["line"].is_null(), "envelope: {v}");
             }
             _ => panic!("expected text"),
         }

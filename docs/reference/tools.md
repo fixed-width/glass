@@ -37,9 +37,11 @@ Each tool's entry below gives its `result` shape as a "Returns" line.
 `result` holds only glass-computed or glass-echoed fields — ids, geometry, counts, elapsed times,
 matched flags. Bulk text the *target app* controls — the `glass_a11y_snapshot` outline, `glass_logs`
 lines, clipboard text, the `glass_list_windows` array (window titles are app-supplied), the
-`glass_a11y_marks` legend — never rides inside `result`. It follows as its own subsequent content
-block, wrapped in an untrusted marker, so an app that puts an instruction-shaped string in a window
-title or a log line can't pass it off as glass itself instructing the agent.
+`glass_a11y_marks` legend, and the matched element from `glass_wait_for_element` /
+`glass_scroll_to_element` and matched line from `glass_wait_for_log` — never rides inside `result`. It
+follows as its own subsequent content block, wrapped in an untrusted marker, so an app that puts an
+instruction-shaped string in an element name or a log line can't pass it off as glass itself
+instructing the agent.
 
 A capture tool (`glass_screenshot`, `glass_wait_stable` with an image, `glass_a11y_marks`, and
 `glass_diff` / `glass_wait_for_region` when they attach one) emits the image content block *first*,
@@ -181,8 +183,9 @@ no accessibility tree.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms, element{id, role, name, value, bounds, states}}` — `element` is
-`null` when `matched:false`; otherwise its `id` is usable with `glass_click_element`.
+Returns `{matched, elapsed_ms}`. On a match, the matched element (`{id, role, name, value, bounds,
+states}`) rides as an untrusted sibling text block, since its `name`/`value` are app-controlled; its
+`id` is usable with `glass_click_element`. No sibling on timeout.
 
 ### `glass_wait_for_region`
 
@@ -216,9 +219,10 @@ Block until a log line containing `contains` appears, then return it as text.
 - `interval_ms` (integer, default 100) — poll interval.
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, line{seq, stream, text}, cursor, elapsed_ms}` (`line` is `null` when unmatched),
-plus `note` on a default-cursor timeout when the substring was already in the log before this call —
-it points you at `cursor:0`. Resume reading from the returned `cursor`.
+Returns `{matched, cursor, elapsed_ms}`, plus `note` on a default-cursor timeout when the substring
+was already in the log before this call — it points you at `cursor:0`. On a match, the matched line
+(`{seq, stream, text}`) rides as an untrusted sibling text block, since log output is app-controlled;
+no sibling on timeout. Resume reading from the returned `cursor`.
 
 ## Input
 
@@ -438,9 +442,10 @@ Errors if the app exposes no accessibility tree.
   larger covers distance faster but risks stepping past a row's/column's realized band.
 - `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms, element{id, role, name, value, bounds, states}, scrolled{steps,
-reversed, direction}}` — `element` is `null` when `matched:false`; `direction` is the resolved
-(possibly inferred) sweep direction, and the `id` is usable with `glass_click_element`.
+Returns `{matched, elapsed_ms, scrolled{steps, reversed, direction}}` — `direction` is the resolved
+(possibly inferred) sweep direction. On a match, the matched element (`{id, role, name, value, bounds,
+states}`) rides as an untrusted sibling text block, since its `name`/`value` are app-controlled; its
+`id` is usable with `glass_click_element`. No sibling on timeout.
 
 ## Clipboard
 
