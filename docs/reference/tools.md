@@ -160,10 +160,11 @@ Wait until the window stops changing, then return the settled frame.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
 
-Returns `{settled, saw_motion, observed_ms, width, height}` (plus `x, y` — the region's origin —
-when `region` was given) whether or not `include_image` attached a frame. `saw_motion` and
-`observed_ms` make `settled` non-opaque: `settled:true` with `saw_motion:false` over a short
-`observed_ms` is only a brief quiet window, not necessarily a finished animation.
+Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
+added only when `include_image` attached a frame and `region` was given (the text-only result never
+includes them). `saw_motion` and `observed_ms` make `settled` non-opaque: `settled:true` with
+`saw_motion:false` over a short `observed_ms` is only a brief quiet window, not necessarily a
+finished animation.
 
 ### `glass_wait_for_element`
 
