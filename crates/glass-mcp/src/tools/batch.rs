@@ -9,6 +9,23 @@ use crate::tools::{
     ToolOutput, ToolResult,
 };
 
+/// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
+/// sibling blocks — images and the IMAGE_NOTE). The envelope text block itself is consumed.
+fn split_sub(out: ToolOutput) -> (serde_json::Value, Vec<OutContent>) {
+    let mut result = json!({});
+    let mut siblings = Vec::new();
+    for c in out.0 {
+        match c {
+            OutContent::Text(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+                Ok(v) if v.get("result").is_some() => result = v["result"].clone(),
+                _ => siblings.push(OutContent::Text(t)), // e.g. IMAGE_NOTE (not JSON)
+            },
+            img => siblings.push(img),
+        }
+    }
+    (result, siblings)
+}
+
 /// Build a text-only `WaitStableArgs` from a `SettleArgs` (no image, no crop).
 fn settle_args(s: &SettleArgs) -> WaitStableArgs {
     WaitStableArgs {
@@ -52,28 +69,42 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
         }
     }
 
-    let mut out = vec![OutContent::Text(json!({ "executed": n }).to_string())];
+    let mut result = json!({ "executed": n });
+    let mut siblings = Vec::new();
     if let Some(then) = &a.then {
-        let mut items = run_then(glass, then)
+        let (meta, sib) = run_then(glass, then)
             .map_err(|msg| format!("all {n} actions executed; terminal observe failed: {msg}"))?;
-        out.append(&mut items);
+        result["then"] = meta;
+        siblings = sib;
     }
-    Ok(ToolOutput(out))
+    Ok(ToolOutput::result_with("glass_do", result, siblings))
 }
 
-/// Run the terminal observe in fixed order: settle → diff → screenshot.
-fn run_then(glass: &mut Glass, then: &ThenArgs) -> Result<Vec<OutContent>, String> {
-    let mut items = Vec::new();
+/// Run the terminal observe in fixed order: settle → diff → screenshot. Returns
+/// the `then` metadata object (each ran sub-tool's `result` payload keyed by
+/// name) and the collected image/IMAGE_NOTE sibling blocks, in run order.
+fn run_then(
+    glass: &mut Glass,
+    then: &ThenArgs,
+) -> Result<(serde_json::Value, Vec<OutContent>), String> {
+    let mut meta = json!({});
+    let mut siblings = Vec::new();
     if let Some(s) = &then.settle {
-        items.extend(wait_stable(glass, &settle_args(s))?.0);
+        let (r, mut sib) = split_sub(wait_stable(glass, &settle_args(s))?);
+        meta["settle"] = r;
+        siblings.append(&mut sib);
     }
     if let Some(d) = &then.diff {
-        items.extend(diff(glass, d)?.0);
+        let (r, mut sib) = split_sub(diff(glass, d)?);
+        meta["diff"] = r;
+        siblings.append(&mut sib);
     }
     if let Some(sc) = &then.screenshot {
-        items.extend(screenshot(glass, sc)?.0);
+        let (r, mut sib) = split_sub(screenshot(glass, sc)?);
+        meta["screenshot"] = r;
+        siblings.append(&mut sib);
     }
-    Ok(items)
+    Ok((meta, siblings))
 }
 
 #[cfg(test)]
@@ -112,6 +143,19 @@ mod tests {
         })
     }
 
+    /// Parse the leading content block as the `{ok,tool,result}` envelope and
+    /// return its `result` payload.
+    fn envelope_result(out: &ToolOutput) -> serde_json::Value {
+        match &out.0[0] {
+            OutContent::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("leading block must be the JSON envelope");
+                v["result"].clone()
+            }
+            _ => panic!("expected envelope text as first item"),
+        }
+    }
+
     #[test]
     fn runs_actions_in_order() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -136,10 +180,8 @@ mod tests {
             *log.lock().unwrap(),
             vec!["click(10,20)", "type(alice)", "key(Tab)"]
         );
-        match &out.0[0] {
-            OutContent::Text(t) => assert!(t.contains("\"executed\":3"), "got: {t}"),
-            _ => panic!("expected executed text"),
-        }
+        let result = envelope_result(&out);
+        assert_eq!(result["executed"], json!(3));
     }
 
     #[test]
@@ -206,11 +248,13 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out.0.len(), 2, "executed text + settle text, no image");
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"settled\":true"), "got: {t}"),
-            _ => panic!("expected settle text, not an image"),
-        }
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folded into the envelope, no separate/image block"
+        );
+        let result = envelope_result(&out);
+        assert_eq!(result["then"]["settle"]["settled"], json!(true));
     }
 
     #[test]
@@ -232,22 +276,20 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(&out.0[0], OutContent::Text(t) if t.contains("\"executed\":1")));
+        let result = envelope_result(&out);
+        assert_eq!(result["executed"], json!(1));
+        assert_eq!(result["then"]["screenshot"]["width"], json!(4));
         assert!(
             matches!(out.0[1], OutContent::Image(_)),
             "screenshot image appended"
         );
         assert_eq!(
             out.0.len(),
-            4,
-            "executed text + screenshot image + dims text + IMAGE_NOTE"
+            3,
+            "envelope + screenshot image + IMAGE_NOTE (dims folded into result.then.screenshot)"
         );
         assert!(
-            matches!(&out.0[2], OutContent::Text(t) if t.contains("\"width\":4")),
-            "dims text after image"
-        );
-        assert!(
-            matches!(&out.0[3], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
+            matches!(&out.0[2], OutContent::Text(t) if *t == crate::untrusted::IMAGE_NOTE),
             "IMAGE_NOTE last"
         );
     }
@@ -276,10 +318,8 @@ mod tests {
             },
         )
         .unwrap();
-        match &out.0[1] {
-            OutContent::Text(t) => assert!(t.contains("\"settled\":false"), "got: {t}"),
-            _ => panic!("expected settle text"),
-        }
+        let result = envelope_result(&out);
+        assert_eq!(result["then"]["settle"]["settled"], json!(false));
     }
 
     #[test]
