@@ -46,7 +46,7 @@ impl ToolOutput {
 }
 
 /// Serialize the success envelope. `ok` is always true — errors take the `Err` path.
-fn envelope(tool: &str, result: serde_json::Value) -> String {
+pub(crate) fn envelope(tool: &str, result: serde_json::Value) -> String {
     serde_json::json!({ "ok": true, "tool": tool, "result": result }).to_string()
 }
 

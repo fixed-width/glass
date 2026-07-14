@@ -4,7 +4,7 @@ use glass_core::{frame_to_webp, Frame, Glass, Region, Stream};
 use serde_json::json;
 
 use crate::params::*;
-use crate::tools::{OutContent, ToolOutput, ToolResult};
+use crate::tools::{envelope, OutContent, ToolOutput, ToolResult};
 
 /// Crop the captured frame to the requested region, or return it whole.
 fn crop_frame(frame: Frame, region: Option<&RegionArgs>) -> Result<Frame, String> {
@@ -29,7 +29,7 @@ pub fn screenshot(glass: &mut Glass, a: &ScreenshotArgs) -> ToolResult {
     }
     Ok(ToolOutput(vec![
         OutContent::Image(img),
-        OutContent::Text(meta.to_string()),
+        OutContent::Text(envelope("glass_screenshot", meta)),
         OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
     ]))
 }
@@ -60,7 +60,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
-        return Ok(ToolOutput::text(meta.to_string()));
+        return Ok(ToolOutput::result("glass_wait_stable", meta));
     }
 
     let frame = crop_frame(outcome.frame, a.region.as_ref())?;
@@ -72,14 +72,17 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
     }
     Ok(ToolOutput(vec![
         OutContent::Image(img),
-        OutContent::Text(meta.to_string()),
+        OutContent::Text(envelope("glass_wait_stable", meta)),
         OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()),
     ]))
 }
 
 pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
     glass.save_baseline(&a.name).map_err(|e| e.to_string())?;
-    Ok(ToolOutput::text(format!("saved baseline '{}'", a.name)))
+    Ok(ToolOutput::result(
+        "glass_baseline_save",
+        json!({ "name": a.name }),
+    ))
 }
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
@@ -116,7 +119,6 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     if let Some(rr) = a.region.as_ref() {
         body["region"] = json!({ "x": rr.x, "y": rr.y, "width": rr.width, "height": rr.height });
     }
-    let text = OutContent::Text(body.to_string());
 
     // Opt-in: when something changed, attach the current frame cropped to the
     // changed region (token-minimal, exactly what differs). Nothing changed ->
@@ -138,7 +140,7 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
             image_produced = true;
         }
     }
-    out.push(text);
+    out.push(OutContent::Text(envelope("glass_diff", body)));
     if image_produced {
         out.push(OutContent::Text(crate::untrusted::IMAGE_NOTE.to_string()));
     }
@@ -170,8 +172,12 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
             })
         })
         .collect();
-    let body = json!({ "lines": json_lines, "cursor": cursor }).to_string();
-    Ok(ToolOutput::text(crate::untrusted::wrap_untrusted(&body)))
+    let body = json!({ "lines": json_lines }).to_string();
+    Ok(ToolOutput::result_with(
+        "glass_logs",
+        json!({ "cursor": cursor }),
+        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+    ))
 }
 
 #[cfg(test)]
@@ -515,7 +521,19 @@ mod tests {
             },
         )
         .unwrap();
+        // envelope leads, carrying the cursor
         match &out.0[0] {
+            OutContent::Text(t) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(t).expect("envelope must be valid JSON");
+                assert_eq!(v["ok"], json!(true), "envelope: {v}");
+                assert_eq!(v["tool"], json!("glass_logs"), "envelope: {v}");
+                assert_eq!(v["result"]["cursor"], json!(1), "envelope: {v}");
+            }
+            _ => panic!("expected envelope text as first item"),
+        }
+        // untrusted lines sibling follows, carrying the app-controlled lines
+        match &out.0[1] {
             OutContent::Text(t) => {
                 assert!(
                     t.starts_with(crate::untrusted::NOTE),
@@ -526,9 +544,8 @@ mod tests {
                     "enveloped: {t}"
                 );
                 assert!(t.contains("\"text\":\"ready\""));
-                assert!(t.contains("\"cursor\":1"));
             }
-            _ => panic!("expected text"),
+            _ => panic!("expected untrusted lines text as second item"),
         }
     }
 
