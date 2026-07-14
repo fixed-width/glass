@@ -294,7 +294,10 @@ impl GlassServer {
             tokio::task::spawn_blocking(move || crate::doctor::diagnose_with_audit(deep, &report))
                 .await
                 .expect("doctor task panicked");
-        Ok(to_call_result(ToolOutput::text(diag.render_text(backend))))
+        Ok(to_call_result(ToolOutput::result(
+            "glass_doctor",
+            serde_json::json!({ "report": diag.render_text(backend) }),
+        )))
     }
 
     #[tool(
@@ -314,7 +317,8 @@ impl GlassServer {
         Parameters(a): Parameters<CapabilitiesArgs>,
     ) -> Result<CallToolResult, McpError> {
         Ok(map_tool_result(
-            crate::capabilities::render_json(a.backend.as_deref()).map(ToolOutput::text),
+            crate::capabilities::render_value(a.backend.as_deref())
+                .map(|v| ToolOutput::result("glass_capabilities", v)),
         ))
     }
 
@@ -596,11 +600,56 @@ mod tests {
 
         let text = first_text(&out);
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["backend"], "android");
-        assert_eq!(v["available"], true);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["tool"], "glass_capabilities");
+        let result = &v["result"];
+        assert_eq!(result["backend"], "android");
+        assert_eq!(result["available"], true);
         assert_eq!(
-            v["capabilities"]["window_move_resize"]["status"],
+            result["capabilities"]["window_move_resize"]["status"],
             "unsupported"
+        );
+    }
+
+    #[tokio::test]
+    async fn glass_capabilities_rejects_an_unknown_backend() {
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        let report = crate::audit::report_from_config(None, |_| None);
+        let server = GlassServer::new(glass, report);
+
+        let out = server
+            .glass_capabilities(Parameters(CapabilitiesArgs {
+                backend: Some("nope".into()),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(out.is_error, Some(true));
+        assert!(first_text(&out).contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn glass_doctor_envelopes_the_report_text() {
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        let report = crate::audit::report_from_config(None, |_| None);
+        let server = GlassServer::new(glass, report);
+
+        let out = server
+            .glass_doctor(Parameters(DoctorArgs { deep: None }))
+            .await
+            .unwrap();
+
+        let text = first_text(&out);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["tool"], "glass_doctor");
+        assert!(
+            v["result"]["report"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "expected a non-empty result.report string, got {v}"
         );
     }
 
