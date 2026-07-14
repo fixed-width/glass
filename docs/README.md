@@ -37,6 +37,7 @@ way it does? The explanations.
 ## Reference — look up a fact
 
 - [Tools](reference/tools.md) — every `glass_*` tool, its parameters, and platform support
+- [Stability and versioning](reference/stability.md) — the semver promise: what's covered from 1.0
 - [Environment variables](reference/environment.md) — every `GLASS_*` variable
 - [CLI](reference/cli.md) — `glass-mcp` subcommands
 - [Platform support](reference/platforms.md) — the capability matrix and system requirements

@@ -82,7 +82,8 @@ network HTTP.
 ## Documentation
 
 The full docs — tutorial, how-to guides, reference, and explanations — are under
-**[`docs/`](docs/README.md)**. See [`CHANGELOG.md`](CHANGELOG.md) for release notes.
+**[`docs/`](docs/README.md)**. See [`CHANGELOG.md`](CHANGELOG.md) for release notes, and
+[Stability and versioning](docs/reference/stability.md) for what a 1.0 release guarantees.
 
 ## License
 
