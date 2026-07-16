@@ -56,6 +56,7 @@ pub struct StateFacts {
     pub toggled_on: bool,
     pub expanded: bool,
     pub editable: bool,
+    pub checkable: bool,
 }
 
 /// Map gathered facts to the normalized `AxStates`.
@@ -67,6 +68,7 @@ pub fn map_states(f: &StateFacts) -> AxStates {
         visible: !f.offscreen,
         selected: f.selected,
         checked: f.toggled_on,
+        checkable: f.checkable,
         expanded: f.expanded,
         editable: f.editable,
     }
@@ -116,5 +118,15 @@ mod tests {
         let s = map_states(&f);
         assert!(s.focused && s.focusable && s.editable);
         assert!(!s.selected && !s.checked);
+    }
+    #[test]
+    fn checkable_from_toggle_pattern_fact() {
+        let f = StateFacts {
+            checkable: true,
+            toggled_on: true,
+            ..Default::default()
+        };
+        assert!(map_states(&f).checkable && map_states(&f).checked);
+        assert!(!map_states(&StateFacts::default()).checkable);
     }
 }
