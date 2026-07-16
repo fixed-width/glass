@@ -20,6 +20,7 @@ perf.data.old
 # Editor / OS cruft
 *.swp
 .DS_Store
+.idea/
 
 # Pulled-back artifacts from scripts/test-windows.sh on-box runs
 /.windows-artifacts/
