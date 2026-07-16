@@ -62,7 +62,7 @@ pub enum GlassError {
     #[error("element #{0} has no clickable on-screen geometry")]
     AxElementNotClickable(u32),
 
-    #[error("element #{0} is not editable")]
+    #[error("element #{0} is not editable via the accessibility API (its a11y projection exposes no writable value — a common toolkit gap even when the element accepts typed input); focus it with glass_click, then enter text with glass_type / glass_key instead")]
     AxElementNotEditable(u32),
 
     #[error("element #{0} has no option matching {1:?}; available options: {2}")]
@@ -176,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             GlassError::AxElementNotEditable(5).to_string(),
-            "element #5 is not editable"
+            "element #5 is not editable via the accessibility API (its a11y projection exposes no writable value — a common toolkit gap even when the element accepts typed input); focus it with glass_click, then enter text with glass_type / glass_key instead"
         );
         assert_eq!(
             GlassError::AxElementChanged(2).to_string(),
