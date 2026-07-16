@@ -130,6 +130,8 @@ pub struct AxStates {
     pub visible: bool,
     pub selected: bool,
     pub checked: bool,
+    /// The element exposes a real toggle state (`checked` is only meaningful when this is true).
+    pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
 }
@@ -153,8 +155,8 @@ impl AxStates {
         if self.selected {
             v.push("selected");
         }
-        if self.checked {
-            v.push("checked");
+        if self.checkable {
+            v.push(if self.checked { "checked" } else { "unchecked" });
         }
         if self.expanded {
             v.push("expanded");
@@ -421,8 +423,8 @@ impl ElementCondition {
             Appears | Disappears => |_| true,
             Enabled => |s| s.enabled,
             Disabled => |s| !s.enabled,
-            Checked => |s| s.checked,
-            Unchecked => |s| !s.checked,
+            Checked => |s| s.checkable && s.checked,
+            Unchecked => |s| s.checkable && !s.checked,
             Selected => |s| s.selected,
             Unselected => |s| !s.selected,
             Expanded => |s| s.expanded,
@@ -704,6 +706,7 @@ mod tests {
             focusable: true,
             enabled: true,
             checked: true,
+            checkable: true,
             ..Default::default()
         };
         assert_eq!(s.active(), vec!["focusable", "enabled", "checked"]);
@@ -1031,5 +1034,83 @@ mod tests {
             ),
             ElementMatch::Pending
         ));
+    }
+
+    #[test]
+    fn checked_conditions_require_checkable() {
+        let non_toggle = AxStates {
+            checkable: false,
+            checked: false,
+            ..Default::default()
+        };
+        let off = AxStates {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let on = AxStates {
+            checkable: true,
+            checked: true,
+            ..Default::default()
+        };
+        // The asymmetric case: a backend that (incorrectly) reports `checked:true` without
+        // `checkable:true` — this is what distinguishes the gated `s.checkable && s.checked`
+        // arm from an ungated `s.checked` arm, which would wrongly satisfy `Checked` here.
+        let checked_but_not_checkable = AxStates {
+            checkable: false,
+            checked: true,
+            ..Default::default()
+        };
+        let pred = |c: ElementCondition| c.state_pred();
+        // non-checkable matches NEITHER (the fix)
+        assert!(!(pred(ElementCondition::Unchecked))(&non_toggle));
+        assert!(!(pred(ElementCondition::Checked))(&non_toggle));
+        // real toggle matches per its checked state
+        assert!((pred(ElementCondition::Unchecked))(&off));
+        assert!(!(pred(ElementCondition::Checked))(&off));
+        assert!((pred(ElementCondition::Checked))(&on));
+        assert!(!(pred(ElementCondition::Unchecked))(&on));
+        // checked:true with checkable:false still matches NEITHER — checked alone is not
+        // enough without checkable.
+        assert!(!(pred(ElementCondition::Checked))(
+            &checked_but_not_checkable
+        ));
+        assert!(!(pred(ElementCondition::Unchecked))(
+            &checked_but_not_checkable
+        ));
+    }
+
+    #[test]
+    fn active_renders_toggle_state_only_when_checkable() {
+        let on = AxStates {
+            checkable: true,
+            checked: true,
+            ..Default::default()
+        };
+        let off = AxStates {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let plain = AxStates {
+            checkable: false,
+            checked: false,
+            ..Default::default()
+        };
+        // The asymmetric case: `checked:true` without `checkable:true` — distinguishes
+        // `active()`'s `if self.checkable { push checked/unchecked }` gating from a
+        // hypothetical ungated version that renders off `self.checked` alone.
+        let checked_but_not_checkable = AxStates {
+            checkable: false,
+            checked: true,
+            ..Default::default()
+        };
+        assert!(on.active().contains(&"checked"));
+        assert!(off.active().contains(&"unchecked"));
+        assert!(!plain.active().contains(&"checked") && !plain.active().contains(&"unchecked"));
+        assert!(
+            !checked_but_not_checkable.active().contains(&"checked")
+                && !checked_but_not_checkable.active().contains(&"unchecked")
+        );
     }
 }

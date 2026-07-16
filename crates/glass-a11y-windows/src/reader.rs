@@ -169,10 +169,16 @@ fn walk(
 /// so we don't make a live cross-process `get_pattern` call for a pattern the control can't support
 /// (UIA is chatty — each probe is an out-of-process COM round-trip).
 fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<String>) {
-    let toggled_on = matches!(ct_id, 50000 | 50002 | 50011 | 50031) // Button/CheckBox/MenuItem/SplitButton
-        && el.get_pattern::<UITogglePattern>().ok()
-            .and_then(|p| p.get_toggle_state().ok())
-            .map(|s| s == ToggleState::On).unwrap_or(false);
+    // Fetch the Toggle pattern once: its mere presence is `checkable` (the control exposes
+    // on/off semantics at all), independent of whether we can also read its current state.
+    let toggle_pattern = matches!(ct_id, 50000 | 50002 | 50011 | 50031) // Button/CheckBox/MenuItem/SplitButton
+        .then(|| el.get_pattern::<UITogglePattern>().ok())
+        .flatten();
+    let checkable = toggle_pattern.is_some();
+    let toggled_on = toggle_pattern
+        .and_then(|p| p.get_toggle_state().ok())
+        .map(|s| s == ToggleState::On)
+        .unwrap_or(false);
     let selected = matches!(ct_id, 50007 | 50019 | 50024 | 50029) // ListItem/TabItem/TreeItem/DataItem
         && el.get_pattern::<UISelectionItemPattern>().ok()
             .and_then(|p| p.is_selected().ok()).unwrap_or(false);
@@ -205,6 +211,7 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
         toggled_on,
         expanded,
         editable,
+        checkable,
     };
     (facts, value)
 }

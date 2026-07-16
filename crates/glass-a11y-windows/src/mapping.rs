@@ -45,7 +45,9 @@ pub fn map_role(control_type_id: u32) -> AxRole {
 
 /// Plain state facts the reader gathers from a UIA element (no `uiautomation` types here,
 /// so this stays unit-testable on Linux). `editable` is the reader's derived
-/// "text control AND not read-only"; `toggled_on` is `TogglePattern.ToggleState == On`.
+/// "text control AND not read-only"; `toggled_on` is `TogglePattern.ToggleState == On`;
+/// `checkable` is Toggle-pattern *availability* — the pattern is present on the element,
+/// independent of whether its current toggle state was actually readable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StateFacts {
     pub enabled: bool,
@@ -56,6 +58,7 @@ pub struct StateFacts {
     pub toggled_on: bool,
     pub expanded: bool,
     pub editable: bool,
+    pub checkable: bool,
 }
 
 /// Map gathered facts to the normalized `AxStates`.
@@ -67,6 +70,7 @@ pub fn map_states(f: &StateFacts) -> AxStates {
         visible: !f.offscreen,
         selected: f.selected,
         checked: f.toggled_on,
+        checkable: f.checkable,
         expanded: f.expanded,
         editable: f.editable,
     }
@@ -116,5 +120,28 @@ mod tests {
         let s = map_states(&f);
         assert!(s.focused && s.focusable && s.editable);
         assert!(!s.selected && !s.checked);
+    }
+    #[test]
+    fn checkable_from_toggle_pattern_fact() {
+        let f = StateFacts {
+            checkable: true,
+            toggled_on: true,
+            ..Default::default()
+        };
+        assert!(map_states(&f).checkable && map_states(&f).checked);
+        assert!(!map_states(&StateFacts::default()).checkable);
+    }
+
+    #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // checkable != toggled_on — a fixture like this catches a swapped-field bug that
+        // `checkable_from_toggle_pattern_fact`'s checkable+toggled_on-together fixture cannot.
+        let f = StateFacts {
+            checkable: true,
+            toggled_on: false,
+            ..Default::default()
+        };
+        let s = map_states(&f);
+        assert!(s.checkable && !s.checked);
     }
 }

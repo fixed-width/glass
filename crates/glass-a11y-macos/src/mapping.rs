@@ -49,6 +49,7 @@ pub struct AxStateFacts {
     pub focusable: bool,
     pub selected: bool,
     pub checked: bool,
+    pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
     pub visible: bool,
@@ -63,6 +64,7 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
         visible: f.visible,
         selected: f.selected,
         checked: f.checked,
+        checkable: f.checkable,
         expanded: f.expanded,
         editable: f.editable,
     }
@@ -122,6 +124,30 @@ mod tests {
         assert_eq!(map_role("AXRadioGroup"), AxRole::Group);
         assert_eq!(map_role("AXProgressIndicator"), AxRole::ProgressBar);
         assert_eq!(map_role("AXScrollBar"), AxRole::ScrollBar);
+    }
+
+    #[test]
+    fn checkable_fact_maps_through() {
+        let f = AxStateFacts {
+            checkable: true,
+            checked: true,
+            ..Default::default()
+        };
+        assert!(map_states(&f).checkable && map_states(&f).checked);
+        assert!(!map_states(&AxStateFacts::default()).checkable);
+    }
+
+    #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // checkable != checked — a fixture like this catches a swapped-field bug that
+        // `checkable_fact_maps_through`'s checkable+checked-together fixture cannot.
+        let f = AxStateFacts {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let s = map_states(&f);
+        assert!(s.checkable && !s.checked);
     }
 
     #[test]

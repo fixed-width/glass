@@ -416,6 +416,16 @@ fn gather_states(el: &AXUIElement) -> AxStateFacts {
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
         focusable: ffi::is_settable(el, attr::FOCUSED),
         editable: ffi::is_settable(el, attr::VALUE),
+        // Known limitation: this reader does not yet read the AX checked state (`AXValue`
+        // is 0/1/2 for a checkbox/switch/radio button), so `checkable` stays `false` here
+        // rather than being derived from role alone — a real ON checkbox would otherwise
+        // be reported `checkable` with an unread (always-false) `checked`, mis-rendering
+        // as "unchecked" and satisfying `condition:"unchecked"`. Leaving both at their
+        // default makes the `Checked`/`Unchecked` wait conditions match neither instead,
+        // mirroring the iOS reader's precedent (`crates/glass-ios/src/axmap.rs`).
+        // Follow-up: read `AXValue` to populate `checkable`+`checked` for real (needs
+        // on-device mini verification).
+        checkable: false,
         ..Default::default()
     }
 }

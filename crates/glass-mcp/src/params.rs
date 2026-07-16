@@ -243,6 +243,8 @@ pub struct WaitForElementArgs {
     pub role: Option<String>,
     /// What to wait for (default "appears"): appears|disappears|enabled|disabled|
     /// checked|unchecked|selected|unselected|expanded|collapsed|focused|visible|hidden.
+    /// `checked`/`unchecked` only match a checkable element (one exposing a real toggle
+    /// state) — a non-toggle element matches neither.
     pub condition: Option<String>,
     /// Additionally require the matched element's `value` to contain this substring.
     /// Not a standalone selector — `name` and/or `role` is still required.

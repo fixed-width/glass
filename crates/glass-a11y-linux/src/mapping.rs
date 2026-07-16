@@ -63,6 +63,7 @@ pub(crate) fn map_states(states: &StateSet) -> AxStates {
         visible: states.contains(State::Showing),
         selected: states.contains(State::Selected),
         checked: states.contains(State::Checked),
+        checkable: states.contains(State::Checkable),
         expanded: states.contains(State::Expanded),
         editable: states.contains(State::Editable),
     }
@@ -105,5 +106,23 @@ mod tests {
         let m = map_states(&StateSet::new(State::Checked | State::Editable));
         assert!(m.checked && m.editable);
         assert!(!m.focused);
+    }
+
+    #[test]
+    fn checkable_from_atspi_state() {
+        let on = StateSet::new(State::Checkable | State::Checked);
+        let m = map_states(&on);
+        assert!(m.checkable && m.checked);
+        let plain = map_states(&StateSet::empty());
+        assert!(!plain.checkable);
+    }
+
+    #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // Checkable but NOT checked — a fixture with checkable != checked catches a
+        // swapped-field bug that `checkable_from_atspi_state`'s checkable+checked-together
+        // fixture cannot.
+        let m = map_states(&StateSet::new(State::Checkable));
+        assert!(m.checkable && !m.checked);
     }
 }
