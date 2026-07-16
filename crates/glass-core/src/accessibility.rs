@@ -130,6 +130,8 @@ pub struct AxStates {
     pub visible: bool,
     pub selected: bool,
     pub checked: bool,
+    /// The element exposes a real toggle state (`checked` is only meaningful when this is true).
+    pub checkable: bool,
     pub expanded: bool,
     pub editable: bool,
 }
@@ -153,8 +155,8 @@ impl AxStates {
         if self.selected {
             v.push("selected");
         }
-        if self.checked {
-            v.push("checked");
+        if self.checkable {
+            v.push(if self.checked { "checked" } else { "unchecked" });
         }
         if self.expanded {
             v.push("expanded");
@@ -421,8 +423,8 @@ impl ElementCondition {
             Appears | Disappears => |_| true,
             Enabled => |s| s.enabled,
             Disabled => |s| !s.enabled,
-            Checked => |s| s.checked,
-            Unchecked => |s| !s.checked,
+            Checked => |s| s.checkable && s.checked,
+            Unchecked => |s| s.checkable && !s.checked,
             Selected => |s| s.selected,
             Unselected => |s| !s.selected,
             Expanded => |s| s.expanded,
@@ -704,6 +706,7 @@ mod tests {
             focusable: true,
             enabled: true,
             checked: true,
+            checkable: true,
             ..Default::default()
         };
         assert_eq!(s.active(), vec!["focusable", "enabled", "checked"]);
@@ -1031,5 +1034,55 @@ mod tests {
             ),
             ElementMatch::Pending
         ));
+    }
+
+    #[test]
+    fn checked_conditions_require_checkable() {
+        let non_toggle = AxStates {
+            checkable: false,
+            checked: false,
+            ..Default::default()
+        };
+        let off = AxStates {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let on = AxStates {
+            checkable: true,
+            checked: true,
+            ..Default::default()
+        };
+        let pred = |c: ElementCondition| c.state_pred();
+        // non-checkable matches NEITHER (the fix)
+        assert!(!(pred(ElementCondition::Unchecked))(&non_toggle));
+        assert!(!(pred(ElementCondition::Checked))(&non_toggle));
+        // real toggle matches per its checked state
+        assert!((pred(ElementCondition::Unchecked))(&off));
+        assert!(!(pred(ElementCondition::Checked))(&off));
+        assert!((pred(ElementCondition::Checked))(&on));
+        assert!(!(pred(ElementCondition::Unchecked))(&on));
+    }
+
+    #[test]
+    fn active_renders_toggle_state_only_when_checkable() {
+        let on = AxStates {
+            checkable: true,
+            checked: true,
+            ..Default::default()
+        };
+        let off = AxStates {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let plain = AxStates {
+            checkable: false,
+            checked: false,
+            ..Default::default()
+        };
+        assert!(on.active().contains(&"checked"));
+        assert!(off.active().contains(&"unchecked"));
+        assert!(!plain.active().contains(&"checked") && !plain.active().contains(&"unchecked"));
     }
 }
