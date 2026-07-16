@@ -284,6 +284,7 @@ fn walk(
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let role = mapping::map_role(&ax_role);
+    let states = mapping::map_states(&gather_states(el, &ax_role));
     // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to the
     // raw AX role string when it's absent. If both are absent (an element exposing neither)
     // `raw_role` is the empty string — a "role unknown" signal, not a guaranteed-populated
@@ -296,7 +297,6 @@ fn walk(
         .or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
-    let states = mapping::map_states(&gather_states(el));
 
     let mut children = Vec::new();
     if depth < MAX_DEPTH && *count < MAX_NODES {
@@ -407,15 +407,19 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 }
 
 /// Gather the plain state facts `mapping::map_states` normalizes: `AXEnabled`/`AXFocused`
-/// (boolean attributes) and `editable`/`focusable` (whether `AXValue`/`AXFocused` are
-/// writable). The remaining facts stay at their defaults — macOS doesn't expose them as
-/// simple universal attributes, and the reader never over-claims a state it didn't read.
-fn gather_states(el: &AXUIElement) -> AxStateFacts {
+/// (boolean attributes), `editable`/`focusable` (whether `AXValue`/`AXFocused` are
+/// writable), and `checkable` (macOS AX exposes no direct "checkable" attribute, so it's
+/// derived from the toggle role — AppKit checkboxes and switches both surface as
+/// `AXCheckBox`). The remaining facts stay at their defaults — macOS doesn't expose them
+/// as simple universal attributes, and the reader never over-claims a state it didn't
+/// read.
+fn gather_states(el: &AXUIElement, ax_role: &str) -> AxStateFacts {
     AxStateFacts {
         enabled: ffi::attribute_bool(el, attr::ENABLED).unwrap_or(false),
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
         focusable: ffi::is_settable(el, attr::FOCUSED),
         editable: ffi::is_settable(el, attr::VALUE),
+        checkable: matches!(ax_role, "AXCheckBox" | "AXRadioButton"),
         ..Default::default()
     }
 }
