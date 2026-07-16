@@ -116,4 +116,13 @@ mod tests {
         let plain = map_states(&StateSet::empty());
         assert!(!plain.checkable);
     }
+
+    #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // Checkable but NOT checked — a fixture with checkable != checked catches a
+        // swapped-field bug that `checkable_from_atspi_state`'s checkable+checked-together
+        // fixture cannot.
+        let m = map_states(&StateSet::new(State::Checkable));
+        assert!(m.checkable && !m.checked);
+    }
 }

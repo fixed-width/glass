@@ -45,7 +45,9 @@ pub fn map_role(control_type_id: u32) -> AxRole {
 
 /// Plain state facts the reader gathers from a UIA element (no `uiautomation` types here,
 /// so this stays unit-testable on Linux). `editable` is the reader's derived
-/// "text control AND not read-only"; `toggled_on` is `TogglePattern.ToggleState == On`.
+/// "text control AND not read-only"; `toggled_on` is `TogglePattern.ToggleState == On`;
+/// `checkable` is Toggle-pattern *availability* — the pattern is present on the element,
+/// independent of whether its current toggle state was actually readable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StateFacts {
     pub enabled: bool,
@@ -128,5 +130,18 @@ mod tests {
         };
         assert!(map_states(&f).checkable && map_states(&f).checked);
         assert!(!map_states(&StateFacts::default()).checkable);
+    }
+
+    #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // checkable != toggled_on — a fixture like this catches a swapped-field bug that
+        // `checkable_from_toggle_pattern_fact`'s checkable+toggled_on-together fixture cannot.
+        let f = StateFacts {
+            checkable: true,
+            toggled_on: false,
+            ..Default::default()
+        };
+        let s = map_states(&f);
+        assert!(s.checkable && !s.checked);
     }
 }

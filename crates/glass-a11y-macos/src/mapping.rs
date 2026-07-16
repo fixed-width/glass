@@ -138,6 +138,19 @@ mod tests {
     }
 
     #[test]
+    fn checkable_and_checked_are_independent_fields() {
+        // checkable != checked — a fixture like this catches a swapped-field bug that
+        // `checkable_fact_maps_through`'s checkable+checked-together fixture cannot.
+        let f = AxStateFacts {
+            checkable: true,
+            checked: false,
+            ..Default::default()
+        };
+        let s = map_states(&f);
+        assert!(s.checkable && !s.checked);
+    }
+
+    #[test]
     fn visible_and_selected_and_checked_map() {
         let f = AxStateFacts {
             visible: true,

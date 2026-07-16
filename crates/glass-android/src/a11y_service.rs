@@ -71,6 +71,9 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
             // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,
+            // Known limitation: the device `tree` JSON protocol does not yet carry
+            // `checkable`/`checked`, so both stay at their `AxStates::default()` (false)
+            // here — mirrors the iOS reader's precedent (`crates/glass-ios/src/axmap.rs`).
             ..Default::default()
         },
         bounds: Some(AxRect {

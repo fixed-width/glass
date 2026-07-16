@@ -118,7 +118,12 @@ fn map_node(node: roxmltree::Node, window: &WindowGeometry) -> AxNode {
         visible: true,
         selected: boolean("selected"),
         checked: boolean("checked"),
-        checkable: boolean("checkable"),
+        // OR in `checked`: uiautomator on a Compose toggle can under-report
+        // `checkable="false"` while `checked="true"` (see
+        // `checkable_reflects_the_uiautomator_attribute`). OR-ing keeps a `checked="true"`
+        // reading trustworthy (its `Checked` wait condition still matches) while a plain
+        // non-toggle (`checkable="false" checked="false"`) still matches neither.
+        checkable: boolean("checkable") || boolean("checked"),
         expanded: false,
         editable,
     };
@@ -248,7 +253,8 @@ mod tests {
 
     #[test]
     fn checkable_reflects_the_uiautomator_attribute() {
-        // A Switch reported NOT checkable (Compose gap) vs a real checkable Switch.
+        // A Switch reported NOT checkable (Compose gap) vs a real checkable Switch vs a
+        // Compose-ON switch that under-reports checkable="false" while checked="true".
         let xml = concat!(
             "<?xml version='1.0'?><hierarchy rotation=\"0\">",
             "<node index=\"0\" text=\"\" class=\"android.widget.Switch\" content-desc=\"NotReal\" ",
@@ -257,6 +263,9 @@ mod tests {
             "<node index=\"1\" text=\"\" class=\"android.widget.Switch\" content-desc=\"RealOn\" ",
             "enabled=\"true\" focusable=\"true\" focused=\"false\" selected=\"false\" ",
             "checkable=\"true\" checked=\"true\" password=\"false\" bounds=\"[0,60][100,110]\" />",
+            "<node index=\"2\" text=\"\" class=\"android.widget.Switch\" content-desc=\"ComposeOn\" ",
+            "enabled=\"true\" focusable=\"true\" focused=\"false\" selected=\"false\" ",
+            "checkable=\"false\" checked=\"true\" password=\"false\" bounds=\"[0,120][100,170]\" />",
             "</hierarchy>",
         );
         let w = WindowGeometry {
@@ -268,6 +277,7 @@ mod tests {
         let tree = build_tree(xml, &w).unwrap();
         let not_real = &tree.root.children[0];
         let real_on = &tree.root.children[1];
+        let compose_on = &tree.root.children[2];
         assert!(
             !not_real.states.checkable,
             "checkable=false attr must map to checkable=false"
@@ -275,6 +285,11 @@ mod tests {
         assert!(
             real_on.states.checkable && real_on.states.checked,
             "real Switch → checkable+checked"
+        );
+        assert!(
+            compose_on.states.checkable && compose_on.states.checked,
+            "checkable=false checked=true (Compose under-report) must still map to \
+             checkable=true so the Checked condition matches"
         );
     }
 }

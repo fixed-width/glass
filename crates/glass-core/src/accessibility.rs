@@ -1053,6 +1053,14 @@ mod tests {
             checked: true,
             ..Default::default()
         };
+        // The asymmetric case: a backend that (incorrectly) reports `checked:true` without
+        // `checkable:true` — this is what distinguishes the gated `s.checkable && s.checked`
+        // arm from an ungated `s.checked` arm, which would wrongly satisfy `Checked` here.
+        let checked_but_not_checkable = AxStates {
+            checkable: false,
+            checked: true,
+            ..Default::default()
+        };
         let pred = |c: ElementCondition| c.state_pred();
         // non-checkable matches NEITHER (the fix)
         assert!(!(pred(ElementCondition::Unchecked))(&non_toggle));
@@ -1062,6 +1070,14 @@ mod tests {
         assert!(!(pred(ElementCondition::Checked))(&off));
         assert!((pred(ElementCondition::Checked))(&on));
         assert!(!(pred(ElementCondition::Unchecked))(&on));
+        // checked:true with checkable:false still matches NEITHER — checked alone is not
+        // enough without checkable.
+        assert!(!(pred(ElementCondition::Checked))(
+            &checked_but_not_checkable
+        ));
+        assert!(!(pred(ElementCondition::Unchecked))(
+            &checked_but_not_checkable
+        ));
     }
 
     #[test]
@@ -1081,8 +1097,20 @@ mod tests {
             checked: false,
             ..Default::default()
         };
+        // The asymmetric case: `checked:true` without `checkable:true` — distinguishes
+        // `active()`'s `if self.checkable { push checked/unchecked }` gating from a
+        // hypothetical ungated version that renders off `self.checked` alone.
+        let checked_but_not_checkable = AxStates {
+            checkable: false,
+            checked: true,
+            ..Default::default()
+        };
         assert!(on.active().contains(&"checked"));
         assert!(off.active().contains(&"unchecked"));
         assert!(!plain.active().contains(&"checked") && !plain.active().contains(&"unchecked"));
+        assert!(
+            !checked_but_not_checkable.active().contains(&"checked")
+                && !checked_but_not_checkable.active().contains(&"unchecked")
+        );
     }
 }
