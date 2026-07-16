@@ -42,7 +42,12 @@ jobs:
             fi
             echo "release $TAG already exists as a draft (re-run) — reusing it."
           else
-            gh release create "$TAG" --draft --generate-notes --title "$TAG"
+            # A semver pre-release tag carries a hyphen (v1.0.0-rc1, v0.9.0-beta). Mark it
+            # --prerelease so GitHub never surfaces it as the repo's "Latest" release; a final
+            # tag (v1.0.0) has no hyphen and publishes as a normal release.
+            PRERELEASE=""
+            case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
+            gh release create "$TAG" --draft $PRERELEASE --generate-notes --title "$TAG"
           fi
 
   linux:
@@ -324,4 +329,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release edit "$TAG" --draft=false
+        # Reaffirm the prerelease flag at publish (idempotent) so a hyphenated tag stays a
+        # pre-release even if its draft was created before this flag existed. --latest=false on
+        # a pre-release keeps it from taking the "Latest" badge; a final tag flips both live.
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            *-*) gh release edit "$TAG" --draft=false --prerelease --latest=false ;;
+            *)   gh release edit "$TAG" --draft=false --latest ;;
+          esac
