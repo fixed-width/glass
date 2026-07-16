@@ -156,6 +156,10 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
         // is always false here (a known limitation of this backend).
         focused: false,
         editable,
+        // idb's accessibility_info exposes no checked/checkable trait, so iOS toggles
+        // are out of scope here (a known limitation of this backend); `checked` stays
+        // at its `AxStates::default()` value below alongside it.
+        checkable: false,
         ..AxStates::default()
     };
     let bounds = n.get("frame").and_then(|f| frame_to_rect(f, scale));
