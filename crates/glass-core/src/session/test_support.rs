@@ -47,6 +47,10 @@ pub(crate) struct FakePlatform {
     /// Stands in for a backend (iOS) that reports a switch's frame as the whole row — makes
     /// `a11y_toggle_control_at_trailing_edge` return true so the trailing-aim path is testable.
     a11y_trailing_toggle: bool,
+    /// When set, a `WindowOp::Geometry` read reports this geometry — models an app that resized
+    /// itself (e.g. opened a sidebar) without a `glass_window` op, so the session's cached
+    /// geometry is stale until `a11y_snapshot` refreshes it.
+    resized_to: Option<WindowGeometry>,
 }
 
 impl FakePlatform {
@@ -107,6 +111,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_trailing_toggle_backend(mut self) -> Self {
         self.a11y_trailing_toggle = true;
+        self
+    }
+    pub(crate) fn resized_to(mut self, g: WindowGeometry) -> Self {
+        self.resized_to = Some(g);
         self
     }
 }
@@ -184,7 +192,12 @@ impl Platform for FakePlatform {
                 self.geometry.x = x;
                 self.geometry.y = y;
             }
-            WindowOp::Focus | WindowOp::Geometry => {}
+            WindowOp::Focus => {}
+            WindowOp::Geometry => {
+                if let Some(g) = &self.resized_to {
+                    self.geometry = g.clone();
+                }
+            }
         }
         Ok(self.geometry.clone())
     }

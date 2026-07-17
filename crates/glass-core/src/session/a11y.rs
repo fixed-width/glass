@@ -13,8 +13,13 @@ impl Glass {
     /// `AxUnsupported` if the backend has no accessibility reader.
     pub fn a11y_snapshot(&mut self) -> Result<AxTree> {
         let s = self.active_mut()?;
+        // Re-read the current window geometry: an app can resize itself (open a sidebar / panel)
+        // without a glass_window op, leaving `s.geometry` stale so the tree — and the subsequent
+        // click_element / set_value, which clamp against `s.geometry` — would map to the old
+        // window bounds and clip elements now beyond them.
+        let window = s.platform.window(&WindowOp::Geometry)?;
+        s.geometry = window.clone();
         let pids = s.platform.app_pids();
-        let window = s.geometry.clone();
         let window_handle = s.platform.active_window_handle();
         let a11y_bus_addr = s.platform.a11y_bus_addr();
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
@@ -783,6 +788,62 @@ mod tests {
         g.click_element(AxNodeId(1)).unwrap();
         // The Button at (10,10 20x20) → center (20,20), via the normal pointer path.
         assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn a11y_snapshot_refreshes_geometry_so_click_element_uses_current_window() {
+        // #6: an app resizes itself (opens a sidebar) without a glass_window op; a11y_snapshot
+        // must re-read the current geometry, else click_element clamps against the stale (smaller)
+        // window and clips elements now beyond it. Start 230 wide, platform now reports 458; a
+        // Button at x=292 is off a stale 230 window but on-screen in the real 458 one.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let bounds = AxRect {
+            x: 292,
+            y: 241,
+            width: 48,
+            height: 48,
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "window".into(),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 458,
+                height: 408,
+            }),
+            children: vec![AxNode {
+                id: AxNodeId(0),
+                role: AxRole::Button,
+                raw_role: "button".into(),
+                name: Some("5".into()),
+                value: None,
+                states: AxStates::default(),
+                bounds: Some(bounds),
+                children: vec![],
+            }],
+        };
+        let platform = FakePlatform::new(230, 408)
+            .resized_to(WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 458,
+                height: 408,
+            })
+            .with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // must refresh s.geometry 230 → 458
+        g.click_element(AxNodeId(1)).unwrap(); // the Button at x=292 — on-screen only in 458
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            bounds.clamped_center(458, 408),
+            "click_element clamps against the refreshed 458 window, not the stale 230"
+        );
     }
 
     #[test]
