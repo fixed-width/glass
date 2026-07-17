@@ -211,6 +211,38 @@ impl Glass {
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
         }
+        // A trailing-toggle backend (iOS) has no accessibility value-set; a checkable there is
+        // driven by the same trailing-edge swipe as click_element. Set-to-target = toggle iff
+        // current != target, then verify (never a silent ok). Read the needed state and DROP the
+        // `&self` borrow before calling click_element_inner (which needs `&mut self`).
+        let (trailing, node_state) = {
+            let s = self.require_active()?;
+            (
+                s.platform.a11y_toggle_control_at_trailing_edge(),
+                s.last_ax
+                    .as_ref()
+                    .and_then(|t| t.find(id))
+                    .map(|n| (n.states.checkable, n.states.checked)),
+            )
+        };
+        if trailing {
+            if let (Some((true, checked)), Some(want)) = (node_state, parse_bool(text)) {
+                if checked == want {
+                    return Ok(()); // already in the requested state
+                }
+                self.click_element_inner(id)?; // the swipe toggle
+                self.settle_for_popup();
+                let tree = self.a11y_snapshot()?;
+                let now = find_named(&tree.root, target.name.as_deref())
+                    .map(|n| n.states.checkable && n.states.checked == want)
+                    .unwrap_or(false);
+                return if now {
+                    Ok(())
+                } else {
+                    Err(GlassError::AxValueNotApplied(id.0))
+                };
+            }
+        }
         let s = self.active_mut()?;
         s.accessibility
             .as_mut()
@@ -298,6 +330,26 @@ fn find_role(node: &AxNode, role: AxRole) -> Option<&AxNode> {
         return Some(node);
     }
     node.children.iter().find_map(|c| find_role(c, role))
+}
+
+/// Parse a `set_value` boolean for a switch/checkbox. Case-insensitive; `None` for anything else
+/// (which falls through to the backend's normal `set_value` path).
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" => Some(true),
+        "false" | "off" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// First node whose accessible name equals `name` (case-sensitive), pre-order. `None` if `name`
+/// is `None` (a nameless element cannot be re-found after a snapshot → caller reports not-applied).
+fn find_named<'a>(root: &'a AxNode, name: Option<&str>) -> Option<&'a AxNode> {
+    let name = name?;
+    if root.name.as_deref() == Some(name) {
+        return Some(root);
+    }
+    root.children.iter().find_map(|c| find_named(c, Some(name)))
 }
 
 fn rect_center(r: &crate::accessibility::AxRect) -> (i64, i64) {
@@ -1443,5 +1495,105 @@ mod tests {
             g.set_value(AxNodeId(1), "x").unwrap_err(),
             GlassError::AxElementNotEditable(1)
         ));
+    }
+
+    /// A row-shaped CheckBox "Sw" (300x30 at the origin) as the single child of a root Window —
+    /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
+    /// numbering gives the switch id 1.
+    fn sw(checked: bool) -> AxTree {
+        let switch = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::CheckBox,
+            raw_role: "switch".into(),
+            name: Some("Sw".into()),
+            value: None,
+            states: AxStates {
+                checkable: true,
+                checked,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 30,
+            }),
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            }),
+            children: vec![switch],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn set_value_true_swipes_an_unchecked_ios_switch_and_verifies() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = unchecked; snapshot #2 (verify re-read) = checked.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(true)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches unchecked
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_true_is_a_noop_when_already_checked() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y(platform, sw(true));
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "already true -> no actuation"
+        );
+    }
+
+    #[test]
+    fn set_value_errors_when_the_toggle_does_not_apply() {
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_trailing_toggle_backend();
+        // Both reads unchecked: the swipe "did not take" -> honest error, not false ok.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(false)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(1), "true").unwrap_err();
+        assert!(matches!(err, GlassError::AxValueNotApplied(_)));
+    }
+
+    #[test]
+    fn parse_bool_accepts_the_documented_spellings() {
+        for t in ["true", "on", "1", "yes", "TRUE"] {
+            assert_eq!(parse_bool(t), Some(true));
+        }
+        for f in ["false", "off", "0", "no", "OFF"] {
+            assert_eq!(parse_bool(f), Some(false));
+        }
+        assert_eq!(parse_bool("banana"), None);
     }
 }
