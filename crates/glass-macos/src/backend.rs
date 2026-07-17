@@ -547,48 +547,63 @@ impl Platform for MacosPlatform {
             .run
             .first()
             .ok_or_else(|| GlassError::AppNotStarted("empty run".into()))?;
-        if crate::bundle::is_app_bundle(run0) {
-            return self.start_bundle(spec, Path::new(run0));
-        }
-        let (mut child, clip) = process::spawn(spec, self.logs.clone())?;
-        let pid = child.id();
-        match Self::discover_window(&mut child, pid, spec.timeout_ms) {
-            Ok(m) => {
-                self.child = Some(child);
-                self.app_pid = Some(pid);
-                // Defensive: a plain exec is never an adopted session — clear any stale
-                // handoff record from a prior un-stopped session so it can't widen
-                // `stop_app`/`Drop`'s reap blast radius (symmetric with `start_bundle`'s
-                // handoff path clearing `self.child`).
-                self.adopted = None;
-                // NOTE: this seeds the active-window model (Plan 4 design decision 2): the
-                // first window discovered for the launched app becomes the implicit target
-                // of capture/input, exactly as `select_window` (a later task) will retarget
-                // it to a different window later. `resolve_active_window` (used by
-                // `capture_frame`/`send_pointer`/`send_key` below) is what actually honors
-                // this field on every call.
-                self.active_window = Some(m.window_id);
-                // Decide the session's clipboard route now that the launched window is
-                // confirmed — see `decide_clip`'s doc.
-                self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
-                self.clip = clip;
-                // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
-                // window fresh on every call instead (see its doc) since it may move/resize
-                // after this initial discovery. Only the initial geometry is returned to the
-                // caller, matching every other backend's `start_app` contract.
-                Ok(m.geometry)
+        let geometry = if crate::bundle::is_app_bundle(run0) {
+            self.start_bundle(spec, Path::new(run0))?
+        } else {
+            let (mut child, clip) = process::spawn(spec, self.logs.clone())?;
+            let pid = child.id();
+            match Self::discover_window(&mut child, pid, spec.timeout_ms) {
+                Ok(m) => {
+                    self.child = Some(child);
+                    self.app_pid = Some(pid);
+                    // Defensive: a plain exec is never an adopted session — clear any stale
+                    // handoff record from a prior un-stopped session so it can't widen
+                    // `stop_app`/`Drop`'s reap blast radius (symmetric with `start_bundle`'s
+                    // handoff path clearing `self.child`).
+                    self.adopted = None;
+                    // NOTE: this seeds the active-window model (Plan 4 design decision 2): the
+                    // first window discovered for the launched app becomes the implicit target
+                    // of capture/input, exactly as `select_window` (a later task) will retarget
+                    // it to a different window later. `resolve_active_window` (used by
+                    // `capture_frame`/`send_pointer`/`send_key` below) is what actually honors
+                    // this field on every call.
+                    self.active_window = Some(m.window_id);
+                    // Decide the session's clipboard route now that the launched window is
+                    // confirmed — see `decide_clip`'s doc.
+                    self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
+                    self.clip = clip;
+                    // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
+                    // window fresh on every call instead (see its doc) since it may move/resize
+                    // after this initial discovery. Only the initial geometry is returned to the
+                    // caller, matching every other backend's `start_app` contract.
+                    m.geometry
+                }
+                Err(e) => {
+                    // The window never appeared (or discovery otherwise failed): don't leak
+                    // the spawned child.
+                    process::terminate(&mut child);
+                    // Nor the named pasteboards the shim may already have created — the app (and
+                    // its ctor) ran before discovery. `self.clip` is never set on this path, so
+                    // `stop_app` wouldn't release them; do it here (`release_clip`'s doc).
+                    release_clip(clip.as_ref());
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                // The window never appeared (or discovery otherwise failed): don't leak
-                // the spawned child.
-                process::terminate(&mut child);
-                // Nor the named pasteboards the shim may already have created — the app (and
-                // its ctor) ran before discovery. `self.clip` is never set on this path, so
-                // `stop_app` wouldn't release them; do it here (`release_clip`'s doc).
-                release_clip(clip.as_ref());
-                Err(e)
+        };
+        // Bring the launched app frontmost so its windows register with the AX API — otherwise
+        // `glass_a11y_snapshot` `WindowNotFound`s until the first input activates it. Best-effort:
+        // capture and the activate-on-first-input path both still work, so a declined activation
+        // (the OS can deprioritize a launch — see `input::focus`) is logged, never fatal. This is
+        // the same activation the first `glass_click`/`glass_type` already makes, only earlier.
+        if let Some(pid) = self.app_pid {
+            if let Err(e) = crate::input::focus(pid as i32) {
+                eprintln!(
+                    "glass-macos: could not activate launched app (pid {pid}): {e}; \
+                     a11y may need a glass_click to raise the window"
+                );
             }
         }
+        Ok(geometry)
     }
 
     /// Terminate the launched app (however it was launched) and clear the active pid/window.
