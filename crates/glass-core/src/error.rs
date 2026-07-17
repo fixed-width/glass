@@ -15,7 +15,9 @@ pub enum GlassError {
     #[error("app exited (code {0:?})")]
     AppExited(Option<i32>),
 
-    #[error("window not found")]
+    #[error(
+        "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
+    )]
     WindowNotFound,
 
     #[error("capture failed: {0}")]
@@ -146,6 +148,10 @@ mod tests {
         assert_eq!(
             GlassError::BaselineMissing("main".into()).to_string(),
             "baseline not found: main"
+        );
+        assert_eq!(
+            GlassError::WindowNotFound.to_string(),
+            "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
         );
     }
 
