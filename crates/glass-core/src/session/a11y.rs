@@ -3,13 +3,20 @@ use super::*;
 
 /// A checkable element wider than this multiple of its height is treated as "row-shaped". On a
 /// backend that frames a switch as its whole row (`Platform::a11y_toggle_control_at_trailing_edge`),
-/// `click_element` aims a row-shaped checkable's tap at the trailing control instead of the row
+/// `click_element` swipes a row-shaped checkable's trailing control instead of clicking the row
 /// center.
 const ROW_ASPECT: u32 = 4;
 
 /// Duration of the trailing-toggle swipe (ms) — long enough for idb's HID swipe to register as a
 /// pan on a UISwitch; matches the proven ~250ms on-device swipe.
 const TOGGLE_SWIPE_MS: u64 = 250;
+
+/// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
+/// the swiped switch to read back the wanted state.
+const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
+/// Bound on the post-toggle verify poll — generous enough to absorb a lagging a11y-tree update
+/// under load without turning a real actuation failure into an indefinite hang.
+const TOGGLE_VERIFY_TIMEOUT_MS: u64 = 2000;
 
 impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
@@ -138,14 +145,14 @@ impl Glass {
             && trailing_toggle_backend
             && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
         if row_shaped_toggle {
-            let (from, to) = bounds
+            let seg = bounds
                 .trailing_toggle_swipe(active_geo.width, active_geo.height)
                 .ok_or(GlassError::AxElementNotClickable(id.0))?;
             self.pointer_inner(&PointerEvent::Drag {
-                from_x: from.0,
-                from_y: from.1,
-                to_x: to.0,
-                to_y: to.1,
+                from_x: seg.from_x,
+                from_y: seg.from_y,
+                to_x: seg.to_x,
+                to_y: seg.to_y,
                 duration_ms: TOGGLE_SWIPE_MS,
                 button: MouseButton::Left,
                 modifiers: vec![],
@@ -211,10 +218,14 @@ impl Glass {
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
         }
-        // A trailing-toggle backend (iOS) has no accessibility value-set; a checkable there is
-        // driven by the same trailing-edge swipe as click_element. Set-to-target = toggle iff
-        // current != target, then verify (never a silent ok). Read the needed state and DROP the
-        // `&self` borrow before calling click_element_inner (which needs `&mut self`).
+        // iOS's value-set (tap+type) doesn't apply to a checkable — a tap doesn't toggle a
+        // UISwitch and there's no text to type — so a checkable is driven by the trailing-edge
+        // swipe instead. Set-to-target = toggle iff current != target, then verify by a bounded
+        // poll (never a silent ok). Gated on `checkable` alone (NOT row-shape): a checkable
+        // switch that isn't row-shaped on a trailing backend must still fail-safe through this
+        // branch (parse/verify → error) rather than fall through to the delegate below, which
+        // would silently tap the inert label and type into nothing. Read the needed state and
+        // DROP the `&self` borrow before calling click_element_inner (which needs `&mut self`).
         let (trailing, node_state) = {
             let s = self.require_active()?;
             (
@@ -222,25 +233,36 @@ impl Glass {
                 s.last_ax
                     .as_ref()
                     .and_then(|t| t.find(id))
-                    .map(|n| (n.states.checkable, n.states.checked)),
+                    .map(|n| n.states),
             )
         };
         if trailing {
-            if let (Some((true, checked)), Some(want)) = (node_state, parse_bool(text)) {
-                if checked == want {
-                    return Ok(()); // already in the requested state
+            if let Some(st) = node_state {
+                if st.checkable {
+                    // A checkable switch expects a boolean; unrecognized text must NOT fall
+                    // through to the tap+type delegate (which would silently no-op a UISwitch).
+                    // Erroring here preserves the "never a silent ok" invariant.
+                    let want = parse_bool(text).ok_or(GlassError::AxValueNotApplied(id.0))?;
+                    if st.checked == want {
+                        return Ok(()); // truthful no-op, no actuation
+                    }
+                    self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+                    let outcome = crate::poll::poll_until(
+                        TOGGLE_VERIFY_INTERVAL_MS,
+                        TOGGLE_VERIFY_TIMEOUT_MS,
+                        || {
+                            let tree = self.a11y_snapshot()?;
+                            let now = find_checkable_near(&tree.root, target.bounds.as_ref())
+                                .is_some_and(|n| n.states.checked == want);
+                            Ok(now.then_some(()))
+                        },
+                    )?;
+                    return if outcome.value.is_some() {
+                        Ok(())
+                    } else {
+                        Err(GlassError::AxValueNotApplied(id.0))
+                    };
                 }
-                self.click_element_inner(id)?; // the swipe toggle
-                self.settle_for_popup();
-                let tree = self.a11y_snapshot()?;
-                let now = find_checkable_near(&tree.root, target.bounds.as_ref())
-                    .map(|n| n.states.checked == want)
-                    .unwrap_or(false);
-                return if now {
-                    Ok(())
-                } else {
-                    Err(GlassError::AxValueNotApplied(id.0))
-                };
             }
         }
         let s = self.active_mut()?;
@@ -1119,10 +1141,15 @@ mod tests {
                     from_y,
                     to_x,
                     to_y,
+                    duration_ms,
                     ..
                 } => {
-                    assert_eq!((from_x, from_y), expected.0);
-                    assert_eq!((to_x, to_y), expected.1);
+                    assert_eq!((from_x, from_y), (expected.from_x, expected.from_y));
+                    assert_eq!((to_x, to_y), (expected.to_x, expected.to_y));
+                    assert_eq!(
+                        duration_ms, TOGGLE_SWIPE_MS,
+                        "a too-short duration would make idb treat this as a tap, not a swipe"
+                    );
                 }
                 ref e => panic!("expected a Drag, got {e:?}"),
             }
@@ -1609,6 +1636,45 @@ mod tests {
         assert!(matches!(err, GlassError::AxValueNotApplied(_)));
     }
 
+    #[test]
+    fn set_value_false_swipes_a_checked_ios_switch_and_verifies() {
+        // The mirror of `set_value_true_swipes_an_unchecked_ios_switch_and_verifies` — proves
+        // the toggle path handles a checked -> unchecked transition too, not just off -> on.
+        // The fixed swipe is a TOGGLE gesture (proven on-device: identical swipes alternate
+        // off/on/off/on — see `AxRect::trailing_toggle_swipe`), so the same swipe that turns a
+        // switch on also turns it off; there is no direction logic to exercise separately.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = checked; snapshot #2 (verify re-read) = unchecked.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(true), sw(false)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches checked
+
+        g.set_value(AxNodeId(1), "false").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_false_is_a_noop_when_already_unchecked() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y(platform, sw(false));
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "false").unwrap();
+
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "already false -> no actuation"
+        );
+    }
+
     /// Two same-named ("Sw") row-shaped switches at DIFFERENT bounds — a `sibling` listed
     /// before the `target` (so a naive first-match-by-name search hits the sibling first,
     /// the exact silent-success risk `find_checkable_near` exists to rule out), and a
@@ -1704,10 +1770,14 @@ mod tests {
     #[test]
     fn set_value_on_a_non_checkable_element_ignores_the_trailing_toggle_gate() {
         // The iOS toggle gate (`set_value_inner`'s trailing-toggle branch) must only intercept
-        // CHECKABLE elements. A non-checkable element (e.g. a plain button) on a
-        // trailing-toggle backend must fall straight through to the normal accessibility
-        // `set_value` delegate path, unchanged — no swipe/drag is ever emitted, and the
-        // backend's `set_value` is the one that actually runs.
+        // CHECKABLE elements — `checkable` is the discriminator, not "did the text parse as a
+        // bool". Uses a BOOLEAN value ("true") deliberately: with non-bool text, a dropped
+        // `checkable` guard is invisible (both arms fall through to the delegate the same way),
+        // so this must exercise the boolean path to actually catch a removed guard. A boolean
+        // value on a non-checkable element (e.g. a plain button) must still fall straight
+        // through to the normal accessibility `set_value` delegate path, unchanged — no
+        // swipe/drag is ever emitted, and the backend's `set_value` is the one that actually
+        // runs.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let dir = tempfile::tempdir().unwrap();
@@ -1734,7 +1804,7 @@ mod tests {
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
 
-        g.set_value(AxNodeId(1), "hello").unwrap();
+        g.set_value(AxNodeId(1), "true").unwrap();
 
         let calls = log.lock().unwrap();
         assert_eq!(
@@ -1742,10 +1812,55 @@ mod tests {
             1,
             "the delegate accessibility set_value path was taken"
         );
-        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].1, "true");
         assert!(
             drags.lock().unwrap().is_empty(),
             "a non-checkable element must never trigger the toggle swipe"
+        );
+    }
+
+    #[test]
+    fn set_value_on_a_checkable_rejects_non_boolean_text() {
+        // FIX 1's core invariant: a non-boolean value on a checkable+trailing target must ERROR,
+        // never fall through to the tap+type delegate (which would tap the inert label, type
+        // into nothing, and still report Ok — the exact silent success this branch exists to
+        // kill). No actuation (no swipe) and no delegate call either.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let log2 = log.clone();
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(
+                FakePlatform::new(400, 400)
+                    .with_drag_log(drags.clone())
+                    .with_trailing_toggle_backend(),
+            ),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: sw(false), // #1 is the checkable switch "Sw"
+                set_log: log2,
+                set_fail: false,
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(1), "banana").unwrap_err();
+
+        assert!(matches!(err, GlassError::AxValueNotApplied(1)), "{err}");
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "an unparseable value must never trigger the toggle swipe"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "an unparseable value must never fall through to the tap+type delegate"
         );
     }
 

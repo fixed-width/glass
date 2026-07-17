@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 
 use crate::error::Result;
-use crate::platform::WindowGeometry;
+use crate::platform::{Segment, WindowGeometry};
 
 /// Normalized accessibility role — the union of the AT-SPI / AX / UIA
 /// vocabularies. A backend maps its native role in; anything unmapped becomes
@@ -227,22 +227,29 @@ impl AxRect {
     /// element — the gesture that toggles a control (e.g. an iOS `UISwitch`) which does NOT actuate
     /// on a tap. Anchored at the same trailing point as [`Self::clamped_trailing_point`]; the span is
     /// ~1.5×the control height (`inset`), matching the proven idb swipe. `None` for an off-screen rect,
-    /// exactly like [`Self::clamped_center`]. The segment lies entirely in the trailing (right) region,
-    /// so it never begins in the left-edge back-swipe zone.
-    pub fn trailing_toggle_swipe(
-        &self,
-        win_w: u32,
-        win_h: u32,
-    ) -> Option<((i32, i32), (i32, i32))> {
+    /// exactly like [`Self::clamped_center`]. For a genuinely row-shaped input — the shape the
+    /// caller gates on (see `ROW_ASPECT` in `session::a11y`) — the segment lies entirely in the
+    /// trailing (right) region, clear of the left-edge back-swipe zone; that is an emergent
+    /// property of row-shaped bounds, not a guarantee this method makes for arbitrary input.
+    ///
+    /// Always left-to-right, never direction-aware — deliberately: on-device testing showed three
+    /// IDENTICAL left-to-right swipes alternate a `UISwitch` unchecked -> checked -> unchecked ->
+    /// checked. A short swipe here registers as a TOGGLE gesture, not a directional drag-to-value,
+    /// so there is no "swipe right to turn on" physics to encode — direction is irrelevant to the
+    /// outcome. Do not "fix" this into direction-dependent logic.
+    pub fn trailing_toggle_swipe(&self, win_w: u32, win_h: u32) -> Option<Segment> {
         let (left, top, right, bottom) = self.visible_intersection(win_w, win_h)?;
-        let cy = (top + bottom) / 2;
+        let (anchor_x, anchor_y) = self.clamped_trailing_point(win_w, win_h)?;
         let inset = bottom - top; // control ~this far from the trailing edge and ~this tall
-        let center_x = (left + right) / 2;
-        let anchor_x = (right - inset).max(center_x); // == clamped_trailing_point().x
-        let half = (inset * 3 / 4).max(1); // span 1.5*inset; matches the proven px-945->1074 swipe on inset 84; floor of 1 keeps a thin control's swipe non-zero-length
+        let half = (inset * 3 / 4).max(1); // span 1.5*inset; matches the proven ~951->1077 px swipe on inset 84; floor of 1 keeps a thin control's swipe non-zero-length
         let from_x = (anchor_x - half).max(left);
         let to_x = (anchor_x + half).min(right);
-        Some(((from_x, cy), (to_x, cy)))
+        Some(Segment {
+            from_x,
+            from_y: anchor_y,
+            to_x,
+            to_y: anchor_y,
+        })
     }
 }
 
@@ -795,19 +802,19 @@ mod tests {
             width: 990,
             height: 84,
         };
-        let ((fx, fy), (tx, ty)) = r.trailing_toggle_swipe(1206, 2622).expect("has a segment");
+        let seg = r.trailing_toggle_swipe(1206, 2622).expect("has a segment");
         // Anchor == clamped_trailing_point.x; swipe is centered on it, span = 1.5*inset(84) = 126.
         let (anchor_x, anchor_y) = r.clamped_trailing_point(1206, 2622).unwrap();
-        assert_eq!(fy, anchor_y);
+        assert_eq!(seg.from_y, anchor_y);
         assert_eq!(
-            ty, anchor_y,
+            seg.to_y, anchor_y,
             "horizontal swipe stays at the control's vertical center"
         );
-        assert!(fx < tx, "real left-to-right movement");
-        assert_eq!(fx, anchor_x - 63);
-        assert_eq!(tx, anchor_x + 63);
+        assert!(seg.from_x < seg.to_x, "real left-to-right movement");
+        assert_eq!(seg.from_x, anchor_x - 63);
+        assert_eq!(seg.to_x, anchor_x + 63);
         // Entirely in the right half — structurally clear of the left-edge back-swipe zone.
-        assert!(fx > (r.x + r.x + r.width as i32) / 2);
+        assert!(seg.from_x > (r.x + r.x + r.width as i32) / 2);
     }
 
     #[test]
@@ -822,10 +829,10 @@ mod tests {
             width: 20,
             height: 40,
         };
-        let ((fx, _), (tx, _)) = r.trailing_toggle_swipe(400, 400).unwrap();
-        assert_eq!(fx, 0, "from clamps to the left edge");
-        assert_eq!(tx, 20, "to clamps to the right edge");
-        assert!(fx < tx, "still a real left-to-right movement");
+        let seg = r.trailing_toggle_swipe(400, 400).unwrap();
+        assert_eq!(seg.from_x, 0, "from clamps to the left edge");
+        assert_eq!(seg.to_x, 20, "to clamps to the right edge");
+        assert!(seg.from_x < seg.to_x, "still a real left-to-right movement");
     }
 
     #[test]
@@ -837,9 +844,9 @@ mod tests {
             width: 100,
             height: 1,
         };
-        let ((fx, _), (tx, _)) = r.trailing_toggle_swipe(400, 400).unwrap();
+        let seg = r.trailing_toggle_swipe(400, 400).unwrap();
         assert!(
-            fx < tx,
+            seg.from_x < seg.to_x,
             "even a 1px-tall control yields a real swipe, not a zero-length tap"
         );
     }
