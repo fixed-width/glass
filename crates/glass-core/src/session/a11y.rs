@@ -233,8 +233,8 @@ impl Glass {
                 self.click_element_inner(id)?; // the swipe toggle
                 self.settle_for_popup();
                 let tree = self.a11y_snapshot()?;
-                let now = find_named(&tree.root, target.name.as_deref())
-                    .map(|n| n.states.checkable && n.states.checked == want)
+                let now = find_checkable_near(&tree.root, target.bounds.as_ref())
+                    .map(|n| n.states.checked == want)
                     .unwrap_or(false);
                 return if now {
                     Ok(())
@@ -342,16 +342,6 @@ fn parse_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// First node whose accessible name equals `name` (case-sensitive), pre-order. `None` if `name`
-/// is `None` (a nameless element cannot be re-found after a snapshot → caller reports not-applied).
-fn find_named<'a>(root: &'a AxNode, name: Option<&str>) -> Option<&'a AxNode> {
-    let name = name?;
-    if root.name.as_deref() == Some(name) {
-        return Some(root);
-    }
-    root.children.iter().find_map(|c| find_named(c, Some(name)))
-}
-
 fn rect_center(r: &crate::accessibility::AxRect) -> (i64, i64) {
     (
         r.x as i64 + r.width as i64 / 2,
@@ -388,6 +378,39 @@ fn find_combo_near<'a>(
     walk(root, tx, ty, &mut best);
     best.map(|(n, _)| n)
         .or_else(|| find_role(root, AxRole::ComboBox))
+}
+
+/// The CHECKABLE node nearest `bounds` — disambiguates same-named checkable siblings (e.g. two
+/// generic `UISwitch` rows) when re-locating a toggled switch after a re-snapshot, since ids
+/// don't survive it either. Matching by name alone risks latching onto a same-named sibling
+/// that already happens to sit in the wanted state, turning a no-op sibling into a false `Ok`
+/// for the element that was actually supposed to move — bounds are the disambiguator instead,
+/// same as `find_combo_near` uses for combos. Unlike `find_combo_near`, there is no
+/// single-element fallback when `bounds` is `None`: a toggle verify with no captured bounds
+/// must error rather than risk matching the wrong same-named node.
+fn find_checkable_near<'a>(
+    root: &'a AxNode,
+    bounds: Option<&crate::accessibility::AxRect>,
+) -> Option<&'a AxNode> {
+    let t = bounds?;
+    let (tx, ty) = rect_center(t);
+    fn walk<'a>(node: &'a AxNode, tx: i64, ty: i64, best: &mut Option<(&'a AxNode, i64)>) {
+        if node.states.checkable {
+            if let Some(b) = &node.bounds {
+                let (cx, cy) = rect_center(b);
+                let d = (cx - tx).pow(2) + (cy - ty).pow(2);
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    *best = Some((node, d));
+                }
+            }
+        }
+        for c in &node.children {
+            walk(c, tx, ty, best);
+        }
+    }
+    let mut best = None;
+    walk(root, tx, ty, &mut best);
+    best.map(|(n, _)| n)
 }
 
 /// The open (expanded) ComboBox, if any — disambiguates the one whose popup is up.
@@ -1584,6 +1607,146 @@ mod tests {
 
         let err = g.set_value(AxNodeId(1), "true").unwrap_err();
         assert!(matches!(err, GlassError::AxValueNotApplied(_)));
+    }
+
+    /// Two same-named ("Sw") row-shaped switches at DIFFERENT bounds — a `sibling` listed
+    /// before the `target` (so a naive first-match-by-name search hits the sibling first,
+    /// the exact silent-success risk `find_checkable_near` exists to rule out), and a
+    /// `target` at the bounds `set_value` actually addresses. Pre-order id assignment gives
+    /// the sibling id 1 and the target id 2. Shared by the disambiguation tests below.
+    fn two_switches(sibling_checked: bool, target_checked: bool) -> AxTree {
+        let make = |checked: bool, y: i32| AxNode {
+            id: AxNodeId(0),
+            role: AxRole::CheckBox,
+            raw_role: "switch".into(),
+            name: Some("Sw".into()),
+            value: None,
+            states: AxStates {
+                checkable: true,
+                checked,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y,
+                width: 300,
+                height: 30,
+            }),
+            children: vec![],
+        };
+        let sibling = make(sibling_checked, 0);
+        let target = make(target_checked, 200);
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            }),
+            children: vec![sibling, target],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn set_value_true_verifies_the_target_by_bounds_when_a_same_named_sibling_is_already_checked() {
+        // The sibling "Sw" is already checked (the wanted state) throughout; only the TARGET
+        // flips false -> true on the verify re-snapshot. A name-only verify (the old,
+        // pre-order-first `find_named`) would match the sibling — listed first — and return Ok
+        // regardless of whether the target itself ever moved. The bounds-nearest verify must
+        // instead confirm THIS node (the target, at its own captured bounds) reached the
+        // wanted state.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y_seq(
+            platform,
+            vec![two_switches(true, false), two_switches(true, true)],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches: sibling already checked, target unchecked
+
+        // Target is id 2 (sibling listed first gets id 1; see `two_switches`).
+        g.set_value(AxNodeId(2), "true").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_true_errors_when_only_a_same_named_sibling_is_checked() {
+        // Same same-named-sibling setup, but this time the swipe "does not take": the target
+        // stays unchecked on the verify re-snapshot while the sibling remains (coincidentally)
+        // already checked. A name-only verify would match the sibling first and return a false
+        // Ok — exactly the silent-success bug this fixture guards against. The bounds-nearest
+        // verify must instead see the ACTUAL target still unchecked and report
+        // `AxValueNotApplied`, proving a same-name collision can never fake a false ok.
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y_seq(
+            platform,
+            vec![two_switches(true, false), two_switches(true, false)],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(2), "true").unwrap_err();
+        assert!(matches!(err, GlassError::AxValueNotApplied(2)));
+    }
+
+    #[test]
+    fn set_value_on_a_non_checkable_element_ignores_the_trailing_toggle_gate() {
+        // The iOS toggle gate (`set_value_inner`'s trailing-toggle branch) must only intercept
+        // CHECKABLE elements. A non-checkable element (e.g. a plain button) on a
+        // trailing-toggle backend must fall straight through to the normal accessibility
+        // `set_value` delegate path, unchanged — no swipe/drag is ever emitted, and the
+        // backend's `set_value` is the one that actually runs.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let log2 = log.clone();
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(
+                FakePlatform::new(100, 100)
+                    .with_drag_log(drags.clone())
+                    .with_trailing_toggle_backend(),
+            ),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: fake_tree(), // #1 is a non-checkable Button "Save"
+                set_log: log2,
+                set_fail: false,
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "hello").unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the delegate accessibility set_value path was taken"
+        );
+        assert_eq!(calls[0].1, "hello");
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "a non-checkable element must never trigger the toggle swipe"
+        );
     }
 
     #[test]
