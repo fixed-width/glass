@@ -27,6 +27,11 @@ internal refactors, CI, or test-only changes.
   accessibility tree (via its `RangeValuePattern` position), so `glass_wait_for_element
   {value_contains}` can match a range control's number; previously these controls exposed no value.
   The value is the control's raw numeric position (a `0..1` slider shown as "50%" reads as `0.5`).
+- **Android: the on-device accessibility companion now reports toggle state.** A checkbox / switch /
+  toggle read via the high-fidelity `AccessibilityService` companion now carries its
+  `checkable`/`checked` state (the baseline `uiautomator` reader already did), so
+  `glass_wait_for_element {condition: "checked"}` works against Android toggles through the companion
+  path too.
 
 ### Fixed
 - **`glass_click_element` now reliably toggles an iOS switch.** iOS reports a switch's frame as its
