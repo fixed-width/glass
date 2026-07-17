@@ -360,7 +360,8 @@ impl GlassServer {
                        into that popover window and the previously-active window is restored \
                        afterward. Ids are only valid within the latest snapshot — re-run \
                        glass_a11y_snapshot if the UI changed. Optional `return`: \"snapshot\" \
-                       folds a fresh a11y tree into the result (and refreshes the snapshot \
+                       settles the UI then folds a fresh a11y tree into the result (and \
+                       refreshes the snapshot \
                        cache); \"settle\" waits for the UI to stop changing (text-only); omit or \
                        \"none\" for no observe (default)."
     )]
@@ -376,8 +377,9 @@ impl GlassServer {
                        keystrokes) — pick the element's #id from glass_a11y_snapshot. Errors if the \
                        element isn't editable, if it changed since the snapshot (re-snapshot), or if \
                        the app exposes no accessibility tree. \
-                       Optional `return`: \"snapshot\" folds a fresh a11y tree into the result \
-                       (and refreshes the snapshot cache); \"settle\" waits for the UI to stop \
+                       Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
+                       tree into the result (and refreshes the snapshot cache); \"settle\" waits \
+                       for the UI to stop \
                        changing (text-only); omit or \"none\" for no observe (default)."
     )]
     async fn glass_set_value(
