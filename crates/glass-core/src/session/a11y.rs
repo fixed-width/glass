@@ -1,6 +1,11 @@
 //! `Glass` accessibility ops: snapshot, marks, click, and set-value.
 use super::*;
 
+/// A checkable element wider than this multiple of its height is treated as "row-shaped" — a
+/// backend (iOS/idb) reporting the whole table row as a switch's frame — so `click_element`
+/// aims at the trailing control instead of the row center.
+const ROW_ASPECT: u32 = 4;
+
 impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
     /// relative, ids assigned by the core). Caches it for `click_element`.
@@ -33,8 +38,9 @@ impl Glass {
         Ok(crate::marks::render(&frame, &tree))
     }
 
-    /// Click the element with id `id` from the most recent `a11y_snapshot`
-    /// (clicks the center of its bounds, via the normal pointer path).
+    /// Click the element with id `id` from the most recent `a11y_snapshot` via the normal
+    /// pointer path — the center of its bounds, or the trailing control for a row-shaped
+    /// checkable (see [`AxRect::clamped_trailing_point`]).
     pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
@@ -48,12 +54,12 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
-        let (bounds, active_geo) = {
+        let (bounds, checkable, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let bounds = node.bounds.ok_or(GlassError::AxElementNotClickable(id.0))?;
-            (bounds, s.geometry.clone())
+            (bounds, node.states.checkable, s.geometry.clone())
         };
         // The element's a11y bounds are reported relative to the active window, but it
         // may actually render in a separate popover window (e.g. an open dropdown's
@@ -94,9 +100,16 @@ impl Glass {
             }
             return result;
         }
-        let (x, y) = bounds
-            .clamped_center(active_geo.width, active_geo.height)
-            .ok_or(GlassError::AxElementNotClickable(id.0))?;
+        // A row-shaped checkable (a switch whose backend reports the whole row as its frame,
+        // e.g. iOS/idb) has its control at the trailing edge, so the geometric center lands on
+        // the label. Aim trailing there; every backend whose switch bounds are the tight control
+        // is not row-shaped and uses the unchanged center.
+        let (x, y) = if checkable && bounds.width > bounds.height.saturating_mul(ROW_ASPECT) {
+            bounds.clamped_trailing_point(active_geo.width, active_geo.height)
+        } else {
+            bounds.clamped_center(active_geo.width, active_geo.height)
+        }
+        .ok_or(GlassError::AxElementNotClickable(id.0))?;
         self.pointer_inner(&PointerEvent::Click {
             x,
             y,
@@ -861,6 +874,69 @@ mod tests {
         assert!(
             select_log.lock().unwrap().is_empty(),
             "no popover routing means no select_window call"
+        );
+    }
+
+    #[test]
+    fn click_element_taps_trailing_edge_for_a_row_shaped_checkable() {
+        // A checkable node whose bounds are row-shaped (w > 4h) — a backend (iOS/idb) that
+        // reports the whole cell as a switch's frame. The click must land near the trailing
+        // control (right of center); a non-checkable node of the SAME bounds still clicks center.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let bounds = AxRect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 15,
+        }; // 80 > 4 * 15 ⇒ row-shaped
+        let leaf = |role: AxRole, name: &str, checkable: bool| AxNode {
+            id: AxNodeId(0),
+            role,
+            raw_role: name.into(),
+            name: Some(name.into()),
+            value: None,
+            states: AxStates {
+                checkable,
+                ..Default::default()
+            },
+            bounds: Some(bounds),
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "window".into(),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            children: vec![
+                leaf(AxRole::CheckBox, "switch", true),
+                leaf(AxRole::ListItem, "row", false),
+            ],
+        };
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        // node #1 = the row-shaped checkable → trailing point (right of center).
+        g.click_element(AxNodeId(1)).unwrap();
+        let trailing = bounds.clamped_trailing_point(100, 100).unwrap();
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some(trailing));
+        assert!(trailing.0 > bounds.clamped_center(100, 100).unwrap().0);
+
+        // node #2 = the non-checkable row of identical bounds → geometric center (gate needs
+        // checkable, so a plain wide list row is unaffected).
+        g.click_element(AxNodeId(2)).unwrap();
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            bounds.clamped_center(100, 100)
         );
     }
 
