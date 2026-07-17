@@ -241,8 +241,11 @@ impl Glass {
                 if st.checkable {
                     // A checkable switch expects a boolean; unrecognized text must NOT fall
                     // through to the tap+type delegate (which would silently no-op a UISwitch).
-                    // Erroring here preserves the "never a silent ok" invariant.
-                    let want = parse_bool(text).ok_or(GlassError::AxValueNotApplied(id.0))?;
+                    // Erroring here preserves the "never a silent ok" invariant — and the error
+                    // must tell the agent to pass a boolean, not misdirect it (a generic
+                    // "value not applied — use keystrokes" would send it down a futile path).
+                    let want = parse_bool(text)
+                        .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
                     if st.checked == want {
                         return Ok(()); // truthful no-op, no actuation
                     }
@@ -1853,7 +1856,18 @@ mod tests {
 
         let err = g.set_value(AxNodeId(1), "banana").unwrap_err();
 
-        assert!(matches!(err, GlassError::AxValueNotApplied(1)), "{err}");
+        // The error must be the switch-specific "expects a boolean" one, and its message must
+        // actually guide the agent (name the accepted values + echo the bad input) — NOT a generic
+        // "value not applied — use keystrokes", which would send the agent down a futile path.
+        assert!(
+            matches!(err, GlassError::AxValueNotBoolean(1, ref got) if got == "banana"),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("true/false") && msg.contains("banana"),
+            "error must tell the agent to pass a boolean, not misdirect it: {msg}"
+        );
         assert!(
             drags.lock().unwrap().is_empty(),
             "an unparseable value must never trigger the toggle swipe"
