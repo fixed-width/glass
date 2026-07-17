@@ -7,6 +7,10 @@ use super::*;
 /// center.
 const ROW_ASPECT: u32 = 4;
 
+/// Duration of the trailing-toggle swipe (ms) — long enough for idb's HID swipe to register as a
+/// pan on a UISwitch; matches the proven ~250ms on-device swipe.
+const TOGGLE_SWIPE_MS: u64 = 250;
+
 impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
     /// relative, ids assigned by the core). Caches it for `click_element`.
@@ -55,8 +59,8 @@ impl Glass {
     }
 
     /// Click the element with id `id` from the most recent `a11y_snapshot` via the normal
-    /// pointer path — the center of its bounds, or the trailing control for a row-shaped
-    /// checkable (see [`AxRect::clamped_trailing_point`]).
+    /// pointer path — the center of its bounds, or a swipe across the trailing control for a
+    /// row-shaped checkable on a trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]).
     pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
@@ -123,28 +127,41 @@ impl Glass {
         }
         // A switch whose backend reports the whole row as its frame with the control at the
         // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
-        // label. For such a backend, aim a row-shaped checkable's tap at the trailing control.
-        // Gated on the backend capability, NOT geometry alone: a wide *labeled* checkbox on a
-        // desktop backend is also row-shaped but has its indicator at the LEADING edge, so the
-        // trailing-aim must not apply there. The row-shape test uses the raw-bounds aspect as a
-        // cheap pre-filter; `clamped_trailing_point` derives its inset from the clamped visible
-        // height.
-        let (x, y) = if checkable
+        // label, and even aimed at the control a `UISwitch` does NOT actuate on a tap: it needs a
+        // short swipe (see `AxRect::trailing_toggle_swipe`). For such a backend, swipe a
+        // row-shaped checkable's trailing control instead of clicking it. Gated on the backend
+        // capability, NOT geometry alone: a wide *labeled* checkbox on a desktop backend is also
+        // row-shaped but has its indicator at the LEADING edge, so the trailing-aim must not
+        // apply there. The row-shape test uses the raw-bounds aspect as a cheap pre-filter;
+        // `trailing_toggle_swipe` derives its inset from the clamped visible height.
+        let row_shaped_toggle = checkable
             && trailing_toggle_backend
-            && bounds.width > bounds.height.saturating_mul(ROW_ASPECT)
-        {
-            bounds.clamped_trailing_point(active_geo.width, active_geo.height)
+            && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
+        if row_shaped_toggle {
+            let (from, to) = bounds
+                .trailing_toggle_swipe(active_geo.width, active_geo.height)
+                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            self.pointer_inner(&PointerEvent::Drag {
+                from_x: from.0,
+                from_y: from.1,
+                to_x: to.0,
+                to_y: to.1,
+                duration_ms: TOGGLE_SWIPE_MS,
+                button: MouseButton::Left,
+                modifiers: vec![],
+            })
         } else {
-            bounds.clamped_center(active_geo.width, active_geo.height)
+            let (x, y) = bounds
+                .clamped_center(active_geo.width, active_geo.height)
+                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            self.pointer_inner(&PointerEvent::Click {
+                x,
+                y,
+                button: MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            })
         }
-        .ok_or(GlassError::AxElementNotClickable(id.0))?;
-        self.pointer_inner(&PointerEvent::Click {
-            x,
-            y,
-            button: MouseButton::Left,
-            count: 1,
-            modifiers: vec![],
-        })
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -962,11 +979,13 @@ mod tests {
     }
 
     #[test]
-    fn click_element_taps_trailing_edge_for_a_row_shaped_checkable() {
+    fn click_element_swipes_the_trailing_control_for_a_row_shaped_checkable() {
         // A checkable node whose bounds are row-shaped (w > 4h) — a backend (iOS/idb) that
-        // reports the whole cell as a switch's frame. The click must land near the trailing
-        // control (right of center); a non-checkable node of the SAME bounds still clicks center.
+        // reports the whole cell as a switch's frame. A `UISwitch` does not actuate on a tap, so
+        // the click must emit a swipe across the trailing control instead of a `Click`; a
+        // non-checkable node of the SAME bounds still clicks center.
         let clicks = Arc::new(Mutex::new(Vec::new()));
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let bounds = AxRect {
             x: 10,
             y: 10,
@@ -1007,23 +1026,48 @@ mod tests {
         // A backend that frames a switch as its whole row (iOS/idb) opts into the trailing-aim.
         let platform = FakePlatform::new(100, 100)
             .with_click_log(clicks.clone())
+            .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
 
-        // node #1 = the row-shaped checkable → trailing point (right of center).
+        // node #1 = the row-shaped checkable → a swipe across the trailing control, not a click.
         g.click_element(AxNodeId(1)).unwrap();
-        let trailing = bounds.clamped_trailing_point(100, 100).unwrap();
-        assert_eq!(clicks.lock().unwrap().last().copied(), Some(trailing));
-        assert!(trailing.0 > bounds.clamped_center(100, 100).unwrap().0);
+        let expected = bounds.trailing_toggle_swipe(100, 100).unwrap();
+        {
+            let d = drags.lock().unwrap();
+            assert_eq!(d.len(), 1, "a swipe was emitted");
+            match d[0] {
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    ..
+                } => {
+                    assert_eq!((from_x, from_y), expected.0);
+                    assert_eq!((to_x, to_y), expected.1);
+                }
+                ref e => panic!("expected a Drag, got {e:?}"),
+            }
+        }
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "the row-shaped checkable must swipe, not click"
+        );
 
-        // node #2 = the non-checkable row of identical bounds → geometric center (gate needs
-        // checkable, so a plain wide list row is unaffected).
+        // node #2 = the non-checkable row of identical bounds → geometric center click (gate
+        // needs checkable, so a plain wide list row is unaffected).
         g.click_element(AxNodeId(2)).unwrap();
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
             bounds.clamped_center(100, 100)
+        );
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the non-checkable row must not also emit a swipe"
         );
     }
 

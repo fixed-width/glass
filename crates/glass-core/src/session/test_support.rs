@@ -28,6 +28,7 @@ pub(crate) struct FakePlatform {
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     scroll_log: Arc<Mutex<Vec<PointerEvent>>>,
+    drag_log: Arc<Mutex<Vec<PointerEvent>>>,
     stop_count: Option<Arc<Mutex<u32>>>,
     windows: Vec<WindowInfo>,
     clipboard: String,
@@ -79,6 +80,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_scroll_log(mut self, log: Arc<Mutex<Vec<PointerEvent>>>) -> Self {
         self.scroll_log = log;
+        self
+    }
+    pub(crate) fn with_drag_log(mut self, log: Arc<Mutex<Vec<PointerEvent>>>) -> Self {
+        self.drag_log = log;
         self
     }
     pub(crate) fn with_select_log(mut self, log: Arc<Mutex<Vec<WindowId>>>) -> Self {
@@ -168,6 +173,9 @@ impl Platform for FakePlatform {
         }
         if let PointerEvent::Scroll { .. } = event {
             self.scroll_log.lock().unwrap().push(event.clone());
+        }
+        if let PointerEvent::Drag { .. } = event {
+            self.drag_log.lock().unwrap().push(event.clone());
         }
         self.pointer_events.push(event.clone());
         Ok(())
