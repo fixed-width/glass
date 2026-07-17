@@ -28,6 +28,9 @@ internal refactors, CI, or test-only changes.
 - **`glass_click_element` now reliably toggles an iOS switch.** iOS reports a switch's frame as its
   whole table row, so a click aimed at the geometric center landed on the inert label and did nothing;
   the click now targets the trailing control.
+- **macOS: a newly-launched app is brought frontmost at `glass_start`**, so `glass_a11y_snapshot`
+  resolves its window immediately instead of returning `window not found` until the first `glass_click`
+  activated the app. The `window not found` message also now suggests a remedy.
 
 ### Changed
 - **Every tool now returns a uniform result envelope.** On success, a tool's leading text block is
