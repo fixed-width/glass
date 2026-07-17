@@ -16,6 +16,19 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- **macOS and iOS accessibility now report toggle state.** A checkbox, radio button, or switch read
+  via `glass_a11y_snapshot` / `glass_wait_for_element` now carries its `checkable`/`checked` state on
+  the macOS and iOS backends (previously only Linux, Windows, and Android did), so
+  `glass_wait_for_element {condition: "checked"}` (or `"unchecked"`) works against those controls.
+  State is reported only when it can be read for certain — an indeterminate or unreadable control
+  matches neither condition rather than being misreported.
+
+### Fixed
+- **`glass_click_element` now reliably toggles an iOS switch.** iOS reports a switch's frame as its
+  whole table row, so a click aimed at the geometric center landed on the inert label and did nothing;
+  the click now targets the trailing control.
+
 ### Changed
 - **Every tool now returns a uniform result envelope.** On success, a tool's leading text block is
   `{"ok": true, "tool": "<name>", "result": { … }}`, with the tool-specific fields under `result`.
