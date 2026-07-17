@@ -8,7 +8,7 @@ instead of asking you "does this look right?".
 This is the **Windows x86-64** build. See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
 For Windows-specific setup (containment runtime, network transport, Android-on-Windows),
-see [docs/how-to/setup-windows.md](../docs/how-to/setup-windows.md).
+see [docs/how-to/setup-windows.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-windows.md).
 
 ---
 
@@ -37,10 +37,12 @@ mkdir $env:USERPROFILE\bin -Force
 copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 ```
 
-> **First run — SmartScreen.** These binaries are not yet Authenticode-signed, so the first launch may
-> show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run anyway**.
-> It's a publisher-trust prompt, not a permission request — glass needs no permission grants on Windows
-> (see [docs/explanation/windows-permissions.md](../docs/explanation/windows-permissions.md)).
+> **First run — SmartScreen.** The binary is Authenticode-signed (publisher: **Fixed Width LLC** — you can
+> confirm it in the file's Properties → Digital Signatures). Windows may still show Microsoft Defender
+> SmartScreen's "Windows protected your PC" on first download until the certificate builds reputation; if
+> it does, click **More info → Run anyway**. It's a publisher-trust prompt, not a permission request —
+> glass needs no permission grants on Windows
+> (see [docs/explanation/windows-permissions.md](https://github.com/fixed-width/glass/blob/master/docs/explanation/windows-permissions.md)).
 
 ## 3. Verify your setup
 

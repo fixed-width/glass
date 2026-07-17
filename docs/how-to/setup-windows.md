@@ -42,10 +42,11 @@ copy `glass-mcp.exe` into a directory that's already on `PATH` instead.
 If you want to hack on glass or are on an architecture with no published asset,
 [build from source](build-from-source.md) instead.
 
-> **First run — SmartScreen.** Prebuilt binaries are not yet Authenticode-signed, so the first launch
-> may show Microsoft Defender SmartScreen's "Windows protected your PC". Click **More info → Run
-> anyway**. This is a publisher-trust prompt, not a permission request — glass needs no permission
-> grants on Windows ([why](../explanation/windows-permissions.md)).
+> **First run — SmartScreen.** The prebuilt `glass-mcp.exe` is Authenticode-signed (publisher: **Fixed
+> Width LLC**). Windows may still show Microsoft Defender SmartScreen's "Windows protected your PC" on
+> first download until the certificate builds reputation; if it does, click **More info → Run anyway**.
+> This is a publisher-trust prompt, not a permission request — glass needs no permission grants on Windows
+> ([why](../explanation/windows-permissions.md)).
 
 ## Verify
 
