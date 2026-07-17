@@ -35,6 +35,10 @@ internal refactors, CI, or test-only changes.
 - **macOS: a newly-launched app is brought frontmost at `glass_start`**, so `glass_a11y_snapshot`
   resolves its window immediately instead of returning `window not found` until the first `glass_click`
   activated the app. The `window not found` message also now suggests a remedy.
+- **`return:"snapshot"` now waits for the UI to settle before folding the a11y tree.** A
+  screen-changing `glass_click_element` / `glass_set_value` with `return:"snapshot"` returns the
+  post-transition tree instead of a mid-transition one (best-effort — a continuously-animating UI still
+  returns the freshest tree at the settle deadline).
 
 ### Changed
 - **Every tool now returns a uniform result envelope.** On success, a tool's leading text block is

@@ -227,8 +227,8 @@ fn resolve_return(
             // Let the UI settle before folding the tree so a screen-changing action (a
             // navigating click) doesn't fold a mid-transition tree. Best-effort: `wait_stable`
             // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
-            // real capture failure is swallowed because `a11y_snapshot` reads the AX/UIA tree
-            // (not pixels) and still returns the freshest tree — the caller asked for the tree.
+            // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
+            // tree (not pixels) and still returns the freshest tree — the caller asked for it.
             let _ = glass.wait_stable(&settle_params());
             let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
             Ok((
