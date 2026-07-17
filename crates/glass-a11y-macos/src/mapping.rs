@@ -70,6 +70,22 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
     }
 }
 
+/// macOS `(checkable, checked)` from the normalized role and its `AXValue` as an integer
+/// (a checkbox/radio/switch exposes `AXValue` 0=off, 1=on, 2=mixed). Claims `checkable` ONLY
+/// for a determinate on/off value (the #170 invariant); mixed (2), an unexpected value, or an
+/// unread value (`None`) → `(false, false)` so a mixed box never matches `condition:"unchecked"`.
+/// A macOS `NSSwitch` reports role `AXCheckBox`, so `CheckBox` already covers switches.
+pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
+    match role {
+        AxRole::CheckBox | AxRole::RadioButton => match ax_value {
+            Some(1) => (true, true),
+            Some(0) => (true, false),
+            _ => (false, false),
+        },
+        _ => (false, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +178,19 @@ mod tests {
         let s = map_states(&f);
         assert!(s.visible && s.selected && s.checked && s.expanded);
         assert!(!s.enabled && !s.focused && !s.focusable && !s.editable);
+    }
+
+    #[test]
+    fn macos_checkable_checked_only_claims_a_determinate_toggle() {
+        use AxRole::*;
+        assert_eq!(checkable_checked(CheckBox, Some(1)), (true, true));
+        assert_eq!(checkable_checked(CheckBox, Some(0)), (true, false));
+        assert_eq!(checkable_checked(RadioButton, Some(1)), (true, true));
+        // Mixed (2), unexpected, unread, or a non-checkable role → neither (the #170 invariant):
+        // a mixed checkbox must not match `condition:"unchecked"`.
+        assert_eq!(checkable_checked(CheckBox, Some(2)), (false, false));
+        assert_eq!(checkable_checked(CheckBox, None), (false, false));
+        assert_eq!(checkable_checked(Button, Some(1)), (false, false));
+        assert_eq!(checkable_checked(Slider, Some(1)), (false, false));
     }
 }
