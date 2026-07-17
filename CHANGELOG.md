@@ -23,6 +23,10 @@ internal refactors, CI, or test-only changes.
   `glass_wait_for_element {condition: "checked"}` (or `"unchecked"`) works against those controls.
   State is reported only when it can be read for certain — an indeterminate or unreadable control
   matches neither condition rather than being misreported.
+- **Windows: a Slider, Spinner, or ProgressBar's numeric value is now readable** through the
+  accessibility tree (via its `RangeValuePattern` position), so `glass_wait_for_element
+  {value_contains}` can match a range control's number; previously these controls exposed no value.
+  The value is the control's raw numeric position (a `0..1` slider shown as "50%" reads as `0.5`).
 
 ### Fixed
 - **`glass_click_element` now reliably toggles an iOS switch.** iOS reports a switch's frame as its
