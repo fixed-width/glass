@@ -239,7 +239,7 @@ impl AxRect {
         let inset = bottom - top; // control ~this far from the trailing edge and ~this tall
         let center_x = (left + right) / 2;
         let anchor_x = (right - inset).max(center_x); // == clamped_trailing_point().x
-        let half = inset * 3 / 4; // span 1.5*inset; matches the proven px-945->1074 swipe on inset 84
+        let half = (inset * 3 / 4).max(1); // span 1.5*inset; matches the proven px-945->1074 swipe on inset 84; floor of 1 keeps a thin control's swipe non-zero-length
         let from_x = (anchor_x - half).max(left);
         let to_x = (anchor_x + half).min(right);
         Some(((from_x, cy), (to_x, cy)))
@@ -812,15 +812,36 @@ mod tests {
 
     #[test]
     fn trailing_toggle_swipe_clamps_into_visible_bounds() {
-        // Control hard against the window's right edge: `to` clamps to `right`, `from` stays inside.
+        // A tall/narrow control (height > width/2): the anchor falls back to center_x and the
+        // half-span (1.5*inset) overshoots BOTH edges, so both clamps must fire.
+        // rect 20x40 in a 400x400 window: inset=40, center_x=10, anchor_x=10, half=30 →
+        // unclamped (-20, 40) → clamped to (0, 20). Deleting either clamp breaks these asserts.
         let r = AxRect {
             x: 0,
             y: 0,
-            width: 400,
+            width: 20,
             height: 40,
         };
         let ((fx, _), (tx, _)) = r.trailing_toggle_swipe(400, 400).unwrap();
-        assert!(fx >= 0 && tx <= 400 && fx < tx);
+        assert_eq!(fx, 0, "from clamps to the left edge");
+        assert_eq!(tx, 20, "to clamps to the right edge");
+        assert!(fx < tx, "still a real left-to-right movement");
+    }
+
+    #[test]
+    fn trailing_toggle_swipe_keeps_a_nonzero_span_for_a_thin_control() {
+        // A 1px-tall control: inset*3/4 == 0 without the .max(1) guard → a zero-length "tap".
+        let r = AxRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 1,
+        };
+        let ((fx, _), (tx, _)) = r.trailing_toggle_swipe(400, 400).unwrap();
+        assert!(
+            fx < tx,
+            "even a 1px-tall control yields a real swipe, not a zero-length tap"
+        );
     }
 
     #[test]
