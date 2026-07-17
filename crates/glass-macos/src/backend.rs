@@ -403,6 +403,27 @@ fn release_clip(clip: Option<&ClipLaunch>) {
     }
 }
 
+/// Bring the launched app (`app_pid`) frontmost so its windows register with the AX API —
+/// otherwise `glass_a11y_snapshot` `WindowNotFound`s until the first input activates it. This
+/// front-loads the raise the first `glass_click`/`glass_type` would do anyway (`send_pointer`/
+/// `send_key` both call `input::focus` first).
+///
+/// **Best-effort — never fatal.** `input::focus` already tolerates an OS-deprioritized
+/// (declined) activation by discarding `activateWithOptions`'s `false` and returning `Ok`, so
+/// the *only* error it can yield is `AppExited` — the app died in the gap after
+/// `discover_window` confirmed its window. The launch still succeeded (the returned geometry is
+/// from a window that was confirmed present), and the next capture/a11y/input op surfaces that
+/// `AppExited` with a structured error, so here we log and continue rather than fail the launch.
+fn activate_launched(app_pid: Option<u32>) {
+    if let Some(pid) = app_pid {
+        if let Err(e) = crate::input::focus(pid as i32) {
+            eprintln!(
+                "glass-macos: launched app (pid {pid}) exited before it could be activated: {e}"
+            );
+        }
+    }
+}
+
 /// Bounds-check every window-relative coordinate `event` carries against `geom` via
 /// `coords::check_in_bounds`, failing with `GlassError::CoordOutOfBounds` before
 /// `input::send_pointer` ever maps a coordinate to a global point — the "no
@@ -590,19 +611,9 @@ impl Platform for MacosPlatform {
                 }
             }
         };
-        // Bring the launched app frontmost so its windows register with the AX API — otherwise
-        // `glass_a11y_snapshot` `WindowNotFound`s until the first input activates it. Best-effort:
-        // capture and the activate-on-first-input path both still work, so a declined activation
-        // (the OS can deprioritize a launch — see `input::focus`) is logged, never fatal. This is
-        // the same activation the first `glass_click`/`glass_type` already makes, only earlier.
-        if let Some(pid) = self.app_pid {
-            if let Err(e) = crate::input::focus(pid as i32) {
-                eprintln!(
-                    "glass-macos: could not activate launched app (pid {pid}): {e}; \
-                     a11y may need a glass_click to raise the window"
-                );
-            }
-        }
+        // Activate the launched app so its window registers with the AX API (best-effort — see
+        // `activate_launched`); the launch itself already succeeded above.
+        activate_launched(self.app_pid);
         Ok(geometry)
     }
 
@@ -1090,6 +1101,23 @@ mod tests {
             p.start_app(&spec),
             Err(GlassError::AppNotStarted(_))
         ));
+    }
+
+    #[test]
+    fn activate_launched_none_is_a_noop() {
+        // No launched pid → nothing to activate; must short-circuit before touching AppKit.
+        activate_launched(None);
+    }
+
+    #[test]
+    fn activate_launched_swallows_a_dead_pid() {
+        // The best-effort contract: a pid with no live app makes `input::focus` return
+        // `AppExited` — it resolves `runningApplicationWithProcessIdentifier` to `None` before
+        // ever calling `activateWithOptions`, so this needs no grant, no app, and no main
+        // thread (same as `stop_app`'s pid-999_999 tests). `activate_launched` must log and
+        // return, never panic or propagate: a regression tightening its `if let Err` into `?`
+        // would change its `()` signature and fail to compile against `start_app`'s call.
+        activate_launched(Some(999_999));
     }
 
     #[test]
