@@ -254,6 +254,18 @@ pub trait Platform {
     fn active_window_handle(&self) -> Option<i64> {
         None
     }
+
+    /// Whether this backend reports a checkable element's a11y frame as the whole containing
+    /// *row*, with the actual control at the row's **trailing** edge — as iOS/idb does for a
+    /// `UISwitch` in a grouped table cell. When true, `click_element` aims a row-shaped
+    /// checkable's tap at the trailing control instead of the geometric center, which would
+    /// otherwise land on the inert label and no-op. Default `false`: every other backend
+    /// reports a switch's frame as the tight control (its center is the right target), so the
+    /// trailing-aim would misfire on a wide *labeled* checkbox whose indicator is at the
+    /// leading edge — hence this is opt-in per backend rather than a geometry heuristic.
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

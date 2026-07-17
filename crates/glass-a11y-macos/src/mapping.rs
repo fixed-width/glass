@@ -70,6 +70,24 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
     }
 }
 
+/// macOS `(checkable, checked)` from the normalized role and its `AXValue` as an integer. A
+/// checkbox/radio/switch exposes `AXValue` as `0` (off) or `1` (on); a mixed/indeterminate
+/// checkbox reports some other value (AppKit's mixed state is not `0`/`1` — its exact AX
+/// encoding, `2`/`-1`/…, is deliberately not relied on here). Claims `checkable` ONLY for a
+/// determinate `0`/`1` (the #170 invariant); every other value, and an unread `None`, →
+/// `(false, false)`, so a mixed or unreadable box matches neither `condition:"checked"` nor
+/// `"unchecked"`. A macOS `NSSwitch` reports role `AXCheckBox`, so `CheckBox` covers switches.
+pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
+    match role {
+        AxRole::CheckBox | AxRole::RadioButton => match ax_value {
+            Some(1) => (true, true),
+            Some(0) => (true, false),
+            _ => (false, false),
+        },
+        _ => (false, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +180,22 @@ mod tests {
         let s = map_states(&f);
         assert!(s.visible && s.selected && s.checked && s.expanded);
         assert!(!s.enabled && !s.focused && !s.focusable && !s.editable);
+    }
+
+    #[test]
+    fn macos_checkable_checked_only_claims_a_determinate_toggle() {
+        use AxRole::*;
+        assert_eq!(checkable_checked(CheckBox, Some(1)), (true, true));
+        assert_eq!(checkable_checked(CheckBox, Some(0)), (true, false));
+        assert_eq!(checkable_checked(RadioButton, Some(1)), (true, true));
+        assert_eq!(checkable_checked(RadioButton, Some(0)), (true, false));
+        // A mixed/indeterminate value (whatever AppKit's AX encoding — 2, -1, …), an unread
+        // value, or a non-checkable role → neither (the #170 invariant): a mixed or unreadable
+        // box must not match `condition:"unchecked"`.
+        assert_eq!(checkable_checked(CheckBox, Some(2)), (false, false));
+        assert_eq!(checkable_checked(CheckBox, Some(-1)), (false, false));
+        assert_eq!(checkable_checked(CheckBox, None), (false, false));
+        assert_eq!(checkable_checked(Button, Some(1)), (false, false));
+        assert_eq!(checkable_checked(Slider, Some(1)), (false, false));
     }
 }

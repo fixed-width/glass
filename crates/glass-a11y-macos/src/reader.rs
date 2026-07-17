@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
+    Result,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -296,7 +297,7 @@ fn walk(
         .or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
-    let states = mapping::map_states(&gather_states(el));
+    let states = mapping::map_states(&gather_states(el, role));
 
     let mut children = Vec::new();
     if depth < MAX_DEPTH && *count < MAX_NODES {
@@ -407,25 +408,29 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 }
 
 /// Gather the plain state facts `mapping::map_states` normalizes: `AXEnabled`/`AXFocused`
-/// (boolean attributes) and `editable`/`focusable` (whether `AXValue`/`AXFocused` are
-/// writable). The remaining facts stay at their defaults — macOS doesn't expose them as
-/// simple universal attributes, and the reader never over-claims a state it didn't read.
-fn gather_states(el: &AXUIElement) -> AxStateFacts {
+/// (boolean attributes), `editable`/`focusable` (whether `AXValue`/`AXFocused` are writable),
+/// and — for a checkbox/radio/switch — `checkable`/`checked` derived from `AXValue`
+/// (`mapping::checkable_checked`; a determinate 0/1 only, per the #170 invariant, so a mixed or
+/// unreadable value claims neither). The remaining facts stay at their defaults — macOS doesn't
+/// expose them as simple universal attributes, and the reader never over-claims a state it
+/// didn't read.
+fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
+    // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
+    // extra AX IPC round-trip) only for those roles — every other node skips it. `map_role`
+    // maps an `NSSwitch` to `CheckBox`, so switches are covered.
+    let (checkable, checked) = match role {
+        AxRole::CheckBox | AxRole::RadioButton => {
+            mapping::checkable_checked(role, ffi::attribute_i64(el, attr::VALUE))
+        }
+        _ => (false, false),
+    };
     AxStateFacts {
         enabled: ffi::attribute_bool(el, attr::ENABLED).unwrap_or(false),
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
         focusable: ffi::is_settable(el, attr::FOCUSED),
         editable: ffi::is_settable(el, attr::VALUE),
-        // Known limitation: this reader does not yet read the AX checked state (`AXValue`
-        // is 0/1/2 for a checkbox/switch/radio button), so `checkable` stays `false` here
-        // rather than being derived from role alone — a real ON checkbox would otherwise
-        // be reported `checkable` with an unread (always-false) `checked`, mis-rendering
-        // as "unchecked" and satisfying `condition:"unchecked"`. Leaving both at their
-        // default makes the `Checked`/`Unchecked` wait conditions match neither instead,
-        // mirroring the iOS reader's precedent (`crates/glass-ios/src/axmap.rs`).
-        // Follow-up: read `AXValue` to populate `checkable`+`checked` for real (needs
-        // on-device mini verification).
-        checkable: false,
+        checkable,
+        checked,
         ..Default::default()
     }
 }

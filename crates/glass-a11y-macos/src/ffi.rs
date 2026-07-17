@@ -29,7 +29,9 @@
 use std::ptr::NonNull;
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
-use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGPoint, CGSize};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint, CGSize,
+};
 
 use glass_core::{GlassError, Result};
 
@@ -167,6 +169,24 @@ pub(crate) fn attribute_string_checked(
 pub(crate) fn attribute_bool(el: &AXUIElement, attr_name: &str) -> Option<bool> {
     let value = copy_attribute(el, attr_name).ok()?;
     value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)
+}
+
+/// Read `el`'s `attr_name` as an `i64` (`CFNumber`), or `None` when the attribute is absent,
+/// isn't a `CFNumber`, or holds a value that doesn't fit an `i64`. A checkbox/radio/switch
+/// exposes `AXValue` as a `CFNumber` (`0`/`1` for off/on), which `attribute_string`/
+/// `attribute_bool` cannot read — this is how the reader learns the checked state. Absence
+/// collapses to `None` (via `copy_attribute(...).ok()`), like the siblings.
+pub(crate) fn attribute_i64(el: &AXUIElement, attr_name: &str) -> Option<i64> {
+    let value = copy_attribute(el, attr_name).ok()?;
+    let num = value.downcast_ref::<CFNumber>()?;
+    let mut out: i64 = 0;
+    // SAFETY: `num` was downcast-verified to be a real `CFNumber`; `out` is a valid, correctly
+    // sized `i64` slot matching the requested `SInt64Type`. `CFNumberGetValue` writes at most 8
+    // bytes into `out` and returns false (→ `None`) when the stored value isn't exactly
+    // representable as an `i64` — the same out-param idiom `ax_position`/`ax_size` use for
+    // `AXValue`.
+    let ok = unsafe { num.value(CFNumberType::SInt64Type, (&mut out as *mut i64).cast()) };
+    ok.then_some(out)
 }
 
 /// Whether `attr_name` is writable on `el` (`AXUIElement::is_attribute_settable`). `false`

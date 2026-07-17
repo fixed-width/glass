@@ -180,28 +180,47 @@ pub struct AxRect {
 }
 
 impl AxRect {
-    /// The click point for this element: the center of its intersection with the window,
-    /// always inside `[0,win_w) × [0,win_h)`. Returns `None` when there is nothing to click —
-    /// the rect or window has zero area, or the element has no visible overlap with the window
-    /// (fully clipped off-screen) — so the caller surfaces a not-clickable error instead of a
-    /// click on the window edge that never lands on the element.
-    pub fn clamped_center(&self, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
+    /// The element's visible intersection with `[0,win_w) × [0,win_h)`, as
+    /// `(left, top, right, bottom)`. `None` when the rect or window has zero area, or the element
+    /// has no visible overlap with the window (fully clipped off-screen). Every actuation point
+    /// below derives from this one clip so their intersection semantics can't drift: a
+    /// partially-clipped element is still acted on within its own visible portion, and a
+    /// fully-clipped one returns `None` — surfaced as a not-clickable error rather than a silent
+    /// click on the window edge that never lands on the element (the "no silent fallbacks"
+    /// invariant).
+    fn visible_intersection(&self, win_w: u32, win_h: u32) -> Option<(i32, i32, i32, i32)> {
         if self.width == 0 || self.height == 0 || win_w == 0 || win_h == 0 {
             return None;
         }
-        // Click the center of the element's *intersection* with the window — the visible
-        // portion — not the raw center clamped to the window edge. A partially-clipped element
-        // is then still clicked on itself, and a fully-clipped element (no overlap) returns
-        // `None`, surfaced as a not-clickable error rather than a silent click on the window
-        // edge that never lands on the element (the "no silent fallbacks" invariant).
         let left = self.x.max(0);
         let top = self.y.max(0);
         let right = (self.x + self.width as i32).min(win_w as i32);
         let bottom = (self.y + self.height as i32).min(win_h as i32);
-        if right <= left || bottom <= top {
-            return None;
-        }
+        (right > left && bottom > top).then_some((left, top, right, bottom))
+    }
+
+    /// The click point for this element: the center of its visible intersection with the window,
+    /// always inside `[0,win_w) × [0,win_h)`. `None` when there is nothing to click (see
+    /// [`Self::visible_intersection`]).
+    pub fn clamped_center(&self, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
+        let (left, top, right, bottom) = self.visible_intersection(win_w, win_h)?;
         Some(((left + right) / 2, (top + bottom) / 2))
+    }
+
+    /// Actuation point for a **row-shaped checkable** element. A backend (iOS/idb) can report
+    /// a table-cell switch's frame as the whole row, whose control sits at the trailing edge;
+    /// the geometric [`Self::clamped_center`] then lands on the label and a tap no-ops. This
+    /// aims near the trailing control: `x = right_edge - inset`, floored at the horizontal
+    /// center so it never crosses back past the middle; `y` = vertical center. The inset is the
+    /// visible height rather than a fixed pixel amount, so it scales with the control at any
+    /// device scale (a switch's width ≈ its row height). Shares [`Self::visible_intersection`]
+    /// with `clamped_center`, so the clip / zero-area / fully-offscreen `None` are identical.
+    pub fn clamped_trailing_point(&self, win_w: u32, win_h: u32) -> Option<(i32, i32)> {
+        let (left, top, right, bottom) = self.visible_intersection(win_w, win_h)?;
+        let center_x = (left + right) / 2;
+        let inset = bottom - top; // visible height; the control is ~this far from the edge
+        let x = (right - inset).max(center_x);
+        Some((x, (top + bottom) / 2))
     }
 }
 
@@ -698,6 +717,50 @@ mod tests {
             .clamped_center(0, 10),
             None
         );
+    }
+
+    #[test]
+    fn clamped_trailing_point_targets_the_trailing_control() {
+        // A row-shaped element (idb's whole-cell switch frame): the trailing point sits
+        // right of center, near the right edge — not the geometric center.
+        let r = AxRect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 30,
+        };
+        let (x, y) = r.clamped_trailing_point(400, 400).expect("has a point");
+        let (cx, _) = r.clamped_center(400, 400).unwrap();
+        assert!(x > cx, "trailing point is right of center ({x} !> {cx})");
+        assert!(
+            (270..300).contains(&x),
+            "near the right edge, inset ~= height"
+        );
+        assert_eq!(y, 15, "vertical center");
+    }
+
+    #[test]
+    fn clamped_trailing_point_never_crosses_left_of_center() {
+        // A near-square element: right - height would fall left of center, so it floors at center.
+        let r = AxRect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 30,
+        };
+        let (x, _) = r.clamped_trailing_point(400, 400).unwrap();
+        assert_eq!(x, r.clamped_center(400, 400).unwrap().0);
+    }
+
+    #[test]
+    fn clamped_trailing_point_rejects_offscreen_like_clamped_center() {
+        let r = AxRect {
+            x: 500,
+            y: 500,
+            width: 40,
+            height: 20,
+        };
+        assert_eq!(r.clamped_trailing_point(400, 400), None);
     }
 
     #[test]

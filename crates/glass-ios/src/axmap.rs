@@ -121,6 +121,20 @@ pub fn scale_from_width(json: &str, frame_px_width: u32) -> Option<f64> {
         .map(|pt| f64::from(frame_px_width) / pt)
 }
 
+/// iOS `(checkable, checked)` from the normalized role and idb's `AXValue` string. A UISwitch
+/// reports role AXCheckBox/AXSwitch/AXToggle with AXValue "0"/"1". Claims `checkable` ONLY for a
+/// determinate "0"/"1" on a checkable role (the #170 invariant); anything else → (false, false).
+fn checkable_checked(role: AxRole, ax_value: Option<&str>) -> (bool, bool) {
+    match role {
+        AxRole::CheckBox | AxRole::ToggleButton => match ax_value {
+            Some("1") => (true, true),
+            Some("0") => (true, false),
+            _ => (false, false),
+        },
+        _ => (false, false),
+    }
+}
+
 fn map_node(n: &Value, scale: f64) -> AxNode {
     // Read a string field, collapsing both a JSON `null` (missing/non-string) and an
     // empty string to `None` so absent and blank values are treated alike.
@@ -149,17 +163,16 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
     } else {
         None
     };
+    // `checkable`/`checked` from the switch's AXValue (see `checkable_checked`). idb exposes no
+    // per-element focus state, so `focused` stays false — a real limitation of this backend.
+    let (checkable, checked) = checkable_checked(role, s("AXValue").as_deref());
     let states = AxStates {
         enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         visible: true,
-        // idb's accessibility_info exposes no per-element focus state, so `focused`
-        // is always false here (a known limitation of this backend).
         focused: false,
         editable,
-        // idb's accessibility_info exposes no checked/checkable trait, so iOS toggles
-        // are out of scope here (a known limitation of this backend); `checked` stays
-        // at its `AxStates::default()` value below alongside it.
-        checkable: false,
+        checkable,
+        checked,
         ..AxStates::default()
     };
     let bounds = n.get("frame").and_then(|f| frame_to_rect(f, scale));
@@ -237,6 +250,10 @@ mod tests {
         assert_eq!(ax_role("AXTextField"), AxRole::TextField);
         assert_eq!(ax_role("AXApplication"), AxRole::Application);
         assert_eq!(ax_role("AXImage"), AxRole::Image);
+        // The checkable roles the toggle-state derivation depends on.
+        assert_eq!(ax_role("AXSwitch"), AxRole::ToggleButton);
+        assert_eq!(ax_role("AXToggle"), AxRole::ToggleButton);
+        assert_eq!(ax_role("AXCheckBox"), AxRole::CheckBox);
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
     }
 
@@ -400,5 +417,36 @@ mod tests {
         // caller ever divides by a zero-or-negative point width.
         assert_eq!(scale_from_width("[]", 1206), None);
         assert_eq!(scale_from_width(r#"[{"frame":{"width":0}}]"#, 1206), None);
+    }
+
+    #[test]
+    fn ios_checkable_checked_only_claims_a_determinate_toggle() {
+        use AxRole::*;
+        assert_eq!(checkable_checked(CheckBox, Some("1")), (true, true));
+        assert_eq!(checkable_checked(CheckBox, Some("0")), (true, false));
+        assert_eq!(checkable_checked(ToggleButton, Some("1")), (true, true));
+        assert_eq!(checkable_checked(ToggleButton, Some("0")), (true, false));
+        // Not a determinate 0/1, or not a checkable role → neither (the #170 invariant).
+        assert_eq!(checkable_checked(CheckBox, Some("mixed")), (false, false));
+        assert_eq!(checkable_checked(CheckBox, None), (false, false));
+        assert_eq!(checkable_checked(TextField, Some("1")), (false, false));
+        assert_eq!(checkable_checked(Button, Some("0")), (false, false));
+    }
+
+    #[test]
+    fn build_tree_reads_switch_checked_state_and_keeps_label_as_value() {
+        // A UISwitch as idb reports it: role AXCheckBox, stable id, label, AXValue "1" (on).
+        let j = r#"[{"role":"AXCheckBox","subrole":"AXSwitch","AXUniqueId":"boldText",
+                     "AXLabel":"Bold Text","AXValue":"1",
+                     "frame":{"x":0,"y":0,"width":100,"height":30}}]"#;
+        let mut tree = build_tree(j, 1.0, &win()).expect("parses");
+        tree.assign_ids();
+        let sw = find_by_name(&tree.root, "boldText").expect("switch present");
+        assert!(
+            sw.states.checkable && sw.states.checked,
+            "an on switch → checkable + checked"
+        );
+        // `checked` carries the state; the label still lives in `value` (unchanged behavior).
+        assert_eq!(sw.value.as_deref(), Some("Bold Text"));
     }
 }

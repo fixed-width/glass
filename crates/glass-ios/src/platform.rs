@@ -261,6 +261,13 @@ fn discover_scale(client: &IdbClient, frame_px_width: u32) -> Result<f64> {
 }
 
 impl Platform for IosPlatform {
+    /// idb reports a `UISwitch` in a grouped table cell with the whole cell as its frame and
+    /// the control at the trailing edge, so a centered `click_element` tap lands on the inert
+    /// label. Opt into the trailing-aim (see the trait default's rationale).
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        true
+    }
+
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         if let Some(build) = &spec.build {
             let mut cmd = Command::new("sh");
