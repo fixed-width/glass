@@ -76,6 +76,14 @@ pub fn map_states(f: &StateFacts) -> AxStates {
     }
 }
 
+/// Render a `RangeValuePattern` numeric value (a slider/spinner/progress position) as the node's
+/// `value` string. Uses `f64`'s shortest round-tripping `Display`, so a whole number has no
+/// trailing `.0` (a slider at `50.0` → `"50"`, matching `value_contains:"50"`) while a fractional
+/// position keeps its digits (`50.5` → `"50.5"`).
+pub fn format_range_value(v: f64) -> String {
+    format!("{v}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +151,14 @@ mod tests {
         };
         let s = map_states(&f);
         assert!(s.checkable && !s.checked);
+    }
+
+    #[test]
+    fn range_value_formats_without_trailing_zero() {
+        assert_eq!(format_range_value(50.0), "50");
+        assert_eq!(format_range_value(0.0), "0");
+        assert_eq!(format_range_value(100.0), "100");
+        assert_eq!(format_range_value(50.5), "50.5");
+        assert_eq!(format_range_value(-3.0), "-3");
     }
 }
