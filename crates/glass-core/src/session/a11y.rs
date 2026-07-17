@@ -13,10 +13,20 @@ impl Glass {
     /// `AxUnsupported` if the backend has no accessibility reader.
     pub fn a11y_snapshot(&mut self) -> Result<AxTree> {
         let s = self.active_mut()?;
+        // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
+        // precedence over — and a reader-less backend skips — the geometry round-trip below.
+        if s.accessibility.is_none() {
+            return Err(GlassError::AxUnsupported);
+        }
         // Re-read the current window geometry: an app can resize itself (open a sidebar / panel)
-        // without a glass_window op, leaving `s.geometry` stale so the tree — and the subsequent
-        // click_element / set_value, which clamp against `s.geometry` — would map to the old
-        // window bounds and clip elements now beyond them.
+        // without a glass_window op, leaving `s.geometry` stale so the tree's scale/origin — and
+        // the subsequent click_element clamp / set_value context, which read `s.geometry` — would
+        // map to the old window bounds and clip elements now beyond them. Strict by design: a
+        // failure propagates rather than silently reusing a stale cache. Note: on macOS this
+        // resolves the window via ScreenCaptureKit, so a snapshot depends on that and can fail on
+        // a momentarily off-screen window — accepted for correctness. (Android reports a cached
+        // fullscreen window, so a freeform self-resize wouldn't refresh — a residual limitation,
+        // moot while Android apps run fullscreen.)
         let window = s.platform.window(&WindowOp::Geometry)?;
         s.geometry = window.clone();
         let pids = s.platform.app_pids();
