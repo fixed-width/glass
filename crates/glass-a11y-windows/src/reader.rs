@@ -10,7 +10,8 @@ use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
 };
 use uiautomation::patterns::{
-    UIExpandCollapsePattern, UISelectionItemPattern, UITogglePattern, UIValuePattern,
+    UIExpandCollapsePattern, UIRangeValuePattern, UISelectionItemPattern, UITogglePattern,
+    UIValuePattern,
 };
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
@@ -187,7 +188,7 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
             .and_then(|p| p.get_state().ok())
             .map(|s| s == ExpandCollapseState::Expanded).unwrap_or(false);
     // Value pattern: one fetch for both the value string and read-only (Edit/ComboBox/Document)
-    let (value, readonly) = if matches!(ct_id, 50003 | 50004 | 50030) {
+    let (value_text, readonly) = if matches!(ct_id, 50003 | 50004 | 50030) {
         match el.get_pattern::<UIValuePattern>() {
             Ok(p) => (p.get_value().ok().and_then(nonempty), p.is_readonly().ok()),
             Err(_) => (None, None),
@@ -195,6 +196,19 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
     } else {
         (None, None)
     };
+    // RangeValue pattern: a Slider/Spinner/ProgressBar exposes its numeric position here, never
+    // via ValuePattern, so read it (gated by control type — `get_pattern` is a COM round-trip) so
+    // `value_contains`/`wait_for_element` can match the number.
+    let value = value_text.or_else(|| {
+        matches!(ct_id, 50012 | 50015 | 50016) // ProgressBar/Slider/Spinner
+            .then(|| {
+                el.get_pattern::<UIRangeValuePattern>()
+                    .ok()
+                    .and_then(|p| p.get_value().ok())
+                    .map(crate::mapping::format_range_value)
+            })
+            .flatten()
+    });
     // Editable iff a writable ValuePattern is present — for ANY value-bearing
     // control (Edit/ComboBox/Document), not just Edit; otherwise a writable
     // ComboBox/Document reports editable=false while set_value would succeed on
