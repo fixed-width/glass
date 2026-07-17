@@ -37,6 +37,9 @@ internal refactors, CI, or test-only changes.
 - iOS: `glass_click_element` and `glass_set_value` now toggle a `UISwitch` by swiping its control (a tap
   does not actuate a UISwitch); `glass_set_value` verifies the switch reached the requested state instead
   of returning a premature `ok`. Other backends are unchanged.
+- `glass_set_value` on a switch/checkbox now returns an actionable error naming the accepted boolean
+  spellings (`true/false`, `on/off`, `1/0`, `yes/no`) when given a non-boolean value, instead of a generic
+  "value did not change — use keystrokes" message that misdirected the agent.
 - **macOS: a newly-launched app is brought frontmost at `glass_start`**, so `glass_a11y_snapshot`
   resolves its window immediately instead of returning `window not found` until the first `glass_click`
   activated the app. The `window not found` message also now suggests a remedy.
