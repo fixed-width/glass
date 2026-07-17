@@ -76,6 +76,9 @@ pub enum GlassError {
     #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
     AxValueNotApplied(u32),
 
+    #[error("set_value on element #{0} is a switch/checkbox and expects a boolean — one of true/false, on/off, 1/0, yes/no (got {1:?})")]
+    AxValueNotBoolean(u32, String),
+
     #[error("element #{0} is inside a popover glass could not map to a window; select_window it and click by coordinate")]
     AxElementInUnmappedPopover(u32),
 
