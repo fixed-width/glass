@@ -71,9 +71,11 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
             // Android "focusable" is keyboard-only; map isClickable -> focusable as the actability proxy.
             focusable: flag("clickable"),
             visible: true,
-            // Known limitation: the device `tree` JSON protocol does not yet carry
-            // `checkable`/`checked`, so both stay at their `AxStates::default()` (false)
-            // here — mirrors the iOS reader's precedent (`crates/glass-ios/src/axmap.rs`).
+            // The companion carries isCheckable/isChecked (authoritative, unlike the baseline
+            // uiautomator reader), so surface them directly; `AxStates::active()` and the
+            // Checked/Unchecked `state_pred`s gate `checked` on `checkable`.
+            checkable: flag("checkable"),
+            checked: flag("checked"),
             ..Default::default()
         },
         bounds: Some(AxRect {
@@ -460,6 +462,28 @@ mod tests {
         let save = t.find(AxNodeId(2)).unwrap();
         assert_eq!(save.role, AxRole::Button);
         assert_eq!(save.name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn reads_checkable_and_checked_from_json() {
+        // The companion now carries isCheckable/isChecked; surface them on the node's states.
+        let on = json!({
+            "class": "android.widget.CheckBox", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+            "checkable": true, "checked": true
+        });
+        let n = json_to_node(&on, &win()).unwrap();
+        assert!(
+            n.states.checkable && n.states.checked,
+            "on checkbox → checkable + checked"
+        );
+        let plain = json!({
+            "class": "android.widget.TextView", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10}
+        });
+        let p = json_to_node(&plain, &win()).unwrap();
+        assert!(
+            !p.states.checkable && !p.states.checked,
+            "a node with no checkable/checked keys stays false"
+        );
     }
 
     #[test]
