@@ -32,11 +32,12 @@ relationship, not a consent grant: to drive an elevated app, run glass at the sa
 so the two processes match. Most apps run at medium integrity, where the default works with no special
 handling.
 
-**SmartScreen and Defender (distribution, not runtime).** These gate *installing* an unknown binary,
-not *what a running binary may do*. An unsigned download of `glass-mcp.exe` triggers Microsoft Defender
-SmartScreen's "Windows protected your PC" banner — a publisher-trust prompt, not an access grant. A
-signed release clears it; an unsigned build runs after **More info → Run anyway**. See the install
-steps in [how-to/setup-windows.md](../how-to/setup-windows.md).
+**SmartScreen and Defender (distribution, not runtime).** These gate *installing* a downloaded binary,
+not *what a running binary may do*. The release `glass-mcp.exe` is Authenticode-signed (publisher: Fixed
+Width LLC), which establishes the publisher; Microsoft Defender SmartScreen may still show "Windows
+protected your PC" on first download until the certificate builds reputation — a publisher-trust prompt,
+not an access grant, cleared with **More info → Run anyway**. See the install steps in
+[how-to/setup-windows.md](../how-to/setup-windows.md).
 
 ## Why there's no grant to click
 

@@ -7,12 +7,12 @@ instead of asking you "does this look right?".
 
 This is the **statically-linked Linux x86-64** build: **no glibc version requirement**
 and **no shared-library prerequisites** — it runs on essentially any x86-64 Linux.
-(A prebuilt **Windows** build is also available — see
-[`packaging/README-windows.md`](README-windows.md). macOS has no prebuilt binary yet;
-build from source — see [docs/how-to/build-from-source.md](../docs/how-to/build-from-source.md).)
+Prebuilt builds are also available for **Windows** (see
+[`packaging/README-windows.md`](https://github.com/fixed-width/glass/blob/master/packaging/README-windows.md)) and **macOS** (a notarized `.dmg` —
+see [docs/how-to/setup-macos.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-macos.md)).
 See the project README for the full picture: <https://github.com/fixed-width/glass>.
 For Linux-specific display/compositor and containment setup, see
-[docs/how-to/setup-linux.md](../docs/how-to/setup-linux.md).
+[docs/how-to/setup-linux.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-linux.md).
 
 ---
 
