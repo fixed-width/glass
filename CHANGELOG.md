@@ -40,6 +40,10 @@ internal refactors, CI, or test-only changes.
 - **macOS: a newly-launched app is brought frontmost at `glass_start`**, so `glass_a11y_snapshot`
   resolves its window immediately instead of returning `window not found` until the first `glass_click`
   activated the app. The `window not found` message also now suggests a remedy.
+- **Accessibility actions now work after an app resizes its own window** (e.g. macOS Calculator
+  opening its sidebar). `glass_a11y_snapshot` re-reads the current window geometry, so
+  `glass_click_element` / `glass_set_value` clamp against the window's actual size instead of a stale
+  cached one — elements that moved beyond the old bounds are no longer reported unclickable.
 - **`return:"snapshot"` now waits for the UI to settle before folding the a11y tree.** A
   screen-changing `glass_click_element` / `glass_set_value` with `return:"snapshot"` returns the
   post-transition tree instead of a mid-transition one (best-effort — a continuously-animating UI still
