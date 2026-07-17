@@ -104,9 +104,9 @@ pub struct ClickElementArgs {
     /// window and the previously-active window is restored afterward — no extra step
     /// needed.
     pub id: u32,
-    /// Optional observe folded into the result: "snapshot" (a fresh a11y tree, also
-    /// refreshing the snapshot cache), "settle" (wait for the UI to stop changing,
-    /// text-only), or "none" (default).
+    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
+    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
+    /// to stop changing, text-only), or "none" (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }
@@ -120,9 +120,9 @@ pub struct SetValueArgs {
     /// `"1"`/`"0"`) — idempotent. For a dropdown/combo box, an option label
     /// (case-insensitive); glass opens it and picks that option.
     pub text: String,
-    /// Optional observe folded into the result: "snapshot" (a fresh a11y tree, also
-    /// refreshing the snapshot cache), "settle" (wait for the UI to stop changing,
-    /// text-only), or "none" (default).
+    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
+    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
+    /// to stop changing, text-only), or "none" (default).
     #[serde(rename = "return")]
     pub return_: Option<String>,
 }

@@ -224,6 +224,12 @@ fn resolve_return(
             ))
         }
         Some("snapshot") => {
+            // Let the UI settle before folding the tree so a screen-changing action (a
+            // navigating click) doesn't fold a mid-transition tree. Best-effort: `wait_stable`
+            // soft-times-out (`settled:false`, not an error) on a non-settling UI, and a rare
+            // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
+            // tree (not pixels) and still returns the freshest tree — the caller asked for it.
+            let _ = glass.wait_stable(&settle_params());
             let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
             Ok((
                 None,
@@ -335,6 +341,9 @@ pub(crate) mod testutil {
         pub started: bool,
         pub events: Arc<Mutex<Vec<String>>>,
         pub clipboard: String,
+        /// Count of `capture_frame` calls — lets a test assert a settle actually captured
+        /// frames (e.g. `return:"snapshot"` settling before it folds the tree).
+        pub captures: Arc<Mutex<usize>>,
     }
 
     impl FakePlatform {
@@ -361,6 +370,10 @@ pub(crate) mod testutil {
             self.events = log;
             self
         }
+        pub fn with_capture_log(mut self, log: Arc<Mutex<usize>>) -> Self {
+            self.captures = log;
+            self
+        }
     }
 
     impl Platform for FakePlatform {
@@ -373,6 +386,7 @@ pub(crate) mod testutil {
             Ok(())
         }
         fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
+            *self.captures.lock().unwrap() += 1;
             let frame = match self.frames.pop_front() {
                 Some(f) => {
                     if self.frames.is_empty() {
@@ -1079,7 +1093,9 @@ mod tests {
 
     #[test]
     fn return_snapshot_appends_tree_and_refreshes_cache() {
-        let mut g = started_a11y_frames(vec![]); // click + a11y_snapshot don't capture frames
+        // vec![] → the snapshot arm's best-effort settle can't capture and is swallowed; the
+        // tree still folds (the assertions below are unaffected by the settle).
+        let mut g = started_a11y_frames(vec![]);
         let out = click_element(
             &mut g,
             &ClickElementArgs {
@@ -1121,6 +1137,68 @@ mod tests {
             }
         )
         .is_ok());
+    }
+
+    #[test]
+    fn return_snapshot_settles_before_folding() {
+        use glass_core::Frame;
+        use std::sync::{Arc, Mutex};
+        // A settleable frame + a capture counter, wired inline (started_a11y_frames doesn't
+        // expose a capture log).
+        let captures = Arc::new(Mutex::new(0usize));
+        let platform = FakePlatform::new(100, 100)
+            .with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        a11y_snapshot(&mut g).unwrap(); // seed last_ax for click_element
+        let before = *captures.lock().unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        // The a11y outline is still folded (envelope + one untrusted sibling) ...
+        assert_eq!(out.0.len(), 2, "envelope + a11y outline sibling");
+        // ... AND the settle captured frames before the fold. This guards the `wait_stable`
+        // line: remove it and `captures` stays at `before`.
+        assert!(
+            *captures.lock().unwrap() > before,
+            "return:snapshot must settle (capture frames) before folding"
+        );
+    }
+
+    #[test]
+    fn return_snapshot_without_frames_still_folds() {
+        // No frames → the settle's `wait_stable` errors (no scripted frames); the `let _ =`
+        // swallows it and the tree is still folded. A `?` there would deny the tree.
+        let mut g = started_a11y_frames(vec![]);
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            2,
+            "tree still folds even when the settle can't run"
+        );
     }
 
     #[test]
