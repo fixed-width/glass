@@ -70,11 +70,13 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
     }
 }
 
-/// macOS `(checkable, checked)` from the normalized role and its `AXValue` as an integer
-/// (a checkbox/radio/switch exposes `AXValue` 0=off, 1=on, 2=mixed). Claims `checkable` ONLY
-/// for a determinate on/off value (the #170 invariant); mixed (2), an unexpected value, or an
-/// unread value (`None`) → `(false, false)` so a mixed box never matches `condition:"unchecked"`.
-/// A macOS `NSSwitch` reports role `AXCheckBox`, so `CheckBox` already covers switches.
+/// macOS `(checkable, checked)` from the normalized role and its `AXValue` as an integer. A
+/// checkbox/radio/switch exposes `AXValue` as `0` (off) or `1` (on); a mixed/indeterminate
+/// checkbox reports some other value (AppKit's mixed state is not `0`/`1` — its exact AX
+/// encoding, `2`/`-1`/…, is deliberately not relied on here). Claims `checkable` ONLY for a
+/// determinate `0`/`1` (the #170 invariant); every other value, and an unread `None`, →
+/// `(false, false)`, so a mixed or unreadable box matches neither `condition:"checked"` nor
+/// `"unchecked"`. A macOS `NSSwitch` reports role `AXCheckBox`, so `CheckBox` covers switches.
 pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
     match role {
         AxRole::CheckBox | AxRole::RadioButton => match ax_value {
@@ -186,9 +188,12 @@ mod tests {
         assert_eq!(checkable_checked(CheckBox, Some(1)), (true, true));
         assert_eq!(checkable_checked(CheckBox, Some(0)), (true, false));
         assert_eq!(checkable_checked(RadioButton, Some(1)), (true, true));
-        // Mixed (2), unexpected, unread, or a non-checkable role → neither (the #170 invariant):
-        // a mixed checkbox must not match `condition:"unchecked"`.
+        assert_eq!(checkable_checked(RadioButton, Some(0)), (true, false));
+        // A mixed/indeterminate value (whatever AppKit's AX encoding — 2, -1, …), an unread
+        // value, or a non-checkable role → neither (the #170 invariant): a mixed or unreadable
+        // box must not match `condition:"unchecked"`.
         assert_eq!(checkable_checked(CheckBox, Some(2)), (false, false));
+        assert_eq!(checkable_checked(CheckBox, Some(-1)), (false, false));
         assert_eq!(checkable_checked(CheckBox, None), (false, false));
         assert_eq!(checkable_checked(Button, Some(1)), (false, false));
         assert_eq!(checkable_checked(Slider, Some(1)), (false, false));

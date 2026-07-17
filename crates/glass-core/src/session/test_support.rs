@@ -44,6 +44,9 @@ pub(crate) struct FakePlatform {
     /// proving a failed popover-probe enumeration degrades to the normal click path
     /// instead of propagating.
     fail_list_windows: bool,
+    /// Stands in for a backend (iOS) that reports a switch's frame as the whole row — makes
+    /// `a11y_toggle_control_at_trailing_edge` return true so the trailing-aim path is testable.
+    a11y_trailing_toggle: bool,
 }
 
 impl FakePlatform {
@@ -100,6 +103,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_failing_list_windows(mut self) -> Self {
         self.fail_list_windows = true;
+        self
+    }
+    pub(crate) fn with_trailing_toggle_backend(mut self) -> Self {
+        self.a11y_trailing_toggle = true;
         self
     }
 }
@@ -159,6 +166,9 @@ impl Platform for FakePlatform {
     }
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
+    }
+    fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
+        self.a11y_trailing_toggle
     }
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         self.key_events.push(event.clone());

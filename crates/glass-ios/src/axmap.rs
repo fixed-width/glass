@@ -163,9 +163,8 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
     } else {
         None
     };
-    // A UISwitch reports role AXCheckBox/AXSwitch/AXToggle with AXValue "0"/"1"; derive the
-    // toggle state from it. idb exposes no per-element focus state, so `focused` stays false
-    // (a real limitation of this backend).
+    // `checkable`/`checked` from the switch's AXValue (see `checkable_checked`). idb exposes no
+    // per-element focus state, so `focused` stays false — a real limitation of this backend.
     let (checkable, checked) = checkable_checked(role, s("AXValue").as_deref());
     let states = AxStates {
         enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true),
@@ -251,6 +250,10 @@ mod tests {
         assert_eq!(ax_role("AXTextField"), AxRole::TextField);
         assert_eq!(ax_role("AXApplication"), AxRole::Application);
         assert_eq!(ax_role("AXImage"), AxRole::Image);
+        // The checkable roles the toggle-state derivation depends on.
+        assert_eq!(ax_role("AXSwitch"), AxRole::ToggleButton);
+        assert_eq!(ax_role("AXToggle"), AxRole::ToggleButton);
+        assert_eq!(ax_role("AXCheckBox"), AxRole::CheckBox);
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
     }
 

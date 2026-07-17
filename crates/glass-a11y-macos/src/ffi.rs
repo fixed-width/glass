@@ -171,10 +171,11 @@ pub(crate) fn attribute_bool(el: &AXUIElement, attr_name: &str) -> Option<bool> 
     value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool)
 }
 
-/// Read `el`'s `attr_name` as an `i64` (`CFNumber`), or `None` when the attribute is absent or
-/// isn't a number. A checkbox/radio/switch exposes `AXValue` as a `CFNumber` (0/1/2), which
-/// `attribute_string`/`attribute_bool` cannot read — this is how the reader learns the checked
-/// state. Absence collapses to `None` (via `copy_attribute(...).ok()`), like the siblings.
+/// Read `el`'s `attr_name` as an `i64` (`CFNumber`), or `None` when the attribute is absent,
+/// isn't a `CFNumber`, or holds a value that doesn't fit an `i64`. A checkbox/radio/switch
+/// exposes `AXValue` as a `CFNumber` (`0`/`1` for off/on), which `attribute_string`/
+/// `attribute_bool` cannot read — this is how the reader learns the checked state. Absence
+/// collapses to `None` (via `copy_attribute(...).ok()`), like the siblings.
 pub(crate) fn attribute_i64(el: &AXUIElement, attr_name: &str) -> Option<i64> {
     let value = copy_attribute(el, attr_name).ok()?;
     let num = value.downcast_ref::<CFNumber>()?;

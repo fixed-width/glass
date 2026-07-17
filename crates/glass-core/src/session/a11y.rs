@@ -1,9 +1,10 @@
 //! `Glass` accessibility ops: snapshot, marks, click, and set-value.
 use super::*;
 
-/// A checkable element wider than this multiple of its height is treated as "row-shaped" — a
-/// backend (iOS/idb) reporting the whole table row as a switch's frame — so `click_element`
-/// aims at the trailing control instead of the row center.
+/// A checkable element wider than this multiple of its height is treated as "row-shaped". On a
+/// backend that frames a switch as its whole row (`Platform::a11y_toggle_control_at_trailing_edge`),
+/// `click_element` aims a row-shaped checkable's tap at the trailing control instead of the row
+/// center.
 const ROW_ASPECT: u32 = 4;
 
 impl Glass {
@@ -54,12 +55,17 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
-        let (bounds, checkable, active_geo) = {
+        let (bounds, checkable, trailing_toggle_backend, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let bounds = node.bounds.ok_or(GlassError::AxElementNotClickable(id.0))?;
-            (bounds, node.states.checkable, s.geometry.clone())
+            (
+                bounds,
+                node.states.checkable,
+                s.platform.a11y_toggle_control_at_trailing_edge(),
+                s.geometry.clone(),
+            )
         };
         // The element's a11y bounds are reported relative to the active window, but it
         // may actually render in a separate popover window (e.g. an open dropdown's
@@ -100,11 +106,18 @@ impl Glass {
             }
             return result;
         }
-        // A row-shaped checkable (a switch whose backend reports the whole row as its frame,
-        // e.g. iOS/idb) has its control at the trailing edge, so the geometric center lands on
-        // the label. Aim trailing there; every backend whose switch bounds are the tight control
-        // is not row-shaped and uses the unchanged center.
-        let (x, y) = if checkable && bounds.width > bounds.height.saturating_mul(ROW_ASPECT) {
+        // A switch whose backend reports the whole row as its frame with the control at the
+        // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
+        // label. For such a backend, aim a row-shaped checkable's tap at the trailing control.
+        // Gated on the backend capability, NOT geometry alone: a wide *labeled* checkbox on a
+        // desktop backend is also row-shaped but has its indicator at the LEADING edge, so the
+        // trailing-aim must not apply there. The row-shape test uses the raw-bounds aspect as a
+        // cheap pre-filter; `clamped_trailing_point` derives its inset from the clamped visible
+        // height.
+        let (x, y) = if checkable
+            && trailing_toggle_backend
+            && bounds.width > bounds.height.saturating_mul(ROW_ASPECT)
+        {
             bounds.clamped_trailing_point(active_geo.width, active_geo.height)
         } else {
             bounds.clamped_center(active_geo.width, active_geo.height)
@@ -920,7 +933,10 @@ mod tests {
                 leaf(AxRole::ListItem, "row", false),
             ],
         };
-        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        // A backend that frames a switch as its whole row (iOS/idb) opts into the trailing-aim.
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks.clone())
+            .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
@@ -937,6 +953,112 @@ mod tests {
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
             bounds.clamped_center(100, 100)
+        );
+    }
+
+    #[test]
+    fn click_element_uses_center_for_a_row_shaped_checkable_on_a_non_trailing_backend() {
+        // The trailing-aim is opt-in per backend. A desktop backend (default FakePlatform: no
+        // `with_trailing_toggle_backend`) frames a labeled checkbox as a wide row too, but its
+        // indicator is at the LEADING edge — so a row-shaped checkable here must still click
+        // center, never trailing. This is the guard that keeps the iOS fix from misfiring
+        // on macOS/Windows/Linux/Android.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let bounds = AxRect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 15,
+        }; // identical row-shaped bounds to the trailing test
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "window".into(),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            children: vec![AxNode {
+                id: AxNodeId(0),
+                role: AxRole::CheckBox,
+                raw_role: "checkbox".into(),
+                name: Some("labeled".into()),
+                value: None,
+                states: AxStates {
+                    checkable: true,
+                    ..Default::default()
+                },
+                bounds: Some(bounds),
+                children: vec![],
+            }],
+        };
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+        g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            bounds.clamped_center(100, 100),
+            "a row-shaped checkable on a non-trailing backend clicks center, not trailing"
+        );
+    }
+
+    #[test]
+    fn click_element_uses_center_for_a_checkable_that_is_not_row_shaped() {
+        // Even on a trailing-toggle backend, a checkable whose bounds are NOT row-shaped clicks
+        // center. Uses exactly 4:1 (60x15) to pin the strict `>` boundary: 60 is NOT > 4*15=60,
+        // so it is treated as tight → center.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let bounds = AxRect {
+            x: 10,
+            y: 10,
+            width: 60,
+            height: 15,
+        }; // 60 == 4*15 exactly → not row-shaped (strict >)
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "window".into(),
+            name: None,
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            children: vec![AxNode {
+                id: AxNodeId(0),
+                role: AxRole::CheckBox,
+                raw_role: "checkbox".into(),
+                name: Some("tight".into()),
+                value: None,
+                states: AxStates {
+                    checkable: true,
+                    ..Default::default()
+                },
+                bounds: Some(bounds),
+                children: vec![],
+            }],
+        };
+        let platform = FakePlatform::new(100, 100)
+            .with_click_log(clicks.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+        g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            clicks.lock().unwrap().last().copied(),
+            bounds.clamped_center(100, 100),
+            "exactly 4:1 is not row-shaped (strict >), so it clicks center"
         );
     }
 

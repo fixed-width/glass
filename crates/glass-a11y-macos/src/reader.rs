@@ -415,8 +415,15 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 /// expose them as simple universal attributes, and the reader never over-claims a state it
 /// didn't read.
 fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
-    let (checkable, checked) =
-        mapping::checkable_checked(role, ffi::attribute_i64(el, attr::VALUE));
+    // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
+    // extra AX IPC round-trip) only for those roles — every other node skips it. `map_role`
+    // maps an `NSSwitch` to `CheckBox`, so switches are covered.
+    let (checkable, checked) = match role {
+        AxRole::CheckBox | AxRole::RadioButton => {
+            mapping::checkable_checked(role, ffi::attribute_i64(el, attr::VALUE))
+        }
+        _ => (false, false),
+    };
     AxStateFacts {
         enabled: ffi::attribute_bool(el, attr::ENABLED).unwrap_or(false),
         focused: ffi::attribute_bool(el, attr::FOCUSED).unwrap_or(false),
