@@ -34,9 +34,9 @@ internal refactors, CI, or test-only changes.
   path too.
 
 ### Fixed
-- **`glass_click_element` now reliably toggles an iOS switch.** iOS reports a switch's frame as its
-  whole table row, so a click aimed at the geometric center landed on the inert label and did nothing;
-  the click now targets the trailing control.
+- iOS: `glass_click_element` and `glass_set_value` now toggle a `UISwitch` by swiping its control (a tap
+  does not actuate a UISwitch); `glass_set_value` verifies the switch reached the requested state instead
+  of returning a premature `ok`. Other backends are unchanged.
 - **macOS: a newly-launched app is brought frontmost at `glass_start`**, so `glass_a11y_snapshot`
   resolves its window immediately instead of returning `window not found` until the first `glass_click`
   activated the app. The `window not found` message also now suggests a remedy.

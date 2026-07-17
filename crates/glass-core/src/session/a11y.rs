@@ -3,9 +3,20 @@ use super::*;
 
 /// A checkable element wider than this multiple of its height is treated as "row-shaped". On a
 /// backend that frames a switch as its whole row (`Platform::a11y_toggle_control_at_trailing_edge`),
-/// `click_element` aims a row-shaped checkable's tap at the trailing control instead of the row
+/// `click_element` swipes a row-shaped checkable's trailing control instead of clicking the row
 /// center.
 const ROW_ASPECT: u32 = 4;
+
+/// Duration of the trailing-toggle swipe (ms) — long enough for idb's HID swipe to register as a
+/// pan on a UISwitch; matches the proven ~250ms on-device swipe.
+const TOGGLE_SWIPE_MS: u64 = 250;
+
+/// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
+/// the swiped switch to read back the wanted state.
+const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
+/// Bound on the post-toggle verify poll — generous enough to absorb a lagging a11y-tree update
+/// under load without turning a real actuation failure into an indefinite hang.
+const TOGGLE_VERIFY_TIMEOUT_MS: u64 = 2000;
 
 impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
@@ -55,8 +66,8 @@ impl Glass {
     }
 
     /// Click the element with id `id` from the most recent `a11y_snapshot` via the normal
-    /// pointer path — the center of its bounds, or the trailing control for a row-shaped
-    /// checkable (see [`AxRect::clamped_trailing_point`]).
+    /// pointer path — the center of its bounds, or a swipe across the trailing control for a
+    /// row-shaped checkable on a trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]).
     pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
@@ -123,28 +134,41 @@ impl Glass {
         }
         // A switch whose backend reports the whole row as its frame with the control at the
         // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
-        // label. For such a backend, aim a row-shaped checkable's tap at the trailing control.
-        // Gated on the backend capability, NOT geometry alone: a wide *labeled* checkbox on a
-        // desktop backend is also row-shaped but has its indicator at the LEADING edge, so the
-        // trailing-aim must not apply there. The row-shape test uses the raw-bounds aspect as a
-        // cheap pre-filter; `clamped_trailing_point` derives its inset from the clamped visible
-        // height.
-        let (x, y) = if checkable
+        // label, and even aimed at the control a `UISwitch` does NOT actuate on a tap: it needs a
+        // short swipe (see `AxRect::trailing_toggle_swipe`). For such a backend, swipe a
+        // row-shaped checkable's trailing control instead of clicking it. Gated on the backend
+        // capability, NOT geometry alone: a wide *labeled* checkbox on a desktop backend is also
+        // row-shaped but has its indicator at the LEADING edge, so the trailing-aim must not
+        // apply there. The row-shape test uses the raw-bounds aspect as a cheap pre-filter;
+        // `trailing_toggle_swipe` derives its inset from the clamped visible height.
+        let row_shaped_toggle = checkable
             && trailing_toggle_backend
-            && bounds.width > bounds.height.saturating_mul(ROW_ASPECT)
-        {
-            bounds.clamped_trailing_point(active_geo.width, active_geo.height)
+            && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
+        if row_shaped_toggle {
+            let seg = bounds
+                .trailing_toggle_swipe(active_geo.width, active_geo.height)
+                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            self.pointer_inner(&PointerEvent::Drag {
+                from_x: seg.from_x,
+                from_y: seg.from_y,
+                to_x: seg.to_x,
+                to_y: seg.to_y,
+                duration_ms: TOGGLE_SWIPE_MS,
+                button: MouseButton::Left,
+                modifiers: vec![],
+            })
         } else {
-            bounds.clamped_center(active_geo.width, active_geo.height)
+            let (x, y) = bounds
+                .clamped_center(active_geo.width, active_geo.height)
+                .ok_or(GlassError::AxElementNotClickable(id.0))?;
+            self.pointer_inner(&PointerEvent::Click {
+                x,
+                y,
+                button: MouseButton::Left,
+                count: 1,
+                modifiers: vec![],
+            })
         }
-        .ok_or(GlassError::AxElementNotClickable(id.0))?;
-        self.pointer_inner(&PointerEvent::Click {
-            x,
-            y,
-            button: MouseButton::Left,
-            count: 1,
-            modifiers: vec![],
-        })
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -193,6 +217,53 @@ impl Glass {
         // open it, keyboard-navigate to the option, and press Enter.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
+        }
+        // iOS's value-set (tap+type) doesn't apply to a checkable — a tap doesn't toggle a
+        // UISwitch and there's no text to type — so a checkable is driven by the trailing-edge
+        // swipe instead. Set-to-target = toggle iff current != target, then verify by a bounded
+        // poll (never a silent ok). Gated on `checkable` alone (NOT row-shape): a checkable
+        // switch that isn't row-shaped on a trailing backend must still fail-safe through this
+        // branch (parse/verify → error) rather than fall through to the delegate below, which
+        // would silently tap the inert label and type into nothing. Read the needed state and
+        // DROP the `&self` borrow before calling click_element_inner (which needs `&mut self`).
+        let (trailing, node_state) = {
+            let s = self.require_active()?;
+            (
+                s.platform.a11y_toggle_control_at_trailing_edge(),
+                s.last_ax
+                    .as_ref()
+                    .and_then(|t| t.find(id))
+                    .map(|n| n.states),
+            )
+        };
+        if trailing {
+            if let Some(st) = node_state {
+                if st.checkable {
+                    // A checkable switch expects a boolean; unrecognized text must NOT fall
+                    // through to the tap+type delegate (which would silently no-op a UISwitch).
+                    // Erroring here preserves the "never a silent ok" invariant.
+                    let want = parse_bool(text).ok_or(GlassError::AxValueNotApplied(id.0))?;
+                    if st.checked == want {
+                        return Ok(()); // truthful no-op, no actuation
+                    }
+                    self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+                    let outcome = crate::poll::poll_until(
+                        TOGGLE_VERIFY_INTERVAL_MS,
+                        TOGGLE_VERIFY_TIMEOUT_MS,
+                        || {
+                            let tree = self.a11y_snapshot()?;
+                            let now = find_checkable_near(&tree.root, target.bounds.as_ref())
+                                .is_some_and(|n| n.states.checked == want);
+                            Ok(now.then_some(()))
+                        },
+                    )?;
+                    return if outcome.value.is_some() {
+                        Ok(())
+                    } else {
+                        Err(GlassError::AxValueNotApplied(id.0))
+                    };
+                }
+            }
         }
         let s = self.active_mut()?;
         s.accessibility
@@ -283,6 +354,16 @@ fn find_role(node: &AxNode, role: AxRole) -> Option<&AxNode> {
     node.children.iter().find_map(|c| find_role(c, role))
 }
 
+/// Parse a `set_value` boolean for a switch/checkbox. Case-insensitive; `None` for anything else
+/// (which falls through to the backend's normal `set_value` path).
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" => Some(true),
+        "false" | "off" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn rect_center(r: &crate::accessibility::AxRect) -> (i64, i64) {
     (
         r.x as i64 + r.width as i64 / 2,
@@ -319,6 +400,39 @@ fn find_combo_near<'a>(
     walk(root, tx, ty, &mut best);
     best.map(|(n, _)| n)
         .or_else(|| find_role(root, AxRole::ComboBox))
+}
+
+/// The CHECKABLE node nearest `bounds` — disambiguates same-named checkable siblings (e.g. two
+/// generic `UISwitch` rows) when re-locating a toggled switch after a re-snapshot, since ids
+/// don't survive it either. Matching by name alone risks latching onto a same-named sibling
+/// that already happens to sit in the wanted state, turning a no-op sibling into a false `Ok`
+/// for the element that was actually supposed to move — bounds are the disambiguator instead,
+/// same as `find_combo_near` uses for combos. Unlike `find_combo_near`, there is no
+/// single-element fallback when `bounds` is `None`: a toggle verify with no captured bounds
+/// must error rather than risk matching the wrong same-named node.
+fn find_checkable_near<'a>(
+    root: &'a AxNode,
+    bounds: Option<&crate::accessibility::AxRect>,
+) -> Option<&'a AxNode> {
+    let t = bounds?;
+    let (tx, ty) = rect_center(t);
+    fn walk<'a>(node: &'a AxNode, tx: i64, ty: i64, best: &mut Option<(&'a AxNode, i64)>) {
+        if node.states.checkable {
+            if let Some(b) = &node.bounds {
+                let (cx, cy) = rect_center(b);
+                let d = (cx - tx).pow(2) + (cy - ty).pow(2);
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    *best = Some((node, d));
+                }
+            }
+        }
+        for c in &node.children {
+            walk(c, tx, ty, best);
+        }
+    }
+    let mut best = None;
+    walk(root, tx, ty, &mut best);
+    best.map(|(n, _)| n)
 }
 
 /// The open (expanded) ComboBox, if any — disambiguates the one whose popup is up.
@@ -962,11 +1076,13 @@ mod tests {
     }
 
     #[test]
-    fn click_element_taps_trailing_edge_for_a_row_shaped_checkable() {
+    fn click_element_swipes_the_trailing_control_for_a_row_shaped_checkable() {
         // A checkable node whose bounds are row-shaped (w > 4h) — a backend (iOS/idb) that
-        // reports the whole cell as a switch's frame. The click must land near the trailing
-        // control (right of center); a non-checkable node of the SAME bounds still clicks center.
+        // reports the whole cell as a switch's frame. A `UISwitch` does not actuate on a tap, so
+        // the click must emit a swipe across the trailing control instead of a `Click`; a
+        // non-checkable node of the SAME bounds still clicks center.
         let clicks = Arc::new(Mutex::new(Vec::new()));
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let bounds = AxRect {
             x: 10,
             y: 10,
@@ -1007,23 +1123,53 @@ mod tests {
         // A backend that frames a switch as its whole row (iOS/idb) opts into the trailing-aim.
         let platform = FakePlatform::new(100, 100)
             .with_click_log(clicks.clone())
+            .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
 
-        // node #1 = the row-shaped checkable → trailing point (right of center).
+        // node #1 = the row-shaped checkable → a swipe across the trailing control, not a click.
         g.click_element(AxNodeId(1)).unwrap();
-        let trailing = bounds.clamped_trailing_point(100, 100).unwrap();
-        assert_eq!(clicks.lock().unwrap().last().copied(), Some(trailing));
-        assert!(trailing.0 > bounds.clamped_center(100, 100).unwrap().0);
+        let expected = bounds.trailing_toggle_swipe(100, 100).unwrap();
+        {
+            let d = drags.lock().unwrap();
+            assert_eq!(d.len(), 1, "a swipe was emitted");
+            match d[0] {
+                PointerEvent::Drag {
+                    from_x,
+                    from_y,
+                    to_x,
+                    to_y,
+                    duration_ms,
+                    ..
+                } => {
+                    assert_eq!((from_x, from_y), (expected.from_x, expected.from_y));
+                    assert_eq!((to_x, to_y), (expected.to_x, expected.to_y));
+                    assert_eq!(
+                        duration_ms, TOGGLE_SWIPE_MS,
+                        "a too-short duration would make idb treat this as a tap, not a swipe"
+                    );
+                }
+                ref e => panic!("expected a Drag, got {e:?}"),
+            }
+        }
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "the row-shaped checkable must swipe, not click"
+        );
 
-        // node #2 = the non-checkable row of identical bounds → geometric center (gate needs
-        // checkable, so a plain wide list row is unaffected).
+        // node #2 = the non-checkable row of identical bounds → geometric center click (gate
+        // needs checkable, so a plain wide list row is unaffected).
         g.click_element(AxNodeId(2)).unwrap();
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
             bounds.clamped_center(100, 100)
+        );
+        assert_eq!(
+            drags.lock().unwrap().len(),
+            1,
+            "the non-checkable row must not also emit a swipe"
         );
     }
 
@@ -1399,5 +1545,333 @@ mod tests {
             g.set_value(AxNodeId(1), "x").unwrap_err(),
             GlassError::AxElementNotEditable(1)
         ));
+    }
+
+    /// A row-shaped CheckBox "Sw" (300x30 at the origin) as the single child of a root Window —
+    /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
+    /// numbering gives the switch id 1.
+    fn sw(checked: bool) -> AxTree {
+        let switch = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::CheckBox,
+            raw_role: "switch".into(),
+            name: Some("Sw".into()),
+            value: None,
+            states: AxStates {
+                checkable: true,
+                checked,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 30,
+            }),
+            children: vec![],
+        };
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            }),
+            children: vec![switch],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn set_value_true_swipes_an_unchecked_ios_switch_and_verifies() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = unchecked; snapshot #2 (verify re-read) = checked.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(true)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches unchecked
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_true_is_a_noop_when_already_checked() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y(platform, sw(true));
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "already true -> no actuation"
+        );
+    }
+
+    #[test]
+    fn set_value_errors_when_the_toggle_does_not_apply() {
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_trailing_toggle_backend();
+        // Both reads unchecked: the swipe "did not take" -> honest error, not false ok.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(false)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(1), "true").unwrap_err();
+        assert!(matches!(err, GlassError::AxValueNotApplied(_)));
+    }
+
+    #[test]
+    fn set_value_false_swipes_a_checked_ios_switch_and_verifies() {
+        // The mirror of `set_value_true_swipes_an_unchecked_ios_switch_and_verifies` — proves
+        // the toggle path handles a checked -> unchecked transition too, not just off -> on.
+        // The fixed swipe is a TOGGLE gesture (proven on-device: identical swipes alternate
+        // off/on/off/on — see `AxRect::trailing_toggle_swipe`), so the same swipe that turns a
+        // switch on also turns it off; there is no direction logic to exercise separately.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = checked; snapshot #2 (verify re-read) = unchecked.
+        let mut g = glass_with_a11y_seq(platform, vec![sw(true), sw(false)]);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches checked
+
+        g.set_value(AxNodeId(1), "false").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_false_is_a_noop_when_already_unchecked() {
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y(platform, sw(false));
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "false").unwrap();
+
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "already false -> no actuation"
+        );
+    }
+
+    /// Two same-named ("Sw") row-shaped switches at DIFFERENT bounds — a `sibling` listed
+    /// before the `target` (so a naive first-match-by-name search hits the sibling first,
+    /// the exact silent-success risk `find_checkable_near` exists to rule out), and a
+    /// `target` at the bounds `set_value` actually addresses. Pre-order id assignment gives
+    /// the sibling id 1 and the target id 2. Shared by the disambiguation tests below.
+    fn two_switches(sibling_checked: bool, target_checked: bool) -> AxTree {
+        let make = |checked: bool, y: i32| AxNode {
+            id: AxNodeId(0),
+            role: AxRole::CheckBox,
+            raw_role: "switch".into(),
+            name: Some("Sw".into()),
+            value: None,
+            states: AxStates {
+                checkable: true,
+                checked,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y,
+                width: 300,
+                height: 30,
+            }),
+            children: vec![],
+        };
+        let sibling = make(sibling_checked, 0);
+        let target = make(target_checked, 200);
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+            }),
+            children: vec![sibling, target],
+        };
+        AxTree { root, count: 0 }
+    }
+
+    #[test]
+    fn set_value_true_verifies_the_target_by_bounds_when_a_same_named_sibling_is_already_checked() {
+        // The sibling "Sw" is already checked (the wanted state) throughout; only the TARGET
+        // flips false -> true on the verify re-snapshot. A name-only verify (the old,
+        // pre-order-first `find_named`) would match the sibling — listed first — and return Ok
+        // regardless of whether the target itself ever moved. The bounds-nearest verify must
+        // instead confirm THIS node (the target, at its own captured bounds) reached the
+        // wanted state.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y_seq(
+            platform,
+            vec![two_switches(true, false), two_switches(true, true)],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap(); // caches: sibling already checked, target unchecked
+
+        // Target is id 2 (sibling listed first gets id 1; see `two_switches`).
+        g.set_value(AxNodeId(2), "true").unwrap();
+
+        assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_true_errors_when_only_a_same_named_sibling_is_checked() {
+        // Same same-named-sibling setup, but this time the swipe "does not take": the target
+        // stays unchecked on the verify re-snapshot while the sibling remains (coincidentally)
+        // already checked. A name-only verify would match the sibling first and return a false
+        // Ok — exactly the silent-success bug this fixture guards against. The bounds-nearest
+        // verify must instead see the ACTUAL target still unchecked and report
+        // `AxValueNotApplied`, proving a same-name collision can never fake a false ok.
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(Arc::new(Mutex::new(Vec::new())))
+            .with_trailing_toggle_backend();
+        let mut g = glass_with_a11y_seq(
+            platform,
+            vec![two_switches(true, false), two_switches(true, false)],
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(2), "true").unwrap_err();
+        assert!(matches!(err, GlassError::AxValueNotApplied(2)));
+    }
+
+    #[test]
+    fn set_value_on_a_non_checkable_element_ignores_the_trailing_toggle_gate() {
+        // The iOS toggle gate (`set_value_inner`'s trailing-toggle branch) must only intercept
+        // CHECKABLE elements — `checkable` is the discriminator, not "did the text parse as a
+        // bool". Uses a BOOLEAN value ("true") deliberately: with non-bool text, a dropped
+        // `checkable` guard is invisible (both arms fall through to the delegate the same way),
+        // so this must exercise the boolean path to actually catch a removed guard. A boolean
+        // value on a non-checkable element (e.g. a plain button) must still fall straight
+        // through to the normal accessibility `set_value` delegate path, unchanged — no
+        // swipe/drag is ever emitted, and the backend's `set_value` is the one that actually
+        // runs.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let log2 = log.clone();
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(
+                FakePlatform::new(100, 100)
+                    .with_drag_log(drags.clone())
+                    .with_trailing_toggle_backend(),
+            ),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: fake_tree(), // #1 is a non-checkable Button "Save"
+                set_log: log2,
+                set_fail: false,
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the delegate accessibility set_value path was taken"
+        );
+        assert_eq!(calls[0].1, "true");
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "a non-checkable element must never trigger the toggle swipe"
+        );
+    }
+
+    #[test]
+    fn set_value_on_a_checkable_rejects_non_boolean_text() {
+        // FIX 1's core invariant: a non-boolean value on a checkable+trailing target must ERROR,
+        // never fall through to the tap+type delegate (which would tap the inert label, type
+        // into nothing, and still report Ok — the exact silent success this branch exists to
+        // kill). No actuation (no swipe) and no delegate call either.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let log2 = log.clone();
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(
+                FakePlatform::new(400, 400)
+                    .with_drag_log(drags.clone())
+                    .with_trailing_toggle_backend(),
+            ),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: sw(false), // #1 is the checkable switch "Sw"
+                set_log: log2,
+                set_fail: false,
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot().unwrap();
+
+        let err = g.set_value(AxNodeId(1), "banana").unwrap_err();
+
+        assert!(matches!(err, GlassError::AxValueNotApplied(1)), "{err}");
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "an unparseable value must never trigger the toggle swipe"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "an unparseable value must never fall through to the tap+type delegate"
+        );
+    }
+
+    #[test]
+    fn parse_bool_accepts_the_documented_spellings() {
+        for t in ["true", "on", "1", "yes", "TRUE"] {
+            assert_eq!(parse_bool(t), Some(true));
+        }
+        for f in ["false", "off", "0", "no", "OFF"] {
+            assert_eq!(parse_bool(f), Some(false));
+        }
+        assert_eq!(parse_bool("banana"), None);
     }
 }
