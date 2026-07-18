@@ -34,6 +34,11 @@ internal refactors, CI, or test-only changes.
   path too.
 
 ### Fixed
+- **Linux: accessibility-enabled launches are no longer slow.** On X11 and Wayland, starting an app
+  with `a11y: true` (needed for `glass_a11y_snapshot`, `glass_click_element`, and the other
+  accessibility tools) previously added a fixed ~25-second delay before the app's window appeared.
+  glass now runs its private accessibility bus with no auto-activatable services, eliminating the
+  delay — these launches are now as fast as launches without accessibility.
 - iOS: `glass_click_element` and `glass_set_value` now toggle a `UISwitch` by swiping its control (a tap
   does not actuate a UISwitch); `glass_set_value` verifies the switch reached the requested state instead
   of returning a premature `ok`. Other backends are unchanged.
