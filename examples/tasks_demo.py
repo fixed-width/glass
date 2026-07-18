@@ -1,12 +1,4 @@
-"""A tiny GTK4 "Tasks" app — with a deliberate bug — for trying glass end to end.
-
-There's a bug: clicking **Add** does nothing. Point an agent at glass and have it run this app,
-reproduce the bug from the accessibility tree, find and fix it in the code, and verify a task
-appears. See examples/README.md for the prompt (and, if you want it, the answer).
-
-Run directly to see the bug yourself:  python3 examples/tasks_demo.py
-(needs Python 3 + GTK 4 introspection: `apt install python3-gi gir1.2-gtk-4.0`)
-"""
+"""A tiny GTK4 "Tasks" app: type a task, click Add, and it appears in the list."""
 
 import gi
 
