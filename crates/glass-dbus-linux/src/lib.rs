@@ -76,7 +76,7 @@ impl PrivateBus {
   </policy>
 </busconfig>
 "#,
-            sock = session_sock.display()
+            sock = xml_escape(&session_sock.display().to_string())
         );
         std::fs::write(&config_path, config)
             .map_err(|e| GlassError::Backend(format!("write a11y bus config: {e}")))?;
@@ -84,10 +84,9 @@ impl PrivateBus {
             .arg("--config-file")
             .arg(&config_path)
             .arg("--print-address")
-            // Pin XDG_RUNTIME_DIR to the private dir so the launcher we spawn (and any
-            // child it forks) keep their sockets inside it, off the host's
-            // /run/user/UID/at-spi/ — preserving isolation from the host a11y bus.
-            .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            // No XDG_RUNTIME_DIR pin on the daemon: it declares no activatable services, so
+            // nothing inherits its env, and its listen socket is the explicit path above. The
+            // launcher we spawn below keeps its OWN XDG_RUNTIME_DIR pinned to the private dir.
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -141,6 +140,15 @@ impl PrivateBus {
                 runtime_dir,
             }),
             Err(e) => {
+                // With no activation fallback, the directly-spawned launcher is the only path
+                // to org.a11y.Bus. If it has already exited, name that specifically instead of
+                // returning only the generic resolve timeout.
+                let e = match atspi.try_wait() {
+                    Ok(Some(status)) => GlassError::Backend(format!(
+                        "at-spi-bus-launcher exited ({status}) before claiming org.a11y.Bus: {e}"
+                    )),
+                    _ => e,
+                };
                 reap_children(&mut dbus, &mut atspi);
                 Err(e)
             }
@@ -198,6 +206,17 @@ fn read_first_line(stdout: ChildStdout, timeout: Duration) -> Result<(String, Ch
             "timed out reading dbus-daemon address".into(),
         )),
     }
+}
+
+/// Minimal XML escaping for the socket path spliced into the generated bus config, so an
+/// unusual `TMPDIR` (a path containing `&`, `<`, `>`, `"`) can't produce malformed XML that
+/// `dbus-daemon` rejects with an opaque "failed to start" error. `&` must be replaced first.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn find_launcher() -> Option<PathBuf> {
@@ -333,10 +352,11 @@ mod tests {
 
     /// The private session bus must expose NO auto-activatable services. glass spawns
     /// `at-spi-bus-launcher` directly (it owns `org.a11y.Bus`), and the generated bus config
-    /// declares no `<servicedir>`, so a launched GtkApplication's startup probe of a portal
-    /// fails FAST with `ServiceUnknown` instead of triggering a D-Bus activation that blocks
-    /// the launch for the ~25s reply timeout (a portal cannot run in this isolated env). Run
-    /// under a throwaway `XDG_RUNTIME_DIR` (test-a11y.sh does).
+    /// declares no `<servicedir>` — so nothing can be D-Bus-activated. That is what stops a
+    /// launched GtkApplication's startup portal probe from triggering an activation that blocks
+    /// the launch for the ~25s D-Bus reply timeout. Asserting on `ListActivatableNames` proves
+    /// the property directly from the (zero) servicedir count, independent of whether any
+    /// particular service (e.g. a portal) happens to be installed on the test host.
     #[test]
     #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run via test-a11y.sh"]
     fn private_bus_has_no_auto_activatable_services() {
@@ -345,8 +365,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let started = Instant::now();
-        let res = rt.block_on(async {
+        let activatable = rt.block_on(async {
             let addr: zbus::Address = bus
                 .session_bus_address()
                 .try_into()
@@ -356,21 +375,57 @@ mod tests {
                 .build()
                 .await
                 .expect("connect session bus");
-            let dbus = zbus::fdo::DBusProxy::new(&conn).await.expect("DBus proxy");
-            // A portal only the system service dirs would provide. With no <servicedir> the
-            // bus must refuse to activate it, and do so immediately.
-            let name = zbus::names::WellKnownName::try_from("org.freedesktop.portal.Desktop")
-                .expect("well-known name");
-            dbus.start_service_by_name(name, 0).await
+            let dbus_proxy = zbus::fdo::DBusProxy::new(&conn).await.expect("DBus proxy");
+            dbus_proxy
+                .list_activatable_names()
+                .await
+                .expect("list activatable names")
         });
-        let elapsed = started.elapsed();
+        // The bus is always activatable as itself; nothing else may be. Anything extra means a
+        // <servicedir> leaked in (e.g. a portal) — exactly what caused the ~25s startup hang.
+        let extra: Vec<_> = activatable
+            .iter()
+            .filter(|n| n.as_str() != "org.freedesktop.DBus")
+            .collect();
         assert!(
-            matches!(res, Err(zbus::fdo::Error::ServiceUnknown(_))),
-            "portal must not be activatable on the private bus (got {res:?})"
+            extra.is_empty(),
+            "private bus must expose no auto-activatable services, found: {extra:?}"
+        );
+    }
+
+    /// With no service dirs, `org.a11y.Bus` is owned *only* by the directly-spawned launcher —
+    /// there is no activation fallback. If that launcher never claims the name (here a stand-in
+    /// that exits immediately without claiming it), `PrivateBus::start` must fail loudly and
+    /// promptly — naming the dead launcher — rather than hanging or returning a broken address.
+    #[test]
+    #[ignore = "spawns a private dbus-daemon; run via test-a11y.sh"]
+    fn launcher_that_never_claims_the_name_fails_fast() {
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("GLASS_ATSPI_LAUNCHER");
+            }
+        }
+        // /bin/true is a real file (find_launcher accepts it) that exits 0 without ever
+        // claiming org.a11y.Bus.
+        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/bin/true");
+        let _guard = EnvGuard;
+
+        let started = Instant::now();
+        let res = PrivateBus::start();
+        let elapsed = started.elapsed();
+        // `PrivateBus` isn't `Debug`, so match rather than `expect_err`.
+        let err = match res {
+            Ok(_) => panic!("a launcher that never claims org.a11y.Bus must fail the bring-up"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("at-spi-bus-launcher exited"),
+            "the error should name the dead launcher, got: {err}"
         );
         assert!(
-            elapsed < Duration::from_secs(5),
-            "activation attempt must fail fast (no hang), took {elapsed:?}"
+            elapsed < Duration::from_secs(8),
+            "bring-up must fail promptly (bounded by the resolve poll), took {elapsed:?}"
         );
     }
 
