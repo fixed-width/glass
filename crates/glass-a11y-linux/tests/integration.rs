@@ -52,7 +52,7 @@ fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
                     title: Some("Glass A11y Fixture".into()),
                     class: None,
                 }),
-                timeout_ms: 35_000,
+                timeout_ms: 10_000,
                 sandbox: glass_core::SandboxLevel::Off,
                 a11y: true,
             })
@@ -82,17 +82,16 @@ fn snapshot_finds_gtk_widgets() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
         .expect("launch GTK fixture");
 
-    // GTK4 apps connecting to a fresh D-Bus session (as in test-a11y.sh) go
-    // through xdg-desktop-portal initialisation before presenting the window.
-    // The portal's secrets-service probe can take ~25 s on a system without
-    // gnome-keyring on the private bus, so wait long enough that the window is
-    // mapped and the AT-SPI tree is populated before we snapshot.
+    // Give the AT-SPI tree a moment to populate after the window maps, then snapshot.
+    // The launch itself is fast: glass spawns the private session bus with no
+    // auto-activatable services, so the app's startup portal probe fails fast instead of
+    // blocking on a D-Bus activation timeout.
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let tree = glass.a11y_snapshot().expect("a11y snapshot");
@@ -104,6 +103,59 @@ fn snapshot_finds_gtk_widgets() {
     assert!(
         outline.contains("CheckBox \"Enable\""),
         "no Enable checkbox in:\n{outline}"
+    );
+
+    glass.stop().expect("stop");
+}
+
+/// Regression guard for the private-bus portal-activation hang: launching a GtkApplication
+/// with `a11y: true` once cost a constant ~25s — the app's startup probe of
+/// `org.freedesktop.portal.Desktop` triggered a D-Bus activation on the private session bus
+/// that never replied, so the window did not map until the 25s reply timeout elapsed. The
+/// private bus now declares no auto-activatable services, so the launch is fast. `timeout_ms`
+/// is left generous here (a regressed hang would complete within it) so the timing assertion —
+/// a coarse tripwire, not a perf gate — is what catches the regression. The 20s threshold sits
+/// above `PrivateBus::start`'s own worst-case bring-up budget (READY_TIMEOUT + resolve ≈ 15s),
+/// so a merely-slow-but-healthy bus can't trip it, yet stays well below the ~25s hang. The
+/// snapshot check proves a11y is still functional, not merely fast.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn a11y_launch_is_fast_without_the_portal_hang() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
+    let started = std::time::Instant::now();
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Fixture".into()),
+                class: None,
+            }),
+            timeout_ms: 30_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("launch GTK fixture");
+    let launch = started.elapsed();
+    assert!(
+        launch < std::time::Duration::from_secs(20),
+        "a11y launch took {launch:?}; the ~25s portal-activation hang may have regressed"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let outline = glass.a11y_snapshot().expect("a11y snapshot").to_outline();
+    assert!(
+        outline.contains("Button \"Save\""),
+        "a11y tree missing after a fast launch:\n{outline}"
     );
 
     glass.stop().expect("stop");
@@ -130,7 +182,7 @@ fn snapshot_reads_entry_value() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
@@ -173,7 +225,7 @@ fn set_value_changes_entry() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
@@ -222,7 +274,7 @@ fn set_value_on_button_is_not_editable() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
@@ -260,7 +312,7 @@ fn set_value_changes_spinbutton() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
@@ -336,7 +388,7 @@ fn launch_fixture() -> Glass {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: true,
         })
@@ -528,7 +580,7 @@ fn snapshot_without_a11y_flag_errors() {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: glass_core::SandboxLevel::Off,
             a11y: false,
         })
@@ -567,7 +619,7 @@ fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: level,
             a11y: true,
         })
@@ -629,7 +681,7 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
                 title: Some("Glass A11y Fixture".into()),
                 class: None,
             }),
-            timeout_ms: 35_000,
+            timeout_ms: 10_000,
             sandbox: level,
             a11y: true,
         })
