@@ -1,7 +1,8 @@
 //! `PrivateBus`: a per-session private D-Bus session bus + AT-SPI registry so a
 //! launched app publishes an accessibility tree isolated from the host session.
-//! Spawns `dbus-daemon --session --print-address` and `at-spi-bus-launcher`, and
-//! resolves the a11y-bus address; reaps both on `Drop` (mirrors `glass-x11`'s `Xvfb`).
+//! Spawns a minimal-config `dbus-daemon` (session bus, no auto-activatable services) plus
+//! `at-spi-bus-launcher`, and resolves the a11y-bus address; reaps both on `Drop` (mirrors
+//! `glass-x11`'s `Xvfb`).
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -53,18 +54,39 @@ impl PrivateBus {
             .map_err(|e| GlassError::Backend(format!("a11y runtime dir: {e}")))?;
 
         let session_sock = runtime_dir.path().join("session-bus");
+        let config_path = runtime_dir.path().join("session-bus.conf");
+        // Spawn the private session bus from a minimal generated config rather than
+        // `--session`. `--session` loads the system service directories, which makes
+        // portals and session managers auto-activatable: a launched GtkApplication probes
+        // `org.freedesktop.portal.Desktop` at startup, the bus tries to activate a portal
+        // that cannot run in this headless/isolated environment, and GTK blocks on the ~25s
+        // D-Bus reply timeout before it maps its window (glass then waits that out locating
+        // the window). A config with NO `<servicedir>` makes that probe fail fast
+        // (`ServiceUnknown`). a11y is unaffected: `at-spi-bus-launcher`, spawned directly
+        // below, owns `org.a11y.Bus` on this bus — it is never D-Bus-activated.
+        let config = format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path={sock}</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+            sock = session_sock.display()
+        );
+        std::fs::write(&config_path, config)
+            .map_err(|e| GlassError::Backend(format!("write a11y bus config: {e}")))?;
         let mut dbus = Command::new(&dbus_bin)
-            .args([
-                "--session",
-                &format!("--address=unix:path={}", session_sock.display()),
-                "--print-address",
-            ])
-            // Pin XDG_RUNTIME_DIR to the private dir: when this bus *D-Bus-activates*
-            // org.a11y.Bus (which it does whenever the launcher we spawn directly doesn't
-            // claim the name first), the activated at-spi-bus-launcher inherits this env.
-            // Without it, activation falls back to the ambient XDG_RUNTIME_DIR and attaches
-            // to the *host* accessibility bus — breaking isolation and risking a wedge on
-            // the contended host bus. Keep activation inside the private dir.
+            .arg("--config-file")
+            .arg(&config_path)
+            .arg("--print-address")
+            // Pin XDG_RUNTIME_DIR to the private dir so the launcher we spawn (and any
+            // child it forks) keep their sockets inside it, off the host's
+            // /run/user/UID/at-spi/ — preserving isolation from the host a11y bus.
             .env("XDG_RUNTIME_DIR", runtime_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -282,6 +304,7 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run explicitly"]
@@ -308,36 +331,46 @@ mod tests {
         assert_ne!(a.runtime_dir(), b.runtime_dir());
     }
 
-    /// Regression: the private a11y bus must stay inside our private runtime dir even
-    /// when `org.a11y.Bus` is brought up by **D-Bus activation** rather than the launcher
-    /// we spawn directly. We force that path by pointing `GLASS_ATSPI_LAUNCHER` at a no-op
-    /// (`/bin/true` exits without claiming the name — exactly the zombie observed in
-    /// practice), so the session bus must activate the real launcher itself. If the
-    /// activated launcher escapes to the ambient `XDG_RUNTIME_DIR`, it attaches to the
-    /// host accessibility bus — breaking isolation and (as observed) wedging on the
-    /// contended host bus. Run this under a throwaway `XDG_RUNTIME_DIR` (test-a11y.sh does)
-    /// so "ambient" is a sacrificial dir, never the operator's real `/run/user/UID`.
+    /// The private session bus must expose NO auto-activatable services. glass spawns
+    /// `at-spi-bus-launcher` directly (it owns `org.a11y.Bus`), and the generated bus config
+    /// declares no `<servicedir>`, so a launched GtkApplication's startup probe of a portal
+    /// fails FAST with `ServiceUnknown` instead of triggering a D-Bus activation that blocks
+    /// the launch for the ~25s reply timeout (a portal cannot run in this isolated env). Run
+    /// under a throwaway `XDG_RUNTIME_DIR` (test-a11y.sh does).
     #[test]
-    #[ignore = "spawns a private dbus-daemon + activates at-spi; run via test-a11y.sh"]
-    fn activation_fallback_stays_in_the_private_runtime_dir() {
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                std::env::remove_var("GLASS_ATSPI_LAUNCHER");
-            }
-        }
-        // /bin/true is a real file (find_launcher accepts it) that exits 0 immediately,
-        // so it never claims org.a11y.Bus → the session bus must activate the real one.
-        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/bin/true");
-        let _guard = EnvGuard;
-
-        let bus = PrivateBus::start().expect("a11y bring-up via D-Bus activation");
-        let private_dir = bus.runtime_dir().to_string_lossy().into_owned();
-        let a11y = bus.a11y_bus_address();
+    #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run via test-a11y.sh"]
+    fn private_bus_has_no_auto_activatable_services() {
+        let bus = PrivateBus::start().expect("private bus");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = Instant::now();
+        let res = rt.block_on(async {
+            let addr: zbus::Address = bus
+                .session_bus_address()
+                .try_into()
+                .expect("parse session address");
+            let conn = zbus::connection::Builder::address(addr)
+                .expect("address builder")
+                .build()
+                .await
+                .expect("connect session bus");
+            let dbus = zbus::fdo::DBusProxy::new(&conn).await.expect("DBus proxy");
+            // A portal only the system service dirs would provide. With no <servicedir> the
+            // bus must refuse to activate it, and do so immediately.
+            let name = zbus::names::WellKnownName::try_from("org.freedesktop.portal.Desktop")
+                .expect("well-known name");
+            dbus.start_service_by_name(name, 0).await
+        });
+        let elapsed = started.elapsed();
         assert!(
-            a11y.contains(&private_dir),
-            "a11y bus {a11y} escaped the private runtime dir {private_dir} \
-             (activation inherited the ambient XDG_RUNTIME_DIR — isolation breach)"
+            matches!(res, Err(zbus::fdo::Error::ServiceUnknown(_))),
+            "portal must not be activatable on the private bus (got {res:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "activation attempt must fail fast (no hang), took {elapsed:?}"
         );
     }
 
