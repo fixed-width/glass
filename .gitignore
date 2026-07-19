@@ -24,3 +24,6 @@ perf.data.old
 
 # Pulled-back artifacts from scripts/test-windows.sh on-box runs
 /.windows-artifacts/
+
+# Fixture cruft
+**/__pycache__/
