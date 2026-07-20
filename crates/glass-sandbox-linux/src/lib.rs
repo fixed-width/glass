@@ -74,6 +74,50 @@ pub fn program_ro_binds(program: &OsStr) -> Vec<std::path::PathBuf> {
     }
 }
 
+/// Read-only binds that make the launch target reachable inside the namespace: the program and
+/// every `run` argument that names an existing absolute path. The ephemeral-`$HOME` and `/tmp`
+/// tmpfs shadow anything under those roots, so a script/asset passed by absolute path must be
+/// re-bound to be visible. Bare-name programs (resolved via `PATH` under `--ro-bind / /`) and
+/// relative args (covered by the `cwd` bind) contribute nothing.
+///
+/// Each target is exposed by its directory (so sibling modules/assets are reachable), EXCEPT when
+/// that directory is a tmpfs-shadowed root (`home` or `/tmp`) or an ancestor of one — binding it
+/// would re-mount the real subtree over the tmpfs, so only the file itself is bound. Read-only,
+/// de-duplicated. Mirrors the `cwd` guard in `WrapOpts`.
+pub fn launch_ro_binds(program: &OsStr, args: &[OsString], home: &OsStr) -> Vec<PathBuf> {
+    let home = canon(std::path::Path::new(home));
+    let shadowed_roots = [home.as_path(), std::path::Path::new("/tmp")];
+    let mut out: Vec<PathBuf> = Vec::new();
+    for tok in std::iter::once(program).chain(args.iter().map(|a| a.as_os_str())) {
+        let p = std::path::Path::new(tok);
+        if !p.is_absolute() {
+            continue; // bare-name (PATH) or relative (cwd) — already reachable
+        }
+        let real = canon(p);
+        if std::fs::metadata(&real).is_err() {
+            continue; // not an existing path (a flag/value) — nothing to bind
+        }
+        let is_dir = std::fs::metadata(&real)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        let dir: &std::path::Path = if is_dir {
+            &real
+        } else {
+            real.parent().unwrap_or(&real)
+        };
+        // Never re-expose a tmpfs-shadowed root (or an ancestor of one) as a directory.
+        let bind = if shadowed_roots.iter().any(|root| root.starts_with(dir)) {
+            real.clone()
+        } else {
+            dir.to_path_buf()
+        };
+        if !out.contains(&bind) {
+            out.push(bind);
+        }
+    }
+    out
+}
+
 /// The ephemeral HOME path to use: the real `$HOME` (so apps that hardcode the path
 /// still work — it's shadowed by a tmpfs), else a fixed fallback.
 pub fn ephemeral_home() -> OsString {
@@ -445,6 +489,103 @@ mod tests {
             binds.is_empty(),
             "bare name needs no extra bind; got: {binds:?}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // launch_ro_binds tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bare_name_program_binds_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let out = launch_ro_binds(OsStr::new("python3"), &[], home.path().as_os_str());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn program_under_a_project_dir_binds_its_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = home.path().join("proj/app");
+        std::fs::create_dir_all(&proj).unwrap();
+        let bin = proj.join("bin");
+        std::fs::write(&bin, b"").unwrap();
+        let out = launch_ro_binds(bin.as_os_str(), &[], home.path().as_os_str());
+        assert_eq!(out, vec![proj.canonicalize().unwrap()]); // the file's directory, not the file
+    }
+
+    #[test]
+    fn arg_script_binds_its_directory_so_siblings_are_reachable() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("app.py");
+        std::fs::write(&script, b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&script)],
+            home.path().as_os_str(),
+        );
+        assert_eq!(out, vec![dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn existing_directory_arg_binds_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("proj/data");
+        std::fs::create_dir_all(&data).unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("srv"),
+            &[OsString::from("--root"), OsString::from(&data)],
+            home.path().as_os_str(),
+        );
+        assert_eq!(out, vec![data.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn target_directly_in_home_binds_only_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("app.py"); // parent dir == home
+        std::fs::write(&script, b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&script)],
+            home.path().as_os_str(),
+        );
+        assert_eq!(out, vec![script.canonicalize().unwrap()]); // guard: never bind home itself as a dir
+        assert!(!out.iter().any(|p| p == home.path()));
+    }
+
+    #[test]
+    fn nonpath_and_relative_args_contribute_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[
+                OsString::from("-m"),
+                OsString::from("http.server"),
+                OsString::from("app.py"),
+                OsString::from("/no/such/abs/path"),
+            ],
+            home.path().as_os_str(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn duplicate_dirs_are_collapsed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.py");
+        std::fs::write(&a, b"").unwrap();
+        let b = dir.join("b.py");
+        std::fs::write(&b, b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&a), OsString::from(&b)],
+            home.path().as_os_str(),
+        );
+        assert_eq!(out, vec![dir.canonicalize().unwrap()]);
     }
 
     #[test]
