@@ -533,7 +533,10 @@ fn bring_up_session(
             // group, not just the leader, or a leaked Xwayland holds the X
             // display in the global namespace and breaks the next session.
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-            return Err(GlassError::AppExited(status.code()));
+            return Err(GlassError::app_exited_during_discovery(
+                status.code(),
+                spec.sandbox != glass_core::SandboxLevel::Off,
+            ));
         }
         if Instant::now() >= deadline {
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
@@ -569,7 +572,10 @@ fn bring_up_session(
                 // Reap the whole group (see the socket-wait loop above): an
                 // unclean sway exit can orphan Xwayland + the app otherwise.
                 glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
-                return Err(GlassError::AppExited(status.code()));
+                return Err(GlassError::app_exited_during_discovery(
+                    status.code(),
+                    spec.sandbox != glass_core::SandboxLevel::Off,
+                ));
             }
             if Instant::now() >= deadline {
                 glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);

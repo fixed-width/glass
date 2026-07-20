@@ -15,6 +15,17 @@ pub enum GlassError {
     #[error("app exited (code {0:?})")]
     AppExited(Option<i32>),
 
+    /// Same failure as `AppExited`, but the launch was sandboxed — so the
+    /// exit may be the contained app failing to find a file that a bind
+    /// mount hides. Carries a remedy rather than internal threat-model
+    /// detail.
+    #[error(
+        "app exited (code {0:?}) before its window appeared. If it was sandboxed, a file it needs \
+         may be hidden by the ephemeral $HOME/tmp — set `cwd`, add a bind, or run with \
+         sandbox:\"off\"."
+    )]
+    SandboxedAppExited(Option<i32>),
+
     #[error(
         "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
     )]
@@ -125,6 +136,18 @@ impl GlassError {
         }
         msg.push_str("; call glass_capabilities to see what this backend can do");
         GlassError::Unsupported(msg)
+    }
+
+    /// The error for "the child exited before `discover_window` found its
+    /// window" — `SandboxedAppExited` (with the path-visibility remedy) when
+    /// the launch was contained, plain `AppExited` otherwise. Shared by every
+    /// backend's discovery loop so the conditional isn't triplicated.
+    pub fn app_exited_during_discovery(code: Option<i32>, sandboxed: bool) -> Self {
+        if sandboxed {
+            GlassError::SandboxedAppExited(code)
+        } else {
+            GlassError::AppExited(code)
+        }
     }
 }
 
@@ -237,6 +260,25 @@ mod tests {
             "window_move_resize is not supported by the android backend (apps are full-screen); \
              call glass_capabilities to see what this backend can do"
         );
+    }
+
+    #[test]
+    fn sandboxed_app_exited_message_hints_the_remedy() {
+        let msg = GlassError::SandboxedAppExited(Some(2)).to_string();
+        assert!(msg.contains("sandbox:\"off\""), "{msg}");
+        assert!(msg.contains("$HOME"), "{msg}");
+    }
+
+    #[test]
+    fn app_exited_during_discovery_picks_the_sandboxed_variant_when_sandboxed() {
+        let err = GlassError::app_exited_during_discovery(Some(2), true);
+        assert!(matches!(err, GlassError::SandboxedAppExited(Some(2))));
+    }
+
+    #[test]
+    fn app_exited_during_discovery_picks_the_plain_variant_when_not_sandboxed() {
+        let err = GlassError::app_exited_during_discovery(Some(2), false);
+        assert!(matches!(err, GlassError::AppExited(Some(2))));
     }
 
     #[test]
