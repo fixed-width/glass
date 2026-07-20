@@ -54,10 +54,10 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Re-expose the program binary when it is absolute (it may live under
-            // $HOME, which the ephemeral tmpfs shadows). PATH-resolved bare names
-            // are covered by `--ro-bind / /` and need no extra bind.
-            let mut ro_binds = glass_sandbox_linux::program_ro_binds(&prog);
+            // Re-expose the launch target — the program and any path-argument under $HOME/tmp, which
+            // the ephemeral tmpfs shadows.
+            let mut ro_binds =
+                glass_sandbox_linux::launch_ro_binds(&prog, &args, &ephemeral_home());
             if let Some(dir) = a11y_bind_dir {
                 ro_binds.push(dir.to_path_buf());
             }

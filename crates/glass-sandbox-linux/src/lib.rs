@@ -61,19 +61,6 @@ pub struct WrapOpts {
     pub rw_binds: Vec<PathBuf>,
 }
 
-/// Read-only binds needed to reach the program binary inside the namespace: the
-/// program path itself when it is absolute (it may live under `$HOME`, which the
-/// ephemeral-HOME tmpfs shadows). Bare-name programs resolve via PATH (covered by
-/// `--ro-bind / /`), so they need no extra bind.
-pub fn program_ro_binds(program: &OsStr) -> Vec<std::path::PathBuf> {
-    let p = std::path::Path::new(program);
-    if p.is_absolute() {
-        vec![p.to_path_buf()]
-    } else {
-        vec![]
-    }
-}
-
 /// Read-only binds that make the launch target reachable inside the namespace: the program and
 /// every `run` argument that names an existing absolute path. The ephemeral-`$HOME` and `/tmp`
 /// tmpfs shadow anything under those roots, so a script/asset passed by absolute path must be
@@ -478,21 +465,6 @@ mod tests {
         assert!(
             s.windows(2).any(|w| w == ["--chdir", "/home/u/proj"]),
             "cwd subdir of home must emit --chdir <cwd>; got: {s:?}"
-        );
-    }
-
-    #[test]
-    fn program_ro_binds_absolute_returns_that_path() {
-        let binds = super::program_ro_binds(OsStr::new("/home/u/myapp"));
-        assert_eq!(binds, vec![PathBuf::from("/home/u/myapp")]);
-    }
-
-    #[test]
-    fn program_ro_binds_bare_name_returns_empty() {
-        let binds = super::program_ro_binds(OsStr::new("app"));
-        assert!(
-            binds.is_empty(),
-            "bare name needs no extra bind; got: {binds:?}"
         );
     }
 

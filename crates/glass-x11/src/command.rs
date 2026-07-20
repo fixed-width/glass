@@ -32,12 +32,14 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Always re-expose the X11 socket dir; also re-expose the program
-            // binary itself when it is absolute (it may live under $HOME, which
-            // the ephemeral tmpfs shadows). PATH-resolved bare names are covered
-            // by `--ro-bind / /` and need no extra bind.
+            // Always re-expose the X11 socket dir; also re-expose the launch target — the program and
+            // any argument that names a path under $HOME/tmp, which the ephemeral tmpfs shadows.
             let mut ro_binds = vec![std::path::PathBuf::from("/tmp/.X11-unix")];
-            ro_binds.extend(glass_sandbox_linux::program_ro_binds(&prog));
+            ro_binds.extend(glass_sandbox_linux::launch_ro_binds(
+                &prog,
+                &args,
+                &ephemeral_home(),
+            ));
             // Re-expose the private a11y bus dir (session-bus + at-spi sockets) so a sandboxed
             // app can reach the advertised unix:path= sockets, like the X11 socket above.
             if let Some(dir) = a11y_bind_dir {
