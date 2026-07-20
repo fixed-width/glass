@@ -82,8 +82,10 @@ pub fn program_ro_binds(program: &OsStr) -> Vec<std::path::PathBuf> {
 ///
 /// Each target is exposed by its directory (so sibling modules/assets are reachable), EXCEPT when
 /// that directory is a tmpfs-shadowed root (`home` or `/tmp`) or an ancestor of one — binding it
-/// would re-mount the real subtree over the tmpfs, so only the file itself is bound. Read-only,
-/// de-duplicated. Mirrors the `cwd` guard in `WrapOpts`.
+/// would re-mount the real subtree over the tmpfs, so only the file itself is bound. A target that
+/// IS itself a shadowed root or an ancestor of one (e.g. an arg of `/tmp`, `home`, or `/`)
+/// contributes no bind at all, for the same reason. Read-only, de-duplicated. Mirrors the `cwd`
+/// guard in `WrapOpts`.
 pub fn launch_ro_binds(program: &OsStr, args: &[OsString], home: &OsStr) -> Vec<PathBuf> {
     let home = canon(std::path::Path::new(home));
     let shadowed_roots = [home.as_path(), std::path::Path::new("/tmp")];
@@ -94,20 +96,23 @@ pub fn launch_ro_binds(program: &OsStr, args: &[OsString], home: &OsStr) -> Vec<
             continue; // bare-name (PATH) or relative (cwd) — already reachable
         }
         let real = canon(p);
-        if std::fs::metadata(&real).is_err() {
+        let Ok(meta) = std::fs::metadata(&real) else {
             continue; // not an existing path (a flag/value) — nothing to bind
+        };
+        // Never auto-expose a shadowed root itself (or an ancestor of one) — binding it would
+        // re-mount the real subtree over the tmpfs. Such targets need cwd / an explicit bind /
+        // sandbox off.
+        if shadowed_roots.iter().any(|root| root.starts_with(&real)) {
+            continue;
         }
-        let is_dir = std::fs::metadata(&real)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        let dir: &std::path::Path = if is_dir {
+        let dir: &std::path::Path = if meta.is_dir() {
             &real
         } else {
             real.parent().unwrap_or(&real)
         };
         // Never re-expose a tmpfs-shadowed root (or an ancestor of one) as a directory.
         let bind = if shadowed_roots.iter().any(|root| root.starts_with(dir)) {
-            real.clone()
+            real.clone() // real is a genuine file/subpath under a shadowed root (checked above) → safe
         } else {
             dir.to_path_buf()
         };
@@ -552,7 +557,9 @@ mod tests {
             home.path().as_os_str(),
         );
         assert_eq!(out, vec![script.canonicalize().unwrap()]); // guard: never bind home itself as a dir
-        assert!(!out.iter().any(|p| p == home.path()));
+        assert!(!out
+            .iter()
+            .any(|p| *p == home.path().canonicalize().unwrap()));
     }
 
     #[test]
@@ -586,6 +593,54 @@ mod tests {
             home.path().as_os_str(),
         );
         assert_eq!(out, vec![dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn arg_equal_to_tmp_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from("/tmp")],
+            home.path().as_os_str(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn arg_equal_to_home_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(home.path())],
+            home.path().as_os_str(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ancestor_of_home_is_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("a/b/c");
+        std::fs::create_dir_all(&home).unwrap();
+        let ancestor = root.path().join("a/b"); // ancestor of home, not home itself
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&ancestor)],
+            home.as_os_str(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn file_directly_under_tmp_binds_the_file_only() {
+        let home = tempfile::tempdir().unwrap(); // unrelated to the /tmp file below
+        let file = tempfile::Builder::new().tempfile_in("/tmp").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(file.path())],
+            home.path().as_os_str(),
+        );
+        assert_eq!(out, vec![file.path().canonicalize().unwrap()]);
     }
 
     #[test]
