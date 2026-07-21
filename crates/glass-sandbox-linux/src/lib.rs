@@ -8,11 +8,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
+use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
 
 /// The bubblewrap binary glass invokes: `$GLASS_BWRAP`, else `bwrap` (on `PATH`).
 fn bwrap_bin() -> String {
@@ -124,42 +124,6 @@ pub fn launch_ro_binds(
     out
 }
 
-/// Resolve a token to an absolute host path: an absolute token as-is, a relative one against
-/// `cwd` (`execvp`/shell semantics), so a relative launch argument reaches its real location.
-/// Returns `None` for a relative token when `cwd` is unknown — the token is then skipped rather
-/// than resolved against a wrong root like `/`.
-fn abs_token(tok: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
-    if tok.is_absolute() {
-        Some(tok.to_path_buf())
-    } else {
-        cwd.map(|c| c.join(tok))
-    }
-}
-
-/// The first `$PATH` entry holding an executable regular file named `program`, resolved the way
-/// `execvp` resolves a bare command name. `None` when `$PATH` is unset or nothing matches. Mirrors
-/// the `PATH` scan in [`runnable`], but returns the match (not just a bool) and requires an execute
-/// bit so a same-named non-executable file is skipped like `execvp` skips it.
-fn resolve_on_path(program: &OsStr) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    resolve_on_path_in(program, &path)
-}
-
-/// [`resolve_on_path`] against an explicit `$PATH` value — the testable seam (no global env).
-fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
-    std::env::split_paths(path)
-        .map(|dir| dir.join(program))
-        .find(|cand| is_executable_file(cand))
-}
-
-/// Whether `p` is (or resolves through symlinks to) a regular file with at least one execute bit —
-/// `execvp`'s "is this runnable" test.
-fn is_executable_file(p: &Path) -> bool {
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
 /// Append the guarded read-only binds that make `lit` — an absolute launch-target path already
 /// resolved against `cwd`/`$PATH` — reachable, de-duplicated into `out`.
 ///
@@ -181,15 +145,6 @@ fn push_token_binds(out: &mut Vec<PathBuf>, lit: &Path, roots: &[&Path]) {
     if roots.iter().any(|root| root.starts_with(&real)) {
         return;
     }
-    // The directory to expose for a path: the path itself when it is a directory, else its parent.
-    // Canonicalized so the guard checks below see a `..`-free path.
-    let dir_of = |p: &Path| -> PathBuf {
-        if p.is_dir() {
-            canon(p)
-        } else {
-            canon(p.parent().unwrap_or(p))
-        }
-    };
     // Where the token is WRITTEN (so a symlink is readable at its literal location) AND where its
     // target actually LIVES. These coincide for a non-symlink (or same-dir symlink), so dedup
     // collapses them to one bind.
@@ -211,13 +166,6 @@ fn push_token_binds(out: &mut Vec<PathBuf>, lit: &Path, roots: &[&Path]) {
 /// still work — it's shadowed by a tmpfs), else a fixed fallback.
 pub fn ephemeral_home() -> OsString {
     std::env::var_os("HOME").unwrap_or_else(|| OsString::from("/tmp/glass-sandbox-home"))
-}
-
-/// Best-effort path canonicalization that never panics on a nonexistent path.
-/// If `canonicalize` fails (e.g. the path doesn't exist yet), the raw path is
-/// returned unchanged.
-fn canon(p: &std::path::Path) -> std::path::PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Build the full argv for a contained launch: `bwrap … -- <program> <args…>`.
@@ -437,6 +385,7 @@ mod tests {
     use super::*;
     use glass_core::SandboxLevel;
     use std::ffi::{OsStr, OsString};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn argv_strings(v: &[OsString]) -> Vec<String> {
@@ -794,27 +743,6 @@ mod tests {
     }
 
     // --- bare-name program via $PATH ---------------------------------------------------------
-
-    #[test]
-    fn resolve_on_path_in_finds_first_executable_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("mytool");
-        std::fs::write(&exe, b"").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(resolve_on_path_in(OsStr::new("mytool"), &path), Some(exe));
-    }
-
-    #[test]
-    fn resolve_on_path_in_skips_non_executable_and_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let plain = dir.path().join("mytool");
-        std::fs::write(&plain, b"").unwrap(); // exists but NOT executable
-        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let path = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(resolve_on_path_in(OsStr::new("mytool"), &path), None);
-        assert_eq!(resolve_on_path_in(OsStr::new("absent"), &path), None);
-    }
 
     /// A bare-name program installed only under a `$HOME` `PATH` dir (`~/.cargo/bin`, an asdf shim)
     /// is hidden by the home tmpfs, so its resolving directory must be bound. Prepends a home bin

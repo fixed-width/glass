@@ -1287,6 +1287,7 @@ name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-sandbox-core",
  "tempfile",
 ]
 
