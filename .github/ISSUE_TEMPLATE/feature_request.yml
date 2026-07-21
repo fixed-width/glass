@@ -1,0 +1,61 @@
+name: Feature request
+description: Suggest a new capability or an improvement to an existing one.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion!
+
+        - Please **[search existing issues](https://github.com/fixed-width/glass/issues?q=is%3Aissue)** first.
+        - Still exploring the idea, or want to gauge interest? Start in [Discussions](https://github.com/fixed-width/glass/discussions) — concrete, scoped proposals belong here.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that glass can't do today? Describe the situation, not just the fix.
+      placeholder: "When driving <app> on <backend>, I need to … but glass has no way to …"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like glass to do? A new tool, a new argument, changed behavior — whatever you have in mind.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: backends
+    attributes:
+      label: Which backends does this involve?
+      description: Select all that apply, or "All / core" if it isn't backend-specific.
+      multiple: true
+      options:
+        - All / core (backend-agnostic)
+        - X11 (Linux)
+        - Wayland (Linux)
+        - Windows
+        - macOS
+        - Android
+        - iOS
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you tried or thought about, and why they fall short.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true

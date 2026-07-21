@@ -1,0 +1,113 @@
+name: Bug report
+description: Something in glass behaves incorrectly — a tool returns the wrong result, a backend misbehaves, or the loop breaks.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        - Please **[search existing issues](https://github.com/fixed-width/glass/issues?q=is%3Aissue)** first — yours may already be reported.
+        - This form is **not for security vulnerabilities**. glass injects input and captures the screen; report those privately via a [security advisory](https://github.com/fixed-width/glass/security/advisories/new).
+        - Not sure it's a bug? Ask in [Discussions](https://github.com/fixed-width/glass/discussions) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did glass actually do? Include the exact error message or tool response if there was one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What did you expect to happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The sequence that triggers it. Include the `glass_*` tool calls (with their arguments) where
+        relevant, and the target app if it matters.
+      placeholder: |
+        1. glass_start { "run": ["target/release/my-app"] }
+        2. glass_click { "x": 240, "y": 160 }
+        3. glass_screenshot  → the window is blank
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Which backend were you driving? (See `glass-mcp doctor`, or the `backend` argument to `glass_start`.)
+      options:
+        - X11 (Linux)
+        - Wayland (Linux)
+        - Windows
+        - macOS
+        - Android
+        - iOS
+        - Multiple / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: host-os
+    attributes:
+      label: Host OS and version
+      description: The machine running glass.
+      placeholder: "e.g. Ubuntu 24.04, macOS 26.5, Windows 11 23H2"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: glass version
+      description: Output of `glass-mcp --version` (or the release tag / commit you built from).
+      placeholder: "e.g. glass-mcp 1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: agent
+    attributes:
+      label: Agent / MCP client
+      description: What is driving glass?
+      placeholder: "e.g. Claude Code, Cursor, a custom MCP client"
+    validations:
+      required: false
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`glass-mcp doctor` output"
+      description: Paste the output of `glass-mcp doctor` — it captures the environment and saves a round-trip. Automatically formatted; no backticks needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Anything from `glass_logs` or the app's stderr that looks related. Automatically formatted; no backticks needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go to a [private advisory](https://github.com/fixed-width/glass/security/advisories/new)).
+          required: true
