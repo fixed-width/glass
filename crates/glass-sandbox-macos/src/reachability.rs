@@ -128,7 +128,7 @@ mod tests {
     // and this dev box has no real `/Users` tree to place a file under — placing one is impossible
     // without root and would not be legitimate for a portable unit test. Verified instead: the two
     // predicates `push_reallows` actually branches on for this exact scenario. Full end-to-end
-    // exercise of this branch is an ON-DEVICE (mini) verification case — see report.
+    // exercise of this branch is verified on real macOS hardware (Seatbelt does not run here).
     // -------------------------------------------------------------------------
     #[test]
     fn arg_directly_under_home_root_reallows_file_not_dir() {
@@ -258,7 +258,7 @@ mod tests {
     // The positive "home PATH dir" case is gated on `dir.starts_with("/Users")` in launch_reallows
     // BEFORE any is_safe_reallow/tempdir logic runs, and `resolve_on_path` additionally requires the
     // executable to actually exist — so it cannot be exercised without a real `/Users` tree. Deferred
-    // to ON-DEVICE (mini) verification — see report.
+    // to verification on real macOS hardware (Seatbelt does not run here).
     // -------------------------------------------------------------------------
     #[test]
     fn bare_name_program_on_home_path_dir_is_reallowed_usr_bin_is_not() {
