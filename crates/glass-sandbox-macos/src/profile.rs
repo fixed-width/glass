@@ -131,9 +131,27 @@ fn emit_read_allow_file(out: &mut String, path: &Path) {
 /// and a bare home root `/Users/<user>`; a deeper path (a real project dir) or any path outside
 /// `/Users` is safe. Fail-safe: an unsafe path is simply omitted (the app is over-contained,
 /// never over-exposed).
-fn is_safe_reallow(path: &Path) -> bool {
+pub(crate) fn is_safe_reallow(path: &Path) -> bool {
     use std::path::Component;
     if !path.is_absolute() {
+        return false;
+    }
+    // Self-defending: a path carrying a `.`/`..` segment is not normalized, and the home-root
+    // component count below assumes a normalized path. Callers pass canon()'d paths, so this only
+    // rejects the degenerate case where canonicalization failed (e.g. a TOCTOU race between the
+    // caller's metadata() check and canon()); treating such a path as unsafe over-contains
+    // (fail-safe), never over-exposes.
+    //
+    // Checked against the raw `/`-separated segments, not `Path::components()`: `components()`
+    // silently normalizes away an EMBEDDED `.` segment (it only surfaces `Component::CurDir` for a
+    // `.` at the very start of the path), so it would never observe a case like
+    // `/Users/dev/./proj`. `..` is not normalized away by `components()` either way, but the same
+    // raw check catches both uniformly.
+    if path
+        .to_string_lossy()
+        .split('/')
+        .any(|seg| seg == "." || seg == "..")
+    {
         return false;
     }
     if path == Path::new("/") || path == Path::new("/Users") {
@@ -147,6 +165,22 @@ fn is_safe_reallow(path: &Path) -> bool {
         })
         .collect();
     !(normals.len() == 2 && normals[0] == "Users")
+}
+
+/// Whether `path` is a home root or above — `/`, `/Users`, or a bare `/Users/<user>` — such that it
+/// must never be re-allowed. Defined as the complement of [`is_safe_reallow`] for an absolute path,
+/// so the home-detection rule lives in ONE place and the two guards cannot drift. A relative path is
+/// not a home root (it is rejected as unsafe for a different reason), so this returns false for it.
+pub(crate) fn is_home_root_or_above(path: &Path) -> bool {
+    path.is_absolute() && !is_safe_reallow(path)
+}
+
+/// Whether `dir` lies under the `/Users` home tree that the profile hides with
+/// `(deny file-read* (subpath "/Users"))`. A bare-name program resolved to such a dir needs an
+/// explicit re-allow; one resolved outside `/Users` (`/usr/bin`, `/opt/homebrew`) is already visible
+/// via the whole-filesystem read-allow and contributes nothing.
+pub(crate) fn under_users(dir: &Path) -> bool {
+    dir.starts_with("/Users")
 }
 
 /// Append `  (subpath "<escaped>")\n`.
@@ -332,6 +366,77 @@ mod tests {
     }
 
     #[test]
+    fn is_home_root_or_above_flags_root_and_bare_home_roots() {
+        assert!(is_home_root_or_above(Path::new("/")), "root");
+        assert!(is_home_root_or_above(Path::new("/Users")), "Users root");
+        assert!(
+            is_home_root_or_above(Path::new("/Users/dev")),
+            "a bare home root"
+        );
+    }
+
+    #[test]
+    fn is_home_root_or_above_allows_deeper_paths() {
+        assert!(
+            !is_home_root_or_above(Path::new("/Users/dev/project")),
+            "a project dir under home is not itself a home root"
+        );
+        assert!(
+            !is_home_root_or_above(Path::new("/work/project")),
+            "outside home entirely"
+        );
+    }
+
+    /// A path carrying a `.`/`..` component is not normalized, so the home-root component count
+    /// `is_safe_reallow` relies on cannot be trusted for it — it must be rejected outright rather
+    /// than evaluated as if it were the (different) canonical path it might resolve to.
+    #[test]
+    fn is_safe_reallow_rejects_non_canonical_paths() {
+        assert!(
+            !is_safe_reallow(Path::new("/Users/dev/proj/..")),
+            "a trailing `..` component must be rejected"
+        );
+        assert!(
+            !is_safe_reallow(Path::new("/Users/dev/./proj")),
+            "an embedded `.` component must be rejected"
+        );
+    }
+
+    /// `is_home_root_or_above` is now DEFINED as the complement of `is_safe_reallow` for an
+    /// absolute path — assert that relationship holds over a representative sweep, including the
+    /// non-canonical case A1 newly rejects, and spot-check the concrete expected values so the two
+    /// predicates are pinned, not just internally consistent with each other.
+    #[test]
+    fn is_home_root_or_above_is_the_complement_of_is_safe_reallow() {
+        let paths = [
+            "/",
+            "/Users",
+            "/Users/dev",
+            "/Users/dev/proj",
+            "/usr/bin",
+            "/Users/dev/proj/..",
+        ];
+        for raw in paths {
+            let p = Path::new(raw);
+            assert_eq!(
+                is_home_root_or_above(p),
+                p.is_absolute() && !is_safe_reallow(p),
+                "{raw:?}: is_home_root_or_above must equal the is_safe_reallow complement"
+            );
+        }
+        for raw in ["/", "/Users", "/Users/dev"] {
+            assert!(is_home_root_or_above(Path::new(raw)), "{raw:?}");
+        }
+        for raw in ["/Users/dev/proj", "/usr/bin"] {
+            assert!(!is_home_root_or_above(Path::new(raw)), "{raw:?}");
+        }
+        assert!(
+            is_home_root_or_above(Path::new("/Users/dev/proj/..")),
+            "non-canonical → is_safe_reallow rejects it → is_home_root_or_above is true"
+        );
+    }
+
+    #[test]
     fn program_dir_is_read_allowed() {
         let p = build_profile(SandboxLevel::Default, &opts());
         assert!(
@@ -348,6 +453,20 @@ mod tests {
         let p = build_profile(SandboxLevel::Default, &o);
         assert!(p.contains(r#"(subpath "/opt/data")"#), "{p}");
         assert!(p.contains(r#"(subpath "/opt/scratch")"#), "{p}");
+    }
+
+    /// A bare home root passed in via `ro_binds` must be filtered out at the emit point (the
+    /// `.filter(|b| is_safe_reallow(b))` on `build_profile`'s `ro_binds` loop) — never re-exposed
+    /// as a `(subpath …)`, which would undo the whole-home `/Users` deny.
+    #[test]
+    fn build_profile_filters_an_unsafe_ro_binds_entry() {
+        let mut o = opts();
+        o.ro_binds = vec![PathBuf::from("/Users/dev")];
+        let p = build_profile(SandboxLevel::Default, &o);
+        assert!(
+            !p.contains(r#"(subpath "/Users/dev")"#),
+            "a bare home root passed via ro_binds must be filtered, not emitted:\n{p}"
+        );
     }
 
     /// A `ro_files` entry (the injected clip-shim dylib) must be re-allowed for read as a

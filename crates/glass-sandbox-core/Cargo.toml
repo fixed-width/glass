@@ -1,14 +1,10 @@
 [package]
-name = "glass-sandbox-linux"
+name = "glass-sandbox-core"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-
-[dependencies]
-glass-core.workspace = true
-glass-sandbox-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

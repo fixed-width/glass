@@ -36,7 +36,7 @@ use rustix::process::{kill_process, Pid, Signal};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
 use glass_core::{GlassError, Result, Stream};
-use glass_sandbox_macos::{build_profile, ProfileOpts};
+use glass_sandbox_macos::{build_profile, launch_reallows, ProfileOpts};
 
 /// Per-spawn counter feeding one component of
 /// [`crate::clipboard_route::session_pasteboard_name`] (combined there with this process's pid
@@ -164,14 +164,27 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
     // sandbox_init syscall). Off spawns unchanged. Build (run_build) is never contained.
     let mut clip: Option<ClipLaunch> = None;
     if spec.sandbox != SandboxLevel::Off {
-        // Resolve to absolute paths: a relative `(subpath ".")` never matches the child's real
-        // cwd, and `build_profile`'s guard needs absolute paths to reason about home exposure.
-        let cwd = spec
-            .cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        // Effective working dir for the profile + reachability: the caller's cwd, else glass's own
+        // current dir. A failure to read current_dir() is surfaced (not silently substituted with
+        // "/", which would misroot relative launch tokens) and leaves the cwd unset.
+        let effective_cwd: Option<PathBuf> = spec.cwd.clone().or_else(|| {
+            std::env::current_dir()
+                .map_err(|e| {
+                    logs.lock().expect("log sink mutex").push((
+                        Stream::Stderr,
+                        format!(
+                            "glass: could not determine current directory for sandbox cwd: {e}"
+                        ),
+                    ));
+                })
+                .ok()
+        });
+        // Canonicalize for the profile's cwd field (same as the pre-diff code did), non-fatally.
+        let cwd_canon: Option<PathBuf> = effective_cwd
+            .as_ref()
+            .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()));
+        // Resolve to an absolute path: `build_profile`'s guard needs one to reason about home
+        // exposure.
         let program =
             std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
 
@@ -230,14 +243,30 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
             clip = Some(ClipLaunch { name });
         }
 
+        // Re-allow the launch target itself (program + path args) so it stays reachable under
+        // the profile's `/Users` read-deny — see `launch_reallows`'s own docs. Pass the
+        // un-canonicalized `effective_cwd` (not `cwd_canon`) so relative tokens resolve against
+        // where glass was actually invoked.
+        let reallows = launch_reallows(&spec.run, effective_cwd.as_deref());
+        // Union the arg-literal re-allows with the shim file (if injecting); the shim file lives in
+        // glass's own target dir and is not expected to collide with a launch target, and the
+        // `.contains()` dedup below is defensive regardless (not load-bearing on that expectation).
+        let mut ro_files = reallows.ro_files;
+        if let Some(f) = shim_file {
+            if !ro_files.contains(&f) {
+                ro_files.push(f);
+            }
+        }
         // Pasteboard is allowed only for an injectable target (the shim's redirect is the
         // actual isolation there); a hardened/non-injectable target keeps it denied, same as
         // before this task.
         let opts = ProfileOpts {
-            cwd,
+            // `/` here is inert (`is_safe_reallow("/")` is false) — it only matters when
+            // `effective_cwd` was unset (a `current_dir()` failure, logged above).
+            cwd: cwd_canon.unwrap_or_else(|| PathBuf::from("/")),
             program,
-            ro_binds: vec![],
-            ro_files: shim_file.into_iter().collect(),
+            ro_binds: reallows.ro_binds,
+            ro_files,
             rw_binds: vec![],
             allow_pasteboard,
         };
@@ -421,6 +450,68 @@ mod tests {
         assert!(
             !out.iter().any(|l| l == "HOME_READABLE"),
             "home leaked: {out:?}"
+        );
+    }
+
+    /// Regression test for the fix this branch ships: `launch_reallows` re-allows the launch
+    /// target's OWN directory independent of `cwd` — previously only `cwd` was reallowed under the
+    /// `/Users` read-deny, so a launch target (the program itself) living under `$HOME` but
+    /// launched with a `cwd` OUTSIDE `$HOME` would fail to start (it could not even be read to be
+    /// exec'd). This is the macOS analog of the Linux
+    /// `sandbox_default_reaches_launch_target_via_argument_path` integration test; it runs on real
+    /// macOS hardware (CI macOS runner + on-device), not on the Linux dev box.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_sandbox_reaches_launch_target_under_home_when_cwd_is_elsewhere() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let script_dir =
+            std::path::Path::new(&home).join(format!("glass-sbx-target-{}", std::process::id()));
+        std::fs::create_dir_all(&script_dir).expect("create script dir under $HOME");
+        let script_path = script_dir.join("run.sh");
+        let sentinel = format!("GLASS_SBX_SENTINEL_{}", std::process::id());
+        std::fs::write(&script_path, format!("#!/bin/sh\necho {sentinel}\n"))
+            .expect("write script under $HOME");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x script");
+
+        // Drop guard so the dir under $HOME is removed even if an assertion below panics.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(script_dir.clone());
+
+        let script_str = script_path.to_str().expect("script path is valid UTF-8");
+        let mut launch = spec(&[script_str]);
+        launch.sandbox = SandboxLevel::Default;
+        // Deliberately OUTSIDE $HOME: proves the launch target is reachable via its OWN
+        // re-allow, not merely because it happens to sit under a reallowed cwd.
+        launch.cwd = Some(std::env::temp_dir());
+
+        let logs = empty_sink();
+        let (mut child, _clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
+            panic!(
+                "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
+                 succeed: {e}"
+            )
+        });
+        child.wait().expect("wait");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let out: Vec<String> = logs
+            .lock()
+            .expect("sink")
+            .iter()
+            .map(|(_, l)| l.clone())
+            .collect();
+        assert!(
+            out.iter().any(|l| l == &sentinel),
+            "launch target under $HOME must be reachable (read + exec'd) even when cwd is \
+             outside $HOME: {out:?}"
         );
     }
 
