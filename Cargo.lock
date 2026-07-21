@@ -1350,6 +1350,7 @@ dependencies = [
  "glass-dbus-linux",
  "glass-proc-linux",
  "glass-sandbox-linux",
+ "tempfile",
  "x11rb",
 ]
 

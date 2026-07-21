@@ -32,13 +32,22 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Always re-expose the X11 socket dir; also re-expose the launch target — the program and
-            // any argument that names a path under $HOME/tmp, which the ephemeral tmpfs shadows.
+            // Default the working directory to glass's own cwd when the spec sets none, so a
+            // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
+            // directory (matching `sandbox:"off"`) and any relative launch token resolves against
+            // it. Computed once and shared by both `launch_ro_binds` and `WrapOpts.cwd`.
+            let effective_cwd = spec.cwd.clone().or_else(|| std::env::current_dir().ok());
+            let home_os = ephemeral_home();
+            // Always re-expose the X11 socket dir; also re-expose the launch target — the program
+            // and any path token under $HOME or /tmp, which the ephemeral tmpfs shadows.
             let mut ro_binds = vec![std::path::PathBuf::from("/tmp/.X11-unix")];
             ro_binds.extend(glass_sandbox_linux::launch_ro_binds(
                 &prog,
                 &args,
-                &ephemeral_home(),
+                std::path::Path::new(&home_os),
+                effective_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("/")),
             ));
             // Re-expose the private a11y bus dir (session-bus + at-spi sockets) so a sandboxed
             // app can reach the advertised unix:path= sockets, like the X11 socket above.
@@ -47,8 +56,8 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
             }
             let opts = WrapOpts {
                 level,
-                home: ephemeral_home(),
-                cwd: spec.cwd.clone(),
+                home: home_os,
+                cwd: effective_cwd,
                 ro_binds,
                 rw_binds: vec![],
             };
@@ -236,6 +245,37 @@ mod tests {
             .find(|(k, _)| *k == std::ffi::OsStr::new("DISPLAY"))
             .and_then(|(_, v)| v);
         assert_eq!(disp, Some(std::ffi::OsStr::new(":99")));
+    }
+
+    #[test]
+    fn build_command_binds_an_absolute_argument_path_dir() {
+        // A launch target reached only through an ARGUMENT path (not run[0]) must be re-exposed:
+        // the arg's directory is bound into the bwrap argv. This runs under the default
+        // (display-less) `cargo test`, so it catches an `&args` mis-wire that the #[ignore]d
+        // integration test would otherwise be the only guard against.
+        use glass_core::SandboxLevel;
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap(); // under /tmp, not $HOME
+        let asset = dir.path().join("asset.bin");
+        std::fs::write(&asset, b"").unwrap();
+        let asset_s = asset.to_string_lossy();
+        let mut s = spec(&["/bin/cat", asset_s.as_ref()]);
+        s.sandbox = SandboxLevel::Default;
+        let cmd = build_command(&s, ":99", None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let argdir = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == argdir && w[2] == argdir),
+            "arg dir {argdir} not bound into bwrap argv: {args:?}"
+        );
     }
 
     #[test]

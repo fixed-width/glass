@@ -54,17 +54,27 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Re-expose the launch target — the program and any path-argument under $HOME/tmp, which
-            // the ephemeral tmpfs shadows.
-            let mut ro_binds =
-                glass_sandbox_linux::launch_ro_binds(&prog, &args, &ephemeral_home());
+            // Default the working directory to glass's own cwd when the spec sets none, so a
+            // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
+            // directory (matching `sandbox:"off"`) and any relative launch token resolves against
+            // it. Computed once and shared by both `launch_ro_binds` and `WrapOpts.cwd`.
+            let effective_cwd = spec.cwd.clone().or_else(|| std::env::current_dir().ok());
+            let home_os = ephemeral_home();
+            // Re-expose the launch target — the program and any path token under $HOME or /tmp,
+            // which the ephemeral tmpfs shadows.
+            let mut ro_binds = glass_sandbox_linux::launch_ro_binds(
+                &prog,
+                &args,
+                Path::new(&home_os),
+                effective_cwd.as_deref().unwrap_or_else(|| Path::new("/")),
+            );
             if let Some(dir) = a11y_bind_dir {
                 ro_binds.push(dir.to_path_buf());
             }
             let opts = WrapOpts {
                 level,
-                home: ephemeral_home(),
-                cwd: spec.cwd.clone(),
+                home: home_os,
+                cwd: effective_cwd,
                 ro_binds,
                 rw_binds: vec![runtime_dir.to_path_buf()],
             };
@@ -285,6 +295,28 @@ mod tests {
         assert_eq!(
             dbus.as_deref(),
             Some("unix:path=/tmp/glass-a11y/session-bus")
+        );
+    }
+
+    #[test]
+    fn sway_config_binds_an_absolute_argument_path_dir() {
+        // A launch target reached only through an ARGUMENT path (not run[0]) must be re-exposed:
+        // the arg's directory is bound into the exec bwrap argv. Runs under the default
+        // (display-less) `cargo test`, catching an `&args` mis-wire the #[ignore]d integration
+        // test would otherwise be the only guard against.
+        use glass_core::SandboxLevel;
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap(); // under /tmp, not $HOME
+        let asset = dir.path().join("asset.bin");
+        std::fs::write(&asset, b"").unwrap();
+        let asset_s = asset.to_string_lossy();
+        let mut s = spec(&["/bin/cat", asset_s.as_ref()]);
+        s.sandbox = SandboxLevel::Default;
+        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let argdir = dir.path().canonicalize().unwrap();
+        let needle = format!("'--ro-bind-try' '{d}' '{d}'", d = argdir.to_string_lossy());
+        assert!(
+            cfg.contains(&needle),
+            "arg dir not bound into the exec bwrap:\nwant: {needle}\ngot:\n{cfg}"
         );
     }
 
