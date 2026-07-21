@@ -20,7 +20,8 @@ Install [Sandboxie](https://sandboxie-plus.com/downloads) — **Classic** (GPLv3
 with its service running. Classic is the default and is auto-detected at `%ProgramFiles%\Sandboxie`.
 Plus installs elsewhere (e.g. `%ProgramFiles%\Sandboxie-Plus`), so set `GLASS_SANDBOXIE_DIR` to its
 install directory. `GLASS_WIN_SANDBOX_PROVIDER` (`auto`|`sandboxie`|`none`) selects the provider. Set
-`GLASS_SANDBOX=off` to launch apps unconfined (no Sandboxie required).
+`GLASS_SANDBOX=off` to launch apps unconfined (no Sandboxie required) — unless an operator has set
+`GLASS_SANDBOX_FLOOR` to forbid `off` on this host, in which case an `off` request is refused.
 
 ## Install the binary
 

@@ -22,6 +22,14 @@ One boundary is worth stating plainly: the `sandbox` level governs the **launche
 optional `build` step always runs unsandboxed, with your full developer environment — building is your
 code doing what you asked, whereas the launched app is the thing under test.
 
+Whoever is driving glass picks `sandbox` per launch, but an **operator** — whoever configures the host
+glass runs on — can pin a floor under that choice: `GLASS_SANDBOX_FLOOR` sets the minimum containment
+level a launch may run at. A launch may still ask for *more* containment than the floor, just never
+less: an omitted `sandbox` is raised to the floor automatically, and an explicit request below the
+floor is refused rather than silently strengthened. The default is `off` — no floor, today's behavior
+— so this is opt-in for an operator who wants to guarantee a minimum on their host regardless of what
+any individual launch requests.
+
 ## Per-OS mechanisms
 
 Containment has a different implementation per OS:
@@ -81,5 +89,11 @@ The containment is real but not airtight, and it's honest about the edges:
 - **`sandbox_init` is deprecated** by Apple in favour of the App Sandbox entitlement model, but it
   remains present and functional on every currently-supported macOS release — it underpins App Sandbox
   itself, and Chromium uses it too.
+- **Windows containment isolates writes, not reads.** Sandboxie virtualizes the boxed app's *writes*
+  into a private store (your real files are never modified) and, under `strict`, blocks the network —
+  but unlike the Linux and macOS profiles it does **not** hide your home from the app's *reads*. A
+  contained Windows app can still read files under `%USERPROFILE%`, including secrets like SSH keys.
+  Treat the Windows sandbox as write-and-network containment; use `sandbox:off` deliberately, and
+  don't rely on it to hide read-side secrets.
 
 `glass-mcp doctor` reports the live containment-runtime availability for your host.
