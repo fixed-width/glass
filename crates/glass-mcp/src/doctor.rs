@@ -52,15 +52,52 @@ fn default_backend_check(raw: Option<&str>) -> Check {
     }
 }
 
+/// The "sandbox floor" line of the `general` section: the operator-enforced minimum containment
+/// level (`GLASS_SANDBOX_FLOOR`, consumed by `tools::resolve_sandbox`), so an operator can
+/// confirm their policy is actually in effect without reading source or triggering a launch.
+/// Host-level and backend-independent, hence its home in `general` rather than a per-backend
+/// `sandbox` section. Pure in `raw` (the read `GLASS_SANDBOX_FLOOR` value) so it's unit-tested
+/// without touching the process environment, mirroring [`default_backend_check`]. Unlike a
+/// mis-set `GLASS_BACKEND` (which silently falls back to a host default), a `GLASS_SANDBOX_FLOOR`
+/// that fails to parse makes `resolve_sandbox` reject *every* `glass_start` call — so that case is
+/// a `Fail`, not a `Warn`.
+fn sandbox_floor_check(raw: Option<&str>) -> Check {
+    match raw {
+        None => Check::new(
+            "sandbox floor",
+            CheckStatus::Ok,
+            "off (no floor; the agent may choose any level)",
+        ),
+        Some(v) => match v.parse::<glass_core::SandboxLevel>() {
+            Ok(level) => Check::new(
+                "sandbox floor",
+                CheckStatus::Ok,
+                format!("{level} (GLASS_SANDBOX_FLOOR)"),
+            ),
+            Err(_) => Check::new(
+                "sandbox floor",
+                CheckStatus::Fail,
+                format!(
+                    "GLASS_SANDBOX_FLOOR={v:?} is not a recognized sandbox level (off/default/strict) \
+                     — every glass_start call will be rejected until this is fixed"
+                ),
+            )
+            .with_remedy("set GLASS_SANDBOX_FLOOR to one of: off, default, strict, or unset it"),
+        },
+    }
+}
+
 fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diagnosis {
     let raw = std::env::var("GLASS_BACKEND").ok();
     let backend = crate::default_backend(raw.as_deref());
+    let sandbox_floor_raw = std::env::var("GLASS_SANDBOX_FLOOR").ok();
 
     let general = Section::new(
         "general",
         None,
         vec![
             default_backend_check(raw.as_deref()),
+            sandbox_floor_check(sandbox_floor_raw.as_deref()),
             Check::new("glass", CheckStatus::Ok, env!("CARGO_PKG_VERSION")),
         ],
     );
@@ -528,6 +565,54 @@ mod tests {
         )]);
         assert_eq!(diag.overall("x11"), CheckStatus::Warn);
         assert_eq!(diag.exit_code("x11"), 0);
+    }
+
+    #[test]
+    fn sandbox_floor_check_reports_off_when_unset() {
+        let c = sandbox_floor_check(None);
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.detail.contains("off"), "detail: {}", c.detail);
+        assert!(c.detail.contains("no floor"), "detail: {}", c.detail);
+    }
+
+    #[test]
+    fn sandbox_floor_check_reports_a_configured_level() {
+        let c = sandbox_floor_check(Some("strict"));
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.detail.contains("strict"), "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("GLASS_SANDBOX_FLOOR"),
+            "detail: {}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn sandbox_floor_check_fails_on_an_unrecognized_value() {
+        // Unlike a mis-set GLASS_BACKEND (which silently falls back), a GLASS_SANDBOX_FLOOR that
+        // fails to parse makes `resolve_sandbox` reject every glass_start call — so this is a
+        // Fail, not a Warn, and carries a remedy.
+        let c = sandbox_floor_check(Some("bogus"));
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(c.detail.contains("bogus"), "detail: {}", c.detail);
+        assert!(c.remedy.is_some(), "expected a remedy on the failure");
+    }
+
+    #[test]
+    fn diagnose_general_section_includes_sandbox_floor() {
+        // Host-level, backend-independent — must appear in `general` on every platform, not
+        // inside a per-backend `sandbox` section.
+        let d = diagnose(false);
+        let general = d
+            .sections
+            .iter()
+            .find(|s| s.title == "general")
+            .expect("general section");
+        assert!(
+            general.checks.iter().any(|c| c.name == "sandbox floor"),
+            "{:?}",
+            general.checks
+        );
     }
 
     #[test]

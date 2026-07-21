@@ -146,7 +146,17 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         None => glass.start(&spec),
     }
     .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
+    // `x/y/width/height` stay at the top (backward compatible); `sandbox` rides alongside as a
+    // new sibling field carrying the effective level so the agent can see policy applied to an
+    // omitted/clamped request without a separate round-trip.
+    let mut result = geometry_value(&geo);
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "sandbox".into(),
+            serde_json::Value::String(sandbox.to_string()),
+        );
+    }
+    Ok(ToolOutput::result("glass_start", result))
 }
 
 pub fn stop(glass: &mut Glass) -> ToolResult {
@@ -731,6 +741,21 @@ mod tests {
         let v = assert_envelope(&out, "glass_start");
         assert_eq!(v["width"], json!(80));
         assert_eq!(v["height"], json!(60));
+        // The effective sandbox level rides alongside the geometry as a sibling field (a plain
+        // start, no arg/env set, resolves to the Default level).
+        assert_eq!(v["sandbox"], json!("default"), "envelope: {v}");
+    }
+
+    #[test]
+    fn start_reports_the_effective_sandbox_level() {
+        // The agent's explicit request must be echoed back as the *effective* level, so it can
+        // see what was actually applied (e.g. under an operator floor) without a second call.
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        let mut a = start_args();
+        a.sandbox = Some("off".into());
+        let out = start(&mut g, &a).unwrap();
+        let v = assert_envelope(&out, "glass_start");
+        assert_eq!(v["sandbox"], json!("off"), "envelope: {v}");
     }
 
     #[test]
