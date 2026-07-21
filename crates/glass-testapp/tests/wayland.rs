@@ -621,6 +621,169 @@ fn fail_closed_when_bwrap_missing_wayland() {
     );
 }
 
+/// Wayland twin of the X11 `sandbox_default_reaches_launch_target_via_argument_path`
+/// test: the reported bug reproduced on the other Linux backend, which shares the same
+/// `launch_ro_binds` fix. A launch target reached only through an **argument**
+/// (`run[1]`), not `run[0]` itself, must still be reachable under the default sandbox.
+/// See the X11 test in `tests/integration.rs` for the full rationale — the fixture
+/// shape (temp dir + sibling testapp copy + `run.sh`) is identical.
+#[test]
+#[ignore = "requires sway + bwrap; run via scripts/test-wayland.sh"]
+fn sandbox_default_reaches_launch_target_via_argument_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let testapp_copy = dir.path().join("glass-testapp");
+    std::fs::copy(TESTAPP, &testapp_copy).expect("copy glass-testapp into temp dir");
+
+    let run_sh = dir.path().join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\nexec \"{}\"\n", testapp_copy.display()),
+    )
+    .expect("write run.sh");
+    // `fs::copy` preserves the source's executable bit, but `fs::write` does not —
+    // the wrapper script needs it set explicitly.
+    std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x run.sh");
+
+    let mut p = WaylandPlatform::new().unwrap();
+    let sandboxed_spec = AppSpec {
+        build: None,
+        run: vec!["sh".to_string(), run_sh.to_string_lossy().into_owned()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: APP_TIMEOUT_MS,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = start(&mut p, &sandboxed_spec);
+    assert_eq!(
+        (geom.width, geom.height),
+        (320, 240),
+        "arg-path launch target unreachable under the default sandbox"
+    );
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY (sandboxed, arg-path launch)"
+    );
+    p.stop_app().unwrap();
+}
+
+/// Wayland twin of the X11 `sandbox_default_reaches_relative_launch_token_with_defaulted_cwd`.
+/// A relative launch token with `cwd: None` resolves against glass's DEFAULTED cwd (its own
+/// working directory), which is `--chdir`'d and rw-bound into the namespace. See the X11 test for
+/// the full rationale; the fixture and the shared `launch_ro_binds` / cwd-default wiring are
+/// identical. Load-bearing on the same code path (verified on X11 by stubbing the cwd default).
+#[test]
+#[ignore = "requires sway + bwrap; run via scripts/test-wayland.sh"]
+fn sandbox_default_reaches_relative_launch_token_with_defaulted_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let testapp_copy = dir.path().join("glass-testapp");
+    std::fs::copy(TESTAPP, &testapp_copy).expect("copy glass-testapp into temp dir");
+    let run_sh = dir.path().join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\nexec \"{}\"\n", testapp_copy.display()),
+    )
+    .expect("write run.sh");
+    std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x run.sh");
+
+    let original_cwd = std::env::current_dir().expect("read cwd");
+    let _cwd_guard = CwdGuard(original_cwd);
+    std::env::set_current_dir(dir.path()).expect("chdir into temp dir");
+
+    let mut p = WaylandPlatform::new().unwrap();
+    let sandboxed_spec = AppSpec {
+        build: None,
+        run: vec!["sh".to_string(), "./run.sh".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: APP_TIMEOUT_MS,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = start(&mut p, &sandboxed_spec);
+    assert_eq!(
+        (geom.width, geom.height),
+        (320, 240),
+        "relative launch token unreachable with a defaulted cwd"
+    );
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY (relative token, defaulted cwd)"
+    );
+    p.stop_app().unwrap();
+}
+
+/// Wayland twin of the X11 `sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir`.
+/// A bare-name program resolvable only via a `PATH` dir under a shadowed root must launch under the
+/// default sandbox because `launch_ro_binds` resolves `run[0]` against `$PATH` and binds the
+/// resolving directory. See the X11 test for the full rationale. Load-bearing on the same shared
+/// code path (verified on X11 by stubbing the resolution bind).
+#[test]
+#[ignore = "requires sway + bwrap; run via scripts/test-wayland.sh"]
+fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct PathGuard(std::ffi::OsString);
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.0);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create temp dir"); // under /tmp (tmpfs-shadowed)
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).expect("create bin dir");
+    let tool = bindir.join("glass-testapp-bare");
+    std::fs::copy(TESTAPP, &tool).expect("copy glass-testapp as a bare-name tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod +x tool");
+
+    let mut p = WaylandPlatform::new().unwrap();
+
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut prepended = bindir.clone().into_os_string();
+    prepended.push(":");
+    prepended.push(&original_path);
+    std::env::set_var("PATH", &prepended);
+    let _path_guard = PathGuard(original_path);
+
+    let sandboxed_spec = AppSpec {
+        build: None,
+        run: vec!["glass-testapp-bare".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: APP_TIMEOUT_MS,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = start(&mut p, &sandboxed_spec);
+    assert_eq!(
+        (geom.width, geom.height),
+        (320, 240),
+        "bare-name program on a shadowed PATH dir unreachable under the default sandbox"
+    );
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY (bare-name on a shadowed PATH dir)"
+    );
+    p.stop_app().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Build-step integration tests (bwrap + sway)
 // ---------------------------------------------------------------------------

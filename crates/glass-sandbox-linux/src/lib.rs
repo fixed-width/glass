@@ -7,7 +7,9 @@
 #![cfg(target_os = "linux")]
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
@@ -61,16 +63,147 @@ pub struct WrapOpts {
     pub rw_binds: Vec<PathBuf>,
 }
 
-/// Read-only binds needed to reach the program binary inside the namespace: the
-/// program path itself when it is absolute (it may live under `$HOME`, which the
-/// ephemeral-HOME tmpfs shadows). Bare-name programs resolve via PATH (covered by
-/// `--ro-bind / /`), so they need no extra bind.
-pub fn program_ro_binds(program: &OsStr) -> Vec<std::path::PathBuf> {
-    let p = std::path::Path::new(program);
-    if p.is_absolute() {
-        vec![p.to_path_buf()]
+/// Read-only binds that make the LITERAL launch target reachable inside the namespace: the
+/// program and every `run` argument that resolves to an existing path. The ephemeral-`$HOME` and
+/// `/tmp` tmpfs shadow anything under those roots, so a script/asset/binary living there must be
+/// re-bound to be visible.
+///
+/// Three resolution rules mirror how the child is actually exec'd, so the paths bwrap opens match
+/// the paths the launch touches:
+/// - **`run[0]` as a bare name** (no `/`) is resolved against `$PATH` like `execvp`; the resolving
+///   directory is bound only when it is under a shadowed root (e.g. `~/.cargo/bin`, an asdf shim).
+///   A match under `/usr/bin` etc. is already visible via `--ro-bind / /`, so it contributes
+///   nothing. Arguments are NOT `$PATH`-resolved.
+/// - **A relative token** (program-with-`/` or any relative argument) is resolved against `cwd`
+///   (`cwd.join(token)`) before binding, so `./start.sh` / `sub/asset` reach their real location.
+///   When `cwd` is `None` (glass could not resolve a default working directory) a relative token
+///   is SKIPPED rather than resolved against a wrong root.
+/// - **An absolute token** is bound as-is.
+///
+/// For each resolved token, bwrap opens the path *as written*, but a symlink's target may live
+/// elsewhere, so BOTH the literal path's directory (so the symlink/file is readable where it is
+/// named) and the resolved target's directory (so the target is readable) are exposed — deduped,
+/// so a non-symlink collapses to a single bind. Each directory is exposed EXCEPT when it is a
+/// tmpfs-shadowed root (`home` or `/tmp`) or an ancestor of one — binding it would re-mount the
+/// real subtree over the tmpfs, so only the file itself is bound. A target that IS itself a
+/// shadowed root or an ancestor of one (e.g. an arg of `/tmp`, `home`, or `/`) contributes no bind
+/// at all, for the same reason. Read-only, de-duplicated. Mirrors the `cwd` guard in `WrapOpts`.
+pub fn launch_ro_binds(
+    program: &OsStr,
+    args: &[OsString],
+    home: &Path,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let home = canon(home);
+    let shadowed_roots = [home.as_path(), Path::new("/tmp")];
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // run[0] (the program).
+    if program.as_bytes().contains(&b'/') {
+        // A path program: absolute, or relative (e.g. `./start.sh`) → resolved against cwd. A
+        // relative token with no known cwd resolves to nothing and is skipped (not bound to `/`).
+        if let Some(p) = abs_token(Path::new(program), cwd) {
+            push_token_binds(&mut out, &p, &shadowed_roots);
+        }
+    } else if let Some(resolved) = resolve_on_path(program) {
+        // A bare name → resolve via `$PATH` like execvp. Bind the resolving directory ONLY when
+        // it is under a shadowed root (a `$HOME`/`/tmp` PATH dir such as `~/.cargo/bin`, an asdf
+        // shim); a match under `/usr/bin` etc. is already visible via `--ro-bind / /`.
+        let dir = canon(resolved.parent().unwrap_or(&resolved));
+        if shadowed_roots.iter().any(|root| dir.starts_with(root)) {
+            push_token_binds(&mut out, &resolved, &shadowed_roots);
+        }
+    }
+
+    // run[1..] (arguments): absolute or cwd-relative path tokens (never $PATH-resolved).
+    for a in args {
+        if let Some(p) = abs_token(Path::new(a), cwd) {
+            push_token_binds(&mut out, &p, &shadowed_roots);
+        }
+    }
+    out
+}
+
+/// Resolve a token to an absolute host path: an absolute token as-is, a relative one against
+/// `cwd` (`execvp`/shell semantics), so a relative launch argument reaches its real location.
+/// Returns `None` for a relative token when `cwd` is unknown — the token is then skipped rather
+/// than resolved against a wrong root like `/`.
+fn abs_token(tok: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if tok.is_absolute() {
+        Some(tok.to_path_buf())
     } else {
-        vec![]
+        cwd.map(|c| c.join(tok))
+    }
+}
+
+/// The first `$PATH` entry holding an executable regular file named `program`, resolved the way
+/// `execvp` resolves a bare command name. `None` when `$PATH` is unset or nothing matches. Mirrors
+/// the `PATH` scan in [`runnable`], but returns the match (not just a bool) and requires an execute
+/// bit so a same-named non-executable file is skipped like `execvp` skips it.
+fn resolve_on_path(program: &OsStr) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    resolve_on_path_in(program, &path)
+}
+
+/// [`resolve_on_path`] against an explicit `$PATH` value — the testable seam (no global env).
+fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|cand| is_executable_file(cand))
+}
+
+/// Whether `p` is (or resolves through symlinks to) a regular file with at least one execute bit —
+/// `execvp`'s "is this runnable" test.
+fn is_executable_file(p: &Path) -> bool {
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Append the guarded read-only binds that make `lit` — an absolute launch-target path already
+/// resolved against `cwd`/`$PATH` — reachable, de-duplicated into `out`.
+///
+/// bwrap opens the LITERAL path, but a symlink's target may live elsewhere, so BOTH the literal
+/// path's directory and the resolved target's directory are exposed. The directory used for every
+/// shadowed-root guard check is CANONICALIZED so a `..` component cannot sneak a shadowed root past
+/// the guard.
+fn push_token_binds(out: &mut Vec<PathBuf>, lit: &Path, roots: &[&Path]) {
+    // `metadata` follows symlinks. ANY stat error — NotFound, EACCES, a dangling symlink, ELOOP,
+    // … — is DELIBERATELY treated as "not a bindable path" and skipped: a token we cannot even
+    // stat (a flag, a value, a missing file) contributes no bind. This is the fail-safe — we never
+    // bind something we cannot confirm exists.
+    if std::fs::metadata(lit).is_err() {
+        return;
+    }
+    let real = canon(lit); // the resolved target (symlinks followed)
+                           // Never auto-expose a shadowed root itself (or an ancestor of one) — binding it would re-mount
+                           // the real subtree over the tmpfs. Such a target needs cwd / sandbox off.
+    if roots.iter().any(|root| root.starts_with(&real)) {
+        return;
+    }
+    // The directory to expose for a path: the path itself when it is a directory, else its parent.
+    // Canonicalized so the guard checks below see a `..`-free path.
+    let dir_of = |p: &Path| -> PathBuf {
+        if p.is_dir() {
+            canon(p)
+        } else {
+            canon(p.parent().unwrap_or(p))
+        }
+    };
+    // Where the token is WRITTEN (so a symlink is readable at its literal location) AND where its
+    // target actually LIVES. These coincide for a non-symlink (or same-dir symlink), so dedup
+    // collapses them to one bind.
+    for dir in [dir_of(lit), dir_of(&real)] {
+        // A shadowed-root (or ancestor) directory must never be bound as a directory; the target
+        // is a genuine file/subpath under it (checked above), so bind just the file.
+        let bind = if roots.iter().any(|root| root.starts_with(&dir)) {
+            real.clone()
+        } else {
+            dir
+        };
+        if !out.contains(&bind) {
+            out.push(bind);
+        }
     }
 }
 
@@ -149,20 +282,21 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
     if let Some(cwd) = &opts.cwd {
         let home_c = canon(std::path::Path::new(&opts.home));
         let cwd_c = canon(cwd);
-        // Guard: skip the rw bind when cwd IS home or an ancestor of home.
+        // Guard: skip the rw bind when cwd IS a tmpfs-shadowed root (`home` or `/tmp`) or an
+        // ancestor of one. Mirrors the `shadowed_roots` prefix logic in `launch_ro_binds`.
         //
-        // `--tmpfs <home>` mounts an ephemeral tmpfs over the real $HOME to hide
-        // ~/.ssh and other secrets.  If we also emit `--bind <cwd> <cwd>` and cwd
-        // equals home (or is a parent of home, e.g. cwd="/home" home="/home/u"),
-        // that bind re-mounts the real HOME subtree OVER the tmpfs — re-exposing
-        // everything we just hid.
+        // `--tmpfs <home>` and `--tmpfs /tmp` mount ephemeral tmpfs over the real $HOME (hiding
+        // ~/.ssh etc.) and /tmp. If we also emit `--bind <cwd> <cwd>` and cwd equals a shadowed
+        // root (or is a parent of one — e.g. cwd="/home" with home="/home/u", or cwd="/tmp" now
+        // that cwd defaults to glass's current dir), that bind re-mounts the real subtree OVER the
+        // tmpfs, re-exposing everything we just hid.
         //
-        // `home_c.starts_with(&cwd_c)` is true in both the equal case and the
-        // ancestor case, so we skip the bind in both.  The common subdir case
-        // (cwd="/home/u/proj") gives starts_with=false and is bound rw as usual.
-        // The `--ro-bind / /` + tmpfs already provide the path for the skipped
-        // cases so `--chdir` still works.
-        if !home_c.starts_with(&cwd_c) {
+        // `root.starts_with(&cwd_c)` is true when cwd equals a root or is an ancestor of it, so we
+        // skip the bind in both cases. The common subdir case (cwd="/home/u/proj" or "/tmp/scratch")
+        // gives false and is bound rw as usual. The `--ro-bind / /` + tmpfs already provide the path
+        // for the skipped cases so `--chdir` still works.
+        let shadowed_roots = [home_c.as_path(), std::path::Path::new("/tmp")];
+        if !shadowed_roots.iter().any(|root| root.starts_with(&cwd_c)) {
             v.push(OsString::from("--bind"));
             v.push(cwd.clone().into_os_string());
             v.push(cwd.clone().into_os_string());
@@ -432,18 +566,406 @@ mod tests {
         );
     }
 
+    /// `/tmp` is a tmpfs-shadowed root too. Now that cwd defaults to glass's own working
+    /// directory, glass running with cwd exactly `/tmp` must NOT emit `--bind /tmp /tmp` (that
+    /// would re-mount host `/tmp` over the ephemeral tmpfs), but `--chdir /tmp` must still appear.
     #[test]
-    fn program_ro_binds_absolute_returns_that_path() {
-        let binds = super::program_ro_binds(OsStr::new("/home/u/myapp"));
-        assert_eq!(binds, vec![PathBuf::from("/home/u/myapp")]);
+    fn cwd_equal_to_tmp_skips_bind_but_keeps_chdir() {
+        let o = WrapOpts {
+            level: SandboxLevel::Default,
+            home: OsString::from("/home/u"),
+            // cwd == /tmp: the dangerous case the home-only guard used to miss.
+            cwd: Some(PathBuf::from("/tmp")),
+            ro_binds: vec![],
+            rw_binds: vec![],
+        };
+        let s = argv_strings(&wrap_argv(OsStr::new("app"), &[], &o));
+        assert!(
+            !s.windows(3).any(|w| w == ["--bind", "/tmp", "/tmp"]),
+            "cwd==/tmp must not emit --bind /tmp /tmp; got: {s:?}"
+        );
+        assert!(
+            s.windows(2).any(|w| w == ["--chdir", "/tmp"]),
+            "cwd==/tmp must still emit --chdir /tmp; got: {s:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // launch_ro_binds tests
+    // -------------------------------------------------------------------------
+
+    /// `launch_ro_binds` with a throwaway EMPTY `cwd`, so no relative token resolves against it —
+    /// for the cases that exercise only bare-name/absolute tokens. Cases that test cwd-relative
+    /// resolution call `launch_ro_binds` directly with a populated `cwd`.
+    fn ro_binds(program: &OsStr, args: &[OsString], home: &Path) -> Vec<PathBuf> {
+        let cwd = tempfile::tempdir().unwrap();
+        launch_ro_binds(program, args, home, Some(cwd.path()))
     }
 
     #[test]
-    fn program_ro_binds_bare_name_returns_empty() {
-        let binds = super::program_ro_binds(OsStr::new("app"));
+    fn bare_name_program_via_usr_bin_binds_nothing() {
+        // `env` is a coreutils tool guaranteed on the system PATH under a non-shadowed dir
+        // (/usr/bin, already visible via --ro-bind / /), so resolving it contributes no bind. Using
+        // `env` rather than `python3` guarantees the "resolves under a non-shadowed dir → no bind"
+        // branch is actually exercised (a missing program would take the None path instead).
+        let home = tempfile::tempdir().unwrap();
+        assert!(ro_binds(OsStr::new("env"), &[], home.path()).is_empty());
+    }
+
+    #[test]
+    fn program_under_a_project_dir_binds_its_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = home.path().join("proj/app");
+        std::fs::create_dir_all(&proj).unwrap();
+        let bin = proj.join("bin");
+        std::fs::write(&bin, b"").unwrap();
+        let out = ro_binds(bin.as_os_str(), &[], home.path());
+        assert_eq!(out, vec![proj.canonicalize().unwrap()]); // the file's directory, not the file
+    }
+
+    #[test]
+    fn arg_script_binds_its_directory_so_siblings_are_reachable() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("app.py");
+        std::fs::write(&script, b"").unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&script)],
+            home.path(),
+        );
+        assert_eq!(out, vec![dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn existing_directory_arg_binds_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("proj/data");
+        std::fs::create_dir_all(&data).unwrap();
+        let out = ro_binds(
+            OsStr::new("srv"),
+            &[OsString::from("--root"), OsString::from(&data)],
+            home.path(),
+        );
+        assert_eq!(out, vec![data.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn target_directly_in_home_binds_only_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("app.py"); // parent dir == home
+        std::fs::write(&script, b"").unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&script)],
+            home.path(),
+        );
+        assert_eq!(out, vec![script.canonicalize().unwrap()]); // guard: never bind home itself as a dir
+        assert!(!out
+            .iter()
+            .any(|p| *p == home.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn nonexistent_tokens_contribute_nothing() {
+        // Flags/values and missing paths — bare, relative, or absolute — are not bindable. With an
+        // empty cwd the relative tokens (`http.server`, `app.py`) resolve to nothing, so the whole
+        // launch yields no binds.
+        let home = tempfile::tempdir().unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[
+                OsString::from("-m"),
+                OsString::from("http.server"),
+                OsString::from("app.py"),
+                OsString::from("/no/such/abs/path"),
+            ],
+            home.path(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn duplicate_dirs_are_collapsed() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.py");
+        std::fs::write(&a, b"").unwrap();
+        let b = dir.join("b.py");
+        std::fs::write(&b, b"").unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(&a), OsString::from(&b)],
+            home.path(),
+        );
+        assert_eq!(out, vec![dir.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn arg_equal_to_tmp_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from("/tmp")],
+            home.path(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn arg_equal_to_home_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(home.path())],
+            home.path(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ancestor_of_home_is_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("a/b/c");
+        std::fs::create_dir_all(&home).unwrap();
+        let ancestor = root.path().join("a/b"); // ancestor of home, not home itself
+        let out = ro_binds(OsStr::new("python3"), &[OsString::from(&ancestor)], &home);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn file_directly_under_tmp_binds_the_file_only() {
+        let home = tempfile::tempdir().unwrap(); // unrelated to the /tmp file below
+        let file = tempfile::Builder::new().tempfile_in("/tmp").unwrap();
+        let out = ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(file.path())],
+            home.path(),
+        );
+        assert_eq!(out, vec![file.path().canonicalize().unwrap()]);
+    }
+
+    // --- literal-path (symlink) reachability -------------------------------------------------
+
+    /// A symlink under `home` whose target lives OUTSIDE both shadowed roots (a venv/pyenv-style
+    /// `bin/python` → a system binary): bwrap opens the LITERAL symlink, so its directory must be
+    /// bound, not only the resolved target's. This is the `run[0]` regression the first increment
+    /// re-introduced by deciding binds from `canonicalize()` alone.
+    #[test]
+    fn symlink_program_binds_the_literal_dir_even_when_target_is_outside_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let bindir = home.path().join("venv/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let target = Path::new("/bin/sh"); // a real binary outside home and /tmp
+        assert!(target.exists(), "test needs /bin/sh present");
+        let link = bindir.join("python");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let out = ro_binds(link.as_os_str(), &[], home.path());
         assert!(
-            binds.is_empty(),
-            "bare name needs no extra bind; got: {binds:?}"
+            out.contains(&bindir.canonicalize().unwrap()),
+            "literal symlink's dir must be bound so bwrap can open it as written; got {out:?}"
+        );
+    }
+
+    /// A symlink under `home` whose target ALSO lives under `home` (a different directory): BOTH the
+    /// literal symlink's directory and the resolved target's directory must be bound.
+    #[test]
+    fn symlink_program_target_under_home_binds_both_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let bindir = home.path().join("venv/bin");
+        let libdir = home.path().join("venv/lib");
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::create_dir_all(&libdir).unwrap();
+        let target = libdir.join("python3.real");
+        std::fs::write(&target, b"").unwrap();
+        let link = bindir.join("python");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let out = ro_binds(link.as_os_str(), &[], home.path());
+        assert!(
+            out.contains(&bindir.canonicalize().unwrap()),
+            "literal symlink's dir missing: {out:?}"
+        );
+        assert!(
+            out.contains(&libdir.canonicalize().unwrap()),
+            "resolved target's dir missing: {out:?}"
+        );
+    }
+
+    // --- bare-name program via $PATH ---------------------------------------------------------
+
+    #[test]
+    fn resolve_on_path_in_finds_first_executable_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("mytool");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(resolve_on_path_in(OsStr::new("mytool"), &path), Some(exe));
+    }
+
+    #[test]
+    fn resolve_on_path_in_skips_non_executable_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("mytool");
+        std::fs::write(&plain, b"").unwrap(); // exists but NOT executable
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(resolve_on_path_in(OsStr::new("mytool"), &path), None);
+        assert_eq!(resolve_on_path_in(OsStr::new("absent"), &path), None);
+    }
+
+    /// A bare-name program installed only under a `$HOME` `PATH` dir (`~/.cargo/bin`, an asdf shim)
+    /// is hidden by the home tmpfs, so its resolving directory must be bound. Prepends a home bin
+    /// dir to `PATH` (keeping the rest, so concurrent readers still resolve their own binaries) and
+    /// installs a uniquely named executable there; a RAII guard restores `PATH` even on panic.
+    #[test]
+    fn bare_name_program_on_a_home_path_dir_binds_that_dir() {
+        struct PathGuard(std::ffi::OsString);
+        impl Drop for PathGuard {
+            fn drop(&mut self) {
+                std::env::set_var("PATH", &self.0);
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let bindir = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = bindir.join("glass-uniq-tool-xyzzy");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cwd = tempfile::tempdir().unwrap();
+        let out = {
+            let original = std::env::var_os("PATH").unwrap_or_default();
+            let mut prepended = bindir.clone().into_os_string();
+            prepended.push(":");
+            prepended.push(&original);
+            std::env::set_var("PATH", &prepended);
+            let _guard = PathGuard(original);
+            launch_ro_binds(
+                OsStr::new("glass-uniq-tool-xyzzy"),
+                &[],
+                home.path(),
+                Some(cwd.path()),
+            )
+        };
+        assert_eq!(out, vec![bindir.canonicalize().unwrap()]);
+    }
+
+    // --- relative token resolution against cwd -----------------------------------------------
+
+    /// A relative launch argument (`assets/data.bin`) is resolved against `cwd` and its directory
+    /// bound, so a contained launch that names files relative to its working dir reaches them.
+    #[test]
+    fn relative_arg_is_resolved_against_cwd_and_bound() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sub = cwd.path().join("assets");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("data.bin"), b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from("assets/data.bin")],
+            home.path(),
+            Some(cwd.path()),
+        );
+        assert_eq!(out, vec![sub.canonicalize().unwrap()]);
+    }
+
+    /// A relative token with NO known `cwd` (`None`) is SKIPPED, not resolved against `/` — so it
+    /// never binds a wrong top-level directory. An absolute token in the same call still binds, so
+    /// the ONLY bind here is that absolute path's directory.
+    #[test]
+    fn relative_token_with_no_cwd_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let sub = home.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let abs = sub.join("keep.bin");
+        std::fs::write(&abs, b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("./run.sh"), // relative program → skipped when cwd is None
+            &[OsString::from("assets/data.bin"), OsString::from(&abs)],
+            home.path(),
+            None,
+        );
+        assert_eq!(out, vec![sub.canonicalize().unwrap()]);
+    }
+
+    // --- /tmp guard isolated from home (load-bearing for the /tmp shadowed root) --------------
+
+    /// The `/tmp` guard must hold even when `home` is unrelated to `/tmp`: a real file directly
+    /// under `/tmp` is bound file-only (never `/tmp` as a directory), and an arg of exactly `/tmp`
+    /// is skipped. `home` is a NONEXISTENT path OUTSIDE `/tmp` (canon falls back to it), so ONLY
+    /// the literal `/tmp` entry in `shadowed_roots` protects `/tmp` — remove it and this test
+    /// fails (the file's dir `/tmp` would be bound, and `/tmp` itself would bind rather than skip).
+    #[test]
+    fn tmp_guard_holds_when_home_is_outside_tmp() {
+        let home = Path::new("/nonexistent-glass-home-outside-tmp");
+        let cwd = tempfile::tempdir().unwrap();
+        let file = tempfile::Builder::new().tempfile_in("/tmp").unwrap();
+
+        // A real file directly under /tmp → bind the FILE only, never /tmp as a directory.
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from(file.path())],
+            home,
+            Some(cwd.path()),
+        );
+        assert_eq!(out, vec![file.path().canonicalize().unwrap()]);
+        assert!(!out.iter().any(|p| *p == Path::new("/tmp")));
+
+        // An arg of exactly /tmp → skipped entirely.
+        let out2 = launch_ro_binds(
+            OsStr::new("python3"),
+            &[OsString::from("/tmp")],
+            home,
+            Some(cwd.path()),
+        );
+        assert!(
+            out2.is_empty(),
+            "an arg of /tmp must be skipped; got {out2:?}"
+        );
+    }
+
+    // --- secret-isolation invariant ----------------------------------------------------------
+
+    /// The hard invariant over a mixed launch: no produced bind may equal a shadowed root
+    /// (`home`, `/tmp`) or be an ancestor of one.
+    #[test]
+    fn no_bind_equals_a_shadowed_root_or_ancestor() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = home.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let in_home = home.path().join("top.py");
+        std::fs::write(&in_home, b"").unwrap();
+        let tmpfile = tempfile::Builder::new().tempfile_in("/tmp").unwrap();
+        std::fs::write(cwd.join("r.sh"), b"").unwrap();
+        let out = launch_ro_binds(
+            OsStr::new("python3"),
+            &[
+                OsString::from(&in_home),       // file directly under home
+                OsString::from(tmpfile.path()), // file directly under /tmp
+                OsString::from("/tmp"),         // a shadowed root itself
+                OsString::from(home.path()),    // home itself
+                OsString::from("r.sh"),         // relative → cwd/r.sh
+            ],
+            home.path(),
+            Some(cwd.as_path()),
+        );
+        let home_c = home.path().canonicalize().unwrap();
+        let roots = [home_c.as_path(), Path::new("/tmp")];
+        for b in &out {
+            // `root.starts_with(b)` is true iff `b` equals a root or is an ancestor of one.
+            assert!(
+                !roots.iter().any(|root| root.starts_with(b)),
+                "bind {b:?} equals a shadowed root or an ancestor of one"
+            );
+        }
+        assert!(
+            !out.is_empty(),
+            "sanity: the launch should still bind something"
         );
     }
 

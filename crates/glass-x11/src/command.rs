@@ -32,12 +32,33 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
         level => {
             let prog = OsString::from(&spec.run[0]);
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
-            // Always re-expose the X11 socket dir; also re-expose the program
-            // binary itself when it is absolute (it may live under $HOME, which
-            // the ephemeral tmpfs shadows). PATH-resolved bare names are covered
-            // by `--ro-bind / /` and need no extra bind.
+            // Default the working directory to glass's own cwd when the spec sets none, so a
+            // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
+            // directory (matching `sandbox:"off"`) and any relative launch token resolves against
+            // it. Computed ONCE (as an `Option<PathBuf>`) and shared by both consumers verbatim:
+            // `launch_ro_binds` via `as_deref()` and `WrapOpts.cwd` by move. If `current_dir()`
+            // fails, the error is logged and both consumers see `None` (no `--chdir`/bind; relative
+            // tokens are skipped, never resolved against a wrong root).
+            let effective_cwd = spec.cwd.clone().or_else(|| {
+                std::env::current_dir()
+                    .inspect_err(|e| {
+                        eprintln!(
+                            "glass: could not resolve a default cwd for the sandboxed launch: {e}; \
+                             relative launch tokens may not resolve"
+                        )
+                    })
+                    .ok()
+            });
+            let home_os = ephemeral_home();
+            // Always re-expose the X11 socket dir; also re-expose the launch target — the program
+            // and any path token under $HOME or /tmp, which the ephemeral tmpfs shadows.
             let mut ro_binds = vec![std::path::PathBuf::from("/tmp/.X11-unix")];
-            ro_binds.extend(glass_sandbox_linux::program_ro_binds(&prog));
+            ro_binds.extend(glass_sandbox_linux::launch_ro_binds(
+                &prog,
+                &args,
+                std::path::Path::new(&home_os),
+                effective_cwd.as_deref(),
+            ));
             // Re-expose the private a11y bus dir (session-bus + at-spi sockets) so a sandboxed
             // app can reach the advertised unix:path= sockets, like the X11 socket above.
             if let Some(dir) = a11y_bind_dir {
@@ -45,8 +66,8 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
             }
             let opts = WrapOpts {
                 level,
-                home: ephemeral_home(),
-                cwd: spec.cwd.clone(),
+                home: home_os,
+                cwd: effective_cwd,
                 ro_binds,
                 rw_binds: vec![],
             };
@@ -234,6 +255,77 @@ mod tests {
             .find(|(k, _)| *k == std::ffi::OsStr::new("DISPLAY"))
             .and_then(|(_, v)| v);
         assert_eq!(disp, Some(std::ffi::OsStr::new(":99")));
+    }
+
+    #[test]
+    fn build_command_binds_an_absolute_argument_path_dir() {
+        // A launch target reached only through an ARGUMENT path (not run[0]) must be re-exposed:
+        // the arg's directory is bound into the bwrap argv. This runs under the default
+        // (display-less) `cargo test`, so it catches an `&args` mis-wire that the #[ignore]d
+        // integration test would otherwise be the only guard against.
+        use glass_core::SandboxLevel;
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap(); // under /tmp, not $HOME
+        let asset = dir.path().join("asset.bin");
+        std::fs::write(&asset, b"").unwrap();
+        let asset_s = asset.to_string_lossy();
+        let mut s = spec(&["/bin/cat", asset_s.as_ref()]);
+        s.sandbox = SandboxLevel::Default;
+        let cmd = build_command(&s, ":99", None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let argdir = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == argdir && w[2] == argdir),
+            "arg dir {argdir} not bound into bwrap argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_defaults_cwd_to_current_dir_when_unset() {
+        // With cwd: None and a sandbox, glass defaults the working directory to its OWN cwd, so the
+        // bwrap argv must carry `--chdir <current_dir>` (and, unless current_dir is the ephemeral
+        // HOME/tmp or an ancestor, a rw `--bind <current_dir> <current_dir>`). Both this test and
+        // the code read current_dir() in-process, so it's a literal-value assertion.
+        use glass_core::SandboxLevel;
+        let cwd = std::env::current_dir().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.cwd = None;
+        let cmd = build_command(&s, ":99", None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let cwd_s = cwd.to_string_lossy().into_owned();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--chdir" && w[1] == cwd_s),
+            "expected --chdir {cwd_s} in argv: {args:?}"
+        );
+        // The rw bind is suppressed only when current_dir is a shadowed root or an ancestor of one
+        // (the secret-isolation guard); assert it otherwise (the normal project-dir case).
+        let home = ephemeral_home();
+        let home_c = std::path::Path::new(&home)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&home));
+        let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        let cwd_is_root_or_ancestor = [home_c.as_path(), std::path::Path::new("/tmp")]
+            .iter()
+            .any(|root| root.starts_with(&cwd_c));
+        if !cwd_is_root_or_ancestor {
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == cwd_s && w[2] == cwd_s),
+                "expected --bind {cwd_s} {cwd_s} in argv: {args:?}"
+            );
+        }
     }
 
     #[test]

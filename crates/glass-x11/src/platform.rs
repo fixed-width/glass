@@ -333,7 +333,10 @@ impl X11Platform {
             }
             if let Some(child) = self.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
-                    return Err(GlassError::AppExited(status.code()));
+                    return Err(GlassError::app_exited_during_discovery(
+                        status.code(),
+                        spec.sandbox,
+                    ));
                 }
             }
             if Instant::now() >= deadline {
