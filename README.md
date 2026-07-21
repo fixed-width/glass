@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/fixed-width/glass/actions/workflows/ci.yml/badge.svg)](https://github.com/fixed-width/glass/actions/workflows/ci.yml)
 
+**Give your coding agent hands for the app it's building** — launch it, drive it, and verify the
+result, without burning a screenshot on every step.
+
 A Rust [MCP](https://modelcontextprotocol.io) server that gives an AI coding agent a closed **build →
 see → interact → debug** loop over external native GUI applications.
 
@@ -15,21 +18,50 @@ or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** 
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`;
 multi-touch gestures excepted), and a **macOS** backend, behind a platform-agnostic core.
 
+## See it
+
+![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)
+
+An agent building a GUI app runs it under glass, reproduces a bug **from the accessibility tree**
+(no screenshots), fixes the code, and re-verifies — the loop it otherwise can't close on its own.
+[Try it yourself](#try-it-in-60-seconds).
+
+## Try it in 60 seconds
+
+1. Download glass for your platform from the [Releases page](https://github.com/fixed-width/glass/releases/latest)
+   and [connect it to your agent](docs/how-to/connect-an-agent.md).
+2. Get the example app — clone this repo, or download
+   [`examples/tasks_demo.py`](examples/tasks_demo.py) (on Linux it needs
+   `sudo apt install python3-gi gir1.2-gtk-4.0`).
+3. Paste this to your agent:
+
+   > Use glass to run `examples/tasks_demo.py` with accessibility on. There's a bug: clicking
+   > **Add** doesn't add the typed task. Reproduce it by driving the UI and checking the
+   > accessibility tree (don't just screenshot), then find and fix the bug in the code and verify a
+   > task actually appears.
+
+Your agent launches the app, reproduces the bug from the accessibility tree, fixes the one-line
+wiring bug, and confirms the task appears — the whole build → see → interact → debug loop, start to
+finish. (`glass-mcp doctor` checks your environment if anything's off.)
+
 ## The loop in practice
 
-Point an agent at a GUI app and it runs the whole cycle itself:
+Point an agent at a GUI app and it runs the whole cycle itself. When the app exposes an accessibility
+tree, the agent drives it semantically — addressing widgets by `#id` and confirming each step from
+text, no per-step screenshot:
 
 ```jsonc
-glass_start   { "build": "cargo build --release", "run": ["target/release/my-app"] }  // builds, then launches (sandboxed)
-glass_screenshot                       // see the window
-glass_click   { "x": 240, "y": 160 }   // interact
-glass_wait_stable                      // let the render settle
-glass_diff                             // what changed? changed_pct + bbox, as text — no image
-glass_logs                             // read the app's stderr
+glass_start            { "run": ["python3", "app.py"], "a11y": true }   // launch (+ private a11y bus)
+glass_a11y_snapshot                        // the tree: role, name, #id, bounds — as text
+glass_click_element    { "id": 5 }         // click by #id, not pixels
+glass_wait_for_element { "name": "Save", "condition": "enabled" }       // wait on state — no polling
+glass_set_value        { "id": 4, "value": "hello" }   // set a field / toggle / dropdown
+glass_logs                                 // read the app's stderr
 ```
 
-`glass_diff` and the `glass_wait_for_*` tools return text only, so the routine checks between
-screenshots cost no vision tokens. Why the loop is shaped this way:
+For a canvas or custom-rendered app with no accessibility tree, drive it by pixels instead —
+`glass_screenshot`, `glass_click {x,y}`, and `glass_diff`, which returns `changed_pct` + a `bbox` as
+text, so routine checks between screenshots cost no vision tokens. Why the loop is shaped this way:
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
 
 ## Install at a glance
