@@ -36,7 +36,7 @@ use rustix::process::{kill_process, Pid, Signal};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
 use glass_core::{GlassError, Result, Stream};
-use glass_sandbox_macos::{build_profile, ProfileOpts};
+use glass_sandbox_macos::{build_profile, launch_reallows, ProfileOpts};
 
 /// Per-spawn counter feeding one component of
 /// [`crate::clipboard_route::session_pasteboard_name`] (combined there with this process's pid
@@ -164,14 +164,27 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
     // sandbox_init syscall). Off spawns unchanged. Build (run_build) is never contained.
     let mut clip: Option<ClipLaunch> = None;
     if spec.sandbox != SandboxLevel::Off {
-        // Resolve to absolute paths: a relative `(subpath ".")` never matches the child's real
-        // cwd, and `build_profile`'s guard needs absolute paths to reason about home exposure.
-        let cwd = spec
-            .cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/"));
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        // Effective working dir for the profile + reachability: the caller's cwd, else glass's own
+        // current dir. A failure to read current_dir() is surfaced (not silently substituted with
+        // "/", which would misroot relative launch tokens) and leaves the cwd unset.
+        let effective_cwd: Option<PathBuf> = spec.cwd.clone().or_else(|| {
+            std::env::current_dir()
+                .map_err(|e| {
+                    logs.lock().expect("log sink mutex").push((
+                        Stream::Stderr,
+                        format!(
+                            "glass: could not determine current directory for sandbox cwd: {e}"
+                        ),
+                    ));
+                })
+                .ok()
+        });
+        // Canonicalize for the profile's cwd field (same as the pre-diff code did), non-fatally.
+        let cwd_canon: Option<PathBuf> = effective_cwd
+            .as_ref()
+            .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()));
+        // Resolve to an absolute path: `build_profile`'s guard needs one to reason about home
+        // exposure.
         let program =
             std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
 
@@ -230,14 +243,29 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
             clip = Some(ClipLaunch { name });
         }
 
+        // Re-allow the launch target itself (program + path args) so it stays reachable under
+        // the profile's `/Users` read-deny — see `launch_reallows`'s own docs. Pass the
+        // un-canonicalized `effective_cwd` (not `cwd_canon`) so relative tokens resolve against
+        // where glass was actually invoked.
+        let reallows = launch_reallows(&spec.run, effective_cwd.as_deref());
+        // Union the arg-literal re-allows with the shim file (if injecting); the shim file is a
+        // distinct path from anything `launch_reallows` could have produced.
+        let mut ro_files = reallows.ro_files;
+        if let Some(f) = shim_file {
+            if !ro_files.contains(&f) {
+                ro_files.push(f);
+            }
+        }
         // Pasteboard is allowed only for an injectable target (the shim's redirect is the
         // actual isolation there); a hardened/non-injectable target keeps it denied, same as
         // before this task.
         let opts = ProfileOpts {
-            cwd,
+            // `/` here is inert (`is_safe_reallow("/")` is false) — it only matters when
+            // `effective_cwd` was unset (a `current_dir()` failure, logged above).
+            cwd: cwd_canon.unwrap_or_else(|| PathBuf::from("/")),
             program,
-            ro_binds: vec![],
-            ro_files: shim_file.into_iter().collect(),
+            ro_binds: reallows.ro_binds,
+            ro_files,
             rw_binds: vec![],
             allow_pasteboard,
         };
