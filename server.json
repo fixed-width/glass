@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.fixed-width/glass",
+  "title": "glass",
+  "description": "MCP server giving a coding agent a build→see→interact→debug loop over native GUI apps.",
+  "version": "1.0.1",
+  "websiteUrl": "https://fixedwidth.tech/glass",
+  "repository": {
+    "url": "https://github.com/fixed-width/glass",
+    "source": "github"
+  }
+}
