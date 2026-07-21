@@ -119,14 +119,35 @@ fn resolve_sandbox(
     }
 }
 
+/// Read the operator floor env, distinguishing "unset" from "set-but-unreadable". A floor whose
+/// bytes are not valid UTF-8 must NOT be silently treated as unset — that would drop the operator's
+/// floor (fail-OPEN). It is an error, so the launch is refused until it's fixed (fail-closed),
+/// exactly as an unrecognized floor value is. (`std::env::var(..).ok()` would collapse both the
+/// absent and the non-UTF-8 cases to `None`, which is the fail-open we avoid here.)
+fn floor_from_var(v: Result<String, std::env::VarError>) -> Result<Option<String>, String> {
+    match v {
+        Ok(s) => Ok(Some(s)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "GLASS_SANDBOX_FLOOR is set but is not valid UTF-8; set it to off/default/strict or \
+             unset it"
+                .to_string(),
+        ),
+    }
+}
+
 pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
     if a.run.is_empty() {
         return Err("`run` must contain at least the program to launch".into());
     }
+    // Read the two operator vars into named bindings so the wiring is eyeball-obvious (a swap
+    // between the omit-default and the floor would otherwise compile silently).
+    let sandbox_env = std::env::var("GLASS_SANDBOX").ok();
+    let floor_env = floor_from_var(std::env::var("GLASS_SANDBOX_FLOOR"))?;
     let sandbox = resolve_sandbox(
         a.sandbox.as_deref(),
-        std::env::var("GLASS_SANDBOX").ok().as_deref(),
-        std::env::var("GLASS_SANDBOX_FLOOR").ok().as_deref(),
+        sandbox_env.as_deref(),
+        floor_env.as_deref(),
     )?;
     let spec = AppSpec {
         build: a.build.clone(),
@@ -722,6 +743,27 @@ mod tests {
     fn invalid_floor_or_level_is_an_error() {
         assert!(resolve_sandbox(None, None, Some("bogus")).is_err());
         assert!(resolve_sandbox(Some("bogus"), None, None).is_err());
+    }
+
+    #[test]
+    fn floor_from_var_maps_present_absent_and_non_utf8() {
+        // Present + valid → Some; absent → None (no floor).
+        assert_eq!(
+            floor_from_var(Ok("strict".to_string())).unwrap(),
+            Some("strict".to_string())
+        );
+        assert_eq!(
+            floor_from_var(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        // Set-but-non-UTF-8 must be an ERROR (fail-closed), never silently unset (fail-open) —
+        // otherwise a garbled operator floor would silently disable the policy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![0x73, 0x80, 0x74]); // invalid UTF-8
+            assert!(floor_from_var(Err(std::env::VarError::NotUnicode(bad))).is_err());
+        }
     }
 
     #[test]

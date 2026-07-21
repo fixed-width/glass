@@ -61,7 +61,19 @@ fn default_backend_check(raw: Option<&str>) -> Check {
 /// mis-set `GLASS_BACKEND` (which silently falls back to a host default), a `GLASS_SANDBOX_FLOOR`
 /// that fails to parse makes `resolve_sandbox` reject *every* `glass_start` call — so that case is
 /// a `Fail`, not a `Warn`.
-fn sandbox_floor_check(raw: Option<&str>) -> Check {
+fn sandbox_floor_check(raw: Option<&str>, not_utf8: bool) -> Check {
+    if not_utf8 {
+        // A set-but-non-UTF-8 floor is treated as fail-closed by `start` (the launch is refused),
+        // so doctor must surface it as a hard failure — never a green "off" that hides a floor the
+        // operator believes is enforced.
+        return Check::new(
+            "sandbox floor",
+            CheckStatus::Fail,
+            "GLASS_SANDBOX_FLOOR is set but is not valid UTF-8 \
+             — every glass_start call will be rejected until this is fixed",
+        )
+        .with_remedy("set GLASS_SANDBOX_FLOOR to one of: off, default, strict, or unset it");
+    }
     match raw {
         None => Check::new(
             "sandbox floor",
@@ -90,14 +102,20 @@ fn sandbox_floor_check(raw: Option<&str>) -> Check {
 fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diagnosis {
     let raw = std::env::var("GLASS_BACKEND").ok();
     let backend = crate::default_backend(raw.as_deref());
-    let sandbox_floor_raw = std::env::var("GLASS_SANDBOX_FLOOR").ok();
+    // Distinguish unset from set-but-non-UTF-8: the latter fails `start` closed, so it must not read
+    // as a green "off" here (mirrors `tools::floor_from_var`).
+    let (sandbox_floor_raw, sandbox_floor_bad_utf8) = match std::env::var("GLASS_SANDBOX_FLOOR") {
+        Ok(v) => (Some(v), false),
+        Err(std::env::VarError::NotPresent) => (None, false),
+        Err(std::env::VarError::NotUnicode(_)) => (None, true),
+    };
 
     let general = Section::new(
         "general",
         None,
         vec![
             default_backend_check(raw.as_deref()),
-            sandbox_floor_check(sandbox_floor_raw.as_deref()),
+            sandbox_floor_check(sandbox_floor_raw.as_deref(), sandbox_floor_bad_utf8),
             Check::new("glass", CheckStatus::Ok, env!("CARGO_PKG_VERSION")),
         ],
     );
@@ -569,7 +587,7 @@ mod tests {
 
     #[test]
     fn sandbox_floor_check_reports_off_when_unset() {
-        let c = sandbox_floor_check(None);
+        let c = sandbox_floor_check(None, false);
         assert_eq!(c.status, CheckStatus::Ok);
         assert!(c.detail.contains("off"), "detail: {}", c.detail);
         assert!(c.detail.contains("no floor"), "detail: {}", c.detail);
@@ -577,7 +595,7 @@ mod tests {
 
     #[test]
     fn sandbox_floor_check_reports_a_configured_level() {
-        let c = sandbox_floor_check(Some("strict"));
+        let c = sandbox_floor_check(Some("strict"), false);
         assert_eq!(c.status, CheckStatus::Ok);
         assert!(c.detail.contains("strict"), "detail: {}", c.detail);
         assert!(
@@ -592,9 +610,19 @@ mod tests {
         // Unlike a mis-set GLASS_BACKEND (which silently falls back), a GLASS_SANDBOX_FLOOR that
         // fails to parse makes `resolve_sandbox` reject every glass_start call — so this is a
         // Fail, not a Warn, and carries a remedy.
-        let c = sandbox_floor_check(Some("bogus"));
+        let c = sandbox_floor_check(Some("bogus"), false);
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(c.detail.contains("bogus"), "detail: {}", c.detail);
+        assert!(c.remedy.is_some(), "expected a remedy on the failure");
+    }
+
+    #[test]
+    fn sandbox_floor_check_fails_on_non_utf8() {
+        // A set-but-non-UTF-8 floor fails `start` closed, so doctor must report Fail (with a
+        // remedy) — never a green "off" that hides an enforced-but-unreadable floor.
+        let c = sandbox_floor_check(None, true);
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(c.detail.contains("UTF-8"), "detail: {}", c.detail);
         assert!(c.remedy.is_some(), "expected a remedy on the failure");
     }
 
