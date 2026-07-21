@@ -75,14 +75,64 @@ fn geometry_value(g: &WindowGeometry) -> serde_json::Value {
     json!({ "x": g.x, "y": g.y, "width": g.width, "height": g.height })
 }
 
-/// Resolve the sandbox level: explicit arg → `GLASS_SANDBOX` env → `Default`.
+/// Resolve the effective sandbox level from the agent's request, the operator's omit-default
+/// (`GLASS_SANDBOX`), and the operator's enforced floor (`GLASS_SANDBOX_FLOOR`).
+///
+/// - `floor` = `GLASS_SANDBOX_FLOOR` else `Off` (no floor = today's behavior).
+/// - Agent OMITS `sandbox`: `requested` = `GLASS_SANDBOX` else `Default`, then clamped UP to the
+///   floor (the agent stated no preference, so policy simply applies). Never an error.
+/// - Agent passes `sandbox` EXPLICITLY: honored iff at or above the floor; a request *below* the
+///   floor is REFUSED, naming the policy — the operator, not the agent, decides to weaken it.
 fn resolve_sandbox(
     arg: Option<&str>,
-    env: Option<&str>,
+    env_default: Option<&str>,
+    env_floor: Option<&str>,
 ) -> Result<glass_core::SandboxLevel, String> {
-    match arg.or(env) {
-        Some(s) => s.parse(),
-        None => Ok(glass_core::SandboxLevel::Default),
+    use glass_core::SandboxLevel;
+    let floor = match env_floor {
+        Some(s) => s.parse::<SandboxLevel>()?,
+        None => SandboxLevel::Off,
+    };
+    match arg {
+        Some(s) => {
+            let requested = s.parse::<SandboxLevel>()?;
+            if requested.strength() < floor.strength() {
+                return Err(format!(
+                    "sandbox:\"{requested}\" is below the operator's containment floor \
+                     (GLASS_SANDBOX_FLOOR={floor}); request a level at or above \"{floor}\", or ask \
+                     the operator to lower the floor"
+                ));
+            }
+            Ok(requested)
+        }
+        None => {
+            let omit_default = match env_default {
+                Some(s) => s.parse::<SandboxLevel>()?,
+                None => SandboxLevel::Default,
+            };
+            Ok(if omit_default.strength() >= floor.strength() {
+                omit_default
+            } else {
+                floor
+            })
+        }
+    }
+}
+
+/// Read the operator floor env, distinguishing "unset" from "set-but-unreadable". A floor whose
+/// bytes are not valid UTF-8 must NOT be silently treated as unset — that would drop the operator's
+/// floor (fail-OPEN). It is an error, so the launch is refused until it's fixed (fail-closed),
+/// exactly as an unrecognized floor value is. (`std::env::var(..).ok()` would collapse both the
+/// absent and the non-UTF-8 cases to `None`, which is the fail-open we avoid here.)
+fn floor_from_var(v: Result<String, std::env::VarError>) -> Result<Option<String>, String> {
+    match v {
+        Ok(s) => Ok(Some(s)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "GLASS_SANDBOX_FLOOR is set but is not valid UTF-8; set it to off/default/strict or \
+             unset it"
+                .to_string(),
+        ),
     }
 }
 
@@ -90,9 +140,14 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
     if a.run.is_empty() {
         return Err("`run` must contain at least the program to launch".into());
     }
+    // Read the two operator vars into named bindings so the wiring is eyeball-obvious (a swap
+    // between the omit-default and the floor would otherwise compile silently).
+    let sandbox_env = std::env::var("GLASS_SANDBOX").ok();
+    let floor_env = floor_from_var(std::env::var("GLASS_SANDBOX_FLOOR"))?;
     let sandbox = resolve_sandbox(
         a.sandbox.as_deref(),
-        std::env::var("GLASS_SANDBOX").ok().as_deref(),
+        sandbox_env.as_deref(),
+        floor_env.as_deref(),
     )?;
     let spec = AppSpec {
         build: a.build.clone(),
@@ -635,21 +690,80 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_precedence_arg_over_env_over_default() {
-        // arg wins
+    fn floor_unset_preserves_current_behavior() {
+        // arg wins over env; omit → GLASS_SANDBOX else default. Floor off = no enforcement.
         assert_eq!(
-            resolve_sandbox(Some("strict"), Some("off")).unwrap(),
-            SandboxLevel::Strict
-        );
-        // env used when no arg
-        assert_eq!(
-            resolve_sandbox(None, Some("off")).unwrap(),
+            resolve_sandbox(Some("off"), Some("strict"), None).unwrap(),
             SandboxLevel::Off
         );
-        // default when neither
-        assert_eq!(resolve_sandbox(None, None).unwrap(), SandboxLevel::Default);
-        // bad value is a clear error
-        assert!(resolve_sandbox(Some("nope"), None).is_err());
+        assert_eq!(
+            resolve_sandbox(None, Some("strict"), None).unwrap(),
+            SandboxLevel::Strict
+        );
+        assert_eq!(
+            resolve_sandbox(None, None, None).unwrap(),
+            SandboxLevel::Default
+        );
+    }
+
+    #[test]
+    fn floor_clamps_an_omitted_request_up() {
+        // omit-default default, floor strict → effective strict (policy applies, no error).
+        assert_eq!(
+            resolve_sandbox(None, None, Some("strict")).unwrap(),
+            SandboxLevel::Strict
+        );
+        assert_eq!(
+            resolve_sandbox(None, Some("off"), Some("default")).unwrap(),
+            SandboxLevel::Default
+        );
+    }
+
+    #[test]
+    fn floor_honors_an_explicit_request_at_or_above_it() {
+        assert_eq!(
+            resolve_sandbox(Some("strict"), None, Some("default")).unwrap(),
+            SandboxLevel::Strict
+        );
+        assert_eq!(
+            resolve_sandbox(Some("default"), None, Some("default")).unwrap(),
+            SandboxLevel::Default
+        );
+    }
+
+    #[test]
+    fn floor_refuses_an_explicit_request_below_it() {
+        let err = resolve_sandbox(Some("off"), None, Some("strict")).unwrap_err();
+        assert!(err.contains("GLASS_SANDBOX_FLOOR=strict"), "{err}");
+        assert!(err.contains("off"), "{err}");
+        assert!(resolve_sandbox(Some("default"), None, Some("strict")).is_err());
+    }
+
+    #[test]
+    fn invalid_floor_or_level_is_an_error() {
+        assert!(resolve_sandbox(None, None, Some("bogus")).is_err());
+        assert!(resolve_sandbox(Some("bogus"), None, None).is_err());
+    }
+
+    #[test]
+    fn floor_from_var_maps_present_absent_and_non_utf8() {
+        // Present + valid → Some; absent → None (no floor).
+        assert_eq!(
+            floor_from_var(Ok("strict".to_string())).unwrap(),
+            Some("strict".to_string())
+        );
+        assert_eq!(
+            floor_from_var(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        // Set-but-non-UTF-8 must be an ERROR (fail-closed), never silently unset (fail-open) —
+        // otherwise a garbled operator floor would silently disable the policy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![0x73, 0x80, 0x74]); // invalid UTF-8
+            assert!(floor_from_var(Err(std::env::VarError::NotUnicode(bad))).is_err());
+        }
     }
 
     #[test]

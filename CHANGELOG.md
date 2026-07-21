@@ -17,6 +17,10 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- **`GLASS_SANDBOX_FLOOR`** — an operator-set minimum containment level (`off`/`default`/`strict`)
+  that a launch's `sandbox` level can raise but never drop below: an omitted `sandbox` is clamped up
+  to the floor, and an explicit request below it is refused. Default `off` (no floor — today's
+  behavior). `glass-mcp doctor` reports the configured floor.
 - **macOS and iOS accessibility now report toggle state.** A checkbox, radio button, or switch read
   via `glass_a11y_snapshot` / `glass_wait_for_element` now carries its `checkable`/`checked` state on
   the macOS and iOS backends (previously only Linux, Windows, and Android did), so
@@ -83,6 +87,9 @@ internal refactors, CI, or test-only changes.
 - **`glass_start`'s `env` is now a JSON object** `{ "KEY": "VALUE" }` instead of an array of
   `[key, value]` pairs.
 - **`glass_logs`'s `max_lines` is a plain integer** (a `u32`).
+- The containment docs now spell out that the Windows sandbox isolates the boxed app's writes and
+  (under `strict`) its network, but not its reads — it does not hide your home directory from the app
+  the way the Linux and macOS profiles do. Behavior is unchanged; this documents an existing limit.
 
 ## [0.5.0] - 2026-07-13
 

@@ -32,6 +32,31 @@ impl std::str::FromStr for SandboxLevel {
     }
 }
 
+impl SandboxLevel {
+    /// Containment strength as a total order: `Off` < `Default` < `Strict`. Used to enforce a policy
+    /// floor (the operator-set minimum). This is deliberately NOT the enum's declaration order, so
+    /// deriving `Ord` would give the wrong answer — hence an explicit rank.
+    pub fn strength(self) -> u8 {
+        match self {
+            SandboxLevel::Off => 0,
+            SandboxLevel::Default => 1,
+            SandboxLevel::Strict => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxLevel {
+    /// The lowercase name, round-tripping with `FromStr` (used in the policy-floor error message
+    /// and the `doctor` floor line).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SandboxLevel::Off => "off",
+            SandboxLevel::Default => "default",
+            SandboxLevel::Strict => "strict",
+        })
+    }
+}
+
 /// Window geometry in screen coordinates, as reported by a backend.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WindowGeometry {
@@ -298,6 +323,23 @@ mod sandbox_level_tests {
     #[test]
     fn default_is_default_variant() {
         assert_eq!(SandboxLevel::default(), SandboxLevel::Default);
+    }
+
+    #[test]
+    fn strength_orders_off_below_default_below_strict() {
+        assert!(SandboxLevel::Off.strength() < SandboxLevel::Default.strength());
+        assert!(SandboxLevel::Default.strength() < SandboxLevel::Strict.strength());
+    }
+
+    #[test]
+    fn display_round_trips_with_from_str() {
+        for lvl in [
+            SandboxLevel::Off,
+            SandboxLevel::Default,
+            SandboxLevel::Strict,
+        ] {
+            assert_eq!(lvl.to_string().parse::<SandboxLevel>().unwrap(), lvl);
+        }
     }
 }
 

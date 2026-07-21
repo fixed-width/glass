@@ -59,6 +59,8 @@ pub struct StartArgs {
     /// Containment level for the launched app: `"default"` (filesystem/process
     /// containment, network on), `"strict"` (also no network), or `"off"` (no
     /// containment). Omit for the server default (`GLASS_SANDBOX`, else `default`).
+    /// An operator-set floor (`GLASS_SANDBOX_FLOOR`) may raise an omitted level, and
+    /// refuses an explicit level requested below it.
     pub sandbox: Option<String>,
     pub cwd: Option<String>,
     /// Extra environment variables for the launched app, as a `{ "KEY": "VALUE" }` object.

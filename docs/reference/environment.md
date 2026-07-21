@@ -31,6 +31,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | Variable | Purpose | Default | Scope |
 |---|---|---|---|
 | `GLASS_SANDBOX` | Default containment level: `default`, `strict`, or `off` | `default` | all |
+| `GLASS_SANDBOX_FLOOR` | Operator-enforced minimum containment level; raises an omitted request, refuses an explicit one below it | `off` (no floor) | all |
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
