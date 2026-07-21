@@ -1,6 +1,7 @@
 # glass
 
-[![CI](https://github.com/fixed-width/glass/actions/workflows/ci.yml/badge.svg)](https://github.com/fixed-width/glass/actions/workflows/ci.yml)
+[![CI](https://github.com/fixed-width/glass/actions/workflows/ci.yml/badge.svg)](https://github.com/fixed-width/glass/actions/workflows/ci.yml)  
+[![glass MCP server](https://glama.ai/mcp/servers/fixed-width/glass/badges/score.svg)](https://glama.ai/mcp/servers/fixed-width/glass)
 
 **Give your coding agent hands for the app it's building** — launch it, drive it, and verify the
 result, without burning a screenshot on every step.
