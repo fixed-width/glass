@@ -621,6 +621,56 @@ fn fail_closed_when_bwrap_missing_wayland() {
     );
 }
 
+/// Wayland twin of the X11 `sandbox_default_reaches_launch_target_via_argument_path`
+/// test: the reported bug reproduced on the other Linux backend, which shares the same
+/// `launch_ro_binds` fix. A launch target reached only through an **argument**
+/// (`run[1]`), not `run[0]` itself, must still be reachable under the default sandbox.
+/// See the X11 test in `tests/integration.rs` for the full rationale — the fixture
+/// shape (temp dir + sibling testapp copy + `run.sh`) is identical.
+#[test]
+#[ignore = "requires sway + bwrap; run via scripts/test-wayland.sh"]
+fn sandbox_default_reaches_launch_target_via_argument_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let testapp_copy = dir.path().join("glass-testapp");
+    std::fs::copy(TESTAPP, &testapp_copy).expect("copy glass-testapp into temp dir");
+
+    let run_sh = dir.path().join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\nexec \"{}\"\n", testapp_copy.display()),
+    )
+    .expect("write run.sh");
+    // `fs::copy` preserves the source's executable bit, but `fs::write` does not —
+    // the wrapper script needs it set explicitly.
+    std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x run.sh");
+
+    let mut p = WaylandPlatform::new().unwrap();
+    let sandboxed_spec = AppSpec {
+        build: None,
+        run: vec!["sh".to_string(), run_sh.to_string_lossy().into_owned()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: APP_TIMEOUT_MS,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = start(&mut p, &sandboxed_spec);
+    assert_eq!(
+        (geom.width, geom.height),
+        (320, 240),
+        "arg-path launch target unreachable under the default sandbox"
+    );
+    assert!(
+        drain_until(&mut p, "READY", READY_TRIES),
+        "never saw READY (sandboxed, arg-path launch)"
+    );
+    p.stop_app().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Build-step integration tests (bwrap + sway)
 // ---------------------------------------------------------------------------

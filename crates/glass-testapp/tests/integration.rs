@@ -1487,3 +1487,60 @@ fn window_op_on_a_closed_window_reports_window_not_found() {
 
     p.stop_app().ok();
 }
+
+/// Reproduces the reported bug: a launch target reached only through an **argument**
+/// (`run[1]`), not `run[0]` itself, must still be reachable under the default sandbox.
+/// `launch_ro_binds` binds the *directory* of every `run` token that is an absolute,
+/// existing path — so placing `run.sh` in a fresh temp dir (under `/tmp`, which the
+/// sandbox's tmpfs shadows) alongside a copy of `glass-testapp`, and having `run.sh`
+/// `exec` that sibling copy, means the one bind for `run.sh`'s directory also exposes
+/// the testapp copy. The whole launch chain then succeeds: `sh` (bare name, reached via
+/// the `--ro-bind / /` PATH lookup) execs `run.sh` (the arg needing the fix), which execs
+/// the sibling testapp binary (now visible in the same bound dir).
+///
+/// Before the fix, `launch_ro_binds` considered only `run[0]` (`sh`, a bare name that
+/// contributes no bind), so the temp dir stayed hidden behind the tmpfs shadow, `sh`
+/// could not read `run.sh`, and `start_app` failed with `SandboxedAppExited`.
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
+fn sandbox_default_reaches_launch_target_via_argument_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let testapp_copy = dir.path().join("glass-testapp");
+    std::fs::copy(TESTAPP, &testapp_copy).expect("copy glass-testapp into temp dir");
+
+    let run_sh = dir.path().join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\nexec \"{}\"\n", testapp_copy.display()),
+    )
+    .expect("write run.sh");
+    // `fs::copy` preserves the source's executable bit, but `fs::write` does not —
+    // the wrapper script needs it set explicitly.
+    std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x run.sh");
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        build: None,
+        run: vec!["sh".to_string(), run_sh.to_string_lossy().into_owned()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 8000,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = p.start_app(&spec).unwrap_or_else(|e| {
+        panic!("arg-path launch target unreachable under the default sandbox: {e}")
+    });
+    assert_eq!(geom.width, 320);
+    assert_eq!(geom.height, 240);
+    assert!(
+        wait_for_log(&mut p, "READY", 60),
+        "never saw READY on stdout (sandboxed, arg-path launch)"
+    );
+    p.stop_app().unwrap();
+}
