@@ -1,0 +1,6 @@
+# Keep the build context small: exclude build output, VCS, release artifacts, and heavy media.
+# Everything the build needs (crates/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/) is kept.
+target/
+.git/
+dist/
+docs/assets/
