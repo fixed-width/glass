@@ -1498,9 +1498,10 @@ fn window_op_on_a_closed_window_reports_window_not_found() {
 /// the `--ro-bind / /` PATH lookup) execs `run.sh` (the arg needing the fix), which execs
 /// the sibling testapp binary (now visible in the same bound dir).
 ///
-/// Before the fix, `launch_ro_binds` considered only `run[0]` (`sh`, a bare name that
-/// contributes no bind), so the temp dir stayed hidden behind the tmpfs shadow, `sh`
-/// could not read `run.sh`, and `start_app` failed with `SandboxedAppExited`.
+/// Load-bearing: `run.sh`'s directory is exposed ONLY because `launch_ro_binds` binds the
+/// directory of the `run[1]` path argument. Stub that bind away and the temp dir stays hidden
+/// behind the tmpfs shadow, `sh` cannot read `run.sh`, and `start_app` fails with
+/// `SandboxedAppExited` — the check that keeps this test honest.
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
 fn sandbox_default_reaches_launch_target_via_argument_path() {
@@ -1541,6 +1542,131 @@ fn sandbox_default_reaches_launch_target_via_argument_path() {
     assert!(
         wait_for_log(&mut p, "READY", 60),
         "never saw READY on stdout (sandboxed, arg-path launch)"
+    );
+    p.stop_app().unwrap();
+}
+
+/// A **relative** launch token with `cwd: None` must still resolve under the default sandbox.
+/// With no `cwd`, glass defaults the sandbox working directory to its OWN cwd, so it emits
+/// `--chdir <cwd>` + a guarded rw bind of that directory and resolves relative tokens against it.
+/// The test `chdir`s into a fresh temp dir holding `run.sh` (+ a sibling `glass-testapp` copy it
+/// execs), then launches `sh ./run.sh` with `cwd: None`.
+///
+/// Load-bearing: without the cwd default, `cwd: None` leaves the child's cwd on the empty ephemeral
+/// `$HOME` tmpfs and passes no cwd to `launch_ro_binds`, so `./run.sh` cannot resolve and the app
+/// exits with `SandboxedAppExited`. A RAII guard restores the process cwd even on panic; the suite
+/// runs `--test-threads=1`.
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
+fn sandbox_default_reaches_relative_launch_token_with_defaulted_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let testapp_copy = dir.path().join("glass-testapp");
+    std::fs::copy(TESTAPP, &testapp_copy).expect("copy glass-testapp into temp dir");
+    let run_sh = dir.path().join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\nexec \"{}\"\n", testapp_copy.display()),
+    )
+    .expect("write run.sh");
+    std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x run.sh");
+
+    let original_cwd = std::env::current_dir().expect("read cwd");
+    let _cwd_guard = CwdGuard(original_cwd);
+    std::env::set_current_dir(dir.path()).expect("chdir into temp dir");
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        build: None,
+        // Relative token; cwd is None so it must resolve against glass's defaulted cwd.
+        run: vec!["sh".to_string(), "./run.sh".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 8000,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = p
+        .start_app(&spec)
+        .unwrap_or_else(|e| panic!("relative launch token unreachable with a defaulted cwd: {e}"));
+    assert_eq!(geom.width, 320);
+    assert_eq!(geom.height, 240);
+    assert!(
+        wait_for_log(&mut p, "READY", 60),
+        "never saw READY on stdout (relative token, defaulted cwd)"
+    );
+    p.stop_app().unwrap();
+}
+
+/// A **bare-name** program resolvable only via a `PATH` directory under a tmpfs-shadowed root
+/// (`~/.cargo/bin`, an asdf shim; here a temp dir under `/tmp`) must still launch under the default
+/// sandbox. `launch_ro_binds` resolves `run[0]` against `$PATH` like `execvp` and binds the
+/// resolving directory when it is shadowed, so the child's own `execvp` finds it inside bwrap.
+///
+/// Load-bearing: without the `$PATH`-resolution bind the bin dir stays hidden behind the `/tmp`
+/// tmpfs, the child's `execvp` fails, and the launch exits with `SandboxedAppExited`. A RAII guard
+/// restores `PATH`; the suite runs `--test-threads=1`.
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
+fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct PathGuard(std::ffi::OsString);
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.0);
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("create temp dir"); // under /tmp (tmpfs-shadowed)
+    let bindir = dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).expect("create bin dir");
+    let tool = bindir.join("glass-testapp-bare");
+    std::fs::copy(TESTAPP, &tool).expect("copy glass-testapp as a bare-name tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod +x tool");
+
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+
+    // Prepend the shadowed bin dir to PATH (keep the rest so bwrap/Xvfb still resolve).
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut prepended = bindir.clone().into_os_string();
+    prepended.push(":");
+    prepended.push(&original_path);
+    std::env::set_var("PATH", &prepended);
+    let _path_guard = PathGuard(original_path);
+
+    let spec = AppSpec {
+        build: None,
+        run: vec!["glass-testapp-bare".to_string()], // bare name resolved via the shadowed PATH dir
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 8000,
+        sandbox: glass_core::SandboxLevel::Default,
+        a11y: false,
+    };
+    let geom = p.start_app(&spec).unwrap_or_else(|e| {
+        panic!(
+            "bare-name program on a shadowed PATH dir unreachable under the default sandbox: {e}"
+        )
+    });
+    assert_eq!(geom.width, 320);
+    assert_eq!(geom.height, 240);
+    assert!(
+        wait_for_log(&mut p, "READY", 60),
+        "never saw READY on stdout (bare-name on a shadowed PATH dir)"
     );
     p.stop_app().unwrap();
 }
