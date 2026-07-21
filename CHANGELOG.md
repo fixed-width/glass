@@ -16,6 +16,13 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-21
+
+*First stable release. glass's agent-facing surface — tool names and parameters, result shapes, enum
+values, the untrusted-content marker, and `GLASS_*` variables — is now covered by a stability
+commitment (see [stability.md](docs/reference/stability.md)): changes follow SemVer, with
+breaking changes signalled in the schema and error text and a deprecate-then-major path.*
+
 ### Added
 - **`GLASS_SANDBOX_FLOOR`** — an operator-set minimum containment level (`off`/`default`/`strict`)
   that a launch's `sandbox` level can raise but never drop below: an omitted `sandbox` is clamped up
@@ -315,7 +322,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/fixed-width/glass/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/fixed-width/glass/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fixed-width/glass/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/fixed-width/glass/compare/v0.3.0...v0.3.1
