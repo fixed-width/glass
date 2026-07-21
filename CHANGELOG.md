@@ -16,6 +16,15 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-21
+
+### Fixed
+- **`glass-mcp` reports its real version.** `--version`, `glass-mcp doctor`, and the MCP
+  `initialize` handshake previously reported `0.0.0` (the crate is versioned by release tag, not in
+  `Cargo.toml`), and the handshake additionally identified the server by the transport library's
+  name and version rather than glass's. The version is now derived at build time from the release
+  tag, and the handshake identifies the server as `glass-mcp`.
+
 ## [1.0.0] - 2026-07-21
 
 *First stable release. glass's agent-facing surface — tool names and parameters, result shapes, enum
@@ -322,7 +331,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/fixed-width/glass/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/fixed-width/glass/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/fixed-width/glass/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/fixed-width/glass/compare/v0.3.1...v0.4.0

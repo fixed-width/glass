@@ -544,8 +544,16 @@ const SERVER_INSTRUCTIONS: &str =
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GlassServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(SERVER_INSTRUCTIONS)
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS);
+        // Identify the server as glass in the MCP `initialize` handshake. The rmcp default
+        // (`Implementation::from_build_env`) reports the transport crate's own name and version
+        // (`rmcp` / its crate version), not glass's — so every connecting client would see the wrong
+        // server identity. Override with glass's name + build-time version.
+        info.server_info.name = "glass-mcp".to_string();
+        info.server_info.title = Some("glass".to_string());
+        info.server_info.version = crate::VERSION.to_string();
+        info
     }
 }
 
@@ -646,6 +654,26 @@ mod tests {
 
         assert_eq!(out.is_error, Some(true));
         assert!(first_text(&out).contains("nope"));
+    }
+
+    #[test]
+    fn get_info_identifies_the_server_as_glass_not_the_transport_crate() {
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(10, 10));
+        let report = crate::audit::report_from_config(None, |_| None);
+        let server = GlassServer::new(glass, report);
+        let info = server.get_info();
+        // Must override the rmcp default (which reports the transport crate's own name/version).
+        assert_eq!(
+            info.server_info.name, "glass-mcp",
+            "the MCP handshake must identify glass, not the rmcp transport crate"
+        );
+        assert_eq!(info.server_info.title.as_deref(), Some("glass"));
+        assert_eq!(
+            info.server_info.version,
+            crate::VERSION,
+            "handshake version must be glass's build-time version, not the crate's 0.0.0 or rmcp's"
+        );
     }
 
     #[tokio::test]

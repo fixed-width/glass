@@ -116,7 +116,7 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         vec![
             default_backend_check(raw.as_deref()),
             sandbox_floor_check(sandbox_floor_raw.as_deref(), sandbox_floor_bad_utf8),
-            Check::new("glass", CheckStatus::Ok, env!("CARGO_PKG_VERSION")),
+            Check::new("glass", CheckStatus::Ok, crate::VERSION),
         ],
     );
 
@@ -641,6 +641,23 @@ mod tests {
             "{:?}",
             general.checks
         );
+    }
+
+    #[test]
+    fn diagnose_general_section_reports_the_build_time_glass_version() {
+        // The "glass" check must show `crate::VERSION` (build-time), not the crate's `0.0.0`.
+        let d = diagnose(false);
+        let general = d
+            .sections
+            .iter()
+            .find(|s| s.title == "general")
+            .expect("general section");
+        let glass = general
+            .checks
+            .iter()
+            .find(|c| c.name == "glass")
+            .expect("glass version check");
+        assert_eq!(glass.detail, crate::VERSION);
     }
 
     #[test]

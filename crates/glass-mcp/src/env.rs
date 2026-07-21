@@ -201,6 +201,10 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // Forces a test-only AX-geometry fallback path (glass-macos/src/axwindow.rs); read only to
     // exercise that path in an integration test, not a supported way to configure glass.
     "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK",
+    // Build-time only: `build.rs` computes the release version and emits it as a
+    // `cargo:rustc-env=GLASS_VERSION`, read via `env!` (see `crate::VERSION`). Not read from the
+    // process environment and never an operator override.
+    "GLASS_VERSION",
 ];
 
 /// Standard (non-`GLASS_*`) env glass reads at runtime — reference only.

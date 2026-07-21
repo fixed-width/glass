@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "glass-mcp",
-    version,
+    version = crate::VERSION,
     about = "glass MCP server — a build→see→interact→debug loop over native GUI apps",
     after_help = "With no command, glass-mcp serves MCP over stdio (the default)."
 )]
@@ -279,5 +279,17 @@ mod tests {
         // per-subcommand help works too
         let dh = Cli::try_parse_from(["glass-mcp", "doctor", "--help"]).unwrap_err();
         assert_eq!(dh.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn version_is_the_build_time_glass_version_not_the_crate_default() {
+        use clap::CommandFactory;
+        // `--version` must render the build-time `GLASS_VERSION` (via `crate::VERSION`), not the
+        // crate's pinned `CARGO_PKG_VERSION` (`0.0.0`).
+        assert_eq!(Cli::command().get_version(), Some(crate::VERSION));
+        assert!(
+            !crate::VERSION.is_empty(),
+            "GLASS_VERSION must be populated by build.rs"
+        );
     }
 }
