@@ -1296,6 +1296,8 @@ name = "glass-sandbox-macos"
 version = "0.0.0"
 dependencies = [
  "glass-core",
+ "glass-sandbox-core",
+ "tempfile",
 ]
 
 [[package]]

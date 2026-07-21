@@ -131,7 +131,7 @@ fn emit_read_allow_file(out: &mut String, path: &Path) {
 /// and a bare home root `/Users/<user>`; a deeper path (a real project dir) or any path outside
 /// `/Users` is safe. Fail-safe: an unsafe path is simply omitted (the app is over-contained,
 /// never over-exposed).
-fn is_safe_reallow(path: &Path) -> bool {
+pub(crate) fn is_safe_reallow(path: &Path) -> bool {
     use std::path::Component;
     if !path.is_absolute() {
         return false;
@@ -147,6 +147,25 @@ fn is_safe_reallow(path: &Path) -> bool {
         })
         .collect();
     !(normals.len() == 2 && normals[0] == "Users")
+}
+
+/// Whether `real` (a canonicalized launch-target path) is a home root or above — `/`, `/Users`, or
+/// a bare `/Users/<user>`. Such a target must NEVER be re-allowed (not even as a file literal): it
+/// would re-expose the home the `/Users` deny hides. The macOS analog of Linux's "target IS a
+/// shadowed root or an ancestor of one → no bind."
+pub(crate) fn is_home_root_or_above(real: &Path) -> bool {
+    use std::path::Component;
+    if real == Path::new("/") || real == Path::new("/Users") {
+        return true;
+    }
+    let normals: Vec<&std::ffi::OsStr> = real
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    normals.len() == 2 && normals[0] == "Users"
 }
 
 /// Append `  (subpath "<escaped>")\n`.
@@ -329,6 +348,28 @@ mod tests {
             "outside home entirely"
         );
         assert!(is_safe_reallow(Path::new("/tmp/x")), "scratch dir");
+    }
+
+    #[test]
+    fn is_home_root_or_above_flags_root_and_bare_home_roots() {
+        assert!(is_home_root_or_above(Path::new("/")), "root");
+        assert!(is_home_root_or_above(Path::new("/Users")), "Users root");
+        assert!(
+            is_home_root_or_above(Path::new("/Users/dev")),
+            "a bare home root"
+        );
+    }
+
+    #[test]
+    fn is_home_root_or_above_allows_deeper_paths() {
+        assert!(
+            !is_home_root_or_above(Path::new("/Users/dev/project")),
+            "a project dir under home is not itself a home root"
+        );
+        assert!(
+            !is_home_root_or_above(Path::new("/work/project")),
+            "outside home entirely"
+        );
     }
 
     #[test]
