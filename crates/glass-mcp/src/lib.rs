@@ -1,6 +1,11 @@
 //! glass-mcp library root. `main.rs` is a thin binary over this so the serve
 //! path is reachable from integration tests.
 
+/// The user-facing glass version, resolved at build time (see `build.rs`): the release tag in CI,
+/// else the nearest git tag locally, else the crate version. Single source for `--version`,
+/// `doctor`, and the MCP `initialize` handshake — the crate version itself is pinned at 0.0.0.
+pub const VERSION: &str = env!("GLASS_VERSION");
+
 pub mod audit;
 pub mod capabilities;
 pub mod cli;
