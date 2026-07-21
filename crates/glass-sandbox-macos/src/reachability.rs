@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
 
-use crate::profile::{is_home_root_or_above, is_safe_reallow};
+use crate::profile::{is_home_root_or_above, is_safe_reallow, under_users};
 
 /// The extra re-allows a launch needs, split by the SBPL form `build_profile` emits for each:
 /// `ro_binds` → `(subpath …)` (dir + siblings), `ro_files` → `(literal …)` (one file, no siblings).
@@ -38,8 +38,13 @@ pub fn launch_reallows(run: &[String], cwd: Option<&Path>) -> LaunchReallows {
         // /opt/homebrew match is already visible via (subpath "/") — is_safe_reallow of that dir is
         // true, so push_reallows would emit a harmless-but-redundant subpath; skip it explicitly to
         // mirror Linux's "usr/bin contributes nothing" and avoid a puzzling re-allow.
+        //
+        // Known limitation: this resolves against GLASS's OWN `$PATH`, not `spec.env`'s — a caller
+        // that overrides `PATH` (via `spec.env`) for a bare-name program that only exists under a
+        // `/Users`-rooted PATH entry may not get a re-allow here. Fail-safe: the app then fails to
+        // start under containment rather than gaining unintended exposure.
         let dir = dir_of(&resolved);
-        if dir.starts_with("/Users") {
+        if under_users(&dir) {
             push_reallows(&mut out, &resolved);
         }
     }
@@ -58,7 +63,7 @@ pub fn launch_reallows(run: &[String], cwd: Option<&Path>) -> LaunchReallows {
 /// path's directory and the resolved target's directory are considered. A target that does not
 /// exist (any `stat` error) contributes nothing (fail-safe). A target that IS a home root or above
 /// contributes nothing (never re-expose home). A safe directory → `ro_binds` (subpath); a directory
-/// that is a bare home root → the FILE only → `ro_files` (literal).
+/// that fails `is_safe_reallow` (a bare home root, or `/`) → the FILE only → `ro_files` (literal).
 fn push_reallows(out: &mut LaunchReallows, lit: &Path) {
     if std::fs::metadata(lit).is_err() {
         return; // a flag, a value, or a missing file — not a reachable path
@@ -255,7 +260,7 @@ mod tests {
     // -------------------------------------------------------------------------
     // 7. Bare-name program only under a $HOME PATH dir → its dir; under /usr/bin → nothing.
     // MIXED: the /usr/bin negative case is REAL (env is guaranteed present on a non-shadowed dir).
-    // The positive "home PATH dir" case is gated on `dir.starts_with("/Users")` in launch_reallows
+    // The positive "home PATH dir" case is gated on `under_users(&dir)` in launch_reallows
     // BEFORE any is_safe_reallow/tempdir logic runs, and `resolve_on_path` additionally requires the
     // executable to actually exist — so it cannot be exercised without a real `/Users` tree. Deferred
     // to verification on real macOS hardware (Seatbelt does not run here).
@@ -343,5 +348,73 @@ mod tests {
                  could place a home root's contents in ro_binds"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. Invariant over the SAME mixed launch as test 8: no ro_files entry is /, /Users, or a bare
+    // home root either. push_reallows returns before touching EITHER list when
+    // `is_home_root_or_above(&real)` is true (the guard sits above the ro_binds/ro_files branch),
+    // so the same short-circuit that protects ro_binds protects ro_files — closing the T-4 gap that
+    // test 8 (ro_binds-only) left open.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn no_ro_file_is_a_home_root_or_above() {
+        // --- REAL half: the exact mixed launch from no_ro_bind_is_a_home_root_or_above ---
+        let proj = tempfile::tempdir().unwrap();
+        let data = proj.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let script = proj.path().join("app.py");
+        std::fs::write(&script, b"").unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("r.sh"), b"").unwrap();
+
+        let out = launch_reallows(
+            &[
+                "python3".to_string(),
+                script.to_string_lossy().into_owned(),
+                data.to_string_lossy().into_owned(),
+                "/".to_string(),
+                "r.sh".to_string(),
+            ],
+            Some(cwd.path()),
+        );
+        for f in &out.ro_files {
+            assert!(
+                !is_home_root_or_above(f),
+                "ro_files entry {f:?} is a home root or above"
+            );
+        }
+
+        // --- PREDICATE half: the exact shape push_reallows emits to ro_files is `real` itself (the
+        // resolved file), gated by the SAME `is_home_root_or_above(&real)` early-return that guards
+        // ro_binds. A file living directly under a bare home root is the shape that routes to
+        // ro_files (its dir fails is_safe_reallow) — prove that shape is itself never a home root.
+        for root in SYNTHETIC_HOME_ROOTS {
+            let file = Path::new(root).join("app.py");
+            assert!(
+                !is_home_root_or_above(&file),
+                "{file:?} is the exact shape push_reallows would emit to ro_files, and must not \
+                 itself be classified a home root or above"
+            );
+        }
+        for root in [Path::new("/"), Path::new("/Users")] {
+            assert!(
+                is_home_root_or_above(root),
+                "{root:?} itself must short-circuit before ever reaching ro_files"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_run_yields_no_reallows() {
+        assert_eq!(launch_reallows(&[], None), LaunchReallows::default());
+    }
+
+    #[test]
+    fn under_users_matches_only_the_home_tree() {
+        assert!(under_users(Path::new("/Users/dev/.cargo/bin")));
+        assert!(under_users(Path::new("/Users")));
+        assert!(!under_users(Path::new("/usr/bin")));
+        assert!(!under_users(Path::new("/opt/homebrew/bin")));
     }
 }

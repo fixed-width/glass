@@ -46,9 +46,9 @@ internal refactors, CI, or test-only changes.
 - **macOS: apps whose program or files live under your home directory now start under the default
   sandbox.** The same fix as Linux, for the macOS (Seatbelt) sandbox: the default sandbox hides
   `/Users` from the launched app, which previously also hid the app's *own* launch target — a script,
-  asset, or binary passed by path, reached through a symlink, or found on a `PATH` entry under your
-  home would fail to start. glass now makes the launch target reachable while keeping the rest of your
-  home hidden.
+  asset, or binary passed by path, reached through a symlink, found on a `PATH` entry under your home,
+  or given by a relative path would fail to start. glass now makes the launch target reachable while
+  keeping the rest of your home hidden.
 - **Linux: accessibility-enabled launches are no longer slow.** On X11 and Wayland, starting an app
   with `a11y: true` (needed for `glass_a11y_snapshot`, `glass_click_element`, and the other
   accessibility tools) previously added a fixed ~25-second delay before the app's window appeared.

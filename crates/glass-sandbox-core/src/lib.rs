@@ -27,7 +27,7 @@ pub fn resolve_on_path(program: &OsStr) -> Option<PathBuf> {
 }
 
 /// [`resolve_on_path`] against an explicit `$PATH` value — the testable seam (no global env).
-pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(program))
         .find(|cand| is_executable_file(cand))
@@ -38,7 +38,7 @@ pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 /// hosts (where glass has no Seatbelt/bwrap sandbox) it degrades to "is a regular file" so the
 /// crate still compiles as a `--workspace` member.
 #[cfg(unix)]
-pub fn is_executable_file(p: &Path) -> bool {
+pub(crate) fn is_executable_file(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -46,7 +46,7 @@ pub fn is_executable_file(p: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-pub fn is_executable_file(p: &Path) -> bool {
+pub(crate) fn is_executable_file(p: &Path) -> bool {
     std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
@@ -96,6 +96,26 @@ mod tests {
         assert_eq!(resolve_on_path_in(OsStr::new("mytool"), &path), Some(exe));
     }
 
+    /// Pins the documented "first `$PATH` entry wins" contract (`execvp` semantics): with two
+    /// directories on `$PATH`, each holding an executable of the SAME name, the match from the
+    /// FIRST directory must be returned, not merely any match.
+    #[test]
+    fn resolve_on_path_in_returns_the_first_match() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [&first, &second] {
+            let exe = dir.path().join("mytool");
+            std::fs::write(&exe, b"").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_eq!(
+            resolve_on_path_in(OsStr::new("mytool"), &path),
+            Some(first.path().join("mytool")),
+            "must return the FIRST $PATH entry's match, not merely any match"
+        );
+    }
+
     #[test]
     fn resolve_on_path_in_skips_non_executable_and_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -116,5 +136,42 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         assert_eq!(dir_of(&file), sub.canonicalize().unwrap());
         assert_eq!(dir_of(&sub), sub.canonicalize().unwrap());
+    }
+
+    /// Pins the never-panics/raw-fallback contract: a path that doesn't exist can't be
+    /// `canonicalize`d, so `canon` must hand back the raw path unchanged rather than panicking or
+    /// erroring.
+    #[test]
+    fn canon_returns_the_raw_path_when_it_does_not_exist() {
+        assert_eq!(
+            canon(Path::new("/no/such/glass/path")),
+            PathBuf::from("/no/such/glass/path")
+        );
+    }
+
+    #[test]
+    fn is_executable_file_true_for_exec_false_for_dir_and_plain() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let exe = dir.path().join("exe");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&exe), "an exec-bit file must be true");
+
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !is_executable_file(&plain),
+            "a non-exec plain file must be false"
+        );
+
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !is_executable_file(&subdir),
+            "a directory (even an 'executable'-mode one) must be false"
+        );
     }
 }
