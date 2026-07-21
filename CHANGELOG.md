@@ -34,6 +34,15 @@ internal refactors, CI, or test-only changes.
   path too.
 
 ### Fixed
+- **Linux: apps whose program or files live under your home directory now start under the default
+  sandbox.** The default sandbox hides your home directory (and `/tmp`) from the launched app, which
+  previously also hid the app's *own* launch target — so an app passed by absolute path under home
+  (`python3 /home/you/app.py`), reached through a symlink (a virtualenv or asdf/pyenv shim), found on
+  a `PATH` entry under home (a `cargo install`/`pipx`/`npm -g` tool), or given by a relative path
+  would fail to start (it exited before its window appeared). glass now makes the launch target
+  reachable inside the sandbox — and defaults the working directory to glass's — while still keeping
+  your home directory hidden. A contained app that still exits before its window now reports the
+  likely cause and how to fix it (`set cwd`, or run with `sandbox:"off"`) instead of a bare exit code.
 - **Linux: accessibility-enabled launches are no longer slow.** On X11 and Wayland, starting an app
   with `a11y: true` (needed for `glass_a11y_snapshot`, `glass_click_element`, and the other
   accessibility tools) previously added a fixed ~25-second delay before the app's window appeared.
