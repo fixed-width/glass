@@ -1,0 +1,48 @@
+name: Publish to MCP Registry
+
+# Publishes server.json (a no-package descriptor pointing at the repo + website) to the official
+# MCP Registry. Authentication is GitHub OIDC — the workflow runs in a repo under the `fixed-width`
+# org, which proves ownership of the `io.github.fixed-width` namespace, so no stored secret is
+# needed. Runs on a version tag (each release republishes) and on manual dispatch (to publish the
+# current server.json out of band — e.g. the first listing of an already-released version).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC token used to authenticate to the registry
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # On a tag build, set server.json's version from the tag so the registry entry matches the
+      # release exactly; a manual dispatch keeps the committed version.
+      - name: Sync version from tag
+        if: github.ref_type == 'tag'
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          VERSION="${TAG_REF#refs/tags/v}"
+          # Guard: only a plain semver-ish tag becomes the version; anything else keeps the committed
+          # value (defense-in-depth — the tag is maintainer-controlled, but never trust it into a file).
+          if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            jq --arg v "$VERSION" '.version = $v' server.json > server.tmp && mv server.tmp server.json
+          else
+            echo "tag '$VERSION' is not a plain version; keeping the committed server.json version"
+          fi
+
+      - name: Authenticate to the MCP Registry (OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
