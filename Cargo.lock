@@ -1276,6 +1276,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-sandbox-core"
+version = "0.0.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
