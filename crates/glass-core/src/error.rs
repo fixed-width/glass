@@ -16,12 +16,12 @@ pub enum GlassError {
     AppExited(Option<i32>),
 
     /// Same failure as `AppExited`, but the launch was sandboxed — so the
-    /// exit may be the contained app failing to find a file that a bind
-    /// mount hides. Carries a remedy rather than internal threat-model
-    /// detail.
+    /// exit may be the contained app failing to find a file the ephemeral
+    /// tmpfs hides. Carries an actionable remedy rather than internal sandbox
+    /// mechanics.
     #[error(
-        "app exited (code {0:?}) before its window appeared. If it was sandboxed, a file it needs \
-         may be hidden by the ephemeral $HOME/tmp — set `cwd`, add a bind, or run with \
+        "app exited (code {0:?}) before its window appeared. The launch was sandboxed, so a file \
+         it needs may be hidden by the ephemeral $HOME or /tmp — set `cwd`, or run with \
          sandbox:\"off\"."
     )]
     SandboxedAppExited(Option<i32>),
@@ -140,10 +140,13 @@ impl GlassError {
 
     /// The error for "the child exited before `discover_window` found its
     /// window" — `SandboxedAppExited` (with the path-visibility remedy) when
-    /// the launch was contained, plain `AppExited` otherwise. Shared by every
-    /// backend's discovery loop so the conditional isn't triplicated.
-    pub fn app_exited_during_discovery(code: Option<i32>, sandboxed: bool) -> Self {
-        if sandboxed {
+    /// the launch was contained, plain `AppExited` otherwise. Shared by the
+    /// Linux backends' discovery loops so the conditional isn't triplicated.
+    ///
+    /// Takes the launch's [`SandboxLevel`] (not a pre-computed bool) so the
+    /// "was this contained?" decision lives here, in one place.
+    pub fn app_exited_during_discovery(code: Option<i32>, sandbox: crate::SandboxLevel) -> Self {
+        if sandbox != crate::SandboxLevel::Off {
             GlassError::SandboxedAppExited(code)
         } else {
             GlassError::AppExited(code)
@@ -271,13 +274,13 @@ mod tests {
 
     #[test]
     fn app_exited_during_discovery_picks_the_sandboxed_variant_when_sandboxed() {
-        let err = GlassError::app_exited_during_discovery(Some(2), true);
+        let err = GlassError::app_exited_during_discovery(Some(2), crate::SandboxLevel::Default);
         assert!(matches!(err, GlassError::SandboxedAppExited(Some(2))));
     }
 
     #[test]
     fn app_exited_during_discovery_picks_the_plain_variant_when_not_sandboxed() {
-        let err = GlassError::app_exited_during_discovery(Some(2), false);
+        let err = GlassError::app_exited_during_discovery(Some(2), crate::SandboxLevel::Off);
         assert!(matches!(err, GlassError::AppExited(Some(2))));
     }
 

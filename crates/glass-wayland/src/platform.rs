@@ -535,7 +535,7 @@ fn bring_up_session(
             glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
             return Err(GlassError::app_exited_during_discovery(
                 status.code(),
-                spec.sandbox != glass_core::SandboxLevel::Off,
+                spec.sandbox,
             ));
         }
         if Instant::now() >= deadline {
@@ -574,7 +574,7 @@ fn bring_up_session(
                 glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
                 return Err(GlassError::app_exited_during_discovery(
                     status.code(),
-                    spec.sandbox != glass_core::SandboxLevel::Off,
+                    spec.sandbox,
                 ));
             }
             if Instant::now() >= deadline {

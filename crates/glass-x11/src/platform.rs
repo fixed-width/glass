@@ -335,7 +335,7 @@ impl X11Platform {
                 if let Ok(Some(status)) = child.try_wait() {
                     return Err(GlassError::app_exited_during_discovery(
                         status.code(),
-                        spec.sandbox != glass_core::SandboxLevel::Off,
+                        spec.sandbox,
                     ));
                 }
             }
