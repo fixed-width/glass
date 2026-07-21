@@ -57,8 +57,20 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
             // Default the working directory to glass's own cwd when the spec sets none, so a
             // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
             // directory (matching `sandbox:"off"`) and any relative launch token resolves against
-            // it. Computed once and shared by both `launch_ro_binds` and `WrapOpts.cwd`.
-            let effective_cwd = spec.cwd.clone().or_else(|| std::env::current_dir().ok());
+            // it. Computed ONCE (as an `Option<PathBuf>`) and shared by both consumers verbatim:
+            // `launch_ro_binds` via `as_deref()` and `WrapOpts.cwd` by move. If `current_dir()`
+            // fails, the error is logged and both consumers see `None` (no `--chdir`/bind; relative
+            // tokens are skipped, never resolved against a wrong root).
+            let effective_cwd = spec.cwd.clone().or_else(|| {
+                std::env::current_dir()
+                    .inspect_err(|e| {
+                        eprintln!(
+                            "glass: could not resolve a default cwd for the sandboxed launch: {e}; \
+                             relative launch tokens may not resolve"
+                        )
+                    })
+                    .ok()
+            });
             let home_os = ephemeral_home();
             // Re-expose the launch target — the program and any path token under $HOME or /tmp,
             // which the ephemeral tmpfs shadows.
@@ -66,7 +78,7 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
                 &prog,
                 &args,
                 Path::new(&home_os),
-                effective_cwd.as_deref().unwrap_or_else(|| Path::new("/")),
+                effective_cwd.as_deref(),
             );
             if let Some(dir) = a11y_bind_dir {
                 ro_binds.push(dir.to_path_buf());
@@ -318,6 +330,39 @@ mod tests {
             cfg.contains(&needle),
             "arg dir not bound into the exec bwrap:\nwant: {needle}\ngot:\n{cfg}"
         );
+    }
+
+    #[test]
+    fn sway_config_defaults_cwd_to_current_dir_when_unset() {
+        // With cwd: None and a sandbox, glass defaults the working directory to its OWN cwd, so the
+        // exec bwrap must carry `--chdir <current_dir>` (and, unless current_dir is the ephemeral
+        // HOME/tmp or an ancestor, a rw `--bind <current_dir> <current_dir>`). Both test and code
+        // read current_dir() in-process, so it's a literal-value assertion.
+        use glass_core::SandboxLevel;
+        let cwd = std::env::current_dir().unwrap();
+        let mut s = spec(&["/bin/app"]);
+        s.sandbox = SandboxLevel::Default;
+        s.cwd = None;
+        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        let cwd_s = cwd.to_string_lossy();
+        assert!(
+            cfg.contains(&format!("'--chdir' '{cwd_s}'")),
+            "expected --chdir {cwd_s} in exec:\n{cfg}"
+        );
+        let home = ephemeral_home();
+        let home_c = std::path::Path::new(&home)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&home));
+        let cwd_c = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        let cwd_is_root_or_ancestor = [home_c.as_path(), std::path::Path::new("/tmp")]
+            .iter()
+            .any(|root| root.starts_with(&cwd_c));
+        if !cwd_is_root_or_ancestor {
+            assert!(
+                cfg.contains(&format!("'--bind' '{cwd_s}' '{cwd_s}'")),
+                "expected --bind {cwd_s} {cwd_s} in exec:\n{cfg}"
+            );
+        }
     }
 
     #[test]
