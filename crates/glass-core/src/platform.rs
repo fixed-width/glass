@@ -46,8 +46,8 @@ impl SandboxLevel {
 }
 
 impl std::fmt::Display for SandboxLevel {
-    /// The lowercase name, round-tripping with `FromStr` (used in the result envelope and the
-    /// policy-floor error message).
+    /// The lowercase name, round-tripping with `FromStr` (used in the policy-floor error message
+    /// and the `doctor` floor line).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             SandboxLevel::Off => "off",
