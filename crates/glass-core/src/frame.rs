@@ -41,6 +41,26 @@ impl Region {
         }
         Ok(())
     }
+
+    /// Overlap of two regions, or `None` when they are disjoint.
+    pub fn intersect(&self, other: &Region) -> Option<Region> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = self
+            .x
+            .saturating_add(self.width)
+            .min(other.x.saturating_add(other.width));
+        let y1 = self
+            .y
+            .saturating_add(self.height)
+            .min(other.y.saturating_add(other.height));
+        (x0 < x1 && y0 < y1).then(|| Region {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        })
+    }
 }
 
 /// The tightly-packed RGBA byte length for a `width`×`height` frame, or `None`

@@ -1,5 +1,5 @@
 use crate::error::{GlassError, Result};
-use crate::frame::Frame;
+use crate::frame::{Frame, Region};
 use std::simd::cmp::{SimdOrd, SimdPartialOrd};
 use std::simd::{u8x32, Simd};
 
@@ -23,6 +23,139 @@ pub struct DiffResult {
     /// Pixels that differed but were suppressed as anti-aliasing by the perceptual
     /// diff (always 0 for the exact diff). Surfaces how much was filtered.
     pub aa_ignored: u64,
+}
+
+/// Rectangles excluded from a comparison, precomputed into merged per-row
+/// column spans. Built once per diff; the rect list is small in practice, so
+/// per-row spans are cheaper than a per-pixel bitmap over the whole frame.
+///
+/// Spans are half-open `[start, end)`, sorted, and non-overlapping — merging is
+/// what makes overlapping rects count once in [`ignored_count`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IgnoreMask {
+    rows: Vec<Vec<(u32, u32)>>,
+    ignored: u64,
+}
+
+impl IgnoreMask {
+    /// A mask that excludes nothing.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build a mask over a `width`×`height` area. Rects are clamped to that area;
+    /// a rect entirely outside contributes nothing (its mistake shows up as a zero
+    /// `ignored_count`, not an error). A zero-area rect is a caller bug and errors.
+    pub fn new(rects: &[Region], width: u32, height: u32) -> Result<Self> {
+        for r in rects {
+            if r.width == 0 || r.height == 0 {
+                return Err(GlassError::InvalidRegion(format!(
+                    "ignore rect has zero area: {}x{} at ({},{})",
+                    r.width, r.height, r.x, r.y
+                )));
+            }
+        }
+        if rects.is_empty() || width == 0 || height == 0 {
+            return Ok(Self::default());
+        }
+
+        let mut rows: Vec<Vec<(u32, u32)>> = vec![Vec::new(); height as usize];
+        for r in rects {
+            let x0 = r.x.min(width);
+            let y0 = r.y.min(height);
+            let x1 = r.x.saturating_add(r.width).min(width);
+            let y1 = r.y.saturating_add(r.height).min(height);
+            if x0 >= x1 || y0 >= y1 {
+                continue; // fully outside the frame
+            }
+            for row in rows.iter_mut().take(y1 as usize).skip(y0 as usize) {
+                row.push((x0, x1));
+            }
+        }
+
+        let mut ignored = 0u64;
+        for spans in &mut rows {
+            spans.sort_unstable();
+            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+            for &(s, e) in spans.iter() {
+                match merged.last_mut() {
+                    // `s <= last.1` merges touching spans too, not just overlapping.
+                    Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            ignored += merged.iter().map(|&(s, e)| u64::from(e - s)).sum::<u64>();
+            *spans = merged;
+        }
+
+        Ok(Self { rows, ignored })
+    }
+
+    /// Build a mask for a comparison scoped to `region`: each rect is intersected
+    /// with the region and translated into region-local coordinates, so callers
+    /// always pass window-relative rects regardless of scoping.
+    pub fn for_region(
+        rects: &[Region],
+        region: Option<&Region>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let Some(region) = region else {
+            return Self::new(rects, width, height);
+        };
+        for r in rects {
+            if r.width == 0 || r.height == 0 {
+                return Err(GlassError::InvalidRegion(format!(
+                    "ignore rect has zero area: {}x{} at ({},{})",
+                    r.width, r.height, r.x, r.y
+                )));
+            }
+        }
+        let local: Vec<Region> = rects
+            .iter()
+            .filter_map(|r| r.intersect(region))
+            .map(|i| Region {
+                x: i.x - region.x,
+                y: i.y - region.y,
+                width: i.width,
+                height: i.height,
+            })
+            .collect();
+        Self::new(&local, region.width, region.height)
+    }
+
+    /// True when nothing is excluded — lets callers take the unmasked fast path.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ignored == 0
+    }
+
+    /// Total excluded pixels, counting overlaps once.
+    #[inline]
+    pub fn ignored_count(&self) -> u64 {
+        self.ignored
+    }
+
+    /// Merged, sorted excluded column spans for row `y`.
+    #[inline]
+    pub fn spans_for_row(&self, y: u32) -> &[(u32, u32)] {
+        self.rows.get(y as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// True when column `x` of row `y` is excluded.
+    #[inline]
+    pub fn is_ignored(&self, x: u32, y: u32) -> bool {
+        self.spans_for_row(y).iter().any(|&(s, e)| x >= s && x < e)
+    }
+
+    /// True when the half-open column run `[x0, x1)` of row `y` is *entirely*
+    /// excluded — the whole-SIMD-chunk skip test.
+    #[inline]
+    pub fn covers_span(&self, y: u32, x0: u32, x1: u32) -> bool {
+        self.spans_for_row(y)
+            .iter()
+            .any(|&(s, e)| s <= x0 && x1 <= e)
+    }
 }
 
 /// Direction of a region wait: diverge from a reference, or converge to it.
@@ -807,5 +940,111 @@ mod tests {
     fn region_matches_satisfied_when_identical() {
         assert!(region_satisfied(&diff_result(0), RegionUntil::Matches));
         assert!(!region_satisfied(&diff_result(5), RegionUntil::Matches));
+    }
+
+    // ---- ignore mask ----
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Region {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn empty_mask_ignores_nothing() {
+        let m = IgnoreMask::new(&[], 10, 10).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.ignored_count(), 0);
+        assert!(!m.is_ignored(0, 0));
+    }
+
+    #[test]
+    fn mask_counts_a_single_rect() {
+        let m = IgnoreMask::new(&[rect(1, 1, 2, 3)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 6);
+        assert!(m.is_ignored(1, 1));
+        assert!(m.is_ignored(2, 3));
+        assert!(!m.is_ignored(3, 1), "x=3 is outside [1,3)");
+        assert!(!m.is_ignored(1, 4), "y=4 is outside [1,4)");
+    }
+
+    #[test]
+    fn overlapping_rects_count_each_pixel_once() {
+        // Two 4x4 rects overlapping in a 2x2 corner: 16 + 16 - 4 = 28.
+        let m = IgnoreMask::new(&[rect(0, 0, 4, 4), rect(2, 2, 4, 4)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 28);
+    }
+
+    #[test]
+    fn adjacent_spans_merge_into_one() {
+        let m = IgnoreMask::new(&[rect(0, 0, 2, 1), rect(2, 0, 2, 1)], 10, 10).unwrap();
+        assert_eq!(m.spans_for_row(0), &[(0, 4)]);
+        assert_eq!(m.ignored_count(), 4);
+    }
+
+    #[test]
+    fn rect_partly_out_of_bounds_is_clamped() {
+        // 4 wide starting at x=8 in a 10-wide frame => only x in [8,10) masks.
+        let m = IgnoreMask::new(&[rect(8, 0, 4, 1)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 2);
+        assert_eq!(m.spans_for_row(0), &[(8, 10)]);
+    }
+
+    #[test]
+    fn rect_fully_out_of_bounds_ignores_nothing_and_does_not_error() {
+        let m = IgnoreMask::new(&[rect(50, 50, 4, 4)], 10, 10).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.ignored_count(), 0);
+    }
+
+    #[test]
+    fn zero_area_rect_is_an_error() {
+        assert!(matches!(
+            IgnoreMask::new(&[rect(0, 0, 0, 4)], 10, 10).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
+        assert!(matches!(
+            IgnoreMask::new(&[rect(0, 0, 4, 0)], 10, 10).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
+    }
+
+    #[test]
+    fn covers_span_detects_fully_masked_runs() {
+        let m = IgnoreMask::new(&[rect(0, 0, 8, 1)], 16, 4).unwrap();
+        assert!(m.covers_span(0, 0, 8), "[0,8) is inside [0,8)");
+        assert!(!m.covers_span(0, 4, 12), "[4,12) runs past the mask");
+        assert!(!m.covers_span(1, 0, 8), "row 1 is unmasked");
+    }
+
+    #[test]
+    fn for_region_intersects_and_translates_into_region_space() {
+        // Frame 100x100, region at (10,10) 20x20, mask rect at (15,15) 10x10.
+        // Intersection is (15,15)-(25,25) clipped to the region => (15,15) 10x10,
+        // translated to region-local (5,5) 10x10 => 100 px.
+        let region = rect(10, 10, 20, 20);
+        let m = IgnoreMask::for_region(&[rect(15, 15, 10, 10)], Some(&region), 100, 100).unwrap();
+        assert_eq!(m.ignored_count(), 100);
+        assert!(m.is_ignored(5, 5), "region-local origin of the mask");
+        assert!(!m.is_ignored(4, 5), "just outside the translated mask");
+    }
+
+    #[test]
+    fn for_region_drops_rects_outside_the_region() {
+        let region = rect(0, 0, 10, 10);
+        let m = IgnoreMask::for_region(&[rect(50, 50, 5, 5)], Some(&region), 100, 100).unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn region_intersect_returns_none_when_disjoint() {
+        assert_eq!(rect(0, 0, 5, 5).intersect(&rect(10, 10, 5, 5)), None);
+        assert_eq!(
+            rect(0, 0, 10, 10).intersect(&rect(5, 5, 10, 10)),
+            Some(rect(5, 5, 5, 5))
+        );
     }
 }
