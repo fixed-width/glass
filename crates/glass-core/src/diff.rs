@@ -1298,29 +1298,77 @@ mod tests {
     }
 
     /// The decisive guard on masking in-loop rather than copying frame A's masked
-    /// rects into frame B: anti-alias detection must keep reading real neighbours,
-    /// so a pixel next to a mask classifies exactly as it does unmasked.
+    /// rects into frame B before diffing: anti-alias detection must keep reading
+    /// real neighbours, so a pixel next to a mask classifies exactly as it would
+    /// from the true, unmutated frame data.
+    ///
+    /// Geometry is load-bearing here, and deliberately small — do not "simplify"
+    /// this to a bigger/rounder frame. `is_antialiased`'s "3+ identical
+    /// neighbours" flat-region check (`has_many_siblings`) is satisfied by *any*
+    /// matching neighbour; a wide or tall frame is mostly uniform black/white
+    /// padding, which hands it redundant confirmations everywhere, including
+    /// right next to a mask. That redundancy is exactly what let a previous,
+    /// larger version of this fixture (16x8, 2 masked rows) pass identically
+    /// under both the in-loop and the copy-into-B designs — the two designs
+    /// only diverge when the surviving row bordering the mask has *no* spare
+    /// matching neighbour to fall back on.
+    ///
+    /// A 4-wide, 3-row frame with only row 0 masked gives row 1 (the row right
+    /// below the mask) exactly that: at the seam, row 1's own vertical neighbour
+    /// is row 0. Verified by hand-tracing `is_antialiased` and by an experimental
+    /// copy-into-B implementation: under the correct design, pixels (1,1) and
+    /// (2,1) classify `Changed` (row 1 reads B's real row 0, seam at column 2);
+    /// under the rejected design they classify `AntiAliased` instead, because
+    /// row 0 in the diffed copy of B would hold A's seam (column 1) copied in
+    /// before diffing — a value B never actually had. Row 2 isn't adjacent to
+    /// the mask, so its classification (`AntiAliased`) doesn't move either way;
+    /// it is what makes this fixture assert something beyond "row 1 disappeared".
     #[test]
     fn perceptual_mask_does_not_disturb_neighbouring_aa_classification() {
-        let a = edge_frame(16, 8, 6);
-        let b = edge_frame(16, 8, 7);
-        let unmasked = diff_perceptual(&a, &b, 0.1).unwrap();
-        // Mask a band far from the seam; the seam's own classification must not move.
-        let mask = IgnoreMask::new(&[rect(0, 0, 16, 2)], 16, 8).unwrap();
+        // Seam 1 -> 2 in a 4-wide frame differs only at columns 1 and 2:
+        // a = [black, gray(seam), white, white], b = [black, black, gray(seam), white].
+        let a = edge_frame(4, 3, 1);
+        let b = edge_frame(4, 3, 2);
+        // Mask only row 0, leaving row 1 (adjacent to the mask) and row 2 (not
+        // adjacent) to survive.
+        let mask = IgnoreMask::new(&[rect(0, 0, 4, 1)], 4, 3).unwrap();
+
         let masked = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
 
-        // Rows 0..2 are masked; those rows contributed 1/4 of every count before.
-        let rows_kept = 6u64;
-        let rows_all = 8u64;
+        // The real invariant: every surviving pixel must classify exactly as it
+        // would from the true, unmutated frames. `reference_perceptual_masked`
+        // is that definition made concrete — it calls `classify` on `a.pixels`
+        // and `b.pixels` verbatim and never mutates either frame. Equality here
+        // is what "in-loop masking never disturbs anti-alias classification"
+        // means; it would still hold trivially if this fixture didn't
+        // discriminate, which is why the concrete counts below matter too.
+        let reference = reference_perceptual_masked(&a, &b, 0.1, &mask);
         assert_eq!(
-            masked.changed_pixels,
-            unmasked.changed_pixels / rows_all * rows_kept,
-            "per-row uniform frame: masking 2 of 8 rows removes exactly their share"
+            masked, reference,
+            "masked diff must match direct per-pixel classification of the real, unmutated frames"
+        );
+
+        // Pin the concrete counts so a regression is legible without diffing a
+        // DiffResult by hand (see the doc comment above for how these were
+        // derived and cross-checked against the rejected design).
+        assert_eq!(masked.ignored_pixels, 4, "row 0 (4 px) is excluded");
+        assert_eq!(
+            masked.changed_pixels, 2,
+            "(1,1) and (2,1): row 1's seam pixels see B's real row-0 neighbour, not A's copied-in seam"
         );
         assert_eq!(
-            masked.aa_ignored,
-            unmasked.aa_ignored / rows_all * rows_kept,
-            "AA classification of surviving rows must be identical"
+            masked.aa_ignored, 2,
+            "(1,2) and (2,2): row 2's seam pixels are unaffected by the mask either way"
+        );
+        assert_eq!(
+            masked.bbox,
+            Some(BBox {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1
+            }),
+            "only row 1's pixels are real changes; row 2's are suppressed as AA"
         );
     }
 
