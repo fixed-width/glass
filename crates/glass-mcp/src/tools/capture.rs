@@ -90,13 +90,15 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let region = a.region.as_ref().map(Region::from);
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
+        // `&[]`: no ignore rects yet — the tool doesn't accept them until a later change.
         "perceptual" => glass.diff_baseline_perceptual_with_frame(
             &a.name,
             region.as_ref(),
+            &[],
             a.threshold.unwrap_or(0.1),
         ),
         "exact" => {
-            glass.diff_baseline_with_frame(&a.name, region.as_ref(), a.tolerance.unwrap_or(0))
+            glass.diff_baseline_with_frame(&a.name, region.as_ref(), &[], a.tolerance.unwrap_or(0))
         }
         other => {
             return Err(format!(
