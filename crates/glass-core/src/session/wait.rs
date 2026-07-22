@@ -40,6 +40,12 @@ pub struct WaitStableOutcome {
     pub saw_motion: bool,
     /// How long (ms) frames were observed before settling or timing out.
     pub observed_ms: u64,
+    /// Pixels an `ignore` mask excluded from every settle comparison (counting
+    /// overlaps once); 0 when no `ignore` rects were in effect. `settled:true`
+    /// with `ignored_pixels` equal to the compared area means the mask covered
+    /// everything, so nothing was actually compared — the same signal `glass_diff`
+    /// surfaces.
+    pub ignored_pixels: u64,
 }
 
 /// Parameters for [`Glass::wait_for_element`].
@@ -265,6 +271,11 @@ pub struct WaitRegionOutcome {
     pub frame: Frame,
     /// Wall-clock milliseconds elapsed when the wait returned.
     pub elapsed_ms: u64,
+    /// Pixels an `ignore` mask excluded from the last comparison (counting
+    /// overlaps once); 0 when no `ignore` rects were in effect. Mirrors
+    /// `glass_diff`'s `ignored_pixels`: when it equals the watched area nothing
+    /// was actually compared, so `matched`/`changed_pct` describe an empty diff.
+    pub ignored_pixels: u64,
 }
 
 /// Parameters for [`Glass::wait_for_log`].
@@ -347,6 +358,7 @@ impl Glass {
             settled,
             saw_motion: tracker.saw_change(),
             observed_ms: outcome.elapsed_ms,
+            ignored_pixels: tracker.ignored_count(),
         })
     }
 
@@ -573,7 +585,7 @@ impl Glass {
             params.region,
             params.window,
         );
-        let mut last: Option<(f32, Option<BBox>, Frame)> = None;
+        let mut last: Option<(f32, Option<BBox>, u64, Frame)> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             let current = self.capture(window, region.as_ref())?;
             let d = if perceptual {
@@ -582,16 +594,17 @@ impl Glass {
                 diff_with_mask(&reference, &current, tolerance, &mask)?
             };
             let satisfied = region_satisfied(&d, until);
-            last = Some((d.changed_pct, d.bbox, current));
+            last = Some((d.changed_pct, d.bbox, d.ignored_pixels, current));
             Ok(if satisfied { Some(()) } else { None })
         })?;
-        let (changed_pct, bbox, frame) = last.expect("at least one poll ran");
+        let (changed_pct, bbox, ignored_pixels, frame) = last.expect("at least one poll ran");
         Ok(WaitRegionOutcome {
             matched: outcome.value.is_some(),
             changed_pct,
             bbox,
             frame,
             elapsed_ms: outcome.elapsed_ms,
+            ignored_pixels,
         })
     }
 
@@ -798,6 +811,39 @@ mod tests {
             log.lock().unwrap().len(),
             3,
             "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_reports_ignored_pixels_masked_out_of_the_settle_comparison() {
+        // A single ignore rect covering the whole 4x4 frame leaves nothing to
+        // compare, so the stream settles trivially — and the outcome must surface
+        // the full masked count so an agent can tell it compared nothing, rather
+        // than reading a hollow `settled: true` (the gap `glass_diff` never had).
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let b = Frame::solid(4, 4, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(4, 4).with_frames(vec![a, b]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert_eq!(
+            outcome.ignored_pixels, 16,
+            "the mask covers the whole 4x4 frame, so every pixel was excluded"
         );
     }
 
@@ -1666,6 +1712,41 @@ mod tests {
             log.lock().unwrap().len(),
             2,
             "baseline save + exactly one poll — matched on the first real comparison"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_reports_ignored_pixels_from_the_last_diff() {
+        // The whole 2x2 area is masked, so `until: Changes` never sees a change and
+        // the wait times out — but the outcome must still carry the masked count
+        // from the final diff, giving the agent the same signal `glass_diff` does.
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(2, 2).with_frames(vec![a, b]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert_eq!(
+            o.ignored_pixels, 4,
+            "the mask covers the whole 2x2 area, so every pixel was excluded from the diff"
         );
     }
 

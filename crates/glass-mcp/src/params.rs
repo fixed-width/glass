@@ -234,9 +234,9 @@ pub struct WaitStableArgs {
     /// the settle decision ignores changes outside it. Independent of `region`.
     pub stability_region: Option<RegionArgs>,
     /// Return the settled frame as an image (default true). Set false for a
-    /// text-only `{settled, saw_motion, observed_ms, width, height}` result
-    /// with no WebP — cheap when the next step is a text `glass_diff`.
-    /// `region` is ignored when false.
+    /// text-only `{settled, saw_motion, observed_ms, ignored_pixels, width,
+    /// height}` result with no WebP — cheap when the next step is a text
+    /// `glass_diff`. `region` is ignored when false.
     pub include_image: Option<bool>,
     /// Capture/observe this window (id from `glass_list_windows`) instead of the
     /// active one, without changing which window subsequent ops target. Omit for
@@ -251,8 +251,8 @@ pub struct WaitStableArgs {
     /// returned image. A rect that falls partially or entirely outside the
     /// compared area — the frame, or the `stability_region` sub-rectangle when
     /// one is set — is silently clamped or dropped, masking less than
-    /// requested or nothing at all; this tool reports no `ignored_pixels`
-    /// count to reveal that, so double-check placement.
+    /// requested or nothing at all; the excluded count is reported as
+    /// `ignored_pixels`, so a smaller-than-expected value flags a misplaced rect.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -335,9 +335,9 @@ pub struct WaitForRegionArgs {
     /// `region`: rects are always window-relative and are intersected with it.
     /// A rect that falls partially or entirely outside the compared area —
     /// the frame, or the `region` sub-rectangle when one is set — is silently
-    /// clamped or dropped, masking less than requested or nothing at all;
-    /// this tool reports no `ignored_pixels` count to reveal that, so
-    /// double-check placement.
+    /// clamped or dropped, masking less than requested or nothing at all; the
+    /// excluded count is reported as `ignored_pixels`, so a smaller-than-
+    /// expected value flags a misplaced rect.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 

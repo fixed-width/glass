@@ -174,14 +174,15 @@ Wait until the window stops changing, then return the settled frame.
   and are intersected with it. Independent of `region`, which only crops the returned image. A
   rect that falls partially or entirely outside the compared area — the frame, or the
   `stability_region` sub-rectangle when one is set — is silently clamped or dropped, masking less
-  than requested or nothing at all; this tool reports no `ignored_pixels` count to reveal that, so
-  double-check placement.
+  than requested or nothing at all; the excluded count is reported as `ignored_pixels`, so a
+  smaller-than-expected value flags a misplaced rect.
 
-Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
-added only when `include_image` attached a frame and `region` was given (the text-only result never
-includes them). `saw_motion` and `observed_ms` make `settled` non-opaque: `settled:true` with
-`saw_motion:false` over a short `observed_ms` is only a brief quiet window, not necessarily a
-finished animation.
+Returns `{settled, saw_motion, observed_ms, ignored_pixels, width, height}`; `x, y` — the region's
+origin — are added only when `include_image` attached a frame and `region` was given (the text-only
+result never includes them). `saw_motion` and `observed_ms` make `settled` non-opaque: `settled:true`
+with `saw_motion:false` over a short `observed_ms` is only a brief quiet window, not necessarily a
+finished animation. `ignored_pixels` is the count an `ignore` mask excluded from the settle
+comparison; when it equals the compared area, the mask covered everything and nothing was compared.
 
 ### `glass_wait_for_element`
 
@@ -224,12 +225,14 @@ baseline), then return text metrics.
   that remain. Combines with `region`: ignore rects are always window-relative and are intersected
   with it. A rect that falls partially or entirely outside the compared area — the frame, or the
   `region` sub-rectangle when one is set — is silently clamped or dropped, masking less than
-  requested or nothing at all; this tool reports no `ignored_pixels` count to reveal that, so
-  double-check placement.
+  requested or nothing at all; the excluded count is reported as `ignored_pixels`, so a
+  smaller-than-expected value flags a misplaced rect.
 
-Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
-an approved design without spending vision tokens. For the non-blocking case — one already-captured
-frame instead of polling — `glass_diff` takes the same `region`.
+Returns `{matched, changed_pct, bbox, elapsed_ms, ignored_pixels}`. Use `until:"matches"` to confirm
+the UI reached an approved design without spending vision tokens. `ignored_pixels` is the count an
+`ignore` mask excluded from the last comparison; when it equals the watched area, nothing was
+compared. For the non-blocking case — one already-captured frame instead of polling — `glass_diff`
+takes the same `region`.
 
 ### `glass_wait_for_log`
 

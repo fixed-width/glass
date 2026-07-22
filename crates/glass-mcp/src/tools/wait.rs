@@ -156,6 +156,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         "changed_pct": o.changed_pct,
         "bbox": bbox,
         "elapsed_ms": o.elapsed_ms,
+        "ignored_pixels": o.ignored_pixels,
     });
     let image = if o.matched && a.include_image.unwrap_or(false) {
         Some(frame_to_webp(&o.frame).map_err(|e| e.to_string())?)
@@ -708,6 +709,36 @@ mod tests {
             2,
             "reference capture + exactly one poll, not outlasted into FakePlatform's repeat"
         );
+    }
+
+    #[test]
+    fn region_envelope_reports_ignored_pixels() {
+        // The ignore rect covers the whole 2x2 window, so nothing is compared and
+        // the wait times out — but the envelope must still report the masked count,
+        // matching glass_diff's ignored_pixels signal.
+        let black = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let white = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let mut g = started_frames(vec![black, white]);
+        let mut a = region_args();
+        a.timeout_ms = Some(0);
+        a.ignore = Some(vec![RegionArgs {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }]);
+        let out = wait_for_region(&mut g, &a).unwrap();
+        match out.0.last().unwrap() {
+            OutContent::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(t).unwrap();
+                assert_eq!(
+                    v["result"]["ignored_pixels"],
+                    json!(4),
+                    "the whole-window mask excludes all 4 pixels: {t}"
+                );
+            }
+            _ => panic!("expected text"),
+        }
     }
 
     fn started_logs(logs: Vec<(glass_core::Stream, &str)>) -> Glass {

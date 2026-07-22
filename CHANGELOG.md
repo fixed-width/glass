@@ -21,8 +21,10 @@ internal refactors, CI, or test-only changes.
   `glass_wait_stable`, and `glass_do`'s `settle` action accept `ignore` — window-relative
   rectangles excluded from the comparison — so perpetually animating content (a blinking text
   caret, a clock, a spinner) no longer keeps `changed_pct` permanently non-zero or prevents a
-  settle from ever completing. `glass_diff` reports the excluded count as `ignored_pixels`, and
-  `changed_pct` is measured over the pixels that remain.
+  settle from ever completing. `glass_diff`, `glass_wait_stable`, and `glass_wait_for_region` each
+  report the excluded count as `ignored_pixels` — so a mask that covers the whole compared area is
+  visible rather than hidden behind a hollow `settled`/`matched` — and `changed_pct` is measured
+  over the pixels that remain.
 
 ## [1.0.1] - 2026-07-21
 

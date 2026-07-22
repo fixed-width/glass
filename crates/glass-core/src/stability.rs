@@ -64,6 +64,14 @@ impl StabilityTracker {
         self.last.as_ref()
     }
 
+    /// Pixels the mask excluded from every frame-to-frame comparison (counting
+    /// overlaps once). Zero when no `ignore` rects were in effect. Lets a caller
+    /// tell a genuine settle from one where the mask covered the whole compared
+    /// area, so nothing was actually compared.
+    pub fn ignored_count(&self) -> u64 {
+        self.mask.ignored_count()
+    }
+
     /// Whether any frame-to-frame change was observed during this watch. `false` after a
     /// settle means the window was quiet throughout — but a watch shorter than an
     /// animation's period can still miss it, so this is a hint, not a guarantee of idleness.

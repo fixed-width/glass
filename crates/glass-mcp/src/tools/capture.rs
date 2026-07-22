@@ -51,6 +51,10 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
     // over a short observed_ms is only a brief quiet window (a slow animation can hide).
     let saw_motion = outcome.saw_motion;
     let observed_ms = outcome.observed_ms;
+    // Surfaced exactly as `glass_diff` does: `settled:true` with `ignored_pixels`
+    // equal to the compared area means the mask covered everything, so nothing was
+    // actually compared.
+    let ignored_pixels = outcome.ignored_pixels;
 
     // Text-only: report the settle status + full-frame dims, no WebP. `region`
     // (which only crops the returned image) is intentionally ignored here.
@@ -59,6 +63,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
             "settled": settled,
             "saw_motion": saw_motion,
             "observed_ms": observed_ms,
+            "ignored_pixels": ignored_pixels,
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
@@ -67,7 +72,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
 
     let frame = crop_frame(outcome.frame, a.region.as_ref())?;
     let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
-    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "width": frame.width, "height": frame.height });
+    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "ignored_pixels": ignored_pixels, "width": frame.width, "height": frame.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
@@ -439,6 +444,42 @@ mod tests {
             *log.lock().unwrap(),
             3,
             "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_envelope_reports_ignored_pixels() {
+        // The ignore rect covers the whole 4x4 frame, so the settle comparison
+        // considers nothing; the text envelope must surface the masked count (the
+        // signal glass_diff already carries) so a caller isn't left with a hollow
+        // settled:true.
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
+        let a = WaitStableArgs {
+            interval_ms: Some(0),
+            settle_frames: Some(1),
+            tolerance: None,
+            timeout_ms: Some(1000),
+            region: None,
+            stability_region: None,
+            include_image: Some(false),
+            window_id: None,
+            ignore: Some(vec![RegionArgs {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }]),
+        };
+        let out = wait_stable(&mut g, &a).unwrap();
+        let v = assert_envelope(&out, "glass_wait_stable");
+        assert_eq!(
+            v["ignored_pixels"],
+            json!(16),
+            "the whole-frame mask excludes all 16 pixels: {v}"
         );
     }
 
