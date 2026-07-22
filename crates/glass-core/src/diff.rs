@@ -466,11 +466,24 @@ fn classify(a: &[u8], b: &[u8], x: u32, y: u32, w: u32, h: u32, max_delta: f32) 
     }
 }
 
-/// Compare two same-size frames perceptually. `threshold` ∈ [0,1] sets sensitivity
-/// (smaller = stricter; ~0.1 is a sensible default). A pixel counts as changed only
-/// when its perceptual delta exceeds the threshold **and** it isn't anti-aliasing in
-/// either frame; suppressed anti-alias pixels are reported in `aa_ignored`.
+/// Compare two same-size frames perceptually. See [`diff_perceptual_with_mask`];
+/// pixels covered by `mask` are excluded exactly as in [`diff_with_mask`].
 pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResult> {
+    diff_perceptual_with_mask(a, b, threshold, &IgnoreMask::empty())
+}
+
+/// Like [`diff_perceptual`], but pixels covered by `mask` are excluded: they never
+/// count as changed or anti-aliased, never extend the bbox, and are removed from the
+/// `changed_pct` denominator. Neighbour reads for anti-alias classification still hit
+/// the unmodified frames, so a masked pixel's real value can still confirm an edge in
+/// an unmasked neighbour. `threshold` ∈ [0,1] sets sensitivity (smaller = stricter;
+/// ~0.1 is a sensible default).
+pub fn diff_perceptual_with_mask(
+    a: &Frame,
+    b: &Frame,
+    threshold: f32,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -489,18 +502,30 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         let base = y as usize * row_bytes;
         let ra = &a.pixels[base..base + row_bytes];
         let rb = &b.pixels[base..base + row_bytes];
+        let masked_row = !mask.spans_for_row(y).is_empty();
         let mut off = 0usize;
         let mut col = 0u32;
         // SIMD pre-scan: byte-identical 8-pixel chunks (the common case) can't
         // contain a change, so skip the per-pixel perceptual + AA work entirely.
         while off + LANES <= row_bytes {
+            let chunk_end = col + (LANES / 4) as u32;
+            // Whole-chunk skip: the cheap win when a mask is large.
+            if masked_row && mask.covers_span(y, col, chunk_end) {
+                off += LANES;
+                col = chunk_end;
+                continue;
+            }
             if u8x32::from_slice(&ra[off..off + LANES]) != u8x32::from_slice(&rb[off..off + LANES])
             {
                 for px in 0..(LANES / 4) as u32 {
+                    let cx = col + px;
+                    if masked_row && mask.is_ignored(cx, y) {
+                        continue;
+                    }
                     classify_into(
                         a,
                         b,
-                        col + px,
+                        cx,
                         y,
                         w,
                         h,
@@ -515,48 +540,46 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
                 }
             }
             off += LANES;
-            col += (LANES / 4) as u32;
+            col = chunk_end;
         }
         while off < row_bytes {
-            classify_into(
-                a,
-                b,
-                col,
-                y,
-                w,
-                h,
-                max_delta,
-                &mut changed,
-                &mut aa_ignored,
-                &mut min_x,
-                &mut min_y,
-                &mut max_x,
-                &mut max_y,
-            );
+            if !(masked_row && mask.is_ignored(col, y)) {
+                classify_into(
+                    a,
+                    b,
+                    col,
+                    y,
+                    w,
+                    h,
+                    max_delta,
+                    &mut changed,
+                    &mut aa_ignored,
+                    &mut min_x,
+                    &mut min_y,
+                    &mut max_x,
+                    &mut max_y,
+                );
+            }
             off += 4;
             col += 1;
         }
     }
 
     let total = a.pixel_count();
+    let ignored = mask.ignored_count().min(total);
     let bbox = (changed > 0).then(|| BBox {
         x: min_x,
         y: min_y,
         width: max_x - min_x + 1,
         height: max_y - min_y + 1,
     });
-    let changed_pct = if total > 0 {
-        (changed as f64 / total as f64 * 100.0) as f32
-    } else {
-        0.0
-    };
     Ok(DiffResult {
         changed_pixels: changed,
         total_pixels: total,
-        changed_pct,
+        changed_pct: pct(changed, total - ignored),
         bbox,
         aa_ignored,
-        ignored_pixels: 0,
+        ignored_pixels: ignored,
     })
 }
 
@@ -1234,6 +1257,134 @@ mod tests {
             changed_pct,
             bbox,
             aa_ignored: 0,
+            ignored_pixels: ignored,
+        }
+    }
+
+    // ---- masked perceptual diff ----
+
+    #[test]
+    fn perceptual_mask_excludes_pixels_and_keeps_denominator_honest() {
+        let a = Frame::solid(10, 10, [0, 0, 0, 255]);
+        let b = Frame::solid(10, 10, [255, 255, 255, 255]);
+        // Mask the top 5 rows: 50 of 100 px considered, all of which changed.
+        let mask = IgnoreMask::new(&[rect(0, 0, 10, 5)], 10, 10).unwrap();
+        let r = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
+        assert_eq!(r.ignored_pixels, 50);
+        assert_eq!(r.changed_pixels, 50);
+        assert!(
+            (r.changed_pct - 100.0).abs() < 1e-4,
+            "got {}",
+            r.changed_pct
+        );
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 0,
+                y: 5,
+                width: 10,
+                height: 5
+            })
+        );
+    }
+
+    #[test]
+    fn perceptual_unmasked_is_unchanged() {
+        let a = make(33, 17, 1);
+        let b = make(33, 17, 5);
+        let old = diff_perceptual(&a, &b, 0.1).unwrap();
+        let new = diff_perceptual_with_mask(&a, &b, 0.1, &IgnoreMask::empty()).unwrap();
+        assert_eq!(old, new);
+    }
+
+    /// The decisive guard on masking in-loop rather than copying frame A's masked
+    /// rects into frame B: anti-alias detection must keep reading real neighbours,
+    /// so a pixel next to a mask classifies exactly as it does unmasked.
+    #[test]
+    fn perceptual_mask_does_not_disturb_neighbouring_aa_classification() {
+        let a = edge_frame(16, 8, 6);
+        let b = edge_frame(16, 8, 7);
+        let unmasked = diff_perceptual(&a, &b, 0.1).unwrap();
+        // Mask a band far from the seam; the seam's own classification must not move.
+        let mask = IgnoreMask::new(&[rect(0, 0, 16, 2)], 16, 8).unwrap();
+        let masked = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
+
+        // Rows 0..2 are masked; those rows contributed 1/4 of every count before.
+        let rows_kept = 6u64;
+        let rows_all = 8u64;
+        assert_eq!(
+            masked.changed_pixels,
+            unmasked.changed_pixels / rows_all * rows_kept,
+            "per-row uniform frame: masking 2 of 8 rows removes exactly their share"
+        );
+        assert_eq!(
+            masked.aa_ignored,
+            unmasked.aa_ignored / rows_all * rows_kept,
+            "AA classification of surviving rows must be identical"
+        );
+    }
+
+    #[test]
+    fn masked_perceptual_matches_masked_naive_reference() {
+        let sizes = [(1u32, 1u32), (7, 3), (8, 8), (9, 9), (33, 17), (64, 8)];
+        for &(w, h) in &sizes {
+            let a = make(w, h, 1);
+            let b = make(w, h, 5);
+            for (label, m) in mask_matrix(w, h) {
+                for thr in [0.02f32, 0.1, 0.4] {
+                    assert_eq!(
+                        diff_perceptual_with_mask(&a, &b, thr, &m).unwrap(),
+                        reference_perceptual_masked(&a, &b, thr, &m),
+                        "{w}x{h} thr={thr} mask={label}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn reference_perceptual_masked(
+        a: &Frame,
+        b: &Frame,
+        threshold: f32,
+        mask: &IgnoreMask,
+    ) -> DiffResult {
+        let (w, h) = (a.width, a.height);
+        let max_delta = MAX_YIQ_DELTA * threshold.clamp(0.0, 1.0).powi(2);
+        let mut changed = 0u64;
+        let mut aa_ignored = 0u64;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                if mask.is_ignored(x, y) {
+                    continue;
+                }
+                match classify(&a.pixels, &b.pixels, x, y, w, h, max_delta) {
+                    PixelClass::Same => {}
+                    PixelClass::AntiAliased => aa_ignored += 1,
+                    PixelClass::Changed => {
+                        changed += 1;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+        }
+        let total = a.pixel_count();
+        let ignored = mask.ignored_count().min(total);
+        let bbox = (changed > 0).then(|| BBox {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        });
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct: pct(changed, total - ignored),
+            bbox,
+            aa_ignored,
             ignored_pixels: ignored,
         }
     }
