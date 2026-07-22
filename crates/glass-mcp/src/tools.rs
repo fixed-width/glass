@@ -250,7 +250,8 @@ fn settle_params() -> glass_core::WaitStableParams {
         tolerance: 0,
         timeout_ms: 5000,
         stability_region: None,
-        ignore: Vec::new(), // no ignore rects yet — the tool doesn't accept them until a later change
+        // the return:"settle" observe has no arg surface to carry ignore rects — always masks nothing
+        ignore: Vec::new(),
         window: None,
     }
 }

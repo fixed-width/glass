@@ -251,6 +251,8 @@ pub struct WaitRegionParams {
     /// `until: Changes`, nor block `until: Matches` from converging. When `region`
     /// is set, each rect is intersected with it and translated into region-local
     /// coordinates, so `ignore` is always window-relative regardless of scoping.
+    /// With `window` set, "window-relative" means relative to the watched window,
+    /// not the active one.
     pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
@@ -766,17 +768,17 @@ mod tests {
     #[test]
     fn wait_stable_settles_using_ignore_to_mask_a_blinking_pixel() {
         // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
-        // clock — while the rest of the 4x4 frame stays constant black. Without
-        // `ignore` this pixel would mean the full-frame comparison never settles;
-        // masking it lets the (otherwise-constant) frame settle normally.
+        // clock — while the rest of the 4x4 frame stays constant black. Masking
+        // it lets the (otherwise-constant) frame settle on the scripted frames.
         //
-        // Asserting the capture count matters: `FakePlatform` repeats its last
-        // supplied frame forever once exhausted, so a generous timeout would
-        // eventually report `settled` even WITHOUT masking (comparing the
-        // repeated final frame to itself) — that would prove nothing about
-        // `ignore`. Pinning the count to exactly 3 (the frames actually
-        // supplied) rules that out: it can only happen if the blink was masked
-        // from the very first comparison.
+        // `settled` alone is NOT the discriminator: without the mask the stream
+        // still settles, just *late*. `FakePlatform` repeats its last supplied
+        // frame forever once exhausted, so once polling outlasts the 3 scripted
+        // frames it compares that repeated final frame to itself and "settles"
+        // trivially — proving nothing about `ignore`. Pinning the capture count to
+        // exactly 3 (the frames actually supplied) rules that out: settling within
+        // them can only happen if the blink was masked from the very first
+        // comparison.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);
@@ -1661,6 +1663,64 @@ mod tests {
             log.lock().unwrap().len(),
             2,
             "reference capture + exactly one poll, not outlasted into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_ignore_is_window_relative_under_a_region() {
+        // (3,3) blinks and is INSIDE the watched region (2,2,2,2), so the cropped
+        // frames differ every poll; only a window-relative rect translated into
+        // region-local space masks it. The region-scoped path was the last one
+        // left unexercised for `ignore`; the siblings are
+        // `wait_stable_ignore_is_window_relative_under_a_stability_region` and
+        // `baseline_ignore_is_window_relative_under_a_region`.
+        //
+        // Pinning the capture count to 2 (reference + exactly one poll, via
+        // `timeout_ms: 0`) makes the translation load-bearing: this can only be
+        // `!matched` if the window-relative rect was translated into region-local
+        // space and masked the blink on that single real comparison. Drop the
+        // translation (build the mask with no region) and the rect lands outside
+        // the 2x2 crop, the blink registers, and this flips to `matched`.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: Some(Region {
+                    x: 2,
+                    y: 2,
+                    width: 2,
+                    height: 2,
+                }),
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            !o.matched,
+            "the window-relative rect must translate into region-local space and mask the blink"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "reference capture + exactly one poll — pins that the translated mask suppressed the only change on the first real comparison"
         );
     }
 

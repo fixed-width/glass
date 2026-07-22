@@ -211,6 +211,11 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
 /// Like [`diff`], but pixels covered by `mask` are excluded: they never count as
 /// changed, never extend the bbox, and are removed from the `changed_pct`
 /// denominator. The mask never mutates pixel data.
+///
+/// The `mask` must be built for `a`'s dimensions. A mask sized for a different
+/// frame silently miscompares — it masks the wrong columns/rows and can subtract
+/// more than the frame holds; the internal `.min(total)` clamp only keeps the
+/// arithmetic sound, not the result meaningful.
 pub fn diff_with_mask(
     a: &Frame,
     b: &Frame,
@@ -484,6 +489,11 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
 /// the unmodified frames, so a masked pixel's real value can still confirm an edge in
 /// an unmasked neighbour. `threshold` ∈ [0,1] sets sensitivity (smaller = stricter;
 /// ~0.1 is a sensible default).
+///
+/// The `mask` must be built for `a`'s dimensions. A mask sized for a different
+/// frame silently miscompares — it masks the wrong columns/rows and can subtract
+/// more than the frame holds; the internal `.min(total)` clamp only keeps the
+/// arithmetic sound, not the result meaningful.
 pub fn diff_perceptual_with_mask(
     a: &Frame,
     b: &Frame,
@@ -1104,6 +1114,19 @@ mod tests {
         let region = rect(0, 0, 10, 10);
         let m = IgnoreMask::for_region(&[rect(50, 50, 5, 5)], &region).unwrap();
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn for_region_rejects_a_zero_area_rect_before_intersecting() {
+        // `for_region` validates zero-area up front — before intersecting with the
+        // region — so region-scoping can't launder a zero-area rect into a silent
+        // drop. Exercises `for_region`'s own validation branch, distinct from
+        // `new`'s (covered by `zero_area_rect_is_an_error`).
+        let region = rect(0, 0, 10, 10);
+        assert!(matches!(
+            IgnoreMask::for_region(&[rect(0, 0, 0, 4)], &region).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
     }
 
     #[test]
