@@ -6,6 +6,13 @@
 
 use std::ops::Deref;
 
+// Shared body for the X11/Wayland ignore-regions MCP end-to-end tests. Only pulled in by the
+// test binaries that declare `mod common;` and actually call it
+// (ignore_regions_e2e.rs / wayland_ignore_regions_e2e.rs); this file's `#![allow(dead_code)]`
+// covers it for the other `mod common;` binaries (integration.rs, network.rs, harness_smoke.rs)
+// that don't.
+pub mod mcp_ignore;
+
 pub struct Xvfb(glass_x11::Xvfb);
 
 impl Xvfb {

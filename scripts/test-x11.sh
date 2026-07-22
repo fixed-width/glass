@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Run the X11 integration suite (the #[ignore]d tests in tests/integration.rs and
-# the over-HTTP e2e in tests/network.rs). Each test starts its own private Xvfb, so
-# this only requires Xvfb to be installed. (The Wayland tests live in tests/wayland.rs
-# and run via scripts/test-wayland.sh — kept separate so the
-# Wayland tests' Xwayland and the X11 tests' Xvfb don't contend.)
+# Run the X11 integration suite (the #[ignore]d tests in tests/integration.rs, the over-HTTP
+# e2e in tests/network.rs, and the ignore-regions MCP e2e in tests/ignore_regions_e2e.rs).
+# Each test starts its own private Xvfb, so this only requires Xvfb to be installed. (The
+# Wayland tests live in tests/wayland.rs and tests/wayland_ignore_regions_e2e.rs, run via
+# scripts/test-wayland.sh — kept separate so the Wayland tests' Xwayland and the X11 tests'
+# Xvfb don't contend.)
 #
 # NOTE: the sandbox_* tests (sandbox_default_app_still_runs_and_captures,
 # sandbox_default_build_step_cannot_write_real_home, etc.) require 'bubblewrap'
@@ -15,4 +16,4 @@
 # sandbox level explicitly in the AppSpec.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec cargo test -p glass-testapp --test integration --test network -- --ignored --test-threads=1 "$@"
+exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e -- --ignored --test-threads=1 "$@"

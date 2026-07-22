@@ -3,6 +3,7 @@
 //! received input/configure events to stdout (one `EVENT ...` line each).
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
@@ -12,6 +13,19 @@ use x11rb::CURRENT_TIME;
 
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 240;
+
+// `--blink` mode: a small rectangle repainted on a fixed schedule — a deterministic stand-in
+// for a blinking text caret / clock / spinner, for tests proving glass's `ignore` masks keep a
+// perpetually animating region from blocking wait_stable/diff. Fully inside the TL quadrant
+// (0..160 x 0..120), clear of any seam, so masking it can't accidentally exclude real content.
+const BLINK_X: i16 = 16;
+const BLINK_Y: i16 = 16;
+const BLINK_W: u16 = 32;
+const BLINK_H: u16 = 32;
+// The painted grayscale level advances every this many ms, derived from wall-clock elapsed
+// time rather than an incrementing counter, so it needs no cross-thread state. It never
+// repeats within a short observation window (wraps every 256 * BLINK_TICK_MS ≈ 1.3s).
+const BLINK_TICK_MS: u128 = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--no-wm-pid` suppresses _NET_WM_PID so tests can exercise glass's
@@ -26,6 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pid as `EVENT child_pid=<n>`, so tests can verify glass reaps the whole
     // process group on shutdown rather than orphaning the app's children.
     let fork_child = std::env::args().any(|a| a == "--fork-child");
+    // `--blink` repaints a small rectangle on a fixed schedule instead of blocking on X11
+    // events — see the BLINK_* constants. Default (unset) behavior is unchanged: the loop
+    // below still just blocks on `wait_for_event`.
+    let blink = std::env::args().any(|a| a == "--blink");
     // `--windows N` opens N-1 extra plain top-levels (titled glass-testapp-1..)
     // alongside the main quadrant window, each a distinct solid color, so
     // multi-window enumeration can be tested. Default 1 = unchanged behavior.
@@ -199,46 +217,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("READY w={WIDTH} h={HEIGHT}");
     std::io::stdout().flush()?;
 
+    if blink {
+        run_blink_loop(&conn, win, gc, &extras)
+    } else {
+        run_event_loop(&conn, win, gc, &extras)
+    }
+}
+
+/// Handle one X11 event the same way regardless of loop mode: paint on Expose, echo
+/// input/geometry to stdout for the test harness to assert on.
+fn dispatch_event(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+    extras: &[(Window, u32)],
+    event: Event,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match event {
+        Event::Expose(e) => {
+            if e.window == win {
+                draw_quadrants(conn, win, gc)?;
+            } else if let Some(&(ewin, color)) = extras.iter().find(|(w, _)| *w == e.window) {
+                draw_solid(conn, ewin, gc, color)?;
+            }
+            conn.flush()?;
+        }
+        Event::ButtonPress(e) => {
+            println!(
+                "EVENT button={} x={} y={} state={}",
+                e.detail,
+                e.event_x,
+                e.event_y,
+                u16::from(e.state)
+            );
+            std::io::stdout().flush()?;
+        }
+        Event::MotionNotify(e) => {
+            println!("EVENT motion x={} y={}", e.event_x, e.event_y);
+            std::io::stdout().flush()?;
+        }
+        Event::KeyPress(e) => {
+            // Fetch the keysym for this keycode under the *current* keymap so
+            // a dynamically-uploaded keymap (Wayland backend) is reflected.
+            let m = conn.get_keyboard_mapping(e.detail, 1)?.reply()?;
+            let ks = m.keysyms.first().copied().unwrap_or(0);
+            println!("EVENT keysym={ks}");
+            std::io::stdout().flush()?;
+        }
+        Event::ConfigureNotify(e) => {
+            println!("EVENT configure w={} h={}", e.width, e.height);
+            std::io::stdout().flush()?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Default loop: block on X11 events. Behavior unchanged from before `--blink` existed.
+fn run_event_loop(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+    extras: &[(Window, u32)],
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = conn.wait_for_event()?;
-        match event {
-            Event::Expose(e) => {
-                if e.window == win {
-                    draw_quadrants(&conn, win, gc)?;
-                } else if let Some(&(ewin, color)) = extras.iter().find(|(w, _)| *w == e.window) {
-                    draw_solid(&conn, ewin, gc, color)?;
-                }
-                conn.flush()?;
-            }
-            Event::ButtonPress(e) => {
-                println!(
-                    "EVENT button={} x={} y={} state={}",
-                    e.detail,
-                    e.event_x,
-                    e.event_y,
-                    u16::from(e.state)
-                );
-                std::io::stdout().flush()?;
-            }
-            Event::MotionNotify(e) => {
-                println!("EVENT motion x={} y={}", e.event_x, e.event_y);
-                std::io::stdout().flush()?;
-            }
-            Event::KeyPress(e) => {
-                // Fetch the keysym for this keycode under the *current* keymap so
-                // a dynamically-uploaded keymap (Wayland backend) is reflected.
-                let m = conn.get_keyboard_mapping(e.detail, 1)?.reply()?;
-                let ks = m.keysyms.first().copied().unwrap_or(0);
-                println!("EVENT keysym={ks}");
-                std::io::stdout().flush()?;
-            }
-            Event::ConfigureNotify(e) => {
-                println!("EVENT configure w={} h={}", e.width, e.height);
-                std::io::stdout().flush()?;
-            }
-            _ => {}
-        }
+        dispatch_event(conn, win, gc, extras, event)?;
     }
+}
+
+/// `--blink`: repaint the blink rect at the current wall-clock-derived grayscale level on
+/// every tick, while still servicing events non-blockingly.
+fn run_blink_loop(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+    extras: &[(Window, u32)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        while let Some(event) = conn.poll_for_event()? {
+            dispatch_event(conn, win, gc, extras, event)?;
+        }
+        let level = ((start.elapsed().as_millis() / BLINK_TICK_MS) % 256) as u8;
+        draw_blink(conn, win, gc, level)?;
+        conn.flush()?;
+        std::thread::sleep(Duration::from_millis(BLINK_TICK_MS as u64));
+    }
+}
+
+/// Fill the blink rectangle with a flat grayscale fill at `level`.
+fn draw_blink(
+    conn: &impl Connection,
+    win: Window,
+    gc: Gcontext,
+    level: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let level = u32::from(level);
+    let color = (level << 16) | (level << 8) | level;
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(color))?;
+    conn.poly_fill_rectangle(
+        win,
+        gc,
+        &[Rectangle {
+            x: BLINK_X,
+            y: BLINK_Y,
+            width: BLINK_W,
+            height: BLINK_H,
+        }],
+    )?;
+    Ok(())
 }
 
 /// Distinct solid fill color for extra window `i` (1-based).
