@@ -40,8 +40,8 @@ pub use image_io::{frame_from_webp, frame_to_webp};
 
 pub mod diff;
 pub use diff::{
-    diff, diff_perceptual, diff_with_mask, region_satisfied, BBox, DiffResult, IgnoreMask,
-    RegionUntil,
+    diff, diff_perceptual, diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox,
+    DiffResult, IgnoreMask, RegionUntil,
 };
 pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Section};

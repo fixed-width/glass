@@ -17,7 +17,8 @@ pub struct WaitStableParams {
     /// caret, a clock) cannot prevent the stream from settling. When
     /// `stability_region` is set, each rect is intersected with it and translated
     /// into region-local coordinates, so `ignore` is always window-relative
-    /// regardless of scoping.
+    /// regardless of scoping. With `window` set, "window-relative" means relative
+    /// to the watched window, not the active one.
     pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
@@ -783,6 +784,55 @@ mod tests {
     }
 
     #[test]
+    fn wait_stable_masks_by_captured_frame_size_not_stale_cached_geometry() {
+        // The cached window geometry is a deliberately stale/smaller 2x2 —
+        // `FakePlatform::new(2, 2)` — while `with_frames` serves the same 4x4
+        // blinking frames as the sibling test above. This models watching a
+        // window whose real size the session's geometry cache doesn't reflect
+        // (a different window, or a self-resize since the cache was last
+        // refreshed). The `ignore` rect at (3,3) falls outside the stale 2x2
+        // bounds but inside the actual 4x4 frame: if the mask were ever sized
+        // from the cached geometry instead of the captured frame, (3,3) would be
+        // clamped away, the blink would go unmasked, and the frames would never
+        // settle within the timeout.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![f0, f1, f2.clone()])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            outcome.settled,
+            "the mask must be sized from the captured 4x4 frame, not the stale 2x2 cached geometry"
+        );
+        assert_eq!(outcome.frame, f2);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
     fn wait_stable_ignore_is_window_relative_under_a_stability_region() {
         // (3,3) blinks and is INSIDE the watched region, so the cropped frames
         // differ every poll; only a window-relative rect translated into
@@ -918,6 +968,35 @@ mod tests {
                     height: 1,
                 }),
                 ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GlassError::InvalidRegion(_)));
+    }
+
+    #[test]
+    fn wait_stable_rejects_zero_area_ignore_rect() {
+        // `IgnoreMask` validates this directly, but the mask is now built lazily
+        // inside the poll closure — pin that the error still propagates out of
+        // `wait_stable` itself, so a future change that swallowed it in there
+        // (e.g. treating a build failure as "not yet stable") would be caught.
+        let platform =
+            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let err = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 1,
+                }],
                 window: None,
             })
             .unwrap_err();
