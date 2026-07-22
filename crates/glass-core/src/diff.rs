@@ -23,6 +23,10 @@ pub struct DiffResult {
     /// Pixels that differed but were suppressed as anti-aliasing by the perceptual
     /// diff (always 0 for the exact diff). Surfaces how much was filtered.
     pub aa_ignored: u64,
+    /// Pixels excluded from the comparison by an [`IgnoreMask`], counting
+    /// overlapping rects once. `changed_pct` is measured over the remaining
+    /// (considered) pixels.
+    pub ignored_pixels: u64,
 }
 
 /// Rectangles excluded from a comparison, precomputed into merged per-row
@@ -195,6 +199,18 @@ fn pixel_changed(ra: &[u8], rb: &[u8], off: usize, tolerance: u8) -> bool {
 /// Compare two same-size frames. A pixel counts as changed when the maximum
 /// per-channel absolute difference exceeds `tolerance`.
 pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
+    diff_with_mask(a, b, tolerance, &IgnoreMask::empty())
+}
+
+/// Like [`diff`], but pixels covered by `mask` are excluded: they never count as
+/// changed, never extend the bbox, and are removed from the `changed_pct`
+/// denominator. The mask never mutates pixel data.
+pub fn diff_with_mask(
+    a: &Frame,
+    b: &Frame,
+    tolerance: u8,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -210,17 +226,28 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
         let base = y as usize * row_bytes;
         let ra = &a.pixels[base..base + row_bytes];
         let rb = &b.pixels[base..base + row_bytes];
+        let masked_row = !mask.spans_for_row(y).is_empty();
         let mut off = 0usize;
         let mut col = 0u32;
         // SIMD over full 32-byte (8-pixel) chunks: skip chunks with no change.
         while off + LANES <= row_bytes {
+            let chunk_end = col + (LANES / 4) as u32;
+            // Whole-chunk skip: the cheap win when a mask is large.
+            if masked_row && mask.covers_span(y, col, chunk_end) {
+                off += LANES;
+                col = chunk_end;
+                continue;
+            }
             let va = u8x32::from_slice(&ra[off..off + LANES]);
             let vb = u8x32::from_slice(&rb[off..off + LANES]);
             let d = va.simd_max(vb) - va.simd_min(vb);
             if d.simd_gt(tol_vec).any() {
                 for px in 0..(LANES / 4) {
+                    let cx = col + px as u32;
+                    if masked_row && mask.is_ignored(cx, y) {
+                        continue;
+                    }
                     if pixel_changed(ra, rb, off + px * 4, tolerance) {
-                        let cx = col + px as u32;
                         changed += 1;
                         min_x = min_x.min(cx);
                         min_y = min_y.min(y);
@@ -230,11 +257,11 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
                 }
             }
             off += LANES;
-            col += (LANES / 4) as u32;
+            col = chunk_end;
         }
         // Scalar tail (< 8 pixels left in the row).
         while off < row_bytes {
-            if pixel_changed(ra, rb, off, tolerance) {
+            if !(masked_row && mask.is_ignored(col, y)) && pixel_changed(ra, rb, off, tolerance) {
                 changed += 1;
                 min_x = min_x.min(col);
                 min_y = min_y.min(y);
@@ -247,24 +274,31 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
     }
 
     let total = a.pixel_count();
+    let ignored = mask.ignored_count().min(total);
     let bbox = (changed > 0).then(|| BBox {
         x: min_x,
         y: min_y,
         width: max_x - min_x + 1,
         height: max_y - min_y + 1,
     });
-    let changed_pct = if total > 0 {
-        (changed as f64 / total as f64 * 100.0) as f32
-    } else {
-        0.0
-    };
     Ok(DiffResult {
         changed_pixels: changed,
         total_pixels: total,
-        changed_pct,
+        changed_pct: pct(changed, total - ignored),
         bbox,
         aa_ignored: 0,
+        ignored_pixels: ignored,
     })
+}
+
+/// `changed` as a percentage of `considered`; 0.0 when nothing was considered.
+#[inline]
+fn pct(changed: u64, considered: u64) -> f32 {
+    if considered > 0 {
+        (changed as f64 / considered as f64 * 100.0) as f32
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +556,7 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         changed_pct,
         bbox,
         aa_ignored,
+        ignored_pixels: 0,
     })
 }
 
@@ -676,6 +711,7 @@ mod tests {
             changed_pct,
             bbox,
             aa_ignored: 0,
+            ignored_pixels: 0,
         }
     }
 
@@ -878,6 +914,7 @@ mod tests {
             changed_pct,
             bbox,
             aa_ignored,
+            ignored_pixels: 0,
         }
     }
 
@@ -927,6 +964,7 @@ mod tests {
                 None
             },
             aa_ignored: 0,
+            ignored_pixels: 0,
         }
     }
 
@@ -1046,5 +1084,157 @@ mod tests {
             rect(0, 0, 10, 10).intersect(&rect(5, 5, 10, 10)),
             Some(rect(5, 5, 5, 5))
         );
+    }
+
+    // ---- masked exact diff ----
+
+    #[test]
+    fn masked_pixels_do_not_count_as_changed() {
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut b = a.clone();
+        // Change (1,2) and (3,3); mask only (1,2).
+        for (x, y) in [(1u32, 2u32), (3, 3)] {
+            b.pixels[((y * 4 + x) * 4) as usize] = 255;
+        }
+        let mask = IgnoreMask::new(&[rect(1, 2, 1, 1)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.changed_pixels, 1, "only the unmasked change counts");
+        assert_eq!(r.ignored_pixels, 1);
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1
+            }),
+            "bbox must not stretch to the masked pixel"
+        );
+    }
+
+    #[test]
+    fn changed_pct_uses_the_considered_denominator() {
+        // 4x4 = 16 px; mask 8 px; 1 changed px among the 8 considered => 12.5%.
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut b = a.clone();
+        b.pixels[0] = 255; // (0,0), unmasked
+        let mask = IgnoreMask::new(&[rect(0, 2, 4, 2)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.ignored_pixels, 8);
+        assert_eq!(r.total_pixels, 16);
+        assert_eq!(r.changed_pixels, 1);
+        assert!((r.changed_pct - 12.5).abs() < 1e-4, "got {}", r.changed_pct);
+    }
+
+    #[test]
+    fn fully_masked_frame_reports_zeros() {
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let b = Frame::solid(4, 4, [255, 255, 255, 255]);
+        let mask = IgnoreMask::new(&[rect(0, 0, 4, 4)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.changed_pixels, 0);
+        assert_eq!(r.bbox, None);
+        assert_eq!(r.changed_pct, 0.0);
+        assert_eq!(r.ignored_pixels, r.total_pixels);
+    }
+
+    #[test]
+    fn unmasked_diff_is_unchanged_by_the_new_field() {
+        let a = make(33, 9, 0);
+        let b = make(33, 9, 4);
+        let old = diff(&a, &b, 0).unwrap();
+        let new = diff_with_mask(&a, &b, 0, &IgnoreMask::empty()).unwrap();
+        assert_eq!(old, new);
+        assert_eq!(old.ignored_pixels, 0);
+    }
+
+    #[test]
+    fn masked_simd_matches_masked_scalar_reference() {
+        // Masks chosen to land on and across 8-pixel SIMD chunk boundaries.
+        let sizes = [
+            (1u32, 1u32),
+            (7, 3),
+            (8, 8),
+            (9, 9),
+            (33, 17),
+            (64, 8),
+            (100, 40),
+        ];
+        for &(w, h) in &sizes {
+            let a = make(w, h, 0);
+            let b = make(w, h, 7);
+            let masks = mask_matrix(w, h);
+            for (label, m) in masks {
+                for tol in [0u8, 10] {
+                    assert_eq!(
+                        diff_with_mask(&a, &b, tol, &m).unwrap(),
+                        reference_diff_masked(&a, &b, tol, &m),
+                        "{w}x{h} tol={tol} mask={label}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mask shapes that exercise empty, sub-chunk, chunk-aligned, cross-chunk,
+    /// full-row, and full-frame coverage.
+    fn mask_matrix(w: u32, h: u32) -> Vec<(&'static str, IgnoreMask)> {
+        let mut out = vec![("empty", IgnoreMask::empty())];
+        let mk = |label, rects: Vec<Region>| (label, IgnoreMask::new(&rects, w, h).unwrap());
+        if w > 0 && h > 0 {
+            out.push(mk("single-px", vec![rect(0, 0, 1, 1)]));
+            out.push(mk("full-frame", vec![rect(0, 0, w, h)]));
+            out.push(mk("first-row", vec![rect(0, 0, w, 1)]));
+        }
+        if w >= 8 && h >= 2 {
+            out.push(mk("chunk-aligned", vec![rect(0, 0, 8, 2)]));
+            out.push(mk("cross-chunk", vec![rect(4, 0, 8, 2)]));
+            out.push(mk("overlapping", vec![rect(0, 0, 6, 2), rect(3, 0, 6, 2)]));
+        }
+        out
+    }
+
+    /// Naive masked reference — the straightforward loop the optimized masked
+    /// diff must agree with.
+    fn reference_diff_masked(a: &Frame, b: &Frame, tolerance: u8, mask: &IgnoreMask) -> DiffResult {
+        let mut changed = 0u64;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..a.height {
+            for x in 0..a.width {
+                if mask.is_ignored(x, y) {
+                    continue;
+                }
+                let off = ((y * a.width + x) * 4) as usize;
+                if pixel_changed(&a.pixels, &b.pixels, off, tolerance) {
+                    changed += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let total = a.pixel_count();
+        let ignored = mask.ignored_count().min(total);
+        let considered = total - ignored;
+        let bbox = (changed > 0).then(|| BBox {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        });
+        let changed_pct = if considered > 0 {
+            (changed as f64 / considered as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct,
+            bbox,
+            aa_ignored: 0,
+            ignored_pixels: ignored,
+        }
     }
 }
