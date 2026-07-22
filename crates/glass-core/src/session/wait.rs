@@ -323,12 +323,8 @@ impl Glass {
             let t = match tracker {
                 Some(ref mut t) => t,
                 None => {
-                    let mask = IgnoreMask::for_region(
-                        &params.ignore,
-                        region.as_ref(),
-                        frame.width,
-                        frame.height,
-                    )?;
+                    let mask =
+                        mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
                     tracker.insert(StabilityTracker::with_mask(
                         params.settle_frames,
                         params.tolerance,
@@ -563,7 +559,7 @@ impl Glass {
         // `current` frame is required to match `reference`'s size (the masked
         // diff functions error otherwise via `SizeMismatch`), so `reference`'s own
         // dimensions are exactly the comparison's real size, cropped or not.
-        let mask = IgnoreMask::for_region(
+        let mask = mask_for(
             &params.ignore,
             params.region.as_ref(),
             reference.width,

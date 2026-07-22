@@ -47,10 +47,13 @@ impl IgnoreMask {
         Self::default()
     }
 
-    /// Build a mask over a `width`×`height` area. Rects are clamped to that area;
-    /// a rect entirely outside contributes nothing (its mistake shows up as a zero
-    /// `ignored_count`, not an error). A zero-area rect is a caller bug and errors.
-    pub fn new(rects: &[Region], width: u32, height: u32) -> Result<Self> {
+    /// Reject a zero-area rect up front: it can never mask anything, so it is a
+    /// caller bug worth naming rather than silently dropping. Shared by [`new`]
+    /// and [`for_region`] so both entry points validate identically.
+    ///
+    /// [`new`]: Self::new
+    /// [`for_region`]: Self::for_region
+    fn ensure_no_zero_area(rects: &[Region]) -> Result<()> {
         for r in rects {
             if r.width == 0 || r.height == 0 {
                 return Err(GlassError::InvalidRegion(format!(
@@ -59,6 +62,14 @@ impl IgnoreMask {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Build a mask over a `width`×`height` area. Rects are clamped to that area;
+    /// a rect entirely outside contributes nothing (its mistake shows up as a zero
+    /// `ignored_count`, not an error). A zero-area rect is a caller bug and errors.
+    pub fn new(rects: &[Region], width: u32, height: u32) -> Result<Self> {
+        Self::ensure_no_zero_area(rects)?;
         if rects.is_empty() || width == 0 || height == 0 {
             return Ok(Self::default());
         }
@@ -92,29 +103,24 @@ impl IgnoreMask {
             *spans = merged;
         }
 
+        if ignored == 0 {
+            // Every rect fell outside the area, so this masks nothing. Collapse to
+            // the canonical empty mask rather than keeping a rows-of-empty-spans
+            // representation, so an all-out-of-bounds list compares `Eq` with
+            // `empty()` — both exclude exactly nothing.
+            return Ok(Self::default());
+        }
         Ok(Self { rows, ignored })
     }
 
     /// Build a mask for a comparison scoped to `region`: each rect is intersected
     /// with the region and translated into region-local coordinates, so callers
-    /// always pass window-relative rects regardless of scoping.
-    pub fn for_region(
-        rects: &[Region],
-        region: Option<&Region>,
-        width: u32,
-        height: u32,
-    ) -> Result<Self> {
-        let Some(region) = region else {
-            return Self::new(rects, width, height);
-        };
-        for r in rects {
-            if r.width == 0 || r.height == 0 {
-                return Err(GlassError::InvalidRegion(format!(
-                    "ignore rect has zero area: {}x{} at ({},{})",
-                    r.width, r.height, r.x, r.y
-                )));
-            }
-        }
+    /// always pass window-relative rects regardless of scoping. The mask is sized
+    /// from the region — the space the scoped comparison runs in. A zero-area rect
+    /// is rejected up front, before intersecting, so region-scoping can't launder
+    /// it into a silent drop.
+    pub fn for_region(rects: &[Region], region: &Region) -> Result<Self> {
+        Self::ensure_no_zero_area(rects)?;
         let local: Vec<Region> = rects
             .iter()
             .filter_map(|r| r.intersect(region))
@@ -1087,7 +1093,7 @@ mod tests {
         // Intersection is (15,15)-(25,25) clipped to the region => (15,15) 10x10,
         // translated to region-local (5,5) 10x10 => 100 px.
         let region = rect(10, 10, 20, 20);
-        let m = IgnoreMask::for_region(&[rect(15, 15, 10, 10)], Some(&region), 100, 100).unwrap();
+        let m = IgnoreMask::for_region(&[rect(15, 15, 10, 10)], &region).unwrap();
         assert_eq!(m.ignored_count(), 100);
         assert!(m.is_ignored(5, 5), "region-local origin of the mask");
         assert!(!m.is_ignored(4, 5), "just outside the translated mask");
@@ -1096,7 +1102,7 @@ mod tests {
     #[test]
     fn for_region_drops_rects_outside_the_region() {
         let region = rect(0, 0, 10, 10);
-        let m = IgnoreMask::for_region(&[rect(50, 50, 5, 5)], Some(&region), 100, 100).unwrap();
+        let m = IgnoreMask::for_region(&[rect(50, 50, 5, 5)], &region).unwrap();
         assert!(m.is_empty());
     }
 

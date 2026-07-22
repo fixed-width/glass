@@ -68,7 +68,7 @@ impl Glass {
         tolerance: u8,
     ) -> Result<(DiffResult, Frame)> {
         let (baseline, current) = self.baseline_and_current(name, region)?;
-        let mask = IgnoreMask::for_region(ignore, region, baseline.width, baseline.height)?;
+        let mask = mask_for(ignore, region, baseline.width, baseline.height)?;
         let r = diff_with_mask(&baseline, &current, tolerance, &mask)?;
         Ok((r, current))
     }
@@ -98,7 +98,7 @@ impl Glass {
         threshold: f32,
     ) -> Result<(DiffResult, Frame)> {
         let (baseline, current) = self.baseline_and_current(name, region)?;
-        let mask = IgnoreMask::for_region(ignore, region, baseline.width, baseline.height)?;
+        let mask = mask_for(ignore, region, baseline.width, baseline.height)?;
         let r = diff_perceptual_with_mask(&baseline, &current, threshold, &mask)?;
         Ok((r, current))
     }
