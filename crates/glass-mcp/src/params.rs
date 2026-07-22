@@ -234,8 +234,9 @@ pub struct WaitStableArgs {
     /// the settle decision ignores changes outside it. Independent of `region`.
     pub stability_region: Option<RegionArgs>,
     /// Return the settled frame as an image (default true). Set false for a
-    /// text-only `{settled,width,height}` result with no WebP — cheap when the
-    /// next step is a text `glass_diff`. `region` is ignored when false.
+    /// text-only `{settled, saw_motion, observed_ms, width, height}` result
+    /// with no WebP — cheap when the next step is a text `glass_diff`.
+    /// `region` is ignored when false.
     pub include_image: Option<bool>,
     /// Capture/observe this window (id from `glass_list_windows`) instead of the
     /// active one, without changing which window subsequent ops target. Omit for
@@ -247,9 +248,11 @@ pub struct WaitStableArgs {
     /// inside a rect never count as changed and never set `saw_motion`.
     /// Combines with `stability_region`: rects are always window-relative and
     /// are intersected with it. Independent of `region`, which only crops the
-    /// returned image. A rect entirely outside the frame is silently clamped
-    /// away and masks nothing — this tool reports no `ignored_pixels` count to
-    /// reveal that mistake, so double-check placement.
+    /// returned image. A rect that falls partially or entirely outside the
+    /// compared area — the frame, or the `stability_region` sub-rectangle when
+    /// one is set — is silently clamped or dropped, masking less than
+    /// requested or nothing at all; this tool reports no `ignored_pixels`
+    /// count to reveal that, so double-check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -330,9 +333,11 @@ pub struct WaitForRegionArgs {
     /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
     /// `changed_pct` is measured over the pixels that remain. Combines with
     /// `region`: rects are always window-relative and are intersected with it.
-    /// A rect entirely outside the frame is silently clamped away and masks
-    /// nothing — this tool reports no `ignored_pixels` count to reveal that
-    /// mistake, so double-check placement.
+    /// A rect that falls partially or entirely outside the compared area —
+    /// the frame, or the `region` sub-rectangle when one is set — is silently
+    /// clamped or dropped, masking less than requested or nothing at all;
+    /// this tool reports no `ignored_pixels` count to reveal that, so
+    /// double-check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -431,12 +436,11 @@ pub struct SettleArgs {
     pub stability_region: Option<RegionArgs>,
     /// Window-relative rectangles to exclude from the settle comparison. Use for
     /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps the window from ever settling. Pixels
-    /// inside a rect never count as changed and never set `saw_motion`.
+    /// spinner — which otherwise keeps the window from ever settling.
     /// Combines with `stability_region`: rects are always window-relative and
-    /// are intersected with it. A rect entirely outside the frame is silently
-    /// clamped away and masks nothing — this tool reports no `ignored_pixels`
-    /// count to reveal that mistake, so double-check placement.
+    /// are intersected with it. A rect that falls partially or entirely
+    /// outside the compared area is silently clamped or dropped, masking less
+    /// than requested or nothing at all — double-check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 

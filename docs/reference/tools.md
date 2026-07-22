@@ -172,8 +172,10 @@ Wait until the window stops changing, then return the settled frame.
   would otherwise keep the window from ever settling; pixels inside a rect never count as changed
   and never set `saw_motion`. Combines with `stability_region`: rects are always window-relative
   and are intersected with it. Independent of `region`, which only crops the returned image. A
-  rect entirely outside the frame is silently clamped away and masks nothing — this tool reports
-  no `ignored_pixels` count to reveal that mistake, so double-check placement.
+  rect that falls partially or entirely outside the compared area — the frame, or the
+  `stability_region` sub-rectangle when one is set — is silently clamped or dropped, masking less
+  than requested or nothing at all; this tool reports no `ignored_pixels` count to reveal that, so
+  double-check placement.
 
 Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
 added only when `include_image` attached a frame and `region` was given (the text-only result never
@@ -220,8 +222,10 @@ baseline), then return text metrics.
   comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
   would otherwise keep `changed_pct` non-zero forever. `changed_pct` is measured over the pixels
   that remain. Combines with `region`: ignore rects are always window-relative and are intersected
-  with it. A rect entirely outside the frame is silently clamped away and masks nothing — this
-  tool reports no `ignored_pixels` count to reveal that mistake, so double-check placement.
+  with it. A rect that falls partially or entirely outside the compared area — the frame, or the
+  `region` sub-rectangle when one is set — is silently clamped or dropped, masking less than
+  requested or nothing at all; this tool reports no `ignored_pixels` count to reveal that, so
+  double-check placement.
 
 Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
 an approved design without spending vision tokens. For the non-blocking case — one already-captured
@@ -344,8 +348,12 @@ Run an ordered sequence of input actions in one call (collapsing per-action roun
 optionally observe.
 
 - `actions` (array, **required**, non-empty) — each item is `{ action: "click"|"move"|"drag"|
-  "scroll"|"type"|"key"|"settle", ...same fields as the matching tool }`. A `settle` action waits
-  for the screen to stop changing between steps.
+  "scroll"|"type"|"key"|"settle", ...fields }`. Click/move/drag/scroll/type/key take the same
+  fields as their matching tool. A `settle` action takes a *subset* of `glass_wait_stable`'s
+  fields — `interval_ms`, `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and
+  `ignore` (the same window-relative-rectangles knob) — but no `window_id`, `region`, or
+  `include_image`: it always settles the active window and never returns an image. It waits for
+  the screen to stop changing between steps.
 - `then` (`{ settle?, diff?, screenshot? }`) — a terminal observe after all actions succeed; text-
   first, returning an image only for `screenshot` (or `diff` with its own `include_image`).
 
