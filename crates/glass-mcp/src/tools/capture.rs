@@ -42,8 +42,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         timeout_ms: a.timeout_ms.unwrap_or(5000),
         stability_region: a.stability_region.as_ref().map(|r| r.into()),
-        // No ignore rects yet — the tool doesn't accept them until a later change.
-        ignore: Vec::new(),
+        ignore: ignore_regions(a.ignore.as_ref()),
         window: a.window_id.map(glass_core::WindowId),
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
@@ -91,17 +90,20 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let region = a.region.as_ref().map(Region::from);
+    let ignore = ignore_regions(a.ignore.as_ref());
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
-        // `&[]`: no ignore rects yet — the tool doesn't accept them until a later change.
         "perceptual" => glass.diff_baseline_perceptual_with_frame(
             &a.name,
             region.as_ref(),
-            &[],
+            &ignore,
             a.threshold.unwrap_or(0.1),
         ),
-        "exact" => {
-            glass.diff_baseline_with_frame(&a.name, region.as_ref(), &[], a.tolerance.unwrap_or(0))
-        }
+        "exact" => glass.diff_baseline_with_frame(
+            &a.name,
+            region.as_ref(),
+            &ignore,
+            a.tolerance.unwrap_or(0),
+        ),
         other => {
             return Err(format!(
                 "unknown diff mode '{other}' (use perceptual/exact)"
@@ -118,6 +120,7 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
         "total_pixels": r.total_pixels,
         "changed_pct": r.changed_pct,
         "aa_ignored": r.aa_ignored,
+        "ignored_pixels": r.ignored_pixels,
         "bbox": bbox,
     });
     // Echo the region so the caller can map the region-relative bbox back to
@@ -318,6 +321,7 @@ mod tests {
             stability_region: None,
             include_image: None,
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         if let OutContent::Image(bytes) = &out.0[0] {
@@ -349,6 +353,7 @@ mod tests {
             }),
             include_image: None,
             window_id: None,
+            ignore: None,
         };
         assert!(wait_stable(&mut g, &a).unwrap_err().contains("region"));
     }
@@ -372,6 +377,7 @@ mod tests {
             stability_region: None,
             include_image: None,
             window_id: Some(3),
+            ignore: None,
         };
         let err = wait_stable(&mut g, &a).unwrap_err();
         assert!(err.contains("not supported"), "got: {err}");
@@ -402,11 +408,50 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
         let v = assert_envelope(&out, "glass_diff");
         assert_eq!(v["changed_pixels"], json!(1), "envelope: {v}");
+    }
+
+    #[test]
+    fn diff_with_ignore_excludes_rect_and_reports_ignored_pixels() {
+        let base = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut changed = base.clone();
+        changed.pixels[0] = 255; // pixel (0,0) changes, inside the ignore rect below
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![base, changed]));
+        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
+        let out = diff(
+            &mut g,
+            &DiffArgs {
+                region: None,
+                name: "m".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+                ignore: Some(vec![RegionArgs {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }]),
+            },
+        )
+        .unwrap();
+        let v = assert_envelope(&out, "glass_diff");
+        assert_eq!(
+            v["changed_pixels"],
+            json!(0),
+            "the only change sits inside the ignore rect: {v}"
+        );
+        assert_eq!(
+            v["ignored_pixels"],
+            json!(4),
+            "the 2x2 ignore rect excludes 4 pixels: {v}"
+        );
     }
 
     #[test]
@@ -431,6 +476,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
@@ -460,6 +506,7 @@ mod tests {
                 threshold: None,
                 tolerance: Some(0),
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
@@ -475,6 +522,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap_err();
@@ -497,6 +545,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap_err();
@@ -565,6 +614,7 @@ mod tests {
             stability_region: None,
             include_image: Some(false),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         assert_eq!(
@@ -594,6 +644,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -632,6 +683,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -655,6 +707,7 @@ mod tests {
             stability_region: None,
             include_image: Some(true),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // must have [Image, meta-Text, IMAGE_NOTE-Text]
@@ -704,6 +757,7 @@ mod tests {
             stability_region: None,
             include_image: Some(false),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // no image -> no IMAGE_NOTE
@@ -781,6 +835,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -818,6 +873,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();

@@ -136,10 +136,15 @@ Diff the current frame against a named baseline; returns change stats and a boun
 - `region` (`{x,y,width,height}`) — window-relative sub-rectangle to diff; omit to diff the whole
   window. Scopes the comparison (and the reported `bbox`, which becomes region-relative) to just
   this area — the way to ask "did *only* this part change?".
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
+  always window-relative and are intersected with it.
 
-Returns `{changed_pixels, total_pixels, changed_pct, aa_ignored, bbox}` (`bbox` is `null` when
-nothing changed), plus the given `region` echoed back when one was passed; only attaches an image
-when `include_image:true` and something changed.
+Returns `{changed_pixels, total_pixels, changed_pct, aa_ignored, ignored_pixels, bbox}` (`bbox` is
+`null` when nothing changed), plus the given `region` echoed back when one was passed; only attaches
+an image when `include_image:true` and something changed. `ignored_pixels` is the count excluded by
+`ignore`; `changed_pct` is measured over `total_pixels - ignored_pixels`.
 
 ## Settling & waiting
 
@@ -161,6 +166,10 @@ Wait until the window stops changing, then return the settled frame.
 - `tolerance` (integer 0–255) — per-frame change tolerance.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
+  always window-relative and are intersected with it.
 
 Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
 added only when `include_image` attached a frame and `region` was given (the text-only result never
@@ -203,6 +212,10 @@ baseline), then return text metrics.
 - `include_image` (boolean, default false) — on match, also return the watched region as an image.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
+  always window-relative and are intersected with it.
 
 Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
 an approved design without spending vision tokens. For the non-blocking case — one already-captured

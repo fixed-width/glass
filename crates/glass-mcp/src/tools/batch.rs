@@ -49,6 +49,7 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
         stability_region: s.stability_region.clone(),
         include_image: Some(false),
         window_id: None,
+        ignore: None,
     }
 }
 
@@ -341,6 +342,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: Some(false),
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),
@@ -376,6 +378,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: Some(true),
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),
@@ -416,6 +419,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: None,
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),

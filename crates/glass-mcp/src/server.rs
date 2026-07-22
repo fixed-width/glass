@@ -971,6 +971,37 @@ mod tests {
         );
     }
 
+    /// `glass_diff`, `glass_wait_stable`, and `glass_wait_for_region` must each advertise an
+    /// `ignore` schema property typed as an array (`Option<Vec<RegionArgs>>` renders as
+    /// `type: ["array","null"]` under schemars 1.x) — the shape an agent's MCP client reads to
+    /// know it can pass ignore rects at all.
+    #[test]
+    fn ignore_param_is_an_array_on_diff_and_the_waits() {
+        let router = GlassServer::tool_router();
+        for tool_name in ["glass_diff", "glass_wait_stable", "glass_wait_for_region"] {
+            let tool = router
+                .list_all()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} is registered"));
+            let ignore_type = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("ignore"))
+                .and_then(|v| v.get("type"))
+                .unwrap_or_else(|| panic!("{tool_name} has no `ignore` schema property"));
+            let is_array = match ignore_type {
+                serde_json::Value::String(s) => s == "array",
+                serde_json::Value::Array(vs) => vs.iter().any(|v| v == "array"),
+                _ => false,
+            };
+            assert!(
+                is_array,
+                "{tool_name}'s `ignore` property must be array-typed; got {ignore_type:?}"
+            );
+        }
+    }
+
     #[test]
     fn tool_reference_documents_exactly_the_registry() {
         let documented = documented_tools();

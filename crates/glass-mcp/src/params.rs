@@ -24,6 +24,12 @@ impl From<&RegionArgs> for Region {
     }
 }
 
+/// Window-relative ignore rects as core `Region`s; empty when omitted.
+pub fn ignore_regions(args: Option<&Vec<RegionArgs>>) -> Vec<Region> {
+    args.map(|v| v.iter().map(Region::from).collect())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScreenshotArgs {
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
@@ -235,6 +241,13 @@ pub struct WaitStableArgs {
     /// active one, without changing which window subsequent ops target. Omit for
     /// the active window.
     pub window_id: Option<u64>,
+    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
+    /// `changed_pct` is measured over the pixels that remain; the excluded
+    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
+    /// always window-relative and are intersected with it.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -309,6 +322,13 @@ pub struct WaitForRegionArgs {
     /// active one, without changing which window subsequent ops target. Omit for
     /// the active window.
     pub window_id: Option<u64>,
+    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
+    /// `changed_pct` is measured over the pixels that remain; the excluded
+    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
+    /// always window-relative and are intersected with it.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -364,6 +384,13 @@ pub struct DiffArgs {
     /// region-relative) to just this area — the way to ask "did *only* this part
     /// change?" Mirrors `glass_wait_for_region`'s `region`.
     pub region: Option<RegionArgs>,
+    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
+    /// `changed_pct` is measured over the pixels that remain; the excluded
+    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
+    /// always window-relative and are intersected with it.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -512,6 +539,87 @@ mod tests {
                 .unwrap();
         let r = some.region.unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn diff_args_ignore_defaults_none_and_parses() {
+        let none: DiffArgs = serde_json::from_str(r#"{"name":"m"}"#).unwrap();
+        assert!(none.ignore.is_none());
+        let some: DiffArgs =
+            serde_json::from_str(r#"{"name":"m","ignore":[{"x":1,"y":2,"width":3,"height":4}]}"#)
+                .unwrap();
+        let regions = some.ignore.unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            (
+                regions[0].x,
+                regions[0].y,
+                regions[0].width,
+                regions[0].height
+            ),
+            (1, 2, 3, 4)
+        );
+    }
+
+    #[test]
+    fn wait_stable_args_ignore_defaults_none_and_parses() {
+        let none: WaitStableArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: WaitStableArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_region_args_ignore_defaults_none_and_parses() {
+        let none: WaitForRegionArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: WaitForRegionArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignore_regions_maps_none_to_empty_vec() {
+        assert!(ignore_regions(None).is_empty());
+    }
+
+    #[test]
+    fn ignore_regions_maps_some_to_core_regions() {
+        let rects = vec![
+            RegionArgs {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            },
+            RegionArgs {
+                x: 5,
+                y: 6,
+                width: 7,
+                height: 8,
+            },
+        ];
+        let regions = ignore_regions(Some(&rects));
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            (
+                regions[0].x,
+                regions[0].y,
+                regions[0].width,
+                regions[0].height
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(
+            (
+                regions[1].x,
+                regions[1].y,
+                regions[1].width,
+                regions[1].height
+            ),
+            (5, 6, 7, 8)
+        );
     }
 
     #[test]

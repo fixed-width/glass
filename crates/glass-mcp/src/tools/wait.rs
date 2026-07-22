@@ -139,8 +139,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         interval_ms: a.interval_ms.unwrap_or(100),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
-        // No ignore rects yet — the tool doesn't accept them until a later change.
-        ignore: Vec::new(),
+        ignore: ignore_regions(a.ignore.as_ref()),
         window: a.window_id.map(glass_core::WindowId),
     };
     let o = glass.wait_for_region(&params).map_err(|e| e.to_string())?;
@@ -548,6 +547,7 @@ mod tests {
             timeout_ms: Some(1000),
             include_image: None,
             window_id: None,
+            ignore: None,
         }
     }
 
