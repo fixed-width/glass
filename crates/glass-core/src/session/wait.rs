@@ -239,6 +239,13 @@ pub struct WaitRegionParams {
     pub tolerance: u8,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// Window-relative sub-rectangles excluded from the comparison — pixels there
+    /// never count toward `changed`/`matches`, so a perpetually animating area (a
+    /// blinking caret, a clock) inside the watched region cannot itself satisfy
+    /// `until: Changes`, nor block `until: Matches` from converging. When `region`
+    /// is set, each rect is intersected with it and translated into region-local
+    /// coordinates, so `ignore` is always window-relative regardless of scoping.
+    pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
     pub window: Option<WindowId>,
@@ -524,7 +531,9 @@ impl Glass {
     /// captured frame is returned for an optional image at the tool layer.
     /// If `baseline` is set and `region` is `None`, the baseline must match the
     /// current window size — a size change since it was saved returns `SizeMismatch`;
-    /// crop to a stable `region` to avoid this.
+    /// crop to a stable `region` to avoid this. `ignore` excludes window-relative
+    /// sub-rectangles from every comparison — pixels there never count toward
+    /// `changed`/`matches` (see `WaitRegionParams::ignore`).
     pub fn wait_for_region(&mut self, params: &WaitRegionParams) -> Result<WaitRegionOutcome> {
         let active = self.require_active()?;
         // As in `wait_stable`: the active window's cached geometry only bounds
@@ -547,6 +556,19 @@ impl Glass {
             }
             None => self.capture(params.window, params.region.as_ref())?,
         };
+        // The mask is built once, sized from `reference` — the frame that will
+        // actually be compared every tick — not from the session's cached window
+        // geometry, which can be stale or belong to a different window (the same
+        // trap `wait_stable` hit: see its mask-build comment). Every polled
+        // `current` frame is required to match `reference`'s size (the masked
+        // diff functions error otherwise via `SizeMismatch`), so `reference`'s own
+        // dimensions are exactly the comparison's real size, cropped or not.
+        let mask = IgnoreMask::for_region(
+            &params.ignore,
+            params.region.as_ref(),
+            reference.width,
+            reference.height,
+        )?;
         let (perceptual, threshold, tolerance, until, region, window) = (
             params.perceptual,
             params.threshold,
@@ -559,9 +581,9 @@ impl Glass {
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             let current = self.capture(window, region.as_ref())?;
             let d = if perceptual {
-                diff_perceptual(&reference, &current, threshold)?
+                diff_perceptual_with_mask(&reference, &current, threshold, &mask)?
             } else {
-                diff(&reference, &current, tolerance)?
+                diff_with_mask(&reference, &current, tolerance, &mask)?
             };
             let satisfied = region_satisfied(&d, until);
             last = Some((d.changed_pct, d.bbox, current));
@@ -1489,6 +1511,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -1513,6 +1536,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 0,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -1539,11 +1563,114 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
         assert!(o.matched);
         assert_eq!(o.changed_pct, 0.0);
+    }
+
+    #[test]
+    fn wait_for_region_ignore_masks_a_changing_rect_so_changes_never_matches() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
+        // clock — while the rest of the 4x4 frame stays constant. Masking it means
+        // `until: Changes` has nothing left to react to: the corner is the only
+        // pixel that ever differs, and it is excluded from the comparison.
+        //
+        // `timeout_ms: 0` bounds the wait to exactly one poll after the reference
+        // capture (see `poll_until`), so a generous timeout letting `FakePlatform`
+        // outlast its scripted frames into its repeat-forever fallback can't be
+        // what makes this pass — the outcome is decided by that single real
+        // comparison. Pinning the capture count to 2 (reference + one poll) makes
+        // that explicit.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            !o.matched,
+            "the only real difference (the corner) is masked, so nothing should register as a change"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "reference capture + exactly one poll, not outlasted into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_ignore_lets_matches_converge_despite_a_changing_rect() {
+        // The baseline is saved while the corner is 10; the polled stream then
+        // serves a frame with the corner at 20 — otherwise identical. Without
+        // masking, that real corner difference would keep `until: Matches` from
+        // ever being satisfied; masking it lets the (otherwise-constant) rest of
+        // the frame converge on the very first poll.
+        //
+        // Pinning the capture count to 2 (the baseline save + one poll) rules out
+        // a generous timeout eventually matching by other means: it can only
+        // happen if the corner was masked from that first real comparison.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.save_baseline("b").unwrap(); // consumes f0
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: Some("b".into()),
+                region: None,
+                until: RegionUntil::Matches,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            o.matched,
+            "the corner is masked, so the rest of the frame matches the baseline immediately"
+        );
+        assert_eq!(o.changed_pct, 0.0);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "baseline save + exactly one poll — matched on the first real comparison"
+        );
     }
 
     #[test]
@@ -1597,6 +1724,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: Some(WindowId(2)),
             })
             .unwrap();

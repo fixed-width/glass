@@ -7,8 +7,8 @@ use crate::accessibility::{
 };
 use crate::baseline::BaselineStore;
 use crate::diff::{
-    diff, diff_perceptual, diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox,
-    DiffResult, IgnoreMask, RegionUntil,
+    diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox, DiffResult, IgnoreMask,
+    RegionUntil,
 };
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
