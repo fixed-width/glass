@@ -25,7 +25,7 @@ impl From<&RegionArgs> for Region {
 }
 
 /// Window-relative ignore rects as core `Region`s; empty when omitted.
-pub fn ignore_regions(args: Option<&Vec<RegionArgs>>) -> Vec<Region> {
+pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
     args.map(|v| v.iter().map(Region::from).collect())
         .unwrap_or_default()
 }
@@ -241,12 +241,15 @@ pub struct WaitStableArgs {
     /// active one, without changing which window subsequent ops target. Omit for
     /// the active window.
     pub window_id: Option<u64>,
-    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// Window-relative rectangles to exclude from the settle comparison. Use for
     /// perpetually animating content — a blinking text caret, a clock, a
-    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
-    /// `changed_pct` is measured over the pixels that remain; the excluded
-    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
-    /// always window-relative and are intersected with it.
+    /// spinner — which otherwise keeps the window from ever settling. Pixels
+    /// inside a rect never count as changed and never set `saw_motion`.
+    /// Combines with `stability_region`: rects are always window-relative and
+    /// are intersected with it. Independent of `region`, which only crops the
+    /// returned image. A rect entirely outside the frame is silently clamped
+    /// away and masks nothing — this tool reports no `ignored_pixels` count to
+    /// reveal that mistake, so double-check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -325,9 +328,11 @@ pub struct WaitForRegionArgs {
     /// Window-relative rectangles to exclude from the comparison. Use for
     /// perpetually animating content — a blinking text caret, a clock, a
     /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
-    /// `changed_pct` is measured over the pixels that remain; the excluded
-    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
-    /// always window-relative and are intersected with it.
+    /// `changed_pct` is measured over the pixels that remain. Combines with
+    /// `region`: rects are always window-relative and are intersected with it.
+    /// A rect entirely outside the frame is silently clamped away and masks
+    /// nothing — this tool reports no `ignored_pixels` count to reveal that
+    /// mistake, so double-check placement.
     pub ignore: Option<Vec<RegionArgs>>,
 }
 
@@ -424,6 +429,15 @@ pub struct SettleArgs {
     pub tolerance: Option<u8>,
     pub timeout_ms: Option<u64>,
     pub stability_region: Option<RegionArgs>,
+    /// Window-relative rectangles to exclude from the settle comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps the window from ever settling. Pixels
+    /// inside a rect never count as changed and never set `saw_motion`.
+    /// Combines with `stability_region`: rects are always window-relative and
+    /// are intersected with it. A rect entirely outside the frame is silently
+    /// clamped away and masks nothing — this tool reports no `ignored_pixels`
+    /// count to reveal that mistake, so double-check placement.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 /// Optional terminal observe after a `glass_do` sequence (run settle → diff →
@@ -580,6 +594,17 @@ mod tests {
     }
 
     #[test]
+    fn settle_args_ignore_defaults_none_and_parses() {
+        // A `glass_do` settle action/`then.settle` carries the same `ignore`
+        // knob as the standalone `glass_wait_stable` tool.
+        let none: SettleArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: SettleArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
     fn ignore_regions_maps_none_to_empty_vec() {
         assert!(ignore_regions(None).is_empty());
     }
@@ -600,7 +625,7 @@ mod tests {
                 height: 8,
             },
         ];
-        let regions = ignore_regions(Some(&rects));
+        let regions = ignore_regions(Some(rects.as_slice()));
         assert_eq!(regions.len(), 2);
         assert_eq!(
             (

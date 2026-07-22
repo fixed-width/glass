@@ -42,7 +42,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         timeout_ms: a.timeout_ms.unwrap_or(5000),
         stability_region: a.stability_region.as_ref().map(|r| r.into()),
-        ignore: ignore_regions(a.ignore.as_ref()),
+        ignore: ignore_regions(a.ignore.as_deref()),
         window: a.window_id.map(glass_core::WindowId),
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
@@ -90,7 +90,7 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let region = a.region.as_ref().map(Region::from);
-    let ignore = ignore_regions(a.ignore.as_ref());
+    let ignore = ignore_regions(a.ignore.as_deref());
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
         "perceptual" => glass.diff_baseline_perceptual_with_frame(
             &a.name,
@@ -381,6 +381,63 @@ mod tests {
         };
         let err = wait_stable(&mut g, &a).unwrap_err();
         assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_stable_with_ignore_settles_despite_a_blinking_rect() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking text
+        // caret, a clock, a spinner — while the rest of the 4x4 frame stays
+        // constant. Without `ignore` reaching `WaitStableParams`, the full-
+        // frame comparison would never settle; masking it lets the
+        // otherwise-constant stream settle normally.
+        //
+        // Pinning the capture count to 3 (the frames actually supplied) rules
+        // out a generous timeout settling by outlasting the scripted frames
+        // into `FakePlatform`'s repeat-forever fallback (comparing the
+        // repeated final frame to itself would "settle" even without
+        // masking, proving nothing about the wiring).
+        let log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let mut g = started_with(
+            FakePlatform::new(4, 4)
+                .with_frames(vec![f0, f1, f2])
+                .with_capture_log(log.clone()),
+        );
+        let a = WaitStableArgs {
+            interval_ms: Some(0),
+            settle_frames: Some(2),
+            tolerance: None,
+            timeout_ms: Some(1000),
+            region: None,
+            stability_region: None,
+            include_image: Some(false),
+            window_id: None,
+            ignore: Some(vec![RegionArgs {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1,
+            }]),
+        };
+        let out = wait_stable(&mut g, &a).unwrap();
+        let v = assert_envelope(&out, "glass_wait_stable");
+        assert_eq!(
+            v["settled"],
+            json!(true),
+            "the blinking rect is masked, so the stream is stable: {v}"
+        );
+        assert_eq!(
+            v["saw_motion"],
+            json!(false),
+            "motion confined to an ignore rect must never set saw_motion: {v}"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
     }
 
     #[test]

@@ -974,7 +974,10 @@ mod tests {
     /// `glass_diff`, `glass_wait_stable`, and `glass_wait_for_region` must each advertise an
     /// `ignore` schema property typed as an array (`Option<Vec<RegionArgs>>` renders as
     /// `type: ["array","null"]` under schemars 1.x) — the shape an agent's MCP client reads to
-    /// know it can pass ignore rects at all.
+    /// know it can pass ignore rects at all. Also pin the item shape itself: schemars renders
+    /// `Vec<RegionArgs>`'s `items` as a `$ref` to the shared `RegionArgs` `$defs` entry, so this
+    /// must resolve there — an `items` typed as a bare integer (or anything else) would still
+    /// pass the array-only check above but reject every `{x,y,width,height}` rect a caller sends.
     #[test]
     fn ignore_param_is_an_array_on_diff_and_the_waits() {
         let router = GlassServer::tool_router();
@@ -984,11 +987,13 @@ mod tests {
                 .into_iter()
                 .find(|t| t.name == tool_name)
                 .unwrap_or_else(|| panic!("{tool_name} is registered"));
-            let ignore_type = tool
+            let ignore_prop = tool
                 .input_schema
                 .get("properties")
                 .and_then(|p| p.get("ignore"))
-                .and_then(|v| v.get("type"))
+                .unwrap_or_else(|| panic!("{tool_name} has no `ignore` schema property"));
+            let ignore_type = ignore_prop
+                .get("type")
                 .unwrap_or_else(|| panic!("{tool_name} has no `ignore` schema property"));
             let is_array = match ignore_type {
                 serde_json::Value::String(s) => s == "array",
@@ -998,6 +1003,17 @@ mod tests {
             assert!(
                 is_array,
                 "{tool_name}'s `ignore` property must be array-typed; got {ignore_type:?}"
+            );
+            let items_ref = ignore_prop
+                .get("items")
+                .and_then(|v| v.get("$ref"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!("{tool_name}'s `ignore.items` must be a $ref (got {ignore_prop:?})")
+                });
+            assert_eq!(
+                items_ref, "#/$defs/RegionArgs",
+                "{tool_name}'s `ignore.items` must reference the shared RegionArgs $def; got {items_ref}"
             );
         }
     }

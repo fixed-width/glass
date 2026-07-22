@@ -69,8 +69,9 @@ ids are in [Conventions](#conventions) above):
   `glass_click`/`glass_move`/`glass_drag`/`glass_scroll`/`glass_gesture` — are signed `i32`,
   window-relative. A negative value addresses a point off the window's top-left edge rather than
   being rejected.
-- **Region coordinates** — `region`/`stability_region` (`x,y,width,height`), wherever a tool accepts
-  one — are unsigned `u32`; they can never be negative.
+- **Region coordinates** — `region`/`stability_region`/the rects inside `ignore`
+  (`x,y,width,height`), wherever a tool accepts one — are unsigned `u32`; they can never be
+  negative.
 - `glass_logs`' `max_lines` is a `u32`.
 
 ## Session lifecycle
@@ -166,10 +167,13 @@ Wait until the window stops changing, then return the settled frame.
 - `tolerance` (integer 0–255) — per-frame change tolerance.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
-- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the settle
   comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
-  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
-  always window-relative and are intersected with it.
+  would otherwise keep the window from ever settling; pixels inside a rect never count as changed
+  and never set `saw_motion`. Combines with `stability_region`: rects are always window-relative
+  and are intersected with it. Independent of `region`, which only crops the returned image. A
+  rect entirely outside the frame is silently clamped away and masks nothing — this tool reports
+  no `ignored_pixels` count to reveal that mistake, so double-check placement.
 
 Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
 added only when `include_image` attached a frame and `region` was given (the text-only result never
@@ -214,8 +218,10 @@ baseline), then return text metrics.
   one, without changing which window subsequent ops target.
 - `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
   comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
-  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
-  always window-relative and are intersected with it.
+  would otherwise keep `changed_pct` non-zero forever. `changed_pct` is measured over the pixels
+  that remain. Combines with `region`: ignore rects are always window-relative and are intersected
+  with it. A rect entirely outside the frame is silently clamped away and masks nothing — this
+  tool reports no `ignored_pixels` count to reveal that mistake, so double-check placement.
 
 Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
 an approved design without spending vision tokens. For the non-blocking case — one already-captured

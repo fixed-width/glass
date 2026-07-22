@@ -820,6 +820,7 @@ mod tests {
                         tolerance: None,
                         timeout_ms: Some(500),
                         stability_region: None,
+                        ignore: None,
                     }),
                 ],
                 then: None,
