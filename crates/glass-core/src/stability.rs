@@ -1,4 +1,4 @@
-use crate::diff::diff;
+use crate::diff::{diff_with_mask, IgnoreMask};
 use crate::error::Result;
 use crate::frame::Frame;
 
@@ -13,6 +13,10 @@ use crate::frame::Frame;
 pub struct StabilityTracker {
     settle_frames: u32,
     tolerance: u8,
+    /// Pixels excluded from the settle comparison — a perpetually animating region
+    /// (a blinking caret, a clock) can toggle here forever without ever preventing
+    /// a settle.
+    mask: IgnoreMask,
     last: Option<Frame>,
     stable_count: u32,
     saw_change: bool,
@@ -20,9 +24,17 @@ pub struct StabilityTracker {
 
 impl StabilityTracker {
     pub fn new(settle_frames: u32, tolerance: u8) -> Self {
+        Self::with_mask(settle_frames, tolerance, IgnoreMask::empty())
+    }
+
+    /// Like [`new`](Self::new), but pixels covered by `mask` are excluded from the
+    /// frame-to-frame comparison — so a perpetually animating region (a blinking
+    /// caret, a clock) cannot prevent the stream from settling.
+    pub fn with_mask(settle_frames: u32, tolerance: u8, mask: IgnoreMask) -> Self {
         Self {
             settle_frames: settle_frames.max(1),
             tolerance,
+            mask,
             last: None,
             stable_count: 0,
             saw_change: false,
@@ -35,7 +47,9 @@ impl StabilityTracker {
         let had_prev = self.last.is_some();
         let unchanged = match &self.last {
             None => false,
-            Some(prev) => diff(prev, &frame, self.tolerance)?.changed_pixels == 0,
+            Some(prev) => {
+                diff_with_mask(prev, &frame, self.tolerance, &self.mask)?.changed_pixels == 0
+            }
         };
         if had_prev && !unchanged {
             self.saw_change = true;
@@ -61,6 +75,7 @@ impl StabilityTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::Region;
 
     #[test]
     fn settles_after_consecutive_identical_frames() {
@@ -91,6 +106,44 @@ mod tests {
         t.observe(a).unwrap();
         t.observe(b.clone()).unwrap();
         assert_eq!(t.last(), Some(&b));
+    }
+
+    #[test]
+    fn a_masked_blinking_pixel_still_counts_as_settled() {
+        let mask = IgnoreMask::new(
+            &[Region {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+            4,
+            4,
+        )
+        .unwrap();
+        let mut t = StabilityTracker::with_mask(2, 0, mask);
+        let base = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut blink = base.clone();
+        blink.pixels[0] = 255; // only the masked pixel toggles
+
+        assert!(!t.observe(base.clone()).unwrap());
+        assert!(!t.observe(blink.clone()).unwrap());
+        assert!(
+            t.observe(base.clone()).unwrap(),
+            "the toggling pixel is masked, so the stream is stable"
+        );
+    }
+
+    #[test]
+    fn an_unmasked_blinking_pixel_never_settles() {
+        let mut t = StabilityTracker::new(2, 0);
+        let base = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut blink = base.clone();
+        blink.pixels[0] = 255;
+        for _ in 0..6 {
+            assert!(!t.observe(base.clone()).unwrap());
+            assert!(!t.observe(blink.clone()).unwrap());
+        }
     }
 
     #[test]

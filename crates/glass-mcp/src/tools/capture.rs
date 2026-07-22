@@ -42,6 +42,8 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         timeout_ms: a.timeout_ms.unwrap_or(5000),
         stability_region: a.stability_region.as_ref().map(|r| r.into()),
+        // No ignore rects yet — the tool doesn't accept them until a later change.
+        ignore: Vec::new(),
         window: a.window_id.map(glass_core::WindowId),
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;

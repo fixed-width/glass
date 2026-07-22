@@ -12,6 +12,13 @@ pub struct WaitStableParams {
     /// When set, the settle decision compares only this sub-rectangle of each
     /// frame; the returned frame is still the full window.
     pub stability_region: Option<Region>,
+    /// Window-relative sub-rectangles excluded from the settle comparison — pixels
+    /// there never count as changed, so a perpetually animating region (a blinking
+    /// caret, a clock) cannot prevent the stream from settling. When
+    /// `stability_region` is set, each rect is intersected with it and translated
+    /// into region-local coordinates, so `ignore` is always window-relative
+    /// regardless of scoping.
+    pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
     pub window: Option<WindowId>,
@@ -281,17 +288,27 @@ pub struct WaitLogOutcome {
 impl Glass {
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
         let active = self.require_active()?;
+        let geo = active.geometry.clone();
         // The active window's cached geometry only bounds a stability_region when
         // watching the active window itself; a specific `window` is validated by
         // the backend against its own geometry instead (see `capture`).
         if params.window.is_none() {
-            let geo = active.geometry.clone();
             if let Some(r) = &params.stability_region {
                 r.check_fits(geo.width, geo.height)?;
             }
         }
-        let mut tracker = StabilityTracker::new(params.settle_frames, params.tolerance);
         let region = params.stability_region;
+        // `capture` returns frames cropped to `region` when one is set (see
+        // `wait_stable_polls_only_the_region_and_captures_full_once`), so the
+        // settle comparison happens in that cropped space — the mask must match
+        // it. `for_region` builds exactly that: passed the full (uncropped)
+        // geometry plus the region, it intersects `ignore` with the region and
+        // translates into region-local coordinates, same as the baseline diff
+        // path. `geo` is the active window's geometry; as with the bounds check
+        // above, a specific `window` bypasses this sizing for the same reason —
+        // its own geometry is validated by the backend, not cached here.
+        let mask = IgnoreMask::for_region(&params.ignore, region.as_ref(), geo.width, geo.height)?;
+        let mut tracker = StabilityTracker::with_mask(params.settle_frames, params.tolerance, mask);
         let window = params.window;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             // Poll only the watched region (cheap) when one is set; else the full window.
@@ -627,6 +644,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -654,6 +672,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 0, // give up after the first non-settling capture
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -683,6 +702,7 @@ mod tests {
                     width: 2,
                     height: 2,
                 }),
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -693,6 +713,57 @@ mod tests {
         assert_eq!(
             outcome.frame, f2,
             "wait_stable returns the FULL frame, not the cropped region"
+        );
+    }
+
+    #[test]
+    fn wait_stable_settles_using_ignore_to_mask_a_blinking_pixel() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
+        // clock — while the rest of the 4x4 frame stays constant black. Without
+        // `ignore` this pixel would mean the full-frame comparison never settles;
+        // masking it lets the (otherwise-constant) frame settle normally.
+        //
+        // Asserting the capture count matters: `FakePlatform` repeats its last
+        // supplied frame forever once exhausted, so a generous timeout would
+        // eventually report `settled` even WITHOUT masking (comparing the
+        // repeated final frame to itself) — that would prove nothing about
+        // `ignore`. Pinning the count to exactly 3 (the frames actually
+        // supplied) rules that out: it can only happen if the blink was masked
+        // from the very first comparison.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1, f2.clone()])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            outcome.settled,
+            "the blinking pixel is masked, so the stream is stable"
+        );
+        assert_eq!(outcome.frame, f2);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
         );
     }
 
@@ -722,6 +793,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: Some(region),
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -757,6 +829,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -786,6 +859,7 @@ mod tests {
                     width: 99,
                     height: 1,
                 }),
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap_err();
@@ -840,6 +914,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: Some(WindowId(2)),
             })
             .unwrap();
