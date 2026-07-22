@@ -34,7 +34,8 @@ pub struct WaitStableOutcome {
     /// `saw_motion:false` over a short `observed_ms` is a *brief* quiet window — a slow
     /// animation can still hide under it, so use `wait_for_region {until:"changes"}` to
     /// positively assert motion. `settled:true` with `saw_motion:true` means it was moving
-    /// and then quieted.
+    /// and then quieted. Motion confined to an `ignore` rect does not count — it is masked
+    /// out of the comparison, so it can never set this flag.
     pub saw_motion: bool,
     /// How long (ms) frames were observed before settling or timing out.
     pub observed_ms: u64,
@@ -288,34 +289,48 @@ pub struct WaitLogOutcome {
 impl Glass {
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
         let active = self.require_active()?;
-        let geo = active.geometry.clone();
         // The active window's cached geometry only bounds a stability_region when
         // watching the active window itself; a specific `window` is validated by
         // the backend against its own geometry instead (see `capture`).
         if params.window.is_none() {
+            let geo = active.geometry.clone();
             if let Some(r) = &params.stability_region {
                 r.check_fits(geo.width, geo.height)?;
             }
         }
         let region = params.stability_region;
-        // `capture` returns frames cropped to `region` when one is set (see
-        // `wait_stable_polls_only_the_region_and_captures_full_once`), so the
-        // settle comparison happens in that cropped space — the mask must match
-        // it. `for_region` builds exactly that: passed the full (uncropped)
-        // geometry plus the region, it intersects `ignore` with the region and
-        // translates into region-local coordinates, same as the baseline diff
-        // path. `geo` is the active window's geometry; as with the bounds check
-        // above, a specific `window` bypasses this sizing for the same reason —
-        // its own geometry is validated by the backend, not cached here.
-        let mask = IgnoreMask::for_region(&params.ignore, region.as_ref(), geo.width, geo.height)?;
-        let mut tracker = StabilityTracker::with_mask(params.settle_frames, params.tolerance, mask);
         let window = params.window;
+        // The mask is built lazily, on the first poll tick, sized from that
+        // captured frame's own dimensions rather than the session's cached
+        // geometry — which can belong to a different window than the one being
+        // watched, or be stale if the watched window resized itself since the
+        // cache was last refreshed. `for_region` intersects `ignore` with
+        // `region` and translates into region-local coordinates (`capture`
+        // crops to `region` when one is set, so the settle comparison and the
+        // mask must agree on that same cropped space).
+        let mut tracker: Option<StabilityTracker> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             // Poll only the watched region (cheap) when one is set; else the full window.
             let frame = self.capture(window, region.as_ref())?;
-            let settled = tracker.observe(frame)?;
-            Ok(if settled { Some(()) } else { None })
+            let t = match tracker {
+                Some(ref mut t) => t,
+                None => {
+                    let mask = IgnoreMask::for_region(
+                        &params.ignore,
+                        region.as_ref(),
+                        frame.width,
+                        frame.height,
+                    )?;
+                    tracker.insert(StabilityTracker::with_mask(
+                        params.settle_frames,
+                        params.tolerance,
+                        mask,
+                    ))
+                }
+            };
+            Ok(if t.observe(frame)? { Some(()) } else { None })
         })?;
+        let tracker = tracker.expect("poll_until ticks at least once");
         let settled = outcome.value.is_some();
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
@@ -764,6 +779,49 @@ mod tests {
             log.lock().unwrap().len(),
             3,
             "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_ignore_is_window_relative_under_a_stability_region() {
+        // (3,3) blinks and is INSIDE the watched region, so the cropped frames
+        // differ every poll; only a window-relative rect translated into
+        // region-local space masks it.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1, f2])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: Some(Region {
+                    x: 2,
+                    y: 2,
+                    width: 2,
+                    height: 2,
+                }),
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            4,
+            "3 region polls + 1 final full capture"
         );
     }
 
