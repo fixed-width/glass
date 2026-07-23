@@ -16,4 +16,4 @@
 # sandbox level explicitly in the AppSpec.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e -- --ignored --test-threads=1 "$@"
+exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance -- --ignored --test-threads=1 "$@"
