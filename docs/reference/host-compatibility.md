@@ -26,6 +26,7 @@ loop — a tool call that returns text and one that returns an image — with th
 | Host | stdio | HTTP | Basis |
 |------|:-----:|:----:|-------|
 | [Claude Code](https://docs.claude.com/en/docs/claude-code) | ✅ | ✅ | Driven in day-to-day development; covered by the host-conformance tests |
+| Antigravity | ✅ | — | Driven end-to-end (v2.3.1): the agent listed the glass tools and a launch → screenshot → stop loop returned a screenshot |
 
 Registration for a host is in [Connect glass to your agent](../how-to/connect-an-agent.md).
 
