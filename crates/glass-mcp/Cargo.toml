@@ -42,6 +42,7 @@ futures = { version = "0.3", optional = true }
 glass-x11 = { path = "../glass-x11" }
 glass-wayland = { path = "../glass-wayland" }
 glass-a11y-linux = { path = "../glass-a11y-linux" }
+glass-dbus-linux = { path = "../glass-dbus-linux" }
 glass-sandbox-linux.workspace = true
 
 [target.'cfg(windows)'.dependencies]

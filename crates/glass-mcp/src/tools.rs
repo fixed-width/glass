@@ -128,6 +128,21 @@ fn resolve_a11y(arg: Option<bool>) -> bool {
     arg.unwrap_or(true)
 }
 
+/// Non-spawning preflight for the accessibility bus, so a best-effort (default-on) a11y
+/// launch can degrade to pixel-only on a host that can't provide it (e.g. AT-SPI not
+/// installed) instead of failing. Only the Linux backends spawn a private AT-SPI bus and
+/// read `spec.a11y`; on every other target the flag is a no-op, so the preflight is a
+/// no-op too. An explicit `a11y: true` skips this and still fails loudly if the bus can't
+/// start (no silent fallback).
+#[cfg(target_os = "linux")]
+fn a11y_bus_preflight() -> Result<(), String> {
+    glass_dbus_linux::available()
+}
+#[cfg(not(target_os = "linux"))]
+fn a11y_bus_preflight() -> Result<(), String> {
+    Ok(())
+}
+
 /// Read the operator floor env, distinguishing "unset" from "set-but-unreadable". A floor whose
 /// bytes are not valid UTF-8 must NOT be silently treated as unset — that would drop the operator's
 /// floor (fail-OPEN). It is an error, so the launch is refused until it's fixed (fail-closed),
@@ -158,7 +173,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         sandbox_env.as_deref(),
         floor_env.as_deref(),
     )?;
-    let spec = AppSpec {
+    let mut spec = AppSpec {
         build: a.build.clone(),
         run: a.run.clone(),
         cwd: a.cwd.clone().map(PathBuf::from),
@@ -171,6 +186,19 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         sandbox,
         a11y: resolve_a11y(a.a11y),
     };
+    // Best-effort default: a11y is on unless the caller opts out, but a host that can't bring
+    // up the accessibility bus must still launch and pixel-drive. When a11y is on only because
+    // it defaults on (not explicitly requested) and the bus can't start here, launch without
+    // it. An explicit a11y:true is left to fail loudly at the backend (no silent fallback).
+    if spec.a11y && a.a11y.is_none() {
+        if let Err(why) = a11y_bus_preflight() {
+            eprintln!(
+                "glass: accessibility is on by default but this host can't start its bus \
+                 ({why}); launching without it — pass a11y:true to require it."
+            );
+            spec.a11y = false;
+        }
+    }
     let geo = match a.backend.as_deref() {
         Some(b) => glass.start_on(b, &spec),
         None => glass.start(&spec),

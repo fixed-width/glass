@@ -241,6 +241,28 @@ fn find_launcher() -> Option<PathBuf> {
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
+/// Cheap, non-spawning preflight: are the binaries a private a11y bus needs resolvable on
+/// this host? Lets a caller decide whether a best-effort (default-on) a11y launch is worth
+/// attempting or should quietly fall back to pixel-only, without the cost and teardown churn
+/// of actually starting the bus. Not a guarantee [`PrivateBus::start`] will succeed — a
+/// resolvable binary can still fail to spawn — but it catches the common "AT-SPI not
+/// installed" and misconfigured-path cases.
+pub fn available() -> std::result::Result<(), String> {
+    if find_launcher().is_none() {
+        return Err(
+            "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
+                .into(),
+        );
+    }
+    // `tool_path` returns an explicit path (from GLASS_DBUS_DAEMON) or the bare "dbus-daemon"
+    // name resolved on PATH at spawn time. Only an explicit path can be checked here.
+    let dbus = glass_core::tool_path("GLASS_DBUS_DAEMON", "dbus-daemon");
+    if dbus.contains('/') && !std::path::Path::new(&dbus).is_file() {
+        return Err(format!("dbus-daemon not found at {dbus}"));
+    }
+    Ok(())
+}
+
 #[zbus::proxy(
     interface = "org.a11y.Bus",
     default_service = "org.a11y.Bus",
@@ -357,6 +379,28 @@ fn resolve_a11y_address(session_addr: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn available_errors_when_the_atspi_launcher_is_missing() {
+        // Point the launcher override at a nonexistent path so the check is deterministic
+        // regardless of whether at-spi2-core is installed on the test host. Restore on drop.
+        struct Guard(Option<std::ffi::OsString>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("GLASS_ATSPI_LAUNCHER", v),
+                    None => std::env::remove_var("GLASS_ATSPI_LAUNCHER"),
+                }
+            }
+        }
+        let _g = Guard(std::env::var_os("GLASS_ATSPI_LAUNCHER"));
+        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/nonexistent/glass-no-atspi");
+        let err = available().expect_err("missing launcher must report unavailable");
+        assert!(
+            err.contains("at-spi-bus-launcher"),
+            "actionable message: {err}"
+        );
+    }
 
     #[test]
     #[ignore = "spawns dbus-daemon + at-spi-bus-launcher; run explicitly"]
