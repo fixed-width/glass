@@ -115,6 +115,14 @@ impl PrivateBus {
         let mut atspi = match Command::new(&launcher)
             .env("DBUS_SESSION_BUS_ADDRESS", &session_bus_address)
             .env("XDG_RUNTIME_DIR", runtime_dir.path())
+            // at-spi-bus-launcher backs `org.a11y.Status` (IsEnabled/ScreenReaderEnabled) with
+            // GSettings, whose default backend persists through the `ca.desrt.dconf` D-Bus
+            // service. This bus has no `<servicedir>` (see the config above), so dconf can never
+            // be activated — a later `Set` on ScreenReaderEnabled would fail to persist and the
+            // property would silently stay at its default `false`, forever hiding
+            // accesskit-based apps' a11y trees. The in-memory backend needs no D-Bus service at
+            // all, so the setter in `advertise_screen_reader` actually takes.
+            .env("GSETTINGS_BACKEND", "memory")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -255,13 +263,38 @@ const A11Y_STATUS_IFACE: &str = "org.a11y.Status";
 /// prior behavior), so a failure here must not abort the launch. (`org.a11y.Status`'s typed
 /// proxy exposes getters only, so set the properties via the low-level `Proxy`.)
 async fn advertise_screen_reader(conn: &zbus::Connection) {
-    let Ok(status) =
-        zbus::Proxy::new(conn, A11Y_BUS_SERVICE, A11Y_BUS_PATH, A11Y_STATUS_IFACE).await
-    else {
-        return;
-    };
-    let _ = status.set_property("ScreenReaderEnabled", true).await;
-    let _ = status.set_property("IsEnabled", true).await;
+    let status =
+        match zbus::Proxy::new(conn, A11Y_BUS_SERVICE, A11Y_BUS_PATH, A11Y_STATUS_IFACE).await {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!(
+                    "glass: org.a11y.Status proxy failed, cannot advertise screen reader \
+                 (AccessKit-based apps like egui may not publish an a11y tree): {e}"
+                );
+                return;
+            }
+        };
+    if let Err(e) = status.set_property("ScreenReaderEnabled", true).await {
+        eprintln!("glass: set ScreenReaderEnabled failed: {e}");
+    }
+    if let Err(e) = status.set_property("IsEnabled", true).await {
+        eprintln!("glass: set IsEnabled failed: {e}");
+    }
+    match status.get_property::<bool>("ScreenReaderEnabled").await {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "glass: ScreenReaderEnabled did not persist after being set \
+                 (AccessKit-based apps like egui may not publish an a11y tree)"
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "glass: readback of ScreenReaderEnabled failed, cannot confirm the advert \
+                 stuck (AccessKit-based apps like egui may not publish an a11y tree): {e}"
+            );
+        }
+    }
 }
 
 fn resolve_a11y_address(session_addr: &str) -> Result<String> {

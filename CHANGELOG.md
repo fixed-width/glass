@@ -25,6 +25,17 @@ internal refactors, CI, or test-only changes.
   report the excluded count as `ignored_pixels` — so a mask that covers the whole compared area is
   visible rather than hidden behind a hollow `settled`/`matched` — and `changed_pct` is measured
   over the pixels that remain.
+- How-to: measure the verification-loop cost (semantic vs screenshot) —
+  [docs/how-to/verification-cost.md](docs/how-to/verification-cost.md).
+
+### Fixed
+- **Linux `a11y:true` now reaches AccessKit-based apps (egui/winit and other Rust GUI
+  toolkits).** The private accessibility bus glass spawns for `a11y:true` advertises a screen
+  reader by setting `org.a11y.Status.ScreenReaderEnabled`, the signal AccessKit-based apps gate
+  their accessibility-tree publication on. That setting previously failed to take effect (the
+  bus's GSettings backend tried to persist it via a D-Bus service glass's isolated bus doesn't
+  expose), so such apps stayed invisible to `glass_a11y_snapshot` and friends even though the
+  bus itself was reachable — GTK/Qt apps, which don't gate on the advertisement, were unaffected.
 
 ## [1.0.1] - 2026-07-21
 
