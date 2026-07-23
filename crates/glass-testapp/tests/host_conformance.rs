@@ -3,19 +3,24 @@
 //! consumes it. Each path asserts: `initialize` negotiates a protocol version,
 //! `tools/list` advertises the core loop tools, and a tool call returns a
 //! decodable non-blank IMAGE content block. Cross-transport parity of the tool
-//! set is asserted in `tool_sets_match_across_transports` (Task 3).
+//! set is asserted in `tool_sets_match_across_transports`.
 //!
 //! `#[ignore]d` (needs Xvfb + the testapp); run via `./scripts/test-x11.sh`.
+//! To run a single test, filter on its function-name substring, e.g.
+//! `./scripts/test-x11.sh stdio_host_can` (the bare file name `host_conformance`
+//! is not a test name and matches nothing).
 
 // The HTTP path needs one `unsafe { env::set_var }` for pre-spawn setup (mirrors
-// tests/network.rs's `// SAFETY:` note); opt out of the workspace `unsafe_code = "deny"`.
+// tests/network.rs); opt out of the workspace `unsafe_code = "deny"`.
 #![allow(unsafe_code)]
 
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use common::Xvfb;
@@ -28,14 +33,26 @@ use rmcp::{RoleClient, ServiceExt};
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 
+/// Wall-clock ceiling for a single stdio JSON-RPC response. Generous (the child
+/// replies in milliseconds); its job is to turn a hung child into a fast, legible
+/// failure instead of blocking the whole `--test-threads=1` X11 suite until CI's
+/// job timeout.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Path to the `glass-mcp` binary. `env!("CARGO_BIN_EXE_glass-mcp")` isn't usable here:
 /// Cargo only injects `CARGO_BIN_EXE_<name>` for binaries owned by the package the test
 /// itself belongs to, and this test lives in `glass-testapp`, not `glass-mcp`. Every
 /// workspace binary lands in the same Cargo output directory, so derive the path from the
 /// sibling `glass-testapp` binary Cargo *does* inject the var for.
 fn glass_mcp_path() -> std::path::PathBuf {
-    std::path::Path::new(TESTAPP)
-        .with_file_name(format!("glass-mcp{}", std::env::consts::EXE_SUFFIX))
+    let p = std::path::Path::new(TESTAPP)
+        .with_file_name(format!("glass-mcp{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        p.exists(),
+        "glass-mcp binary not found at {p:?}; build it first: \
+         cargo build -p glass-mcp --bin glass-mcp (scripts/test-x11.sh does this for you)"
+    );
+    p
 }
 
 /// The build → see → interact → debug loop tools every host must see. A subset;
@@ -96,27 +113,14 @@ fn send(stdin: &mut impl Write, msg: &serde_json::Value) {
     stdin.flush().unwrap();
 }
 
-fn read_response(reader: &mut impl BufRead, id: i64) -> serde_json::Value {
-    let mut line = String::new();
-    for _ in 0..1000 {
-        line.clear();
-        if reader.read_line(&mut line).unwrap() == 0 {
-            panic!("server closed stdout before responding to id {id}");
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
-                return v;
-            }
-        }
-    }
-    panic!("no response with id {id}");
-}
-
-/// A glass-mcp child driven over stdio with newline-delimited JSON-RPC.
+/// A glass-mcp child driven over stdio with newline-delimited JSON-RPC. A reader
+/// thread pumps stdout lines into a channel so responses can be awaited with a
+/// wall-clock timeout rather than a blocking read that could hang the suite.
 struct StdioServer {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    lines: Receiver<String>,
+    reader: Option<JoinHandle<()>>,
     next_id: i64,
 }
 
@@ -131,12 +135,56 @@ impl StdioServer {
             .spawn()
             .expect("spawn glass-mcp");
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut r = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break, // EOF (child gone) or read error: stop pumping.
+                    Ok(_) => {
+                        if tx.send(std::mem::take(&mut line)).is_err() {
+                            break; // receiver dropped; nothing left to read for.
+                        }
+                    }
+                }
+            }
+        });
         StdioServer {
             child,
             stdin,
-            stdout,
+            lines,
+            reader: Some(reader),
             next_id: 1,
+        }
+    }
+
+    /// Block until the JSON-RPC response with `id` arrives, skipping unrelated lines,
+    /// or panic after `READ_TIMEOUT` (or if the child closes stdout first).
+    fn read_response(&self, id: i64) -> serde_json::Value {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out after {READ_TIMEOUT:?} waiting for response id {id}");
+            }
+            match self.lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                        if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                            return v;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("timed out after {READ_TIMEOUT:?} waiting for response id {id}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("server closed stdout before responding to id {id}")
+                }
+            }
         }
     }
 
@@ -147,7 +195,7 @@ impl StdioServer {
             &mut self.stdin,
             &serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         );
-        read_response(&mut self.stdout, id)
+        self.read_response(id)
     }
 
     fn notify(&mut self, method: &str) {
@@ -176,17 +224,23 @@ impl StdioServer {
         let resp = self.request("tools/list", serde_json::json!({}));
         resp["result"]["tools"]
             .as_array()
-            .expect("tools array")
+            .unwrap_or_else(|| panic!("no tools array in tools/list response: {resp}"))
             .iter()
             .map(|t| t["name"].as_str().unwrap_or("").to_string())
             .collect()
     }
 
-    /// Call a tool; return its `result` object.
+    /// Call a tool; return its `result` object. Panics if the server replied with a
+    /// JSON-RPC top-level error (no `result`) — otherwise a protocol-level failure would
+    /// read as `Null` and silently pass an `isError` success check at the call site.
     fn call(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
         let resp = self.request(
             "tools/call",
             serde_json::json!({ "name": name, "arguments": arguments }),
+        );
+        assert!(
+            resp.get("result").is_some(),
+            "tools/call {name} failed at the JSON-RPC level: {resp}"
         );
         resp["result"].clone()
     }
@@ -195,7 +249,10 @@ impl StdioServer {
 impl Drop for StdioServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.wait(); // closes stdout, so the reader thread's read_line returns EOF.
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -231,9 +288,10 @@ fn stdio_host_can_initialize_list_tools_and_get_an_image() {
         Some(true),
         "glass_screenshot returned an error result: {shot}"
     );
-    let webp_b64 = shot["content"]
+    let content = shot["content"]
         .as_array()
-        .expect("content array")
+        .unwrap_or_else(|| panic!("no content array in glass_screenshot response: {shot}"));
+    let webp_b64 = content
         .iter()
         .find_map(|c| {
             if c["type"] == "image" {
@@ -244,6 +302,12 @@ fn stdio_host_can_initialize_list_tools_and_get_an_image() {
         })
         .expect("screenshot returned an image content block");
     assert_image_nonblank(webp_b64);
+    // The screenshot response is multi-block (image + a text envelope + an untrusted-content
+    // note); assert a text block survived the wire alongside the image.
+    assert!(
+        content.iter().any(|c| c["type"] == "text"),
+        "screenshot response carried no text block alongside the image: {shot}"
+    );
 
     let _ = srv.call("glass_stop", serde_json::json!({}));
 }
@@ -253,7 +317,9 @@ fn stdio_host_can_initialize_list_tools_and_get_an_image() {
 /// Boot an in-process glass-mcp HTTP server on an ephemeral loopback port bound to
 /// `display`, and return an initialized rmcp client. Mirrors tests/network.rs.
 async fn boot_http_client(display: &str) -> RunningService<RoleClient, ()> {
-    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    // SAFETY: no other thread reads or writes env vars concurrently here — this runs
+    // before any server task (or any code that could read GLASS_DISPLAY) is spawned,
+    // even though the test's tokio runtime is itself multi-threaded.
     unsafe { std::env::set_var("GLASS_DISPLAY", display) };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -278,26 +344,34 @@ async fn boot_http_client(display: &str) -> RunningService<RoleClient, ()> {
         .expect("initialize over http")
 }
 
+/// List the advertised tool names over the rmcp HTTP client.
+async fn http_tool_names(client: &RunningService<RoleClient, ()>) -> Vec<String> {
+    client
+        .list_all_tools()
+        .await
+        .expect("list_all_tools")
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Xvfb + the testapp; run via ./scripts/test-x11.sh"]
 async fn http_host_can_initialize_list_tools_and_get_an_image() {
     let xvfb = Xvfb::start();
     let client = boot_http_client(&xvfb.display).await;
 
-    // A successful `.serve().await` already means initialize negotiated; confirm the
-    // client holds the server's negotiated info.
+    // `boot_http_client` already `.expect`s a successful initialize; assert the negotiated
+    // protocol version is non-empty, matching the stdio path's rigor.
+    let info = client
+        .peer_info()
+        .expect("no negotiated server info over http");
     assert!(
-        client.peer_info().is_some(),
-        "no negotiated server info over http"
+        !info.protocol_version.as_str().is_empty(),
+        "http initialize did not negotiate a protocolVersion"
     );
 
-    let names: Vec<String> = client
-        .list_all_tools()
-        .await
-        .expect("list_all_tools")
-        .into_iter()
-        .map(|t| t.name.to_string())
-        .collect();
+    let names = http_tool_names(&client).await;
     assert_tool_surface(&names);
 
     let mut start_args = serde_json::Map::new();
@@ -329,6 +403,11 @@ async fn http_host_can_initialize_list_tools_and_get_an_image() {
         .find_map(|c| c.as_image().map(|img| img.data.clone()))
         .expect("screenshot returned image content");
     assert_image_nonblank(&webp_b64);
+    // Assert a text block survived alongside the image (see the stdio test for why).
+    assert!(
+        shot.content.iter().any(|c| c.as_text().is_some()),
+        "screenshot response carried no text block alongside the image: {shot:?}"
+    );
 
     client.cancel().await.ok();
 }
@@ -350,13 +429,7 @@ async fn tool_sets_match_across_transports() {
 
     // http listing, in-process.
     let client = boot_http_client(&xvfb.display).await;
-    let mut http_names: Vec<String> = client
-        .list_all_tools()
-        .await
-        .expect("list_all_tools")
-        .into_iter()
-        .map(|t| t.name.to_string())
-        .collect();
+    let mut http_names = http_tool_names(&client).await;
     client.cancel().await.ok();
 
     stdio_names.sort();

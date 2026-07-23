@@ -9,12 +9,14 @@ hosts have been verified end to end.
 A host can drive glass if it:
 
 - speaks MCP over **stdio** or **HTTP** (streamable) — glass serves both;
-- renders **image content blocks** — `glass_screenshot` and `glass_diff` return WebP images;
+- renders **image content blocks** — `glass_screenshot` always returns one, and tools like
+  `glass_diff` return one only when asked (`include_image: true`);
 - handles glass's tool set (~30 tools).
 
 These are exactly the capabilities the host-conformance tests exercise
 (`crates/glass-testapp/tests/host_conformance.rs`): on both transports they negotiate a protocol
-version, list the full tool set, and return a decodable screenshot image.
+version, list the tool set (compared for cross-transport parity), and return a decodable screenshot
+image.
 
 ## Verified hosts
 
