@@ -187,8 +187,10 @@ pub struct AppSpec {
     /// How aggressively to contain the launched process tree.
     pub sandbox: SandboxLevel,
     /// Spawn a private, isolated AT-SPI bus for this launch so the app publishes an
-    /// accessibility tree glass can read. Opt-in: when false, no a11y processes are
-    /// spawned and the a11y tools return a "relaunch with a11y:true" error.
+    /// accessibility tree glass can read. On by default at the tool boundary (the a11y
+    /// path is the low-token default); when false, no a11y processes are spawned and the
+    /// a11y tools return a "relaunch with a11y:true" error. Only affects Linux backends;
+    /// others read accessibility ambiently.
     pub a11y: bool,
 }
 

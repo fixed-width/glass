@@ -123,7 +123,7 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Build, launch, and locate a native GUI app; returns its window geometry. Choose a backend with the `backend` param (defaults to the host); pass `a11y` to enable the accessibility tools. Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to another process."
+        description = "Build, launch, and locate a native GUI app; returns its window geometry. Choose a backend with the `backend` param (defaults to the host). The accessibility tools are enabled by default; pass `a11y:false` to skip the accessibility bus for canvas/pixel-only apps. Optional `window_hint` ({ title?, class? }) picks the right window when several appear, or locates one the launched process hands off to another process."
     )]
     async fn glass_start(
         &self,

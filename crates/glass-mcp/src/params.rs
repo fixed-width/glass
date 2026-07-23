@@ -79,9 +79,11 @@ pub struct StartArgs {
     pub window_hint: Option<WindowHintArgs>,
     pub timeout_ms: Option<u64>,
     /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
-    /// `set_value` / `click_element` / `wait_for_element` work against this app. Opt-in
-    /// (default false) — only set when you need the accessibility tree; it spawns extra
-    /// processes. Linux only.
+    /// `set_value` / `click_element` / `wait_for_element` work against this app. **On by
+    /// default** — the accessibility path is the cheap, low-token way to drive a UI, so it
+    /// is available unless you opt out. Pass `false` to skip the bus for canvas/pixel-only
+    /// apps (it spawns extra processes). Effective on Linux only; other backends read
+    /// accessibility ambiently and ignore this flag.
     #[serde(default)]
     pub a11y: Option<bool>,
 }

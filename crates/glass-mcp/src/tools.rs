@@ -119,6 +119,15 @@ fn resolve_sandbox(
     }
 }
 
+/// Resolve the `a11y` launch flag. On by default: the accessibility path (semantic
+/// addressing, text-only verification) is glass's cheap, low-token default, so omitting
+/// the flag enables it rather than leaving it off. Pass `a11y: false` to skip spawning
+/// the accessibility bus for canvas/pixel-only work. (The flag only has effect on Linux,
+/// which spawns a private AT-SPI bus; other backends read accessibility ambiently.)
+fn resolve_a11y(arg: Option<bool>) -> bool {
+    arg.unwrap_or(true)
+}
+
 /// Read the operator floor env, distinguishing "unset" from "set-but-unreadable". A floor whose
 /// bytes are not valid UTF-8 must NOT be silently treated as unset — that would drop the operator's
 /// floor (fail-OPEN). It is an error, so the launch is refused until it's fixed (fail-closed),
@@ -160,7 +169,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         }),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
         sandbox,
-        a11y: a.a11y.unwrap_or(false),
+        a11y: resolve_a11y(a.a11y),
     };
     let geo = match a.backend.as_deref() {
         Some(b) => glass.start_on(b, &spec),
@@ -728,6 +737,14 @@ mod tests {
             timeout_ms: None,
             a11y: None,
         }
+    }
+
+    #[test]
+    fn a11y_defaults_on_when_omitted() {
+        // The a11y-first path is the low-token default, so an omitted flag enables it.
+        assert!(resolve_a11y(None), "omitted a11y must default on");
+        assert!(resolve_a11y(Some(true)));
+        assert!(!resolve_a11y(Some(false)), "explicit false opts out");
     }
 
     #[test]
