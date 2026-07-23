@@ -11,7 +11,10 @@ use common::Xvfb;
 use glass_core::{AppSpec, Platform, SandboxLevel, Stream};
 use glass_x11::X11Platform;
 
-const TASKS_DEMO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/tasks_demo.py");
+const TASKS_DEMO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/tasks-demo/tasks_demo.py"
+);
 
 /// Fail loudly if this host can't run the GTK4 demo (python3 + PyGObject + the GTK 4 typelib).
 /// A hard requirement, not a silent skip: CI installs the packages, and a green pass here must
