@@ -30,6 +30,13 @@ internal refactors, CI, or test-only changes.
 - Reference: host compatibility — which MCP hosts are verified against glass, and what glass needs
   from any host — [docs/reference/host-compatibility.md](docs/reference/host-compatibility.md).
 
+### Changed
+- **Server instructions lead with the low-token accessibility path.** The guidance an MCP host
+  shows the agent now presents semantic addressing (`glass_a11y_snapshot` → `glass_click_element` /
+  `glass_set_value`, text-only, no image tokens) as the default way to see and drive the UI, with
+  screenshots and pixel coordinates as the fallback for canvas/black-box apps — so an agent reaches
+  for the cheap path first. No tool behavior changed.
+
 ### Fixed
 - **Linux `a11y:true` now reaches AccessKit-based apps (egui/winit and other Rust GUI
   toolkits).** The private accessibility bus glass spawns for `a11y:true` advertises a screen
