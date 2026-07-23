@@ -104,40 +104,44 @@ glass_a11y_snapshot {}
 ```jsonc
 glass_click_element { "id": 3 }
 // → { "id": 3 }
-
-glass_wait_stable {}
-// → { "settled": false, "saw_motion": true, "observed_ms": 5197, "width": 1206, "height": 2622 }
 ```
 
 ## Verify — two ways
 
-Semantically, from text (no image tokens):
+Semantically, from text (no image tokens) — wait for the greeting to appear rather than snapshotting
+immediately, since a bare snapshot right after the tap can race the app's re-render:
 
 ```jsonc
-glass_a11y_snapshot {}
+glass_wait_for_element { "name": "Hello, Ada!" }
+// → { "matched": true, "elapsed_ms": 23 }
 ```
 
 ```
-#2 TextField "nameField" (48,1160 1110x102) [enabled,visible,editable]
-#3 Button "greetButton" (539,1334 128x61) [enabled,visible]
-#4 Label "Hello, Ada!" (450,1467 306x79) [enabled,visible]
+{"bounds":{"height":79,"width":306,"x":450,"y":1467},"id":4,"name":"Hello, Ada!","role":"Label","states":["enabled","visible"],"value":null}
 ```
 
-The label's name is now `Hello, Ada!` — confirmed as text, without decoding a single image.
+`glass_wait_for_element` settles and asserts in one call: it polls until an element named exactly
+`Hello, Ada!` exists, then returns it — matched here in 23ms — instead of a separate wait followed by
+a snapshot you have to read yourself.
 
 And visually, that the label region actually changed:
 
 ```jsonc
 glass_diff { "name": "before" }
-// → { "changed_pct": 0.20340706408023834, "changed_pixels": 6432, "total_pixels": 3162132,
-//     "bbox": { "x": 69, "y": 81, "width": 717, "height": 1459 }, "aa_ignored": 4097 }
+// → { "changed_pct": 0.2498314380645752, "changed_pixels": 7900, "total_pixels": 3162132,
+//     "bbox": { "x": 69, "y": 80, "width": 717, "height": 1460 }, "aa_ignored": 5377 }
 ```
 
-About 0.2% of the window's pixels changed, inside that bounding box — a real, measured change was
+About 0.25% of the window's pixels changed, inside that bounding box — a real, measured change was
 detected on top of the semantic check above.
 
 ## Tips
 
+- **Don't verify right after an input call.** `glass_type` and `glass_click_element` return as soon
+  as the input is injected, not once the app has finished re-rendering — checking state immediately
+  can race it. Wait for the outcome you expect instead: `glass_wait_for_element` (as used above)
+  polls until it appears, and `glass_set_value` takes `return: "settle"` to fold a settle into the
+  call itself (`glass_type` has no such option).
 - **Toggles:** if a control is a switch, drive it with a short swipe across its trailing edge rather
   than a tap.
 - **Multi-touch** gestures (`glass_gesture`) are not supported on the Simulator
