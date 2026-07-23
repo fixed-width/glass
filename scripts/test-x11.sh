@@ -16,4 +16,8 @@
 # sandbox level explicitly in the AppSpec.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# host_conformance spawns the glass-mcp *binary* as a stdio child. `cargo test -p glass-testapp`
+# builds glass-mcp only as a library dependency, not its binary, so build the binary explicitly
+# — otherwise the test can't find it in a clean checkout (e.g. CI, which runs only this script).
+cargo build -p glass-mcp --bin glass-mcp
 exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance -- --ignored --test-threads=1 "$@"
