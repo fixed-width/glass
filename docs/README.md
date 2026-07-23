@@ -33,6 +33,8 @@ way it does? The explanations.
 
 - [Build from source](how-to/build-from-source.md) — all platforms; macOS signing + LaunchAgent
 - [Benchmark and profile](how-to/benchmarking.md)
+- [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
+  screenshot-every-step, round-trips and tokens
 
 ## Reference — look up a fact
 
