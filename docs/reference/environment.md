@@ -40,6 +40,29 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 `default` and `strict` are fail-closed; the levels and per-OS mechanisms are explained in
 [explanation/containment.md](../explanation/containment.md).
 
+## Rendering under containment (Linux)
+
+When glass launches an app **under containment** (`sandbox` is not `off`) on Linux, it sets
+software-render environment defaults so GPU / shared-memory rendering paths the sandbox blocks
+don't leave the window black:
+
+| Variable | Value | Toolkit |
+|---|---|---|
+| `GSK_RENDERER` | `cairo` | GTK4 |
+| `QT_X11_NO_MITSHM` | `1` | Qt (X11 widgets) |
+| `QT_QUICK_BACKEND` | `software` | Qt Quick / QML |
+
+The sandbox isolates the SysV IPC namespace, so X11 MIT-SHM can't attach to glass's X server — and
+GTK4's GL renderer, even the software fallback it lands on without a GPU, needs MIT-SHM to present,
+so an unset default leaves the window black. These defaults select a renderer that presents without
+MIT-SHM; each is ignored by toolkits that don't read it. Unlike the `GLASS_*` variables elsewhere in
+this file, glass *sets* these for the launched app rather than reading them, so they don't appear in
+`glass-mcp env`.
+
+To override one — for example to force a GPU renderer against a display that has one — pass the
+variable explicitly in `glass_start`'s `env`; an explicit value always wins. `sandbox: off` launches
+receive none of these defaults.
+
 ## Build & input
 
 | Variable | Purpose | Default | Scope |

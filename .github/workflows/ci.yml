@@ -80,8 +80,9 @@ jobs:
         # bubblewrap: sandbox_* integration tests need unprivileged user namespaces.
         # Ubuntu 24.04 runners restrict them via AppArmor (bwrap then fails "setting up
         # uid map: Permission denied"), so re-enable them (no-op on images without the knob).
+        # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: ./scripts/test-x11.sh
 
@@ -242,8 +243,9 @@ jobs:
         # xvfb + bubblewrap so the X11 integration suite (incl. sandbox_*) runs under coverage.
         # Ubuntu 24.04 runners restrict unprivileged user namespaces via AppArmor; re-enable
         # them for bubblewrap (no-op on images without the knob).
+        # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Measure coverage (unit + X11; Wayland/AT-SPI self-skip)
         run: ./scripts/coverage.sh --lcov
