@@ -7,6 +7,10 @@
 //!
 //! `#[ignore]d` (needs Xvfb + the testapp); run via `./scripts/test-x11.sh`.
 
+// The HTTP path needs one `unsafe { env::set_var }` for pre-spawn setup (mirrors
+// tests/network.rs's `// SAFETY:` note); opt out of the workspace `unsafe_code = "deny"`.
+#![allow(unsafe_code)]
+
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +19,12 @@ use std::time::Duration;
 
 use base64::Engine;
 use common::Xvfb;
+use glass_mcp::serve::config::ServeConfig;
+use rmcp::model::CallToolRequestParams;
+use rmcp::service::RunningService;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::{RoleClient, ServiceExt};
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 
@@ -236,4 +246,89 @@ fn stdio_host_can_initialize_list_tools_and_get_an_image() {
     assert_image_nonblank(webp_b64);
 
     let _ = srv.call("glass_stop", serde_json::json!({}));
+}
+
+// ---- streamable HTTP (what an rmcp-based host does) ----
+
+/// Boot an in-process glass-mcp HTTP server on an ephemeral loopback port bound to
+/// `display`, and return an initialized rmcp client. Mirrors tests/network.rs.
+async fn boot_http_client(display: &str) -> RunningService<RoleClient, ()> {
+    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    unsafe { std::env::set_var("GLASS_DISPLAY", display) };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let glass = glass_mcp::boot(None);
+    let report = glass_mcp::audit::report_from_config(None, |_| None);
+    tokio::spawn(async move {
+        let cfg = ServeConfig {
+            addr,
+            token: Some("conf".into()),
+        };
+        let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
+    });
+    // Give the listener a beat to start accepting.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // `auth_header` takes the BARE token; the reqwest transport prepends `Bearer `.
+    let mut tcfg = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/"));
+    tcfg = tcfg.auth_header("conf".to_string());
+    ().serve(StreamableHttpClientTransport::from_config(tcfg))
+        .await
+        .expect("initialize over http")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Xvfb + the testapp; run via ./scripts/test-x11.sh"]
+async fn http_host_can_initialize_list_tools_and_get_an_image() {
+    let xvfb = Xvfb::start();
+    let client = boot_http_client(&xvfb.display).await;
+
+    // A successful `.serve().await` already means initialize negotiated; confirm the
+    // client holds the server's negotiated info.
+    assert!(
+        client.peer_info().is_some(),
+        "no negotiated server info over http"
+    );
+
+    let names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .expect("list_all_tools")
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_tool_surface(&names);
+
+    let mut start_args = serde_json::Map::new();
+    start_args.insert("run".to_string(), serde_json::json!([TESTAPP]));
+    let start = client
+        .call_tool(CallToolRequestParams::new("glass_start").with_arguments(start_args))
+        .await
+        .expect("glass_start call");
+    assert_ne!(
+        start.is_error,
+        Some(true),
+        "glass_start returned an error result: {start:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let shot = client
+        .call_tool(CallToolRequestParams::new("glass_screenshot"))
+        .await
+        .expect("glass_screenshot call");
+    assert_ne!(
+        shot.is_error,
+        Some(true),
+        "glass_screenshot returned an error result: {shot:?}"
+    );
+    let webp_b64 = shot
+        .content
+        .iter()
+        .find_map(|c| c.as_image().map(|img| img.data.clone()))
+        .expect("screenshot returned image content");
+    assert_image_nonblank(&webp_b64);
+
+    client.cancel().await.ok();
 }
