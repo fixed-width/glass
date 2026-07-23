@@ -6,7 +6,7 @@ use thiserror::Error;
 /// agent. Backend crates fold their OS-specific failures into `Backend`.
 #[derive(Debug, Error)]
 pub enum GlassError {
-    #[error("no active session")]
+    #[error("no active session — call glass_start to launch an app first")]
     NoActiveSession,
 
     #[error("app failed to start: {0}")]
@@ -63,7 +63,10 @@ pub enum GlassError {
     #[error("image codec error: {0}")]
     ImageCodec(String),
 
-    #[error("accessibility is not supported by this backend")]
+    #[error(
+        "accessibility is not supported by this backend — see the app with glass_screenshot \
+         and drive it by pixel coordinates (glass_click) instead"
+    )]
     AxUnsupported,
 
     #[error("no accessibility snapshot yet; call glass_a11y_snapshot first")]
@@ -72,7 +75,11 @@ pub enum GlassError {
     #[error("element #{0} is not in the current snapshot; re-snapshot")]
     AxElementNotFound(u32),
 
-    #[error("element #{0} has no clickable on-screen geometry")]
+    #[error(
+        "element #{0} has no clickable on-screen geometry — it's off-screen or its a11y node \
+         reports no bounds; bring it into view with glass_scroll_to_element (re-snapshots), then \
+         retry, or locate it with glass_screenshot and click by coordinate"
+    )]
     AxElementNotClickable(u32),
 
     #[error("element #{0} is not editable via the accessibility API (its a11y projection exposes no writable value — a common toolkit gap even when the element accepts typed input); focus it with glass_click, then enter text with glass_type / glass_key instead")]
@@ -163,7 +170,10 @@ mod tests {
 
     #[test]
     fn display_messages_are_actionable() {
-        assert_eq!(GlassError::NoActiveSession.to_string(), "no active session");
+        assert_eq!(
+            GlassError::NoActiveSession.to_string(),
+            "no active session — call glass_start to launch an app first"
+        );
         assert_eq!(
             GlassError::CoordOutOfBounds {
                 x: 5,
@@ -195,7 +205,7 @@ mod tests {
     fn a11y_messages_are_actionable() {
         assert_eq!(
             GlassError::AxUnsupported.to_string(),
-            "accessibility is not supported by this backend"
+            "accessibility is not supported by this backend — see the app with glass_screenshot and drive it by pixel coordinates (glass_click) instead"
         );
         assert_eq!(
             GlassError::NoAxSnapshot.to_string(),
@@ -207,7 +217,7 @@ mod tests {
         );
         assert_eq!(
             GlassError::AxElementNotClickable(3).to_string(),
-            "element #3 has no clickable on-screen geometry"
+            "element #3 has no clickable on-screen geometry — it's off-screen or its a11y node reports no bounds; bring it into view with glass_scroll_to_element (re-snapshots), then retry, or locate it with glass_screenshot and click by coordinate"
         );
         assert_eq!(
             GlassError::AxElementNotEditable(5).to_string(),
