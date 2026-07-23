@@ -34,8 +34,10 @@ internal refactors, CI, or test-only changes.
 - **Accessibility is on by default at launch.** `glass_start` now enables the accessibility tools
   without an explicit `a11y: true` — the semantic path (address elements by `#id`, verify from text,
   no image tokens) works out of the box, matching how glass is meant to be driven. Pass `a11y: false`
-  to skip spawning the private accessibility bus for canvas/pixel-only apps. Linux only in effect;
-  other backends already read accessibility ambiently.
+  to skip spawning the private accessibility bus for canvas/pixel-only apps. On a Linux host that
+  can't start an accessibility bus (e.g. `at-spi2-core` isn't installed), the default quietly falls
+  back to pixel-only rather than failing the launch; an explicit `a11y: true` still fails loudly.
+  Linux only in effect; other backends already read accessibility ambiently.
 - **Server instructions lead with the low-token accessibility path.** The guidance an MCP host
   shows the agent now presents semantic addressing (`glass_a11y_snapshot` → `glass_click_element` /
   `glass_set_value`, text-only, no image tokens) as the default way to see and drive the UI, with
