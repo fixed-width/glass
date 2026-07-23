@@ -94,10 +94,10 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
         // path resolves inside bwrap too. Keeps a11y resolution isolated AND on a live bus.
         cmd.env("XDG_RUNTIME_DIR", dir);
     }
-    // Under containment, force GPU/MIT-SHM-dependent toolkits (GTK4, Qt) onto a software present
-    // path so they render on the headless display instead of black (see
-    // glass_sandbox_linux::software_render_env). Applied before spec.env so an explicit override
-    // still wins.
+    // Under containment, X11 MIT-SHM can't attach to glass's out-of-sandbox X server (bwrap's
+    // --unshare-ipc), so GTK4/Qt's default present paths paint black on the headless display; force
+    // a non-SHM renderer instead (see glass_sandbox_linux::software_render_env). Applied before
+    // spec.env so an explicit override still wins.
     for (k, v) in glass_sandbox_linux::software_render_env(spec) {
         cmd.env(k, v);
     }
@@ -199,6 +199,49 @@ mod tests {
             .last()
             .and_then(|(_, v)| v);
         assert_eq!(addr, Some(OsStr::new("unix:path=/tmp/override")));
+    }
+
+    /// Effective value of `key` in the built command (last `.env()` wins).
+    fn env_of<'a>(cmd: &'a std::process::Command, key: &str) -> Option<&'a OsStr> {
+        cmd.get_envs()
+            .filter(|(k, _)| *k == OsStr::new(key))
+            .last()
+            .and_then(|(_, v)| v)
+    }
+
+    #[test]
+    fn build_command_injects_software_render_defaults_under_sandbox() {
+        let mut s = spec(&["app"]);
+        s.sandbox = glass_core::SandboxLevel::Default;
+        let cmd = build_command(&s, ":99", None);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER"), Some(OsStr::new("cairo")));
+        assert_eq!(env_of(&cmd, "QT_X11_NO_MITSHM"), Some(OsStr::new("1")));
+        assert_eq!(
+            env_of(&cmd, "QT_QUICK_BACKEND"),
+            Some(OsStr::new("software"))
+        );
+    }
+
+    #[test]
+    fn build_command_omits_software_render_defaults_when_sandbox_off() {
+        let s = spec(&["app"]); // sandbox: Off
+        let cmd = build_command(&s, ":99", None);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER"), None);
+        assert_eq!(env_of(&cmd, "QT_X11_NO_MITSHM"), None);
+    }
+
+    #[test]
+    fn build_command_lets_spec_env_override_software_render_default() {
+        let mut s = spec(&["app"]);
+        s.sandbox = glass_core::SandboxLevel::Default;
+        s.env = vec![("GSK_RENDERER".into(), "gl".into())];
+        let cmd = build_command(&s, ":99", None);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER"), Some(OsStr::new("gl")));
+        // The other defaults are still injected.
+        assert_eq!(
+            env_of(&cmd, "QT_QUICK_BACKEND"),
+            Some(OsStr::new("software"))
+        );
     }
 
     #[test]

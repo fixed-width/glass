@@ -41,7 +41,7 @@ internal refactors, CI, or test-only changes.
 - **GTK4/Qt apps render under containment on the headless Linux display instead of black.** When
   glass launches an app in its sandbox on Linux, it now sets software-render env defaults
   (`GSK_RENDERER=cairo`, `QT_X11_NO_MITSHM=1`, `QT_QUICK_BACKEND=software`) so the GPU/shared-memory
-  rendering paths the sandbox blocks don't leave the window black. Pass the variable in
+  rendering paths the sandbox blocks don't leave the window black. Pass the relevant variable in
   `glass_start`'s `env` to override.
 
 ## [1.0.1] - 2026-07-21

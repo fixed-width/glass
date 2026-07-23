@@ -14,6 +14,11 @@
 # The GLASS_SANDBOX env var controls containment for glass-mcp-launched apps generally
 # (off / default / strict); it has no effect on integration tests, which set their
 # sandbox level explicitly in the AppSpec.
+#
+# NOTE: the software_render tests (gtk4_app_renders_under_default_sandbox,
+# gtk4_gl_renderer_stays_black_under_sandbox) require 'python3-gi' + 'gir1.2-gtk-4.0'
+# (they drive a real GTK4 app) and fail loudly if absent — install them, or run a subset
+# with a filter (e.g. ./scripts/test-x11.sh network_screenshot_over_http) to skip them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # host_conformance spawns the glass-mcp *binary* as a stdio child. `cargo test -p glass-testapp`

@@ -154,9 +154,12 @@ pub fn build_sway_command(
         // exec's bwrap inherits it too (no --clearenv). spec.env below still overrides.
         cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
     }
-    // Under containment, force GPU/MIT-SHM-dependent toolkits (GTK4, Qt) onto a software present
-    // path (sway itself already gets WLR_RENDERER_ALLOW_SOFTWARE above). Applied before spec.env
-    // so an explicit override still wins.
+    // Apply the same software-render defaults as X11, for consistency and as a safe default under
+    // the headless compositor (which already software-renders via WLR_RENDERER_ALLOW_SOFTWARE
+    // above). A native-Wayland client presents via wl_shm/memfd rather than X11 MIT-SHM, so the
+    // X11 black-frame cause may not apply here — these are harmless when unneeded and still cover an
+    // app routed through Xwayland. Set on sway's env, forwarded to the exec'd app like the DBUS
+    // address above; applied before spec.env so an explicit override still wins.
     for (k, v) in glass_sandbox_linux::software_render_env(spec) {
         cmd.env(k, v);
     }
@@ -313,6 +316,57 @@ mod tests {
         assert_eq!(
             dbus.as_deref(),
             Some("unix:path=/tmp/glass-a11y/session-bus")
+        );
+    }
+
+    /// Effective value of `key` in the built command.
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn sway_cmd(s: &AppSpec) -> Command {
+        build_sway_command(
+            std::path::Path::new("/usr/bin/sway"),
+            std::path::Path::new("/tmp/cfg"),
+            s,
+            std::path::Path::new("/run/glass-rt"),
+            None,
+        )
+    }
+
+    #[test]
+    fn build_sway_command_injects_software_render_defaults_under_sandbox() {
+        let mut s = spec(&["app"]);
+        s.sandbox = glass_core::SandboxLevel::Default;
+        let cmd = sway_cmd(&s);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER").as_deref(), Some("cairo"));
+        assert_eq!(env_of(&cmd, "QT_X11_NO_MITSHM").as_deref(), Some("1"));
+        assert_eq!(
+            env_of(&cmd, "QT_QUICK_BACKEND").as_deref(),
+            Some("software")
+        );
+    }
+
+    #[test]
+    fn build_sway_command_omits_software_render_defaults_when_sandbox_off() {
+        let s = spec(&["app"]); // sandbox: Off
+        let cmd = sway_cmd(&s);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER"), None);
+    }
+
+    #[test]
+    fn build_sway_command_lets_spec_env_override_software_render_default() {
+        let mut s = spec(&["app"]);
+        s.sandbox = glass_core::SandboxLevel::Default;
+        s.env = vec![("GSK_RENDERER".into(), "gl".into())];
+        let cmd = sway_cmd(&s);
+        assert_eq!(env_of(&cmd, "GSK_RENDERER").as_deref(), Some("gl"));
+        assert_eq!(
+            env_of(&cmd, "QT_QUICK_BACKEND").as_deref(),
+            Some("software")
         );
     }
 

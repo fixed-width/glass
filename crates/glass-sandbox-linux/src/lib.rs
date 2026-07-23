@@ -14,12 +14,14 @@ use std::process::Command;
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
 use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
 
-/// App-level environment that forces GPU/MIT-SHM-dependent GUI toolkits onto a software,
-/// non-shared-memory present path. glass's containment breaks accelerated rendering on the
-/// headless display: `wrap_argv` passes `--unshare-ipc` (so X11 MIT-SHM cannot attach to the
-/// out-of-sandbox X server) and `--dev /dev` (no `/dev/dri`, so DRI3/GPU access fails). Under
-/// that, GTK4's GL renderer paints a black window. These vars select the CPU path instead; each
-/// is a no-op for a toolkit that does not read it.
+/// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
+/// containment breaks shared-memory rendering on the headless display: `wrap_argv` passes
+/// `--unshare-ipc`, which isolates the SysV IPC namespace so MIT-SHM can't attach to the
+/// out-of-sandbox X server. That is the operative cause — GTK4's GL renderer, and even the Mesa
+/// software (llvmpipe) path it falls back to once `--dev /dev` also withholds `/dev/dri`, both need
+/// MIT-SHM to present, so the window stays black. These vars pick a renderer that presents via
+/// plain X instead (GTK4's cairo renderer; Qt's non-SHM / software paths); each is a no-op for a
+/// toolkit that does not read it.
 pub const SOFTWARE_RENDER_ENV: &[(&str, &str)] = &[
     ("GSK_RENDERER", "cairo"),        // GTK4
     ("QT_X11_NO_MITSHM", "1"),        // Qt (X11 widgets)
@@ -1064,5 +1066,26 @@ mod tests {
             got,
             vec![("QT_X11_NO_MITSHM", "1"), ("QT_QUICK_BACKEND", "software")]
         );
+    }
+
+    #[test]
+    fn multiple_user_overrides_are_all_excluded() {
+        let got = software_render_env(&spec_with(
+            SandboxLevel::Default,
+            vec![
+                ("GSK_RENDERER".into(), "gl".into()),
+                ("QT_QUICK_BACKEND".into(), "hardware".into()),
+            ],
+        ));
+        assert_eq!(got, vec![("QT_X11_NO_MITSHM", "1")]);
+    }
+
+    #[test]
+    fn unrelated_user_env_key_filters_nothing() {
+        let got = software_render_env(&spec_with(
+            SandboxLevel::Default,
+            vec![("FOO".into(), "bar".into())],
+        ));
+        assert_eq!(got, SOFTWARE_RENDER_ENV.to_vec());
     }
 }
