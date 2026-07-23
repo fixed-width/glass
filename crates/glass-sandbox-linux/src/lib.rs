@@ -14,6 +14,32 @@ use std::process::Command;
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
 use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
 
+/// App-level environment that forces GPU/MIT-SHM-dependent GUI toolkits onto a software,
+/// non-shared-memory present path. glass's containment breaks accelerated rendering on the
+/// headless display: `wrap_argv` passes `--unshare-ipc` (so X11 MIT-SHM cannot attach to the
+/// out-of-sandbox X server) and `--dev /dev` (no `/dev/dri`, so DRI3/GPU access fails). Under
+/// that, GTK4's GL renderer paints a black window. These vars select the CPU path instead; each
+/// is a no-op for a toolkit that does not read it.
+pub const SOFTWARE_RENDER_ENV: &[(&str, &str)] = &[
+    ("GSK_RENDERER", "cairo"),        // GTK4
+    ("QT_X11_NO_MITSHM", "1"),        // Qt (X11 widgets)
+    ("QT_QUICK_BACKEND", "software"), // Qt Quick / QML
+];
+
+/// The [`SOFTWARE_RENDER_ENV`] defaults to inject for a launch: the full set for a contained
+/// launch, minus any key the user already set in `spec.env` (an explicit override always wins);
+/// empty for `sandbox: off` (the app keeps full GPU/SHM access and may legitimately want GL).
+pub fn software_render_env(spec: &AppSpec) -> Vec<(&'static str, &'static str)> {
+    if spec.sandbox == SandboxLevel::Off {
+        return Vec::new();
+    }
+    SOFTWARE_RENDER_ENV
+        .iter()
+        .copied()
+        .filter(|(k, _)| !spec.env.iter().any(|(user_key, _)| user_key.as_str() == *k))
+        .collect()
+}
+
 /// The bubblewrap binary glass invokes: `$GLASS_BWRAP`, else `bwrap` (on `PATH`).
 fn bwrap_bin() -> String {
     glass_core::tool_path("GLASS_BWRAP", "bwrap")
@@ -993,6 +1019,50 @@ mod tests {
         assert!(
             run_build(&make_spec(Some("false"), SandboxLevel::Default)).is_err(),
             "failing build → Err"
+        );
+    }
+
+    fn spec_with(sandbox: SandboxLevel, env: Vec<(String, String)>) -> AppSpec {
+        AppSpec {
+            build: None,
+            run: vec!["app".into()],
+            cwd: None,
+            env,
+            window_hint: None,
+            timeout_ms: 1000,
+            sandbox,
+            a11y: false,
+        }
+    }
+
+    #[test]
+    fn software_render_env_is_empty_when_sandbox_off() {
+        assert!(software_render_env(&spec_with(SandboxLevel::Off, vec![])).is_empty());
+    }
+
+    #[test]
+    fn software_render_env_injects_all_defaults_when_contained() {
+        assert_eq!(
+            software_render_env(&spec_with(SandboxLevel::Default, vec![])),
+            SOFTWARE_RENDER_ENV.to_vec()
+        );
+        // Strict is also a contained level.
+        assert_eq!(
+            software_render_env(&spec_with(SandboxLevel::Strict, vec![])),
+            SOFTWARE_RENDER_ENV.to_vec()
+        );
+    }
+
+    #[test]
+    fn user_env_overrides_the_matching_default() {
+        let got = software_render_env(&spec_with(
+            SandboxLevel::Default,
+            vec![("GSK_RENDERER".into(), "gl".into())],
+        ));
+        // GSK_RENDERER omitted (user set it); the Qt defaults remain.
+        assert_eq!(
+            got,
+            vec![("QT_X11_NO_MITSHM", "1"), ("QT_QUICK_BACKEND", "software")]
         );
     }
 }
