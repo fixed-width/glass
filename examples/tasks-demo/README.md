@@ -16,7 +16,7 @@ Requires Python 3 with GTK 4 introspection:
 sudo apt install python3-gi gir1.2-gtk-4.0
 ```
 
-[Connect glass to your agent](../docs/how-to/connect-an-agent.md), then paste:
+[Connect glass to your agent](../../docs/how-to/connect-an-agent.md), then paste:
 
 > Use glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
 > **Add** doesn't add the typed task. Reproduce it by driving the UI and checking the
