@@ -1,5 +1,5 @@
 use crate::error::{GlassError, Result};
-use crate::frame::Frame;
+use crate::frame::{Frame, Region};
 use std::simd::cmp::{SimdOrd, SimdPartialOrd};
 use std::simd::{u8x32, Simd};
 
@@ -23,6 +23,149 @@ pub struct DiffResult {
     /// Pixels that differed but were suppressed as anti-aliasing by the perceptual
     /// diff (always 0 for the exact diff). Surfaces how much was filtered.
     pub aa_ignored: u64,
+    /// Pixels excluded from the comparison by an [`IgnoreMask`], counting
+    /// overlapping rects once. `changed_pct` is measured over the remaining
+    /// (considered) pixels.
+    pub ignored_pixels: u64,
+}
+
+/// Rectangles excluded from a comparison, precomputed into merged per-row
+/// column spans. Built once per diff; the rect list is small in practice, so
+/// per-row spans are cheaper than a per-pixel bitmap over the whole frame.
+///
+/// Spans are half-open `[start, end)`, sorted, and non-overlapping — merging is
+/// what makes overlapping rects count once in [`ignored_count`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IgnoreMask {
+    rows: Vec<Vec<(u32, u32)>>,
+    ignored: u64,
+}
+
+impl IgnoreMask {
+    /// A mask that excludes nothing.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Reject a zero-area rect up front: it can never mask anything, so it is a
+    /// caller bug worth naming rather than silently dropping. Shared by [`new`]
+    /// and [`for_region`] so both entry points validate identically.
+    ///
+    /// [`new`]: Self::new
+    /// [`for_region`]: Self::for_region
+    fn ensure_no_zero_area(rects: &[Region]) -> Result<()> {
+        for r in rects {
+            if r.width == 0 || r.height == 0 {
+                return Err(GlassError::InvalidRegion(format!(
+                    "ignore rect has zero area: {}x{} at ({},{})",
+                    r.width, r.height, r.x, r.y
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a mask over a `width`×`height` area. Rects are clamped to that area;
+    /// a rect entirely outside contributes nothing (its mistake shows up as a zero
+    /// `ignored_count`, not an error). A zero-area rect is a caller bug and errors.
+    pub fn new(rects: &[Region], width: u32, height: u32) -> Result<Self> {
+        Self::ensure_no_zero_area(rects)?;
+        if rects.is_empty() || width == 0 || height == 0 {
+            return Ok(Self::default());
+        }
+
+        let mut rows: Vec<Vec<(u32, u32)>> = vec![Vec::new(); height as usize];
+        for r in rects {
+            let x0 = r.x.min(width);
+            let y0 = r.y.min(height);
+            let x1 = r.x.saturating_add(r.width).min(width);
+            let y1 = r.y.saturating_add(r.height).min(height);
+            if x0 >= x1 || y0 >= y1 {
+                continue; // fully outside the frame
+            }
+            for row in rows.iter_mut().take(y1 as usize).skip(y0 as usize) {
+                row.push((x0, x1));
+            }
+        }
+
+        let mut ignored = 0u64;
+        for spans in &mut rows {
+            spans.sort_unstable();
+            let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+            for &(s, e) in spans.iter() {
+                match merged.last_mut() {
+                    // `s <= last.1` merges touching spans too, not just overlapping.
+                    Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                    _ => merged.push((s, e)),
+                }
+            }
+            ignored += merged.iter().map(|&(s, e)| u64::from(e - s)).sum::<u64>();
+            *spans = merged;
+        }
+
+        if ignored == 0 {
+            // Every rect fell outside the area, so this masks nothing. Collapse to
+            // the canonical empty mask rather than keeping a rows-of-empty-spans
+            // representation, so an all-out-of-bounds list compares `Eq` with
+            // `empty()` — both exclude exactly nothing.
+            return Ok(Self::default());
+        }
+        Ok(Self { rows, ignored })
+    }
+
+    /// Build a mask for a comparison scoped to `region`: each rect is intersected
+    /// with the region and translated into region-local coordinates, so callers
+    /// always pass window-relative rects regardless of scoping. The mask is sized
+    /// from the region — the space the scoped comparison runs in. A zero-area rect
+    /// is rejected up front, before intersecting, so region-scoping can't launder
+    /// it into a silent drop.
+    pub fn for_region(rects: &[Region], region: &Region) -> Result<Self> {
+        Self::ensure_no_zero_area(rects)?;
+        let local: Vec<Region> = rects
+            .iter()
+            .filter_map(|r| r.intersect(region))
+            .map(|i| Region {
+                x: i.x - region.x,
+                y: i.y - region.y,
+                width: i.width,
+                height: i.height,
+            })
+            .collect();
+        Self::new(&local, region.width, region.height)
+    }
+
+    /// True when nothing is excluded — lets callers take the unmasked fast path.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.ignored == 0
+    }
+
+    /// Total excluded pixels, counting overlaps once.
+    #[inline]
+    pub fn ignored_count(&self) -> u64 {
+        self.ignored
+    }
+
+    /// Merged, sorted excluded column spans for row `y`.
+    #[inline]
+    pub fn spans_for_row(&self, y: u32) -> &[(u32, u32)] {
+        self.rows.get(y as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// True when column `x` of row `y` is excluded.
+    #[inline]
+    pub fn is_ignored(&self, x: u32, y: u32) -> bool {
+        self.spans_for_row(y).iter().any(|&(s, e)| x >= s && x < e)
+    }
+
+    /// True when the half-open column run `[x0, x1)` of row `y` is *entirely*
+    /// excluded — the whole-SIMD-chunk skip test.
+    #[inline]
+    pub fn covers_span(&self, y: u32, x0: u32, x1: u32) -> bool {
+        self.spans_for_row(y)
+            .iter()
+            .any(|&(s, e)| s <= x0 && x1 <= e)
+    }
 }
 
 /// Direction of a region wait: diverge from a reference, or converge to it.
@@ -62,6 +205,23 @@ fn pixel_changed(ra: &[u8], rb: &[u8], off: usize, tolerance: u8) -> bool {
 /// Compare two same-size frames. A pixel counts as changed when the maximum
 /// per-channel absolute difference exceeds `tolerance`.
 pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
+    diff_with_mask(a, b, tolerance, &IgnoreMask::empty())
+}
+
+/// Like [`diff`], but pixels covered by `mask` are excluded: they never count as
+/// changed, never extend the bbox, and are removed from the `changed_pct`
+/// denominator. The mask never mutates pixel data.
+///
+/// The `mask` must be built for `a`'s dimensions. A mask sized for a different
+/// frame silently miscompares — it masks the wrong columns/rows and can subtract
+/// more than the frame holds; the internal `.min(total)` clamp only keeps the
+/// arithmetic sound, not the result meaningful.
+pub fn diff_with_mask(
+    a: &Frame,
+    b: &Frame,
+    tolerance: u8,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -77,17 +237,28 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
         let base = y as usize * row_bytes;
         let ra = &a.pixels[base..base + row_bytes];
         let rb = &b.pixels[base..base + row_bytes];
+        let masked_row = !mask.spans_for_row(y).is_empty();
         let mut off = 0usize;
         let mut col = 0u32;
         // SIMD over full 32-byte (8-pixel) chunks: skip chunks with no change.
         while off + LANES <= row_bytes {
+            let chunk_end = col + (LANES / 4) as u32;
+            // Whole-chunk skip: the cheap win when a mask is large.
+            if masked_row && mask.covers_span(y, col, chunk_end) {
+                off += LANES;
+                col = chunk_end;
+                continue;
+            }
             let va = u8x32::from_slice(&ra[off..off + LANES]);
             let vb = u8x32::from_slice(&rb[off..off + LANES]);
             let d = va.simd_max(vb) - va.simd_min(vb);
             if d.simd_gt(tol_vec).any() {
                 for px in 0..(LANES / 4) {
+                    let cx = col + px as u32;
+                    if masked_row && mask.is_ignored(cx, y) {
+                        continue;
+                    }
                     if pixel_changed(ra, rb, off + px * 4, tolerance) {
-                        let cx = col + px as u32;
                         changed += 1;
                         min_x = min_x.min(cx);
                         min_y = min_y.min(y);
@@ -97,11 +268,11 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
                 }
             }
             off += LANES;
-            col += (LANES / 4) as u32;
+            col = chunk_end;
         }
         // Scalar tail (< 8 pixels left in the row).
         while off < row_bytes {
-            if pixel_changed(ra, rb, off, tolerance) {
+            if !(masked_row && mask.is_ignored(col, y)) && pixel_changed(ra, rb, off, tolerance) {
                 changed += 1;
                 min_x = min_x.min(col);
                 min_y = min_y.min(y);
@@ -114,24 +285,31 @@ pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
     }
 
     let total = a.pixel_count();
+    let ignored = mask.ignored_count().min(total);
     let bbox = (changed > 0).then(|| BBox {
         x: min_x,
         y: min_y,
         width: max_x - min_x + 1,
         height: max_y - min_y + 1,
     });
-    let changed_pct = if total > 0 {
-        (changed as f64 / total as f64 * 100.0) as f32
-    } else {
-        0.0
-    };
     Ok(DiffResult {
         changed_pixels: changed,
         total_pixels: total,
-        changed_pct,
+        changed_pct: pct(changed, total - ignored),
         bbox,
         aa_ignored: 0,
+        ignored_pixels: ignored,
     })
+}
+
+/// `changed` as a percentage of `considered`; 0.0 when nothing was considered.
+#[inline]
+fn pct(changed: u64, considered: u64) -> f32 {
+    if considered > 0 {
+        (changed as f64 / considered as f64 * 100.0) as f32
+    } else {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,11 +477,29 @@ fn classify(a: &[u8], b: &[u8], x: u32, y: u32, w: u32, h: u32, max_delta: f32) 
     }
 }
 
-/// Compare two same-size frames perceptually. `threshold` ∈ [0,1] sets sensitivity
-/// (smaller = stricter; ~0.1 is a sensible default). A pixel counts as changed only
-/// when its perceptual delta exceeds the threshold **and** it isn't anti-aliasing in
-/// either frame; suppressed anti-alias pixels are reported in `aa_ignored`.
+/// Compare two same-size frames perceptually. See [`diff_perceptual_with_mask`];
+/// pixels covered by `mask` are excluded exactly as in [`diff_with_mask`].
 pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResult> {
+    diff_perceptual_with_mask(a, b, threshold, &IgnoreMask::empty())
+}
+
+/// Like [`diff_perceptual`], but pixels covered by `mask` are excluded: they never
+/// count as changed or anti-aliased, never extend the bbox, and are removed from the
+/// `changed_pct` denominator. Neighbour reads for anti-alias classification still hit
+/// the unmodified frames, so a masked pixel's real value can still confirm an edge in
+/// an unmasked neighbour. `threshold` ∈ [0,1] sets sensitivity (smaller = stricter;
+/// ~0.1 is a sensible default).
+///
+/// The `mask` must be built for `a`'s dimensions. A mask sized for a different
+/// frame silently miscompares — it masks the wrong columns/rows and can subtract
+/// more than the frame holds; the internal `.min(total)` clamp only keeps the
+/// arithmetic sound, not the result meaningful.
+pub fn diff_perceptual_with_mask(
+    a: &Frame,
+    b: &Frame,
+    threshold: f32,
+    mask: &IgnoreMask,
+) -> Result<DiffResult> {
     if a.width != b.width || a.height != b.height {
         return Err(GlassError::SizeMismatch {
             a: (a.width, a.height),
@@ -322,18 +518,30 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
         let base = y as usize * row_bytes;
         let ra = &a.pixels[base..base + row_bytes];
         let rb = &b.pixels[base..base + row_bytes];
+        let masked_row = !mask.spans_for_row(y).is_empty();
         let mut off = 0usize;
         let mut col = 0u32;
         // SIMD pre-scan: byte-identical 8-pixel chunks (the common case) can't
         // contain a change, so skip the per-pixel perceptual + AA work entirely.
         while off + LANES <= row_bytes {
+            let chunk_end = col + (LANES / 4) as u32;
+            // Whole-chunk skip: the cheap win when a mask is large.
+            if masked_row && mask.covers_span(y, col, chunk_end) {
+                off += LANES;
+                col = chunk_end;
+                continue;
+            }
             if u8x32::from_slice(&ra[off..off + LANES]) != u8x32::from_slice(&rb[off..off + LANES])
             {
                 for px in 0..(LANES / 4) as u32 {
+                    let cx = col + px;
+                    if masked_row && mask.is_ignored(cx, y) {
+                        continue;
+                    }
                     classify_into(
                         a,
                         b,
-                        col + px,
+                        cx,
                         y,
                         w,
                         h,
@@ -348,47 +556,46 @@ pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResul
                 }
             }
             off += LANES;
-            col += (LANES / 4) as u32;
+            col = chunk_end;
         }
         while off < row_bytes {
-            classify_into(
-                a,
-                b,
-                col,
-                y,
-                w,
-                h,
-                max_delta,
-                &mut changed,
-                &mut aa_ignored,
-                &mut min_x,
-                &mut min_y,
-                &mut max_x,
-                &mut max_y,
-            );
+            if !(masked_row && mask.is_ignored(col, y)) {
+                classify_into(
+                    a,
+                    b,
+                    col,
+                    y,
+                    w,
+                    h,
+                    max_delta,
+                    &mut changed,
+                    &mut aa_ignored,
+                    &mut min_x,
+                    &mut min_y,
+                    &mut max_x,
+                    &mut max_y,
+                );
+            }
             off += 4;
             col += 1;
         }
     }
 
     let total = a.pixel_count();
+    let ignored = mask.ignored_count().min(total);
     let bbox = (changed > 0).then(|| BBox {
         x: min_x,
         y: min_y,
         width: max_x - min_x + 1,
         height: max_y - min_y + 1,
     });
-    let changed_pct = if total > 0 {
-        (changed as f64 / total as f64 * 100.0) as f32
-    } else {
-        0.0
-    };
     Ok(DiffResult {
         changed_pixels: changed,
         total_pixels: total,
-        changed_pct,
+        changed_pct: pct(changed, total - ignored),
         bbox,
         aa_ignored,
+        ignored_pixels: ignored,
     })
 }
 
@@ -543,6 +750,7 @@ mod tests {
             changed_pct,
             bbox,
             aa_ignored: 0,
+            ignored_pixels: 0,
         }
     }
 
@@ -745,6 +953,7 @@ mod tests {
             changed_pct,
             bbox,
             aa_ignored,
+            ignored_pixels: 0,
         }
     }
 
@@ -794,6 +1003,7 @@ mod tests {
                 None
             },
             aa_ignored: 0,
+            ignored_pixels: 0,
         }
     }
 
@@ -807,5 +1017,452 @@ mod tests {
     fn region_matches_satisfied_when_identical() {
         assert!(region_satisfied(&diff_result(0), RegionUntil::Matches));
         assert!(!region_satisfied(&diff_result(5), RegionUntil::Matches));
+    }
+
+    // ---- ignore mask ----
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Region {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn empty_mask_ignores_nothing() {
+        let m = IgnoreMask::new(&[], 10, 10).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.ignored_count(), 0);
+        assert!(!m.is_ignored(0, 0));
+    }
+
+    #[test]
+    fn mask_counts_a_single_rect() {
+        let m = IgnoreMask::new(&[rect(1, 1, 2, 3)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 6);
+        assert!(m.is_ignored(1, 1));
+        assert!(m.is_ignored(2, 3));
+        assert!(!m.is_ignored(3, 1), "x=3 is outside [1,3)");
+        assert!(!m.is_ignored(1, 4), "y=4 is outside [1,4)");
+    }
+
+    #[test]
+    fn overlapping_rects_count_each_pixel_once() {
+        // Two 4x4 rects overlapping in a 2x2 corner: 16 + 16 - 4 = 28.
+        let m = IgnoreMask::new(&[rect(0, 0, 4, 4), rect(2, 2, 4, 4)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 28);
+    }
+
+    #[test]
+    fn adjacent_spans_merge_into_one() {
+        let m = IgnoreMask::new(&[rect(0, 0, 2, 1), rect(2, 0, 2, 1)], 10, 10).unwrap();
+        assert_eq!(m.spans_for_row(0), &[(0, 4)]);
+        assert_eq!(m.ignored_count(), 4);
+    }
+
+    #[test]
+    fn rect_partly_out_of_bounds_is_clamped() {
+        // 4 wide starting at x=8 in a 10-wide frame => only x in [8,10) masks.
+        let m = IgnoreMask::new(&[rect(8, 0, 4, 1)], 10, 10).unwrap();
+        assert_eq!(m.ignored_count(), 2);
+        assert_eq!(m.spans_for_row(0), &[(8, 10)]);
+    }
+
+    #[test]
+    fn rect_fully_out_of_bounds_ignores_nothing_and_does_not_error() {
+        let m = IgnoreMask::new(&[rect(50, 50, 4, 4)], 10, 10).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.ignored_count(), 0);
+    }
+
+    #[test]
+    fn zero_area_rect_is_an_error() {
+        assert!(matches!(
+            IgnoreMask::new(&[rect(0, 0, 0, 4)], 10, 10).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
+        assert!(matches!(
+            IgnoreMask::new(&[rect(0, 0, 4, 0)], 10, 10).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
+    }
+
+    #[test]
+    fn covers_span_detects_fully_masked_runs() {
+        let m = IgnoreMask::new(&[rect(0, 0, 8, 1)], 16, 4).unwrap();
+        assert!(m.covers_span(0, 0, 8), "[0,8) is inside [0,8)");
+        assert!(!m.covers_span(0, 4, 12), "[4,12) runs past the mask");
+        assert!(!m.covers_span(1, 0, 8), "row 1 is unmasked");
+    }
+
+    #[test]
+    fn for_region_intersects_and_translates_into_region_space() {
+        // Frame 100x100, region at (10,10) 20x20, mask rect at (15,15) 10x10.
+        // Intersection is (15,15)-(25,25) clipped to the region => (15,15) 10x10,
+        // translated to region-local (5,5) 10x10 => 100 px.
+        let region = rect(10, 10, 20, 20);
+        let m = IgnoreMask::for_region(&[rect(15, 15, 10, 10)], &region).unwrap();
+        assert_eq!(m.ignored_count(), 100);
+        assert!(m.is_ignored(5, 5), "region-local origin of the mask");
+        assert!(!m.is_ignored(4, 5), "just outside the translated mask");
+    }
+
+    #[test]
+    fn for_region_drops_rects_outside_the_region() {
+        let region = rect(0, 0, 10, 10);
+        let m = IgnoreMask::for_region(&[rect(50, 50, 5, 5)], &region).unwrap();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn for_region_rejects_a_zero_area_rect_before_intersecting() {
+        // `for_region` validates zero-area up front — before intersecting with the
+        // region — so region-scoping can't launder a zero-area rect into a silent
+        // drop. Exercises `for_region`'s own validation branch, distinct from
+        // `new`'s (covered by `zero_area_rect_is_an_error`).
+        let region = rect(0, 0, 10, 10);
+        assert!(matches!(
+            IgnoreMask::for_region(&[rect(0, 0, 0, 4)], &region).unwrap_err(),
+            GlassError::InvalidRegion(_)
+        ));
+    }
+
+    #[test]
+    fn region_intersect_returns_none_when_disjoint() {
+        assert_eq!(rect(0, 0, 5, 5).intersect(&rect(10, 10, 5, 5)), None);
+        assert_eq!(
+            rect(0, 0, 10, 10).intersect(&rect(5, 5, 10, 10)),
+            Some(rect(5, 5, 5, 5))
+        );
+    }
+
+    // ---- masked exact diff ----
+
+    #[test]
+    fn masked_pixels_do_not_count_as_changed() {
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut b = a.clone();
+        // Change (1,2) and (3,3); mask only (1,2).
+        for (x, y) in [(1u32, 2u32), (3, 3)] {
+            b.pixels[((y * 4 + x) * 4) as usize] = 255;
+        }
+        let mask = IgnoreMask::new(&[rect(1, 2, 1, 1)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.changed_pixels, 1, "only the unmasked change counts");
+        assert_eq!(r.ignored_pixels, 1);
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1
+            }),
+            "bbox must not stretch to the masked pixel"
+        );
+    }
+
+    #[test]
+    fn changed_pct_uses_the_considered_denominator() {
+        // 4x4 = 16 px; mask 8 px; 1 changed px among the 8 considered => 12.5%.
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut b = a.clone();
+        b.pixels[0] = 255; // (0,0), unmasked
+        let mask = IgnoreMask::new(&[rect(0, 2, 4, 2)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.ignored_pixels, 8);
+        assert_eq!(r.total_pixels, 16);
+        assert_eq!(r.changed_pixels, 1);
+        assert!((r.changed_pct - 12.5).abs() < 1e-4, "got {}", r.changed_pct);
+    }
+
+    #[test]
+    fn fully_masked_frame_reports_zeros() {
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let b = Frame::solid(4, 4, [255, 255, 255, 255]);
+        let mask = IgnoreMask::new(&[rect(0, 0, 4, 4)], 4, 4).unwrap();
+        let r = diff_with_mask(&a, &b, 0, &mask).unwrap();
+        assert_eq!(r.changed_pixels, 0);
+        assert_eq!(r.bbox, None);
+        assert_eq!(r.changed_pct, 0.0);
+        assert_eq!(r.ignored_pixels, r.total_pixels);
+    }
+
+    #[test]
+    fn unmasked_diff_is_unchanged_by_the_new_field() {
+        let a = make(33, 9, 0);
+        let b = make(33, 9, 4);
+        let old = diff(&a, &b, 0).unwrap();
+        let new = diff_with_mask(&a, &b, 0, &IgnoreMask::empty()).unwrap();
+        assert_eq!(old, new);
+        assert_eq!(old.ignored_pixels, 0);
+    }
+
+    #[test]
+    fn masked_simd_matches_masked_scalar_reference() {
+        // Masks chosen to land on and across 8-pixel SIMD chunk boundaries.
+        let sizes = [
+            (1u32, 1u32),
+            (7, 3),
+            (8, 8),
+            (9, 9),
+            (33, 17),
+            (64, 8),
+            (100, 40),
+        ];
+        for &(w, h) in &sizes {
+            let a = make(w, h, 0);
+            let b = make(w, h, 7);
+            let masks = mask_matrix(w, h);
+            for (label, m) in masks {
+                for tol in [0u8, 10] {
+                    assert_eq!(
+                        diff_with_mask(&a, &b, tol, &m).unwrap(),
+                        reference_diff_masked(&a, &b, tol, &m),
+                        "{w}x{h} tol={tol} mask={label}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mask shapes that exercise empty, sub-chunk, chunk-aligned, cross-chunk,
+    /// full-row, and full-frame coverage.
+    fn mask_matrix(w: u32, h: u32) -> Vec<(&'static str, IgnoreMask)> {
+        let mut out = vec![("empty", IgnoreMask::empty())];
+        let mk = |label, rects: Vec<Region>| (label, IgnoreMask::new(&rects, w, h).unwrap());
+        if w > 0 && h > 0 {
+            out.push(mk("single-px", vec![rect(0, 0, 1, 1)]));
+            out.push(mk("full-frame", vec![rect(0, 0, w, h)]));
+            out.push(mk("first-row", vec![rect(0, 0, w, 1)]));
+        }
+        if w >= 8 && h >= 2 {
+            out.push(mk("chunk-aligned", vec![rect(0, 0, 8, 2)]));
+            out.push(mk("cross-chunk", vec![rect(4, 0, 8, 2)]));
+            out.push(mk("overlapping", vec![rect(0, 0, 6, 2), rect(3, 0, 6, 2)]));
+        }
+        out
+    }
+
+    /// Naive masked reference — the straightforward loop the optimized masked
+    /// diff must agree with.
+    fn reference_diff_masked(a: &Frame, b: &Frame, tolerance: u8, mask: &IgnoreMask) -> DiffResult {
+        let mut changed = 0u64;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..a.height {
+            for x in 0..a.width {
+                if mask.is_ignored(x, y) {
+                    continue;
+                }
+                let off = ((y * a.width + x) * 4) as usize;
+                if pixel_changed(&a.pixels, &b.pixels, off, tolerance) {
+                    changed += 1;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let total = a.pixel_count();
+        let ignored = mask.ignored_count().min(total);
+        let considered = total - ignored;
+        let bbox = (changed > 0).then(|| BBox {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        });
+        let changed_pct = if considered > 0 {
+            (changed as f64 / considered as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct,
+            bbox,
+            aa_ignored: 0,
+            ignored_pixels: ignored,
+        }
+    }
+
+    // ---- masked perceptual diff ----
+
+    #[test]
+    fn perceptual_mask_excludes_pixels_and_keeps_denominator_honest() {
+        let a = Frame::solid(10, 10, [0, 0, 0, 255]);
+        let b = Frame::solid(10, 10, [255, 255, 255, 255]);
+        // Mask the top 5 rows: 50 of 100 px considered, all of which changed.
+        let mask = IgnoreMask::new(&[rect(0, 0, 10, 5)], 10, 10).unwrap();
+        let r = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
+        assert_eq!(r.ignored_pixels, 50);
+        assert_eq!(r.changed_pixels, 50);
+        assert!(
+            (r.changed_pct - 100.0).abs() < 1e-4,
+            "got {}",
+            r.changed_pct
+        );
+        assert_eq!(
+            r.bbox,
+            Some(BBox {
+                x: 0,
+                y: 5,
+                width: 10,
+                height: 5
+            })
+        );
+    }
+
+    #[test]
+    fn perceptual_unmasked_is_unchanged() {
+        let a = make(33, 17, 1);
+        let b = make(33, 17, 5);
+        let old = diff_perceptual(&a, &b, 0.1).unwrap();
+        let new = diff_perceptual_with_mask(&a, &b, 0.1, &IgnoreMask::empty()).unwrap();
+        assert_eq!(old, new);
+    }
+
+    /// The decisive guard on masking in-loop rather than copying frame A's masked
+    /// rects into frame B before diffing: anti-alias detection must keep reading
+    /// real neighbours, so a pixel next to a mask classifies exactly as it would
+    /// from the true, unmutated frame data.
+    ///
+    /// Geometry is load-bearing here, and deliberately small — do not "simplify"
+    /// this to a bigger/rounder frame. `is_antialiased`'s "3+ identical
+    /// neighbours" flat-region check (`has_many_siblings`) is satisfied by *any*
+    /// matching neighbour; a wide or tall frame is mostly uniform black/white
+    /// padding, which hands it redundant confirmations everywhere, including
+    /// right next to a mask. That redundancy is exactly what let a previous,
+    /// larger version of this fixture (16x8, 2 masked rows) pass identically
+    /// under both the in-loop and the copy-into-B designs — the two designs
+    /// only diverge when the surviving row bordering the mask has *no* spare
+    /// matching neighbour to fall back on.
+    ///
+    /// A 4-wide, 3-row frame with only row 0 masked gives row 1 (the row right
+    /// below the mask) exactly that: at the seam, row 1's own vertical neighbour
+    /// is row 0. Verified by hand-tracing `is_antialiased` and by an experimental
+    /// copy-into-B implementation: under the correct design, pixels (1,1) and
+    /// (2,1) classify `Changed` (row 1 reads B's real row 0, seam at column 2);
+    /// under the rejected design they classify `AntiAliased` instead, because
+    /// row 0 in the diffed copy of B would hold A's seam (column 1) copied in
+    /// before diffing — a value B never actually had. Row 2 isn't adjacent to
+    /// the mask, so its classification (`AntiAliased`) doesn't move either way;
+    /// it is what makes this fixture assert something beyond "row 1 disappeared".
+    #[test]
+    fn perceptual_mask_does_not_disturb_neighbouring_aa_classification() {
+        // Seam 1 -> 2 in a 4-wide frame differs only at columns 1 and 2:
+        // a = [black, gray(seam), white, white], b = [black, black, gray(seam), white].
+        let a = edge_frame(4, 3, 1);
+        let b = edge_frame(4, 3, 2);
+        // Mask only row 0, leaving row 1 (adjacent to the mask) and row 2 (not
+        // adjacent) to survive.
+        let mask = IgnoreMask::new(&[rect(0, 0, 4, 1)], 4, 3).unwrap();
+
+        let masked = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
+
+        // The real invariant: every surviving pixel must classify exactly as it
+        // would from the true, unmutated frames. `reference_perceptual_masked`
+        // is that definition made concrete — it calls `classify` on `a.pixels`
+        // and `b.pixels` verbatim and never mutates either frame. Equality here
+        // is what "in-loop masking never disturbs anti-alias classification"
+        // means; it would still hold trivially if this fixture didn't
+        // discriminate, which is why the concrete counts below matter too.
+        let reference = reference_perceptual_masked(&a, &b, 0.1, &mask);
+        assert_eq!(
+            masked, reference,
+            "masked diff must match direct per-pixel classification of the real, unmutated frames"
+        );
+
+        // Pin the concrete counts so a regression is legible without diffing a
+        // DiffResult by hand (see the doc comment above for how these were
+        // derived and cross-checked against the rejected design).
+        assert_eq!(masked.ignored_pixels, 4, "row 0 (4 px) is excluded");
+        assert_eq!(
+            masked.changed_pixels, 2,
+            "(1,1) and (2,1): row 1's seam pixels see B's real row-0 neighbour, not A's copied-in seam"
+        );
+        assert_eq!(
+            masked.aa_ignored, 2,
+            "(1,2) and (2,2): row 2's seam pixels are unaffected by the mask either way"
+        );
+        assert_eq!(
+            masked.bbox,
+            Some(BBox {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1
+            }),
+            "only row 1's pixels are real changes; row 2's are suppressed as AA"
+        );
+    }
+
+    #[test]
+    fn masked_perceptual_matches_masked_naive_reference() {
+        let sizes = [(1u32, 1u32), (7, 3), (8, 8), (9, 9), (33, 17), (64, 8)];
+        for &(w, h) in &sizes {
+            let a = make(w, h, 1);
+            let b = make(w, h, 5);
+            for (label, m) in mask_matrix(w, h) {
+                for thr in [0.02f32, 0.1, 0.4] {
+                    assert_eq!(
+                        diff_perceptual_with_mask(&a, &b, thr, &m).unwrap(),
+                        reference_perceptual_masked(&a, &b, thr, &m),
+                        "{w}x{h} thr={thr} mask={label}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn reference_perceptual_masked(
+        a: &Frame,
+        b: &Frame,
+        threshold: f32,
+        mask: &IgnoreMask,
+    ) -> DiffResult {
+        let (w, h) = (a.width, a.height);
+        let max_delta = MAX_YIQ_DELTA * threshold.clamp(0.0, 1.0).powi(2);
+        let mut changed = 0u64;
+        let mut aa_ignored = 0u64;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                if mask.is_ignored(x, y) {
+                    continue;
+                }
+                match classify(&a.pixels, &b.pixels, x, y, w, h, max_delta) {
+                    PixelClass::Same => {}
+                    PixelClass::AntiAliased => aa_ignored += 1,
+                    PixelClass::Changed => {
+                        changed += 1;
+                        min_x = min_x.min(x);
+                        min_y = min_y.min(y);
+                        max_x = max_x.max(x);
+                        max_y = max_y.max(y);
+                    }
+                }
+            }
+        }
+        let total = a.pixel_count();
+        let ignored = mask.ignored_count().min(total);
+        let bbox = (changed > 0).then(|| BBox {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        });
+        DiffResult {
+            changed_pixels: changed,
+            total_pixels: total,
+            changed_pct: pct(changed, total - ignored),
+            bbox,
+            aa_ignored,
+            ignored_pixels: ignored,
+        }
     }
 }

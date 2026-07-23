@@ -12,6 +12,14 @@ pub struct WaitStableParams {
     /// When set, the settle decision compares only this sub-rectangle of each
     /// frame; the returned frame is still the full window.
     pub stability_region: Option<Region>,
+    /// Window-relative sub-rectangles excluded from the settle comparison — pixels
+    /// there never count as changed, so a perpetually animating region (a blinking
+    /// caret, a clock) cannot prevent the stream from settling. When
+    /// `stability_region` is set, each rect is intersected with it and translated
+    /// into region-local coordinates, so `ignore` is always window-relative
+    /// regardless of scoping. With `window` set, "window-relative" means relative
+    /// to the watched window, not the active one.
+    pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
     pub window: Option<WindowId>,
@@ -27,10 +35,17 @@ pub struct WaitStableOutcome {
     /// `saw_motion:false` over a short `observed_ms` is a *brief* quiet window — a slow
     /// animation can still hide under it, so use `wait_for_region {until:"changes"}` to
     /// positively assert motion. `settled:true` with `saw_motion:true` means it was moving
-    /// and then quieted.
+    /// and then quieted. Motion confined to an `ignore` rect does not count — it is masked
+    /// out of the comparison, so it can never set this flag.
     pub saw_motion: bool,
     /// How long (ms) frames were observed before settling or timing out.
     pub observed_ms: u64,
+    /// Pixels an `ignore` mask excluded from every settle comparison (counting
+    /// overlaps once); 0 when no `ignore` rects were in effect. `settled:true`
+    /// with `ignored_pixels` equal to the compared area means the mask covered
+    /// everything, so nothing was actually compared — the same signal `glass_diff`
+    /// surfaces.
+    pub ignored_pixels: u64,
 }
 
 /// Parameters for [`Glass::wait_for_element`].
@@ -230,6 +245,15 @@ pub struct WaitRegionParams {
     pub tolerance: u8,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// Window-relative sub-rectangles excluded from the comparison — pixels there
+    /// never count toward `changed`/`matches`, so a perpetually animating area (a
+    /// blinking caret, a clock) inside the watched region cannot itself satisfy
+    /// `until: Changes`, nor block `until: Matches` from converging. When `region`
+    /// is set, each rect is intersected with it and translated into region-local
+    /// coordinates, so `ignore` is always window-relative regardless of scoping.
+    /// With `window` set, "window-relative" means relative to the watched window,
+    /// not the active one.
+    pub ignore: Vec<Region>,
     /// When set, watch this window's own region instead of the active window's —
     /// without changing which window is active.
     pub window: Option<WindowId>,
@@ -249,6 +273,11 @@ pub struct WaitRegionOutcome {
     pub frame: Frame,
     /// Wall-clock milliseconds elapsed when the wait returned.
     pub elapsed_ms: u64,
+    /// Pixels an `ignore` mask excluded from the last comparison (counting
+    /// overlaps once); 0 when no `ignore` rects were in effect. Mirrors
+    /// `glass_diff`'s `ignored_pixels`: when it equals the watched area nothing
+    /// was actually compared, so `matched`/`changed_pct` describe an empty diff.
+    pub ignored_pixels: u64,
 }
 
 /// Parameters for [`Glass::wait_for_log`].
@@ -290,15 +319,35 @@ impl Glass {
                 r.check_fits(geo.width, geo.height)?;
             }
         }
-        let mut tracker = StabilityTracker::new(params.settle_frames, params.tolerance);
         let region = params.stability_region;
         let window = params.window;
+        // The mask is built lazily, on the first poll tick, sized from that
+        // captured frame's own dimensions rather than the session's cached
+        // geometry — which can belong to a different window than the one being
+        // watched, or be stale if the watched window resized itself since the
+        // cache was last refreshed. `for_region` intersects `ignore` with
+        // `region` and translates into region-local coordinates (`capture`
+        // crops to `region` when one is set, so the settle comparison and the
+        // mask must agree on that same cropped space).
+        let mut tracker: Option<StabilityTracker> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             // Poll only the watched region (cheap) when one is set; else the full window.
             let frame = self.capture(window, region.as_ref())?;
-            let settled = tracker.observe(frame)?;
-            Ok(if settled { Some(()) } else { None })
+            let t = match tracker {
+                Some(ref mut t) => t,
+                None => {
+                    let mask =
+                        mask_for(&params.ignore, region.as_ref(), frame.width, frame.height)?;
+                    tracker.insert(StabilityTracker::with_mask(
+                        params.settle_frames,
+                        params.tolerance,
+                        mask,
+                    ))
+                }
+            };
+            Ok(if t.observe(frame)? { Some(()) } else { None })
         })?;
+        let tracker = tracker.expect("poll_until ticks at least once");
         let settled = outcome.value.is_some();
         // Return the full window: a fresh capture if we were polling a sub-region
         // (the genuinely-settled state), else the just-observed full frame.
@@ -311,6 +360,7 @@ impl Glass {
             settled,
             saw_motion: tracker.saw_change(),
             observed_ms: outcome.elapsed_ms,
+            ignored_pixels: tracker.ignored_count(),
         })
     }
 
@@ -491,7 +541,9 @@ impl Glass {
     /// captured frame is returned for an optional image at the tool layer.
     /// If `baseline` is set and `region` is `None`, the baseline must match the
     /// current window size — a size change since it was saved returns `SizeMismatch`;
-    /// crop to a stable `region` to avoid this.
+    /// crop to a stable `region` to avoid this. `ignore` excludes window-relative
+    /// sub-rectangles from every comparison — pixels there never count toward
+    /// `changed`/`matches` (see `WaitRegionParams::ignore`).
     pub fn wait_for_region(&mut self, params: &WaitRegionParams) -> Result<WaitRegionOutcome> {
         let active = self.require_active()?;
         // As in `wait_stable`: the active window's cached geometry only bounds
@@ -514,6 +566,19 @@ impl Glass {
             }
             None => self.capture(params.window, params.region.as_ref())?,
         };
+        // The mask is built once, sized from `reference` — the frame that will
+        // actually be compared every tick — not from the session's cached window
+        // geometry, which can be stale or belong to a different window (the same
+        // trap `wait_stable` hit: see its mask-build comment). Every polled
+        // `current` frame is required to match `reference`'s size (the masked
+        // diff functions error otherwise via `SizeMismatch`), so `reference`'s own
+        // dimensions are exactly the comparison's real size, cropped or not.
+        let mask = mask_for(
+            &params.ignore,
+            params.region.as_ref(),
+            reference.width,
+            reference.height,
+        )?;
         let (perceptual, threshold, tolerance, until, region, window) = (
             params.perceptual,
             params.threshold,
@@ -522,25 +587,26 @@ impl Glass {
             params.region,
             params.window,
         );
-        let mut last: Option<(f32, Option<BBox>, Frame)> = None;
+        let mut last: Option<(f32, Option<BBox>, u64, Frame)> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             let current = self.capture(window, region.as_ref())?;
             let d = if perceptual {
-                diff_perceptual(&reference, &current, threshold)?
+                diff_perceptual_with_mask(&reference, &current, threshold, &mask)?
             } else {
-                diff(&reference, &current, tolerance)?
+                diff_with_mask(&reference, &current, tolerance, &mask)?
             };
             let satisfied = region_satisfied(&d, until);
-            last = Some((d.changed_pct, d.bbox, current));
+            last = Some((d.changed_pct, d.bbox, d.ignored_pixels, current));
             Ok(if satisfied { Some(()) } else { None })
         })?;
-        let (changed_pct, bbox, frame) = last.expect("at least one poll ran");
+        let (changed_pct, bbox, ignored_pixels, frame) = last.expect("at least one poll ran");
         Ok(WaitRegionOutcome {
             matched: outcome.value.is_some(),
             changed_pct,
             bbox,
             frame,
             elapsed_ms: outcome.elapsed_ms,
+            ignored_pixels,
         })
     }
 
@@ -627,6 +693,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -654,6 +721,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 0, // give up after the first non-settling capture
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -683,6 +751,7 @@ mod tests {
                     width: 2,
                     height: 2,
                 }),
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -693,6 +762,182 @@ mod tests {
         assert_eq!(
             outcome.frame, f2,
             "wait_stable returns the FULL frame, not the cropped region"
+        );
+    }
+
+    #[test]
+    fn wait_stable_settles_using_ignore_to_mask_a_blinking_pixel() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
+        // clock — while the rest of the 4x4 frame stays constant black. Masking
+        // it lets the (otherwise-constant) frame settle on the scripted frames.
+        //
+        // `settled` alone is NOT the discriminator: without the mask the stream
+        // still settles, just *late*. `FakePlatform` repeats its last supplied
+        // frame forever once exhausted, so once polling outlasts the 3 scripted
+        // frames it compares that repeated final frame to itself and "settles"
+        // trivially — proving nothing about `ignore`. Pinning the capture count to
+        // exactly 3 (the frames actually supplied) rules that out: settling within
+        // them can only happen if the blink was masked from the very first
+        // comparison.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1, f2.clone()])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            outcome.settled,
+            "the blinking pixel is masked, so the stream is stable"
+        );
+        assert_eq!(outcome.frame, f2);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_reports_ignored_pixels_masked_out_of_the_settle_comparison() {
+        // A single ignore rect covering the whole 4x4 frame leaves nothing to
+        // compare, so the stream settles trivially — and the outcome must surface
+        // the full masked count so an agent can tell it compared nothing, rather
+        // than reading a hollow `settled: true` (the gap `glass_diff` never had).
+        let a = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let b = Frame::solid(4, 4, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(4, 4).with_frames(vec![a, b]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert_eq!(
+            outcome.ignored_pixels, 16,
+            "the mask covers the whole 4x4 frame, so every pixel was excluded"
+        );
+    }
+
+    #[test]
+    fn wait_stable_masks_by_captured_frame_size_not_stale_cached_geometry() {
+        // The cached window geometry is a deliberately stale/smaller 2x2 —
+        // `FakePlatform::new(2, 2)` — while `with_frames` serves the same 4x4
+        // blinking frames as the sibling test above. This models watching a
+        // window whose real size the session's geometry cache doesn't reflect
+        // (a different window, or a self-resize since the cache was last
+        // refreshed). The `ignore` rect at (3,3) falls outside the stale 2x2
+        // bounds but inside the actual 4x4 frame: if the mask were ever sized
+        // from the cached geometry instead of the captured frame, (3,3) would be
+        // clamped away, the blink would go unmasked, and the frames would never
+        // settle within the timeout.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(2, 2)
+            .with_frames(vec![f0, f1, f2.clone()])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            outcome.settled,
+            "the mask must be sized from the captured 4x4 frame, not the stale 2x2 cached geometry"
+        );
+        assert_eq!(outcome.frame, f2);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_ignore_is_window_relative_under_a_stability_region() {
+        // (3,3) blinks and is INSIDE the watched region, so the cropped frames
+        // differ every poll; only a window-relative rect translated into
+        // region-local space masks it.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1, f2])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let outcome = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: Some(Region {
+                    x: 2,
+                    y: 2,
+                    width: 2,
+                    height: 2,
+                }),
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(outcome.settled);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            4,
+            "3 region polls + 1 final full capture"
         );
     }
 
@@ -722,6 +967,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: Some(region),
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -757,6 +1003,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -786,6 +1033,36 @@ mod tests {
                     width: 99,
                     height: 1,
                 }),
+                ignore: Vec::new(),
+                window: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, GlassError::InvalidRegion(_)));
+    }
+
+    #[test]
+    fn wait_stable_rejects_zero_area_ignore_rect() {
+        // `IgnoreMask` validates this directly, but the mask is now built lazily
+        // inside the poll closure — pin that the error still propagates out of
+        // `wait_stable` itself, so a future change that swallowed it in there
+        // (e.g. treating a build failure as "not yet stable") would be caught.
+        let platform =
+            FakePlatform::new(4, 4).with_frames(vec![Frame::solid(4, 4, [0, 0, 0, 255])]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let err = g
+            .wait_stable(&WaitStableParams {
+                interval_ms: 0,
+                settle_frames: 2,
+                tolerance: 0,
+                timeout_ms: 1000,
+                stability_region: None,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 1,
+                }],
                 window: None,
             })
             .unwrap_err();
@@ -840,6 +1117,7 @@ mod tests {
                 tolerance: 0,
                 timeout_ms: 1000,
                 stability_region: None,
+                ignore: Vec::new(),
                 window: Some(WindowId(2)),
             })
             .unwrap();
@@ -1277,6 +1555,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -1301,6 +1580,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 0,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
@@ -1327,11 +1607,207 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: None,
             })
             .unwrap();
         assert!(o.matched);
         assert_eq!(o.changed_pct, 0.0);
+    }
+
+    #[test]
+    fn wait_for_region_ignore_masks_a_changing_rect_so_changes_never_matches() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
+        // clock — while the rest of the 4x4 frame stays constant. Masking it means
+        // `until: Changes` has nothing left to react to: the corner is the only
+        // pixel that ever differs, and it is excluded from the comparison.
+        //
+        // `timeout_ms: 0` bounds the wait to exactly one poll after the reference
+        // capture (see `poll_until`), so a generous timeout letting `FakePlatform`
+        // outlast its scripted frames into its repeat-forever fallback can't be
+        // what makes this pass — the outcome is decided by that single real
+        // comparison. Pinning the capture count to 2 (reference + one poll) makes
+        // that explicit.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            !o.matched,
+            "the only real difference (the corner) is masked, so nothing should register as a change"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "reference capture + exactly one poll, not outlasted into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_ignore_is_window_relative_under_a_region() {
+        // (3,3) blinks and is INSIDE the watched region (2,2,2,2), so the cropped
+        // frames differ every poll; only a window-relative rect translated into
+        // region-local space masks it. The region-scoped path was the last one
+        // left unexercised for `ignore`; the siblings are
+        // `wait_stable_ignore_is_window_relative_under_a_stability_region` and
+        // `baseline_ignore_is_window_relative_under_a_region`.
+        //
+        // Pinning the capture count to 2 (reference + exactly one poll, via
+        // `timeout_ms: 0`) makes the translation load-bearing: this can only be
+        // `!matched` if the window-relative rect was translated into region-local
+        // space and masked the blink on that single real comparison. Drop the
+        // translation (build the mask with no region) and the rect lands outside
+        // the 2x2 crop, the blink registers, and this flips to `matched`.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: Some(Region {
+                    x: 2,
+                    y: 2,
+                    width: 2,
+                    height: 2,
+                }),
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            !o.matched,
+            "the window-relative rect must translate into region-local space and mask the blink"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "reference capture + exactly one poll — pins that the translated mask suppressed the only change on the first real comparison"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_ignore_lets_matches_converge_despite_a_changing_rect() {
+        // The baseline is saved while the corner is 10; the polled stream then
+        // serves a frame with the corner at 20 — otherwise identical. Without
+        // masking, that real corner difference would keep `until: Matches` from
+        // ever being satisfied; masking it lets the (otherwise-constant) rest of
+        // the frame converge on the very first poll.
+        //
+        // Pinning the capture count to 2 (the baseline save + one poll) rules out
+        // a generous timeout eventually matching by other means: it can only
+        // happen if the corner was masked from that first real comparison.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let platform = FakePlatform::new(4, 4)
+            .with_frames(vec![f0, f1])
+            .with_capture_log(log.clone());
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        g.save_baseline("b").unwrap(); // consumes f0
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: Some("b".into()),
+                region: None,
+                until: RegionUntil::Matches,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 1000,
+                ignore: vec![Region {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 1,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert!(
+            o.matched,
+            "the corner is masked, so the rest of the frame matches the baseline immediately"
+        );
+        assert_eq!(o.changed_pct, 0.0);
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "baseline save + exactly one poll — matched on the first real comparison"
+        );
+    }
+
+    #[test]
+    fn wait_for_region_reports_ignored_pixels_from_the_last_diff() {
+        // The whole 2x2 area is masked, so `until: Changes` never sees a change and
+        // the wait times out — but the outcome must still carry the masked count
+        // from the final diff, giving the agent the same signal `glass_diff` does.
+        let a = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let b = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let platform = FakePlatform::new(2, 2).with_frames(vec![a, b]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_region(&WaitRegionParams {
+                baseline: None,
+                region: None,
+                until: RegionUntil::Changes,
+                perceptual: false,
+                threshold: 0.1,
+                tolerance: 0,
+                interval_ms: 0,
+                timeout_ms: 0,
+                ignore: vec![Region {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }],
+                window: None,
+            })
+            .unwrap();
+        assert_eq!(
+            o.ignored_pixels, 4,
+            "the mask covers the whole 2x2 area, so every pixel was excluded from the diff"
+        );
     }
 
     #[test]
@@ -1385,6 +1861,7 @@ mod tests {
                 tolerance: 0,
                 interval_ms: 0,
                 timeout_ms: 1000,
+                ignore: Vec::new(),
                 window: Some(WindowId(2)),
             })
             .unwrap();

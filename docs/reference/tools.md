@@ -69,8 +69,9 @@ ids are in [Conventions](#conventions) above):
   `glass_click`/`glass_move`/`glass_drag`/`glass_scroll`/`glass_gesture` — are signed `i32`,
   window-relative. A negative value addresses a point off the window's top-left edge rather than
   being rejected.
-- **Region coordinates** — `region`/`stability_region` (`x,y,width,height`), wherever a tool accepts
-  one — are unsigned `u32`; they can never be negative.
+- **Region coordinates** — `region`/`stability_region`/the rects inside `ignore`
+  (`x,y,width,height`), wherever a tool accepts one — are unsigned `u32`; they can never be
+  negative.
 - `glass_logs`' `max_lines` is a `u32`.
 
 ## Session lifecycle
@@ -136,10 +137,15 @@ Diff the current frame against a named baseline; returns change stats and a boun
 - `region` (`{x,y,width,height}`) — window-relative sub-rectangle to diff; omit to diff the whole
   window. Scopes the comparison (and the reported `bbox`, which becomes region-relative) to just
   this area — the way to ask "did *only* this part change?".
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep `changed_pct` non-zero forever. Combines with `region`: ignore rects are
+  always window-relative and are intersected with it.
 
-Returns `{changed_pixels, total_pixels, changed_pct, aa_ignored, bbox}` (`bbox` is `null` when
-nothing changed), plus the given `region` echoed back when one was passed; only attaches an image
-when `include_image:true` and something changed.
+Returns `{changed_pixels, total_pixels, changed_pct, aa_ignored, ignored_pixels, bbox}` (`bbox` is
+`null` when nothing changed), plus the given `region` echoed back when one was passed; only attaches
+an image when `include_image:true` and something changed. `ignored_pixels` is the count excluded by
+`ignore`; `changed_pct` is measured over `total_pixels - ignored_pixels`.
 
 ## Settling & waiting
 
@@ -161,12 +167,22 @@ Wait until the window stops changing, then return the settled frame.
 - `tolerance` (integer 0–255) — per-frame change tolerance.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the settle
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep the window from ever settling; pixels inside a rect never count as changed
+  and never set `saw_motion`. Combines with `stability_region`: rects are always window-relative
+  and are intersected with it. Independent of `region`, which only crops the returned image. A
+  rect that falls partially or entirely outside the compared area — the frame, or the
+  `stability_region` sub-rectangle when one is set — is silently clamped or dropped, masking less
+  than requested or nothing at all; the excluded count is reported as `ignored_pixels`, so a
+  smaller-than-expected value flags a misplaced rect.
 
-Returns `{settled, saw_motion, observed_ms, width, height}`; `x, y` — the region's origin — are
-added only when `include_image` attached a frame and `region` was given (the text-only result never
-includes them). `saw_motion` and `observed_ms` make `settled` non-opaque: `settled:true` with
-`saw_motion:false` over a short `observed_ms` is only a brief quiet window, not necessarily a
-finished animation.
+Returns `{settled, saw_motion, observed_ms, ignored_pixels, width, height}`; `x, y` — the region's
+origin — are added only when `include_image` attached a frame and `region` was given (the text-only
+result never includes them). `saw_motion` and `observed_ms` make `settled` non-opaque: `settled:true`
+with `saw_motion:false` over a short `observed_ms` is only a brief quiet window, not necessarily a
+finished animation. `ignored_pixels` is the count an `ignore` mask excluded from the settle
+comparison; when it equals the compared area, the mask covered everything and nothing was compared.
 
 ### `glass_wait_for_element`
 
@@ -203,10 +219,20 @@ baseline), then return text metrics.
 - `include_image` (boolean, default false) — on match, also return the watched region as an image.
 - `window_id` (integer) — observe this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target.
+- `ignore` (array of `{x,y,width,height}`) — window-relative rectangles excluded from the
+  comparison. Use for perpetually animating content (a blinking caret, a clock, a spinner) that
+  would otherwise keep `changed_pct` non-zero forever. `changed_pct` is measured over the pixels
+  that remain. Combines with `region`: ignore rects are always window-relative and are intersected
+  with it. A rect that falls partially or entirely outside the compared area — the frame, or the
+  `region` sub-rectangle when one is set — is silently clamped or dropped, masking less than
+  requested or nothing at all; the excluded count is reported as `ignored_pixels`, so a
+  smaller-than-expected value flags a misplaced rect.
 
-Returns `{matched, changed_pct, bbox, elapsed_ms}`. Use `until:"matches"` to confirm the UI reached
-an approved design without spending vision tokens. For the non-blocking case — one already-captured
-frame instead of polling — `glass_diff` takes the same `region`.
+Returns `{matched, changed_pct, bbox, elapsed_ms, ignored_pixels}`. Use `until:"matches"` to confirm
+the UI reached an approved design without spending vision tokens. `ignored_pixels` is the count an
+`ignore` mask excluded from the last comparison; when it equals the watched area, nothing was
+compared. For the non-blocking case — one already-captured frame instead of polling — `glass_diff`
+takes the same `region`.
 
 ### `glass_wait_for_log`
 
@@ -325,8 +351,12 @@ Run an ordered sequence of input actions in one call (collapsing per-action roun
 optionally observe.
 
 - `actions` (array, **required**, non-empty) — each item is `{ action: "click"|"move"|"drag"|
-  "scroll"|"type"|"key"|"settle", ...same fields as the matching tool }`. A `settle` action waits
-  for the screen to stop changing between steps.
+  "scroll"|"type"|"key"|"settle", ...fields }`. Click/move/drag/scroll/type/key take the same
+  fields as their matching tool. A `settle` action takes a *subset* of `glass_wait_stable`'s
+  fields — `interval_ms`, `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and
+  `ignore` (the same window-relative-rectangles knob) — but no `window_id`, `region`, or
+  `include_image`: it always settles the active window and never returns an image. It waits for
+  the screen to stop changing between steps.
 - `then` (`{ settle?, diff?, screenshot? }`) — a terminal observe after all actions succeed; text-
   first, returning an image only for `screenshot` (or `diff` with its own `include_image`).
 

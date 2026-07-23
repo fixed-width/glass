@@ -49,6 +49,7 @@ fn settle_args(s: &SettleArgs) -> WaitStableArgs {
         stability_region: s.stability_region.clone(),
         include_image: Some(false),
         window_id: None,
+        ignore: s.ignore.clone(),
     }
 }
 
@@ -240,6 +241,7 @@ mod tests {
                         tolerance: None,
                         timeout_ms: Some(200),
                         stability_region: None,
+                        ignore: None,
                     }),
                     diff: None,
                     screenshot: None,
@@ -254,6 +256,75 @@ mod tests {
         );
         let result = assert_envelope(&out, "glass_do");
         assert_eq!(result["then"]["settle"]["settled"], json!(true));
+    }
+
+    #[test]
+    fn then_settle_ignore_masks_a_blinking_pixel_so_it_settles() {
+        // Regression for `settle_args()` silently dropping `SettleArgs.ignore`
+        // instead of forwarding it into `WaitStableParams.ignore`: with no
+        // `#[serde(deny_unknown_fields)]` in this crate, a dropped field would
+        // still parse fine and just do nothing. Pixel (1,1) blinks across the
+        // three scripted frames — a stand-in for a blinking caret — while the
+        // rest of the 2x2 frame stays constant; only masking that rect lets it
+        // settle within `settle_frames`.
+        //
+        // Pinning the capture count to 3 (the frames actually supplied) rules
+        // out a generous timeout settling by outlasting the scripted frames
+        // into `FakePlatform`'s repeat-forever fallback, which would "settle"
+        // even without masking by comparing the repeated final frame to itself.
+        let log = Arc::new(Mutex::new(0usize));
+        let mut f0 = Frame::solid(2, 2, [10, 10, 10, 255]);
+        let mut f1 = f0.clone();
+        let mut f2 = f0.clone();
+        let idx = 3 * 4; // pixel (1,1): row 1 * width 2 + col 1 = 3, 4 bytes/pixel
+        f0.pixels[idx] = 10;
+        f1.pixels[idx] = 20;
+        f2.pixels[idx] = 30;
+        let mut g = started(
+            FakePlatform::new(2, 2)
+                .with_frames(vec![f0, f1, f2])
+                .with_capture_log(log.clone()),
+        );
+        let out = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![click(0, 0)],
+                then: Some(ThenArgs {
+                    settle: Some(SettleArgs {
+                        interval_ms: Some(0),
+                        settle_frames: Some(2),
+                        tolerance: None,
+                        timeout_ms: Some(1000),
+                        stability_region: None,
+                        ignore: Some(vec![RegionArgs {
+                            x: 1,
+                            y: 1,
+                            width: 1,
+                            height: 1,
+                        }]),
+                    }),
+                    diff: None,
+                    screenshot: None,
+                }),
+            },
+        )
+        .unwrap();
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(
+            result["then"]["settle"]["settled"],
+            json!(true),
+            "the blinking pixel is masked, so the stream is stable: {result}"
+        );
+        assert_eq!(
+            result["then"]["settle"]["saw_motion"],
+            json!(false),
+            "masked motion must never set saw_motion: {result}"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
     }
 
     #[test]
@@ -310,6 +381,7 @@ mod tests {
                         tolerance: None,
                         timeout_ms: Some(0),
                         stability_region: None,
+                        ignore: None,
                     }),
                     diff: None,
                     screenshot: None,
@@ -341,6 +413,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: Some(false),
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),
@@ -376,6 +449,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: Some(true),
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),
@@ -416,6 +490,7 @@ mod tests {
                         threshold: None,
                         tolerance: None,
                         include_image: None,
+                        ignore: None,
                     }),
                     screenshot: None,
                 }),

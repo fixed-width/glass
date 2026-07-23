@@ -139,6 +139,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         interval_ms: a.interval_ms.unwrap_or(100),
         timeout_ms: a.timeout_ms.unwrap_or(10_000),
+        ignore: ignore_regions(a.ignore.as_deref()),
         window: a.window_id.map(glass_core::WindowId),
     };
     let o = glass.wait_for_region(&params).map_err(|e| e.to_string())?;
@@ -155,6 +156,7 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
         "changed_pct": o.changed_pct,
         "bbox": bbox,
         "elapsed_ms": o.elapsed_ms,
+        "ignored_pixels": o.ignored_pixels,
     });
     let image = if o.matched && a.include_image.unwrap_or(false) {
         Some(frame_to_webp(&o.frame).map_err(|e| e.to_string())?)
@@ -546,6 +548,7 @@ mod tests {
             timeout_ms: Some(1000),
             include_image: None,
             window_id: None,
+            ignore: None,
         }
     }
 
@@ -649,6 +652,93 @@ mod tests {
         a.window_id = Some(9);
         let err = wait_for_region(&mut g, &a).unwrap_err();
         assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn region_with_ignore_masks_a_changing_rect_so_changes_never_matches() {
+        // Pixel (3,3) blinks between the reference (captured at call start,
+        // since no baseline is given) and the polled frame — a stand-in for a
+        // blinking text caret or a clock — while the rest of the 4x4 frame
+        // stays constant. Masking it means `until: "changes"` (the default)
+        // has nothing left to react to: the corner is the only pixel that
+        // ever differs, and it is excluded from the comparison.
+        //
+        // `timeout_ms: 0` bounds the wait to exactly one poll after the
+        // reference capture, so a generous timeout letting `FakePlatform`
+        // outlast its scripted frames into its repeat-forever fallback can't
+        // be what makes this pass — the outcome is decided by that single
+        // real comparison. Pinning the capture count to 2 (reference + one
+        // poll) makes that explicit.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let mut g = glass_with(
+            FakePlatform::new(4, 4)
+                .with_frames(vec![f0, f1])
+                .with_capture_log(log.clone()),
+        );
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let mut a = region_args();
+        a.timeout_ms = Some(0);
+        a.ignore = Some(vec![RegionArgs {
+            x: 3,
+            y: 3,
+            width: 1,
+            height: 1,
+        }]);
+        let out = wait_for_region(&mut g, &a).unwrap();
+        match out.0.last().unwrap() {
+            OutContent::Text(t) => assert!(
+                t.contains("\"matched\":false"),
+                "the only real difference (the corner) is masked, so nothing should register as a change: {t}"
+            ),
+            _ => panic!("expected text"),
+        }
+        assert_eq!(
+            *log.lock().unwrap(),
+            2,
+            "reference capture + exactly one poll, not outlasted into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn region_envelope_reports_ignored_pixels() {
+        // The ignore rect covers the whole 2x2 window, so nothing is compared and
+        // the wait times out — but the envelope must still report the masked count,
+        // matching glass_diff's ignored_pixels signal.
+        let black = Frame::solid(2, 2, [0, 0, 0, 255]);
+        let white = Frame::solid(2, 2, [255, 255, 255, 255]);
+        let mut g = started_frames(vec![black, white]);
+        let mut a = region_args();
+        a.timeout_ms = Some(0);
+        a.ignore = Some(vec![RegionArgs {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        }]);
+        let out = wait_for_region(&mut g, &a).unwrap();
+        match out.0.last().unwrap() {
+            OutContent::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(t).unwrap();
+                assert_eq!(
+                    v["result"]["ignored_pixels"],
+                    json!(4),
+                    "the whole-window mask excludes all 4 pixels: {t}"
+                );
+            }
+            _ => panic!("expected text"),
+        }
     }
 
     fn started_logs(logs: Vec<(glass_core::Stream, &str)>) -> Glass {

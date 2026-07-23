@@ -250,6 +250,8 @@ fn settle_params() -> glass_core::WaitStableParams {
         tolerance: 0,
         timeout_ms: 5000,
         stability_region: None,
+        // the return:"settle" observe has no arg surface to carry ignore rects — always masks nothing
+        ignore: Vec::new(),
         window: None,
     }
 }
@@ -429,6 +431,19 @@ pub(crate) mod testutil {
             self.captures = log;
             self
         }
+    }
+
+    /// A 4x4 opaque frame, constant everywhere except pixel (3,3), set to `corner` —
+    /// a stand-in for a perpetually animating rect (a blinking caret, a clock) in
+    /// `ignore`-masking tests. Mirrors glass-core's own test helper of the same name.
+    pub fn frame_4x4_corner(corner: [u8; 4]) -> Frame {
+        let mut px = vec![0u8; 4 * 4 * 4];
+        for i in 0..16 {
+            px[i * 4 + 3] = 255; // alpha
+        }
+        let idx = (3 * 4 + 3) * 4;
+        px[idx..idx + 4].copy_from_slice(&corner);
+        Frame::new(4, 4, px).expect("4x4 frame is well-formed")
     }
 
     impl Platform for FakePlatform {

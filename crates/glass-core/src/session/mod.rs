@@ -6,7 +6,10 @@ use crate::accessibility::{
     ElementCondition, ElementInfo, ElementMatch,
 };
 use crate::baseline::BaselineStore;
-use crate::diff::{diff, diff_perceptual, region_satisfied, BBox, DiffResult, RegionUntil};
+use crate::diff::{
+    diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox, DiffResult, IgnoreMask,
+    RegionUntil,
+};
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
 use crate::logbuf::{LogBuffer, LogLine, Stream};
@@ -169,6 +172,25 @@ impl Glass {
         let s = self.active_mut()?;
         s.pump();
         Ok(s.logs.read(cursor, max, stream, contains))
+    }
+}
+
+/// Build the ignore mask for a comparison over a `frame_w`×`frame_h` frame,
+/// optionally scoped to `region`. Without a region the window-relative rects mask
+/// the frame directly; with one they are intersected with it and translated into
+/// region-local space — the space the scoped comparison runs in — so callers
+/// always pass window-relative rects regardless of scoping. Picking the right
+/// [`IgnoreMask`] constructor here keeps each one unambiguous: [`IgnoreMask::new`]
+/// sizes from the frame, [`IgnoreMask::for_region`] from the region.
+fn mask_for(
+    ignore: &[Region],
+    region: Option<&Region>,
+    frame_w: u32,
+    frame_h: u32,
+) -> Result<IgnoreMask> {
+    match region {
+        Some(r) => IgnoreMask::for_region(ignore, r),
+        None => IgnoreMask::new(ignore, frame_w, frame_h),
     }
 }
 

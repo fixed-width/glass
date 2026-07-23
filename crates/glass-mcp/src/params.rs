@@ -24,6 +24,12 @@ impl From<&RegionArgs> for Region {
     }
 }
 
+/// Window-relative ignore rects as core `Region`s; empty when omitted.
+pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
+    args.map(|v| v.iter().map(Region::from).collect())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScreenshotArgs {
     /// Optional window-relative sub-rectangle to capture; omit for the whole window.
@@ -228,13 +234,26 @@ pub struct WaitStableArgs {
     /// the settle decision ignores changes outside it. Independent of `region`.
     pub stability_region: Option<RegionArgs>,
     /// Return the settled frame as an image (default true). Set false for a
-    /// text-only `{settled,width,height}` result with no WebP — cheap when the
-    /// next step is a text `glass_diff`. `region` is ignored when false.
+    /// text-only `{settled, saw_motion, observed_ms, ignored_pixels, width,
+    /// height}` result with no WebP — cheap when the next step is a text
+    /// `glass_diff`. `region` is ignored when false.
     pub include_image: Option<bool>,
     /// Capture/observe this window (id from `glass_list_windows`) instead of the
     /// active one, without changing which window subsequent ops target. Omit for
     /// the active window.
     pub window_id: Option<u64>,
+    /// Window-relative rectangles to exclude from the settle comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps the window from ever settling. Pixels
+    /// inside a rect never count as changed and never set `saw_motion`.
+    /// Combines with `stability_region`: rects are always window-relative and
+    /// are intersected with it. Independent of `region`, which only crops the
+    /// returned image. A rect that falls partially or entirely outside the
+    /// compared area — the frame, or the `stability_region` sub-rectangle when
+    /// one is set — is silently clamped or dropped, masking less than
+    /// requested or nothing at all; the excluded count is reported as
+    /// `ignored_pixels`, so a smaller-than-expected value flags a misplaced rect.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -309,6 +328,17 @@ pub struct WaitForRegionArgs {
     /// active one, without changing which window subsequent ops target. Omit for
     /// the active window.
     pub window_id: Option<u64>,
+    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
+    /// `changed_pct` is measured over the pixels that remain. Combines with
+    /// `region`: rects are always window-relative and are intersected with it.
+    /// A rect that falls partially or entirely outside the compared area —
+    /// the frame, or the `region` sub-rectangle when one is set — is silently
+    /// clamped or dropped, masking less than requested or nothing at all; the
+    /// excluded count is reported as `ignored_pixels`, so a smaller-than-
+    /// expected value flags a misplaced rect.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -364,6 +394,13 @@ pub struct DiffArgs {
     /// region-relative) to just this area — the way to ask "did *only* this part
     /// change?" Mirrors `glass_wait_for_region`'s `region`.
     pub region: Option<RegionArgs>,
+    /// Window-relative rectangles to exclude from the comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps `changed_pct` permanently non-zero.
+    /// `changed_pct` is measured over the pixels that remain; the excluded
+    /// count is reported as `ignored_pixels`. Combines with `region`: rects are
+    /// always window-relative and are intersected with it.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,6 +434,14 @@ pub struct SettleArgs {
     pub tolerance: Option<u8>,
     pub timeout_ms: Option<u64>,
     pub stability_region: Option<RegionArgs>,
+    /// Window-relative rectangles to exclude from the settle comparison. Use for
+    /// perpetually animating content — a blinking text caret, a clock, a
+    /// spinner — which otherwise keeps the window from ever settling.
+    /// Combines with `stability_region`: rects are always window-relative and
+    /// are intersected with it. A rect that falls partially or entirely
+    /// outside the compared area is silently clamped or dropped, masking less
+    /// than requested or nothing at all — double-check placement.
+    pub ignore: Option<Vec<RegionArgs>>,
 }
 
 /// Optional terminal observe after a `glass_do` sequence (run settle → diff →
@@ -512,6 +557,98 @@ mod tests {
                 .unwrap();
         let r = some.region.unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn diff_args_ignore_defaults_none_and_parses() {
+        let none: DiffArgs = serde_json::from_str(r#"{"name":"m"}"#).unwrap();
+        assert!(none.ignore.is_none());
+        let some: DiffArgs =
+            serde_json::from_str(r#"{"name":"m","ignore":[{"x":1,"y":2,"width":3,"height":4}]}"#)
+                .unwrap();
+        let regions = some.ignore.unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            (
+                regions[0].x,
+                regions[0].y,
+                regions[0].width,
+                regions[0].height
+            ),
+            (1, 2, 3, 4)
+        );
+    }
+
+    #[test]
+    fn wait_stable_args_ignore_defaults_none_and_parses() {
+        let none: WaitStableArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: WaitStableArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_region_args_ignore_defaults_none_and_parses() {
+        let none: WaitForRegionArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: WaitForRegionArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settle_args_ignore_defaults_none_and_parses() {
+        // A `glass_do` settle action/`then.settle` carries the same `ignore`
+        // knob as the standalone `glass_wait_stable` tool.
+        let none: SettleArgs = serde_json::from_str("{}").unwrap();
+        assert!(none.ignore.is_none());
+        let some: SettleArgs =
+            serde_json::from_str(r#"{"ignore":[{"x":0,"y":0,"width":2,"height":2}]}"#).unwrap();
+        assert_eq!(some.ignore.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignore_regions_maps_none_to_empty_vec() {
+        assert!(ignore_regions(None).is_empty());
+    }
+
+    #[test]
+    fn ignore_regions_maps_some_to_core_regions() {
+        let rects = vec![
+            RegionArgs {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            },
+            RegionArgs {
+                x: 5,
+                y: 6,
+                width: 7,
+                height: 8,
+            },
+        ];
+        let regions = ignore_regions(Some(rects.as_slice()));
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            (
+                regions[0].x,
+                regions[0].y,
+                regions[0].width,
+                regions[0].height
+            ),
+            (1, 2, 3, 4)
+        );
+        assert_eq!(
+            (
+                regions[1].x,
+                regions[1].y,
+                regions[1].width,
+                regions[1].height
+            ),
+            (5, 6, 7, 8)
+        );
     }
 
     #[test]

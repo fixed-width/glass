@@ -42,6 +42,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
         tolerance: a.tolerance.unwrap_or(0),
         timeout_ms: a.timeout_ms.unwrap_or(5000),
         stability_region: a.stability_region.as_ref().map(|r| r.into()),
+        ignore: ignore_regions(a.ignore.as_deref()),
         window: a.window_id.map(glass_core::WindowId),
     };
     let outcome = glass.wait_stable(&params).map_err(|e| e.to_string())?;
@@ -50,6 +51,10 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
     // over a short observed_ms is only a brief quiet window (a slow animation can hide).
     let saw_motion = outcome.saw_motion;
     let observed_ms = outcome.observed_ms;
+    // Surfaced exactly as `glass_diff` does: `settled:true` with `ignored_pixels`
+    // equal to the compared area means the mask covered everything, so nothing was
+    // actually compared.
+    let ignored_pixels = outcome.ignored_pixels;
 
     // Text-only: report the settle status + full-frame dims, no WebP. `region`
     // (which only crops the returned image) is intentionally ignored here.
@@ -58,6 +63,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
             "settled": settled,
             "saw_motion": saw_motion,
             "observed_ms": observed_ms,
+            "ignored_pixels": ignored_pixels,
             "width": outcome.frame.width,
             "height": outcome.frame.height,
         });
@@ -66,7 +72,7 @@ pub fn wait_stable(glass: &mut Glass, a: &WaitStableArgs) -> ToolResult {
 
     let frame = crop_frame(outcome.frame, a.region.as_ref())?;
     let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
-    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "width": frame.width, "height": frame.height });
+    let mut meta = json!({ "settled": settled, "saw_motion": saw_motion, "observed_ms": observed_ms, "ignored_pixels": ignored_pixels, "width": frame.width, "height": frame.height });
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
@@ -89,15 +95,20 @@ pub fn baseline_save(glass: &mut Glass, a: &BaselineSaveArgs) -> ToolResult {
 
 pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     let region = a.region.as_ref().map(Region::from);
+    let ignore = ignore_regions(a.ignore.as_deref());
     let (r, current) = match a.mode.as_deref().unwrap_or("perceptual") {
         "perceptual" => glass.diff_baseline_perceptual_with_frame(
             &a.name,
             region.as_ref(),
+            &ignore,
             a.threshold.unwrap_or(0.1),
         ),
-        "exact" => {
-            glass.diff_baseline_with_frame(&a.name, region.as_ref(), a.tolerance.unwrap_or(0))
-        }
+        "exact" => glass.diff_baseline_with_frame(
+            &a.name,
+            region.as_ref(),
+            &ignore,
+            a.tolerance.unwrap_or(0),
+        ),
         other => {
             return Err(format!(
                 "unknown diff mode '{other}' (use perceptual/exact)"
@@ -114,6 +125,7 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
         "total_pixels": r.total_pixels,
         "changed_pct": r.changed_pct,
         "aa_ignored": r.aa_ignored,
+        "ignored_pixels": r.ignored_pixels,
         "bbox": bbox,
     });
     // Echo the region so the caller can map the region-relative bbox back to
@@ -314,6 +326,7 @@ mod tests {
             stability_region: None,
             include_image: None,
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         if let OutContent::Image(bytes) = &out.0[0] {
@@ -345,6 +358,7 @@ mod tests {
             }),
             include_image: None,
             window_id: None,
+            ignore: None,
         };
         assert!(wait_stable(&mut g, &a).unwrap_err().contains("region"));
     }
@@ -368,9 +382,105 @@ mod tests {
             stability_region: None,
             include_image: None,
             window_id: Some(3),
+            ignore: None,
         };
         let err = wait_stable(&mut g, &a).unwrap_err();
         assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_stable_with_ignore_masks_saw_motion_without_outlasting_scripted_frames() {
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking text
+        // caret, a clock, a spinner — while the rest of the 4x4 frame stays
+        // constant. Without `ignore` reaching `WaitStableParams`, the full-
+        // frame comparison would never settle; masking it lets the
+        // otherwise-constant stream settle normally.
+        //
+        // `settled:true` alone is NOT the discriminator here: a generous
+        // timeout would eventually settle even without `ignore` reaching
+        // core, once polling outlasts the 3 scripted frames into
+        // `FakePlatform`'s repeat-forever fallback (the repeated final frame
+        // compared to itself "settles" trivially, proving nothing about the
+        // wiring). `saw_motion:false` and pinning the capture count to
+        // exactly 3 (the frames actually supplied) are what rule that out.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let f0 = frame_4x4_corner([10, 0, 0, 255]);
+        let f1 = frame_4x4_corner([20, 0, 0, 255]);
+        let f2 = frame_4x4_corner([30, 0, 0, 255]);
+        let mut g = started_with(
+            FakePlatform::new(4, 4)
+                .with_frames(vec![f0, f1, f2])
+                .with_capture_log(log.clone()),
+        );
+        let a = WaitStableArgs {
+            interval_ms: Some(0),
+            settle_frames: Some(2),
+            tolerance: None,
+            timeout_ms: Some(1000),
+            region: None,
+            stability_region: None,
+            include_image: Some(false),
+            window_id: None,
+            ignore: Some(vec![RegionArgs {
+                x: 3,
+                y: 3,
+                width: 1,
+                height: 1,
+            }]),
+        };
+        let out = wait_stable(&mut g, &a).unwrap();
+        let v = assert_envelope(&out, "glass_wait_stable");
+        assert_eq!(
+            v["settled"],
+            json!(true),
+            "the blinking rect is masked, so the stream is stable: {v}"
+        );
+        assert_eq!(
+            v["saw_motion"],
+            json!(false),
+            "motion confined to an ignore rect must never set saw_motion: {v}"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            3,
+            "must settle on the 3 supplied frames, not by outlasting them into FakePlatform's repeat"
+        );
+    }
+
+    #[test]
+    fn wait_stable_envelope_reports_ignored_pixels() {
+        // The ignore rect covers the whole 4x4 frame, so the settle comparison
+        // considers nothing; the text envelope must surface the masked count (the
+        // signal glass_diff already carries) so a caller isn't left with a hollow
+        // settled:true.
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
+            4,
+            4,
+            [0, 0, 0, 255],
+        )]));
+        let a = WaitStableArgs {
+            interval_ms: Some(0),
+            settle_frames: Some(1),
+            tolerance: None,
+            timeout_ms: Some(1000),
+            region: None,
+            stability_region: None,
+            include_image: Some(false),
+            window_id: None,
+            ignore: Some(vec![RegionArgs {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            }]),
+        };
+        let out = wait_stable(&mut g, &a).unwrap();
+        let v = assert_envelope(&out, "glass_wait_stable");
+        assert_eq!(
+            v["ignored_pixels"],
+            json!(16),
+            "the whole-frame mask excludes all 16 pixels: {v}"
+        );
     }
 
     #[test]
@@ -398,11 +508,50 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
         let v = assert_envelope(&out, "glass_diff");
         assert_eq!(v["changed_pixels"], json!(1), "envelope: {v}");
+    }
+
+    #[test]
+    fn diff_with_ignore_excludes_rect_and_reports_ignored_pixels() {
+        let base = Frame::solid(4, 4, [0, 0, 0, 255]);
+        let mut changed = base.clone();
+        changed.pixels[0] = 255; // pixel (0,0) changes, inside the ignore rect below
+        let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![base, changed]));
+        baseline_save(&mut g, &BaselineSaveArgs { name: "m".into() }).unwrap();
+        let out = diff(
+            &mut g,
+            &DiffArgs {
+                region: None,
+                name: "m".into(),
+                mode: None,
+                threshold: None,
+                tolerance: None,
+                include_image: None,
+                ignore: Some(vec![RegionArgs {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                }]),
+            },
+        )
+        .unwrap();
+        let v = assert_envelope(&out, "glass_diff");
+        assert_eq!(
+            v["changed_pixels"],
+            json!(0),
+            "the only change sits inside the ignore rect: {v}"
+        );
+        assert_eq!(
+            v["ignored_pixels"],
+            json!(4),
+            "the 2x2 ignore rect excludes 4 pixels: {v}"
+        );
     }
 
     #[test]
@@ -427,6 +576,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
@@ -456,6 +606,7 @@ mod tests {
                 threshold: None,
                 tolerance: Some(0),
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap();
@@ -471,6 +622,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap_err();
@@ -493,6 +645,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: None,
+                ignore: None,
             },
         )
         .unwrap_err();
@@ -561,6 +714,7 @@ mod tests {
             stability_region: None,
             include_image: Some(false),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         assert_eq!(
@@ -590,6 +744,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -628,6 +783,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -651,6 +807,7 @@ mod tests {
             stability_region: None,
             include_image: Some(true),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // must have [Image, meta-Text, IMAGE_NOTE-Text]
@@ -700,6 +857,7 @@ mod tests {
             stability_region: None,
             include_image: Some(false),
             window_id: None,
+            ignore: None,
         };
         let out = wait_stable(&mut g, &a).unwrap();
         // no image -> no IMAGE_NOTE
@@ -777,6 +935,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();
@@ -814,6 +973,7 @@ mod tests {
                 threshold: None,
                 tolerance: None,
                 include_image: Some(true),
+                ignore: None,
             },
         )
         .unwrap();

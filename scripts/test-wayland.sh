@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run the #[ignore]d Wayland integration tests. Skips cleanly if no
-# glass-discoverable sway >=1.12 is present (build+install via https://github.com/fixed-width/sway-build).
+# Run the #[ignore]d Wayland integration tests (tests/wayland.rs and the ignore-regions MCP
+# e2e in tests/wayland_ignore_regions_e2e.rs). Skips cleanly if no glass-discoverable sway
+# >=1.12 is present (build+install via https://github.com/fixed-width/sway-build).
 #
 # NOTE: the sandbox_* tests in tests/wayland.rs require 'bubblewrap' to be installed
 # (sudo apt-get install -y bubblewrap on Debian/Ubuntu) AND unprivileged user namespaces
@@ -18,4 +19,4 @@ if [ ! -x "$SWAY_BUNDLE" ] && ! { command -v sway >/dev/null 2>&1 && sway --vers
 fi
 # --test-threads=1: each test spawns its own sway (and Xwayland); serialize
 # so concurrent compositors don't contend for the display.
-exec cargo test -p glass-testapp --test wayland -- --ignored --test-threads=1 "$@"
+exec cargo test -p glass-testapp --test wayland --test wayland_ignore_regions_e2e -- --ignored --test-threads=1 "$@"
