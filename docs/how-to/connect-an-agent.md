@@ -49,6 +49,9 @@ servers (or restart Antigravity).
 **Codex CLI:** `codex mcp add glass -- /absolute/path/to/glass-mcp` — or add a `[mcp_servers.glass]`
 table with `command` / `args` to `~/.codex/config.toml`.
 
+**GitHub Copilot (JetBrains):** add glass under `servers` in the plugin's `mcp.json` (`"type":
+"stdio"`, `"command"`, `"args"`), then restart the IDE to load it.
+
 No `env` block is needed: glass uses your host's default backend and, where the host supports it,
 gives each session its own isolated display with nothing to set up. Add an `env` block only to
 override a default — the specific variables are in [reference/environment.md](../reference/environment.md).
@@ -74,6 +77,9 @@ claude mcp add --transport http glass http://127.0.0.1:7300/
 ```
 
 **Codex CLI:** `codex mcp add glass --url http://127.0.0.1:7300/`.
+
+**GitHub Copilot (JetBrains):** the same `servers` entry with `"type": "http"` and `"url"` — then
+restart the IDE (a reload isn't enough) to load the server.
 
 A loopback endpoint (`127.0.0.1`) needs no token. To reach glass from another machine, or to bind a
 non-loopback address, follow [run-over-the-network.md](run-over-the-network.md) for the token and
