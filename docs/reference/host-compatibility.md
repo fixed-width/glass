@@ -27,6 +27,7 @@ loop — a tool call that returns text and one that returns an image — with th
 |------|:-----:|:----:|-------|
 | [Claude Code](https://docs.claude.com/en/docs/claude-code) | ✅ | ✅ | Driven in day-to-day development; covered by the host-conformance tests |
 | [Antigravity](https://antigravity.google) | ✅ | ✅ | Driven end-to-end (v2.3.1) over both transports: the agent listed the glass tools and a launch → screenshot → stop loop returned a screenshot |
+| [Codex CLI](https://github.com/openai/codex) | ✅ | ✅ | Driven end-to-end (codex-cli 0.145.0) over both transports: the agent called `glass_start` → `glass_screenshot` → `glass_stop` and the screenshot returned an image |
 
 Registration for a host is in [Connect glass to your agent](../how-to/connect-an-agent.md).
 
