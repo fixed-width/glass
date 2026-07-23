@@ -41,6 +41,11 @@ internal refactors, CI, or test-only changes.
   unsupported error points to the pixel loop (`glass_screenshot` + `glass_click`); and an element
   with no clickable geometry suggests `glass_scroll_to_element` to bring it into view (or locating it
   by screenshot). The remaining failure paths already carried a next step.
+- **`glass_a11y_snapshot` says what to do when the app exposes no elements.** When a snapshot comes
+  back with only the window root (no addressable elements) — common for an app that doesn't publish an
+  accessibility tree — the result now appends a hint to drive the app by pixels (`glass_screenshot` +
+  `glass_click`), instead of returning a bare root-only outline. Previously only the Linux "no a11y
+  bus" path guided the agent; this covers the thin-tree outcome on every backend.
 
 ### Fixed
 - **Linux `a11y:true` now reaches AccessKit-based apps (egui/winit and other Rust GUI
