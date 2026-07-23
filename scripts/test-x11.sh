@@ -20,4 +20,4 @@ cd "$(dirname "$0")/.."
 # builds glass-mcp only as a library dependency, not its binary, so build the binary explicitly
 # — otherwise the test can't find it in a clean checkout (e.g. CI, which runs only this script).
 cargo build -p glass-mcp --bin glass-mcp
-exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance -- --ignored --test-threads=1 "$@"
+exec cargo test -p glass-testapp --test integration --test network --test ignore_regions_e2e --test host_conformance --test software_render -- --ignored --test-threads=1 "$@"
