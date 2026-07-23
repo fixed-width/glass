@@ -68,8 +68,19 @@ fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
 }
 
 fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
-    // 1. element outline
-    draw_rect_outline(frame, b.x, b.y, b.width as i32, b.height as i32, OUTLINE);
+    // 1. element outline, clamped to the frame. Toolkit a11y extents can overrun the
+    //    window (AT-SPI/GTK over-reports by ~10-20px), which would draw a border off
+    //    the frame edge where it gets clipped away and reads as a rendering bug. Clamp
+    //    the box to [0,0,width,height] so an overrunning edge lands *on* the frame edge.
+    let fw = frame.width as i32;
+    let fh = frame.height as i32;
+    let left = b.x.max(0);
+    let top = b.y.max(0);
+    let right = (b.x + b.width as i32).min(fw);
+    let bottom = (b.y + b.height as i32).min(fh);
+    if right > left && bottom > top {
+        draw_rect_outline(frame, left, top, right - left, bottom - top, OUTLINE);
+    }
 
     // 2. numbered chip, anchored OUTSIDE the element's top-left (up & left), then
     //    clamped into the frame so an edge-hugging element still shows its chip.
@@ -260,6 +271,46 @@ mod tests {
         let (out, legend) = render(&frame, &label_only);
         assert!(legend.is_empty());
         assert_eq!(out, frame);
+    }
+
+    /// A single interactable Button with the given bounds, ids assigned.
+    fn one_button(bounds: AxRect) -> AxTree {
+        let root = node(0, AxRole::Button, "b", Some(bounds));
+        let mut t = AxTree { root, count: 0 };
+        t.assign_ids();
+        t
+    }
+
+    #[test]
+    fn mark_box_right_edge_clamped_to_frame() {
+        // Button overruns the frame's right edge (x=90,w=30 in a 100-wide frame).
+        // Its right border must be redrawn at the last in-frame column (99), not
+        // clipped off past the edge. (99,50) is on the *vertical* right border only
+        // (not a top/bottom corner, clear of the chip), so it distinguishes a
+        // clamped box from the old clipped-away one.
+        let tree = one_button(AxRect {
+            x: 90,
+            y: 40,
+            width: 30,
+            height: 20,
+        });
+        let (out, _) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree);
+        assert_eq!(px(&out, 99, 50), OUTLINE);
+    }
+
+    #[test]
+    fn mark_box_bottom_edge_clamped_to_frame() {
+        // Button overruns the frame's bottom edge (y=90,h=30 in a 100-tall frame).
+        // Its bottom border must land on the last in-frame row (99); (50,99) is on
+        // the horizontal bottom border only, clear of the chip.
+        let tree = one_button(AxRect {
+            x: 40,
+            y: 90,
+            width: 20,
+            height: 30,
+        });
+        let (out, _) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree);
+        assert_eq!(px(&out, 50, 99), OUTLINE);
     }
 
     #[test]
