@@ -1,4 +1,4 @@
-# examples
+# tasks-demo
 
 Small apps for trying glass's **build → see → interact → debug** loop with an agent.
 
