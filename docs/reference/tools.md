@@ -92,8 +92,10 @@ Build, launch, and locate a native GUI app; returns its window geometry.
 - `window_hint` (`{ title?, class? }`) — disambiguate which window is the app's when several appear,
   or find a window the launched process hands off to an unrelated process (some packaged Windows
   apps). `title` is a case-insensitive substring; `class` is an exact match.
-- `a11y` (boolean, default false) — **Linux only.** Spawn a private AT-SPI bus so the accessibility
-  tools work against this app. Opt-in, since it spawns extra processes.
+- `a11y` (boolean, default true) — **Linux only.** Spawn a private AT-SPI bus so the accessibility
+  tools work against this app. On by default (the accessibility path is the cheap, low-token way to
+  drive a UI); pass `false` to skip the bus for canvas/pixel-only apps, since it spawns extra
+  processes. Other backends read accessibility ambiently and ignore this flag.
 - `timeout_ms` (integer) — launch timeout.
 
 Returns the located window's geometry: `{x, y, width, height}`.
@@ -404,7 +406,8 @@ Returns the window's geometry after the op: `{x, y, width, height}`.
 Deterministic, low-token element addressing that complements the pixel loop. Available where the app
 exposes an accessibility tree (most GTK/Qt/toolkit apps — not bare canvas/game UIs); these tools
 **error** for an app with no accessible UI rather than return a fake tree, so fall back to
-`glass_screenshot` then. On Linux, start the app with `glass_start`'s `a11y:true`. The **iOS** backend
+`glass_screenshot` then. On Linux the accessibility bus is on by default — only relevant if you
+launched with `a11y:false`, in which case relaunch without it. The **iOS** backend
 reads the Simulator's accessibility tree over `idb_companion` (install it — see
 [setup-ios.md](../how-to/setup-ios.md#input--accessibility)). See
 [reference/platforms.md](platforms.md) for per-OS backends (AT-SPI / UI Automation / uiautomator / AX / idb).

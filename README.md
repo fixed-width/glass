@@ -53,7 +53,7 @@ tree, the agent drives it semantically — addressing widgets by `#id` and confi
 text, no per-step screenshot:
 
 ```jsonc
-glass_start            { "run": ["python3", "app.py"], "a11y": true }   // launch (+ private a11y bus)
+glass_start            { "run": ["python3", "app.py"] }   // launch (accessibility on by default)
 glass_a11y_snapshot                        // the tree: role, name, #id, bounds — as text
 glass_click_element    { "id": 5 }         // click by #id, not pixels
 glass_wait_for_element { "name": "Save", "condition": "enabled" }       // wait on state — no polling

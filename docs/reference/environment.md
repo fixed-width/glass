@@ -77,7 +77,7 @@ receive none of these defaults.
 | `GLASS_DBUS_DAEMON` | `dbus-daemon` binary for the private AT-SPI bus | `dbus-daemon` (on `PATH`) | Linux |
 | `GLASS_ATSPI_LAUNCHER` | `at-spi-bus-launcher` binary; forces this one and skips discovery (fails closed if wrong) | auto-discovered (well-known install paths) | Linux |
 
-Only used when a launch requests `a11y: true` (see [reference/tools.md](tools.md)): glass spawns a
+Only used when a launch has a11y enabled — the default; see [reference/tools.md](tools.md): glass spawns a
 private D-Bus session bus and AT-SPI bus per launch rather than touching your desktop's shared
 accessibility bus.
 

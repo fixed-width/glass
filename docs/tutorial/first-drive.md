@@ -172,8 +172,8 @@ Three things to do next:
 
 - **Give your agent this loop permanently.** Install the [glass-drive skill](../how-to/drive-glass-well.md)
   so it arrives already knowing the cheap-verify habits you just saw.
-- **Address elements by name, not pixels.** This egui app exposes an accessibility tree, so relaunch it
-  with `glass_start`'s `a11y: true` and try `glass_a11y_snapshot` — you'll get the **Text** field, the
+- **Address elements by name, not pixels.** This egui app exposes an accessibility tree, so try
+  `glass_a11y_snapshot` (the accessibility bus is on by default) — you'll get the **Text** field, the
   **Value** slider, and the **Apply** button as addressable elements. Then `glass_set_value` the slider
   or `glass_click_element` the button by `#id`, no coordinates needed. See the
   [tool reference](../reference/tools.md).
