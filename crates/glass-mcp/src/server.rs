@@ -509,34 +509,30 @@ impl GlassServer {
 const SERVER_INSTRUCTIONS: &str =
     "glass gives you a build → see → interact → debug loop over a real native GUI \
      app — no app integration needed. One active session; tools target it implicitly; \
-     choose a backend at glass_start (defaults to the host; see the `backend` param).\n\n\
-     Loop: glass_start launches the app and captures its logs; glass_screenshot to see \
-     it; glass_click / glass_type / glass_key / glass_scroll / glass_drag (and \
-     glass_gesture for multi-touch where supported) to interact \
-     (coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left); \
-     glass_wait_stable to let a render settle before you look or compare; glass_logs \
-     for the app's stdout/stderr.\n\n\
-     Verify cheaply on the CPU: glass_baseline_save a good frame, act, then \
-     glass_wait_stable with include_image=false and glass_diff, which returns \
-     changed_pct and a bbox as TEXT (no image). Only call glass_diff with \
+     choose a backend at glass_start (defaults to the host; see the `backend` param). \
+     glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
+     SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the app exposes \
+     an accessibility tree, glass_a11y_snapshot returns its elements as TEXT (#id, role, \
+     name, window-relative bounds) — deterministic, no image tokens. Address elements by \
+     #id: glass_click_element clicks one, glass_set_value writes an editable element's \
+     value, and glass_wait_for_element blocks until an element reaches a state (e.g. Save \
+     becomes enabled). Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
+     PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \
+     errors there): glass_screenshot to see it, then glass_click / glass_type / glass_key / \
+     glass_scroll / glass_drag (glass_gesture for multi-touch where supported) to interact. \
+     Coordinates are WINDOW-RELATIVE — 0,0 is the app window's top-left. glass_wait_stable \
+     lets a render settle before you look or compare.\n\n\
+     VERIFY WITHOUT VISION TOKENS: glass_baseline_save a good frame, act, then glass_diff, \
+     which returns changed_pct and a bbox as TEXT (no image). Only call glass_diff with \
      include_image=true (a cropped image of the changed region) when changed_pct shows \
-     something moved — don't screenshot to check every step.\n\n\
-     Wait for a specific condition instead of polling with screenshots: \
-     glass_wait_for_element (until a UI element reaches a state, e.g. Save becomes \
-     enabled — returns the element id for glass_click_element), glass_wait_for_region \
-     (until a region changes, or matches a saved baseline), glass_wait_for_log (until \
-     a log line appears). All return text only and time out softly with \
-     {matched:false} — branch on that rather than retrying blindly.\n\n\
+     something moved — don't screenshot to check every step. glass_wait_for_region blocks \
+     until a region changes or matches a saved baseline; glass_wait_for_log until a log line \
+     appears. Waits return text only and time out softly with {matched:false} — branch on \
+     that rather than retrying blindly.\n\n\
      Batch a known input sequence into one call with glass_do (actions: click/type/key/\
      move/drag/scroll/settle), with an optional text-first `then` observe \
      (settle/diff/screenshot) — fewer round-trips, and it fails fast naming the action \
      that broke.\n\n\
-     Semantic addressing (when the app exposes an accessibility tree): \
-     glass_a11y_snapshot returns the elements as text (#id, role, name, \
-     window-relative bounds); glass_click_element clicks one by #id \
-     and glass_set_value writes an editable element's value by #id. Prefer \
-     this over pixel-hunting when it works; it errors for canvas/black-box \
-     apps, so fall back to screenshots then.\n\n\
      Multiple windows: glass_list_windows and glass_select_window. Errors are real — a \
      failed capture or input returns a message, never a blank or stale frame; fix the \
      cause instead of retrying blindly.";
@@ -801,6 +797,24 @@ mod tests {
             "tool descriptions/instructions must not name a backend \
              (capability support is dynamic, not documentation):\n{}",
             problems.join("\n")
+        );
+    }
+
+    #[test]
+    fn instructions_lead_with_the_low_token_semantic_path() {
+        // The cheap, text-only accessibility path must be presented as the default —
+        // before pixels — so an agent reaches for it first. Guards against drift back
+        // to a screenshot-first framing of the loop.
+        let a11y = SERVER_INSTRUCTIONS
+            .find("glass_a11y_snapshot")
+            .expect("instructions mention glass_a11y_snapshot");
+        let shot = SERVER_INSTRUCTIONS
+            .find("glass_screenshot")
+            .expect("instructions mention glass_screenshot");
+        assert!(
+            a11y < shot,
+            "semantic addressing (glass_a11y_snapshot) must be introduced before \
+             pixel capture (glass_screenshot)"
         );
     }
 
