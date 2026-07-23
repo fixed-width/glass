@@ -42,6 +42,10 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
 }
 ```
 
+**Antigravity:** open **Settings → Customizations → Open MCP Config** to edit its `mcp_config.json`,
+add glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
+servers (or restart Antigravity).
+
 No `env` block is needed: glass uses your host's default backend and, where the host supports it,
 gives each session its own isolated display with nothing to set up. Add an `env` block only to
 override a default — the specific variables are in [reference/environment.md](../reference/environment.md).
