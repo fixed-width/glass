@@ -33,11 +33,11 @@ An agent building a GUI app runs it under glass, reproduces a bug **from the acc
    and [connect it to your agent](docs/how-to/connect-an-agent.md) — glass works with any MCP host
    ([see which are verified](docs/reference/host-compatibility.md)).
 2. Get the example app — clone this repo, or download
-   [`examples/tasks_demo.py`](examples/tasks_demo.py) (on Linux it needs
+   [`examples/tasks-demo/tasks_demo.py`](examples/tasks-demo/tasks_demo.py) (on Linux it needs
    `sudo apt install python3-gi gir1.2-gtk-4.0`).
 3. Paste this to your agent:
 
-   > Use glass to run `examples/tasks_demo.py` with accessibility on. There's a bug: clicking
+   > Use glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
    > **Add** doesn't add the typed task. Reproduce it by driving the UI and checking the
    > accessibility tree (don't just screenshot), then find and fix the bug in the code and verify a
    > task actually appears.
