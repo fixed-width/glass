@@ -43,6 +43,11 @@ internal refactors, CI, or test-only changes.
   (`GSK_RENDERER=cairo`, `QT_X11_NO_MITSHM=1`, `QT_QUICK_BACKEND=software`) so the GPU/shared-memory
   rendering paths the sandbox blocks don't leave the window black. Pass the relevant variable in
   `glass_start`'s `env` to override.
+- **`glass_a11y_marks` boxes stay inside the window.** An element whose accessibility extent
+  reaches past the window edge (toolkit a11y geometry can over-report by ~10–20px) had its outline
+  drawn off-frame, where it was clipped at the capture edge and read as a rendering glitch. Each
+  mark box is now clamped to the window bounds, so an overrunning edge lands on the frame edge. The
+  `#id` and the `glass_click_element` target (the element center) are unchanged.
 
 ## [1.0.1] - 2026-07-21
 
