@@ -16,6 +16,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-23
+
 ### Added
 - **Ignore regions for visual comparison.** `glass_diff`, `glass_wait_for_region`,
   `glass_wait_stable`, and `glass_do`'s `settle` action accept `ignore` — window-relative
@@ -29,6 +31,10 @@ internal refactors, CI, or test-only changes.
   [docs/how-to/verification-cost.md](docs/how-to/verification-cost.md).
 - Reference: host compatibility — which MCP hosts are verified against glass, and what glass needs
   from any host — [docs/reference/host-compatibility.md](docs/reference/host-compatibility.md).
+- How-to: drive a native iOS app in the Simulator — build the bundled
+  [`examples/ios-greeter/`](examples/ios-greeter/) demo app and drive it end to end (launch, read the
+  accessibility tree, act, verify from text and by diff) —
+  [docs/how-to/drive-an-ios-app.md](docs/how-to/drive-an-ios-app.md).
 
 ### Changed
 - **Accessibility is on by default at launch.** `glass_start` now enables the accessibility tools
@@ -388,7 +394,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/fixed-width/glass/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/fixed-width/glass/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/fixed-width/glass/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/fixed-width/glass/compare/v0.4.0...v0.5.0
