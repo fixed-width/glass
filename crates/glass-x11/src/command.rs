@@ -94,6 +94,13 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
         // path resolves inside bwrap too. Keeps a11y resolution isolated AND on a live bus.
         cmd.env("XDG_RUNTIME_DIR", dir);
     }
+    // Under containment, force GPU/MIT-SHM-dependent toolkits (GTK4, Qt) onto a software present
+    // path so they render on the headless display instead of black (see
+    // glass_sandbox_linux::software_render_env). Applied before spec.env so an explicit override
+    // still wins.
+    for (k, v) in glass_sandbox_linux::software_render_env(spec) {
+        cmd.env(k, v);
+    }
     // Applied last so an explicit spec.env entry wins over the forced defaults.
     for (k, v) in &spec.env {
         cmd.env(k, v);

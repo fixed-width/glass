@@ -154,6 +154,12 @@ pub fn build_sway_command(
         // exec's bwrap inherits it too (no --clearenv). spec.env below still overrides.
         cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
     }
+    // Under containment, force GPU/MIT-SHM-dependent toolkits (GTK4, Qt) onto a software present
+    // path (sway itself already gets WLR_RENDERER_ALLOW_SOFTWARE above). Applied before spec.env
+    // so an explicit override still wins.
+    for (k, v) in glass_sandbox_linux::software_render_env(spec) {
+        cmd.env(k, v);
+    }
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
