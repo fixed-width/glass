@@ -38,6 +38,11 @@ internal refactors, CI, or test-only changes.
   bus's GSettings backend tried to persist it via a D-Bus service glass's isolated bus doesn't
   expose), so such apps stayed invisible to `glass_a11y_snapshot` and friends even though the
   bus itself was reachable — GTK/Qt apps, which don't gate on the advertisement, were unaffected.
+- **GTK4/Qt apps render under containment on the headless Linux display instead of black.** When
+  glass launches an app in its sandbox on Linux, it now sets software-render env defaults
+  (`GSK_RENDERER=cairo`, `QT_X11_NO_MITSHM=1`, `QT_QUICK_BACKEND=software`) so the GPU/shared-memory
+  rendering paths the sandbox blocks don't leave the window black. Pass the variable in
+  `glass_start`'s `env` to override.
 
 ## [1.0.1] - 2026-07-21
 
