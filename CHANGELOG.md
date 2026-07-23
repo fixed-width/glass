@@ -27,6 +27,8 @@ internal refactors, CI, or test-only changes.
   over the pixels that remain.
 - How-to: measure the verification-loop cost (semantic vs screenshot) —
   [docs/how-to/verification-cost.md](docs/how-to/verification-cost.md).
+- Reference: host compatibility — which MCP hosts are verified against glass, and what glass needs
+  from any host — [docs/reference/host-compatibility.md](docs/reference/host-compatibility.md).
 
 ### Fixed
 - **Linux `a11y:true` now reaches AccessKit-based apps (egui/winit and other Rust GUI

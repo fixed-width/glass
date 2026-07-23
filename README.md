@@ -30,7 +30,8 @@ An agent building a GUI app runs it under glass, reproduces a bug **from the acc
 ## Try it in 60 seconds
 
 1. Download glass for your platform from the [Releases page](https://github.com/fixed-width/glass/releases/latest)
-   and [connect it to your agent](docs/how-to/connect-an-agent.md).
+   and [connect it to your agent](docs/how-to/connect-an-agent.md) — glass works with any MCP host
+   ([which are verified](docs/reference/host-compatibility.md)).
 2. Get the example app — clone this repo, or download
    [`examples/tasks_demo.py`](examples/tasks_demo.py) (on Linux it needs
    `sudo apt install python3-gi gir1.2-gtk-4.0`).

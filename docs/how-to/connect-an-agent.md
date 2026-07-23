@@ -2,7 +2,9 @@
 
 glass speaks the Model Context Protocol, so you register it with your MCP client once and your agent
 gains the glass tools. glass works with any MCP client; the examples below use Claude Code and a
-generic JSON config. There are two transports — pick by how glass is running.
+generic JSON config. For the verified-host list and what glass needs from a host, see
+[Host compatibility](../reference/host-compatibility.md). There are two transports — pick by how
+glass is running.
 
 - If glass runs on the **same machine** as your agent (the Linux and Windows default), use **stdio**.
 - If glass runs as a **network server** (the macOS menu-bar LaunchAgent, or the agent and app on
