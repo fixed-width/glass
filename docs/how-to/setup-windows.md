@@ -24,6 +24,13 @@ install directory. `GLASS_WIN_SANDBOX_PROVIDER` (`auto`|`sandboxie`|`none`) sele
 set `GLASS_SANDBOX_FLOOR` above `off` on this host, that default is raised to the floor for a launch
 that doesn't ask for a level, and an explicit per-launch `sandbox:"off"` request is refused.
 
+> **What the Windows sandbox covers.** Sandboxie contains the launched app's *writes* (into a private
+> store, so your real files are never modified) and, under `strict`, its network — but it does **not**
+> block *reads*. A contained app can still read files under `%USERPROFILE%`, including secrets like SSH
+> keys, unlike the Linux and macOS profiles, which hide your home from reads. Treat it as write-and-
+> network containment, and don't rely on it to hide read-side secrets. See
+> [Known limits](../explanation/containment.md#known-limits).
+
 ## Install the binary
 
 Download `glass-mcp-*-x86_64-windows.zip` from the
