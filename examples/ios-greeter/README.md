@@ -1,8 +1,9 @@
 # ios-greeter
 
 A tiny SwiftUI app for driving glass in the iOS Simulator: a name field, a **Greet** button, and a
-label that updates to `Hello, <name>!`. Its controls carry accessibility identifiers (`nameField`,
-`greetButton`, `greeting`) so an agent can drive and verify it semantically.
+label that updates to `Hello, <name>!`. The field and button carry accessibility identifiers
+(`nameField`, `greetButton`) so an agent can address them by id; the label carries none, so its text
+is what a snapshot shows — the value you verify after tapping Greet.
 
 ## Build
 
