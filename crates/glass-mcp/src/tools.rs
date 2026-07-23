@@ -235,10 +235,16 @@ pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
 pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
     let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
     let body = tree.to_outline();
+    // The outline is app-derived → untrusted-wrapped. When the tree has nothing to
+    // address, add glass's own (trusted, unwrapped) hint steering to the pixel loop.
+    let mut contents = vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))];
+    if let Some(hint) = tree.empty_guidance() {
+        contents.push(OutContent::Text(hint.to_string()));
+    }
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
         serde_json::json!({}),
-        vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))],
+        contents,
     ))
 }
 
@@ -632,6 +638,26 @@ pub(crate) mod testutil {
         AxTree { root, count: 0 }
     }
 
+    /// A window root with no child elements — the "app publishes no usable tree" shape.
+    pub fn empty_tree() -> AxTree {
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Window,
+            raw_role: "frame".into(),
+            name: Some("Win".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }),
+            children: vec![],
+        };
+        AxTree { root, count: 0 }
+    }
+
     pub fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
         glass_with_a11y_outcome(platform, tree, SetOutcome::Ok)
     }
@@ -915,6 +941,35 @@ mod tests {
                 );
             }
             _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn a11y_snapshot_appends_pixel_hint_when_treeless() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), empty_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let out = a11y_snapshot(&mut g).unwrap();
+        assert_envelope(&out, "glass_a11y_snapshot");
+        // [0]=envelope, [1]=untrusted root-only outline, [2]=glass's trusted pixel hint.
+        match &out.0[2] {
+            OutContent::Text(t) => {
+                assert!(t.contains("glass_screenshot"), "pixel hint: {t}");
+                assert!(
+                    !t.starts_with(crate::untrusted::NOTE),
+                    "the hint is glass's own guidance, not untrusted app content: {t}"
+                );
+            }
+            _ => panic!("expected the pixel-hint text"),
         }
     }
 

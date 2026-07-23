@@ -36,6 +36,16 @@ internal refactors, CI, or test-only changes.
   `glass_set_value`, text-only, no image tokens) as the default way to see and drive the UI, with
   screenshots and pixel coordinates as the fallback for canvas/black-box apps — so an agent reaches
   for the cheap path first. No tool behavior changed.
+- **Error messages point to the recovery action.** Three common failures now name what to do next
+  instead of dead-ending: "no active session" tells you to `glass_start`; the accessibility-
+  unsupported error points to the pixel loop (`glass_screenshot` + `glass_click`); and an element
+  with no clickable geometry suggests `glass_scroll_to_element` to bring it into view (or locating it
+  by screenshot). The remaining failure paths already carried a next step.
+- **`glass_a11y_snapshot` says what to do when the app exposes no elements.** When a snapshot comes
+  back with only the window root (no addressable elements) — common for an app that doesn't publish an
+  accessibility tree — the result now appends a hint to drive the app by pixels (`glass_screenshot` +
+  `glass_click`), instead of returning a bare root-only outline. Previously only the Linux "no a11y
+  bus" path guided the agent; this covers the thin-tree outcome on every backend.
 
 ### Fixed
 - **Linux `a11y:true` now reaches AccessKit-based apps (egui/winit and other Rust GUI

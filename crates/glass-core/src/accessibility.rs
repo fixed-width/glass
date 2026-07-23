@@ -335,6 +335,20 @@ impl AxTree {
         walk(&self.root, 0, &mut out);
         out
     }
+
+    /// Guidance to surface when a snapshot exposes nothing to address — only the window
+    /// root, with no child elements. That means the app isn't publishing a usable
+    /// accessibility tree, which (outside the Linux no-bus path, which errors before a
+    /// tree is ever built) otherwise returns a bare root-only outline with no next step.
+    /// Backend-agnostic: the same thin-tree outcome on Windows/macOS/Android now steers
+    /// the agent to the pixel loop the way the Linux reader's no-tree error already does.
+    pub fn empty_guidance(&self) -> Option<&'static str> {
+        self.root.children.is_empty().then_some(
+            "no accessibility elements exposed — the app may not publish an a11y tree \
+             (some toolkits need it enabled, e.g. relaunch with a11y:true; canvas/game apps \
+             never will). Drive it by pixels instead: glass_screenshot, then glass_click at x,y.",
+        )
+    }
 }
 
 /// Context the display backend supplies so the a11y reader can locate the right
@@ -886,6 +900,24 @@ mod tests {
             bounds: None,
             children: vec![],
         }
+    }
+
+    #[test]
+    fn empty_guidance_flags_a_treeless_snapshot() {
+        // Only the window root, no children → nothing to address → steer to pixels.
+        let empty = AxTree {
+            root: leaf(AxRole::Window, "App"),
+            count: 0,
+        };
+        let hint = empty
+            .empty_guidance()
+            .expect("a root-only tree must yield guidance");
+        assert!(
+            hint.contains("glass_screenshot"),
+            "guidance names the pixel path: {hint}"
+        );
+        // A tree with real elements has something to address — no hint.
+        assert!(sample_tree().empty_guidance().is_none());
     }
 
     fn sample_tree() -> AxTree {
