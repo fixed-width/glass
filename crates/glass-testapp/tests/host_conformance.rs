@@ -332,3 +332,38 @@ async fn http_host_can_initialize_list_tools_and_get_an_image() {
 
     client.cancel().await.ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Xvfb; run via ./scripts/test-x11.sh"]
+async fn tool_sets_match_across_transports() {
+    let xvfb = Xvfb::start();
+
+    // stdio listing is blocking; run it off the async runtime.
+    let stdio_display = xvfb.display.clone();
+    let mut stdio_names = tokio::task::spawn_blocking(move || {
+        let mut srv = StdioServer::start(&stdio_display);
+        srv.initialize();
+        srv.list_tool_names()
+    })
+    .await
+    .expect("stdio listing task");
+
+    // http listing, in-process.
+    let client = boot_http_client(&xvfb.display).await;
+    let mut http_names: Vec<String> = client
+        .list_all_tools()
+        .await
+        .expect("list_all_tools")
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    client.cancel().await.ok();
+
+    stdio_names.sort();
+    http_names.sort();
+    assert!(!stdio_names.is_empty(), "no tools advertised over stdio");
+    assert_eq!(
+        stdio_names, http_names,
+        "tool set differs across transports:\n stdio={stdio_names:?}\n http={http_names:?}"
+    );
+}
