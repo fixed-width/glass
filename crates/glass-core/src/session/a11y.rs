@@ -87,10 +87,14 @@ impl Glass {
         Ok(crate::marks::render(&frame, &tree))
     }
 
-    /// Click the element with id `id` from the most recent `a11y_snapshot` via the normal
-    /// pointer path — the center of its bounds, or a swipe across the trailing control for a
-    /// row-shaped checkable on a trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]).
-    pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
+    /// Click the element with id `id` from the most recent `a11y_snapshot`. Tries the
+    /// platform's native accessibility action first (works for occluded/off-screen/boundless
+    /// elements, and on some backends never moves the pointer); when that's unavailable or
+    /// fails, falls back to the normal synthetic-pointer path — the center of the element's
+    /// bounds, or a swipe across the trailing control for a row-shaped checkable on a
+    /// trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]). The returned
+    /// [`ClickMethod`] says which path actually fired.
+    pub fn click_element(&mut self, id: AxNodeId) -> Result<ClickMethod> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
         let result = self.click_element_inner(id);
@@ -102,7 +106,20 @@ impl Glass {
         result
     }
 
-    fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
+    fn click_element_inner(&mut self, id: AxNodeId) -> Result<ClickMethod> {
+        // Native action first: works for occluded/off-screen/boundless elements and
+        // (on backends whose action API is out-of-band) doesn't move the cursor.
+        let native_fallback = match self.try_native_invoke(id) {
+            Ok(()) => return Ok(ClickMethod::NativeAction),
+            // Propagate-class: a drifted tree mis-clicks by stale bounds too, and the
+            // pre-checks (no snapshot / unknown id) fail the pointer path identically.
+            Err(
+                e @ (GlassError::AxElementChanged(_)
+                | GlassError::NoAxSnapshot
+                | GlassError::AxElementNotFound(_)),
+            ) => return Err(e),
+            Err(e) => native_fallback_reason(&e),
+        };
         let (bounds, checkable, trailing_toggle_backend, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
@@ -152,7 +169,7 @@ impl Glass {
             if let Some(prev) = prev {
                 let _ = self.select_window(prev);
             }
-            return result;
+            return result.map(|()| ClickMethod::Pointer { native_fallback });
         }
         // A switch whose backend reports the whole row as its frame with the control at the
         // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
@@ -179,6 +196,7 @@ impl Glass {
                 button: MouseButton::Left,
                 modifiers: vec![],
             })
+            .map(|()| ClickMethod::Pointer { native_fallback })
         } else {
             let (x, y) = bounds
                 .clamped_center(active_geo.width, active_geo.height)
@@ -190,7 +208,42 @@ impl Glass {
                 count: 1,
                 modifiers: vec![],
             })
+            .map(|()| ClickMethod::Pointer { native_fallback })
         }
+    }
+
+    /// One native-invoke attempt: same fingerprint + context assembly as
+    /// `set_value_inner`, then the backend's `invoke`.
+    fn try_native_invoke(&mut self, id: AxNodeId) -> Result<()> {
+        let (target, ctx) = {
+            let s = self.require_active()?;
+            if s.accessibility.is_none() {
+                return Err(GlassError::AxUnsupported);
+            }
+            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+            };
+            let ctx = AxContext {
+                pids: s.platform.app_pids(),
+                window: s.geometry.clone(),
+                window_handle: s.platform.active_window_handle(),
+                a11y_bus_addr: s.platform.a11y_bus_addr(),
+                limits: s.a11y_limits,
+            };
+            (target, ctx)
+        };
+        let s = self.active_mut()?;
+        s.accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .invoke(&ctx, &target)?;
+        s.pump();
+        Ok(())
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -369,6 +422,18 @@ impl Glass {
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
     fn settle_for_popup(&self) {
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Short, agent-facing reason a native-invoke attempt fell back to the pointer path.
+/// `AxUnsupported`'s own `Display` is snapshot-oriented (it tells the agent to screenshot
+/// instead), which would mislead in a click result — map it.
+fn native_fallback_reason(e: &GlassError) -> String {
+    match e {
+        GlassError::AxUnsupported => "backend has no native action path".into(),
+        GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
+        GlassError::AxActionFailed(_, msg) => format!("native action failed: {msg}"),
+        other => format!("native action error: {other}"),
     }
 }
 
@@ -1057,6 +1122,152 @@ mod tests {
     }
 
     #[test]
+    fn click_element_prefers_native_invoke_and_synthesizes_no_pointer() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, invoke_log) =
+            glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(method, ClickMethod::NativeAction);
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event on the native path"
+        );
+        let log = invoke_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].id, AxNodeId(1));
+        assert_eq!(log[0].role, AxRole::Button);
+        assert_eq!(log[0].name.as_deref(), Some("Save"));
+        assert!(
+            log[0].bounds.is_some(),
+            "fingerprint carries the snapshot bounds"
+        );
+    }
+
+    #[test]
+    fn click_element_falls_back_when_element_has_no_action_and_discloses() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::NoAction);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            method,
+            ClickMethod::Pointer {
+                native_fallback: "element exposes no activation action".into()
+            }
+        );
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn click_element_falls_back_when_backend_has_no_invoke() {
+        // Default knob = Unsupported = a backend that never implemented invoke (iOS/Android).
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            method,
+            ClickMethod::Pointer {
+                native_fallback: "backend has no native action path".into()
+            }
+        );
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn click_element_falls_back_when_the_action_fails() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Fail);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        match method {
+            ClickMethod::Pointer { native_fallback } => {
+                assert!(
+                    native_fallback.starts_with("native action failed:"),
+                    "{native_fallback}"
+                )
+            }
+            m => panic!("expected pointer fallback, got {m:?}"),
+        }
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn click_element_drift_propagates_and_never_pointer_clicks() {
+        // AxElementChanged means the tree drifted; a pointer click at the stale bounds
+        // would hit the wrong element, so there must be NO fallback.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Drifted);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert!(matches!(
+            g.click_element(AxNodeId(1)).unwrap_err(),
+            GlassError::AxElementChanged(1)
+        ));
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after drift"
+        );
+    }
+
+    #[test]
+    fn click_element_boundless_element_clicks_via_invoke() {
+        // Today a boundless node is AxElementNotClickable; with a native action it works.
+        let mut tree = fake_tree();
+        tree.root.children.push(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "button".into(),
+            name: Some("hidden".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![],
+        });
+        let (mut g, _) =
+            glass_with_a11y_invoke(FakePlatform::new(100, 100), tree, InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert_eq!(
+            g.click_element(AxNodeId(2)).unwrap(),
+            ClickMethod::NativeAction
+        );
+    }
+
+    #[test]
+    fn click_element_boundless_element_without_action_stays_not_clickable() {
+        let mut tree = fake_tree();
+        tree.root.children.push(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "button".into(),
+            name: Some("hidden".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![],
+        });
+        let (mut g, _) =
+            glass_with_a11y_invoke(FakePlatform::new(100, 100), tree, InvokeBehavior::NoAction);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert!(matches!(
+            g.click_element(AxNodeId(2)).unwrap_err(),
+            GlassError::AxElementNotClickable(2)
+        ));
+    }
+
+    #[test]
     fn click_element_without_popover_clicks_clamped_center_and_never_selects_a_window() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
@@ -1156,7 +1367,11 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
 
         // node #1 = the row-shaped checkable → a swipe across the trailing control, not a click.
-        g.click_element(AxNodeId(1)).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert!(
+            matches!(method, ClickMethod::Pointer { .. }),
+            "the swipe path is pointer-class (the fake's default invoke is Unsupported)"
+        );
         let expected = bounds.trailing_toggle_swipe(100, 100).unwrap();
         {
             let d = drags.lock().unwrap();
@@ -1367,8 +1582,12 @@ mod tests {
         let globex_id = tree.root.children[0].children[0].id;
         assert_eq!(globex_id, AxNodeId(2));
 
-        g.click_element(globex_id).unwrap();
+        let method = g.click_element(globex_id).unwrap();
 
+        assert!(
+            matches!(method, ClickMethod::Pointer { .. }),
+            "the fake's default invoke behavior is Unsupported, so this still routes pointer"
+        );
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
             Some((20, 54)),
@@ -1519,6 +1738,8 @@ mod tests {
                 set_log: log2,
                 set_fail: false,
                 limits_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1567,6 +1788,8 @@ mod tests {
                 set_log: Arc::new(Mutex::new(Vec::new())),
                 set_fail: false,
                 limits_log: limits_log.clone(),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1611,6 +1834,8 @@ mod tests {
                 set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 set_fail: true,
                 limits_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1874,6 +2099,8 @@ mod tests {
                 set_log: log2,
                 set_fail: false,
                 limits_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1922,6 +2149,8 @@ mod tests {
                 set_log: log2,
                 set_fail: false,
                 limits_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {

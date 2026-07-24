@@ -3,7 +3,7 @@
 
 use crate::accessibility::{
     element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree,
-    ElementCondition, ElementInfo, ElementMatch, WalkLimits,
+    ClickMethod, ElementCondition, ElementInfo, ElementMatch, WalkLimits,
 };
 use crate::baseline::BaselineStore;
 use crate::diff::{

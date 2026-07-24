@@ -254,6 +254,22 @@ impl Platform for FakePlatform {
     }
 }
 
+/// Scripts `FakeAccessibility::invoke`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum InvokeBehavior {
+    /// Mirror a backend that never implemented `invoke` (trait-default shape).
+    #[default]
+    Unsupported,
+    /// Native action fires and reports success.
+    Succeed,
+    /// Element exposes no activation action.
+    NoAction,
+    /// Action fired but the toolkit reported failure.
+    Fail,
+    /// Fingerprint mismatch — tree drifted since the snapshot.
+    Drifted,
+}
+
 /// A scriptable `Accessibility` returning a fixed tree.
 pub(crate) struct FakeAccessibility {
     pub(crate) tree: AxTree,
@@ -263,6 +279,14 @@ pub(crate) struct FakeAccessibility {
     /// `snapshot` or `set_value`) — lets a test prove `max_nodes` actually reached the
     /// backend, not just the session's own bookkeeping. `None` when unset.
     pub(crate) limits_log: Arc<Mutex<Option<crate::accessibility::WalkLimits>>>,
+    /// Scripts this backend's `invoke` outcome. Defaults to `Unsupported`, mirroring a
+    /// backend that never implemented it (the trait's default shape) — so every existing
+    /// test that doesn't opt in still exercises the pointer-fallback path unchanged.
+    pub(crate) invoke_behavior: InvokeBehavior,
+    /// Every target `invoke` "actuated" (only recorded when `invoke_behavior ==
+    /// Succeed`) — lets a test prove the native path fired instead of / in addition to the
+    /// pointer path.
+    pub(crate) invoke_log: Arc<Mutex<Vec<AxTarget>>>,
 }
 
 impl Accessibility for FakeAccessibility {
@@ -280,6 +304,22 @@ impl Accessibility for FakeAccessibility {
             .unwrap()
             .push((target.clone(), text.to_string()));
         Ok(())
+    }
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        *self.limits_log.lock().unwrap() = Some(ctx.limits);
+        match self.invoke_behavior {
+            InvokeBehavior::Unsupported => Err(GlassError::AxUnsupported),
+            InvokeBehavior::Succeed => {
+                self.invoke_log.lock().unwrap().push(target.clone());
+                Ok(())
+            }
+            InvokeBehavior::NoAction => Err(GlassError::AxActionUnavailable(target.id.0)),
+            InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
+                target.id.0,
+                "action reported failure".into(),
+            )),
+            InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
+        }
     }
 }
 
@@ -400,8 +440,33 @@ pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
             set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             set_fail: false,
             limits_log: Arc::new(Mutex::new(None)),
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
         }),
     )
+}
+
+/// Like `glass_with_a11y`, but scripts the backend's `invoke` outcome — for tests of the
+/// native-invoke-first `click_element` path. Returns the invoke log alongside the session
+/// so a test can assert what (if anything) was "actuated" natively.
+pub(crate) fn glass_with_a11y_invoke(
+    platform: FakePlatform,
+    tree: AxTree,
+    behavior: InvokeBehavior,
+) -> (Glass, Arc<Mutex<Vec<AxTarget>>>) {
+    let invoke_log = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(FakeAccessibility {
+            tree,
+            set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            set_fail: false,
+            limits_log: Arc::new(Mutex::new(None)),
+            invoke_behavior: behavior,
+            invoke_log: invoke_log.clone(),
+        }),
+    );
+    (g, invoke_log)
 }
 
 /// An `Accessibility` that returns a scripted sequence of trees — one per
