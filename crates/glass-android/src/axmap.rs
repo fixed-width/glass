@@ -1,6 +1,8 @@
 //! Pure mapping from `uiautomator dump` XML into glass's normalized `AxTree`.
 
-use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree};
+use glass_core::accessibility::{
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, MAX_SIBLINGS,
+};
 use glass_core::{GlassError, Result, WindowGeometry};
 
 /// Map an Android widget class (`android.widget.Button`, …) to a normalized role.
@@ -78,11 +80,23 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
             "uiautomator XML has no <hierarchy> root".into(),
         ));
     }
-    let children = hierarchy
+    let mut budget = WalkBudget::new();
+    let mut children = Vec::new();
+    for (i, n) in hierarchy
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "node")
-        .map(|n| map_node(n, window))
-        .collect();
+        .enumerate()
+    {
+        if i >= MAX_SIBLINGS {
+            budget.hit(TruncationLimit::Siblings);
+            break;
+        }
+        children.push(map_node(n, window, 0, &mut budget));
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
+        }
+    }
     let root = AxNode {
         id: AxNodeId(0),
         role: AxRole::Window,
@@ -98,10 +112,18 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
         }),
         children,
     };
-    Ok(AxTree::new(root))
+    let mut tree = AxTree::new(root);
+    tree.truncated = budget.truncation();
+    Ok(tree)
 }
 
-fn map_node(node: roxmltree::Node, window: &WindowGeometry) -> AxNode {
+fn map_node(
+    node: roxmltree::Node,
+    window: &WindowGeometry,
+    depth: usize,
+    budget: &mut WalkBudget,
+) -> AxNode {
+    budget.visit();
     let attr = |k: &str| node.attribute(k).unwrap_or("");
     let boolean = |k: &str| node.attribute(k) == Some("true");
     let class = attr("class");
@@ -127,11 +149,33 @@ fn map_node(node: roxmltree::Node, window: &WindowGeometry) -> AxNode {
         expanded: false,
         editable,
     };
-    let children = node
-        .children()
-        .filter(|n| n.is_element() && n.tag_name().name() == "node")
-        .map(|n| map_node(n, window))
-        .collect();
+    // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
+    // pathologically deep or wide device tree cannot blow the stack or the token budget.
+    let children = if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        vec![]
+    } else if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        vec![]
+    } else {
+        let mut out = Vec::new();
+        for (i, n) in node
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "node")
+            .enumerate()
+        {
+            if i >= MAX_SIBLINGS {
+                budget.hit(TruncationLimit::Siblings);
+                break;
+            }
+            out.push(map_node(n, window, depth + 1, budget));
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
+        }
+        out
+    };
     AxNode {
         id: AxNodeId(0),
         role,
@@ -241,6 +285,35 @@ mod tests {
             (AxRole::Button, Some("Save"))
         );
         assert_eq!(kids[2].bounds.unwrap().width, 1000);
+    }
+
+    /// A `<hierarchy>` with `n` flat top-level `<node>` elements, each a distinctly-named Button.
+    fn wide_hierarchy_xml(n: usize) -> String {
+        let mut kids = String::new();
+        for i in 0..n {
+            let top = i;
+            let bottom = i + 10;
+            kids.push_str(&format!(
+                r#"<node text="btn{i}" class="android.widget.Button" bounds="[0,{top}][10,{bottom}]" />"#
+            ));
+        }
+        format!(r#"<?xml version='1.0'?><hierarchy rotation="0">{kids}</hierarchy>"#)
+    }
+
+    #[test]
+    fn truncation_stops_the_walk_and_never_shifts_surviving_ids() {
+        // ids are assigned in the same pre-order the tree is walked, so a truncation that
+        // dropped a node from the middle rather than stopping at the end would shift every
+        // later id off the node its own index implies.
+        let xml = wide_hierarchy_xml(glass_core::MAX_NODES + 50);
+        let mut tree = build_tree(&xml, &win()).unwrap();
+        tree.assign_ids();
+
+        assert!(tree.truncated.is_some(), "the node cap must have been hit");
+        // The synthetic Window root is id 0 (never counted against the budget); top-level
+        // child at array index i is id i+1.
+        let third = tree.find(AxNodeId(3)).expect("id 3 survives");
+        assert_eq!(third.name.as_deref(), Some("btn2"));
     }
 
     #[test]
