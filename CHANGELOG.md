@@ -33,6 +33,14 @@ internal refactors, CI, or test-only changes.
   is truncated the notice now reports the actual limit and says how to widen it.
 
 ### Fixed
+- A transiently stalled Xvfb no longer fails `glass_start` on Linux/X11: if the private X
+  server doesn't report its display within 10s, glass kills it and retries once with a fresh
+  server (worst-case start latency in the still-failing case is ~24s). When startup still
+  fails, the error now includes the head of Xvfb's stderr output and names the recovery
+  (attach to an existing display with `GLASS_DISPLAY=:N`, or run Xvfb manually to diagnose).
+  Previously the first stall failed the session outright, with Xvfb's stderr discarded.
+  `glass doctor --deep`'s Xvfb probe budget now covers the retry, so it no longer reports a
+  failure for a stall the real start path survives.
 - The accessibility tree now reports when a snapshot was truncated. Previously a tree that hit
   an internal size limit was returned as though it were complete, so a missing element was
   indistinguishable from one that does not exist. All backends now share the same limits and

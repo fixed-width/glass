@@ -117,8 +117,15 @@ fn can_connect(display: &str) -> bool {
 
 /// Spawn a private Xvfb and tear it down, with a timeout so a wedged Xvfb can't hang
 /// doctor. Returns the display it came up on, or an error string.
+///
+/// The budget must cover `Xvfb::start`'s OWN worst case (which includes one
+/// retry of a wedged server) plus margin — a shorter budget here would report
+/// Fail for the exact transient class the start path survives, with a wrong
+/// remedy. Sized that way, the backstop effectively never fires and the probe
+/// thread always finishes and reaps its child (no orphan).
 fn probe_xvfb() -> Result<String, String> {
     let screen = std::env::var("GLASS_XVFB_SCREEN").unwrap_or_else(|_| "1280x800x24".into());
+    let budget = crate::xvfb::start_deadline() + Duration::from_secs(2);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // The Xvfb is dropped at the end of `map` (after we read its display),
@@ -129,9 +136,12 @@ fn probe_xvfb() -> Result<String, String> {
                 .map_err(|e| e.to_string()),
         );
     });
-    match rx.recv_timeout(Duration::from_secs(8)) {
+    match rx.recv_timeout(budget) {
         Ok(r) => r,
-        Err(_) => Err("Xvfb did not become ready within 8s".into()),
+        Err(_) => Err(format!(
+            "Xvfb did not become ready within {}s (including one retry of a stalled server)",
+            budget.as_secs()
+        )),
     }
 }
 
