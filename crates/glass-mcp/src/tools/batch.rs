@@ -68,6 +68,16 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
             Action::Move(args) => ("move", mouse_move(glass, args)),
             Action::Drag(args) => ("drag", drag(glass, args)),
             Action::Scroll(args) => ("scroll", scroll(glass, args)),
+            // `return` composes an observe into a standalone glass_type result; mid-sequence
+            // that observe's output would be discarded, so reject rather than run-and-drop.
+            Action::Type(args) if args.return_.is_some() => (
+                "type",
+                Err(
+                    "`return` is not accepted inside glass_do — use a `settle` action or the \
+                     terminal `then` observe"
+                        .into(),
+                ),
+            ),
             Action::Type(args) => ("type", type_text(glass, args)),
             Action::Key(args) => ("key", key(glass, args)),
             // A settle's text-only output is discarded mid-sequence; only its
@@ -167,6 +177,7 @@ mod tests {
                     click(10, 20),
                     Action::Type(TypeArgs {
                         text: "alice".into(),
+                        return_: None,
                     }),
                     Action::Key(KeyArgs {
                         chord: "Tab".into(),
@@ -182,6 +193,25 @@ mod tests {
         );
         let result = assert_envelope(&out, "glass_do");
         assert_eq!(result["executed"], json!(3));
+    }
+
+    #[test]
+    fn type_action_with_return_is_rejected() {
+        let mut g = started(FakePlatform::new(100, 100));
+        let err = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![Action::Type(TypeArgs {
+                    text: "hi".into(),
+                    return_: Some("settle".into()),
+                })],
+                then: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("action[0]"), "got: {err}");
+        assert!(err.contains("`return`"), "got: {err}");
+        assert!(err.contains("then"), "got: {err}");
     }
 
     #[test]

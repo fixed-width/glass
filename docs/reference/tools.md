@@ -54,7 +54,8 @@ parsing `result`.
 
 Most input/action tools (`glass_click`, `glass_move`, `glass_drag`, `glass_scroll`, `glass_gesture`,
 `glass_type`, `glass_key`, `glass_stop`, `glass_clipboard_set`) return an empty `{}` — `ok:true` in
-the envelope is itself the confirmation that the action ran.
+the envelope is itself the confirmation that the action ran. (`glass_type` can fold an optional
+observe into that result via `return` — see its entry.)
 
 ## Type conventions
 
@@ -281,6 +282,12 @@ Click at window-relative coordinates.
 Type a string into the focused window.
 
 - `text` (string, **required**).
+- `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for
+  `glass_click_element`. Not accepted inside a `glass_do` `type` action — use a `settle`
+  action or the terminal `then` observe there.
+
+Returns `{}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`,
+exactly as for `glass_click_element`.
 
 ### `glass_key`
 

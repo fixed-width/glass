@@ -219,6 +219,12 @@ pub struct ScrollArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeArgs {
     pub text: String,
+    /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
+    /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
+    /// to stop changing, text-only), or "none" (default). Not accepted inside a `glass_do`
+    /// `type` action — use a `settle` action or the terminal `then` observe there.
+    #[serde(rename = "return")]
+    pub return_: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -726,6 +732,15 @@ mod tests {
             serde_json::from_str(r#"{"id":2,"text":"hi","return":"settle"}"#).unwrap();
         assert_eq!(a.id, 2);
         assert_eq!(a.return_.as_deref(), Some("settle"));
+    }
+
+    #[test]
+    fn type_args_parse_return() {
+        let a: TypeArgs = serde_json::from_str(r#"{"text":"hi","return":"settle"}"#).unwrap();
+        assert_eq!(a.text, "hi");
+        assert_eq!(a.return_.as_deref(), Some("settle"));
+        let b: TypeArgs = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
+        assert!(b.return_.is_none());
     }
 
     #[test]

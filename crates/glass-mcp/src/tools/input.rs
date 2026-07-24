@@ -102,7 +102,12 @@ pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
     glass
         .key(&KeyEvent::Text(a.text.clone()))
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_type", serde_json::json!({})))
+    let (observed, extra) = crate::tools::resolve_return(glass, a.return_.as_deref())?;
+    let mut result = serde_json::json!({});
+    if let Some(o) = observed {
+        result["observed"] = o;
+    }
+    Ok(ToolOutput::result_with("glass_type", result, extra))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
@@ -192,7 +197,14 @@ mod tests {
     fn type_and_key_ok() {
         let mut g = started();
         assert_ok(
-            &type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap(),
+            &type_text(
+                &mut g,
+                &TypeArgs {
+                    text: "hi".into(),
+                    return_: None,
+                },
+            )
+            .unwrap(),
             "glass_type",
         );
         assert_ok(

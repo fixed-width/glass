@@ -16,6 +16,12 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
+  `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
+  fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
+  with guidance to use a `settle` action or the terminal `then` observe instead.
+
 ### Changed
 - `glass_a11y_snapshot` now returns a compacted outline: chains of unnamed single-child
   container elements are collapsed. Element ids are unchanged and every element remains

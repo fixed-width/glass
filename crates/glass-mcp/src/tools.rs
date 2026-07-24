@@ -1610,6 +1610,61 @@ mod tests {
     }
 
     #[test]
+    fn type_return_settle_folds_into_observed() {
+        use glass_core::Frame;
+        // Mirrors the click_element/set_value settle observes: wait_stable needs frames;
+        // one solid frame (repeated by the fake) settles.
+        let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let out = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "hi".into(),
+                return_: Some("settle".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folds into `result.observed`, no extra sibling"
+        );
+        let v = assert_envelope(&out, "glass_type");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
+    }
+
+    #[test]
+    fn type_return_snapshot_appends_outline() {
+        let mut g = started_a11y_frames(vec![]);
+        let out = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "x".into(),
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        assert_envelope(&out, "glass_type");
+        assert!(
+            matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
+            "outline appended"
+        );
+    }
+
+    #[test]
+    fn type_unknown_return_rejected() {
+        let mut g = started_a11y_frames(vec![]);
+        let err = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "x".into(),
+                return_: Some("bogus".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown return"), "msg: {err}");
+    }
+
+    #[test]
     fn list_and_select_window_tools() {
         let mut g = glass_with(FakePlatform::new(320, 240));
         g.start(&AppSpec {

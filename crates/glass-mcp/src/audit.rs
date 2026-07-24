@@ -800,6 +800,7 @@ mod tests {
             &mut g,
             &TypeArgs {
                 text: "secret".into(),
+                return_: None,
             },
         )
         .unwrap(); // "type"
