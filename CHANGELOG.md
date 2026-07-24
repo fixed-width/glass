@@ -16,6 +16,17 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- `glass_a11y_snapshot` now returns a compacted outline: chains of unnamed single-child
+  container elements are collapsed. Element ids are unchanged and every element remains
+  addressable with `glass_click_element` / `glass_set_value`.
+
+### Fixed
+- The accessibility tree now reports when a snapshot was truncated. Previously a tree that hit
+  an internal size limit was returned as though it were complete, so a missing element was
+  indistinguishable from one that does not exist. All backends now share the same limits and
+  disclose when one is reached.
+
 ## [1.1.0] - 2026-07-23
 
 ### Added

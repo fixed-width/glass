@@ -11,6 +11,26 @@ fn log(line: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Wrap `add_contents` in an unnamed container exposed to the accessibility tree with an
+/// explicit `Pane` role, rather than the plain `Frame::group`/`ui.group` default. A plain
+/// group's container is registered internally with accesskit's `GenericContainer` role, which
+/// accesskit's own AT-SPI adapter always elides (its node filter drops every
+/// `GenericContainer` regardless of name or children — see `accesskit_consumer::filters`), so
+/// it would never reach glass's accessibility tree. `Pane` is a distinct, non-generic role
+/// that survives that filter, so it lands in the a11y tree as a real, unnamed, single-child
+/// container — the wrapper chain this fixture's on-box a11y tests need `render_compact` to
+/// have something to collapse.
+fn wrap_in_pane<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let mut prepared = egui::Frame::group(ui.style()).begin(ui);
+    ui.ctx()
+        .accesskit_node_builder(prepared.content_ui.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::Pane);
+        });
+    let ret = add_contents(&mut prepared.content_ui);
+    prepared.end(ui);
+    ret
+}
+
 #[derive(Default)]
 struct Fixture {
     text: String,
@@ -89,9 +109,18 @@ impl eframe::App for Fixture {
             {
                 log(&format!("[fixture] value={}", self.value));
             }
-            if ui.button("Apply").clicked() {
-                log("[fixture] apply");
-            }
+            // Nest Apply inside a pair of unnamed, single-child panes (see `wrap_in_pane`) —
+            // this fixture's accessibility tree is otherwise flat, so on-box a11y tests that
+            // assert the outline's compact render is smaller than its full render need this
+            // chain to have something to collapse. Doesn't change Apply's own role, name, or
+            // behavior.
+            wrap_in_pane(ui, |ui| {
+                wrap_in_pane(ui, |ui| {
+                    if ui.button("Apply").clicked() {
+                        log("[fixture] apply");
+                    }
+                });
+            });
         });
     }
 }
