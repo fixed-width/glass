@@ -356,6 +356,58 @@ fn onbox_a11y_snapshot_and_click() {
     let _ = glass.stop();
 }
 
+// The Button case above only reaches the ladder's Invoke rung (fire-and-report, no post-state to
+// verify). charmap's "Advanced view >>" checkbox exposes UIA TogglePattern but not InvokePattern,
+// so this test exercises the ladder's Toggle rung instead — the one rung with a readable
+// post-state, which `run_invoke` (glass-a11y-windows) polls after firing `Toggle()` and only
+// returns `Ok` once the state has actually flipped. So a plain `Ok(NativeAction)` here already
+// proves the flip against a real UIA provider; the re-snapshot poll below is belt-and-braces on
+// top of that, mirroring the AT-SPI GTK-switch analogue.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_native_toggle_checkbox() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut glass = glass_windows_with_a11y();
+    let _geo = glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
+    let mut hit = None;
+    first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut hit);
+    let n = hit.expect("charmap exposes a CheckBox (Advanced view) with on-screen bounds");
+    let id = n.id;
+    let before = n.states.checked;
+
+    let method = glass.click_element(id).expect("click element by id");
+    assert_eq!(
+        method,
+        glass_core::ClickMethod::NativeAction,
+        "charmap's Advanced-view checkbox publishes only UIA TogglePattern; click_element must \
+         take the native path"
+    );
+
+    // Bounded re-snapshot poll for the state flip. Toggling Advanced view resizes the charmap
+    // window (a side panel opens), so re-find the checkbox by role each pass rather than trusting
+    // a stale id or geometry from the pre-click snapshot.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let t = glass.a11y_snapshot(None).expect("re-snapshot");
+        let mut after = None;
+        first_role_with_bounds(&t.root, AxRole::CheckBox, &mut after);
+        if after.is_some_and(|n2| n2.states.checked != before) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native toggle never flipped the checkbox's checked state"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = glass.stop();
+}
+
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_handoff_grace() {
