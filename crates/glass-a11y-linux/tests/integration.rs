@@ -403,16 +403,14 @@ fn launch_fixture() -> Glass {
 /// The GTK fixture's Switch "Active" exposes an AT-SPI activation action ("toggle") —
 /// click_element must take the native path and actually toggle it.
 ///
-/// Deviation from the design brief: the brief specified the CheckButton "Enable" for
-/// this test. Probed against this box's real GTK4 (4.14.5), a bare `Gtk.CheckButton`
-/// publishes ZERO AT-SPI actions (confirmed with an instrumented `try_action` that
-/// enumerated 0 actions on it, while the same probe found "click" on the Save button) —
-/// consistent with the pre-existing comment on `set_toggle` ("a GTK4 GtkCheckButton
-/// exposes none"). A test asserting `ClickMethod::NativeAction` against that widget
-/// would never pass on real GTK4, so it targets the Switch instead: same fixture, same
-/// production code path (`click_element` -> `try_native_invoke` -> `Accessibility::invoke`),
-/// a widget already proven (via `set_value_toggles_switch`, same target) to expose a
-/// real AT-SPI action.
+/// A bare `Gtk.CheckButton` publishes ZERO AT-SPI actions (verified on GTK 4.14.5 with
+/// an instrumented `try_action` that enumerated 0 actions on the fixture's "Enable"
+/// checkbutton, while the same probe found "click" on the Save button) — matching the
+/// pre-existing comment on `set_toggle` ("a GTK4 GtkCheckButton exposes none"). The
+/// Switch is the fixture's action-exposing toggle, so it's the right target for proving
+/// the native path here: same fixture, same production code path (`click_element` ->
+/// `try_native_invoke` -> `Accessibility::invoke`), and a widget already proven (via
+/// `set_value_toggles_switch`, same target) to expose a real AT-SPI action.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn click_element_native_invokes_gtk_switch() {

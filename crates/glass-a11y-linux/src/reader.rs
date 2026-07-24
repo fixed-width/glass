@@ -524,7 +524,7 @@ async fn set_toggle(
 }
 
 /// AT-SPI action names that activate a widget for a generic click. Broader than
-/// TOGGLE_ACTION_NAMES on the activation side (push/jump), narrower on the
+/// [`TOGGLE_ACTION_NAMES`] on the activation side (push/jump), narrower on the
 /// check/uncheck side — those are set_value verbs, not clicks.
 const ACTIVATE_ACTION_NAMES: &[&str] = &["click", "activate", "press", "push", "jump", "toggle"];
 
