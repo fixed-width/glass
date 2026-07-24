@@ -21,8 +21,9 @@ pub struct RoleTally {
 /// Tally every node by `(raw_role, role)`.
 ///
 /// Unmapped buckets ([`AxRole::Other`]) come first — they are what a probe run is looking for
-/// — then buckets by descending count, then by token. The order is total, so two runs of the
-/// same app diff cleanly.
+/// — then buckets by descending count, then by token, then by role (using Debug format as a
+/// tiebreaker so the same token mapping to multiple roles orders consistently). The order is
+/// total, so two runs of the same app diff cleanly.
 pub fn role_histogram(tree: &AxTree) -> Vec<RoleTally> {
     let mut tallies: Vec<RoleTally> = Vec::new();
     visit(&tree.root, &mut tallies);
@@ -110,7 +111,8 @@ mod tests {
     #[test]
     fn same_token_mapping_two_ways_gets_two_buckets() {
         // A backend may key on more than the token alone (a control type plus a pattern, a
-        // role plus a subrole), so one token can legitimately produce two roles.
+        // role plus a subrole), so one token can legitimately produce two roles. When the same
+        // token maps to multiple roles, they are ordered by role Debug format as a tiebreaker.
         let tree = AxTree::new(node(
             "root",
             AxRole::Window,
@@ -120,7 +122,60 @@ mod tests {
             ],
         ));
         let h = role_histogram(&tree);
-        assert_eq!(h.iter().filter(|t| t.raw_role == "row").count(), 2);
+        assert_eq!(
+            h,
+            vec![
+                RoleTally {
+                    raw_role: "root".into(),
+                    role: AxRole::Window,
+                    count: 1
+                },
+                RoleTally {
+                    raw_role: "row".into(),
+                    role: AxRole::ListItem,
+                    count: 1
+                },
+                RoleTally {
+                    raw_role: "row".into(),
+                    role: AxRole::TreeItem,
+                    count: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn token_tiebreak_sorts_lexicographically_when_unmapped_and_count_tie() {
+        // When two buckets tie on unmapped status and count, they sort by token lexicographically.
+        let tree = AxTree::new(node(
+            "unused",
+            AxRole::Window,
+            vec![
+                node("beta", AxRole::Other, vec![]),
+                node("alpha", AxRole::Other, vec![]),
+            ],
+        ));
+        let h = role_histogram(&tree);
+        assert_eq!(
+            h,
+            vec![
+                RoleTally {
+                    raw_role: "alpha".into(),
+                    role: AxRole::Other,
+                    count: 1
+                },
+                RoleTally {
+                    raw_role: "beta".into(),
+                    role: AxRole::Other,
+                    count: 1
+                },
+                RoleTally {
+                    raw_role: "unused".into(),
+                    role: AxRole::Window,
+                    count: 1
+                },
+            ]
+        );
     }
 
     #[test]
