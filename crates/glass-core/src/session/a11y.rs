@@ -23,9 +23,28 @@ impl Glass {
     /// relative, ids assigned by the core). Caches it for `click_element`.
     /// `AxUnsupported` if the backend has no accessibility reader.
     pub fn a11y_snapshot(&mut self, max_nodes: Option<usize>) -> Result<AxTree> {
-        let limits = crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
+        // A user-facing snapshot sets the limits for the id-space that follows: `set_value`
+        // re-walks with them, and internal re-snapshots reuse them via `a11y_resnapshot`. So
+        // this is the ONLY place that changes `a11y_limits` from a caller's `max_nodes`.
+        self.active_mut()?.a11y_limits =
+            crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
+        self.snapshot_at_current_limits()
+    }
+
+    /// Re-snapshot the active window reusing the limits the last user snapshot set — it does NOT
+    /// reset them. Used by compound operations (the `return:"snapshot"` fold, `wait_for_element`,
+    /// and the scroll/combo/toggle loops) so an agent working in a raised-cap tree keeps that
+    /// id-space instead of silently reverting to the default cap on the next internal snapshot.
+    pub fn a11y_resnapshot(&mut self) -> Result<AxTree> {
+        self.snapshot_at_current_limits()
+    }
+
+    /// The snapshot worker: walks the active window's tree bounded by the session's current
+    /// `a11y_limits` and caches it. Callers set `a11y_limits` first (or reuse it) — see
+    /// [`Glass::a11y_snapshot`] / [`Glass::a11y_resnapshot`].
+    fn snapshot_at_current_limits(&mut self) -> Result<AxTree> {
         let s = self.active_mut()?;
-        s.a11y_limits = limits;
+        let limits = s.a11y_limits;
         // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
         // precedence over — and a reader-less backend skips — the geometry round-trip below.
         if s.accessibility.is_none() {
@@ -64,7 +83,7 @@ impl Glass {
     /// Caches the snapshot, so `click_element` resolves a mark's id afterward.
     pub fn a11y_marks(&mut self) -> Result<(Frame, Vec<Mark>)> {
         let frame = self.screenshot(None, None)?;
-        let tree = self.a11y_snapshot(None)?;
+        let tree = self.a11y_resnapshot()?;
         Ok(crate::marks::render(&frame, &tree))
     }
 
@@ -258,7 +277,7 @@ impl Glass {
                         TOGGLE_VERIFY_INTERVAL_MS,
                         TOGGLE_VERIFY_TIMEOUT_MS,
                         || {
-                            let tree = self.a11y_snapshot(None)?;
+                            let tree = self.a11y_resnapshot()?;
                             let now = find_checkable_near(&tree.root, target.bounds.as_ref())
                                 .is_some_and(|n| n.states.checked == want);
                             Ok(now.then_some(()))
@@ -300,7 +319,7 @@ impl Glass {
         // Re-read the realized options + which one is currently selected. The open
         // combo is `expanded`; when several combos exist, ids don't survive the
         // re-snapshot, so fall back to the one nearest the target's bounds.
-        let tree = self.a11y_snapshot(None)?;
+        let tree = self.a11y_resnapshot()?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -336,7 +355,7 @@ impl Glass {
         self.settle_for_popup();
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_snapshot(None)?;
+        let tree = self.a11y_resnapshot()?;
         let ok = find_combo_near(&tree.root, target.bounds.as_ref())
             .and_then(|c| c.name.as_deref())
             .is_some_and(|n| n.eq_ignore_ascii_case(want));

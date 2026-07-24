@@ -273,8 +273,18 @@ pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
 /// (how to widen the cap). Kept here, not in `glass-core`, so core stays tool-agnostic; used by
 /// both `a11y_snapshot` and the `return:"snapshot"` fold so both disclose the recourse identically.
 fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
-    tree.truncation_notice().map(|notice| {
+    let notice = tree.truncation_notice()?;
+    // Only a Nodes truncation is raisable via `max_nodes`. A Depth/Siblings hit is structural
+    // (max_nodes doesn't touch those rails), and the core notice already steers to narrowing the
+    // UI / driving by pixels — so don't dangle a `max_nodes` recourse that wouldn't help.
+    let raisable = matches!(
+        tree.truncated.map(|t| t.limit),
+        Some(glass_core::TruncationLimit::Nodes)
+    );
+    Some(if raisable {
         format!("{notice} Pass max_nodes to raise the limit, or max_nodes: 0 for the full tree.")
+    } else {
+        notice
     })
 }
 
@@ -350,7 +360,9 @@ fn resolve_return(
             // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
             // tree (not pixels) and still returns the freshest tree — the caller asked for it.
             let _ = glass.wait_stable(&settle_params());
-            let tree = glass.a11y_snapshot(None).map_err(|e| e.to_string())?;
+            // Reuse the session's current limits so a fold after a raised/unbounded snapshot
+            // isn't silently re-truncated to the default cap.
+            let tree = glass.a11y_resnapshot().map_err(|e| e.to_string())?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
             let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(

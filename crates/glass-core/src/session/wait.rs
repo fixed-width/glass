@@ -371,7 +371,7 @@ impl Glass {
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            let tree = self.a11y_snapshot(None)?; // fresh snapshot; assigns ids, caches, pumps
+            let tree = self.a11y_resnapshot()?; // fresh snapshot; assigns ids, caches, pumps
             Ok(
                 match element_match(
                     &tree,
@@ -522,7 +522,7 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
     ) -> Result<(Option<ElementInfo>, String)> {
-        let tree = self.a11y_snapshot(None)?;
+        let tree = self.a11y_resnapshot()?;
         let found = match element_match(
             &tree,
             params.name.as_deref(),

@@ -303,15 +303,20 @@ impl WalkLimits {
         siblings: MAX_SIBLINGS,
     };
 
-    /// Map the MCP `max_nodes` surface to limits: `None` → default; `Some(0)` → fully
-    /// unbounded (all three lifted); `Some(n)` → cap nodes at `n`, depth/siblings default.
+    /// Map the MCP `max_nodes` surface to limits: `None` → default; `Some(0)` → lift the node
+    /// cap (`nodes = usize::MAX`) for the full tree; `Some(n)` → cap nodes at `n`. `max_nodes`
+    /// controls the node count ONLY — `depth` and `siblings` always keep their defaults. Those
+    /// two are structural safety rails, not a size budget: the recursive native-tree walkers
+    /// (AT-SPI / AX / UIA) have no cycle detection, so an unbounded depth on a cyclic or
+    /// pathological tree would recurse to a stack overflow (which aborts the process). The
+    /// generous defaults (`MAX_DEPTH`/`MAX_SIBLINGS`) never bite a real UI, so keeping them costs
+    /// the caller nothing while preserving that backstop even under `max_nodes: 0`.
     pub fn from_max_nodes(max_nodes: Option<usize>) -> WalkLimits {
         match max_nodes {
             None => WalkLimits::DEFAULT,
             Some(0) => WalkLimits {
                 nodes: usize::MAX,
-                depth: usize::MAX,
-                siblings: usize::MAX,
+                ..WalkLimits::DEFAULT
             },
             Some(n) => WalkLimits {
                 nodes: n,
@@ -1535,12 +1540,15 @@ mod tests {
     }
 
     #[test]
-    fn from_max_nodes_none_is_default_some_zero_is_unbounded_some_n_caps_nodes_only() {
+    fn from_max_nodes_controls_nodes_only_keeping_depth_and_sibling_rails() {
         assert_eq!(WalkLimits::from_max_nodes(None), WalkLimits::DEFAULT);
+        // Some(0) lifts the node cap for the full tree, but depth/siblings keep their defaults
+        // (structural safety rails against a cyclic/pathological native tree — see from_max_nodes).
         let unbounded = WalkLimits::from_max_nodes(Some(0));
         assert_eq!(unbounded.nodes, usize::MAX);
-        assert_eq!(unbounded.depth, usize::MAX);
-        assert_eq!(unbounded.siblings, usize::MAX);
+        assert_eq!(unbounded.depth, WalkLimits::DEFAULT.depth);
+        assert_eq!(unbounded.siblings, WalkLimits::DEFAULT.siblings);
+        // Some(n) caps nodes at n, depth/siblings default.
         let capped = WalkLimits::from_max_nodes(Some(42));
         assert_eq!(capped.nodes, 42);
         assert_eq!(capped.depth, WalkLimits::DEFAULT.depth);
@@ -1558,17 +1566,18 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_limits_never_report_exhausted_past_the_default_cap() {
+    fn max_nodes_zero_lifts_the_node_cap_but_keeps_the_depth_rail() {
         let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(0)));
-        // Visit well past the OLD node cap: under DEFAULT this would exhaust; unbounded must not,
-        // so this fails if `Some(0)` left `nodes` at MAX_NODES instead of lifting it.
+        // Visit well past the OLD node cap: under DEFAULT this would exhaust; a lifted node cap
+        // must not, so this fails if `Some(0)` left `nodes` at MAX_NODES instead of lifting it.
         for _ in 0..(MAX_NODES + 10) {
             b.visit();
         }
-        assert!(!b.nodes_exhausted(), "unbounded nodes never exhaust");
+        assert!(!b.nodes_exhausted(), "a lifted node cap never exhausts");
+        // The depth rail is deliberately KEPT even under max_nodes:0 (cycle/stack-overflow guard).
         assert!(
-            !b.depth_exhausted(MAX_DEPTH + 1000),
-            "unbounded depth never exhausts"
+            b.depth_exhausted(MAX_DEPTH),
+            "the depth safety rail is preserved under a lifted node cap"
         );
     }
 
