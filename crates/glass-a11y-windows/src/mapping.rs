@@ -5,42 +5,60 @@
 
 use glass_core::{AxRole, AxStates};
 
+/// Every UIA control type glass maps, as `(ControlTypeId, canonical name, role)`. The
+/// canonical name is the control type's documented English name — it is what the reader puts
+/// in `raw_role`, so an unmapped-but-known control type is still legible to a caller and
+/// identical on every machine, unlike UIA's localized control-type string.
+pub const ROLE_TOKENS: &[(u32, &str, AxRole)] = &[
+    (50000, "Button", AxRole::Button),
+    (50002, "CheckBox", AxRole::CheckBox),
+    (50003, "ComboBox", AxRole::ComboBox),
+    (50004, "Edit", AxRole::TextField),
+    (50005, "Hyperlink", AxRole::Link),
+    (50006, "Image", AxRole::Image),
+    (50007, "ListItem", AxRole::ListItem),
+    (50008, "List", AxRole::List),
+    (50009, "Menu", AxRole::Menu),
+    (50010, "MenuBar", AxRole::MenuBar),
+    (50011, "MenuItem", AxRole::MenuItem),
+    (50012, "ProgressBar", AxRole::ProgressBar),
+    (50013, "RadioButton", AxRole::RadioButton),
+    (50014, "ScrollBar", AxRole::ScrollBar),
+    (50015, "Slider", AxRole::Slider),
+    (50016, "Spinner", AxRole::SpinButton),
+    (50017, "StatusBar", AxRole::StatusBar),
+    (50018, "Tab", AxRole::TabList),
+    (50019, "TabItem", AxRole::Tab),
+    (50020, "Text", AxRole::Label),
+    (50021, "ToolBar", AxRole::Toolbar),
+    (50023, "Tree", AxRole::Tree),
+    (50024, "TreeItem", AxRole::TreeItem),
+    (50026, "Group", AxRole::Group),
+    (50028, "DataGrid", AxRole::Table),
+    // A split button is an actionable button carrying a dropdown.
+    (50031, "SplitButton", AxRole::Button),
+    (50032, "Window", AxRole::Window),
+    (50033, "Pane", AxRole::Group),
+    (50036, "Table", AxRole::Table),
+    (50038, "Separator", AxRole::Separator),
+];
+
 /// Map a UIA `ControlTypeId` to the normalized `AxRole`; unmapped ids become
-/// `AxRole::Other` (the reader keeps the localized control-type name in `raw_role`).
+/// `AxRole::Other` (the reader keeps the canonical control-type name in `raw_role`).
 pub fn map_role(control_type_id: u32) -> AxRole {
-    match control_type_id {
-        50000 => AxRole::Button,
-        50002 => AxRole::CheckBox,
-        50003 => AxRole::ComboBox,
-        50004 => AxRole::TextField, // Edit
-        50005 => AxRole::Link,      // Hyperlink
-        50006 => AxRole::Image,
-        50007 => AxRole::ListItem,
-        50008 => AxRole::List,
-        50009 => AxRole::Menu,
-        50010 => AxRole::MenuBar,
-        50011 => AxRole::MenuItem,
-        50012 => AxRole::ProgressBar,
-        50013 => AxRole::RadioButton,
-        50014 => AxRole::ScrollBar,
-        50015 => AxRole::Slider,
-        50016 => AxRole::SpinButton,
-        50017 => AxRole::StatusBar,
-        50018 => AxRole::TabList, // Tab
-        50019 => AxRole::Tab,     // TabItem
-        50020 => AxRole::Label,   // Text
-        50021 => AxRole::Toolbar,
-        50023 => AxRole::Tree,
-        50024 => AxRole::TreeItem,
-        50026 => AxRole::Group,
-        50028 => AxRole::Table,  // DataGrid
-        50031 => AxRole::Button, // SplitButton — an actionable button with a dropdown
-        50032 => AxRole::Window,
-        50033 => AxRole::Group, // Pane
-        50036 => AxRole::Table,
-        50038 => AxRole::Separator,
-        _ => AxRole::Other,
-    }
+    ROLE_TOKENS
+        .iter()
+        .find(|(id, _, _)| *id == control_type_id)
+        .map(|(_, _, role)| *role)
+        .unwrap_or(AxRole::Other)
+}
+
+/// The control type's canonical English name, or `None` for an id glass does not know.
+pub fn canonical_name(control_type_id: u32) -> Option<&'static str> {
+    ROLE_TOKENS
+        .iter()
+        .find(|(id, _, _)| *id == control_type_id)
+        .map(|(_, name, _)| *name)
 }
 
 /// Plain state facts the reader gathers from a UIA element (no `uiautomation` types here,
@@ -160,5 +178,43 @@ mod tests {
         assert_eq!(format_range_value(100.0), "100");
         assert_eq!(format_range_value(50.5), "50.5");
         assert_eq!(format_range_value(-3.0), "-3");
+    }
+
+    #[test]
+    fn role_tokens_have_no_duplicate_ids() {
+        for (i, (id, _, _)) in ROLE_TOKENS.iter().enumerate() {
+            assert!(
+                !ROLE_TOKENS[i + 1..].iter().any(|(other, _, _)| other == id),
+                "control type {id} listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_name_is_stable_and_locale_free() {
+        assert_eq!(canonical_name(50000), Some("Button"));
+        assert_eq!(canonical_name(50036), Some("Table"));
+        assert_eq!(canonical_name(49999), None);
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::AxRole;
+        for role in AxRole::ALL {
+            let mapped = ROLE_TOKENS.iter().any(|(_, _, r)| *r == role);
+            match support(role, AxBackend::Windows) {
+                RoleSupport::Mapped => {
+                    assert!(
+                        mapped,
+                        "{role:?} declared Mapped but no control type maps to it"
+                    )
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by a control type but the matrix does not declare it"
+                ),
+            }
+        }
     }
 }
