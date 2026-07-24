@@ -42,8 +42,9 @@ pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("WebView", AxRole::Group),
 ];
 
-/// Roles reachable only through the container rule in [`class_to_role`] (any leaf ending in
-/// `Layout`, plus `View`/`ViewGroup`), which no fixed token list can express.
+/// Roles the container rule in [`class_to_role`] can produce (any leaf ending in `Layout`,
+/// plus `View`/`ViewGroup`). These roles cannot be expressed as a fixed token list, so the
+/// column test counts them to verify full role support coverage.
 #[allow(dead_code)]
 pub const RULE_ROLES: &[AxRole] = &[AxRole::Group];
 
@@ -459,8 +460,10 @@ mod tests {
         for role in AxRole::ALL {
             let mapped = CLASS_TOKENS.iter().any(|(_, r)| *r == role)
                 || RULE_ROLES.contains(&role)
-                // The tree root is synthesized as a window by `AxTree` construction, not by
-                // a class name.
+                // Only the uiautomator reader (`build_tree`) synthesizes a Window root; the
+                // on-device AccessibilityService reader roots the tree at the device's node,
+                // which comes from `class_to_role` like any other node. Exempt Window since
+                // `class_to_role` cannot produce it.
                 || role == AxRole::Window;
             match support(role, AxBackend::Android) {
                 RoleSupport::Mapped => {
