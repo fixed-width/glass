@@ -130,6 +130,10 @@ fn walk(
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     let first_child = walker.get_first_child(el).ok();
+    // Tests only whether a first child exists, before `is_offscreen` filters it. A node whose
+    // children are all offscreen, reached once the budget is spent, still records a truncation
+    // though nothing real was declined. Pre-filtering would mean walking the whole
+    // `get_first_child`/`get_next_sibling` chain — the unbounded scan `MAX_SIBLINGS` bounds.
     if first_child.is_some() && may_explore_children(budget, depth) {
         // Offscreen children are skipped without entering, so they never count against
         // `MAX_NODES` — a virtualized list of thousands (or a cyclic `get_next_sibling`
@@ -343,6 +347,10 @@ fn find_nth(
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     let first_child = walker.get_first_child(el).ok();
+    // Same gap as `walk`: only tests whether a first child exists, before `is_offscreen` runs.
+    // A node whose children are all offscreen, reached once the budget is spent, still records
+    // a truncation though nothing real was declined — left as-is for the same reason: it would
+    // mean walking the whole sibling chain, exactly the scan `MAX_SIBLINGS` exists to bound.
     if first_child.is_none() || !may_explore_children(budget, depth) {
         return None;
     }

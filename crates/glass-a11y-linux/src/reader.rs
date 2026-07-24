@@ -239,6 +239,12 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 /// caller-supplied id — so a bound applied in one traversal but not the other resolves the
 /// id against a different tree and writes to the wrong element. Sharing the decision makes
 /// that divergence impossible to introduce by editing only one of them.
+//
+// The exactly-at-cap regression — a complete tree of MAX_NODES nodes must report `None`, since
+// the last node to arrive wasn't declined — is unit-tested directly in the Android and iOS
+// mappers, which build a synthetic tree in-process. This reader shares that loop shape but reads
+// a live system tree over IPC, where a tree at the cap would run ~1500 nodes at several
+// round-trips each — landing on `SNAPSHOT_TIMEOUT` and yielding a flaky test, not a reliable one.
 fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
     if budget.depth_exhausted(depth) {
         budget.hit(TruncationLimit::Depth);

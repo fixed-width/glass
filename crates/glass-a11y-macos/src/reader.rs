@@ -307,6 +307,10 @@ fn walk(
         );
         Vec::new()
     });
+    // Gated on the raw `child_els`, not filtered by `should_skip` first. A node whose children
+    // are all skipped, reached once the node/depth budget is spent, still records a truncation
+    // though nothing real was declined. Pre-filtering would mean calling `should_skip` — a live
+    // AX round trip — over the whole list, exactly the scan `MAX_SIBLINGS` below exists to bound.
     if !child_els.is_empty() && may_explore_children(budget, depth) {
         // `MAX_NODES` only counts nodes actually entered, and `should_skip` siblings are
         // skipped without entering, so an all-skipped level (a virtualized list of thousands)
@@ -396,6 +400,10 @@ fn find_nth(
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
     let child_els = ffi::children(&el).unwrap_or_default();
+    // Same gap as `walk`: gated on the raw `child_els`, before `should_skip` runs. A node whose
+    // children are all skipped, reached once the budget is spent, still records a truncation
+    // though nothing real was declined — left as-is for the same reason: pre-filtering means
+    // calling `should_skip` over the whole list, the scan `MAX_SIBLINGS` exists to bound.
     if child_els.is_empty() || !may_explore_children(budget, depth) {
         return None;
     }
