@@ -342,7 +342,9 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 /// which `click_element` (glass-core) treats as a fall-back-to-pointer signal, not a fatal error.
 ///
 /// Only the Toggle rung has a post-state a client can read back, so only it verifies actuation;
-/// the other three are fire-and-report, exactly as their patterns define.
+/// the other three are fire-and-report, exactly as their patterns define. That rung is also the
+/// one exception to "first pattern wins": if its state can't be read it is skipped rather than
+/// failed, since it cannot be verified and nothing has been dispatched yet.
 ///
 /// Known limitation, deliberate: `get_pattern` returning `Err` is indistinguishable here between
 /// "this control does not implement the pattern" and "the COM call itself failed", so both land
@@ -383,22 +385,31 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         // a provider that accepts `Toggle()` without applying it would otherwise report a
         // successful click on a control that never moved. Read before, fire, then poll until
         // the state differs — same cadence as `run_set_value`'s write verify.
-        let before = p.get_toggle_state().map_err(fail)?;
-        p.toggle().map_err(fail)?;
-        let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
-        loop {
-            if p.get_toggle_state().map_err(fail)? != before {
-                return Ok(());
+        //
+        // A pattern whose state can't even be READ can't be verify-toggled, so this rung is
+        // unusable — fall through to the rest of the ladder instead of reporting a failure.
+        // Nothing has been dispatched at this point, so falling through is safe: the worst
+        // outcome is `AxActionUnavailable` and a single pointer click, whereas an error here
+        // would propagate (an error after dispatch never falls back) and kill the click.
+        if let Ok(before) = p.get_toggle_state() {
+            p.toggle().map_err(fail)?;
+            let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+            loop {
+                // Past the dispatch, a failed read IS a failure: `fail` (AxActionFailed) is
+                // right here, because the toggle may have landed and must not be re-actuated.
+                if p.get_toggle_state().map_err(fail)? != before {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched,
+                    // so this must not fall back to a pointer click that could actuate twice.
+                    return Err(GlassError::AxActionFailed(
+                        target.id.0,
+                        "the toggle action was acknowledged but the state did not change".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
             }
-            if Instant::now() >= deadline {
-                // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched, so
-                // this must not fall back to a pointer click that could actuate it twice.
-                return Err(GlassError::AxActionFailed(
-                    target.id.0,
-                    "the toggle action was acknowledged but the state did not change".into(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
         }
     }
     if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {

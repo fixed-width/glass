@@ -180,6 +180,17 @@ fn first_role<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a AxNode>) {
     }
 }
 
+/// Like [`first_role`], but only nodes that actually report geometry — for a test that goes on
+/// to click the node, where a bounds-less match would make the follow-on assertions luck.
+fn first_role_with_bounds<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a AxNode>) {
+    if out.is_none() && n.role == role && n.bounds.is_some() {
+        *out = Some(n);
+    }
+    for c in &n.children {
+        first_role_with_bounds(c, role, out);
+    }
+}
+
 /// Count msedge.exe processes whose command line carries `marker` (our isolated user-data-dir), via
 /// CIM so the box's background Edge isn't counted.
 fn our_edge_count(marker: &str) -> i32 {
@@ -307,10 +318,11 @@ fn onbox_a11y_snapshot_and_click() {
 
     // A Button specifically, not just the first interactable: `first_clickable` lands on
     // charmap's font ComboBox, whose actuation verb is ExpandCollapse, not Invoke — a weaker
-    // (and differently-behaving) subject for the native-path assertion below.
+    // (and differently-behaving) subject for the native-path assertion below. Still requires
+    // bounds (as `first_clickable` did), so the clampable-center check below stays meaningful.
     let mut hit = None;
-    first_role(&tree.root, AxRole::Button, &mut hit);
-    let n = hit.expect("charmap exposes a Button");
+    first_role_with_bounds(&tree.root, AxRole::Button, &mut hit);
+    let n = hit.expect("charmap exposes a Button with on-screen bounds");
     let id = n.id;
     assert!(
         n.bounds
