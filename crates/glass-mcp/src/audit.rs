@@ -199,14 +199,16 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             };
             ("window", args, None)
         }
-        Actuation::ClickElement { .. } => ("click_element", json!({}), None),
+        Actuation::ClickElement { method, .. } => {
+            ("click_element", json!({ "method": method }), None)
+        }
         Actuation::SetValue { text, .. } => ("set_value", json!({}), Some((*text).to_string())),
     })
 }
 
 fn target_json(act: &Actuation, ctx: &ActuationContext) -> Value {
     match act {
-        Actuation::ClickElement { element } | Actuation::SetValue { element, .. } => {
+        Actuation::ClickElement { element, .. } | Actuation::SetValue { element, .. } => {
             json!({ "element": { "id": element.id, "role": element.role, "name": element.name } })
         }
         _ => match &ctx.window {
@@ -628,6 +630,29 @@ mod tests {
         assert_eq!(r["target"]["element"]["id"], 5);
         assert_eq!(r["target"]["element"]["role"], "PasswordField");
         assert_eq!(r["content"]["len"], 1);
+    }
+
+    #[test]
+    fn click_element_carries_the_actuating_method() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let el = ElementRef {
+            id: 1,
+            role: Some("Button".into()),
+            name: Some("Save".into()),
+        };
+        s.record(
+            &Actuation::ClickElement {
+                element: el,
+                method: Some("pointer"),
+            },
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        let r = &lines(&buf)[0];
+        assert_eq!(r["action"], "click_element");
+        assert_eq!(r["args"]["method"], "pointer");
     }
 
     #[test]

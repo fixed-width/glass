@@ -56,14 +56,33 @@ impl AuditOutcome {
 /// event so the sink can format without `glass-core` depending on serde/JSON.
 #[derive(Debug)]
 pub enum Actuation<'a> {
-    Launch { spec: &'a AppSpec, backend: &'a str },
+    Launch {
+        spec: &'a AppSpec,
+        backend: &'a str,
+    },
     Stop,
-    Pointer { event: &'a PointerEvent },
-    Key { event: &'a KeyEvent },
-    ClipboardSet { text: &'a str },
-    Window { op: &'a WindowOp },
-    ClickElement { element: ElementRef },
-    SetValue { element: ElementRef, text: &'a str },
+    Pointer {
+        event: &'a PointerEvent,
+    },
+    Key {
+        event: &'a KeyEvent,
+    },
+    ClipboardSet {
+        text: &'a str,
+    },
+    Window {
+        op: &'a WindowOp,
+    },
+    ClickElement {
+        element: ElementRef,
+        /// `ClickMethod::label()` of the path that actuated; `None` when the
+        /// click errored before either path completed.
+        method: Option<&'static str>,
+    },
+    SetValue {
+        element: ElementRef,
+        text: &'a str,
+    },
 }
 
 /// Receives every actuation. Implemented in `glass-mcp` (`JsonlSink`). `Send` so it
@@ -96,5 +115,25 @@ mod tests {
         let e = AuditOutcome::from_result(&err);
         assert!(!e.ok);
         assert!(e.error.unwrap().to_lowercase().contains("session"));
+    }
+
+    #[test]
+    fn click_element_actuation_carries_the_actuating_method() {
+        let element = ElementRef {
+            id: 1,
+            role: Some("Button".into()),
+            name: Some("Save".into()),
+        };
+        let act = Actuation::ClickElement {
+            element,
+            method: Some("native-action"),
+        };
+        assert!(matches!(
+            act,
+            Actuation::ClickElement {
+                method: Some("native-action"),
+                ..
+            }
+        ));
     }
 }

@@ -361,8 +361,12 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Click an element by its #id from glass_a11y_snapshot (clicks the \
-                       center of its bounds, via the normal click path). If the element actually \
+        description = "Click an element by its #id from glass_a11y_snapshot (actuates via the \
+                       platform's native accessibility action when the element exposes one — \
+                       works even when it's occluded or scrolled off-screen — else falls back \
+                       to a synthetic pointer click at the center of its bounds; the result's \
+                       `method` field says which path ran, and `native_fallback` says why when \
+                       the pointer path was used). If the element actually \
                        renders in a popover owned by a different window than the active one \
                        (e.g. an open dropdown's option row), the click is automatically routed \
                        into that popover window and the previously-active window is restored \
@@ -405,7 +409,8 @@ impl GlassServer {
                        glass_a11y_snapshot). Chips sit just outside each element so small icon \
                        buttons stay visible. The box is only as precise as the toolkit's \
                        accessibility geometry (it can drift ~10-20px), but the #id and the click \
-                       are exact (click_element targets the element's center). Errors if no \
+                       are exact (click_element actuates via the native accessibility action \
+                       when available, else clicks the element's center). Errors if no \
                        accessibility tree is available — use glass_screenshot then."
     )]
     async fn glass_a11y_marks(&self) -> Result<CallToolResult, McpError> {

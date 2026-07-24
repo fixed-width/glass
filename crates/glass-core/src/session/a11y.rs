@@ -99,7 +99,10 @@ impl Glass {
         let element = self.element_ref(id);
         let result = self.click_element_inner(id);
         self.emit_audit(
-            &crate::audit::Actuation::ClickElement { element },
+            &crate::audit::Actuation::ClickElement {
+                element,
+                method: result.as_ref().ok().map(ClickMethod::label),
+            },
             crate::audit::AuditOutcome::from_result(&result),
             t.elapsed(),
         );
