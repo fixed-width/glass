@@ -103,10 +103,14 @@ impl Glass {
         self.audited_click(id, Self::click_element_inner)
     }
 
-    /// Run one element click and record it through the audit seam. Every path that actuates
-    /// an element by id goes through here — the native-first [`Glass::click_element`] and the
-    /// deliberately pointer-only combo open alike — so the log can't miss an actuation just
-    /// because an internal caller took a different route to it.
+    /// Run one element click and record it through the audit seam. Both clicks that stand on
+    /// their own go through here — the native-first [`Glass::click_element`] and the
+    /// deliberately pointer-only combo open — so the log can't miss one just because an
+    /// internal caller took a different route to the same actuation.
+    ///
+    /// The exception is `set_value_inner`'s trailing-toggle branch, which calls
+    /// `click_element_inner` directly: there the click is one step *inside* a `set_value`, and
+    /// the enclosing `SetValue` record already accounts for it.
     fn audited_click(
         &mut self,
         id: AxNodeId,
@@ -312,13 +316,28 @@ impl Glass {
     }
 
     fn set_value_inner(&mut self, id: AxNodeId, text: &str) -> Result<()> {
-        let (target, ctx) = {
-            let s = self.require_active()?;
+        {
+            let s = self.active_mut()?;
             // Check for reader availability before consulting the snapshot, so that
-            // `AxUnsupported` takes precedence when there is no accessibility backend.
+            // `AxUnsupported` takes precedence when there is no accessibility backend — and so
+            // a reader-less backend skips the geometry round-trip below.
             if s.accessibility.is_none() {
                 return Err(GlassError::AxUnsupported);
             }
+            // Re-read the window geometry, as `a11y_snapshot` and `try_native_invoke` do: the
+            // Windows/macOS `set_value` fingerprints the element by window-RELATIVE bounds
+            // derived from `ctx.window`, so a window moved since the snapshot would make every
+            // element look displaced and reject the write as drift.
+            //
+            // Best-effort, unlike the snapshot's strict refresh: a write must not fail because
+            // a geometry probe hiccuped, so an `Err` keeps the cached value and carries on —
+            // worst case the backend's own fingerprint check rejects, exactly as before.
+            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
+                s.geometry = window;
+            }
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let target = AxTarget {
@@ -2017,6 +2036,43 @@ mod tests {
             g.set_value(AxNodeId(0), "x").unwrap_err(),
             GlassError::AxUnsupported
         ));
+    }
+
+    #[test]
+    fn set_value_refreshes_geometry_so_the_backend_sees_the_current_window() {
+        // The mirror of `click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window`:
+        // `set_value` fingerprints the element the same way `invoke` does (Windows/macOS compare
+        // window-RELATIVE bounds derived from `ctx.window`), so a window moved since the snapshot
+        // would make every element look displaced and reject the write as drift.
+        let snapshot_geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let moved_geo = WindowGeometry {
+            x: 640,
+            y: 480,
+            width: 100,
+            height: 100,
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(snapshot_geo)
+            .resized_to(moved_geo.clone());
+        // The invoke knob is irrelevant here (set_value never invokes); this builder is just the
+        // one that hands back the ctx log.
+        let (mut g, _, ctx_log) =
+            glass_with_a11y_invoke_ctx(platform, fake_tree(), InvokeBehavior::Unsupported);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap(); // consumes the first scripted geometry read
+
+        g.set_value(AxNodeId(1), "hello").unwrap(); // fake_tree: #1 is Button "Save"
+
+        assert_eq!(
+            ctx_log.lock().unwrap().as_ref().map(|c| c.window.clone()),
+            Some(moved_geo),
+            "set_value's ctx carries the refreshed window, not the snapshot's stale one"
+        );
     }
 
     #[test]

@@ -543,7 +543,7 @@ pub(crate) fn glass_with_a11y_seq_invoke(
 ) -> (Glass, Arc<Mutex<Vec<AxTarget>>>) {
     debug_assert!(
         !trees.is_empty(),
-        "glass_with_a11y_seq needs at least one tree (snapshot indexes trees.len() - 1)"
+        "glass_with_a11y_seq_invoke needs at least one tree (snapshot indexes trees.len() - 1)"
     );
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
     let g = glass_with_backend(
