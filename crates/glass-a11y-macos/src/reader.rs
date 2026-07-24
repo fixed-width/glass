@@ -20,25 +20,13 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result,
+    Result, TruncationLimit, WalkBudget, MAX_SIBLINGS,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
 
 use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
-
-/// Deepest subtree level walked. Bounds work on a pathological/cyclic tree together with
-/// [`MAX_NODES`]; sized generously so it never truncates a real macOS UI.
-const MAX_DEPTH: usize = 30;
-/// Global cap on nodes *entered* — the hard ceiling on snapshot size.
-const MAX_NODES: usize = 1500;
-/// Per-level cap on siblings *examined* (on- or off-screen). [`MAX_NODES`] only counts
-/// entered nodes and [`should_skip`] siblings are skipped without entering, so an
-/// all-skipped level (a virtualized list of thousands) could iterate without ever tripping
-/// `MAX_NODES`. Cap the per-level scan so the walk is genuinely bounded regardless of
-/// breadth (mirrors the Windows reader).
-const MAX_SIBLINGS: usize = 4096;
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -94,11 +82,13 @@ impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let (window_el, scale) = resolve_window(ctx)?;
 
-        let mut count = 0usize;
-        let root = walk(&window_el, &ctx.window, scale, 0, &mut count);
+        let mut budget = WalkBudget::new();
+        let root = walk(&window_el, &ctx.window, scale, 0, &mut budget);
+        let mut tree = AxTree::new(root);
+        tree.truncated = budget.truncation();
         // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
         // identical across OS backends.
-        Ok(AxTree::new(root))
+        Ok(tree)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -107,8 +97,8 @@ impl Accessibility for MacosA11y {
         // Start at 0 so `find_nth`'s pre-order numbering matches `snapshot`'s `walk` +
         // `AxTree::assign_ids` (root id = 0); the role+name+bounds fingerprint below
         // backstops any residual drift between the snapshot and this re-walk.
-        let mut count = 0usize;
-        let el = find_nth(window_el, 0, &mut count, target.id.0)
+        let mut budget = WalkBudget::new();
+        let el = find_nth(window_el, 0, &mut budget, target.id.0)
             .ok_or(GlassError::AxElementNotFound(target.id.0))?;
 
         // Verify role + name + bounds (guards a stale id / tree drift): if drift landed a
@@ -272,16 +262,17 @@ fn select_window(
 }
 
 /// Pre-order walk: build this element's [`AxNode`], then recurse into its (non-skipped)
-/// children in array order. `count` is the running node total, incremented on entry and
-/// shared across the whole walk so [`MAX_NODES`] bounds the entire tree.
+/// children in array order. `budget` tracks the running node total and records which
+/// bound (if any) stopped the walk early — shared across the whole walk, and with
+/// [`find_nth`], so the two traversals stay in lockstep.
 fn walk(
     el: &AXUIElement,
     win: &WindowGeometry,
     scale: f64,
     depth: usize,
-    count: &mut usize,
+    budget: &mut WalkBudget,
 ) -> AxNode {
-    *count += 1;
+    budget.visit();
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let role = mapping::map_role(&ax_role);
@@ -300,12 +291,13 @@ fn walk(
     let states = mapping::map_states(&gather_states(el, role));
 
     let mut children = Vec::new();
-    if depth < MAX_DEPTH && *count < MAX_NODES {
+    if may_explore_children(budget, depth) {
         // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
         // `AXChildren`) node and only `Err` for a *real* AX read failure. Degrade a real
         // failure to "no children" so one broken node can't fail the whole snapshot — but log
         // it (mirroring `select_window`'s no-match diagnostic) so the dropped subtree is
-        // observable, never silent.
+        // observable, never silent. This is a different condition from a bound firing (below),
+        // and already reports itself via the log line, so it never touches `budget`.
         let child_els = ffi::children(el).unwrap_or_else(|err| {
             eprintln!(
                 "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
@@ -313,16 +305,22 @@ fn walk(
             );
             Vec::new()
         });
+        // `MAX_NODES` only counts nodes actually entered, and `should_skip` siblings are
+        // skipped without entering, so an all-skipped level (a virtualized list of thousands)
+        // could otherwise iterate without ever tripping it. `MAX_SIBLINGS` bounds the
+        // per-level scan regardless of how many are skipped (mirrors the Windows reader).
         let mut siblings = 0usize;
         for child in child_els {
             siblings += 1;
             if siblings > MAX_SIBLINGS {
+                budget.hit(TruncationLimit::Siblings);
                 break;
             }
             if !should_skip(&child) {
-                children.push(walk(&child, win, scale, depth + 1, count));
+                children.push(walk(&child, win, scale, depth + 1, budget));
             }
-            if *count >= MAX_NODES {
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
                 break;
             }
         }
@@ -349,41 +347,63 @@ fn should_skip(el: &AXUIElement) -> bool {
     matches!(ffi::ax_size(el), Ok((w, h)) if w <= 0.0 || h <= 0.0)
 }
 
+/// Whether this node's children may be explored, recording the bound that stopped the walk
+/// when they may not.
+///
+/// `walk` and `find_nth` MUST consult this one function at the same point in their
+/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
+/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
+/// id against a different tree and writes to the wrong element. Sharing the decision makes
+/// that divergence impossible to introduce by editing only one of them.
+fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        return false;
+    }
+    if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        return false;
+    }
+    true
+}
+
 /// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
-/// `AXChildren` order, same `MAX_DEPTH`/`MAX_NODES`/`MAX_SIBLINGS` bounds — to locate the
-/// element at pre-order index `target`. That is the same numbering
-/// `glass_core::AxTree::assign_ids` gives the tree `snapshot` returns (root = 0), so a
-/// `target.id` captured from a snapshot lands on the same element here. `count` doubles as
-/// the running id (a node's id is `count`'s value on arrival, before it increments) and the
-/// `MAX_NODES` bound, identically to `walk`. Takes (and, on a mismatch, drops) ownership of
-/// each candidate rather than borrowing, since a matched child must outlive the `Vec` of
-/// siblings `ffi::children` returns.
+/// `AXChildren` order, same bounds via [`may_explore_children`] — to locate the element at
+/// pre-order index `target`. That is the same numbering `glass_core::AxTree::assign_ids`
+/// gives the tree `snapshot` returns (root = 0), so a `target.id` captured from a snapshot
+/// lands on the same element here. `budget` doubles as the running id (a node's id is
+/// `budget.nodes_walked()`'s value on arrival, before [`WalkBudget::visit`]) and the node
+/// bound, identically to `walk`. Takes (and, on a mismatch, drops) ownership of each
+/// candidate rather than borrowing, since a matched child must outlive the `Vec` of siblings
+/// `ffi::children` returns.
 fn find_nth(
     el: CFRetained<AXUIElement>,
     depth: usize,
-    count: &mut usize,
+    budget: &mut WalkBudget,
     target: u32,
 ) -> Option<CFRetained<AXUIElement>> {
-    let my_id = *count as u32;
-    *count += 1;
-    if my_id == target {
+    if budget.nodes_walked() == target as usize {
         return Some(el);
     }
-    if depth < MAX_DEPTH && *count < MAX_NODES {
-        let mut siblings = 0usize;
-        for child in ffi::children(&el).unwrap_or_default() {
-            siblings += 1;
-            if siblings > MAX_SIBLINGS {
-                break; // same per-level bound as walk(), so find_nth can't spin either
+    budget.visit();
+    if !may_explore_children(budget, depth) {
+        return None;
+    }
+    let mut siblings = 0usize;
+    for child in ffi::children(&el).unwrap_or_default() {
+        siblings += 1;
+        if siblings > MAX_SIBLINGS {
+            budget.hit(TruncationLimit::Siblings);
+            break; // same per-level bound as walk(), so find_nth can't spin either
+        }
+        if !should_skip(&child) {
+            if let Some(found) = find_nth(child, depth + 1, budget, target) {
+                return Some(found);
             }
-            if !should_skip(&child) {
-                if let Some(found) = find_nth(child, depth + 1, count, target) {
-                    return Some(found);
-                }
-            }
-            if *count >= MAX_NODES {
-                break;
-            }
+        }
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
         }
     }
     None
@@ -461,7 +481,54 @@ fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, requested: 
 
 #[cfg(test)]
 mod tests {
-    use super::{read_back_confirms, set_value_took};
+    use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    use super::{
+        may_explore_children, read_back_confirms, set_value_took, TruncationLimit, WalkBudget,
+    };
+
+    #[test]
+    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
+        let mut budget = WalkBudget::new();
+        assert!(may_explore_children(&mut budget, 0));
+        assert!(budget.truncation().is_none());
+    }
+
+    #[test]
+    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, 0));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
 
     #[test]
     fn noop_is_not_taken() {
