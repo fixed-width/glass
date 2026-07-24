@@ -20,6 +20,8 @@ internal refactors, CI, or test-only changes.
 - `glass_a11y_snapshot` now returns a compacted outline: chains of unnamed single-child
   container elements are collapsed. Element ids are unchanged and every element remains
   addressable with `glass_click_element` / `glass_set_value`.
+- Linux accessibility snapshots are faster on large trees: the AT-SPI reader now issues each
+  element's independent property reads concurrently instead of one at a time.
 
 ### Fixed
 - The accessibility tree now reports when a snapshot was truncated. Previously a tree that hit
