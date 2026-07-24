@@ -458,9 +458,9 @@ impl AxTree {
         }
         let mut out = String::new();
         walk(&self.root, 0, &mut out);
-        // Truncation is a fact about the tree, not a rendering style, so BOTH renderers
-        // disclose it. A capped tree that rendered as complete would read as "the element
-        // does not exist" — the silent fallback this field exists to prevent.
+        // Truncation is a fact about the tree, not a rendering style, so it is disclosed
+        // wherever the tree is rendered. A capped tree that rendered as complete would read
+        // as "the element does not exist" — the silent fallback this field exists to prevent.
         if let Some(t) = self.truncated {
             let _ = writeln!(out, "{}", t.notice());
         }
@@ -1463,6 +1463,11 @@ mod tests {
             b.visit();
         }
         assert!(!b.nodes_exhausted(), "one visit short of the cap");
+        b.visit();
+        assert!(
+            b.nodes_exhausted(),
+            "the cap is reached at exactly MAX_NODES"
+        );
     }
 
     #[test]
