@@ -127,14 +127,23 @@ fn walk(
     let states = crate::mapping::map_states(&facts);
 
     let mut children = Vec::new();
-    if may_explore_children(budget, depth) {
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let first_child = walker.get_first_child(el).ok();
+    if first_child.is_some() && may_explore_children(budget, depth) {
         // Offscreen children are skipped without entering, so they never count against
         // `MAX_NODES` — a virtualized list of thousands (or a cyclic `get_next_sibling`
         // chain) would otherwise scan this level forever. `MAX_SIBLINGS` bounds the
         // per-level scan regardless of how many are skipped.
-        let mut child = walker.get_first_child(el).ok();
+        let mut child = first_child;
         let mut siblings = 0usize;
         while let Some(c) = child {
+            // Checked before processing each child (not after) so the child that merely
+            // completes the tree doesn't get mistaken for one the walk declined to visit.
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
             siblings += 1;
             if siblings > MAX_SIBLINGS {
                 budget.hit(TruncationLimit::Siblings);
@@ -142,10 +151,6 @@ fn walk(
             }
             if !c.is_offscreen().unwrap_or(false) {
                 children.push(walk(walker, &c, origin, depth + 1, budget)?);
-            }
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
             }
             child = walker.get_next_sibling(&c).ok();
         }
@@ -298,7 +303,9 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 }
 
 /// Whether this node's children may be explored, recording the bound that stopped the walk
-/// when they may not.
+/// when they may not. Callers only consult this once they already know the child list is
+/// non-empty — calling it for a childless node would record a truncation for declining to
+/// explore a list that was never going to be walked anyway.
 ///
 /// `walk` and `find_nth` MUST consult this one function at the same point in their
 /// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
@@ -333,12 +340,21 @@ fn find_nth(
         return Some(el.clone());
     }
     budget.visit();
-    if !may_explore_children(budget, depth) {
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let first_child = walker.get_first_child(el).ok();
+    if first_child.is_none() || !may_explore_children(budget, depth) {
         return None;
     }
-    let mut child = walker.get_first_child(el).ok();
+    let mut child = first_child;
     let mut siblings = 0usize;
     while let Some(c) = child {
+        // Checked before processing each child (not after) so the child that merely
+        // completes the tree doesn't get mistaken for one the walk declined to visit.
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
+        }
         siblings += 1;
         if siblings > MAX_SIBLINGS {
             budget.hit(TruncationLimit::Siblings);
@@ -348,10 +364,6 @@ fn find_nth(
             if let Some(found) = find_nth(walker, &c, depth + 1, budget, target) {
                 return Some(found);
             }
-        }
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
-            break;
         }
         child = walker.get_next_sibling(&c).ok();
     }

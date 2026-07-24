@@ -71,15 +71,18 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
         Value::Array(a) => {
             let mut out = Vec::new();
             for (i, n) in a.iter().enumerate() {
+                // Checked before processing each element (not after) so the element that
+                // merely completes the tree doesn't get mistaken for one the walk declined
+                // to visit.
+                if budget.nodes_exhausted() {
+                    budget.hit(TruncationLimit::Nodes);
+                    break;
+                }
                 if i >= MAX_SIBLINGS {
                     budget.hit(TruncationLimit::Siblings);
                     break;
                 }
                 out.push(map_node(n, scale, 0, &mut budget));
-                if budget.nodes_exhausted() {
-                    budget.hit(TruncationLimit::Nodes);
-                    break;
-                }
             }
             out
         }
@@ -204,29 +207,37 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     let bounds = n.get("frame").and_then(|f| frame_to_rect(f, scale));
     // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
     // pathologically deep or wide accessibility tree cannot blow the stack or the token
-    // budget.
-    let children = if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-        vec![]
-    } else if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
-        vec![]
-    } else {
-        let mut out = Vec::new();
-        if let Some(kids) = n.get("children").and_then(Value::as_array) {
+    // budget. The child array is resolved before either bound is consulted: a childless
+    // node must never be reported truncated for declining to explore a list that was
+    // already empty.
+    let children = match n.get("children").and_then(Value::as_array) {
+        None => vec![],
+        Some(arr) if arr.is_empty() => vec![],
+        Some(_) if budget.depth_exhausted(depth) => {
+            budget.hit(TruncationLimit::Depth);
+            vec![]
+        }
+        Some(_) if budget.nodes_exhausted() => {
+            budget.hit(TruncationLimit::Nodes);
+            vec![]
+        }
+        Some(kids) => {
+            let mut out = Vec::new();
             for (i, c) in kids.iter().enumerate() {
+                // Checked before processing each child (not after) so the child that merely
+                // completes the tree doesn't get mistaken for one the walk declined to visit.
+                if budget.nodes_exhausted() {
+                    budget.hit(TruncationLimit::Nodes);
+                    break;
+                }
                 if i >= MAX_SIBLINGS {
                     budget.hit(TruncationLimit::Siblings);
                     break;
                 }
                 out.push(map_node(c, scale, depth + 1, budget));
-                if budget.nodes_exhausted() {
-                    budget.hit(TruncationLimit::Nodes);
-                    break;
-                }
             }
+            out
         }
-        out
     };
     AxNode {
         id: AxNodeId(0),
@@ -506,6 +517,47 @@ mod tests {
         // top-level element at array index i is id i+1.
         let third = tree.find(AxNodeId(3)).expect("id 3 survives");
         assert_eq!(third.name.as_deref(), Some("btn2"));
+    }
+
+    #[test]
+    fn a_complete_tree_of_exactly_max_nodes_reports_no_truncation() {
+        // MAX_NODES flat top-level elements: the walk visits every one of them, and the
+        // LAST one is what pushes the running count to MAX_NODES. Nothing was declined, so
+        // this must NOT be reported truncated (regression for the false-positive-at-the-cap
+        // bug).
+        let json = wide_array_json(glass_core::MAX_NODES);
+        let tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        assert_eq!(tree.truncated, None);
+    }
+
+    #[test]
+    fn a_tree_of_max_nodes_plus_one_still_reports_nodes_truncation() {
+        // One more element than the complete case above: now there really is a node the
+        // walk declines to visit, so the cap must still fire — proving the fix didn't just
+        // disable it.
+        let json = wide_array_json(glass_core::MAX_NODES + 1);
+        let tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        assert_eq!(
+            tree.truncated.map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn a_childless_node_at_the_spent_node_budget_records_no_truncation() {
+        // A leaf with no "children" key, reached once the node budget is already spent,
+        // must not be reported truncated merely for declining to explore an empty list.
+        let leaf = serde_json::json!({
+            "role": "AXButton",
+            "AXLabel": "leaf",
+            "frame": {"x": 0, "y": 0, "width": 10, "height": 10}
+        });
+        let mut budget = WalkBudget::new();
+        for _ in 0..glass_core::MAX_NODES {
+            budget.visit();
+        }
+        let _ = map_node(&leaf, 1.0, 0, &mut budget);
+        assert!(budget.truncation().is_none());
     }
 
     #[test]

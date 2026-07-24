@@ -291,26 +291,35 @@ fn walk(
     let states = mapping::map_states(&gather_states(el, role));
 
     let mut children = Vec::new();
-    if may_explore_children(budget, depth) {
-        // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
-        // `AXChildren`) node and only `Err` for a *real* AX read failure. Degrade a real
-        // failure to "no children" so one broken node can't fail the whole snapshot — but log
-        // it (mirroring `select_window`'s no-match diagnostic) so the dropped subtree is
-        // observable, never silent. This is a different condition from a bound firing (below),
-        // and already reports itself via the log line, so it never touches `budget`.
-        let child_els = ffi::children(el).unwrap_or_else(|err| {
-            eprintln!(
-                "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
-                 bounds={bounds:?}: {err}; treating as no children"
-            );
-            Vec::new()
-        });
+    // `ffi::children` returns `Ok(vec![])` for a legitimately-childless (or absent-
+    // `AXChildren`) node and only `Err` for a *real* AX read failure. Degrade a real
+    // failure to "no children" so one broken node can't fail the whole snapshot — but log
+    // it (mirroring `select_window`'s no-match diagnostic) so the dropped subtree is
+    // observable, never silent. This is a different condition from a bound firing (below),
+    // and already reports itself via the log line, so it never touches `budget`.
+    //
+    // Resolved before the gate below: a childless node must never be reported truncated
+    // for declining to explore a list that was already empty.
+    let child_els = ffi::children(el).unwrap_or_else(|err| {
+        eprintln!(
+            "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
+             bounds={bounds:?}: {err}; treating as no children"
+        );
+        Vec::new()
+    });
+    if !child_els.is_empty() && may_explore_children(budget, depth) {
         // `MAX_NODES` only counts nodes actually entered, and `should_skip` siblings are
         // skipped without entering, so an all-skipped level (a virtualized list of thousands)
         // could otherwise iterate without ever tripping it. `MAX_SIBLINGS` bounds the
         // per-level scan regardless of how many are skipped (mirrors the Windows reader).
         let mut siblings = 0usize;
         for child in child_els {
+            // Checked before processing each child (not after) so the child that merely
+            // completes the tree doesn't get mistaken for one the walk declined to visit.
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
             siblings += 1;
             if siblings > MAX_SIBLINGS {
                 budget.hit(TruncationLimit::Siblings);
@@ -318,10 +327,6 @@ fn walk(
             }
             if !should_skip(&child) {
                 children.push(walk(&child, win, scale, depth + 1, budget));
-            }
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
             }
         }
     }
@@ -348,7 +353,9 @@ fn should_skip(el: &AXUIElement) -> bool {
 }
 
 /// Whether this node's children may be explored, recording the bound that stopped the walk
-/// when they may not.
+/// when they may not. Callers only consult this once they already know the child list is
+/// non-empty — calling it for a childless node would record a truncation for declining to
+/// explore a list that was never going to be walked anyway.
 ///
 /// `walk` and `find_nth` MUST consult this one function at the same point in their
 /// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
@@ -386,11 +393,20 @@ fn find_nth(
         return Some(el);
     }
     budget.visit();
-    if !may_explore_children(budget, depth) {
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let child_els = ffi::children(&el).unwrap_or_default();
+    if child_els.is_empty() || !may_explore_children(budget, depth) {
         return None;
     }
     let mut siblings = 0usize;
-    for child in ffi::children(&el).unwrap_or_default() {
+    for child in child_els {
+        // Checked before processing each child (not after) so the child that merely
+        // completes the tree doesn't get mistaken for one the walk declined to visit.
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
+        }
         siblings += 1;
         if siblings > MAX_SIBLINGS {
             budget.hit(TruncationLimit::Siblings);
@@ -400,10 +416,6 @@ fn find_nth(
             if let Some(found) = find_nth(child, depth + 1, budget, target) {
                 return Some(found);
             }
-        }
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
-            break;
         }
     }
     None

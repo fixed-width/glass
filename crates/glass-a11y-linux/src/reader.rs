@@ -230,7 +230,9 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 }
 
 /// Whether this node's children may be explored, recording the bound that stopped the walk
-/// when they may not.
+/// when they may not. Callers only consult this once they already know the child list is
+/// non-empty — calling it for a childless node would record a truncation for declining to
+/// explore a list that was never going to be walked anyway.
 ///
 /// `walk` and `find_nth` MUST consult this one function at the same point in their
 /// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
@@ -266,11 +268,20 @@ async fn find_nth(
         return Ok(Some(node_ref.clone()));
     }
     budget.visit();
-    if !may_explore_children(budget, depth) {
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let child_refs = proxy.get_children().await.map_err(bus_err)?;
+    if child_refs.is_empty() || !may_explore_children(budget, depth) {
         return Ok(None);
     }
     let mut siblings = 0usize;
-    for child_ref in proxy.get_children().await.map_err(bus_err)? {
+    for child_ref in child_refs {
+        // Checked before processing each child (not after) so the child that merely
+        // completes the tree doesn't get mistaken for one the walk declined to visit.
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
+        }
         siblings += 1;
         if siblings > MAX_SIBLINGS {
             budget.hit(TruncationLimit::Siblings);
@@ -290,10 +301,6 @@ async fn find_nth(
         .await?
         {
             return Ok(Some(found));
-        }
-        if budget.nodes_exhausted() {
-            budget.hit(TruncationLimit::Nodes);
-            break;
         }
     }
     Ok(None)
@@ -340,9 +347,18 @@ async fn walk(
     let bounds = extents(proxy, conn).await;
 
     let mut children = Vec::new();
-    if may_explore_children(budget, depth) {
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let child_refs = proxy.get_children().await.map_err(bus_err)?;
+    if !child_refs.is_empty() && may_explore_children(budget, depth) {
         let mut siblings = 0usize;
-        for child_ref in proxy.get_children().await.map_err(bus_err)? {
+        for child_ref in child_refs {
+            // Checked before processing each child (not after) so the child that merely
+            // completes the tree doesn't get mistaken for one the walk declined to visit.
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
             siblings += 1;
             if siblings > MAX_SIBLINGS {
                 budget.hit(TruncationLimit::Siblings);
@@ -352,10 +368,6 @@ async fn walk(
                 continue;
             };
             children.push(Box::pin(walk(&child, conn, depth + 1, budget)).await?);
-            if budget.nodes_exhausted() {
-                budget.hit(TruncationLimit::Nodes);
-                break;
-            }
         }
     }
 
