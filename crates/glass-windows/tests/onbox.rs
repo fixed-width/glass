@@ -305,15 +305,18 @@ fn onbox_a11y_snapshot_and_click() {
         "charmap must expose interactable elements, got {inter}"
     );
 
+    // A Button specifically, not just the first interactable: `first_clickable` lands on
+    // charmap's font ComboBox, whose actuation verb is ExpandCollapse, not Invoke — a weaker
+    // (and differently-behaving) subject for the native-path assertion below.
     let mut hit = None;
-    first_clickable(&tree.root, &mut hit);
-    let n = hit.expect("an interactable element with on-screen bounds");
+    first_role(&tree.root, AxRole::Button, &mut hit);
+    let n = hit.expect("charmap exposes a Button");
     let id = n.id;
     assert!(
         n.bounds
             .and_then(|b| b.clamped_center(geo.width, geo.height))
             .is_some(),
-        "first interactable has a clampable center"
+        "the Button has a clampable center"
     );
     // Capture before/after so we verify the click actually changed the UI, not merely that
     // click_element returned Ok. A Win32 Button (charmap's "Select"/"Copy", same as an

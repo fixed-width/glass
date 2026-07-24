@@ -1709,6 +1709,100 @@ mod tests {
         );
     }
 
+    /// The popover-routing platform: an active window plus the dropdown's popover window,
+    /// with click + select logs — shared by the popover × native-invoke tests below.
+    fn popover_platform(
+        clicks: Arc<Mutex<Vec<(i32, i32)>>>,
+        select_log: Arc<Mutex<Vec<WindowId>>>,
+    ) -> FakePlatform {
+        let active = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let popover = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        FakePlatform::new(340, 300)
+            .with_windows(vec![active, popover])
+            .with_click_log(clicks)
+            .with_select_log(select_log)
+    }
+
+    #[test]
+    fn click_element_native_invoke_succeeds_for_popover_hosted_element_without_window_select() {
+        // The native action addresses the element directly, so the whole popover machinery —
+        // enumerate windows, select the popover, click at a container-relative offset, restore
+        // the previous window — must be skipped: no focus change, no pointer event.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let (mut g, invoke_log) = glass_with_a11y_invoke(
+            popover_platform(clicks.clone(), select_log.clone()),
+            fake_tree_with_popover_option(),
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        assert_eq!(
+            g.click_element(globex_id).unwrap(),
+            ClickMethod::NativeAction
+        );
+
+        assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event for a natively-invoked popover element"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "the popover is never raised — the native action needs no window focus"
+        );
+    }
+
+    #[test]
+    fn click_element_native_invoke_drifted_for_popover_hosted_element_is_fatal() {
+        // Drift is fatal wherever the element lives: routing into the popover and clicking
+        // its stale bounds would hit whatever moved into that spot.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let (mut g, _) = glass_with_a11y_invoke(
+            popover_platform(clicks.clone(), select_log.clone()),
+            fake_tree_with_popover_option(),
+            InvokeBehavior::Drifted,
+        );
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        assert!(matches!(
+            g.click_element(globex_id).unwrap_err(),
+            GlassError::AxElementChanged(id) if id == globex_id.0
+        ));
+
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after drift"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "and no window was raised on the way to failing"
+        );
+    }
+
     #[test]
     fn click_element_in_popover_without_a_mappable_container_errors() {
         // Same popover-owning geometry, but the target has no List-sized ancestor to
@@ -2111,6 +2205,38 @@ mod tests {
         g.set_value(AxNodeId(1), "true").unwrap();
 
         assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_toggle_path_uses_native_invoke_when_available() {
+        // The trailing-toggle `set_value` branch actuates through `click_element_inner`, so on
+        // a backend that HAS a native action the toggle must fire natively — no swipe — and
+        // still verify the flip by re-snapshot. (The iOS backend this branch exists for has no
+        // invoke today, so only a fake can pin the interaction.)
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = unchecked; snapshot #2 (verify re-read) = checked.
+        let (mut g, invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![sw(false), sw(true)],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert_eq!(
+            invoke_log.lock().unwrap().len(),
+            1,
+            "the toggle actuated once, natively"
+        );
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "the native action replaces the swipe — actuating both would toggle twice"
+        );
     }
 
     #[test]
