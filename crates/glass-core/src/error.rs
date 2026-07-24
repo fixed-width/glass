@@ -94,6 +94,12 @@ pub enum GlassError {
     #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
     AxValueNotApplied(u32),
 
+    #[error("element #{0} exposes no native activation action")]
+    AxActionUnavailable(u32),
+
+    #[error("native action on element #{0} failed: {1}")]
+    AxActionFailed(u32, String),
+
     #[error("set_value on element #{0} is a switch/checkbox and expects a boolean — one of true/false, on/off, 1/0, yes/no (got {1:?})")]
     AxValueNotBoolean(u32, String),
 
@@ -230,6 +236,18 @@ mod tests {
         assert_eq!(
             GlassError::AxElementInUnmappedPopover(9).to_string(),
             "element #9 is inside a popover glass could not map to a window; select_window it and click by coordinate"
+        );
+    }
+
+    #[test]
+    fn ax_action_errors_name_the_element_and_cause() {
+        assert_eq!(
+            GlassError::AxActionUnavailable(7).to_string(),
+            "element #7 exposes no native activation action"
+        );
+        assert_eq!(
+            GlassError::AxActionFailed(7, "action reported failure".into()).to_string(),
+            "native action on element #7 failed: action reported failure"
         );
     }
 

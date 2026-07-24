@@ -625,6 +625,46 @@ pub trait Accessibility {
     fn set_value(&mut self, _ctx: &AxContext, _target: &AxTarget, _text: &str) -> Result<()> {
         Err(crate::error::GlassError::AxUnsupported)
     }
+
+    /// Actuate the element identified by `target` via the platform's native
+    /// accessibility action (the OS-level "press this control" verb). The
+    /// backend re-walks pre-order to `target.id`, verifies the fingerprint
+    /// (role+name, and bounds where its `set_value` does), then fires the
+    /// action. `AxElementChanged` on fingerprint mismatch — the caller treats
+    /// that as fatal, never as a fall-back-to-pointer signal, because a
+    /// drifted tree would mis-click by stale coordinates too.
+    /// Default: unsupported.
+    fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<()> {
+        Err(crate::error::GlassError::AxUnsupported)
+    }
+}
+
+/// How `click_element` actuated the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClickMethod {
+    /// The platform's native accessibility action fired; no pointer was synthesized.
+    NativeAction,
+    /// The synthetic pointer path ran; `native_fallback` says why the native
+    /// action was not used (there is always a reason — invoke is attempted first).
+    Pointer { native_fallback: String },
+}
+
+impl ClickMethod {
+    /// Stable label for result payloads and the audit log.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClickMethod::NativeAction => "native-action",
+            ClickMethod::Pointer { .. } => "pointer",
+        }
+    }
+
+    /// The fallback reason, when the pointer path ran.
+    pub fn native_fallback(&self) -> Option<&str> {
+        match self {
+            ClickMethod::NativeAction => None,
+            ClickMethod::Pointer { native_fallback } => Some(native_fallback),
+        }
+    }
 }
 
 /// A precise wait condition over an accessibility element. State variants assert
@@ -1641,5 +1681,48 @@ mod tests {
     #[test]
     fn new_builds_a_complete_tree() {
         assert_eq!(AxTree::new(leaf(AxRole::Window, "App")).truncated, None);
+    }
+
+    #[test]
+    fn invoke_default_is_unsupported() {
+        struct NoInvoke;
+        impl Accessibility for NoInvoke {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                unreachable!("not exercised")
+            }
+        }
+        let ctx = AxContext {
+            pids: vec![],
+            window: crate::platform::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        };
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::Button,
+            name: None,
+            bounds: None,
+        };
+        assert!(matches!(
+            NoInvoke.invoke(&ctx, &target),
+            Err(crate::error::GlassError::AxUnsupported)
+        ));
+    }
+
+    #[test]
+    fn click_method_labels_and_fallback_access() {
+        assert_eq!(ClickMethod::NativeAction.label(), "native-action");
+        assert_eq!(ClickMethod::NativeAction.native_fallback(), None);
+        let p = ClickMethod::Pointer {
+            native_fallback: "reason".into(),
+        };
+        assert_eq!(p.label(), "pointer");
+        assert_eq!(p.native_fallback(), Some("reason"));
     }
 }
