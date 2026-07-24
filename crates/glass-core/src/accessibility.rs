@@ -6,8 +6,6 @@
 //! `glass-a11y-linux`) map their native roles/states into the normalized types
 //! here; no OS/AT-SPI/D-Bus types appear in this module.
 
-use std::fmt::Write as _;
-
 use crate::error::Result;
 use crate::platform::{Segment, WindowGeometry};
 
@@ -295,8 +293,9 @@ pub enum TruncationLimit {
 }
 
 impl TruncationLimit {
-    /// The limit's numeric value, for the disclosure notice.
-    pub fn value(self) -> usize {
+    /// The limit's numeric value, for the disclosure notice. Private: the only caller is
+    /// [`Truncation::notice`] in this module; nothing outside needs the raw number.
+    fn value(self) -> usize {
         match self {
             TruncationLimit::Nodes => MAX_NODES,
             TruncationLimit::Depth => MAX_DEPTH,
@@ -437,6 +436,12 @@ impl AxTree {
     /// Render a compact indented outline, one line per node:
     /// `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]` — name/bounds/states
     /// elided when absent. Two spaces of indent per depth level.
+    ///
+    /// Pure tree text — no truncation notice is appended here. Keeping this render pure
+    /// means `scroll_to_element`'s saturation check (which diffs consecutive `to_outline`
+    /// strings) can't be perturbed by a truncation-status flip that has nothing to do with
+    /// scrolling, and it keeps the notice out of the untrusted envelope the caller wraps
+    /// this text in at the MCP boundary. See [`Self::truncation_notice`].
     pub fn to_outline(&self) -> String {
         fn walk(node: &AxNode, depth: usize, out: &mut String) {
             crate::outline::write_line(node, depth, out);
@@ -446,13 +451,14 @@ impl AxTree {
         }
         let mut out = String::new();
         walk(&self.root, 0, &mut out);
-        // Truncation is a fact about the tree, not a rendering style, so it is disclosed
-        // wherever the tree is rendered. A capped tree that rendered as complete would read
-        // as "the element does not exist" — the silent fallback this field exists to prevent.
-        if let Some(t) = self.truncated {
-            let _ = writeln!(out, "{}", t.notice());
-        }
         out
+    }
+
+    /// The trusted truncation steer for the MCP boundary to surface as its own content
+    /// block — NOT baked into a render, so it is never buried inside the untrusted-content
+    /// envelope the app-derived outline is wrapped in. `None` when the tree is complete.
+    pub fn truncation_notice(&self) -> Option<String> {
+        self.truncated.map(|t| t.notice())
     }
 
     /// Guidance to surface when a snapshot exposes nothing to address — only the window
@@ -1472,24 +1478,26 @@ mod tests {
     }
 
     #[test]
-    fn outline_appends_the_truncation_notice_when_the_walk_stopped_early() {
+    fn truncation_notice_is_some_when_the_walk_stopped_early() {
+        // `to_outline` itself stays pure tree text (see its doc comment); the truncation
+        // fact is surfaced separately via `truncation_notice` so a caller can never render
+        // a truncated tree as if it were complete without actively dropping this `Some`.
         let mut t = sample_tree();
         t.assign_ids();
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Depth,
             nodes_walked: 42,
         });
-        assert!(
-            t.to_outline().contains("truncated"),
-            "a truncated tree must never render as if complete"
-        );
+        assert!(!t.to_outline().contains("truncated"), "pure tree text");
+        let notice = t.truncation_notice().expect("a truncated tree has one");
+        assert!(notice.contains("truncated"), "notice: {notice}");
     }
 
     #[test]
-    fn outline_appends_nothing_when_the_tree_is_complete() {
+    fn truncation_notice_is_none_when_the_tree_is_complete() {
         let mut t = sample_tree();
         t.assign_ids();
-        assert!(!t.to_outline().contains("truncated"));
+        assert!(t.truncation_notice().is_none());
     }
 
     #[test]

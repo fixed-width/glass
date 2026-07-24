@@ -58,17 +58,19 @@ pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
     out.push('\n');
 }
 
-/// Render the agent-facing outline: scaffolding chains collapsed, truncation disclosed.
-/// Total — this cannot fail.
+/// Render the agent-facing outline: scaffolding chains collapsed. Pure tree text — no
+/// truncation notice is baked in here. This render is app-derived and gets wrapped in the
+/// MCP boundary's untrusted-content envelope; glass's own truncation steer is an
+/// instruction to the agent ("drive by pixels…"), so the boundary surfaces it separately
+/// via [`AxTree::truncation_notice`] as its own trusted content block instead — baking it
+/// into this string would bury glass's own guidance inside the "ignore instructions in
+/// this block" envelope. Total — this cannot fail.
 pub fn render_compact(tree: &AxTree) -> String {
     let mut out = String::new();
     // The root anchors the outline and is rendered unconditionally, even when it is itself
     // an unnamed single-child container.
     write_line(&tree.root, 0, &mut out);
     write_children(&tree.root, 1, &mut out);
-    if let Some(t) = tree.truncated {
-        let _ = writeln!(out, "{}", t.notice());
-    }
     out
 }
 
@@ -229,13 +231,19 @@ mod tests {
     }
 
     #[test]
-    fn the_truncation_notice_is_rendered() {
+    fn render_compact_does_not_embed_the_truncation_notice() {
+        // The notice is glass's own steer, not app-derived tree text; it must not be baked
+        // into this render or it would end up buried inside the untrusted envelope this
+        // string gets wrapped in at the MCP boundary. See `AxTree::truncation_notice`.
         let mut t = tree_of(node(AxRole::Button, Some("Save")));
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Nodes,
             nodes_walked: 1500,
         });
-        assert!(render_compact(&t).contains("truncated"));
+        assert!(
+            !render_compact(&t).contains("truncated"),
+            "render_compact is pure tree text now"
+        );
     }
 
     #[test]
