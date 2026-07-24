@@ -269,8 +269,19 @@ pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
     ))
 }
 
-pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
-    let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
+/// The truncation steer for a snapshot outline: the core notice plus the MCP-level recourse
+/// (how to widen the cap). Kept here, not in `glass-core`, so core stays tool-agnostic; used by
+/// both `a11y_snapshot` and the `return:"snapshot"` fold so both disclose the recourse identically.
+fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
+    tree.truncation_notice().map(|notice| {
+        format!("{notice} Pass max_nodes to raise the limit, or max_nodes: 0 for the full tree.")
+    })
+}
+
+pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
+    let tree = glass
+        .a11y_snapshot(a.max_nodes.map(|n| n as usize))
+        .map_err(|e| e.to_string())?;
     // The agent-facing render: wrapper chains collapsed. The session cache keeps the full
     // tree, so every elided node is still addressable by id. Truncation is disclosed
     // separately below, not baked into this text — see the comment there.
@@ -284,8 +295,8 @@ pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
     if let Some(hint) = tree.empty_guidance() {
         contents.push(OutContent::Text(hint.to_string()));
     }
-    if let Some(notice) = tree.truncation_notice() {
-        contents.push(OutContent::Text(notice));
+    if let Some(steer) = a11y_truncation_steer(&tree) {
+        contents.push(OutContent::Text(steer));
     }
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
@@ -339,7 +350,7 @@ fn resolve_return(
             // real capture failure is swallowed because `a11y_snapshot` reads the accessibility
             // tree (not pixels) and still returns the freshest tree — the caller asked for it.
             let _ = glass.wait_stable(&settle_params());
-            let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
+            let tree = glass.a11y_snapshot(None).map_err(|e| e.to_string())?;
             // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
             // glass's own steers are separate trusted blocks, not baked into that body.
             let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(
@@ -348,8 +359,8 @@ fn resolve_return(
             if let Some(hint) = tree.empty_guidance() {
                 extra.push(OutContent::Text(hint.to_string()));
             }
-            if let Some(notice) = tree.truncation_notice() {
-                extra.push(OutContent::Text(notice));
+            if let Some(steer) = a11y_truncation_steer(&tree) {
+                extra.push(OutContent::Text(steer));
             }
             Ok((None, extra))
         }
@@ -994,7 +1005,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        let out = a11y_snapshot(&mut g).unwrap();
+        let out = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         assert_envelope(&out, "glass_a11y_snapshot");
         match &out.0[1] {
             OutContent::Text(t) => {
@@ -1030,7 +1041,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        let out = a11y_snapshot(&mut g).unwrap();
+        let out = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         assert_envelope(&out, "glass_a11y_snapshot");
         // [0]=envelope, [1]=untrusted root-only outline, [2]=glass's trusted pixel hint.
         match &out.0[2] {
@@ -1064,7 +1075,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        let out = a11y_snapshot(&mut g).unwrap();
+        let out = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         assert_envelope(&out, "glass_a11y_snapshot");
         // [0]=envelope, [1]=untrusted-wrapped outline, [2]=glass's trusted truncation steer.
         assert_eq!(
@@ -1119,7 +1130,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        let err = a11y_snapshot(&mut g).unwrap_err();
+        let err = a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap_err();
         assert!(err.contains("not supported"), "msg: {err}");
     }
 
@@ -1137,7 +1148,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        a11y_snapshot(&mut g).unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         let out = set_value(
             &mut g,
             &SetValueArgs {
@@ -1183,7 +1194,7 @@ mod tests {
             SetOutcome::NotEditable,
         );
         g.start(&spec).unwrap();
-        a11y_snapshot(&mut g).unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         let err = set_value(
             &mut g,
             &SetValueArgs {
@@ -1202,7 +1213,7 @@ mod tests {
             SetOutcome::Changed,
         );
         g.start(&spec).unwrap();
-        a11y_snapshot(&mut g).unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         let err = set_value(
             &mut g,
             &SetValueArgs {
@@ -1229,7 +1240,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        a11y_snapshot(&mut g).unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
         assert!(click_element(
             &mut g,
             &ClickElementArgs {
@@ -1362,7 +1373,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        a11y_snapshot(&mut g).unwrap(); // populate last_ax for click_element/set_value
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap(); // populate last_ax for click_element/set_value
         g
     }
 
@@ -1477,7 +1488,7 @@ mod tests {
             a11y: false,
         })
         .unwrap();
-        a11y_snapshot(&mut g).unwrap(); // seed last_ax for click_element
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap(); // seed last_ax for click_element
         let before = *captures.lock().unwrap();
         let out = click_element(
             &mut g,

@@ -15,7 +15,7 @@ use std::time::Duration;
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, KeyEvent, Modifier,
-    MouseButton, Platform, PointerEvent, WindowGeometry, WindowHint, WindowOp,
+    MouseButton, Platform, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
 
@@ -282,6 +282,7 @@ fn onbox_a11y_snapshot_and_click() {
         window: geo.clone(),
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     assert!(tree.count > 0, "snapshot must have nodes");
@@ -392,6 +393,7 @@ fn onbox_modifier_click() {
         window: geo.clone(),
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     let mut hit = None;
@@ -512,6 +514,7 @@ fn onbox_a11y_set_value() {
         window: geo.clone(),
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
 
@@ -577,6 +580,7 @@ fn onbox_egui_set_value_honesty() {
         window: geo.clone(),
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let tree = a11y
         .snapshot(&ctx)
@@ -758,6 +762,7 @@ fn onbox_a11y_edge_multiprocess() {
         window: geo.clone(),
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let tree = a11y
         .snapshot(&ctx)

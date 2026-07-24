@@ -94,7 +94,7 @@ fn snapshot_finds_gtk_widgets() {
     // blocking on a D-Bus activation timeout.
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
-    let tree = glass.a11y_snapshot().expect("a11y snapshot");
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     let outline = tree.to_outline();
     assert!(
         outline.contains("Button \"Save\""),
@@ -152,7 +152,10 @@ fn a11y_launch_is_fast_without_the_portal_hang() {
     );
 
     std::thread::sleep(std::time::Duration::from_millis(3_000));
-    let outline = glass.a11y_snapshot().expect("a11y snapshot").to_outline();
+    let outline = glass
+        .a11y_snapshot(None)
+        .expect("a11y snapshot")
+        .to_outline();
     assert!(
         outline.contains("Button \"Save\""),
         "a11y tree missing after a fast launch:\n{outline}"
@@ -189,7 +192,7 @@ fn snapshot_reads_entry_value() {
         .expect("launch GTK fixture");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
-    let tree = glass.a11y_snapshot().expect("a11y snapshot");
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     let outline = tree.to_outline();
     // GTK4 Gtk.Entry exposes AT-SPI Role::Text, which maps to AxRole::TextArea.
     // read_value handles both TextField and TextArea via the Text interface.
@@ -232,7 +235,7 @@ fn set_value_changes_entry() {
         .expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     // GTK4 Gtk.Entry exposes AT-SPI Role::Text -> maps to AxRole::TextArea.
     let entry = find_role(&tree.root, glass_core::AxRole::TextArea)
         .or_else(|| find_role(&tree.root, glass_core::AxRole::TextField))
@@ -241,7 +244,7 @@ fn set_value_changes_entry() {
     glass.set_value(entry_id, "changed").expect("set_value");
 
     // Re-snapshot and confirm the new value.
-    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let tree2 = glass.a11y_snapshot(None).expect("snapshot 2");
     let entry2 = find_role(&tree2.root, glass_core::AxRole::TextArea)
         .or_else(|| find_role(&tree2.root, glass_core::AxRole::TextField))
         .expect("entry 2");
@@ -281,7 +284,7 @@ fn set_value_on_button_is_not_editable() {
         .expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
     let err = glass.set_value(button.id, "x").unwrap_err();
     assert!(
@@ -322,12 +325,12 @@ fn set_value_changes_spinbutton() {
     // A GtkSpinButton exposes both EditableText and Value; set_value must write through the
     // Value interface (the only one that commits to the adjustment) rather than the entry
     // buffer, which reverts.
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let spin = find_role(&tree.root, glass_core::AxRole::SpinButton).expect("spinbutton");
     assert_eq!(spin.value.as_deref(), Some("1"), "fixture starts at 1");
     glass.set_value(spin.id, "4").expect("set_value");
 
-    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let tree2 = glass.a11y_snapshot(None).expect("snapshot 2");
     let spin2 = find_role(&tree2.root, glass_core::AxRole::SpinButton).expect("spinbutton 2");
     assert_eq!(
         spin2.value.as_deref(),
@@ -403,12 +406,12 @@ fn set_value_toggles_switch() {
     let mut glass = launch_fixture();
     // The GtkSwitch "Active" starts off; set_value must flip it on via the Action
     // "toggle" (it exposes no text/Value interface).
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let sw = find_role_name(&tree.root, glass_core::AxRole::CheckBox, "Active").expect("switch");
     assert!(!sw.states.checked, "switch starts off");
     glass.set_value(sw.id, "true").expect("set_value true"); // set_value polls until applied
 
-    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let tree2 = glass.a11y_snapshot(None).expect("snapshot 2");
     let sw2 =
         find_role_name(&tree2.root, glass_core::AxRole::CheckBox, "Active").expect("switch 2");
     assert!(
@@ -420,12 +423,12 @@ fn set_value_toggles_switch() {
     glass
         .set_value(sw2.id, "true")
         .expect("set_value true again");
-    let tree3 = glass.a11y_snapshot().expect("snapshot 3");
+    let tree3 = glass.a11y_snapshot(None).expect("snapshot 3");
     let sw3 =
         find_role_name(&tree3.root, glass_core::AxRole::CheckBox, "Active").expect("switch 3");
     assert!(sw3.states.checked, "still on after idempotent set");
     glass.set_value(sw3.id, "false").expect("set_value false");
-    let tree4 = glass.a11y_snapshot().expect("snapshot 4");
+    let tree4 = glass.a11y_snapshot(None).expect("snapshot 4");
     let sw4 =
         find_role_name(&tree4.root, glass_core::AxRole::CheckBox, "Active").expect("switch 4");
     assert!(
@@ -441,7 +444,7 @@ fn set_value_selects_dropdown_option() {
     let mut glass = launch_fixture();
     // The GtkDropDown starts on "Acme"; set_value must select "Globex" by opening
     // the popup and picking the option through the Selection interface.
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo box");
     assert_eq!(combo.name.as_deref(), Some("Acme"), "starts on Acme");
     glass
@@ -449,7 +452,7 @@ fn set_value_selects_dropdown_option() {
         .expect("set_value Globex");
 
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let tree2 = glass.a11y_snapshot().expect("snapshot 2");
+    let tree2 = glass.a11y_snapshot(None).expect("snapshot 2");
     let combo2 = find_role(&tree2.root, glass_core::AxRole::ComboBox).expect("combo box 2");
     assert_eq!(
         combo2.name.as_deref(),
@@ -485,7 +488,7 @@ fn set_value_selects_dropdown_option() {
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn screenshot_includes_open_popover() {
     let mut glass = launch_fixture();
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
     let combo_id = combo.id;
     let combo_bounds = combo.bounds.expect("combo box must report bounds");
@@ -539,15 +542,15 @@ fn screenshot_includes_open_popover() {
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn click_element_commits_dropdown_option() {
     let mut glass = launch_fixture();
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let combo = find_role(&tree.root, glass_core::AxRole::ComboBox).expect("combo");
     glass.click_element(combo.id).expect("open");
     std::thread::sleep(std::time::Duration::from_millis(600));
-    let t2 = glass.a11y_snapshot().expect("snap2");
+    let t2 = glass.a11y_snapshot(None).expect("snap2");
     let globex = find_node(&t2.root, "Globex").expect("globex");
     glass.click_element(globex.id).expect("click option");
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let t3 = glass.a11y_snapshot().expect("snap3");
+    let t3 = glass.a11y_snapshot(None).expect("snap3");
     assert_eq!(
         find_role(&t3.root, glass_core::AxRole::ComboBox).and_then(|c| c.name.as_deref()),
         Some("Globex"),
@@ -588,7 +591,7 @@ fn snapshot_without_a11y_flag_errors() {
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let err = glass
-        .a11y_snapshot()
+        .a11y_snapshot(None)
         .expect_err("snapshot must fail without a11y:true");
     match err {
         glass_core::GlassError::AccessibilityUnavailable(msg) => {
@@ -626,7 +629,7 @@ fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
         .unwrap_or_else(|e| panic!("launch GTK fixture sandboxed ({level:?}): {e}"));
     std::thread::sleep(std::time::Duration::from_millis(3_000));
     let outline = glass
-        .a11y_snapshot()
+        .a11y_snapshot(None)
         .expect("a11y snapshot (sandboxed)")
         .to_outline();
     assert!(
@@ -688,7 +691,7 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
         .unwrap_or_else(|e| panic!("wayland a11y launch ({level:?}): {e}"));
     std::thread::sleep(std::time::Duration::from_millis(3_000));
     let outline = glass
-        .a11y_snapshot()
+        .a11y_snapshot(None)
         .expect("a11y snapshot (wayland)")
         .to_outline();
     assert!(
@@ -724,7 +727,7 @@ fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
     let mut glass = launch_fixture();
     // Precondition: "Row 060" is virtualized — absent from the initial tree. If it
     // were present, the test would prove nothing (no scroll needed).
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     assert!(
         find_node(&tree.root, "Row 060").is_none(),
         "Row 060 should be off-screen/virtualized at start, but was in the tree"
@@ -780,7 +783,7 @@ fn scroll_to_element_reaches_a_virtualized_offscreen_row() {
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn scroll_to_element_reports_unmatched_for_an_absent_row() {
     let mut glass = launch_fixture();
-    let tree = glass.a11y_snapshot().expect("snapshot");
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
     let seed = find_node(&tree.root, "Row 000").expect("an early row realized at start");
     let sb = seed.bounds.expect("row bounds");
     let anchor = (sb.x + sb.width as i32 / 2, sb.y + sb.height as i32 / 2);
@@ -843,7 +846,7 @@ fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
     std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let started = std::time::Instant::now();
-    let tree = glass.a11y_snapshot().expect("a11y snapshot");
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     eprintln!(
         "over-cap snapshot: {} nodes in {:?}",
         tree.to_outline().lines().count(),

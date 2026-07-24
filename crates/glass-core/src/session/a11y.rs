@@ -22,8 +22,10 @@ impl Glass {
     /// Snapshot the active window's accessibility tree (normalized, window-
     /// relative, ids assigned by the core). Caches it for `click_element`.
     /// `AxUnsupported` if the backend has no accessibility reader.
-    pub fn a11y_snapshot(&mut self) -> Result<AxTree> {
+    pub fn a11y_snapshot(&mut self, max_nodes: Option<usize>) -> Result<AxTree> {
+        let limits = crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
         let s = self.active_mut()?;
+        s.a11y_limits = limits;
         // Reader-presence check up front (mirrors set_value_inner) so `AxUnsupported` keeps
         // precedence over — and a reader-less backend skips — the geometry round-trip below.
         if s.accessibility.is_none() {
@@ -49,6 +51,7 @@ impl Glass {
             window,
             window_handle,
             a11y_bus_addr,
+            limits,
         })?;
         tree.assign_ids();
         s.last_ax = Some(tree.clone());
@@ -61,7 +64,7 @@ impl Glass {
     /// Caches the snapshot, so `click_element` resolves a mark's id afterward.
     pub fn a11y_marks(&mut self) -> Result<(Frame, Vec<Mark>)> {
         let frame = self.screenshot(None, None)?;
-        let tree = self.a11y_snapshot()?;
+        let tree = self.a11y_snapshot(None)?;
         Ok(crate::marks::render(&frame, &tree))
     }
 
@@ -208,6 +211,7 @@ impl Glass {
                 window: s.geometry.clone(),
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
+                limits: s.a11y_limits,
             };
             (target, ctx)
         };
@@ -254,7 +258,7 @@ impl Glass {
                         TOGGLE_VERIFY_INTERVAL_MS,
                         TOGGLE_VERIFY_TIMEOUT_MS,
                         || {
-                            let tree = self.a11y_snapshot()?;
+                            let tree = self.a11y_snapshot(None)?;
                             let now = find_checkable_near(&tree.root, target.bounds.as_ref())
                                 .is_some_and(|n| n.states.checked == want);
                             Ok(now.then_some(()))
@@ -296,7 +300,7 @@ impl Glass {
         // Re-read the realized options + which one is currently selected. The open
         // combo is `expanded`; when several combos exist, ids don't survive the
         // re-snapshot, so fall back to the one nearest the target's bounds.
-        let tree = self.a11y_snapshot()?;
+        let tree = self.a11y_snapshot(None)?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -332,7 +336,7 @@ impl Glass {
         self.settle_for_popup();
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_snapshot()?;
+        let tree = self.a11y_snapshot(None)?;
         let ok = find_combo_near(&tree.root, target.bounds.as_ref())
             .and_then(|c| c.name.as_deref())
             .is_some_and(|n| n.eq_ignore_ascii_case(want));
@@ -889,7 +893,7 @@ mod tests {
     fn a11y_snapshot_assigns_ids_and_counts() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
-        let tree = g.a11y_snapshot().unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
         assert_eq!(tree.count, 2);
         assert_eq!(tree.root.id, AxNodeId(0));
         assert_eq!(tree.root.children[0].id, AxNodeId(1));
@@ -900,7 +904,7 @@ mod tests {
         let mut g = glass_with(FakePlatform::new(40, 30));
         g.start(&spec()).unwrap();
         assert!(matches!(
-            g.a11y_snapshot().unwrap_err(),
+            g.a11y_snapshot(None).unwrap_err(),
             GlassError::AxUnsupported
         ));
     }
@@ -911,7 +915,7 @@ mod tests {
         let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
         let mut g = glass_with_a11y(platform, fake_tree());
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         g.click_element(AxNodeId(1)).unwrap();
         // The Button at (10,10 20x20) → center (20,20), via the normal pointer path.
         assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
@@ -964,7 +968,7 @@ mod tests {
             .with_click_log(clicks.clone());
         let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap(); // must refresh s.geometry 230 → 458
+        g.a11y_snapshot(None).unwrap(); // must refresh s.geometry 230 → 458
         g.click_element(AxNodeId(1)).unwrap(); // the Button at x=292 — on-screen only in 458
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
@@ -987,7 +991,7 @@ mod tests {
     fn click_element_unknown_id_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         assert!(matches!(
             g.click_element(AxNodeId(99)).unwrap_err(),
             GlassError::AxElementNotFound(99)
@@ -1025,7 +1029,7 @@ mod tests {
         });
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), tree);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         // node #2 is the boundless Label.
         assert!(matches!(
             g.click_element(AxNodeId(2)).unwrap_err(),
@@ -1065,7 +1069,7 @@ mod tests {
             .with_select_log(select_log.clone());
         let mut g = glass_with_a11y(platform, fake_tree());
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         g.click_element(AxNodeId(1)).unwrap(); // the Button at (10,10 20x20)
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
@@ -1130,7 +1134,7 @@ mod tests {
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         // node #1 = the row-shaped checkable → a swipe across the trailing control, not a click.
         g.click_element(AxNodeId(1)).unwrap();
@@ -1220,7 +1224,7 @@ mod tests {
         let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
         let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         g.click_element(AxNodeId(1)).unwrap();
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
@@ -1273,7 +1277,7 @@ mod tests {
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         g.click_element(AxNodeId(1)).unwrap();
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
@@ -1295,7 +1299,7 @@ mod tests {
             .with_failing_list_windows();
         let mut g = glass_with_a11y(platform, fake_tree());
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         g.click_element(AxNodeId(1))
             .expect("a failing list_windows must not block an ordinary click");
         assert_eq!(
@@ -1339,7 +1343,7 @@ mod tests {
             .with_select_log(select_log.clone());
         let mut g = glass_with_a11y(platform, fake_tree_with_popover_option());
         g.start(&spec()).unwrap();
-        let tree = g.a11y_snapshot().unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
         // assign_ids in pre-order: root=0, List=1, Globex(ListItem)=2.
         let globex_id = tree.root.children[0].children[0].id;
         assert_eq!(globex_id, AxNodeId(2));
@@ -1432,7 +1436,7 @@ mod tests {
             .with_select_log(select_log.clone());
         let mut g = glass_with_a11y(platform, tree);
         g.start(&spec()).unwrap();
-        let snapshot = g.a11y_snapshot().unwrap();
+        let snapshot = g.a11y_snapshot(None).unwrap();
         let globex_id = snapshot.root.children[0].id;
         assert!(matches!(
             g.click_element(globex_id).unwrap_err(),
@@ -1464,7 +1468,7 @@ mod tests {
     fn set_value_unknown_id_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         assert!(matches!(
             g.set_value(AxNodeId(99), "x").unwrap_err(),
             GlassError::AxElementNotFound(99)
@@ -1495,6 +1499,7 @@ mod tests {
                 tree: fake_tree(),
                 set_log: log2,
                 set_fail: false,
+                limits_log: Arc::new(Mutex::new(None)),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1503,7 +1508,7 @@ mod tests {
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap(); // fake_tree: #1 is Button "Save"
+        g.a11y_snapshot(None).unwrap(); // fake_tree: #1 is Button "Save"
         g.set_value(AxNodeId(1), "hello").unwrap();
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -1525,6 +1530,57 @@ mod tests {
     }
 
     #[test]
+    fn a11y_snapshot_threads_max_nodes_into_ctx_limits_and_set_value_reuses_them() {
+        // Same mock harness as `set_value_passes_target_and_text_to_backend`, but this
+        // time inspecting `limits_log` — the `AxContext.limits` the backend actually
+        // received — to prove `max_nodes` reaches the ctx, and that `set_value` reuses
+        // whatever the last `a11y_snapshot` recorded rather than falling back to the
+        // default cap. Real backends still ignore `limits` in this task (they build
+        // `WalkBudget::new()`), so this is the only way to observe the plumbing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let limits_log = Arc::new(Mutex::new(None));
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(FakePlatform::new(100, 100)),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: fake_tree(),
+                set_log: Arc::new(Mutex::new(Vec::new())),
+                set_fail: false,
+                limits_log: limits_log.clone(),
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
+        g.start(&spec()).unwrap();
+
+        g.a11y_snapshot(Some(5000)).unwrap();
+        assert_eq!(
+            limits_log
+                .lock()
+                .unwrap()
+                .expect("snapshot recorded ctx.limits")
+                .nodes,
+            5000,
+            "snapshot ctx carries the raised cap"
+        );
+
+        g.set_value(AxNodeId(1), "x").unwrap(); // fake_tree: #1 is Button "Save"
+        assert_eq!(
+            limits_log
+                .lock()
+                .unwrap()
+                .expect("set_value recorded ctx.limits")
+                .nodes,
+            5000,
+            "set_value reuses the snapshot's limits"
+        );
+    }
+
+    #[test]
     fn set_value_propagates_backend_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
@@ -1535,6 +1591,7 @@ mod tests {
                 tree: fake_tree(),
                 set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 set_fail: true,
+                limits_log: Arc::new(Mutex::new(None)),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1543,7 +1600,7 @@ mod tests {
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
         assert!(matches!(
             g.set_value(AxNodeId(1), "x").unwrap_err(),
             GlassError::AxElementNotEditable(1)
@@ -1600,7 +1657,7 @@ mod tests {
         // Snapshot #1 (cached read) = unchecked; snapshot #2 (verify re-read) = checked.
         let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(true)]);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap(); // caches unchecked
+        g.a11y_snapshot(None).unwrap(); // caches unchecked
 
         g.set_value(AxNodeId(1), "true").unwrap();
 
@@ -1615,7 +1672,7 @@ mod tests {
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, sw(true));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         g.set_value(AxNodeId(1), "true").unwrap();
 
@@ -1633,7 +1690,7 @@ mod tests {
         // Both reads unchecked: the swipe "did not take" -> honest error, not false ok.
         let mut g = glass_with_a11y_seq(platform, vec![sw(false), sw(false)]);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         let err = g.set_value(AxNodeId(1), "true").unwrap_err();
         assert!(matches!(err, GlassError::AxValueNotApplied(_)));
@@ -1653,7 +1710,7 @@ mod tests {
         // Snapshot #1 (cached read) = checked; snapshot #2 (verify re-read) = unchecked.
         let mut g = glass_with_a11y_seq(platform, vec![sw(true), sw(false)]);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap(); // caches checked
+        g.a11y_snapshot(None).unwrap(); // caches checked
 
         g.set_value(AxNodeId(1), "false").unwrap();
 
@@ -1668,7 +1725,7 @@ mod tests {
             .with_trailing_toggle_backend();
         let mut g = glass_with_a11y(platform, sw(false));
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         g.set_value(AxNodeId(1), "false").unwrap();
 
@@ -1740,7 +1797,7 @@ mod tests {
             vec![two_switches(true, false), two_switches(true, true)],
         );
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap(); // caches: sibling already checked, target unchecked
+        g.a11y_snapshot(None).unwrap(); // caches: sibling already checked, target unchecked
 
         // Target is id 2 (sibling listed first gets id 1; see `two_switches`).
         g.set_value(AxNodeId(2), "true").unwrap();
@@ -1764,7 +1821,7 @@ mod tests {
             vec![two_switches(true, false), two_switches(true, false)],
         );
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         let err = g.set_value(AxNodeId(2), "true").unwrap_err();
         assert!(matches!(err, GlassError::AxValueNotApplied(2)));
@@ -1797,6 +1854,7 @@ mod tests {
                 tree: fake_tree(), // #1 is a non-checkable Button "Save"
                 set_log: log2,
                 set_fail: false,
+                limits_log: Arc::new(Mutex::new(None)),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1805,7 +1863,7 @@ mod tests {
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         g.set_value(AxNodeId(1), "true").unwrap();
 
@@ -1844,6 +1902,7 @@ mod tests {
                 tree: sw(false), // #1 is the checkable switch "Sw"
                 set_log: log2,
                 set_fail: false,
+                limits_log: Arc::new(Mutex::new(None)),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1852,7 +1911,7 @@ mod tests {
         });
         let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         g.start(&spec()).unwrap();
-        g.a11y_snapshot().unwrap();
+        g.a11y_snapshot(None).unwrap();
 
         let err = g.set_value(AxNodeId(1), "banana").unwrap_err();
 

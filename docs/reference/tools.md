@@ -414,9 +414,13 @@ reads the Simulator's accessibility tree over `idb_companion` (install it — se
 
 ### `glass_a11y_snapshot`
 
-Capture the active window's accessibility tree as compact text. No parameters. Returns `{}`; the
-tree itself rides as an untrusted sibling text block, one line per element:
+Capture the active window's accessibility tree as compact text. Returns `{}`; the tree itself
+rides as an untrusted sibling text block, one line per element:
 `#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`.
+
+- `max_nodes` (integer) — raise the element cap above the default (which protects the token
+  budget), or `0` for the full tree (no limit). Omit for the default cap. A snapshot renumbers
+  ids, so re-read them after changing this.
 
 ### `glass_a11y_marks`
 

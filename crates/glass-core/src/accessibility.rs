@@ -555,6 +555,10 @@ pub struct AxContext {
     /// `AccessibilityUnavailable` (instructing the caller to relaunch with `a11y:true`) — it does
     /// NOT fall back to any host/ambient bus. Non-Linux backends ignore this field.
     pub a11y_bus_addr: Option<String>,
+    /// The size bounds for this walk. The reader/mapper builds its `WalkBudget` from these.
+    /// Set from the session's stored limits so a snapshot and a later `set_value` walk the
+    /// tree with the same bounds (ids stay resolvable).
+    pub limits: WalkLimits,
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id

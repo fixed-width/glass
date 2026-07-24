@@ -34,6 +34,7 @@ impl Glass {
             platform,
             accessibility,
             last_ax: None,
+            a11y_limits: WalkLimits::DEFAULT,
             geometry: geometry.clone(),
             logs: LogBuffer::new(self.log_capacity),
             active_window: None,

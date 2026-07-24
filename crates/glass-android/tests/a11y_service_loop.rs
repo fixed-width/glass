@@ -6,7 +6,7 @@
 use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget};
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowGeometry};
 
 #[test]
@@ -43,6 +43,7 @@ fn a11y_service_snapshot_and_actions() {
         },
         window_handle: None,
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
 
     let mut tree = a11y.snapshot(&ctx).expect("snapshot");

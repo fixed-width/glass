@@ -3,7 +3,7 @@
 
 use crate::accessibility::{
     element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree,
-    ElementCondition, ElementInfo, ElementMatch,
+    ElementCondition, ElementInfo, ElementMatch, WalkLimits,
 };
 use crate::baseline::BaselineStore;
 use crate::diff::{
@@ -41,6 +41,9 @@ struct ActiveSession {
     // last-captured tree (read by the a11y tools).
     accessibility: Option<Box<dyn Accessibility + Send>>,
     last_ax: Option<AxTree>,
+    /// Limits the most recent `a11y_snapshot` used; reused by `set_value` so ids from a
+    /// raised-cap snapshot stay resolvable. Defaults to `WalkLimits::DEFAULT`.
+    a11y_limits: WalkLimits,
     geometry: WindowGeometry,
     logs: LogBuffer,
     /// Best-effort active window for audit attribution (id from list_windows/select_window).
@@ -220,7 +223,7 @@ mod tests {
 
         g.start(&spec()).unwrap();
         let _ = g.screenshot(None, None).unwrap(); // read
-        let tree = g.a11y_snapshot().unwrap(); // read (populates last_ax)
+        let tree = g.a11y_snapshot(None).unwrap(); // read (populates last_ax)
         g.pointer(&PointerEvent::Click {
             x: 1,
             y: 2,
