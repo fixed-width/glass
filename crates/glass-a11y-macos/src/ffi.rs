@@ -43,7 +43,6 @@ use glass_core::{GlassError, Result};
 pub(crate) mod attr {
     pub(crate) const VALUE: &str = "AXValue";
     pub(crate) const ROLE: &str = "AXRole";
-    pub(crate) const ROLE_DESCRIPTION: &str = "AXRoleDescription";
     pub(crate) const TITLE: &str = "AXTitle";
     pub(crate) const DESCRIPTION: &str = "AXDescription";
     pub(crate) const CHILDREN: &str = "AXChildren";

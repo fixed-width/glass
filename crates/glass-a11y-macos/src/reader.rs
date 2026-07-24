@@ -310,11 +310,12 @@ fn walk(
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let role = mapping::map_role(&ax_role);
-    // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to the
-    // raw AX role string when it's absent. If both are absent (an element exposing neither)
-    // `raw_role` is the empty string — a "role unknown" signal, not a guaranteed-populated
-    // field.
-    let raw_role = ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role);
+    // `raw_role` is the same AX role string `map_role` just matched on — the token, not
+    // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as
+    // a mapping key and not worth a second attribute read. Absent (an element exposing no
+    // `AXRole`) leaves it the empty string — a "role unknown" signal, not a guaranteed-
+    // populated field.
+    let raw_role = ax_role;
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
