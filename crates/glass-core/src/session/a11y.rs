@@ -11,6 +11,11 @@ const ROW_ASPECT: u32 = 4;
 /// pan on a UISwitch; matches the proven ~250ms on-device swipe.
 const TOGGLE_SWIPE_MS: u64 = 250;
 
+/// Disclosed as the click method's fallback reason when `set_combo_value` opens a dropdown:
+/// that one click is pointer-only by design, not because the native action was unavailable.
+const COMBO_OPEN_POINTER_REASON: &str =
+    "combo popup opened by pointer so the keyboard commit lands in it";
+
 /// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
 /// the swiped switch to read back the wanted state.
 const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
@@ -95,9 +100,21 @@ impl Glass {
     /// trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]). The returned
     /// [`ClickMethod`] says which path actually fired.
     pub fn click_element(&mut self, id: AxNodeId) -> Result<ClickMethod> {
+        self.audited_click(id, Self::click_element_inner)
+    }
+
+    /// Run one element click and record it through the audit seam. Every path that actuates
+    /// an element by id goes through here — the native-first [`Glass::click_element`] and the
+    /// deliberately pointer-only combo open alike — so the log can't miss an actuation just
+    /// because an internal caller took a different route to it.
+    fn audited_click(
+        &mut self,
+        id: AxNodeId,
+        click: impl FnOnce(&mut Self, AxNodeId) -> Result<ClickMethod>,
+    ) -> Result<ClickMethod> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
-        let result = self.click_element_inner(id);
+        let result = click(self, id);
         self.emit_audit(
             &crate::audit::Actuation::ClickElement {
                 element,
@@ -124,6 +141,16 @@ impl Glass {
             Err(e) if !e.invoke_fallback_eligible() => return Err(e),
             Err(e) => native_fallback_reason(&e),
         };
+        self.click_element_pointer_only(id)
+            .map(|()| ClickMethod::Pointer { native_fallback })
+    }
+
+    /// The synthetic-pointer half of [`Glass::click_element`], on its own: the center of the
+    /// element's bounds — routed into the owning popover window when the element renders in
+    /// one, or swiped across the trailing control for a row-shaped checkable on a
+    /// trailing-toggle backend. Callable directly by an internal caller that must NOT take
+    /// the native action (see [`Glass::set_combo_value`]).
+    fn click_element_pointer_only(&mut self, id: AxNodeId) -> Result<()> {
         let (bounds, checkable, trailing_toggle_backend, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
@@ -173,7 +200,7 @@ impl Glass {
             if let Some(prev) = prev {
                 let _ = self.select_window(prev);
             }
-            return result.map(|()| ClickMethod::Pointer { native_fallback });
+            return result;
         }
         // A switch whose backend reports the whole row as its frame with the control at the
         // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
@@ -200,7 +227,6 @@ impl Glass {
                 button: MouseButton::Left,
                 modifiers: vec![],
             })
-            .map(|()| ClickMethod::Pointer { native_fallback })
         } else {
             let (x, y) = bounds
                 .clamped_center(active_geo.width, active_geo.height)
@@ -212,7 +238,6 @@ impl Glass {
                 count: 1,
                 modifiers: vec![],
             })
-            .map(|()| ClickMethod::Pointer { native_fallback })
         }
     }
 
@@ -370,8 +395,18 @@ impl Glass {
         {
             return Ok(());
         }
-        // Open the popup (the combo button is in the main window, so this click lands).
-        self.click_element(id)?;
+        // Open the popup with a real pointer click, deliberately NOT the native action (the
+        // combo button is in the main window, so this click lands). A programmatic expand —
+        // UIA's `ExpandCollapsePattern` is the concrete case — opens the popup without moving
+        // keyboard focus, and everything below is keyboard navigation (Down/Up/Return), which
+        // would then go to whatever held focus instead of the popup. Clicking focuses the
+        // combo the way a person's click does.
+        self.audited_click(id, |g, id| {
+            g.click_element_pointer_only(id)
+                .map(|()| ClickMethod::Pointer {
+                    native_fallback: COMBO_OPEN_POINTER_REASON.into(),
+                })
+        })?;
         self.settle_for_popup();
         // Re-read the realized options + which one is currently selected. The open
         // combo is `expanded`; when several combos exist, ids don't survive the
@@ -1699,6 +1734,103 @@ mod tests {
             "the candidate window is never selected either — the container gate runs \
              before select_window, so a mis-detection can't even transiently switch focus"
         );
+    }
+
+    /// The combo fixture: a single `ComboBox` named `name`, optionally `expanded` with its
+    /// option rows realized underneath (an open GtkDropDown's shape — `ListItem`s carrying
+    /// their label, the current one `selected`).
+    fn combo(name: &str, options: &[&str]) -> AxTree {
+        let bounds = AxRect {
+            x: 0,
+            y: 188,
+            width: 320,
+            height: 34,
+        };
+        let items: Vec<AxNode> = options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| AxNode {
+                states: AxStates {
+                    selected: *opt == name,
+                    ..Default::default()
+                },
+                ..named_node(
+                    0,
+                    AxRole::ListItem,
+                    opt,
+                    AxRect {
+                        x: 20,
+                        y: 200 + 30 * i as i32,
+                        width: 280,
+                        height: 27,
+                    },
+                )
+            })
+            .collect();
+        let children = if options.is_empty() {
+            vec![]
+        } else {
+            vec![AxNode {
+                children: items,
+                ..ax_node(
+                    0,
+                    AxRole::List,
+                    Some(AxRect {
+                        x: 0,
+                        y: 194,
+                        width: 320,
+                        height: 129,
+                    }),
+                    vec![],
+                )
+            }]
+        };
+        let combo = AxNode {
+            name: Some(name.into()),
+            states: AxStates {
+                expanded: !options.is_empty(),
+                ..Default::default()
+            },
+            children,
+            ..ax_node(0, AxRole::ComboBox, Some(bounds), vec![])
+        };
+        tree_with(340, 300, vec![combo])
+    }
+
+    #[test]
+    fn set_value_on_a_combo_opens_the_popup_with_a_pointer_click_even_when_invoke_succeeds() {
+        // The combo commit loop is keyboard navigation (Down/Up/Return), so the popup must be
+        // opened by something that takes keyboard focus. A native "expand" action doesn't
+        // (UIA's ExpandCollapsePattern is the concrete case), which would send the keystrokes
+        // to whatever had focus instead. So this one click stays pointer-only even on a
+        // backend whose invoke works.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_click_log(clicks.clone());
+        let (mut g, invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Acme", &[]),                 // cached: closed, showing Acme
+                combo("Acme", &["Acme", "Globex"]), // after the open: expanded + options
+                combo("Globex", &[]),               // after the commit: closed, Globex
+            ],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.set_value(AxNodeId(1), "Globex").unwrap();
+
+        assert!(
+            invoke_log.lock().unwrap().is_empty(),
+            "the popup open must not use the native action — it wouldn't take keyboard focus"
+        );
+        let clicks = clicks.lock().unwrap();
+        assert_eq!(
+            clicks.len(),
+            1,
+            "exactly one pointer click: the popup open, {clicks:?}"
+        );
+        assert_eq!(clicks[0], (160, 205), "the combo's own clamped center");
     }
 
     #[test]

@@ -270,6 +270,28 @@ pub(crate) enum InvokeBehavior {
     Drifted,
 }
 
+/// The scripted `Accessibility::invoke` body shared by [`FakeAccessibility`] and
+/// [`SeqAccessibility`], so both fakes model a backend's invoke identically.
+fn scripted_invoke(
+    behavior: InvokeBehavior,
+    log: &Arc<Mutex<Vec<AxTarget>>>,
+    target: &AxTarget,
+) -> Result<()> {
+    match behavior {
+        InvokeBehavior::Unsupported => Err(GlassError::AxUnsupported),
+        InvokeBehavior::Succeed => {
+            log.lock().unwrap().push(target.clone());
+            Ok(())
+        }
+        InvokeBehavior::NoAction => Err(GlassError::AxActionUnavailable(target.id.0)),
+        InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
+            target.id.0,
+            "action reported failure".into(),
+        )),
+        InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
+    }
+}
+
 /// A scriptable `Accessibility` returning a fixed tree.
 pub(crate) struct FakeAccessibility {
     pub(crate) tree: AxTree,
@@ -307,19 +329,7 @@ impl Accessibility for FakeAccessibility {
     }
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
         *self.limits_log.lock().unwrap() = Some(ctx.limits);
-        match self.invoke_behavior {
-            InvokeBehavior::Unsupported => Err(GlassError::AxUnsupported),
-            InvokeBehavior::Succeed => {
-                self.invoke_log.lock().unwrap().push(target.clone());
-                Ok(())
-            }
-            InvokeBehavior::NoAction => Err(GlassError::AxActionUnavailable(target.id.0)),
-            InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
-                target.id.0,
-                "action reported failure".into(),
-            )),
-            InvokeBehavior::Drifted => Err(GlassError::AxElementChanged(target.id.0)),
-        }
+        scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }
 
@@ -471,10 +481,14 @@ pub(crate) fn glass_with_a11y_invoke(
 
 /// An `Accessibility` that returns a scripted sequence of trees — one per
 /// `snapshot()` call, repeating the last — so a test can model rows/columns
-/// realizing on-screen as the container scrolls.
+/// realizing on-screen as the container scrolls. Its `invoke` is scriptable too
+/// (default: unsupported), so a compound operation that re-snapshots between steps
+/// can also be driven over a backend that has a native action.
 pub(crate) struct SeqAccessibility {
     trees: Vec<AxTree>,
     idx: usize,
+    invoke_behavior: InvokeBehavior,
+    invoke_log: Arc<Mutex<Vec<AxTarget>>>,
 }
 
 impl Accessibility for SeqAccessibility {
@@ -486,14 +500,38 @@ impl Accessibility for SeqAccessibility {
     fn set_value(&mut self, _ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
         Ok(())
     }
+    fn invoke(&mut self, _ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
+    }
 }
 
 pub(crate) fn glass_with_a11y_seq(platform: FakePlatform, trees: Vec<AxTree>) -> Glass {
+    glass_with_a11y_seq_invoke(platform, trees, InvokeBehavior::Unsupported).0
+}
+
+/// Like [`glass_with_a11y_seq`] but with a scripted `invoke` — for compound operations
+/// (`set_value`'s toggle path, `set_combo_value`) that re-snapshot between steps AND run
+/// over a backend with a native action. Returns the invoke log alongside the session.
+pub(crate) fn glass_with_a11y_seq_invoke(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    behavior: InvokeBehavior,
+) -> (Glass, Arc<Mutex<Vec<AxTarget>>>) {
     debug_assert!(
         !trees.is_empty(),
         "glass_with_a11y_seq needs at least one tree (snapshot indexes trees.len() - 1)"
     );
-    glass_with_backend(platform, Box::new(SeqAccessibility { trees, idx: 0 }))
+    let invoke_log = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(SeqAccessibility {
+            trees,
+            idx: 0,
+            invoke_behavior: behavior,
+            invoke_log: invoke_log.clone(),
+        }),
+    );
+    (g, invoke_log)
 }
 
 pub(crate) fn named_node(id: u32, role: AxRole, name: &str, bounds: AxRect) -> AxNode {
