@@ -61,6 +61,21 @@ impl Accessibility for LinuxA11y {
             )),
         }
     }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_invoke(&ctx, &target));
+        });
+        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => Err(GlassError::AccessibilityUnavailable(
+                "accessibility invoke timed out (a11y bus not responding)".into(),
+            )),
+        }
+    }
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -77,6 +92,14 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
     rt.block_on(set_value_async(ctx, target, text))
+}
+
+fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
+    rt.block_on(invoke_async(ctx, target))
 }
 
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
@@ -498,6 +521,40 @@ async fn set_toggle(
         }
     }
     Err(GlassError::AxValueNotApplied(id))
+}
+
+/// AT-SPI action names that activate a widget for a generic click. Broader than
+/// TOGGLE_ACTION_NAMES on the activation side (push/jump), narrower on the
+/// check/uncheck side — those are set_value verbs, not clicks.
+const ACTIVATE_ACTION_NAMES: &[&str] = &["click", "activate", "press", "push", "jump", "toggle"];
+
+/// Actuate the element identified by `target` via its native AT-SPI Action — the
+/// backend for `Accessibility::invoke`. Re-walks pre-order to `target.id`, verifies
+/// the fingerprint (same gate as `set_value_async`, guarding a stale id / mirror
+/// drift), then fires the first action in [`ACTIVATE_ACTION_NAMES`].
+async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let (app_ref, conn) = find_app(ctx).await?;
+    let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
+        .await?
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    // Verify role + name against the fingerprint (guards a stale id / mirror drift) —
+    // same gate as set_value_async.
+    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let name = nonempty(node.name().await.unwrap_or_default());
+    if !target.matches(role, name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES).await {
+        ActionAttempt::Fired(true) => Ok(()),
+        ActionAttempt::Fired(false) => Err(GlassError::AxActionFailed(
+            target.id.0,
+            "the toolkit reported the action did not run".into(),
+        )),
+        ActionAttempt::Unavailable => Err(GlassError::AxActionUnavailable(target.id.0)),
+    }
 }
 
 /// Window-relative bounds via the Component interface, or `None` if the node has no
