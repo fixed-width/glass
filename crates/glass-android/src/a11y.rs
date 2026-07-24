@@ -95,7 +95,7 @@ impl Accessibility for AndroidA11y {
         let status = adb.run(["shell", "uiautomator", "dump", DUMP_PATH])?;
         check_dump_status(&status)?;
         let xml = adb.run(["shell", "cat", DUMP_PATH])?;
-        build_tree(&xml, &window)
+        build_tree(&xml, &window, ctx.limits)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {

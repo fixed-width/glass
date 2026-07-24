@@ -346,10 +346,14 @@ impl GlassServer {
                        Each line is `#<id> <Role> \"<name>\" (x,y wxh) [states]`; pass an \
                        #id to glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
-                       glass_screenshot then."
+                       glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
+                       to remove the element-count limit (default caps protect the token budget)."
     )]
-    async fn glass_a11y_snapshot(&self) -> Result<CallToolResult, McpError> {
-        self.run(tools::a11y_snapshot).await
+    async fn glass_a11y_snapshot(
+        &self,
+        Parameters(a): Parameters<A11ySnapshotArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(move |g| tools::a11y_snapshot(g, &a)).await
     }
 
     #[tool(

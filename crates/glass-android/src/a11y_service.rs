@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree,
-    TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -80,7 +80,7 @@ fn json_to_node(
                     budget.hit(TruncationLimit::Nodes);
                     break;
                 }
-                if i >= MAX_SIBLINGS {
+                if i >= budget.max_siblings() {
                     budget.hit(TruncationLimit::Siblings);
                     break;
                 }
@@ -121,8 +121,12 @@ fn json_to_node(
 }
 
 /// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
-pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
-    let mut budget = WalkBudget::new();
+pub(crate) fn tree_from_json(
+    tree: &Value,
+    win: &WindowGeometry,
+    limits: WalkLimits,
+) -> Result<AxTree> {
+    let mut budget = WalkBudget::with_limits(limits);
     let root = json_to_node(tree, win, 0, &mut budget)?;
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
@@ -197,7 +201,7 @@ impl ServiceA11y {
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let tree = self.client.tree(&self.package)?;
-        tree_from_json(&tree, &ctx.window)
+        tree_from_json(&tree, &ctx.window, ctx.limits)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -483,7 +487,7 @@ mod tests {
                  "editable": false, "clickable": true, "enabled": true, "scrollable": false}
             ]
         });
-        let mut t = tree_from_json(&v, &win()).unwrap();
+        let mut t = tree_from_json(&v, &win(), WalkLimits::DEFAULT).unwrap();
         t.assign_ids();
         assert_eq!(t.count, 3);
         let email = t.find(AxNodeId(1)).unwrap();
@@ -543,7 +547,7 @@ mod tests {
         // nodes from the middle instead of stopping at the end, every later id would shift and
         // set_value would write to the wrong element.
         let json = wide_device_json(glass_core::MAX_NODES + 50);
-        let mut tree = tree_from_json(&json, &win()).expect("tree parses");
+        let mut tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
         tree.assign_ids();
 
         assert!(tree.truncated.is_some(), "the node cap must have been hit");
@@ -561,7 +565,7 @@ mod tests {
         // what pushes the running count to MAX_NODES. Nothing was declined, so this must NOT
         // be reported truncated (regression for the false-positive-at-the-cap bug).
         let json = wide_device_json(glass_core::MAX_NODES - 1);
-        let mut tree = tree_from_json(&json, &win()).expect("tree parses");
+        let mut tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
         tree.assign_ids();
         assert_eq!(tree.count, glass_core::MAX_NODES);
         assert_eq!(tree.truncated, None);
@@ -573,7 +577,7 @@ mod tests {
         // declines to visit, so the cap must still fire — proving the fix didn't just
         // disable it.
         let json = wide_device_json(glass_core::MAX_NODES);
-        let tree = tree_from_json(&json, &win()).expect("tree parses");
+        let tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
         assert_eq!(
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
@@ -604,7 +608,8 @@ mod tests {
             "bounds": {"x": -5, "y": 10, "w": -3, "h": 0},
             "editable": false, "clickable": false, "enabled": true, "scrollable": false
         });
-        let t = tree_from_json(&v, &win()).expect("degenerate bounds must not error the snapshot");
+        let t = tree_from_json(&v, &win(), WalkLimits::DEFAULT)
+            .expect("degenerate bounds must not error the snapshot");
         let b = t.root.bounds.unwrap();
         assert_eq!((b.width, b.height), (0, 0)); // negative/zero w/h clamp to 0
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100

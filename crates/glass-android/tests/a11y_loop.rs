@@ -5,7 +5,7 @@
 //! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
 //! is non-trivial and carries named, role-typed elements.
 
-use glass_core::accessibility::{Accessibility, AxContext};
+use glass_core::accessibility::{Accessibility, AxContext, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel};
 
 fn settings_spec() -> AppSpec {
@@ -38,6 +38,7 @@ fn snapshot_has_named_role_typed_nodes() {
         window,
         window_handle: None,
         a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
     };
     let mut a11y = glass_android::AndroidA11y::new();
     let mut tree = a11y.snapshot(&ctx).expect("snapshot");

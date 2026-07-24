@@ -259,13 +259,19 @@ pub(crate) struct FakeAccessibility {
     pub(crate) tree: AxTree,
     pub(crate) set_log: std::sync::Arc<std::sync::Mutex<Vec<(AxTarget, String)>>>,
     pub(crate) set_fail: bool,
+    /// The `limits` from the most recent `AxContext` this backend received (either
+    /// `snapshot` or `set_value`) — lets a test prove `max_nodes` actually reached the
+    /// backend, not just the session's own bookkeeping. `None` when unset.
+    pub(crate) limits_log: Arc<Mutex<Option<crate::accessibility::WalkLimits>>>,
 }
 
 impl Accessibility for FakeAccessibility {
-    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        *self.limits_log.lock().unwrap() = Some(ctx.limits);
         Ok(self.tree.clone())
     }
-    fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+    fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+        *self.limits_log.lock().unwrap() = Some(ctx.limits);
         if self.set_fail {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
@@ -393,6 +399,7 @@ pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
             tree,
             set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             set_fail: false,
+            limits_log: Arc::new(Mutex::new(None)),
         }),
     )
 }

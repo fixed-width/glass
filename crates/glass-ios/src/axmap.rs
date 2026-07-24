@@ -19,7 +19,7 @@
 //! key anywhere in the output), so [`AxStates::focused`] is always false from this
 //! backend — a known limitation.
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
@@ -62,10 +62,15 @@ pub fn ax_role(ax_type: &str) -> AxRole {
 /// than dropping nodes out of the middle, so ids assigned afterward by
 /// [`AxTree::assign_ids`] stay stable for every surviving node. [`AxTree::truncated`]
 /// records which bound fired, if any.
-pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxTree> {
+pub fn build_tree(
+    json: &str,
+    scale: f64,
+    window: &WindowGeometry,
+    limits: WalkLimits,
+) -> Result<AxTree> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(limits);
     // idb may return either a single root object or an array of top-level elements.
     let children: Vec<AxNode> = match &v {
         Value::Array(a) => {
@@ -78,7 +83,7 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
                     budget.hit(TruncationLimit::Nodes);
                     break;
                 }
-                if i >= MAX_SIBLINGS {
+                if i >= budget.max_siblings() {
                     budget.hit(TruncationLimit::Siblings);
                     break;
                 }
@@ -230,7 +235,7 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
                     budget.hit(TruncationLimit::Nodes);
                     break;
                 }
-                if i >= MAX_SIBLINGS {
+                if i >= budget.max_siblings() {
                     budget.hit(TruncationLimit::Siblings);
                     break;
                 }
@@ -288,7 +293,8 @@ mod tests {
     }
 
     fn built() -> AxTree {
-        let mut tree = build_tree(FIXTURE, SCALE, &win()).expect("fixture must parse");
+        let mut tree =
+            build_tree(FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).expect("fixture must parse");
         tree.assign_ids();
         tree
     }
@@ -414,14 +420,14 @@ mod tests {
 
     #[test]
     fn build_tree_errors_on_malformed_json() {
-        let err = build_tree("this is not json", SCALE, &win()).unwrap_err();
+        let err = build_tree("this is not json", SCALE, &win(), WalkLimits::DEFAULT).unwrap_err();
         assert!(matches!(err, GlassError::AccessibilityUnavailable(_)));
     }
 
     #[test]
     fn build_tree_errors_on_unexpected_root_shape() {
         // A bare scalar is neither an element object nor an array of elements.
-        let err = build_tree("42", SCALE, &win()).unwrap_err();
+        let err = build_tree("42", SCALE, &win(), WalkLimits::DEFAULT).unwrap_err();
         assert!(matches!(err, GlassError::AccessibilityUnavailable(_)));
     }
 
@@ -509,7 +515,7 @@ mod tests {
         // that dropped a node from the middle rather than stopping at the end would
         // shift every later id off the node its own index implies.
         let json = wide_array_json(glass_core::MAX_NODES + 50);
-        let mut tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        let mut tree = build_tree(&json, 1.0, &win(), WalkLimits::DEFAULT).expect("tree builds");
         tree.assign_ids();
 
         assert!(tree.truncated.is_some(), "the node cap must have been hit");
@@ -526,7 +532,7 @@ mod tests {
         // this must NOT be reported truncated (regression for the false-positive-at-the-cap
         // bug).
         let json = wide_array_json(glass_core::MAX_NODES);
-        let tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        let tree = build_tree(&json, 1.0, &win(), WalkLimits::DEFAULT).expect("tree builds");
         assert_eq!(tree.truncated, None);
     }
 
@@ -536,7 +542,7 @@ mod tests {
         // walk declines to visit, so the cap must still fire — proving the fix didn't just
         // disable it.
         let json = wide_array_json(glass_core::MAX_NODES + 1);
-        let tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        let tree = build_tree(&json, 1.0, &win(), WalkLimits::DEFAULT).expect("tree builds");
         assert_eq!(
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
@@ -566,7 +572,7 @@ mod tests {
         let j = r#"[{"role":"AXCheckBox","subrole":"AXSwitch","AXUniqueId":"boldText",
                      "AXLabel":"Bold Text","AXValue":"1",
                      "frame":{"x":0,"y":0,"width":100,"height":30}}]"#;
-        let mut tree = build_tree(j, 1.0, &win()).expect("parses");
+        let mut tree = build_tree(j, 1.0, &win(), WalkLimits::DEFAULT).expect("parses");
         tree.assign_ids();
         let sw = find_by_name(&tree.root, "boldText").expect("switch present");
         assert!(

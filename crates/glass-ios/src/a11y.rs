@@ -41,7 +41,7 @@ impl IosA11y {
                 "could not determine the iOS accessibility scale from the tree".into(),
             )
         })?;
-        let mut tree = axmap::build_tree(&json, scale, &ctx.window)?;
+        let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
         tree.assign_ids();
         Ok((tree, scale))
     }

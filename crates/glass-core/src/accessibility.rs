@@ -284,6 +284,54 @@ pub const MAX_DEPTH: usize = 30;
 /// See [`MAX_NODES`].
 pub const MAX_SIBLINGS: usize = 4096;
 
+/// Runtime bounds for one accessibility walk: the caps that were compile-time consts
+/// (`MAX_NODES`/`MAX_DEPTH`/`MAX_SIBLINGS`). `usize::MAX` in a field means "unbounded"; a
+/// plain `>=`/`>` check never trips there, so unbounded needs no special-casing. Carried by
+/// [`WalkBudget`] and threaded through [`AxContext`] so a caller can raise or lift the caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkLimits {
+    pub nodes: usize,
+    pub depth: usize,
+    pub siblings: usize,
+}
+
+impl WalkLimits {
+    /// The historical caps — the behavior when a caller passes no override.
+    pub const DEFAULT: WalkLimits = WalkLimits {
+        nodes: MAX_NODES,
+        depth: MAX_DEPTH,
+        siblings: MAX_SIBLINGS,
+    };
+
+    /// Map the MCP `max_nodes` surface to limits: `None` → default; `Some(0)` → lift the node
+    /// cap (`nodes = usize::MAX`) for the full tree; `Some(n)` → cap nodes at `n`. `max_nodes`
+    /// controls the node count ONLY — `depth` and `siblings` always keep their defaults. Those
+    /// two are structural safety rails, not a size budget: the recursive native-tree walkers
+    /// (AT-SPI / AX / UIA) have no cycle detection, so an unbounded depth on a cyclic or
+    /// pathological tree would recurse to a stack overflow (which aborts the process). The
+    /// generous defaults (`MAX_DEPTH`/`MAX_SIBLINGS`) never bite a real UI, so keeping them costs
+    /// the caller nothing while preserving that backstop even under `max_nodes: 0`.
+    pub fn from_max_nodes(max_nodes: Option<usize>) -> WalkLimits {
+        match max_nodes {
+            None => WalkLimits::DEFAULT,
+            Some(0) => WalkLimits {
+                nodes: usize::MAX,
+                ..WalkLimits::DEFAULT
+            },
+            Some(n) => WalkLimits {
+                nodes: n,
+                ..WalkLimits::DEFAULT
+            },
+        }
+    }
+}
+
+impl Default for WalkLimits {
+    fn default() -> WalkLimits {
+        WalkLimits::DEFAULT
+    }
+}
+
 /// Which bound stopped a walk early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TruncationLimit {
@@ -293,16 +341,6 @@ pub enum TruncationLimit {
 }
 
 impl TruncationLimit {
-    /// The limit's numeric value, for the disclosure notice. Private: the only caller is
-    /// [`Truncation::notice`] in this module; nothing outside needs the raw number.
-    fn value(self) -> usize {
-        match self {
-            TruncationLimit::Nodes => MAX_NODES,
-            TruncationLimit::Depth => MAX_DEPTH,
-            TruncationLimit::Siblings => MAX_SIBLINGS,
-        }
-    }
-
     /// Human-readable unit for the disclosure notice.
     fn label(self) -> &'static str {
         match self {
@@ -318,6 +356,10 @@ impl TruncationLimit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncation {
     pub limit: TruncationLimit,
+    /// The actual limit value that fired — the runtime [`WalkLimits`] field in effect, not the
+    /// compile-time default — so the notice reports the cap the caller was really subject to
+    /// (e.g. a `max_nodes: 42` snapshot reads "truncated at 42 nodes", not "1500").
+    pub limit_value: usize,
     pub nodes_walked: usize,
 }
 
@@ -330,7 +372,7 @@ impl Truncation {
             "… tree truncated at {} {} ({} nodes walked). Some elements are NOT shown and \
              cannot be addressed by id. Narrow the UI, or drive by pixels: glass_screenshot, \
              then glass_click at x,y.",
-            self.limit.value(),
+            self.limit_value,
             self.limit.label(),
             self.nodes_walked,
         )
@@ -343,11 +385,27 @@ impl Truncation {
 pub struct WalkBudget {
     count: usize,
     truncated: Option<Truncation>,
+    limits: WalkLimits,
 }
 
 impl WalkBudget {
+    /// A budget with the default (historical) limits.
     pub fn new() -> WalkBudget {
-        WalkBudget::default()
+        WalkBudget::with_limits(WalkLimits::DEFAULT)
+    }
+
+    /// A budget bounded by `limits`.
+    pub fn with_limits(limits: WalkLimits) -> WalkBudget {
+        WalkBudget {
+            count: 0,
+            truncated: None,
+            limits,
+        }
+    }
+
+    /// The per-level sibling-scan bound (readers/mappers compare against this).
+    pub fn max_siblings(&self) -> usize {
+        self.limits.siblings
     }
 
     /// Count a visited node. Call exactly once on entry to each node, before its children.
@@ -361,20 +419,26 @@ impl WalkBudget {
 
     /// Whether the node budget is spent.
     pub fn nodes_exhausted(&self) -> bool {
-        self.count >= MAX_NODES
+        self.count >= self.limits.nodes
     }
 
     /// Whether `depth` has reached the nesting bound (so children must not be walked).
     pub fn depth_exhausted(&self, depth: usize) -> bool {
-        depth >= MAX_DEPTH
+        depth >= self.limits.depth
     }
 
     /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
     /// while any later hit is a consequence of having continued.
     pub fn hit(&mut self, limit: TruncationLimit) {
         let nodes_walked = self.count;
+        let limit_value = match limit {
+            TruncationLimit::Nodes => self.limits.nodes,
+            TruncationLimit::Depth => self.limits.depth,
+            TruncationLimit::Siblings => self.limits.siblings,
+        };
         self.truncated.get_or_insert(Truncation {
             limit,
+            limit_value,
             nodes_walked,
         });
     }
@@ -496,6 +560,10 @@ pub struct AxContext {
     /// `AccessibilityUnavailable` (instructing the caller to relaunch with `a11y:true`) — it does
     /// NOT fall back to any host/ambient bus. Non-Linux backends ignore this field.
     pub a11y_bus_addr: Option<String>,
+    /// The size bounds for this walk. The reader/mapper builds its `WalkBudget` from these.
+    /// Set from the session's stored limits so a snapshot and a later `set_value` walk the
+    /// tree with the same bounds (ids stay resolvable).
+    pub limits: WalkLimits,
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
@@ -1465,15 +1533,84 @@ mod tests {
     }
 
     #[test]
+    fn walklimits_default_matches_the_legacy_consts() {
+        assert_eq!(WalkLimits::DEFAULT.nodes, MAX_NODES);
+        assert_eq!(WalkLimits::DEFAULT.depth, MAX_DEPTH);
+        assert_eq!(WalkLimits::DEFAULT.siblings, MAX_SIBLINGS);
+    }
+
+    #[test]
+    fn from_max_nodes_controls_nodes_only_keeping_depth_and_sibling_rails() {
+        assert_eq!(WalkLimits::from_max_nodes(None), WalkLimits::DEFAULT);
+        // Some(0) lifts the node cap for the full tree, but depth/siblings keep their defaults
+        // (structural safety rails against a cyclic/pathological native tree — see from_max_nodes).
+        let unbounded = WalkLimits::from_max_nodes(Some(0));
+        assert_eq!(unbounded.nodes, usize::MAX);
+        assert_eq!(unbounded.depth, WalkLimits::DEFAULT.depth);
+        assert_eq!(unbounded.siblings, WalkLimits::DEFAULT.siblings);
+        // Some(n) caps nodes at n, depth/siblings default.
+        let capped = WalkLimits::from_max_nodes(Some(42));
+        assert_eq!(capped.nodes, 42);
+        assert_eq!(capped.depth, WalkLimits::DEFAULT.depth);
+        assert_eq!(capped.siblings, WalkLimits::DEFAULT.siblings);
+    }
+
+    #[test]
+    fn with_limits_stops_nodes_at_the_configured_cap_not_the_default() {
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(3)));
+        b.visit();
+        b.visit();
+        b.visit();
+        assert!(b.nodes_exhausted(), "3 visits hits a cap of 3");
+        assert_eq!(b.max_siblings(), MAX_SIBLINGS);
+    }
+
+    #[test]
+    fn max_nodes_zero_lifts_the_node_cap_but_keeps_the_depth_rail() {
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(0)));
+        // Visit well past the OLD node cap: under DEFAULT this would exhaust; a lifted node cap
+        // must not, so this fails if `Some(0)` left `nodes` at MAX_NODES instead of lifting it.
+        for _ in 0..(MAX_NODES + 10) {
+            b.visit();
+        }
+        assert!(!b.nodes_exhausted(), "a lifted node cap never exhausts");
+        // The depth rail is deliberately KEPT even under max_nodes:0 (cycle/stack-overflow guard).
+        assert!(
+            b.depth_exhausted(MAX_DEPTH),
+            "the depth safety rail is preserved under a lifted node cap"
+        );
+    }
+
+    #[test]
     fn truncation_notice_states_elements_are_missing_and_names_the_pixel_fallback() {
         let n = Truncation {
             limit: TruncationLimit::Nodes,
+            limit_value: MAX_NODES,
             nodes_walked: 1500,
         }
         .notice();
         assert!(
             n.contains("NOT shown") && n.contains("glass_screenshot"),
             "notice must be unmissable and steer to pixels: {n}"
+        );
+    }
+
+    #[test]
+    fn truncation_notice_reports_the_actual_runtime_cap_not_the_default() {
+        // A raised/lowered cap that fires must render its OWN number, not the compile-time const.
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(42)));
+        for _ in 0..42 {
+            b.visit();
+        }
+        b.hit(TruncationLimit::Nodes);
+        let notice = b.truncation().expect("hit recorded").notice();
+        assert!(
+            notice.contains("42 nodes"),
+            "notice reports the runtime cap (42), not MAX_NODES: {notice}"
+        );
+        assert!(
+            !notice.contains(&MAX_NODES.to_string()),
+            "notice must not show the default cap when a custom one fired: {notice}"
         );
     }
 
@@ -1486,6 +1623,7 @@ mod tests {
         t.assign_ids();
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Depth,
+            limit_value: MAX_DEPTH,
             nodes_walked: 42,
         });
         assert!(!t.to_outline().contains("truncated"), "pure tree text");

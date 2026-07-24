@@ -71,7 +71,7 @@ pub mod accessibility;
 pub use accessibility::{
     element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
     AxTree, ElementCondition, ElementInfo, ElementMatch, Truncation, TruncationLimit, WalkBudget,
-    MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
+    WalkLimits, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
 };
 
 pub mod marks;

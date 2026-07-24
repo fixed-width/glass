@@ -169,7 +169,7 @@ fn wait_for_widgets_sync(glass: &mut Glass) -> AxTree {
     let deadline =
         Instant::now() + mcp_cost::A11Y_SETTLE_TIMEOUT + mcp_cost::WIDGETS_SETTLE_TIMEOUT;
     loop {
-        match glass.a11y_snapshot() {
+        match glass.a11y_snapshot(None) {
             Ok(tree) => {
                 let outline = tree.to_outline();
                 let ready = mcp_cost::find_named_button(&outline, "Apply").is_some()

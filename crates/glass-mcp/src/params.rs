@@ -137,6 +137,15 @@ pub struct SetValueArgs {
     pub return_: Option<String>,
 }
 
+/// Arguments for `glass_a11y_snapshot`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct A11ySnapshotArgs {
+    /// Maximum number of elements to include. Omit for the default cap (protects the token
+    /// budget). Pass a larger number to raise it, or `0` for the full tree (no limit). A
+    /// snapshot renumbers ids, so re-read them after changing this.
+    pub max_nodes: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickArgs {
     pub x: i32,
