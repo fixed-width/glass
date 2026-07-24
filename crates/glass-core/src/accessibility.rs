@@ -284,6 +284,49 @@ pub const MAX_DEPTH: usize = 30;
 /// See [`MAX_NODES`].
 pub const MAX_SIBLINGS: usize = 4096;
 
+/// Runtime bounds for one accessibility walk: the caps that were compile-time consts
+/// (`MAX_NODES`/`MAX_DEPTH`/`MAX_SIBLINGS`). `usize::MAX` in a field means "unbounded"; a
+/// plain `>=`/`>` check never trips there, so unbounded needs no special-casing. Carried by
+/// [`WalkBudget`] and threaded through [`AxContext`] so a caller can raise or lift the caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkLimits {
+    pub nodes: usize,
+    pub depth: usize,
+    pub siblings: usize,
+}
+
+impl WalkLimits {
+    /// The historical caps — the behavior when a caller passes no override.
+    pub const DEFAULT: WalkLimits = WalkLimits {
+        nodes: MAX_NODES,
+        depth: MAX_DEPTH,
+        siblings: MAX_SIBLINGS,
+    };
+
+    /// Map the MCP `max_nodes` surface to limits: `None` → default; `Some(0)` → fully
+    /// unbounded (all three lifted); `Some(n)` → cap nodes at `n`, depth/siblings default.
+    pub fn from_max_nodes(max_nodes: Option<usize>) -> WalkLimits {
+        match max_nodes {
+            None => WalkLimits::DEFAULT,
+            Some(0) => WalkLimits {
+                nodes: usize::MAX,
+                depth: usize::MAX,
+                siblings: usize::MAX,
+            },
+            Some(n) => WalkLimits {
+                nodes: n,
+                ..WalkLimits::DEFAULT
+            },
+        }
+    }
+}
+
+impl Default for WalkLimits {
+    fn default() -> WalkLimits {
+        WalkLimits::DEFAULT
+    }
+}
+
 /// Which bound stopped a walk early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TruncationLimit {
@@ -343,11 +386,27 @@ impl Truncation {
 pub struct WalkBudget {
     count: usize,
     truncated: Option<Truncation>,
+    limits: WalkLimits,
 }
 
 impl WalkBudget {
+    /// A budget with the default (historical) limits.
     pub fn new() -> WalkBudget {
-        WalkBudget::default()
+        WalkBudget::with_limits(WalkLimits::DEFAULT)
+    }
+
+    /// A budget bounded by `limits`.
+    pub fn with_limits(limits: WalkLimits) -> WalkBudget {
+        WalkBudget {
+            count: 0,
+            truncated: None,
+            limits,
+        }
+    }
+
+    /// The per-level sibling-scan bound (readers/mappers compare against this).
+    pub fn max_siblings(&self) -> usize {
+        self.limits.siblings
     }
 
     /// Count a visited node. Call exactly once on entry to each node, before its children.
@@ -361,12 +420,12 @@ impl WalkBudget {
 
     /// Whether the node budget is spent.
     pub fn nodes_exhausted(&self) -> bool {
-        self.count >= MAX_NODES
+        self.count >= self.limits.nodes
     }
 
     /// Whether `depth` has reached the nesting bound (so children must not be walked).
     pub fn depth_exhausted(&self, depth: usize) -> bool {
-        depth >= MAX_DEPTH
+        depth >= self.limits.depth
     }
 
     /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
@@ -1461,6 +1520,51 @@ mod tests {
         assert!(
             b.nodes_exhausted(),
             "the cap is reached at exactly MAX_NODES"
+        );
+    }
+
+    #[test]
+    fn walklimits_default_matches_the_legacy_consts() {
+        assert_eq!(WalkLimits::DEFAULT.nodes, MAX_NODES);
+        assert_eq!(WalkLimits::DEFAULT.depth, MAX_DEPTH);
+        assert_eq!(WalkLimits::DEFAULT.siblings, MAX_SIBLINGS);
+    }
+
+    #[test]
+    fn from_max_nodes_none_is_default_some_zero_is_unbounded_some_n_caps_nodes_only() {
+        assert_eq!(WalkLimits::from_max_nodes(None), WalkLimits::DEFAULT);
+        let unbounded = WalkLimits::from_max_nodes(Some(0));
+        assert_eq!(unbounded.nodes, usize::MAX);
+        assert_eq!(unbounded.depth, usize::MAX);
+        assert_eq!(unbounded.siblings, usize::MAX);
+        let capped = WalkLimits::from_max_nodes(Some(42));
+        assert_eq!(capped.nodes, 42);
+        assert_eq!(capped.depth, WalkLimits::DEFAULT.depth);
+        assert_eq!(capped.siblings, WalkLimits::DEFAULT.siblings);
+    }
+
+    #[test]
+    fn with_limits_stops_nodes_at_the_configured_cap_not_the_default() {
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(3)));
+        b.visit();
+        b.visit();
+        b.visit();
+        assert!(b.nodes_exhausted(), "3 visits hits a cap of 3");
+        assert_eq!(b.max_siblings(), MAX_SIBLINGS);
+    }
+
+    #[test]
+    fn unbounded_limits_never_report_exhausted_past_the_default_cap() {
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(0)));
+        // Visit well past the OLD node cap: under DEFAULT this would exhaust; unbounded must not,
+        // so this fails if `Some(0)` left `nodes` at MAX_NODES instead of lifting it.
+        for _ in 0..(MAX_NODES + 10) {
+            b.visit();
+        }
+        assert!(!b.nodes_exhausted(), "unbounded nodes never exhaust");
+        assert!(
+            !b.depth_exhausted(MAX_DEPTH + 1000),
+            "unbounded depth never exhausts"
         );
     }
 
