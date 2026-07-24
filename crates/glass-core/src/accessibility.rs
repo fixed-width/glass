@@ -439,19 +439,7 @@ impl AxTree {
     /// elided when absent. Two spaces of indent per depth level.
     pub fn to_outline(&self) -> String {
         fn walk(node: &AxNode, depth: usize, out: &mut String) {
-            let indent = "  ".repeat(depth);
-            let _ = write!(out, "{indent}#{} {:?}", node.id.0, node.role);
-            if let Some(name) = &node.name {
-                let _ = write!(out, " {name:?}");
-            }
-            if let Some(b) = &node.bounds {
-                let _ = write!(out, " ({},{} {}x{})", b.x, b.y, b.width, b.height);
-            }
-            let states = node.states.active();
-            if !states.is_empty() {
-                let _ = write!(out, " [{}]", states.join(","));
-            }
-            out.push('\n');
+            crate::outline::write_line(node, depth, out);
             for child in &node.children {
                 walk(child, depth + 1, out);
             }

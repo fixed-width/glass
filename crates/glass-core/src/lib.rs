@@ -77,6 +77,8 @@ pub use accessibility::{
 pub mod marks;
 pub use marks::Mark;
 
+pub mod outline;
+
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};
 
