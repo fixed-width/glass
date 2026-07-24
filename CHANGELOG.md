@@ -33,12 +33,16 @@ internal refactors, CI, or test-only changes.
   is truncated the notice now reports the actual limit and says how to widen it.
 - `glass_click_element` now actuates via the platform's native accessibility action
   when the element exposes one (AT-SPI Action on Linux, UIA patterns on Windows,
-  AXPress on macOS), falling back to the synthetic pointer click otherwise. The
+  AXPress on macOS), falling back to the synthetic pointer click when the element —
+  or the backend — exposes none. A native action that was dispatched but failed
+  reports the error rather than falling back, so a click never actuates twice. The
   result's new `method` field reports which path ran (`native-action`/`pointer`),
   with `native_fallback` explaining any fallback. Native actuation works for
   occluded or scrolled-off-screen elements and, on macOS, no longer moves the
-  cursor. A click whose element no longer matches the snapshot now errors
-  (`element changed; re-snapshot`) instead of clicking stale coordinates.
+  cursor. On those three backends the click also re-checks the element against the
+  live tree, so one that no longer matches the snapshot errors (`element changed;
+  re-snapshot`) instead of clicking stale coordinates — the pointer-only iOS and
+  Android paths have no such live check.
 
 ### Fixed
 - A transiently stalled Xvfb no longer fails `glass_start` on Linux/X11: if the private X

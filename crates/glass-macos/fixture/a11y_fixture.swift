@@ -66,8 +66,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // `print` is fully buffered (not line-buffered) once stdout is a pipe rather than a
     // TTY — and a later task's bounds-agreement test captures this app's stdout through a
     // pipe and greps it for the marker, so the write must be flushed explicitly or it may
-    // never arrive before the test gives up. The brief's original
-    // `FileHandle.standardOutput.synchronizeFile()` calls `fsync(2)` under the hood,
+    // never arrive before the test gives up. Do NOT reach for
+    // `FileHandle.standardOutput.synchronizeFile()`: it calls `fsync(2)` under the hood,
     // which fails — and raises an uncatchable Objective-C exception, crashing the
     // process — on a non-seekable fd such as a pipe. `fflush(stdout)`, the convention
     // already used throughout `quadrants.swift`, is the safe equivalent here.

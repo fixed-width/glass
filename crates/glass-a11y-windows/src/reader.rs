@@ -343,6 +343,14 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 ///
 /// Only the Toggle rung has a post-state a client can read back, so only it verifies actuation;
 /// the other three are fire-and-report, exactly as their patterns define.
+///
+/// Known limitation, deliberate: `get_pattern` returning `Err` is indistinguishable here between
+/// "this control does not implement the pattern" and "the COM call itself failed", so both land
+/// on `AxActionUnavailable` and fall back to a pointer click. That is the safe direction —
+/// `get_pattern` dispatches no action, so the fallback actuates exactly once. UIA does publish
+/// `Is<Pattern>Available` properties that could tell the two apart, but acting on them would turn
+/// a disagreement between property and `get_pattern` into a hard, non-falling-back click failure
+/// (an error after dispatch never falls back), trading a harmless pointer click for a dead one.
 fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))

@@ -67,15 +67,16 @@ text, so routine checks between screenshots cost no vision tokens. Why the loop 
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
 
 `glass_click_element` tries the platform's native accessibility action first — AT-SPI `Action` on
-Linux, a UI Automation invocation pattern on Windows, `AXPress` on macOS — which actuates elements
+Linux, UI Automation patterns on Windows, `AXPress` on macOS — which actuates elements
 that are occluded or scrolled off-screen and, on macOS, without moving the cursor. Not every
 control exposes one (some toolkit checkbuttons expose no action even on a backend that otherwise
 supports it), so the click falls back to a synthetic pointer click at the element's center when it
 doesn't. iOS and Android always use the pointer path today. The result's `method` field
 (`native-action`/`pointer`) says which path actually ran for that click, with `native_fallback`
-explaining why when it fell back — the source of truth per click, not the backend alone. If the
-element no longer matches the latest snapshot, the click errors instead of clicking stale
-coordinates.
+explaining why when it fell back — the source of truth per click, not the backend alone. On those
+three backends the native attempt re-checks the element against the live tree, so a click whose
+element no longer matches errors instead of clicking stale coordinates; the pointer-only iOS and
+Android paths have no such live check.
 
 ## Install at a glance
 

@@ -572,6 +572,10 @@ const TOGGLE_ACTION: &str = "toggle";
 /// AT-SPI action names that activate a widget for a generic click. Broader than
 /// [`TOGGLE_ACTION_NAMES`] on the activation side (push/jump), narrower on the
 /// check/uncheck side — those are set_value verbs, not clicks.
+///
+/// This is a membership set, not a priority order: [`try_action`] fires the node's first
+/// action that appears in this list, so the widget's own action-index order decides which
+/// one runs when it exposes several.
 const ACTIVATE_ACTION_NAMES: &[&str] =
     &["click", "activate", "press", "push", "jump", TOGGLE_ACTION];
 

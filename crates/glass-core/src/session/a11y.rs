@@ -241,8 +241,9 @@ impl Glass {
         }
     }
 
-    /// One native-invoke attempt: same fingerprint + context assembly as
-    /// `set_value_inner`, then the backend's `invoke`.
+    /// One native-invoke attempt: the same fingerprint + context assembly as
+    /// `set_value_inner` (over freshly re-read window geometry — see below), then the
+    /// backend's `invoke`.
     fn try_native_invoke(&mut self, id: AxNodeId) -> Result<()> {
         {
             let s = self.active_mut()?;

@@ -220,15 +220,23 @@ pub(crate) fn set_string_value(el: &AXUIElement, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The element's `AXActionNames` (`AXUIElementCopyActionNames`). Empty on ANY
-/// failure — callers treat "no actions" and "cannot read actions" identically
-/// (neither yields a native invoke), so the two outcomes may share a shape.
+/// The element's `AXActionNames` (`AXUIElementCopyActionNames`). Empty on any failure, or on
+/// an unexpected null result — callers treat "no actions" and "cannot read actions"
+/// identically (neither yields a native invoke), so the two outcomes may share a shape. A
+/// failed read still logs to stderr, so the difference is diagnosable rather than silent.
 pub(crate) fn action_names(el: &AXUIElement) -> Vec<String> {
     let mut raw: *const CFArray = std::ptr::null();
     // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
     // `AXUIElementCopyActionNames`'s documented signature (mirrors `copy_attribute_checked`).
     let err = unsafe { el.copy_action_names(NonNull::from(&mut raw)) };
     if err != AXError::Success {
+        // Dev-tool diagnostic (stderr only, same shape as the reader's): an element reported
+        // as exposing no action reads identically whether it truly has none or the read
+        // failed, and only this line tells the two apart after the fact.
+        eprintln!(
+            "glass-a11y-macos: AXActionNames read failed (AXError {})",
+            err.0
+        );
         return Vec::new();
     }
     let Some(nn) = NonNull::new(raw.cast_mut()) else {
