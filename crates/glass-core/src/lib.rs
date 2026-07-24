@@ -80,7 +80,6 @@ pub use marks::Mark;
 pub mod outline;
 
 pub mod role_support;
-pub use role_support::{support, AxBackend, RoleSupport, ROLE_SUPPORT};
 
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};
