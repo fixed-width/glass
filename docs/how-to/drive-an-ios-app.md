@@ -140,8 +140,8 @@ detected on top of the semantic check above.
 - **Don't verify right after an input call.** `glass_type` and `glass_click_element` return as soon
   as the input is injected, not once the app has finished re-rendering — checking state immediately
   can race it. Wait for the outcome you expect instead: `glass_wait_for_element` (as used above)
-  polls until it appears, and `glass_set_value` takes `return: "settle"` to fold a settle into the
-  call itself (`glass_type` has no such option).
+  polls until it appears, and `glass_set_value` and `glass_type` take `return: "settle"` to fold a
+  settle into the call itself.
 - **Toggles:** if a control is a switch, drive it with a short swipe across its trailing edge rather
   than a tap.
 - **Multi-touch** gestures (`glass_gesture`) are not supported on the Simulator
