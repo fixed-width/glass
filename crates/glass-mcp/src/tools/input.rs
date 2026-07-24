@@ -99,10 +99,20 @@ pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
 }
 
 pub fn type_text(glass: &mut Glass, a: &TypeArgs) -> ToolResult {
+    // Bad `return` value → reject before injecting anything (see `validate_return`).
+    crate::tools::validate_return(a.return_.as_deref())?;
     glass
         .key(&KeyEvent::Text(a.text.clone()))
         .map_err(|e| e.to_string())?;
-    Ok(ToolOutput::result("glass_type", serde_json::json!({})))
+    // Past this point the keystrokes have landed: a failing observe (e.g. `snapshot`
+    // with no a11y reader) must say so, or an agent retries and types the text twice.
+    let (observed, extra) = crate::tools::resolve_return(glass, a.return_.as_deref())
+        .map_err(|msg| format!("text was typed; return observe failed: {msg}"))?;
+    let mut result = serde_json::json!({});
+    if let Some(o) = observed {
+        result["observed"] = o;
+    }
+    Ok(ToolOutput::result_with("glass_type", result, extra))
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
@@ -192,7 +202,14 @@ mod tests {
     fn type_and_key_ok() {
         let mut g = started();
         assert_ok(
-            &type_text(&mut g, &TypeArgs { text: "hi".into() }).unwrap(),
+            &type_text(
+                &mut g,
+                &TypeArgs {
+                    text: "hi".into(),
+                    return_: None,
+                },
+            )
+            .unwrap(),
             "glass_type",
         );
         assert_ok(

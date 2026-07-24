@@ -61,6 +61,21 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
     if a.actions.is_empty() {
         return Err("`actions` must contain at least one action".into());
     }
+    // Pre-flight: a `type` action's `return` observe would have its output discarded
+    // mid-sequence, so it's rejected — and the rejection is decidable from the argument
+    // list alone, so it happens BEFORE any input is injected (never a half-applied
+    // sequence for a pure argument-shape error). An explicit `"none"` is the documented
+    // no-observe default and passes.
+    for (i, action) in a.actions.iter().enumerate() {
+        if let Action::Type(args) = action {
+            if matches!(args.return_.as_deref(), Some(r) if r != "none") {
+                return Err(format!(
+                    "action[{i}] (type): `return` is not accepted inside glass_do — use a \
+                     `settle` action or the terminal `then` observe"
+                ));
+            }
+        }
+    }
     let n = a.actions.len();
     for (i, action) in a.actions.iter().enumerate() {
         let (kind, result): (&str, ToolResult) = match action {
@@ -167,6 +182,7 @@ mod tests {
                     click(10, 20),
                     Action::Type(TypeArgs {
                         text: "alice".into(),
+                        return_: None,
                     }),
                     Action::Key(KeyArgs {
                         chord: "Tab".into(),
@@ -182,6 +198,58 @@ mod tests {
         );
         let result = assert_envelope(&out, "glass_do");
         assert_eq!(result["executed"], json!(3));
+    }
+
+    #[test]
+    fn type_action_with_return_is_rejected_before_any_action_runs() {
+        // The rejection is decidable from the argument list alone, so it must
+        // pre-flight: no earlier action may be injected before the batch errors.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
+        let err = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![
+                    click(10, 10),
+                    Action::Type(TypeArgs {
+                        text: "hi".into(),
+                        return_: Some("settle".into()),
+                    }),
+                ],
+                then: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("action[1]"), "got: {err}");
+        assert!(err.contains("`return`"), "got: {err}");
+        assert!(err.contains("terminal `then` observe"), "got: {err}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "pre-flight must reject before any input is injected: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn type_action_with_return_none_is_allowed() {
+        // "none" is the documented no-observe default — an explicit `"return":"none"`
+        // is semantically identical to omitting the field and must not be rejected.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = started(FakePlatform::new(100, 100).with_event_log(log.clone()));
+        let out = do_actions(
+            &mut g,
+            &DoArgs {
+                actions: vec![Action::Type(TypeArgs {
+                    text: "hi".into(),
+                    return_: Some("none".into()),
+                })],
+                then: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["type(hi)"]);
+        let result = assert_envelope(&out, "glass_do");
+        assert_eq!(result["executed"], json!(1));
     }
 
     #[test]

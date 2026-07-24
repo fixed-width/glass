@@ -54,7 +54,8 @@ parsing `result`.
 
 Most input/action tools (`glass_click`, `glass_move`, `glass_drag`, `glass_scroll`, `glass_gesture`,
 `glass_type`, `glass_key`, `glass_stop`, `glass_clipboard_set`) return an empty `{}` — `ok:true` in
-the envelope is itself the confirmation that the action ran.
+the envelope is itself the confirmation that the action ran. (`glass_type` can fold an optional
+observe into that result via `return` — see its entry.)
 
 ## Type conventions
 
@@ -255,7 +256,9 @@ no sibling on timeout. Resume reading from the returned `cursor`.
 ## Input
 
 Every tool in this section returns an empty `result:{}` on success — `ok:true` in the envelope is
-itself the confirmation that the action ran; there is nothing else to report.
+itself the confirmation that the action ran. The one exception is `glass_type`'s optional `return`
+observe, which folds settle metadata (or appends an accessibility outline) into the result — see
+its entry.
 
 `glass_click`, `glass_drag`, and `glass_scroll` accept an optional `modifiers` array — `"ctrl"`,
 `"shift"`, `"alt"`, or `"super"` (e.g. `["ctrl"]`, `["ctrl","shift"]`; macOS calls this key ⌘ and
@@ -281,6 +284,12 @@ Click at window-relative coordinates.
 Type a string into the focused window.
 
 - `text` (string, **required**).
+- `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for
+  `glass_click_element`. Not accepted inside a `glass_do` `type` action — use a `settle`
+  action or the terminal `then` observe there.
+
+Returns `{}` plus `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`,
+exactly as for `glass_click_element`.
 
 ### `glass_key`
 
@@ -354,7 +363,9 @@ optionally observe.
 
 - `actions` (array, **required**, non-empty) — each item is `{ action: "click"|"move"|"drag"|
   "scroll"|"type"|"key"|"settle", ...fields }`. Click/move/drag/scroll/type/key take the same
-  fields as their matching tool. A `settle` action takes a *subset* of `glass_wait_stable`'s
+  fields as their matching tool, except that a `type` action rejects `return` (its observe output
+  would be discarded mid-sequence — use a `settle` action or `then`; an explicit `"none"` is
+  accepted). A `settle` action takes a *subset* of `glass_wait_stable`'s
   fields — `interval_ms`, `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and
   `ignore` (the same window-relative-rectangles knob) — but no `window_id`, `region`, or
   `include_image`: it always settles the active window and never returns an image. It waits for

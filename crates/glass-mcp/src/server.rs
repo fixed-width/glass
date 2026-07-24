@@ -220,7 +220,11 @@ impl GlassServer {
         self.run(move |g| tools::gesture(g, &a)).await
     }
 
-    #[tool(description = "Type a string of text into the focused window.")]
+    #[tool(description = "Type a string of text into the focused window. \
+                       Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
+                       tree into the result (and refreshes the snapshot cache); \"settle\" waits \
+                       for the UI to stop changing (text-only); omit or \"none\" for no observe \
+                       (default).")]
     async fn glass_type(
         &self,
         Parameters(a): Parameters<TypeArgs>,
@@ -492,7 +496,9 @@ impl GlassServer {
         description = "Run an ordered sequence of input actions in ONE call (collapsing per-action \
                        round-trips), then optionally observe. `actions` is a list of \
                        {\"action\":\"click|move|drag|scroll|type|key|settle\", …same fields as the \
-                       matching tool}; `settle` waits for the screen to stop changing between steps. \
+                       matching tool — except `type`'s `return` observe, rejected here (use a \
+                       settle action or `then`)}; `settle` waits for the screen to stop changing \
+                       between steps. \
                        Optional `then` runs after all actions succeed: {settle?, diff?, screenshot?} \
                        (text-only unless screenshot/diff image). Fails fast: if an action errors it \
                        reports which index failed and how many ran. Use for KNOWN sequences (login, \

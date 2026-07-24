@@ -329,6 +329,17 @@ fn settle_params() -> glass_core::WaitStableParams {
     }
 }
 
+/// Reject an unknown `return` value without touching the session. For a tool whose
+/// action mutates the app (typing, clicking), call this BEFORE acting — a bad
+/// argument must not leave the action applied, or an agent retrying the errored
+/// call applies it twice.
+pub(crate) fn validate_return(ret: Option<&str>) -> Result<(), String> {
+    match ret {
+        None | Some("none" | "settle" | "snapshot") => Ok(()),
+        Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
+    }
+}
+
 /// Apply the optional `return` observe. `settle` → `Some(metadata)` to merge under
 /// `result.observed`; `snapshot` → an untrusted outline sibling to append; none/absent
 /// → neither. Calls the `Glass` methods directly (not the `a11y_snapshot`/`wait_stable`
@@ -381,6 +392,8 @@ fn resolve_return(
 }
 
 pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
+    // Bad `return` value → reject before the click lands (see `validate_return`).
+    validate_return(a.return_.as_deref())?;
     glass
         .click_element(AxNodeId(a.id))
         .map_err(|e| e.to_string())?;
@@ -397,6 +410,8 @@ pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
 }
 
 pub fn set_value(glass: &mut Glass, a: &SetValueArgs) -> ToolResult {
+    // Bad `return` value → reject before the value is written (see `validate_return`).
+    validate_return(a.return_.as_deref())?;
     glass
         .set_value(AxNodeId(a.id), &a.text)
         .map_err(|e| e.to_string())?;
@@ -1607,6 +1622,126 @@ mod tests {
         let v = assert_envelope(&out, "glass_set_value");
         assert_eq!(v["id"], json!(1), "envelope: {v}");
         assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
+    }
+
+    #[test]
+    fn type_return_settle_folds_into_observed() {
+        use glass_core::Frame;
+        // Mirrors the click_element/set_value settle observes: wait_stable needs frames;
+        // one solid frame (repeated by the fake) settles.
+        let mut g = started_a11y_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let out = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "hi".into(),
+                return_: Some("settle".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            1,
+            "settle folds into `result.observed`, no extra sibling"
+        );
+        let v = assert_envelope(&out, "glass_type");
+        assert_eq!(v["observed"]["settled"], json!(true), "envelope: {v}");
+    }
+
+    #[test]
+    fn type_return_snapshot_appends_outline() {
+        let mut g = started_a11y_frames(vec![]);
+        let out = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "x".into(),
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.0.len(),
+            2,
+            "envelope + exactly one sibling (the a11y outline)"
+        );
+        assert_envelope(&out, "glass_type");
+        assert!(
+            matches!(&out.0[1], OutContent::Text(t) if t.starts_with(crate::untrusted::NOTE) && t.contains("#1 Button")),
+            "outline appended"
+        );
+        // the snapshot refreshed last_ax -> a follow-up id-based action still resolves
+        assert!(click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: None
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn type_unknown_return_rejected_before_any_keystroke() {
+        use std::sync::{Arc, Mutex};
+        // A bad `return` value must fail BEFORE the text is injected — an agent that
+        // retries after this error must not end up with the text typed twice.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(100, 100).with_event_log(log.clone()));
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let err = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "x".into(),
+                return_: Some("bogus".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown return"), "msg: {err}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "no input injected on a rejected `return`: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn type_observe_failure_says_text_was_typed() {
+        use std::sync::{Arc, Mutex};
+        // A runtime observe failure (here: `snapshot` on a session with no a11y reader)
+        // happens AFTER the keystrokes landed. The error must say so, or an agent
+        // retries the whole call and the field ends up with the text twice.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(100, 100).with_event_log(log.clone()));
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let err = type_text(
+            &mut g,
+            &TypeArgs {
+                text: "hi".into(),
+                return_: Some("snapshot".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("text was typed"), "msg: {err}");
+        assert_eq!(*log.lock().unwrap(), vec!["type(hi)"], "keystrokes landed");
     }
 
     #[test]
