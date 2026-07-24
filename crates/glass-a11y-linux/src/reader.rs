@@ -229,6 +229,26 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     Err(GlassError::AxElementNotEditable(target.id.0))
 }
 
+/// Whether this node's children may be explored, recording the bound that stopped the walk
+/// when they may not.
+///
+/// `walk` and `find_nth` MUST consult this one function at the same point in their
+/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
+/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
+/// id against a different tree and writes to the wrong element. Sharing the decision makes
+/// that divergence impossible to introduce by editing only one of them.
+fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        return false;
+    }
+    if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        return false;
+    }
+    true
+}
+
 /// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
 /// id is the arrival count), then recurse each child in `get_children` order, skipping children
 /// whose proxy fails to build — **and stopping at the same depth/node/sibling bounds**. The
@@ -246,12 +266,7 @@ async fn find_nth(
         return Ok(Some(node_ref.clone()));
     }
     budget.visit();
-    if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-        return Ok(None);
-    }
-    if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
+    if !may_explore_children(budget, depth) {
         return Ok(None);
     }
     let mut siblings = 0usize;
@@ -325,11 +340,7 @@ async fn walk(
     let bounds = extents(proxy, conn).await;
 
     let mut children = Vec::new();
-    if budget.depth_exhausted(depth) {
-        budget.hit(TruncationLimit::Depth);
-    } else if budget.nodes_exhausted() {
-        budget.hit(TruncationLimit::Nodes);
-    } else {
+    if may_explore_children(budget, depth) {
         let mut siblings = 0usize;
         for child_ref in proxy.get_children().await.map_err(bus_err)? {
             siblings += 1;
@@ -517,6 +528,50 @@ fn nonempty(s: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    #[test]
+    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
+        let mut budget = WalkBudget::new();
+        assert!(may_explore_children(&mut budget, 0));
+        assert!(budget.truncation().is_none());
+    }
+
+    #[test]
+    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, 0));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
 
     #[test]
     fn no_matching_app_message_is_developer_framed() {
