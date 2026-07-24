@@ -95,10 +95,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     let origin = (ctx.window.x, ctx.window.y);
     let mut count = 0usize;
     let root_node = walk(&walker, &window, origin, 0, &mut count)?;
-    let mut tree = AxTree {
-        root: root_node,
-        count: 0,
-    };
+    let mut tree = AxTree::new(root_node);
     tree.assign_ids();
     Ok(tree)
 }

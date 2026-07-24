@@ -90,11 +90,7 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
 
 /// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
 pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
-    // count stays 0 until the caller runs AxTree::assign_ids (per the Accessibility trait contract).
-    Ok(AxTree {
-        root: json_to_node(tree, win)?,
-        count: 0,
-    })
+    Ok(AxTree::new(json_to_node(tree, win)?))
 }
 
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).

@@ -82,7 +82,7 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
         }),
         children,
     };
-    Ok(AxTree { root, count: 0 })
+    Ok(AxTree::new(root))
 }
 
 /// The widest top-level element's logical-point width from idb's nested

@@ -98,7 +98,7 @@ impl Accessibility for MacosA11y {
         let root = walk(&window_el, &ctx.window, scale, 0, &mut count);
         // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
         // identical across OS backends.
-        Ok(AxTree { root, count: 0 })
+        Ok(AxTree::new(root))
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {

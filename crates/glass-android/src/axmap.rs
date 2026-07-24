@@ -98,7 +98,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
         }),
         children,
     };
-    Ok(AxTree { root, count: 0 })
+    Ok(AxTree::new(root))
 }
 
 fn map_node(node: roxmltree::Node, window: &WindowGeometry) -> AxNode {

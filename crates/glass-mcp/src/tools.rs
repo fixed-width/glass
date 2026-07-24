@@ -672,7 +672,7 @@ pub(crate) mod testutil {
             }),
             children: vec![button],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     /// A window root with no child elements — the "app publishes no usable tree" shape.
@@ -692,7 +692,7 @@ pub(crate) mod testutil {
             }),
             children: vec![],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     pub fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {

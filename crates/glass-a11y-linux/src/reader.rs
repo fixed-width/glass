@@ -144,10 +144,7 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
         .map_err(bus_err)?;
 
     let root_node = Box::pin(walk(&app, &zbus_conn)).await?;
-    let mut tree = AxTree {
-        root: root_node,
-        count: 0,
-    };
+    let mut tree = AxTree::new(root_node);
     tree.assign_ids();
     Ok(tree)
 }
