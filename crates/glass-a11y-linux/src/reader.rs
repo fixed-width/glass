@@ -243,8 +243,11 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 // The exactly-at-cap regression — a complete tree of MAX_NODES nodes must report `None`, since
 // the last node to arrive wasn't declined — is unit-tested directly in the Android and iOS
 // mappers, which build a synthetic tree in-process. This reader shares that loop shape but reads
-// a live system tree over IPC, where a tree at the cap would run ~1500 nodes at several
-// round-trips each — landing on `SNAPSHOT_TIMEOUT` and yielding a flaky test, not a reliable one.
+// a live tree over IPC, and `walk` currently spends several sequential round-trips per node, so a
+// tree at the cap would land on `SNAPSHOT_TIMEOUT` and yield a flaky test rather than a reliable
+// one. That is a cost problem, not a fundamental one: reducing the per-node round-trips (batching
+// the attribute reads, or issuing the independent ones concurrently) brings a live at-cap test
+// back within budget, and it should be added alongside that work.
 fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
     if budget.depth_exhausted(depth) {
         budget.hit(TruncationLimit::Depth);
