@@ -244,11 +244,30 @@ impl Glass {
     /// One native-invoke attempt: same fingerprint + context assembly as
     /// `set_value_inner`, then the backend's `invoke`.
     fn try_native_invoke(&mut self, id: AxNodeId) -> Result<()> {
-        let (target, ctx) = {
-            let s = self.require_active()?;
+        {
+            let s = self.active_mut()?;
+            // Reader-presence check up front (mirrors `snapshot_at_current_limits`) so
+            // `AxUnsupported` keeps precedence over — and a reader-less backend skips — the
+            // geometry round-trip below.
             if s.accessibility.is_none() {
                 return Err(GlassError::AxUnsupported);
             }
+            // Re-read the window geometry, as `a11y_snapshot` does: the Windows/macOS `invoke`
+            // fingerprints the element by window-RELATIVE bounds derived from `ctx.window`, so
+            // a window the user moved since the snapshot would make every element look
+            // displaced and reject the invoke as drift. Storing it back also keeps the pointer
+            // fallback clamping against the same window.
+            //
+            // Best-effort, unlike the snapshot's strict refresh: a click must not become
+            // unclickable because a geometry probe hiccuped, so an `Err` keeps the cached
+            // value and carries on — worst case the fingerprint check below rejects, exactly
+            // as it did before this refresh existed.
+            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
+                s.geometry = window;
+            }
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let target = AxTarget {
@@ -1105,6 +1124,47 @@ mod tests {
     }
 
     #[test]
+    fn click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window() {
+        // The Windows/macOS `invoke` fingerprints the element by window-RELATIVE bounds,
+        // derived from `ctx.window`. If the window moved since the snapshot and the click
+        // handed the backend the stale origin, every element would look displaced and the
+        // invoke would be rejected as drift. The snapshot refreshes geometry, so the invoke
+        // path must too: script the geometry read to report a moved window after the
+        // snapshot's own read, and prove the ctx the backend received carries the new origin.
+        let snapshot_geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let moved_geo = WindowGeometry {
+            x: 640,
+            y: 480,
+            width: 100,
+            height: 100,
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(snapshot_geo)
+            .resized_to(moved_geo.clone());
+        let (mut g, invoke_log, ctx_log) =
+            glass_with_a11y_invoke_ctx(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap(); // consumes the first scripted geometry read
+
+        assert_eq!(
+            g.click_element(AxNodeId(1)).unwrap(),
+            ClickMethod::NativeAction
+        );
+
+        assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
+        assert_eq!(
+            ctx_log.lock().unwrap().as_ref().map(|c| c.window.clone()),
+            Some(moved_geo),
+            "invoke's ctx carries the refreshed window, not the snapshot's stale one"
+        );
+    }
+
+    #[test]
     fn click_element_without_snapshot_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
@@ -1878,7 +1938,7 @@ mod tests {
                 tree: fake_tree(),
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
                 invoke_behavior: InvokeBehavior::Unsupported,
                 invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
@@ -1913,7 +1973,7 @@ mod tests {
     #[test]
     fn a11y_snapshot_threads_max_nodes_into_ctx_limits_and_set_value_reuses_them() {
         // Same mock harness as `set_value_passes_target_and_text_to_backend`, but this
-        // time inspecting `limits_log` — the `AxContext.limits` the backend actually
+        // time inspecting `ctx_log` — the `AxContext.limits` the backend actually
         // received — to prove `max_nodes` reaches the ctx, and that `set_value` reuses
         // whatever the last `a11y_snapshot` recorded rather than falling back to the
         // default cap. Real backends still ignore `limits` in this task (they build
@@ -1921,14 +1981,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
-        let limits_log = Arc::new(Mutex::new(None));
+        let ctx_log = Arc::new(Mutex::new(None));
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
             accessibility: Some(Box::new(FakeAccessibility {
                 tree: fake_tree(),
                 set_log: Arc::new(Mutex::new(Vec::new())),
                 set_fail: false,
-                limits_log: limits_log.clone(),
+                ctx_log: ctx_log.clone(),
                 invoke_behavior: InvokeBehavior::Unsupported,
                 invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
@@ -1942,10 +2002,12 @@ mod tests {
 
         g.a11y_snapshot(Some(5000)).unwrap();
         assert_eq!(
-            limits_log
+            ctx_log
                 .lock()
                 .unwrap()
-                .expect("snapshot recorded ctx.limits")
+                .as_ref()
+                .expect("snapshot recorded its ctx")
+                .limits
                 .nodes,
             5000,
             "snapshot ctx carries the raised cap"
@@ -1953,10 +2015,12 @@ mod tests {
 
         g.set_value(AxNodeId(1), "x").unwrap(); // fake_tree: #1 is Button "Save"
         assert_eq!(
-            limits_log
+            ctx_log
                 .lock()
                 .unwrap()
-                .expect("set_value recorded ctx.limits")
+                .as_ref()
+                .expect("set_value recorded its ctx")
+                .limits
                 .nodes,
             5000,
             "set_value reuses the snapshot's limits"
@@ -1974,7 +2038,7 @@ mod tests {
                 tree: fake_tree(),
                 set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 set_fail: true,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
                 invoke_behavior: InvokeBehavior::Unsupported,
                 invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
@@ -2239,7 +2303,7 @@ mod tests {
                 tree: fake_tree(), // #1 is a non-checkable Button "Save"
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
                 invoke_behavior: InvokeBehavior::Unsupported,
                 invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
@@ -2289,7 +2353,7 @@ mod tests {
                 tree: sw(false), // #1 is the checkable switch "Sw"
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
                 invoke_behavior: InvokeBehavior::Unsupported,
                 invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),

@@ -16,6 +16,10 @@ pub(crate) use std::time::Duration;
 /// asserting it (not `capture_frame`) was used, and with what arguments.
 pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
 
+/// The last `AxContext` a fake `Accessibility` was called with — see
+/// [`FakeAccessibility::ctx_log`].
+pub(crate) type CtxLog = Arc<Mutex<Option<AxContext>>>;
+
 /// Scriptable in-memory backend for testing the session manager.
 #[derive(Default)]
 pub(crate) struct FakePlatform {
@@ -48,10 +52,11 @@ pub(crate) struct FakePlatform {
     /// Stands in for a backend (iOS) that reports a switch's frame as the whole row — makes
     /// `a11y_toggle_control_at_trailing_edge` return true so the trailing-aim path is testable.
     a11y_trailing_toggle: bool,
-    /// When set, a `WindowOp::Geometry` read reports this geometry — models an app that resized
-    /// itself (e.g. opened a sidebar) without a `glass_window` op, so the session's cached
-    /// geometry is stale until `a11y_snapshot` refreshes it.
-    resized_to: Option<WindowGeometry>,
+    /// Geometries successive `WindowOp::Geometry` reads report, in order, the last repeating
+    /// forever (same idiom as `frames`) — models an app that resizes/moves itself without a
+    /// `glass_window` op, so the session's cached geometry is stale until something re-reads
+    /// it. Empty means "report the current geometry unchanged".
+    resized_to: VecDeque<WindowGeometry>,
 }
 
 impl FakePlatform {
@@ -118,8 +123,10 @@ impl FakePlatform {
         self.a11y_trailing_toggle = true;
         self
     }
+    /// Script the next `WindowOp::Geometry` read. Call once for "the app resized itself and
+    /// stays that size"; call repeatedly to script successive reads (the last repeats).
     pub(crate) fn resized_to(mut self, g: WindowGeometry) -> Self {
-        self.resized_to = Some(g);
+        self.resized_to.push_back(g);
         self
     }
 }
@@ -202,8 +209,11 @@ impl Platform for FakePlatform {
             }
             WindowOp::Focus => {}
             WindowOp::Geometry => {
-                if let Some(g) = &self.resized_to {
-                    self.geometry = g.clone();
+                if let Some(g) = self.resized_to.front().cloned() {
+                    if self.resized_to.len() > 1 {
+                        self.resized_to.pop_front(); // the last scripted geometry repeats
+                    }
+                    self.geometry = g;
                 }
             }
         }
@@ -297,10 +307,11 @@ pub(crate) struct FakeAccessibility {
     pub(crate) tree: AxTree,
     pub(crate) set_log: std::sync::Arc<std::sync::Mutex<Vec<(AxTarget, String)>>>,
     pub(crate) set_fail: bool,
-    /// The `limits` from the most recent `AxContext` this backend received (either
-    /// `snapshot` or `set_value`) — lets a test prove `max_nodes` actually reached the
-    /// backend, not just the session's own bookkeeping. `None` when unset.
-    pub(crate) limits_log: Arc<Mutex<Option<crate::accessibility::WalkLimits>>>,
+    /// The most recent `AxContext` this backend received (from `snapshot`, `set_value`, or
+    /// `invoke`) — lets a test prove what actually reached the backend (the `max_nodes`
+    /// limits, the window geometry the fingerprint is checked against), not just the
+    /// session's own bookkeeping. `None` when unset.
+    pub(crate) ctx_log: CtxLog,
     /// Scripts this backend's `invoke` outcome. Defaults to `Unsupported`, mirroring a
     /// backend that never implemented it (the trait's default shape) — so every existing
     /// test that doesn't opt in still exercises the pointer-fallback path unchanged.
@@ -313,11 +324,11 @@ pub(crate) struct FakeAccessibility {
 
 impl Accessibility for FakeAccessibility {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        *self.limits_log.lock().unwrap() = Some(ctx.limits);
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         Ok(self.tree.clone())
     }
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        *self.limits_log.lock().unwrap() = Some(ctx.limits);
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         if self.set_fail {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
@@ -328,7 +339,7 @@ impl Accessibility for FakeAccessibility {
         Ok(())
     }
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
-        *self.limits_log.lock().unwrap() = Some(ctx.limits);
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }
@@ -449,7 +460,7 @@ pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
             tree,
             set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             set_fail: false,
-            limits_log: Arc::new(Mutex::new(None)),
+            ctx_log: Arc::new(Mutex::new(None)),
             invoke_behavior: InvokeBehavior::Unsupported,
             invoke_log: Arc::new(Mutex::new(Vec::new())),
         }),
@@ -464,19 +475,32 @@ pub(crate) fn glass_with_a11y_invoke(
     tree: AxTree,
     behavior: InvokeBehavior,
 ) -> (Glass, Arc<Mutex<Vec<AxTarget>>>) {
+    let (g, invoke_log, _) = glass_with_a11y_invoke_ctx(platform, tree, behavior);
+    (g, invoke_log)
+}
+
+/// [`glass_with_a11y_invoke`] plus the ctx log — for a test that must prove what
+/// [`AxContext`] the backend was handed (e.g. the window geometry the fingerprint is
+/// checked against), not just that `invoke` ran.
+pub(crate) fn glass_with_a11y_invoke_ctx(
+    platform: FakePlatform,
+    tree: AxTree,
+    behavior: InvokeBehavior,
+) -> (Glass, Arc<Mutex<Vec<AxTarget>>>, CtxLog) {
     let invoke_log = Arc::new(Mutex::new(Vec::new()));
+    let ctx_log: CtxLog = Arc::new(Mutex::new(None));
     let g = glass_with_backend(
         platform,
         Box::new(FakeAccessibility {
             tree,
             set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             set_fail: false,
-            limits_log: Arc::new(Mutex::new(None)),
+            ctx_log: ctx_log.clone(),
             invoke_behavior: behavior,
             invoke_log: invoke_log.clone(),
         }),
     );
-    (g, invoke_log)
+    (g, invoke_log, ctx_log)
 }
 
 /// An `Accessibility` that returns a scripted sequence of trees — one per
