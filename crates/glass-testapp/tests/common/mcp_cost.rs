@@ -11,6 +11,13 @@
 //! calls it) — which means the `#[cfg(test)]` unit tests below run under `cargo test
 //! --workspace` regardless.
 
+// One `unsafe { env::set_var }` for pre-spawn GLASS_DISPLAY setup in
+// `compact_outline_is_smaller_and_every_id_still_resolves` (see its `// SAFETY:` note), same
+// opt-out as verification_cost.rs / ignore_regions_e2e.rs / network.rs. It lives here, on this
+// module, rather than on each binary's crate root: this file is compiled into several test
+// binaries (see above) and only this one test needs it.
+#![allow(unsafe_code)]
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -22,6 +29,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{Peer, RoleClient, ServiceExt};
 use serde_json::{json, Value};
+
+use super::Xvfb;
 
 /// Repo root: `crates/glass-testapp` is two levels below it.
 fn repo_root() -> PathBuf {
@@ -631,9 +640,9 @@ async fn restart_fixture(client: &Peer<RoleClient>) {
 /// property this file's cost-and-integrity test needs — `glass_a11y_snapshot` always answers
 /// with `render_compact`'s output (see `glass_mcp::tools::a11y_snapshot`), never the
 /// uncompacted `AxTree::to_outline` render — so that test drives `Glass` directly to see both.
-/// Leaves `GLASS_DISPLAY` unset so the x11 backend spawns its own private headless display
-/// (see `glass_x11::X11Platform::from_env`), which avoids the `unsafe { env::set_var }` the
-/// wire-based tests in this suite need for attach mode.
+/// The caller must point `GLASS_DISPLAY` at a live Xvfb before calling this, the same as the
+/// wire-based tests in this suite: `start_on("x11", ...)` attaches to whatever display
+/// `GLASS_DISPLAY` names rather than spawning its own.
 fn start_fixture_sync(glass: &mut Glass) {
     let (build, run, cwd) = fixture_run_spec();
     let spec = AppSpec {
@@ -711,6 +720,10 @@ fn ids_in(outline: &str) -> Vec<AxNodeId> {
 #[test]
 #[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]
 fn compact_outline_is_smaller_and_every_id_still_resolves() {
+    let xvfb = Xvfb::start();
+    // SAFETY: single-threaded test setup; runs before any server task spawns.
+    unsafe { std::env::set_var("GLASS_DISPLAY", &xvfb.display) };
+
     let mut glass = glass_mcp::boot(None);
     start_fixture_sync(&mut glass);
     let tree = wait_for_widgets_sync(&mut glass);
