@@ -424,9 +424,21 @@ const TOGGLE_ACTION_NAMES: &[&str] = &[
     "toggle", "click", "activate", "press", "check", "uncheck", "switch",
 ];
 
-/// Invoke the node's first activating Action (see [`TOGGLE_ACTION_NAMES`]).
-/// Returns whether an action was found and reported success.
-async fn invoke_activating_action(conn: &zbus::Connection, node: &AccessibleProxy<'_>) -> bool {
+/// Outcome of one AT-SPI Action attempt on a node.
+enum ActionAttempt {
+    /// An action from the ladder was found and fired; the bool is the
+    /// bus-reported success.
+    Fired(bool),
+    /// No Action interface, or none of `names` present.
+    Unavailable,
+}
+
+/// Fire the node's first Action whose name is in `names`.
+async fn try_action(
+    conn: &zbus::Connection,
+    node: &AccessibleProxy<'_>,
+    names: &[&str],
+) -> ActionAttempt {
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
     let Some(action) = atspi::proxy::action::ActionProxy::builder(conn)
@@ -434,19 +446,19 @@ async fn invoke_activating_action(conn: &zbus::Connection, node: &AccessibleProx
         .ok()
         .and_then(|b| b.path(path).ok())
     else {
-        return false;
+        return ActionAttempt::Unavailable;
     };
     let Ok(a) = action.build().await else {
-        return false;
+        return ActionAttempt::Unavailable;
     };
     let n = a.n_actions().await.unwrap_or(0);
     for i in 0..n {
         let name = a.get_name(i).await.unwrap_or_default().to_ascii_lowercase();
-        if TOGGLE_ACTION_NAMES.contains(&name.as_str()) {
-            return a.do_action(i).await.unwrap_or(false);
+        if names.contains(&name.as_str()) {
+            return ActionAttempt::Fired(a.do_action(i).await.unwrap_or(false));
         }
     }
-    false
+    ActionAttempt::Unavailable
 }
 
 /// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`. Idempotent:
@@ -470,7 +482,10 @@ async fn set_toggle(
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
         return Ok(()); // already in the desired state
     }
-    if !invoke_activating_action(conn, node).await {
+    if !matches!(
+        try_action(conn, node, TOGGLE_ACTION_NAMES).await,
+        ActionAttempt::Fired(true)
+    ) {
         // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
         // through accessibility; the caller should drive it with click_element.
         return Err(GlassError::AxElementNotEditable(id));
