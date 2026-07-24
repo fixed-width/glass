@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    TruncationLimit, WalkBudget,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -144,7 +144,7 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
         .await
         .map_err(bus_err)?;
 
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(ctx.limits);
     let root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
@@ -165,7 +165,7 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
 async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(ctx.limits);
     let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
         .await?
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
@@ -291,7 +291,7 @@ async fn find_nth(
             break;
         }
         siblings += 1;
-        if siblings > MAX_SIBLINGS {
+        if siblings > budget.max_siblings() {
             budget.hit(TruncationLimit::Siblings);
             break;
         }
@@ -382,7 +382,7 @@ async fn walk(
                 break;
             }
             siblings += 1;
-            if siblings > MAX_SIBLINGS {
+            if siblings > budget.max_siblings() {
                 budget.hit(TruncationLimit::Siblings);
                 break;
             }

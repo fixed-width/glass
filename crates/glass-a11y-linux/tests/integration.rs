@@ -808,13 +808,11 @@ fn scroll_to_element_reports_unmatched_for_an_absent_row() {
     glass.stop().expect("stop");
 }
 
-/// A real AT-SPI tree larger than `MAX_NODES` snapshots into a bounded, complete prefix flagged
-/// `Nodes` — the live end-to-end truncation path the in-process Android/iOS mapper unit tests
-/// cannot cover. Also logs the snapshot wall-time (a fast walk is why this test is practical;
-/// asserted for correctness only, never a latency bound, so it cannot flake on a loaded machine).
-#[test]
-#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
-fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
+/// Launches the bench fixture (`a11y_bench_fixture.py`, ~1900 realized widgets) with a11y
+/// enabled and waits for its AT-SPI tree to populate. Shared by the over-cap parity test and
+/// the configurable-limits tests below — this fixture is the only one wide enough to exceed
+/// `MAX_NODES`.
+fn launch_bench() -> Glass {
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/a11y_bench_fixture.py"
@@ -844,6 +842,17 @@ fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
     // fixture realizes ~1300 widgets, so registration with the AT-SPI registry lags the
     // window map more than the small fixture's does.
     std::thread::sleep(std::time::Duration::from_millis(3_000));
+    glass
+}
+
+/// A real AT-SPI tree larger than `MAX_NODES` snapshots into a bounded, complete prefix flagged
+/// `Nodes` — the live end-to-end truncation path the in-process Android/iOS mapper unit tests
+/// cannot cover. Also logs the snapshot wall-time (a fast walk is why this test is practical;
+/// asserted for correctness only, never a latency bound, so it cannot flake on a loaded machine).
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
+    let mut glass = launch_bench();
 
     let started = std::time::Instant::now();
     let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
@@ -871,5 +880,70 @@ fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
     assert!(
         find_role(&tree.root, glass_core::AxRole::Button).is_some(),
         "the bounded prefix still contains real widgets from the top of the tree"
+    );
+}
+
+/// max_nodes:0 (unbounded) returns the WHOLE bench tree — past the default cap, not truncated.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn unbounded_snapshot_returns_the_full_tree_past_the_default_cap() {
+    let mut glass = launch_bench();
+    let tree = glass.a11y_snapshot(Some(0)).expect("unbounded snapshot");
+    glass.stop().expect("stop");
+    assert!(tree.truncated.is_none(), "unbounded walk is not truncated");
+    assert!(
+        tree.to_outline().lines().count() > glass_core::MAX_NODES,
+        "the full tree exceeds the default cap"
+    );
+}
+
+/// A raised numeric cap stops at exactly that many nodes.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn raised_cap_snapshot_stops_at_the_requested_count() {
+    let mut glass = launch_bench();
+    let tree = glass
+        .a11y_snapshot(Some(2000))
+        .expect("raised-cap snapshot");
+    glass.stop().expect("stop");
+    assert_eq!(
+        tree.to_outline().lines().count(),
+        2000,
+        "the walk stops at the raised cap"
+    );
+    assert_eq!(
+        tree.truncated.map(|t| t.limit),
+        Some(glass_core::TruncationLimit::Nodes)
+    );
+}
+
+/// Lockstep across a raised cap: an id assigned PAST the old cap by an unbounded snapshot is still
+/// resolvable by set_value — find_nth re-walks with the session's stored (unbounded) limits. If
+/// the limits weren't reused, find_nth would truncate at the default cap and fail to resolve the id
+/// (AxElementChanged). Reaching the node (a non-editable one → AxElementNotEditable) proves lockstep.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn set_value_resolves_an_id_past_the_default_cap_from_an_unbounded_snapshot() {
+    let mut glass = launch_bench();
+    let tree = glass.a11y_snapshot(Some(0)).expect("unbounded snapshot");
+    let last = tree.to_outline().lines().count() - 1;
+    assert!(
+        last > glass_core::MAX_NODES,
+        "an id past the default cap exists"
+    );
+    let err = glass
+        .set_value(glass_core::AxNodeId(last as u32), "x")
+        .unwrap_err();
+    glass.stop().expect("stop");
+    let msg = err.to_string();
+    // The failure mode (lockstep broken) is `AxElementChanged`: "element #N changed since the
+    // snapshot; re-snapshot" — find_nth re-walked with the default (not the stored unbounded)
+    // limits, truncated before reaching `last`, and returned None. The success mode (lockstep
+    // held, node reached but not editable) is `AxElementNotEditable`: "element #N is not
+    // editable via the accessibility API ...". Neither "changed" nor "not found" appears in the
+    // not-editable message, so this substring pair cleanly distinguishes the two.
+    assert!(
+        !msg.to_lowercase().contains("changed") && !msg.to_lowercase().contains("not found"),
+        "the id past the old cap resolved (lockstep held); got: {msg}"
     );
 }
