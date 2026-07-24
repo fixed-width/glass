@@ -18,7 +18,9 @@
 //! idb's `accessibility_info` exposes no per-element focus state (there is no focus
 //! key anywhere in the output), so [`AxStates::focused`] is always false from this
 //! backend — a known limitation.
-use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree};
+use glass_core::accessibility::{
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, MAX_SIBLINGS,
+};
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
 
@@ -54,13 +56,34 @@ pub fn ax_role(ax_type: &str) -> AxRole {
 /// Returns [`GlassError::AccessibilityUnavailable`] if the JSON does not parse or
 /// its root is neither an element object nor an array of elements — a malformed
 /// response never yields an empty tree passed off as success.
+///
+/// The walk is bounded by a [`WalkBudget`] (node count, nesting depth, and per-level
+/// sibling scan) shared with every other backend; a bound firing stops the walk rather
+/// than dropping nodes out of the middle, so ids assigned afterward by
+/// [`AxTree::assign_ids`] stay stable for every surviving node. [`AxTree::truncated`]
+/// records which bound fired, if any.
 pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxTree> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
+    let mut budget = WalkBudget::new();
     // idb may return either a single root object or an array of top-level elements.
     let children: Vec<AxNode> = match &v {
-        Value::Array(a) => a.iter().map(|n| map_node(n, scale)).collect(),
-        obj @ Value::Object(_) => vec![map_node(obj, scale)],
+        Value::Array(a) => {
+            let mut out = Vec::new();
+            for (i, n) in a.iter().enumerate() {
+                if i >= MAX_SIBLINGS {
+                    budget.hit(TruncationLimit::Siblings);
+                    break;
+                }
+                out.push(map_node(n, scale, 0, &mut budget));
+                if budget.nodes_exhausted() {
+                    budget.hit(TruncationLimit::Nodes);
+                    break;
+                }
+            }
+            out
+        }
+        obj @ Value::Object(_) => vec![map_node(obj, scale, 0, &mut budget)],
         _ => {
             return Err(GlassError::AccessibilityUnavailable(
                 "idb a11y JSON: unexpected root".into(),
@@ -82,7 +105,9 @@ pub fn build_tree(json: &str, scale: f64, window: &WindowGeometry) -> Result<AxT
         }),
         children,
     };
-    Ok(AxTree::new(root))
+    let mut tree = AxTree::new(root);
+    tree.truncated = budget.truncation();
+    Ok(tree)
 }
 
 /// The widest top-level element's logical-point width from idb's nested
@@ -135,7 +160,8 @@ fn checkable_checked(role: AxRole, ax_value: Option<&str>) -> (bool, bool) {
     }
 }
 
-fn map_node(n: &Value, scale: f64) -> AxNode {
+fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxNode {
+    budget.visit();
     // Read a string field, collapsing both a JSON `null` (missing/non-string) and an
     // empty string to `None` so absent and blank values are treated alike.
     let s = |k: &str| {
@@ -176,11 +202,32 @@ fn map_node(n: &Value, scale: f64) -> AxNode {
         ..AxStates::default()
     };
     let bounds = n.get("frame").and_then(|f| frame_to_rect(f, scale));
-    let children = n
-        .get("children")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().map(|c| map_node(c, scale)).collect())
-        .unwrap_or_default();
+    // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
+    // pathologically deep or wide accessibility tree cannot blow the stack or the token
+    // budget.
+    let children = if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        vec![]
+    } else if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        vec![]
+    } else {
+        let mut out = Vec::new();
+        if let Some(kids) = n.get("children").and_then(Value::as_array) {
+            for (i, c) in kids.iter().enumerate() {
+                if i >= MAX_SIBLINGS {
+                    budget.hit(TruncationLimit::Siblings);
+                    break;
+                }
+                out.push(map_node(c, scale, depth + 1, budget));
+                if budget.nodes_exhausted() {
+                    budget.hit(TruncationLimit::Nodes);
+                    break;
+                }
+            }
+        }
+        out
+    };
     AxNode {
         id: AxNodeId(0),
         role,
@@ -431,6 +478,34 @@ mod tests {
         assert_eq!(checkable_checked(CheckBox, None), (false, false));
         assert_eq!(checkable_checked(TextField, Some("1")), (false, false));
         assert_eq!(checkable_checked(Button, Some("0")), (false, false));
+    }
+
+    /// Array JSON of `n` flat top-level elements, each a distinctly-labeled `AXButton`
+    /// with no `AXUniqueId` (so `map_node` falls back to `AXLabel` for the name).
+    fn wide_array_json(n: usize) -> String {
+        let mut elems = Vec::with_capacity(n);
+        for i in 0..n {
+            elems.push(format!(
+                r#"{{"role":"AXButton","AXLabel":"btn{i}","frame":{{"x":0,"y":0,"width":10,"height":10}}}}"#
+            ));
+        }
+        format!("[{}]", elems.join(","))
+    }
+
+    #[test]
+    fn truncation_stops_the_walk_and_never_shifts_surviving_ids() {
+        // ids are assigned in the same pre-order the tree is walked, so a truncation
+        // that dropped a node from the middle rather than stopping at the end would
+        // shift every later id off the node its own index implies.
+        let json = wide_array_json(glass_core::MAX_NODES + 50);
+        let mut tree = build_tree(&json, 1.0, &win()).expect("tree builds");
+        tree.assign_ids();
+
+        assert!(tree.truncated.is_some(), "the node cap must have been hit");
+        // The synthetic Window root is id 0 (never counted against the budget); the
+        // top-level element at array index i is id i+1.
+        let third = tree.find(AxNodeId(3)).expect("id 3 survives");
+        assert_eq!(third.name.as_deref(), Some("btn2"));
     }
 
     #[test]
