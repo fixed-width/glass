@@ -11,6 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+    TruncationLimit, WalkBudget, MAX_SIBLINGS,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -143,8 +144,10 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
         .await
         .map_err(bus_err)?;
 
-    let root_node = Box::pin(walk(&app, &zbus_conn)).await?;
+    let mut budget = WalkBudget::new();
+    let root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
     let mut tree = AxTree::new(root_node);
+    tree.truncated = budget.truncation();
     tree.assign_ids();
     Ok(tree)
 }
@@ -162,8 +165,8 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
 async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
-    let mut counter = 0u32;
-    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, target.id.0, &mut counter))
+    let mut budget = WalkBudget::new();
+    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
         .await?
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
     let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
@@ -226,29 +229,56 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     Err(GlassError::AxElementNotEditable(target.id.0))
 }
 
-/// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit
-/// the node (its id is the arrival counter), then recurse each child in
-/// `get_children` order, **skipping children whose proxy fails to build** (just
-/// like `walk`'s `let Ok(child) = … else continue`, so ids stay aligned). The
-/// proxy is passed by reference and never returned; the owned `ObjectRefOwned`
-/// (cloned on match) is returned, so nothing borrows the connection.
+/// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
+/// id is the arrival count), then recurse each child in `get_children` order, skipping children
+/// whose proxy fails to build — **and stopping at the same depth/node/sibling bounds**. The
+/// bounds must stay in lockstep with `walk`: if this traversal visited nodes `walk` skipped,
+/// a `set_value` id would resolve against a different tree and write to the wrong element.
 async fn find_nth(
     node_ref: &ObjectRefOwned,
     proxy: &AccessibleProxy<'_>,
     conn: &zbus::Connection,
+    depth: usize,
     target: u32,
-    counter: &mut u32,
+    budget: &mut WalkBudget,
 ) -> Result<Option<ObjectRefOwned>> {
-    if *counter == target {
+    if budget.nodes_walked() == target as usize {
         return Ok(Some(node_ref.clone()));
     }
-    *counter += 1;
+    budget.visit();
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        return Ok(None);
+    }
+    if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        return Ok(None);
+    }
+    let mut siblings = 0usize;
     for child_ref in proxy.get_children().await.map_err(bus_err)? {
+        siblings += 1;
+        if siblings > MAX_SIBLINGS {
+            budget.hit(TruncationLimit::Siblings);
+            break;
+        }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
             continue;
         };
-        if let Some(found) = Box::pin(find_nth(&child_ref, &child, conn, target, counter)).await? {
+        if let Some(found) = Box::pin(find_nth(
+            &child_ref,
+            &child,
+            conn,
+            depth + 1,
+            target,
+            budget,
+        ))
+        .await?
+        {
             return Ok(Some(found));
+        }
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
         }
     }
     Ok(None)
@@ -277,8 +307,17 @@ async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Con
     }
 }
 
-/// Recursively build a normalized node from an AT-SPI accessible.
-async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<AxNode> {
+/// Recursively build a normalized node from an AT-SPI accessible, bounded by
+/// [`WalkBudget`] (node count, nesting depth, and per-level sibling scan) so a
+/// pathological tree can't burn the outer [`SNAPSHOT_TIMEOUT`] with no tree to
+/// show for it.
+async fn walk(
+    proxy: &AccessibleProxy<'_>,
+    conn: &zbus::Connection,
+    depth: usize,
+    budget: &mut WalkBudget,
+) -> Result<AxNode> {
+    budget.visit();
     let role = proxy.get_role().await.map_err(bus_err)?;
     let raw_role = proxy.get_role_name().await.unwrap_or_default();
     let name = nonempty(proxy.name().await.unwrap_or_default());
@@ -286,11 +325,27 @@ async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<Ax
     let bounds = extents(proxy, conn).await;
 
     let mut children = Vec::new();
-    for child_ref in proxy.get_children().await.map_err(bus_err)? {
-        let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
-            continue;
-        };
-        children.push(Box::pin(walk(&child, conn)).await?);
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+    } else if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+    } else {
+        let mut siblings = 0usize;
+        for child_ref in proxy.get_children().await.map_err(bus_err)? {
+            siblings += 1;
+            if siblings > MAX_SIBLINGS {
+                budget.hit(TruncationLimit::Siblings);
+                break;
+            }
+            let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+                continue;
+            };
+            children.push(Box::pin(walk(&child, conn, depth + 1, budget)).await?);
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
+        }
     }
 
     let value = read_value(proxy, conn, map_role(role)).await;
