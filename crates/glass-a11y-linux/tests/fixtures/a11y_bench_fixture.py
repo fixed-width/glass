@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Large non-virtualized GTK4 tree for the glass-a11y-linux over-cap regression test.
 
-40 Frames, each holding a vertical Box of 15 Buttons + 15 Labels -> ~40*(1+1+30) = 1280
-realized accessible widgets plus GTK's own scaffolding, at depth ~5 (window > box > frame >
-box > widget). Non-virtualized (plain Box, not ListView) so every node is realized and walked,
-pushing the tree past MAX_NODES (1500) so the reader's Nodes truncation bound fires on a real
-AT-SPI tree. A short depth-20 nested Box chain exercises the depth axis independently.
+60 Frames, each holding a vertical Box of 15 Buttons + 15 Labels -> ~60*(1+1+30) = 1920
+realized accessible widgets before GTK's own scaffolding, at depth ~5 (window > box > frame >
+box > widget). Non-virtualized (plain Box, not ListView) so every node is realized and walked.
+The widget count alone clears MAX_NODES (1500) by a wide margin — deliberately, so the reader's
+Nodes truncation bound fires on a real AT-SPI tree even if a future GTK realizes fewer accessible
+nodes per widget. A short depth-20 nested Box chain exercises the depth axis independently.
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration and presents
 its window immediately (matches a11y_fixture.py)."""
@@ -30,7 +31,7 @@ class BenchApp(Gtk.Application):
         scroller = Gtk.ScrolledWindow()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
-        for f in range(40):
+        for f in range(60):
             frame = Gtk.Frame(label=f"Group {f:02d}")
             inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             for i in range(15):
