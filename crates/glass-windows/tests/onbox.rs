@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
-    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, KeyEvent, Modifier,
-    MouseButton, Platform, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, Backend, BaselineStore, Glass,
+    GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory, PointerEvent,
+    WalkLimits, WindowGeometry, WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
 
@@ -52,6 +53,25 @@ fn charmap_spec() -> AppSpec {
         sandbox: glass_core::SandboxLevel::Off,
         a11y: false,
     }
+}
+
+/// A `Glass` session wired to the real Windows backend + UIA reader (as opposed to the bare
+/// `WindowsPlatform`/`WindowsA11y` the other on-box tests drive directly) — needed wherever a test
+/// wants the production `click_element` orchestration (invoke-first, pointer-fallback,
+/// `ClickMethod` disclosure) rather than the reader alone. Mirrors the X11 integration suite's
+/// `glass_x11_with_a11y()`. The baseline dir is leaked (not needed: this is a short-lived on-box
+/// test process, and `Glass` never deletes it itself).
+fn glass_windows_with_a11y() -> Glass {
+    let factory: PlatformFactory = Box::new(|_backend| {
+        Ok(Backend {
+            platform: Box::new(WindowsPlatform::new()?),
+            accessibility: Some(Box::new(WindowsA11y::new())),
+        })
+    });
+    let dir = tempfile::tempdir().expect("tempdir for baseline store");
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    Glass::new(factory, "windows".into(), BaselineStore::new(root), 100)
 }
 
 /// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
@@ -272,19 +292,11 @@ fn onbox_isolated_edge_killtree() {
 fn onbox_a11y_snapshot_and_click() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
-    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
-    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    let mut glass = glass_windows_with_a11y();
+    let geo = glass.start(&charmap_spec()).expect("start charmap");
     std::thread::sleep(Duration::from_millis(1500));
 
-    let mut a11y = WindowsA11y::new();
-    let ctx = AxContext {
-        pids: p.app_pids(),
-        window: geo.clone(),
-        window_handle: p.active_window_handle(),
-        a11y_bus_addr: None,
-        limits: WalkLimits::DEFAULT,
-    };
-    let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     assert!(tree.count > 0, "snapshot must have nodes");
     let (mut total, mut inter) = (0usize, 0usize);
     counts(&tree.root, &mut total, &mut inter);
@@ -296,23 +308,26 @@ fn onbox_a11y_snapshot_and_click() {
     let mut hit = None;
     first_clickable(&tree.root, &mut hit);
     let n = hit.expect("an interactable element with on-screen bounds");
-    let (cx, cy) = n
-        .bounds
-        .and_then(|b| b.clamped_center(geo.width, geo.height))
-        .expect("first interactable has a clampable center");
-    // Capture before/after so we verify the click actually changed the UI (exercising the
-    // bounds -> clamped_center -> click coordinate path), not merely that send_pointer returned Ok.
-    let before = p.capture_frame(None).expect("capture before click");
-    p.send_pointer(&PointerEvent::Click {
-        x: cx,
-        y: cy,
-        button: MouseButton::Left,
-        count: 1,
-        modifiers: vec![],
-    })
-    .expect("click element by center");
+    let id = n.id;
+    assert!(
+        n.bounds
+            .and_then(|b| b.clamped_center(geo.width, geo.height))
+            .is_some(),
+        "first interactable has a clampable center"
+    );
+    // Capture before/after so we verify the click actually changed the UI, not merely that
+    // click_element returned Ok. A Win32 Button (charmap's "Select"/"Copy", same as an
+    // egui/accesskit button) publishes the UIA InvokePattern, so the production click_element
+    // path must take the native-action branch here, never synthesize a pointer event.
+    let before = glass.screenshot(None, None).expect("capture before click");
+    let method = glass.click_element(id).expect("click element by id");
+    assert_eq!(
+        method,
+        glass_core::ClickMethod::NativeAction,
+        "a Win32 Button publishes UIA InvokePattern; click_element must take the native path"
+    );
     std::thread::sleep(Duration::from_millis(700));
-    let after = p.capture_frame(None).expect("capture after click");
+    let after = glass.screenshot(None, None).expect("capture after click");
     assert_eq!(
         before.pixels.len(),
         after.pixels.len(),
@@ -323,7 +338,7 @@ fn onbox_a11y_snapshot_and_click() {
         "clicking the element must change the UI"
     );
 
-    let _ = p.stop_app();
+    let _ = glass.stop();
 }
 
 #[test]

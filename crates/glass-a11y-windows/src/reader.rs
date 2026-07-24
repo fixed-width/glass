@@ -11,8 +11,8 @@ use glass_core::{
     TruncationLimit, WalkBudget,
 };
 use uiautomation::patterns::{
-    UIExpandCollapsePattern, UIRangeValuePattern, UISelectionItemPattern, UITogglePattern,
-    UIValuePattern,
+    UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
+    UITogglePattern, UIValuePattern,
 };
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
@@ -66,6 +66,21 @@ impl Accessibility for WindowsA11y {
             Ok(r) => r,
             Err(_) => Err(GlassError::AccessibilityUnavailable(
                 "accessibility set_value timed out (UIA not responding)".into(),
+            )),
+        }
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_invoke(&ctx, &target));
+        });
+        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => Err(GlassError::AccessibilityUnavailable(
+                "accessibility invoke timed out (UIA not responding)".into(),
             )),
         }
     }
@@ -304,6 +319,57 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Actuate `target` via the first UIA action pattern its control publishes. Walks pre-order to
+/// `target.id` and verifies the same role+name+bounds fingerprint as `run_set_value` (guards a
+/// stale id / tree drift) before touching any pattern.
+///
+/// Ladder order mirrors how a real client picks a control's actuation verb, most-specific first:
+/// Invoke (buttons, menu items — "press this") -> Toggle (checkboxes/switches, which don't
+/// implement Invoke) -> SelectionItem (list/tab/tree rows — "select", not "press") ->
+/// ExpandCollapse (tree/combo expanders — flip between the two states rather than invoke). The
+/// first pattern the control exposes wins; a control that publishes none of the four is
+/// `AxActionUnavailable` (the reader itself is fine — this element just offers no actuation verb),
+/// which `click_element` (glass-core) treats as a fall-back-to-pointer signal, not a fatal error.
+fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let automation = UIAutomation::new().map_err(|e| {
+        GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
+    })?;
+    let walker = automation.get_control_view_walker().map_err(uia_err)?;
+    let window = find_app_window(&automation, ctx)?;
+
+    // Start at 0 so find_nth's pre-order numbering matches snapshot's walk + assign_ids, same as
+    // run_set_value.
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+
+    // Same fingerprint gate as run_set_value: role + name + bounds.
+    let role = crate::mapping::map_role(el.get_control_type().map_err(uia_err)? as i32 as u32);
+    let name = nonempty(el.get_name().unwrap_or_default());
+    let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
+    if !target.matches(role, name.as_deref())
+        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+    {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+
+    let fail = |e: uiautomation::Error| GlassError::AxActionFailed(target.id.0, e.to_string());
+    if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+        return p.invoke().map_err(fail);
+    }
+    if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+        return p.toggle().map_err(fail);
+    }
+    if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+        return p.select().map_err(fail);
+    }
+    if let Ok(p) = el.get_pattern::<UIExpandCollapsePattern>() {
+        let expanded = p.get_state().map_err(fail)? == ExpandCollapseState::Expanded;
+        return if expanded { p.collapse() } else { p.expand() }.map_err(fail);
+    }
+    Err(GlassError::AxActionUnavailable(target.id.0))
 }
 
 /// Whether this node's children may be explored, recording the bound that stopped the walk
