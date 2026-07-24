@@ -1,11 +1,17 @@
 //! Mac-gated accessibility-reader integration test — the first real-AX-tree proof through
-//! the whole `glass-a11y-macos` snapshot + set_value path (`MacosPlatform::start_app` ->
-//! `AxContext` -> `MacosA11y::snapshot`/`set_value` -> AXUIElement walk -> `AxTree`), driven
-//! against the `a11y_fixture` Cocoa app (a "Save" button, an "Enable" checkbox, and an
-//! editable "Note" field — labeled "Note" via `setAccessibilityLabel`, holding the content
-//! "hello"). After the snapshot checks, it round-trips `set_value` on the "Note" field
-//! ("hello" -> "world") and confirms the non-editable "Save" button rejects a write with
-//! `AxElementNotEditable`.
+//! the whole `glass-a11y-macos` snapshot + set_value + invoke path (`MacosPlatform::start_app`
+//! -> `AxContext` -> `MacosA11y::snapshot`/`set_value`/`invoke` -> AXUIElement walk ->
+//! `AxTree`), driven against the `a11y_fixture` Cocoa app (a "Save" button, an "Enable"
+//! checkbox, an editable "Note" field — labeled "Note" via `setAccessibilityLabel`, holding
+//! the content "hello" — and a non-interactive "Status" label). After the snapshot checks,
+//! it round-trips `set_value` on the "Note" field ("hello" -> "world") and confirms the
+//! non-editable "Save" button rejects a write with `AxElementNotEditable`.
+//!
+//! Then, a **native-invoke** check: `invoke` fires `AXPress` on the "Save" button and
+//! confirms the fixture's own `onSave` handler ran (via the same `SAVE_CLICKED` marker the
+//! bounds-agreement check below also uses — AXPress runs the identical target/action a real
+//! click does, so reusing the marker is a stronger proof, not a weaker one), then confirms
+//! the non-actionable "Status" label rejects `invoke` with `AxActionUnavailable`.
 //!
 //! Finally, a **bounds-agreement drift guard**: it clamped-centers the "Save" node's
 //! a11y-reported `bounds` into window-relative pixels and dispatches a real
@@ -55,21 +61,23 @@ mod macos_main {
     };
     use glass_macos::MacosPlatform;
 
-    /// Settle after the a11y-bounds click before draining logs, mirroring `input.rs`'s
-    /// `ACTION_SETTLE` — generous relative to `send_pointer`'s own internal focus-settle so
-    /// the fixture's `fflush`ed `SAVE_CLICKED` line has definitely been read by the
-    /// platform's background log reader before we drain.
+    /// Settle after an action that should print `SAVE_CLICKED` — native `invoke` or the
+    /// a11y-bounds pointer click — before draining logs, mirroring `input.rs`'s
+    /// `ACTION_SETTLE`. Generous relative to the action's own internal focus-settle so the
+    /// fixture's `fflush`ed line has definitely been read by the platform's background log
+    /// reader before we drain.
     const CLICK_SETTLE: Duration = Duration::from_millis(400);
 
-    /// The three elements the fixture exposes, asserted as substrings of the tree outline.
+    /// The four elements the fixture exposes, asserted as substrings of the tree outline.
     /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, using only `name` (never
     /// `value`) — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
     /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
-    const NEEDLES: [&str; 3] = [
+    const NEEDLES: [&str; 4] = [
         "Button \"Save\"",
         "CheckBox \"Enable\"",
         "TextField \"Note\"",
+        "Label \"Status\"",
     ];
 
     /// Pre-order search for the first `TextField` node — the fixture's editable "Note" field.
@@ -282,6 +290,42 @@ mod macos_main {
         }
 
         println!("A11Y_SETVALUE_PASS");
+
+        // --- Native invoke: fire AXPress on the "Save" button through `invoke` and confirm
+        // the fixture's own `onSave` handler ran — reusing SAVE_CLICKED (rather than a
+        // dedicated marker) since AXPress on an NSButton runs the identical target/action a
+        // real click does, and nothing has printed it yet at this point in the run. ---
+        try_expect(a11y.invoke(&ctx, &save_tgt), "invoke(Save)")?;
+        std::thread::sleep(CLICK_SETTLE);
+        let invoke_logs = platform.drain_logs();
+        if !logs_contain(&invoke_logs, "SAVE_CLICKED") {
+            return Err(format!(
+                "invoke(Save) did not fire the button's action (fixture stdout: {invoke_logs:?})"
+            ));
+        }
+
+        // A label exposes no AXPress: invoke must report AxActionUnavailable, not silently
+        // no-op or fall back.
+        let status = match find_by_name(&tree2.root, "Status") {
+            Some(n) => n,
+            None => return Err(format!("no \"Status\" label in re-snapshot:\n{outline2}")),
+        };
+        let status_tgt = AxTarget {
+            id: status.id,
+            role: status.role,
+            name: status.name.clone(),
+            bounds: status.bounds,
+        };
+        match a11y.invoke(&ctx, &status_tgt) {
+            Err(GlassError::AxActionUnavailable(_)) => {}
+            other => {
+                return Err(format!(
+                    "expected AxActionUnavailable for Status, got {other:?}"
+                ))
+            }
+        }
+
+        println!("A11Y_INVOKE_PASS");
 
         // --- Bounds-agreement drift guard: clamped-center Save's a11y bounds into
         // window-relative pixels, click there through the real input path, and confirm

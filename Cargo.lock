@@ -1347,6 +1347,7 @@ dependencies = [
  "glass-a11y-windows",
  "glass-clip-hook",
  "glass-core",
+ "tempfile",
  "windows",
  "windows-capture",
 ]

@@ -150,6 +150,40 @@ impl Accessibility for MacosA11y {
             std::thread::sleep(Duration::from_millis(SET_VALUE_POLL_MS));
         }
     }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let (window_el, scale) = resolve_window(ctx)?;
+
+        // Start at 0, same numbering rationale as `set_value`. Unlike `set_value` (whose
+        // miss is `AxElementNotFound` — the id itself is unknown), a miss here is
+        // `AxElementChanged`: it means the tree drifted since the id was captured (same
+        // classification the Linux/Windows readers' `invoke` use), which is also what the
+        // fingerprint mismatch just below reports.
+        let mut budget = WalkBudget::with_limits(ctx.limits);
+        let el = find_nth(window_el, 0, &mut budget, target.id.0)
+            .ok_or(GlassError::AxElementChanged(target.id.0))?;
+
+        // Same fingerprint gate as set_value: role + name + bounds.
+        let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
+        let role = mapping::map_role(&ax_role);
+        let name = ffi::attribute_string(&el, attr::TITLE)
+            .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
+        let bounds = window_relative_rect(&el, scale, &ctx.window);
+        if !target.matches(role, name.as_deref())
+            || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+
+        if !ffi::action_names(&el).iter().any(|a| a == "AXPress") {
+            return Err(GlassError::AxActionUnavailable(target.id.0));
+        }
+        // No post-actuation verify here (unlike the Linux/Windows toggle rungs): AXPress is a
+        // generic press with no universal post-state to read back — a checkbox's AXValue, a
+        // button's nothing, a menu item's opened menu — so there is nothing to confirm against.
+        // Accepted parity gap: a control that accepts AXPress without acting reports success.
+        ffi::perform_action(&el, "AXPress").map_err(|e| GlassError::AxActionFailed(target.id.0, e))
+    }
 }
 
 /// Resolve the `AXWindow` + point→pixel `scale` for `ctx`: the grant gate, pid, app element,

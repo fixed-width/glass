@@ -11,8 +11,8 @@ use glass_core::{
     TruncationLimit, WalkBudget,
 };
 use uiautomation::patterns::{
-    UIExpandCollapsePattern, UIRangeValuePattern, UISelectionItemPattern, UITogglePattern,
-    UIValuePattern,
+    UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
+    UITogglePattern, UIValuePattern,
 };
 use uiautomation::types::{ExpandCollapseState, Handle, Rect, ToggleState};
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
@@ -25,8 +25,11 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the id sits far enough away to be rejected. Generous to avoid false-rejects.
 const SET_VALUE_BOUNDS_TOL: i64 = 12;
 /// How long `run_set_value` polls the read-back for the value to change before declaring the
-/// write a no-op. A real numeric set lands within a frame or two; well under the 10s outer cap.
+/// write a no-op — also the bound `run_invoke`'s Toggle rung gives the state to flip. A real
+/// numeric set lands within a frame or two; well under the 10s outer cap.
 const SET_VALUE_VERIFY_MS: u64 = 800;
+/// Interval between read-backs while waiting for a write / toggle to land.
+const VERIFY_POLL_MS: u64 = 20;
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -66,6 +69,26 @@ impl Accessibility for WindowsA11y {
             Ok(r) => r,
             Err(_) => Err(GlassError::AccessibilityUnavailable(
                 "accessibility set_value timed out (UIA not responding)".into(),
+            )),
+        }
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_invoke(&ctx, &target));
+        });
+        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(r) => r,
+            // The worker thread outlives this timeout, so the pattern call may already have
+            // been dispatched — say so. This error is NOT fallback-eligible (see
+            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
+            Err(_) => Err(GlassError::AccessibilityUnavailable(
+                "accessibility invoke timed out (UIA not responding); the action may still \
+                 land — re-snapshot before retrying"
+                    .into(),
             )),
         }
     }
@@ -302,8 +325,101 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         if Instant::now() >= deadline {
             return Err(GlassError::AxValueNotApplied(target.id.0));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
     }
+}
+
+/// Actuate `target` via the first UIA action pattern its control publishes. Walks pre-order to
+/// `target.id` and verifies the same role+name+bounds fingerprint as `run_set_value` (guards a
+/// stale id / tree drift) before touching any pattern.
+///
+/// Ladder order mirrors how a real client picks a control's actuation verb, most-specific first:
+/// Invoke (buttons, menu items — "press this") -> Toggle (checkboxes/switches, which don't
+/// implement Invoke) -> SelectionItem (list/tab/tree rows — "select", not "press") ->
+/// ExpandCollapse (tree/combo expanders — flip between the two states rather than invoke). The
+/// first pattern the control exposes wins; a control that publishes none of the four is
+/// `AxActionUnavailable` (the reader itself is fine — this element just offers no actuation verb),
+/// which `click_element` (glass-core) treats as a fall-back-to-pointer signal, not a fatal error.
+///
+/// Only the Toggle rung has a post-state a client can read back, so only it verifies actuation;
+/// the other three are fire-and-report, exactly as their patterns define. That rung is also the
+/// one exception to "first pattern wins": if its state can't be read it is skipped rather than
+/// failed, since it cannot be verified and nothing has been dispatched yet.
+///
+/// Known limitation, deliberate: `get_pattern` returning `Err` is indistinguishable here between
+/// "this control does not implement the pattern" and "the COM call itself failed", so both land
+/// on `AxActionUnavailable` and fall back to a pointer click. That is the safe direction —
+/// `get_pattern` dispatches no action, so the fallback actuates exactly once. UIA does publish
+/// `Is<Pattern>Available` properties that could tell the two apart, but acting on them would turn
+/// a disagreement between property and `get_pattern` into a hard, non-falling-back click failure
+/// (an error after dispatch never falls back), trading a harmless pointer click for a dead one.
+fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let automation = UIAutomation::new().map_err(|e| {
+        GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
+    })?;
+    let walker = automation.get_control_view_walker().map_err(uia_err)?;
+    let window = find_app_window(&automation, ctx)?;
+
+    // Start at 0 so find_nth's pre-order numbering matches snapshot's walk + assign_ids, same as
+    // run_set_value.
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+
+    // Same fingerprint gate as run_set_value: role + name + bounds.
+    let role = crate::mapping::map_role(el.get_control_type().map_err(uia_err)? as i32 as u32);
+    let name = nonempty(el.get_name().unwrap_or_default());
+    let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
+    if !target.matches(role, name.as_deref())
+        || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
+    {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+
+    let fail = |e: uiautomation::Error| GlassError::AxActionFailed(target.id.0, e.to_string());
+    if let Ok(p) = el.get_pattern::<UIInvokePattern>() {
+        return p.invoke().map_err(fail);
+    }
+    if let Ok(p) = el.get_pattern::<UITogglePattern>() {
+        // Toggle is the one rung with a readable post-state, so don't take the ack as proof:
+        // a provider that accepts `Toggle()` without applying it would otherwise report a
+        // successful click on a control that never moved. Read before, fire, then poll until
+        // the state differs — same cadence as `run_set_value`'s write verify.
+        //
+        // A pattern whose state can't even be READ can't be verify-toggled, so this rung is
+        // unusable — fall through to the rest of the ladder instead of reporting a failure.
+        // Nothing has been dispatched at this point, so falling through is safe: the worst
+        // outcome is `AxActionUnavailable` and a single pointer click, whereas an error here
+        // would propagate (an error after dispatch never falls back) and kill the click.
+        if let Ok(before) = p.get_toggle_state() {
+            p.toggle().map_err(fail)?;
+            let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+            loop {
+                // Past the dispatch, a failed read IS a failure: `fail` (AxActionFailed) is
+                // right here, because the toggle may have landed and must not be re-actuated.
+                if p.get_toggle_state().map_err(fail)? != before {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched,
+                    // so this must not fall back to a pointer click that could actuate twice.
+                    return Err(GlassError::AxActionFailed(
+                        target.id.0,
+                        "the toggle action was acknowledged but the state did not change".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
+            }
+        }
+    }
+    if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
+        return p.select().map_err(fail);
+    }
+    if let Ok(p) = el.get_pattern::<UIExpandCollapsePattern>() {
+        let expanded = p.get_state().map_err(fail)? == ExpandCollapseState::Expanded;
+        return if expanded { p.collapse() } else { p.expand() }.map_err(fail);
+    }
+    Err(GlassError::AxActionUnavailable(target.id.0))
 }
 
 /// Whether this node's children may be explored, recording the bound that stopped the walk

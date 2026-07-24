@@ -400,6 +400,46 @@ fn launch_fixture() -> Glass {
     glass
 }
 
+/// The GTK fixture's Switch "Active" exposes an AT-SPI activation action ("toggle") —
+/// click_element must take the native path and actually toggle it.
+///
+/// A bare `Gtk.CheckButton` publishes ZERO AT-SPI actions (verified on GTK 4.14.5 with
+/// an instrumented `try_action` that enumerated 0 actions on the fixture's "Enable"
+/// checkbutton, while the same probe found "click" on the Save button) — matching the
+/// pre-existing comment on `set_toggle` ("a GTK4 GtkCheckButton exposes none"). The
+/// Switch is the fixture's action-exposing toggle, so it's the right target for proving
+/// the native path here: same fixture, same production code path (`click_element` ->
+/// `try_native_invoke` -> `Accessibility::invoke`), and a widget already proven (via
+/// `set_value_toggles_switch`, same target) to expose a real AT-SPI action.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn click_element_native_invokes_gtk_switch() {
+    let mut glass = launch_fixture();
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
+    let switch = find_node(&tree.root, "Active").expect("switch");
+    assert!(!switch.states.checked, "fixture starts unchecked");
+    let method = glass.click_element(switch.id).expect("click");
+    assert_eq!(
+        method,
+        glass_core::ClickMethod::NativeAction,
+        "a GTK Switch exposes an activation action; the native path must take it"
+    );
+    // The toolkit applies the action on its next main-loop pass — poll briefly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let t = glass.a11y_snapshot(None).expect("re-snapshot");
+        if find_node(&t.root, "Active").is_some_and(|n| n.states.checked) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native action never toggled the Switch"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    glass.stop().expect("stop");
+}
+
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn set_value_toggles_switch() {

@@ -61,6 +61,26 @@ impl Accessibility for LinuxA11y {
             )),
         }
     }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let ctx = ctx.clone();
+        let target = target.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_invoke(&ctx, &target));
+        });
+        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(r) => r,
+            // The worker thread outlives this timeout, so the action may already have been
+            // dispatched — say so. This error is NOT fallback-eligible (see
+            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
+            Err(_) => Err(GlassError::AccessibilityUnavailable(
+                "accessibility invoke timed out (a11y bus not responding); the action may \
+                 still land — re-snapshot before retrying"
+                    .into(),
+            )),
+        }
+    }
 }
 
 fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
@@ -77,6 +97,14 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
     rt.block_on(set_value_async(ctx, target, text))
+}
+
+fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
+    rt.block_on(invoke_async(ctx, target))
 }
 
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
@@ -424,9 +452,32 @@ const TOGGLE_ACTION_NAMES: &[&str] = &[
     "toggle", "click", "activate", "press", "check", "uncheck", "switch",
 ];
 
-/// Invoke the node's first activating Action (see [`TOGGLE_ACTION_NAMES`]).
-/// Returns whether an action was found and reported success.
-async fn invoke_activating_action(conn: &zbus::Connection, node: &AccessibleProxy<'_>) -> bool {
+/// Outcome of one AT-SPI Action attempt on a node.
+enum ActionAttempt {
+    /// An action from the ladder was found and fired: `ok` is the bus-reported success,
+    /// `action` the (lowercased) action name that ran — the caller uses it to decide
+    /// whether a post-fire state verify applies.
+    Fired { ok: bool, action: String },
+    /// The node exposes no Action interface, or none of `names` is among its actions.
+    /// Nothing was dispatched.
+    Unavailable,
+    /// An AT-SPI call failed, so the outcome is genuinely unknown — in particular a
+    /// failed `DoAction` may still have reached the toolkit. Distinct from
+    /// `Fired(false)` (the toolkit answered "I did not run it") so a caller can't
+    /// report a transport failure as a truthful "did not run".
+    Error(String),
+}
+
+/// Fire the node's first Action whose name is in `names`.
+///
+/// A proxy that cannot be *built* is `Unavailable`: construction dispatches no action, and
+/// the overwhelmingly common cause is the node not implementing the Action interface at all.
+/// From `NActions` onward every RPC failure is `Error`.
+async fn try_action(
+    conn: &zbus::Connection,
+    node: &AccessibleProxy<'_>,
+    names: &[&str],
+) -> ActionAttempt {
     let dest = node.inner().destination().to_owned();
     let path = node.inner().path().to_owned();
     let Some(action) = atspi::proxy::action::ActionProxy::builder(conn)
@@ -434,27 +485,53 @@ async fn invoke_activating_action(conn: &zbus::Connection, node: &AccessibleProx
         .ok()
         .and_then(|b| b.path(path).ok())
     else {
-        return false;
+        return ActionAttempt::Unavailable;
     };
     let Ok(a) = action.build().await else {
-        return false;
+        return ActionAttempt::Unavailable;
     };
-    let n = a.n_actions().await.unwrap_or(0);
+    let n = match a.n_actions().await {
+        Ok(n) => n,
+        Err(e) => return ActionAttempt::Error(format!("NActions: {e}")),
+    };
     for i in 0..n {
-        let name = a.get_name(i).await.unwrap_or_default().to_ascii_lowercase();
-        if TOGGLE_ACTION_NAMES.contains(&name.as_str()) {
-            return a.do_action(i).await.unwrap_or(false);
+        let name = match a.get_name(i).await {
+            Ok(name) => name.to_ascii_lowercase(),
+            Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
+        };
+        if names.contains(&name.as_str()) {
+            return match a.do_action(i).await {
+                Ok(ok) => ActionAttempt::Fired { ok, action: name },
+                Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
+            };
         }
     }
-    false
+    ActionAttempt::Unavailable
 }
+
+/// The AT-SPI state flag carrying a widget's boolean state: toggle buttons expose it as
+/// `Pressed`, checkboxes/switches/radios as `Checked`. Shared by `set_value`'s toggle write
+/// and `invoke`'s toggle verify so the two can never read a control's state differently.
+fn toggle_state_flag(role: glass_core::AxRole) -> atspi_common::State {
+    if role == glass_core::AxRole::ToggleButton {
+        atspi_common::State::Pressed
+    } else {
+        atspi_common::State::Checked
+    }
+}
+
+/// Poll bound for confirming a toggle actually moved: the toolkit applies the action on a
+/// later main-loop pass, so the first read after firing is expected to be stale. Generous
+/// enough for a loaded headless session without letting a real failure hang the tool.
+const TOGGLE_VERIFY_POLLS: usize = 6;
+/// See [`TOGGLE_VERIFY_POLLS`].
+const TOGGLE_VERIFY_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Set a boolean widget (switch/checkbox/toggle/radio) to `target_on`. Idempotent:
 /// only invokes the toggle action when the boolean state differs, then confirms the
 /// state actually changed (the toolkit applies the action on its next loop) — so a
 /// no-op activation (e.g. a radio can't be *un*-selected by clicking it) is reported
-/// as `AxValueNotApplied`, never a silent success. Toggle buttons expose their state
-/// via `Pressed`; checkboxes/switches/radios via `Checked`.
+/// as `AxValueNotApplied`, never a silent success.
 async fn set_toggle(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
@@ -462,27 +539,117 @@ async fn set_toggle(
     target_on: bool,
     id: u32,
 ) -> Result<()> {
-    let flag = if role == glass_core::AxRole::ToggleButton {
-        atspi_common::State::Pressed
-    } else {
-        atspi_common::State::Checked
-    };
+    let flag = toggle_state_flag(role);
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
         return Ok(()); // already in the desired state
     }
-    if !invoke_activating_action(conn, node).await {
+    // `Error` (an AT-SPI call that failed) folds in with "did not fire" here, keeping
+    // `set_value`'s behavior unchanged: this path verifies the state below and reports
+    // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
+    // rather than needing its own classification.
+    if !matches!(
+        try_action(conn, node, TOGGLE_ACTION_NAMES).await,
+        ActionAttempt::Fired { ok: true, .. }
+    ) {
         // No toggle action (e.g. a GTK4 GtkCheckButton exposes none) — can't set it
         // through accessibility; the caller should drive it with click_element.
         return Err(GlassError::AxElementNotEditable(id));
     }
     // Poll until the toolkit applies it; a no-op activation never converges.
-    for _ in 0..6 {
-        tokio::time::sleep(Duration::from_millis(120)).await;
+    for _ in 0..TOGGLE_VERIFY_POLLS {
+        tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
         if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
             return Ok(());
         }
     }
     Err(GlassError::AxValueNotApplied(id))
+}
+
+/// The one AT-SPI action whose meaning is "flip this control's boolean state" — and so the
+/// one rung whose success can be checked by re-reading that state after firing.
+const TOGGLE_ACTION: &str = "toggle";
+
+/// AT-SPI action names that activate a widget for a generic click. Broader than
+/// [`TOGGLE_ACTION_NAMES`] on the activation side (push/jump), narrower on the
+/// check/uncheck side — those are set_value verbs, not clicks.
+///
+/// This is a membership set, not a priority order: [`try_action`] fires the node's first
+/// action that appears in this list, so the widget's own action-index order decides which
+/// one runs when it exposes several.
+const ACTIVATE_ACTION_NAMES: &[&str] =
+    &["click", "activate", "press", "push", "jump", TOGGLE_ACTION];
+
+/// Confirm a fired `toggle` action actually moved the control: poll its boolean state until
+/// it differs from `was_on`. Without this, a toolkit that accepts and acknowledges the action
+/// but never applies it (or applies it to nothing) reports a successful click on a control
+/// that did not move — a silent failure. The failure is `AxActionFailed`, which propagates
+/// rather than falling back to a pointer click: the action was dispatched, so a second
+/// actuation could land on top of a late-applying toggle.
+async fn verify_toggle_flipped(
+    node: &AccessibleProxy<'_>,
+    flag: atspi_common::State,
+    was_on: bool,
+    id: u32,
+) -> Result<()> {
+    for _ in 0..TOGGLE_VERIFY_POLLS {
+        tokio::time::sleep(TOGGLE_VERIFY_INTERVAL).await;
+        if node.get_state().await.map_err(bus_err)?.contains(flag) != was_on {
+            return Ok(());
+        }
+    }
+    Err(GlassError::AxActionFailed(
+        id,
+        "the toggle action was acknowledged but the state did not change".into(),
+    ))
+}
+
+/// Actuate the element identified by `target` via its native AT-SPI Action — the
+/// backend for `Accessibility::invoke`. Re-walks pre-order to `target.id`, verifies
+/// the fingerprint (same gate as `set_value_async`, guarding a stale id / mirror
+/// drift), then fires the first action in [`ACTIVATE_ACTION_NAMES`].
+///
+/// When the action that fired is [`TOGGLE_ACTION`], the ack alone is not accepted as
+/// success: the control's boolean state must be observed to change (see
+/// [`verify_toggle_flipped`]).
+async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    let (app_ref, conn) = find_app(ctx).await?;
+    let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
+        .await?
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
+    // Verify role + name against the fingerprint (guards a stale id / mirror drift) —
+    // same gate as set_value_async.
+    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let name = nonempty(node.name().await.unwrap_or_default());
+    if !target.matches(role, name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    // Read the control's boolean state BEFORE firing, so a `toggle` action can be verified by
+    // an actual flip below — afterwards there is nothing left to compare against. Costs one
+    // property read on every native click; the alternative is trusting a toolkit ack that a
+    // switch may never honor. Meaningless for a control with no boolean state (a plain
+    // button), which is why only the `toggle` rung consults it.
+    let flag = toggle_state_flag(role);
+    let was_on = node.get_state().await.map_err(bus_err)?.contains(flag);
+    match try_action(&conn, &node, ACTIVATE_ACTION_NAMES).await {
+        ActionAttempt::Fired { ok: true, action } if action == TOGGLE_ACTION => {
+            verify_toggle_flipped(&node, flag, was_on, target.id.0).await
+        }
+        ActionAttempt::Fired { ok: true, .. } => Ok(()),
+        ActionAttempt::Fired { ok: false, .. } => Err(GlassError::AxActionFailed(
+            target.id.0,
+            "the toolkit reported the action did not run".into(),
+        )),
+        ActionAttempt::Unavailable => Err(GlassError::AxActionUnavailable(target.id.0)),
+        // Not `AxActionUnavailable`: the call may have reached the toolkit, so this must not
+        // be fallback-eligible (see `GlassError::invoke_fallback_eligible`) — a pointer click
+        // on top of a landed action would actuate the control twice.
+        ActionAttempt::Error(msg) => Err(GlassError::AccessibilityUnavailable(format!(
+            "AT-SPI action call failed: {msg}"
+        ))),
+    }
 }
 
 /// Window-relative bounds via the Component interface, or `None` if the node has no

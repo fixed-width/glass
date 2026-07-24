@@ -113,6 +113,12 @@ pub struct ClickElementArgs {
     /// dropdown's option row), the click is automatically routed into that popover
     /// window and the previously-active window is restored afterward — no extra step
     /// needed.
+    ///
+    /// Clicks via the platform's native accessibility action when the element exposes
+    /// one (works even when the element is occluded or scrolled off-screen), falling
+    /// back to a synthetic pointer click at the element's center; the result's
+    /// `method` field says which path ran, and `native_fallback` says why when the
+    /// pointer path was used.
     pub id: u32,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
     /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI

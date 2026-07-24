@@ -394,11 +394,14 @@ fn resolve_return(
 pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
     // Bad `return` value → reject before the click lands (see `validate_return`).
     validate_return(a.return_.as_deref())?;
-    glass
+    let method = glass
         .click_element(AxNodeId(a.id))
         .map_err(|e| e.to_string())?;
     let (observed, extra) = resolve_return(glass, a.return_.as_deref())?;
-    let mut result = serde_json::json!({ "id": a.id });
+    let mut result = serde_json::json!({ "id": a.id, "method": method.label() });
+    if let Some(reason) = method.native_fallback() {
+        result["native_fallback"] = serde_json::json!(reason);
+    }
     if let Some(o) = observed {
         result["observed"] = o;
     }
@@ -663,10 +666,22 @@ pub(crate) mod testutil {
         Changed,
     }
 
+    /// What `FakeAccessibility::invoke` should do. Default mirrors the trait's own
+    /// default (unsupported) — a backend that never implemented the native action,
+    /// so `click_element` falls back to the pointer path unless a test opts into
+    /// [`InvokeOutcome::Ok`].
+    #[derive(Clone, Copy, Default, PartialEq)]
+    pub enum InvokeOutcome {
+        #[default]
+        Unsupported,
+        Ok,
+    }
+
     pub struct FakeAccessibility {
         pub tree: AxTree,
         pub set_log: std::sync::Arc<std::sync::Mutex<Vec<(AxTarget, String)>>>,
         pub set_outcome: SetOutcome,
+        pub invoke_outcome: InvokeOutcome,
     }
 
     impl Accessibility for FakeAccessibility {
@@ -686,6 +701,12 @@ pub(crate) mod testutil {
                 .unwrap()
                 .push((target.clone(), text.to_string()));
             Ok(())
+        }
+        fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<()> {
+            match self.invoke_outcome {
+                InvokeOutcome::Unsupported => Err(GlassError::AxUnsupported),
+                InvokeOutcome::Ok => Ok(()),
+            }
         }
     }
 
@@ -766,11 +787,28 @@ pub(crate) mod testutil {
     }
 
     /// Like [`glass_with_a11y`] but with a chosen `set_value` outcome, so a test can
-    /// drive the not-editable / changed-since-snapshot rejection paths.
+    /// drive the not-editable / changed-since-snapshot rejection paths. `invoke` stays
+    /// at its default (unsupported) — use [`glass_with_a11y_invoke_ok`] for the
+    /// native-action path.
     pub fn glass_with_a11y_outcome(
         platform: FakePlatform,
         tree: AxTree,
         set_outcome: SetOutcome,
+    ) -> Glass {
+        glass_with_a11y_full(platform, tree, set_outcome, InvokeOutcome::Unsupported)
+    }
+
+    /// Like [`glass_with_a11y`] but with `invoke` wired to succeed, so a test can drive
+    /// `click_element`'s native-action path (no pointer event, no fallback disclosed).
+    pub fn glass_with_a11y_invoke_ok(platform: FakePlatform, tree: AxTree) -> Glass {
+        glass_with_a11y_full(platform, tree, SetOutcome::Ok, InvokeOutcome::Ok)
+    }
+
+    fn glass_with_a11y_full(
+        platform: FakePlatform,
+        tree: AxTree,
+        set_outcome: SetOutcome,
+        invoke_outcome: InvokeOutcome,
     ) -> Glass {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
@@ -781,6 +819,7 @@ pub(crate) mod testutil {
                 tree,
                 set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 set_outcome,
+                invoke_outcome,
             })),
         });
         let factory: PlatformFactory = Box::new(move |_backend| {
@@ -1420,6 +1459,13 @@ mod tests {
         let v = assert_envelope(&out, "glass_click_element");
         assert_eq!(v["id"], json!(1), "envelope: {v}");
         assert!(v["observed"].is_null(), "envelope: {v}");
+        // The fake's default invoke is unsupported (trait default), so the pointer
+        // path ran and the fallback reason must be disclosed.
+        assert_eq!(v["method"], json!("pointer"), "envelope: {v}");
+        assert!(
+            v["native_fallback"].as_str().is_some_and(|s| !s.is_empty()),
+            "envelope: {v}"
+        );
 
         let out2 = click_element(
             &mut g,
@@ -1430,6 +1476,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out2.0.len(), 1);
+    }
+
+    #[test]
+    fn click_element_discloses_native_action_with_no_fallback() {
+        let mut g = glass_with_a11y_invoke_ok(FakePlatform::new(100, 100), fake_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: None,
+            },
+        )
+        .unwrap();
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["method"], json!("native-action"), "envelope: {v}");
+        assert!(
+            v.get("native_fallback").is_none(),
+            "no fallback key on the native-action path: {v}"
+        );
     }
 
     #[test]

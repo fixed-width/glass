@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::accessibility::ClickMethod;
 use crate::error::Result;
 use crate::platform::{AppSpec, KeyEvent, PointerEvent, WindowOp};
 
@@ -56,14 +57,34 @@ impl AuditOutcome {
 /// event so the sink can format without `glass-core` depending on serde/JSON.
 #[derive(Debug)]
 pub enum Actuation<'a> {
-    Launch { spec: &'a AppSpec, backend: &'a str },
+    Launch {
+        spec: &'a AppSpec,
+        backend: &'a str,
+    },
     Stop,
-    Pointer { event: &'a PointerEvent },
-    Key { event: &'a KeyEvent },
-    ClipboardSet { text: &'a str },
-    Window { op: &'a WindowOp },
-    ClickElement { element: ElementRef },
-    SetValue { element: ElementRef, text: &'a str },
+    Pointer {
+        event: &'a PointerEvent,
+    },
+    Key {
+        event: &'a KeyEvent,
+    },
+    ClipboardSet {
+        text: &'a str,
+    },
+    Window {
+        op: &'a WindowOp,
+    },
+    ClickElement {
+        element: ElementRef,
+        /// How the click actuated — the sink renders its label and, for the pointer
+        /// path, the reason the native action was not used. `None` when the click
+        /// ultimately failed (neither path succeeded).
+        method: Option<&'a ClickMethod>,
+    },
+    SetValue {
+        element: ElementRef,
+        text: &'a str,
+    },
 }
 
 /// Receives every actuation. Implemented in `glass-mcp` (`JsonlSink`). `Send` so it
@@ -96,5 +117,31 @@ mod tests {
         let e = AuditOutcome::from_result(&err);
         assert!(!e.ok);
         assert!(e.error.unwrap().to_lowercase().contains("session"));
+    }
+
+    #[test]
+    fn click_element_actuation_carries_the_actuating_method() {
+        let element = ElementRef {
+            id: 1,
+            role: Some("Button".into()),
+            name: Some("Save".into()),
+        };
+        let method = ClickMethod::Pointer {
+            native_fallback: "element exposes no activation action".into(),
+        };
+        let act = Actuation::ClickElement {
+            element,
+            method: Some(&method),
+        };
+        let Actuation::ClickElement { method: got, .. } = act else {
+            panic!("wrong variant");
+        };
+        // The sink renders both halves; borrowing the whole method (not a pre-rendered
+        // label) is what keeps the fallback reason reachable.
+        assert_eq!(got.map(ClickMethod::label), Some(method.label()));
+        assert_eq!(
+            got.and_then(ClickMethod::native_fallback),
+            Some("element exposes no activation action")
+        );
     }
 }

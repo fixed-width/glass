@@ -220,6 +220,54 @@ pub(crate) fn set_string_value(el: &AXUIElement, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The element's `AXActionNames` (`AXUIElementCopyActionNames`). Empty on any failure, or on
+/// an unexpected null result — callers treat "no actions" and "cannot read actions"
+/// identically (neither yields a native invoke), so the two outcomes may share a shape. A
+/// failed read still logs to stderr, so the difference is diagnosable rather than silent.
+pub(crate) fn action_names(el: &AXUIElement) -> Vec<String> {
+    let mut raw: *const CFArray = std::ptr::null();
+    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
+    // `AXUIElementCopyActionNames`'s documented signature (mirrors `copy_attribute_checked`).
+    let err = unsafe { el.copy_action_names(NonNull::from(&mut raw)) };
+    if err != AXError::Success {
+        // Dev-tool diagnostic (stderr only, same shape as the reader's): an element reported
+        // as exposing no action reads identically whether it truly has none or the read
+        // failed, and only this line tells the two apart after the fact.
+        eprintln!(
+            "glass-a11y-macos: AXActionNames read failed (AXError {})",
+            err.0
+        );
+        return Vec::new();
+    }
+    let Some(nn) = NonNull::new(raw.cast_mut()) else {
+        return Vec::new();
+    };
+    // SAFETY: `AXUIElementCopyActionNames` follows Core Foundation's Copy/Create ownership
+    // rule — an already-retained (+1) `CFArrayRef` on success — so `CFRetained::from_raw`
+    // takes ownership without an extra retain (mirrors `copy_attribute_checked`).
+    let arr: CFRetained<CFArray> = unsafe { CFRetained::from_raw(nn) };
+    // SAFETY: `AXActionNames` is documented by Apple to hold `CFStringRef`s; this only
+    // attaches compile-time element-type information (no runtime effect) — the same
+    // technique `array_of_elements` uses for `AXChildren`/`AXWindows`.
+    let typed: CFRetained<CFArray<CFString>> = unsafe { CFRetained::cast_unchecked(arr) };
+    typed.iter().map(|s| s.to_string()).collect()
+}
+
+/// Perform `name` on `el` (`AXUIElementPerformAction`). Any non-`Success`
+/// `AXError` is an `Err` carrying the code — the caller decides the element id
+/// context.
+pub(crate) fn perform_action(el: &AXUIElement, name: &str) -> std::result::Result<(), String> {
+    let action = CFString::from_str(name);
+    // SAFETY: `el` is a live `AXUIElement`; `action` is a valid `CFString` matching
+    // `AXUIElementPerformAction`'s documented contract (element + action name, no other
+    // preconditions) — the same call `axwindow::ax_raise` already makes for `AXRaise`.
+    let err = unsafe { el.perform_action(&action) };
+    if err != AXError::Success {
+        return Err(format!("{name} failed (AXError {})", err.0));
+    }
+    Ok(())
+}
+
 /// Read `el`'s `AXPosition` (top-left, in points — Quartz's top-left-origin global screen
 /// space, the same unit `AXSize` and `glass_core::coords` convert to/from pixels).
 pub(crate) fn ax_position(el: &AXUIElement) -> Result<(f64, f64)> {

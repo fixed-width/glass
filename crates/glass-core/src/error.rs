@@ -94,6 +94,12 @@ pub enum GlassError {
     #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
     AxValueNotApplied(u32),
 
+    #[error("element #{0} exposes no native activation action")]
+    AxActionUnavailable(u32),
+
+    #[error("native action on element #{0} failed: {1}")]
+    AxActionFailed(u32, String),
+
     #[error("set_value on element #{0} is a switch/checkbox and expects a boolean — one of true/false, on/off, 1/0, yes/no (got {1:?})")]
     AxValueNotBoolean(u32, String),
 
@@ -125,6 +131,24 @@ pub enum GlassError {
 }
 
 impl GlassError {
+    /// Whether a failed native-invoke attempt may safely fall back to the synthetic
+    /// pointer path. True only for outcomes where **no native action was dispatched**:
+    /// the backend has no invoke at all ([`GlassError::AxUnsupported`]), or the element
+    /// exposes no activation action ([`GlassError::AxActionUnavailable`]).
+    ///
+    /// Everything else fails CLOSED. A failure *after* dispatch — or an ambiguous
+    /// transport/timeout error, which cannot be distinguished from one — must propagate,
+    /// because a pointer click on top of a native action that may still land actuates the
+    /// control twice (submitting a form twice, sending a message twice). The wildcard arm
+    /// is deliberate: a new error variant is treated as "may have dispatched" until it is
+    /// proven otherwise.
+    pub fn invoke_fallback_eligible(&self) -> bool {
+        matches!(
+            self,
+            GlassError::AxUnsupported | GlassError::AxActionUnavailable(_)
+        )
+    }
+
     /// Runtime "this operation is unsupported on the active backend" error, worded
     /// consistently.
     ///
@@ -231,6 +255,44 @@ mod tests {
             GlassError::AxElementInUnmappedPopover(9).to_string(),
             "element #9 is inside a popover glass could not map to a window; select_window it and click by coordinate"
         );
+    }
+
+    #[test]
+    fn ax_action_errors_name_the_element_and_cause() {
+        assert_eq!(
+            GlassError::AxActionUnavailable(7).to_string(),
+            "element #7 exposes no native activation action"
+        );
+        assert_eq!(
+            GlassError::AxActionFailed(7, "action reported failure".into()).to_string(),
+            "native action on element #7 failed: action reported failure"
+        );
+    }
+
+    #[test]
+    fn invoke_fallback_is_eligible_only_when_nothing_was_dispatched() {
+        // Eligible: the backend never dispatched an action, so a pointer click actuates once.
+        for e in [
+            GlassError::AxUnsupported,
+            GlassError::AxActionUnavailable(3),
+        ] {
+            assert!(e.invoke_fallback_eligible(), "{e}");
+        }
+        // Everything else fails CLOSED — including the two that may mean "dispatched, outcome
+        // unknown" (`AxActionFailed`, `AccessibilityUnavailable`, which carries the invoke
+        // timeout), the drift/pre-check errors, and any variant not named at all (the wildcard).
+        for e in [
+            GlassError::AxActionFailed(3, "boom".into()),
+            GlassError::AccessibilityUnavailable("invoke timed out".into()),
+            GlassError::AxElementChanged(3),
+            GlassError::NoAxSnapshot,
+            GlassError::AxElementNotFound(3),
+            GlassError::NoActiveSession,
+            GlassError::Timeout(10),
+            GlassError::Backend("bus died".into()),
+        ] {
+            assert!(!e.invoke_fallback_eligible(), "{e}");
+        }
     }
 
     #[test]

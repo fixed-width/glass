@@ -41,6 +41,8 @@ windows = { version = "0.62", features = [
 # validate the accessibility path.
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+# onbox.rs's Glass-session harness (glass_windows_with_a11y) needs a scratch baseline dir.
+tempfile.workspace = true
 
 # The pixel conversion is cross-platform, so its bench builds and runs everywhere.
 [dev-dependencies]

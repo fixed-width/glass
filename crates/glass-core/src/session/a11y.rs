@@ -11,6 +11,11 @@ const ROW_ASPECT: u32 = 4;
 /// pan on a UISwitch; matches the proven ~250ms on-device swipe.
 const TOGGLE_SWIPE_MS: u64 = 250;
 
+/// Disclosed as the click method's fallback reason when `set_combo_value` opens a dropdown:
+/// that one click is pointer-only by design, not because the native action was unavailable.
+const COMBO_OPEN_POINTER_REASON: &str =
+    "combo popup opened by pointer so the keyboard commit lands in it";
+
 /// Poll cadence for `set_value`'s post-toggle verify: how often to re-snapshot while waiting for
 /// the swiped switch to read back the wanted state.
 const TOGGLE_VERIFY_INTERVAL_MS: u64 = 50;
@@ -87,22 +92,69 @@ impl Glass {
         Ok(crate::marks::render(&frame, &tree))
     }
 
-    /// Click the element with id `id` from the most recent `a11y_snapshot` via the normal
-    /// pointer path — the center of its bounds, or a swipe across the trailing control for a
-    /// row-shaped checkable on a trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]).
-    pub fn click_element(&mut self, id: AxNodeId) -> Result<()> {
+    /// Click the element with id `id` from the most recent `a11y_snapshot`. Tries the
+    /// platform's native accessibility action first (works for occluded/off-screen/boundless
+    /// elements, and on some backends never moves the pointer); when that's unavailable or
+    /// fails, falls back to the normal synthetic-pointer path — the center of the element's
+    /// bounds, or a swipe across the trailing control for a row-shaped checkable on a
+    /// trailing-toggle backend (see [`AxRect::trailing_toggle_swipe`]). The returned
+    /// [`ClickMethod`] says which path actually fired.
+    pub fn click_element(&mut self, id: AxNodeId) -> Result<ClickMethod> {
+        self.audited_click(id, Self::click_element_inner)
+    }
+
+    /// Run one element click and record it through the audit seam. Both clicks that stand on
+    /// their own go through here — the native-first [`Glass::click_element`] and the
+    /// deliberately pointer-only combo open — so the log can't miss one just because an
+    /// internal caller took a different route to the same actuation.
+    ///
+    /// The exception is `set_value_inner`'s trailing-toggle branch, which calls
+    /// `click_element_inner` directly: there the click is one step *inside* a `set_value`, and
+    /// the enclosing `SetValue` record already accounts for it.
+    fn audited_click(
+        &mut self,
+        id: AxNodeId,
+        click: impl FnOnce(&mut Self, AxNodeId) -> Result<ClickMethod>,
+    ) -> Result<ClickMethod> {
         let t = std::time::Instant::now();
         let element = self.element_ref(id);
-        let result = self.click_element_inner(id);
+        let result = click(self, id);
         self.emit_audit(
-            &crate::audit::Actuation::ClickElement { element },
+            &crate::audit::Actuation::ClickElement {
+                element,
+                method: result.as_ref().ok(),
+            },
             crate::audit::AuditOutcome::from_result(&result),
             t.elapsed(),
         );
         result
     }
 
-    fn click_element_inner(&mut self, id: AxNodeId) -> Result<()> {
+    fn click_element_inner(&mut self, id: AxNodeId) -> Result<ClickMethod> {
+        // Native action first: works for occluded/off-screen/boundless elements and
+        // (on backends whose action API is out-of-band) doesn't move the cursor.
+        //
+        // Falling back is an allowlist, not a denylist: only an attempt that dispatched
+        // NOTHING may be retried with the pointer (see
+        // [`GlassError::invoke_fallback_eligible`]). Anything else — a reported action
+        // failure, an ambiguous transport error, a drifted tree, the pre-check errors —
+        // propagates, because clicking on top of a native action that may still land would
+        // actuate the control twice while the result claimed only "pointer" ran.
+        let native_fallback = match self.try_native_invoke(id) {
+            Ok(()) => return Ok(ClickMethod::NativeAction),
+            Err(e) if !e.invoke_fallback_eligible() => return Err(e),
+            Err(e) => native_fallback_reason(&e),
+        };
+        self.click_element_pointer_only(id)
+            .map(|()| ClickMethod::Pointer { native_fallback })
+    }
+
+    /// The synthetic-pointer half of [`Glass::click_element`], on its own: the center of the
+    /// element's bounds — routed into the owning popover window when the element renders in
+    /// one, or swiped across the trailing control for a row-shaped checkable on a
+    /// trailing-toggle backend. Callable directly by an internal caller that must NOT take
+    /// the native action (see [`Glass::set_combo_value`]).
+    fn click_element_pointer_only(&mut self, id: AxNodeId) -> Result<()> {
         let (bounds, checkable, trailing_toggle_backend, active_geo) = {
             let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
@@ -193,6 +245,60 @@ impl Glass {
         }
     }
 
+    /// One native-invoke attempt: the same fingerprint + context assembly as
+    /// `set_value_inner` (over freshly re-read window geometry — see below), then the
+    /// backend's `invoke`.
+    fn try_native_invoke(&mut self, id: AxNodeId) -> Result<()> {
+        {
+            let s = self.active_mut()?;
+            // Reader-presence check up front (mirrors `snapshot_at_current_limits`) so
+            // `AxUnsupported` keeps precedence over — and a reader-less backend skips — the
+            // geometry round-trip below.
+            if s.accessibility.is_none() {
+                return Err(GlassError::AxUnsupported);
+            }
+            // Re-read the window geometry, as `a11y_snapshot` does: the Windows/macOS `invoke`
+            // fingerprints the element by window-RELATIVE bounds derived from `ctx.window`, so
+            // a window the user moved since the snapshot would make every element look
+            // displaced and reject the invoke as drift. Storing it back also keeps the pointer
+            // fallback clamping against the same window.
+            //
+            // Best-effort, unlike the snapshot's strict refresh: a click must not become
+            // unclickable because a geometry probe hiccuped, so an `Err` keeps the cached
+            // value and carries on — worst case the fingerprint check below rejects, exactly
+            // as it did before this refresh existed.
+            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
+                s.geometry = window;
+            }
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
+            let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
+            let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
+            let target = AxTarget {
+                id,
+                role: node.role,
+                name: node.name.clone(),
+                bounds: node.bounds,
+            };
+            let ctx = AxContext {
+                pids: s.platform.app_pids(),
+                window: s.geometry.clone(),
+                window_handle: s.platform.active_window_handle(),
+                a11y_bus_addr: s.platform.a11y_bus_addr(),
+                limits: s.a11y_limits,
+            };
+            (target, ctx)
+        };
+        let s = self.active_mut()?;
+        s.accessibility
+            .as_mut()
+            .ok_or(GlassError::AxUnsupported)?
+            .invoke(&ctx, &target)?;
+        s.pump();
+        Ok(())
+    }
+
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
     /// platform a11y API. Errors `NoAxSnapshot`/`AxElementNotFound` (id not in the
     /// cached snapshot), `AxUnsupported` (no reader), or — from the backend —
@@ -210,13 +316,28 @@ impl Glass {
     }
 
     fn set_value_inner(&mut self, id: AxNodeId, text: &str) -> Result<()> {
-        let (target, ctx) = {
-            let s = self.require_active()?;
+        {
+            let s = self.active_mut()?;
             // Check for reader availability before consulting the snapshot, so that
-            // `AxUnsupported` takes precedence when there is no accessibility backend.
+            // `AxUnsupported` takes precedence when there is no accessibility backend — and so
+            // a reader-less backend skips the geometry round-trip below.
             if s.accessibility.is_none() {
                 return Err(GlassError::AxUnsupported);
             }
+            // Re-read the window geometry, as `a11y_snapshot` and `try_native_invoke` do: the
+            // Windows/macOS `set_value` fingerprints the element by window-RELATIVE bounds
+            // derived from `ctx.window`, so a window moved since the snapshot would make every
+            // element look displaced and reject the write as drift.
+            //
+            // Best-effort, unlike the snapshot's strict refresh: a write must not fail because
+            // a geometry probe hiccuped, so an `Err` keeps the cached value and carries on —
+            // worst case the backend's own fingerprint check rejects, exactly as before.
+            if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
+                s.geometry = window;
+            }
+        }
+        let (target, ctx) = {
+            let s = self.require_active()?;
             let tree = s.last_ax.as_ref().ok_or(GlassError::NoAxSnapshot)?;
             let node = tree.find(id).ok_or(GlassError::AxElementNotFound(id.0))?;
             let target = AxTarget {
@@ -313,8 +434,18 @@ impl Glass {
         {
             return Ok(());
         }
-        // Open the popup (the combo button is in the main window, so this click lands).
-        self.click_element(id)?;
+        // Open the popup with a real pointer click, deliberately NOT the native action (the
+        // combo button is in the main window, so this click lands). A programmatic expand —
+        // UIA's `ExpandCollapsePattern` is the concrete case — opens the popup without moving
+        // keyboard focus, and everything below is keyboard navigation (Down/Up/Return), which
+        // would then go to whatever held focus instead of the popup. Clicking focuses the
+        // combo the way a person's click does.
+        self.audited_click(id, |g, id| {
+            g.click_element_pointer_only(id)
+                .map(|()| ClickMethod::Pointer {
+                    native_fallback: COMBO_OPEN_POINTER_REASON.into(),
+                })
+        })?;
         self.settle_for_popup();
         // Re-read the realized options + which one is currently selected. The open
         // combo is `expanded`; when several combos exist, ids don't survive the
@@ -369,6 +500,22 @@ impl Glass {
     /// Let a just-opened/closed popup realize in the a11y tree before re-reading.
     fn settle_for_popup(&self) {
         std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Short, agent-facing reason a native-invoke attempt fell back to the pointer path.
+/// `AxUnsupported`'s own `Display` is snapshot-oriented (it tells the agent to screenshot
+/// instead), which would mislead in a click result — map it.
+///
+/// Only the two fallback-eligible errors reach here (see
+/// [`GlassError::invoke_fallback_eligible`], the single place that decides). The `other` arm
+/// is unreachable defence-in-depth, kept so this stays a total function if the eligibility
+/// set ever widens.
+fn native_fallback_reason(e: &GlassError) -> String {
+    match e {
+        GlassError::AxUnsupported => "backend has no native action path".into(),
+        GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
+        other => format!("native action error: {other}"),
     }
 }
 
@@ -997,6 +1144,47 @@ mod tests {
     }
 
     #[test]
+    fn click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window() {
+        // The Windows/macOS `invoke` fingerprints the element by window-RELATIVE bounds,
+        // derived from `ctx.window`. If the window moved since the snapshot and the click
+        // handed the backend the stale origin, every element would look displaced and the
+        // invoke would be rejected as drift. The snapshot refreshes geometry, so the invoke
+        // path must too: script the geometry read to report a moved window after the
+        // snapshot's own read, and prove the ctx the backend received carries the new origin.
+        let snapshot_geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let moved_geo = WindowGeometry {
+            x: 640,
+            y: 480,
+            width: 100,
+            height: 100,
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(snapshot_geo)
+            .resized_to(moved_geo.clone());
+        let (mut g, invoke_log, ctx_log) =
+            glass_with_a11y_invoke_ctx(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap(); // consumes the first scripted geometry read
+
+        assert_eq!(
+            g.click_element(AxNodeId(1)).unwrap(),
+            ClickMethod::NativeAction
+        );
+
+        assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
+        assert_eq!(
+            ctx_log.lock().unwrap().as_ref().map(|c| c.window.clone()),
+            Some(moved_geo),
+            "invoke's ctx carries the refreshed window, not the snapshot's stale one"
+        );
+    }
+
+    #[test]
     fn click_element_without_snapshot_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
         g.start(&spec()).unwrap();
@@ -1050,6 +1238,153 @@ mod tests {
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
         // node #2 is the boundless Label.
+        assert!(matches!(
+            g.click_element(AxNodeId(2)).unwrap_err(),
+            GlassError::AxElementNotClickable(2)
+        ));
+    }
+
+    #[test]
+    fn click_element_prefers_native_invoke_and_synthesizes_no_pointer() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, invoke_log) =
+            glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(method, ClickMethod::NativeAction);
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event on the native path"
+        );
+        let log = invoke_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].id, AxNodeId(1));
+        assert_eq!(log[0].role, AxRole::Button);
+        assert_eq!(log[0].name.as_deref(), Some("Save"));
+        assert!(
+            log[0].bounds.is_some(),
+            "fingerprint carries the snapshot bounds"
+        );
+    }
+
+    #[test]
+    fn click_element_falls_back_when_element_has_no_action_and_discloses() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::NoAction);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            method,
+            ClickMethod::Pointer {
+                native_fallback: "element exposes no activation action".into()
+            }
+        );
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn click_element_falls_back_when_backend_has_no_invoke() {
+        // Default knob = Unsupported = a backend that never implemented invoke (iOS/Android).
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree());
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert_eq!(
+            method,
+            ClickMethod::Pointer {
+                native_fallback: "backend has no native action path".into()
+            }
+        );
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+    }
+
+    #[test]
+    fn click_element_action_failure_propagates_and_never_pointer_clicks() {
+        // A native action that reported failure may still have been DISPATCHED (the backend
+        // fires it on a detached worker and can lose the answer), so a pointer click on top
+        // of it would actuate the control twice. Only outcomes that dispatched nothing may
+        // fall back — everything else fails closed.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Fail);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert!(matches!(
+            g.click_element(AxNodeId(1)).unwrap_err(),
+            GlassError::AxActionFailed(1, _)
+        ));
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after a possibly-dispatched native action"
+        );
+    }
+
+    #[test]
+    fn click_element_drift_propagates_and_never_pointer_clicks() {
+        // AxElementChanged means the tree drifted; a pointer click at the stale bounds
+        // would hit the wrong element, so there must be NO fallback.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
+        let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Drifted);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert!(matches!(
+            g.click_element(AxNodeId(1)).unwrap_err(),
+            GlassError::AxElementChanged(1)
+        ));
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after drift"
+        );
+    }
+
+    #[test]
+    fn click_element_boundless_element_clicks_via_invoke() {
+        // Today a boundless node is AxElementNotClickable; with a native action it works.
+        let mut tree = fake_tree();
+        tree.root.children.push(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "button".into(),
+            name: Some("hidden".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![],
+        });
+        let (mut g, _) =
+            glass_with_a11y_invoke(FakePlatform::new(100, 100), tree, InvokeBehavior::Succeed);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert_eq!(
+            g.click_element(AxNodeId(2)).unwrap(),
+            ClickMethod::NativeAction
+        );
+    }
+
+    #[test]
+    fn click_element_boundless_element_without_action_stays_not_clickable() {
+        let mut tree = fake_tree();
+        tree.root.children.push(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::Button,
+            raw_role: "button".into(),
+            name: Some("hidden".into()),
+            value: None,
+            states: AxStates::default(),
+            bounds: None,
+            children: vec![],
+        });
+        let (mut g, _) =
+            glass_with_a11y_invoke(FakePlatform::new(100, 100), tree, InvokeBehavior::NoAction);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
         assert!(matches!(
             g.click_element(AxNodeId(2)).unwrap_err(),
             GlassError::AxElementNotClickable(2)
@@ -1156,7 +1491,11 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
 
         // node #1 = the row-shaped checkable → a swipe across the trailing control, not a click.
-        g.click_element(AxNodeId(1)).unwrap();
+        let method = g.click_element(AxNodeId(1)).unwrap();
+        assert!(
+            matches!(method, ClickMethod::Pointer { .. }),
+            "the swipe path is pointer-class (the fake's default invoke is Unsupported)"
+        );
         let expected = bounds.trailing_toggle_swipe(100, 100).unwrap();
         {
             let d = drags.lock().unwrap();
@@ -1367,8 +1706,12 @@ mod tests {
         let globex_id = tree.root.children[0].children[0].id;
         assert_eq!(globex_id, AxNodeId(2));
 
-        g.click_element(globex_id).unwrap();
+        let method = g.click_element(globex_id).unwrap();
 
+        assert!(
+            matches!(method, ClickMethod::Pointer { .. }),
+            "the fake's default invoke behavior is Unsupported, so this still routes pointer"
+        );
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
             Some((20, 54)),
@@ -1383,6 +1726,100 @@ mod tests {
             g.geometry().unwrap().width,
             340,
             "active window geometry is restored after the routed click"
+        );
+    }
+
+    /// The popover-routing platform: an active window plus the dropdown's popover window,
+    /// with click + select logs — shared by the popover × native-invoke tests below.
+    fn popover_platform(
+        clicks: Arc<Mutex<Vec<(i32, i32)>>>,
+        select_log: Arc<Mutex<Vec<WindowId>>>,
+    ) -> FakePlatform {
+        let active = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let popover = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        FakePlatform::new(340, 300)
+            .with_windows(vec![active, popover])
+            .with_click_log(clicks)
+            .with_select_log(select_log)
+    }
+
+    #[test]
+    fn click_element_native_invoke_succeeds_for_popover_hosted_element_without_window_select() {
+        // The native action addresses the element directly, so the whole popover machinery —
+        // enumerate windows, select the popover, click at a container-relative offset, restore
+        // the previous window — must be skipped: no focus change, no pointer event.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let (mut g, invoke_log) = glass_with_a11y_invoke(
+            popover_platform(clicks.clone(), select_log.clone()),
+            fake_tree_with_popover_option(),
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        assert_eq!(
+            g.click_element(globex_id).unwrap(),
+            ClickMethod::NativeAction
+        );
+
+        assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event for a natively-invoked popover element"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "the popover is never raised — the native action needs no window focus"
+        );
+    }
+
+    #[test]
+    fn click_element_native_invoke_drifted_for_popover_hosted_element_is_fatal() {
+        // Drift is fatal wherever the element lives: routing into the popover and clicking
+        // its stale bounds would hit whatever moved into that spot.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let select_log = Arc::new(Mutex::new(Vec::new()));
+        let (mut g, _) = glass_with_a11y_invoke(
+            popover_platform(clicks.clone(), select_log.clone()),
+            fake_tree_with_popover_option(),
+            InvokeBehavior::Drifted,
+        );
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        assert!(matches!(
+            g.click_element(globex_id).unwrap_err(),
+            GlassError::AxElementChanged(id) if id == globex_id.0
+        ));
+
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after drift"
+        );
+        assert!(
+            select_log.lock().unwrap().is_empty(),
+            "and no window was raised on the way to failing"
         );
     }
 
@@ -1473,6 +1910,103 @@ mod tests {
         );
     }
 
+    /// The combo fixture: a single `ComboBox` named `name`, optionally `expanded` with its
+    /// option rows realized underneath (an open GtkDropDown's shape — `ListItem`s carrying
+    /// their label, the current one `selected`).
+    fn combo(name: &str, options: &[&str]) -> AxTree {
+        let bounds = AxRect {
+            x: 0,
+            y: 188,
+            width: 320,
+            height: 34,
+        };
+        let items: Vec<AxNode> = options
+            .iter()
+            .enumerate()
+            .map(|(i, opt)| AxNode {
+                states: AxStates {
+                    selected: *opt == name,
+                    ..Default::default()
+                },
+                ..named_node(
+                    0,
+                    AxRole::ListItem,
+                    opt,
+                    AxRect {
+                        x: 20,
+                        y: 200 + 30 * i as i32,
+                        width: 280,
+                        height: 27,
+                    },
+                )
+            })
+            .collect();
+        let children = if options.is_empty() {
+            vec![]
+        } else {
+            vec![AxNode {
+                children: items,
+                ..ax_node(
+                    0,
+                    AxRole::List,
+                    Some(AxRect {
+                        x: 0,
+                        y: 194,
+                        width: 320,
+                        height: 129,
+                    }),
+                    vec![],
+                )
+            }]
+        };
+        let combo = AxNode {
+            name: Some(name.into()),
+            states: AxStates {
+                expanded: !options.is_empty(),
+                ..Default::default()
+            },
+            children,
+            ..ax_node(0, AxRole::ComboBox, Some(bounds), vec![])
+        };
+        tree_with(340, 300, vec![combo])
+    }
+
+    #[test]
+    fn set_value_on_a_combo_opens_the_popup_with_a_pointer_click_even_when_invoke_succeeds() {
+        // The combo commit loop is keyboard navigation (Down/Up/Return), so the popup must be
+        // opened by something that takes keyboard focus. A native "expand" action doesn't
+        // (UIA's ExpandCollapsePattern is the concrete case), which would send the keystrokes
+        // to whatever had focus instead. So this one click stays pointer-only even on a
+        // backend whose invoke works.
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_click_log(clicks.clone());
+        let (mut g, invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Acme", &[]),                 // cached: closed, showing Acme
+                combo("Acme", &["Acme", "Globex"]), // after the open: expanded + options
+                combo("Globex", &[]),               // after the commit: closed, Globex
+            ],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.set_value(AxNodeId(1), "Globex").unwrap();
+
+        assert!(
+            invoke_log.lock().unwrap().is_empty(),
+            "the popup open must not use the native action — it wouldn't take keyboard focus"
+        );
+        let clicks = clicks.lock().unwrap();
+        assert_eq!(
+            clicks.len(),
+            1,
+            "exactly one pointer click: the popup open, {clicks:?}"
+        );
+        assert_eq!(clicks[0], (160, 205), "the combo's own clamped center");
+    }
+
     #[test]
     fn set_value_no_snapshot_errors() {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
@@ -1505,6 +2039,43 @@ mod tests {
     }
 
     #[test]
+    fn set_value_refreshes_geometry_so_the_backend_sees_the_current_window() {
+        // The mirror of `click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window`:
+        // `set_value` fingerprints the element the same way `invoke` does (Windows/macOS compare
+        // window-RELATIVE bounds derived from `ctx.window`), so a window moved since the snapshot
+        // would make every element look displaced and reject the write as drift.
+        let snapshot_geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let moved_geo = WindowGeometry {
+            x: 640,
+            y: 480,
+            width: 100,
+            height: 100,
+        };
+        let platform = FakePlatform::new(100, 100)
+            .resized_to(snapshot_geo)
+            .resized_to(moved_geo.clone());
+        // The invoke knob is irrelevant here (set_value never invokes); this builder is just the
+        // one that hands back the ctx log.
+        let (mut g, _, ctx_log) =
+            glass_with_a11y_invoke_ctx(platform, fake_tree(), InvokeBehavior::Unsupported);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap(); // consumes the first scripted geometry read
+
+        g.set_value(AxNodeId(1), "hello").unwrap(); // fake_tree: #1 is Button "Save"
+
+        assert_eq!(
+            ctx_log.lock().unwrap().as_ref().map(|c| c.window.clone()),
+            Some(moved_geo),
+            "set_value's ctx carries the refreshed window, not the snapshot's stale one"
+        );
+    }
+
+    #[test]
     fn set_value_passes_target_and_text_to_backend() {
         // Build a Glass whose fake records set_value calls, keeping the Arc to inspect.
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1518,7 +2089,9 @@ mod tests {
                 tree: fake_tree(),
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1551,7 +2124,7 @@ mod tests {
     #[test]
     fn a11y_snapshot_threads_max_nodes_into_ctx_limits_and_set_value_reuses_them() {
         // Same mock harness as `set_value_passes_target_and_text_to_backend`, but this
-        // time inspecting `limits_log` — the `AxContext.limits` the backend actually
+        // time inspecting `ctx_log` — the `AxContext.limits` the backend actually
         // received — to prove `max_nodes` reaches the ctx, and that `set_value` reuses
         // whatever the last `a11y_snapshot` recorded rather than falling back to the
         // default cap. Real backends still ignore `limits` in this task (they build
@@ -1559,14 +2132,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
-        let limits_log = Arc::new(Mutex::new(None));
+        let ctx_log = Arc::new(Mutex::new(None));
         let mut held: Option<Backend> = Some(Backend {
             platform: Box::new(FakePlatform::new(100, 100)),
             accessibility: Some(Box::new(FakeAccessibility {
                 tree: fake_tree(),
                 set_log: Arc::new(Mutex::new(Vec::new())),
                 set_fail: false,
-                limits_log: limits_log.clone(),
+                ctx_log: ctx_log.clone(),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1578,10 +2153,12 @@ mod tests {
 
         g.a11y_snapshot(Some(5000)).unwrap();
         assert_eq!(
-            limits_log
+            ctx_log
                 .lock()
                 .unwrap()
-                .expect("snapshot recorded ctx.limits")
+                .as_ref()
+                .expect("snapshot recorded its ctx")
+                .limits
                 .nodes,
             5000,
             "snapshot ctx carries the raised cap"
@@ -1589,10 +2166,12 @@ mod tests {
 
         g.set_value(AxNodeId(1), "x").unwrap(); // fake_tree: #1 is Button "Save"
         assert_eq!(
-            limits_log
+            ctx_log
                 .lock()
                 .unwrap()
-                .expect("set_value recorded ctx.limits")
+                .as_ref()
+                .expect("set_value recorded its ctx")
+                .limits
                 .nodes,
             5000,
             "set_value reuses the snapshot's limits"
@@ -1610,7 +2189,9 @@ mod tests {
                 tree: fake_tree(),
                 set_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 set_fail: true,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1681,6 +2262,38 @@ mod tests {
         g.set_value(AxNodeId(1), "true").unwrap();
 
         assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn set_value_toggle_path_uses_native_invoke_when_available() {
+        // The trailing-toggle `set_value` branch actuates through `click_element_inner`, so on
+        // a backend that HAS a native action the toggle must fire natively — no swipe — and
+        // still verify the flip by re-snapshot. (The iOS backend this branch exists for has no
+        // invoke today, so only a fake can pin the interaction.)
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(400, 400)
+            .with_drag_log(drags.clone())
+            .with_trailing_toggle_backend();
+        // Snapshot #1 (cached read) = unchecked; snapshot #2 (verify re-read) = checked.
+        let (mut g, invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![sw(false), sw(true)],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        g.set_value(AxNodeId(1), "true").unwrap();
+
+        assert_eq!(
+            invoke_log.lock().unwrap().len(),
+            1,
+            "the toggle actuated once, natively"
+        );
+        assert!(
+            drags.lock().unwrap().is_empty(),
+            "the native action replaces the swipe — actuating both would toggle twice"
+        );
     }
 
     #[test]
@@ -1873,7 +2486,9 @@ mod tests {
                 tree: fake_tree(), // #1 is a non-checkable Button "Save"
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
@@ -1921,7 +2536,9 @@ mod tests {
                 tree: sw(false), // #1 is the checkable switch "Sw"
                 set_log: log2,
                 set_fail: false,
-                limits_log: Arc::new(Mutex::new(None)),
+                ctx_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
             })),
         });
         let factory: PlatformFactory = Box::new(move |_b| {
