@@ -347,7 +347,7 @@ impl GlassServer {
                        #id to glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
-                       for the full tree (default caps protect the token budget)."
+                       to remove the element-count limit (default caps protect the token budget)."
     )]
     async fn glass_a11y_snapshot(
         &self,

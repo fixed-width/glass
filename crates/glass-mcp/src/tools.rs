@@ -740,6 +740,7 @@ pub(crate) mod testutil {
         let mut t = fake_tree();
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Nodes,
+            limit_value: 1500,
             nodes_walked: 1500,
         });
         t

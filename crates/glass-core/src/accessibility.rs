@@ -341,16 +341,6 @@ pub enum TruncationLimit {
 }
 
 impl TruncationLimit {
-    /// The limit's numeric value, for the disclosure notice. Private: the only caller is
-    /// [`Truncation::notice`] in this module; nothing outside needs the raw number.
-    fn value(self) -> usize {
-        match self {
-            TruncationLimit::Nodes => MAX_NODES,
-            TruncationLimit::Depth => MAX_DEPTH,
-            TruncationLimit::Siblings => MAX_SIBLINGS,
-        }
-    }
-
     /// Human-readable unit for the disclosure notice.
     fn label(self) -> &'static str {
         match self {
@@ -366,6 +356,10 @@ impl TruncationLimit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncation {
     pub limit: TruncationLimit,
+    /// The actual limit value that fired — the runtime [`WalkLimits`] field in effect, not the
+    /// compile-time default — so the notice reports the cap the caller was really subject to
+    /// (e.g. a `max_nodes: 42` snapshot reads "truncated at 42 nodes", not "1500").
+    pub limit_value: usize,
     pub nodes_walked: usize,
 }
 
@@ -378,7 +372,7 @@ impl Truncation {
             "… tree truncated at {} {} ({} nodes walked). Some elements are NOT shown and \
              cannot be addressed by id. Narrow the UI, or drive by pixels: glass_screenshot, \
              then glass_click at x,y.",
-            self.limit.value(),
+            self.limit_value,
             self.limit.label(),
             self.nodes_walked,
         )
@@ -437,8 +431,14 @@ impl WalkBudget {
     /// while any later hit is a consequence of having continued.
     pub fn hit(&mut self, limit: TruncationLimit) {
         let nodes_walked = self.count;
+        let limit_value = match limit {
+            TruncationLimit::Nodes => self.limits.nodes,
+            TruncationLimit::Depth => self.limits.depth,
+            TruncationLimit::Siblings => self.limits.siblings,
+        };
         self.truncated.get_or_insert(Truncation {
             limit,
+            limit_value,
             nodes_walked,
         });
     }
@@ -1585,12 +1585,32 @@ mod tests {
     fn truncation_notice_states_elements_are_missing_and_names_the_pixel_fallback() {
         let n = Truncation {
             limit: TruncationLimit::Nodes,
+            limit_value: MAX_NODES,
             nodes_walked: 1500,
         }
         .notice();
         assert!(
             n.contains("NOT shown") && n.contains("glass_screenshot"),
             "notice must be unmissable and steer to pixels: {n}"
+        );
+    }
+
+    #[test]
+    fn truncation_notice_reports_the_actual_runtime_cap_not_the_default() {
+        // A raised/lowered cap that fires must render its OWN number, not the compile-time const.
+        let mut b = WalkBudget::with_limits(WalkLimits::from_max_nodes(Some(42)));
+        for _ in 0..42 {
+            b.visit();
+        }
+        b.hit(TruncationLimit::Nodes);
+        let notice = b.truncation().expect("hit recorded").notice();
+        assert!(
+            notice.contains("42 nodes"),
+            "notice reports the runtime cap (42), not MAX_NODES: {notice}"
+        );
+        assert!(
+            !notice.contains(&MAX_NODES.to_string()),
+            "notice must not show the default cap when a custom one fired: {notice}"
         );
     }
 
@@ -1603,6 +1623,7 @@ mod tests {
         t.assign_ids();
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Depth,
+            limit_value: MAX_DEPTH,
             nodes_walked: 42,
         });
         assert!(!t.to_outline().contains("truncated"), "pure tree text");

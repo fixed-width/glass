@@ -23,8 +23,8 @@ internal refactors, CI, or test-only changes.
 - Linux accessibility snapshots are faster on large trees: the AT-SPI reader now issues each
   element's independent property reads concurrently instead of one at a time.
 - `glass_a11y_snapshot` accepts an optional `max_nodes`: raise the element cap for a large app,
-  or pass `0` for the full tree. The default cap is unchanged, and when a snapshot is truncated
-  the notice now says how to widen it.
+  or pass `0` to remove the element-count limit. The default cap is unchanged, and when a snapshot
+  is truncated the notice now reports the actual limit and says how to widen it.
 
 ### Fixed
 - The accessibility tree now reports when a snapshot was truncated. Previously a tree that hit

@@ -419,8 +419,9 @@ rides as an untrusted sibling text block, one line per element:
 `#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
-  budget), or `0` for the full tree (no limit). Omit for the default cap. A snapshot renumbers
-  ids, so re-read them after changing this.
+  budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural
+  depth/sibling safety rails still apply, so a pathologically deep tree can still truncate — the
+  notice says which limit was hit.) A snapshot renumbers ids, so re-read them after changing this.
 
 ### `glass_a11y_marks`
 

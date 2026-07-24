@@ -238,6 +238,7 @@ mod tests {
         let mut t = tree_of(node(AxRole::Button, Some("Save")));
         t.truncated = Some(Truncation {
             limit: TruncationLimit::Nodes,
+            limit_value: 1500,
             nodes_walked: 1500,
         });
         assert!(
