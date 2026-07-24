@@ -962,7 +962,7 @@ mod tests {
                 height: 408,
             })
             .with_click_log(clicks.clone());
-        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap(); // must refresh s.geometry 230 → 458
         g.click_element(AxNodeId(1)).unwrap(); // the Button at x=292 — on-screen only in 458
@@ -1128,7 +1128,7 @@ mod tests {
             .with_click_log(clicks.clone())
             .with_drag_log(drags.clone())
             .with_trailing_toggle_backend();
-        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
 
@@ -1218,7 +1218,7 @@ mod tests {
             }],
         };
         let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
-        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
         g.click_element(AxNodeId(1)).unwrap();
@@ -1271,7 +1271,7 @@ mod tests {
         let platform = FakePlatform::new(100, 100)
             .with_click_log(clicks.clone())
             .with_trailing_toggle_backend();
-        let mut g = glass_with_a11y(platform, AxTree { root, count: 0 });
+        let mut g = glass_with_a11y(platform, AxTree::new(root));
         g.start(&spec()).unwrap();
         g.a11y_snapshot().unwrap();
         g.click_element(AxNodeId(1)).unwrap();
@@ -1403,7 +1403,7 @@ mod tests {
             }),
             children: vec![globex],
         };
-        let tree = AxTree { root, count: 0 };
+        let tree = AxTree::new(root);
         let a = window_info(
             1,
             WindowGeometry {
@@ -1588,7 +1588,7 @@ mod tests {
             }),
             children: vec![switch],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     #[test]
@@ -1720,7 +1720,7 @@ mod tests {
             }),
             children: vec![sibling, target],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     #[test]

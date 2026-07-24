@@ -354,7 +354,7 @@ mod tests {
             }),
             children: vec![button],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     #[test]

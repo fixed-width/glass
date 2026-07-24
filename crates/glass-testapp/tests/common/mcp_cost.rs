@@ -133,8 +133,8 @@ pub async fn start_fixture(client: &Peer<RoleClient>) {
 
 /// How long `a11y_outline` retries a snapshot that reports the launched app isn't publishing
 /// an accessibility tree yet.
-const A11Y_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
-const A11Y_POLL_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const A11Y_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const A11Y_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Snapshot the a11y tree; return the full text (envelope + untrusted outline). Retries for
 /// up to `A11Y_SETTLE_TIMEOUT`: immediately after `glass_start` returns, the launched app's
@@ -365,7 +365,7 @@ impl std::fmt::Display for ArmReport {
 /// tree before giving up. The larger of the two deadlines this consolidates (mcp_cost.rs
 /// previously used 5s, `verification_cost.rs`'s now-removed `poll_until_widgets_present`
 /// used 10s) so the shared function has the more generous headroom of the two under load.
-const WIDGETS_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WIDGETS_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll (unmetered) until the fixture's three widgets are all present in the a11y tree, or
 /// `WIDGETS_SETTLE_TIMEOUT` elapses (in which case this panics, embedding the last-seen

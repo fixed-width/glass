@@ -309,7 +309,7 @@ pub(crate) fn fake_tree() -> AxTree {
         }),
         children: vec![button],
     };
-    AxTree { root, count: 0 }
+    AxTree::new(root)
 }
 
 /// Like `fake_tree` but the Button "Save" is enabled.
@@ -447,7 +447,7 @@ pub(crate) fn tree_with(win_w: u32, win_h: u32, children: Vec<AxNode>) -> AxTree
         }),
         children,
     };
-    AxTree { root, count: 0 }
+    AxTree::new(root)
 }
 
 pub(crate) fn spec() -> AppSpec {
@@ -532,7 +532,7 @@ pub(crate) fn fake_tree_with_popover_option() -> AxTree {
         }),
         children: vec![list],
     };
-    AxTree { root, count: 0 }
+    AxTree::new(root)
 }
 
 /// A bare-minimum `Platform` that overrides nothing — every optional method

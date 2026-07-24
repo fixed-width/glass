@@ -223,7 +223,7 @@ mod tests {
             }),
             children: vec![button, label],
         };
-        let mut t = AxTree { root, count: 0 };
+        let mut t = AxTree::new(root);
         t.assign_ids();
         t
     }
@@ -263,7 +263,7 @@ mod tests {
                     height: 4,
                 }),
             );
-            let mut t = AxTree { root, count: 0 };
+            let mut t = AxTree::new(root);
             t.assign_ids();
             t
         };
@@ -276,7 +276,7 @@ mod tests {
     /// A single interactable Button with the given bounds, ids assigned.
     fn one_button(bounds: AxRect) -> AxTree {
         let root = node(0, AxRole::Button, "b", Some(bounds));
-        let mut t = AxTree { root, count: 0 };
+        let mut t = AxTree::new(root);
         t.assign_ids();
         t
     }
@@ -327,7 +327,7 @@ mod tests {
                     height: 40,
                 }),
             );
-            let mut t = AxTree { root, count: 0 };
+            let mut t = AxTree::new(root);
             t.assign_ids();
             t
         };

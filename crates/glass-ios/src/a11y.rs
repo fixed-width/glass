@@ -138,7 +138,7 @@ mod tests {
             }),
             children: vec![field],
         };
-        let mut t = AxTree { root, count: 0 };
+        let mut t = AxTree::new(root);
         t.assign_ids();
         t
     }

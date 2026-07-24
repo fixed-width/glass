@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree,
+    TruncationLimit, WalkBudget, MAX_SIBLINGS,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -25,7 +26,13 @@ use crate::conn::Conn;
 /// reordering — a node with malformed/missing bounds errors the whole snapshot rather than being
 /// dropped (which would shift every later id). So `set_value` can send `target.id.0` as the device
 /// `ref` and hit the right node. Keep both walks pre-order if either side changes.
-fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
+fn json_to_node(
+    v: &Value,
+    win: &WindowGeometry,
+    depth: usize,
+    budget: &mut WalkBudget,
+) -> Result<AxNode> {
+    budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
@@ -49,13 +56,38 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
     };
     let (x, y, w, h) = (bi("x"), bi("y"), bu("w"), bu("h"));
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // Recursion depth = a11y tree depth (shallow in practice; not hardened against adversarial nesting).
+    // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
+    // pathologically deep or wide device tree cannot blow the stack or the token budget.
+    // The child array is resolved before either bound is consulted: a childless node must
+    // never be reported truncated for declining to explore a list that was already empty.
     let children = match v.get("children").and_then(Value::as_array) {
-        Some(arr) => arr
-            .iter()
-            .map(|c| json_to_node(c, win))
-            .collect::<Result<Vec<_>>>()?,
         None => vec![],
+        Some(arr) if arr.is_empty() => vec![],
+        Some(_) if budget.depth_exhausted(depth) => {
+            budget.hit(TruncationLimit::Depth);
+            vec![]
+        }
+        Some(_) if budget.nodes_exhausted() => {
+            budget.hit(TruncationLimit::Nodes);
+            vec![]
+        }
+        Some(arr) => {
+            let mut out = Vec::new();
+            for (i, c) in arr.iter().enumerate() {
+                // Checked before processing each child (not after) so the child that merely
+                // completes the tree doesn't get mistaken for one the walk declined to visit.
+                if budget.nodes_exhausted() {
+                    budget.hit(TruncationLimit::Nodes);
+                    break;
+                }
+                if i >= MAX_SIBLINGS {
+                    budget.hit(TruncationLimit::Siblings);
+                    break;
+                }
+                out.push(json_to_node(c, win, depth + 1, budget)?);
+            }
+            out
+        }
     };
     Ok(AxNode {
         id: AxNodeId(0),
@@ -90,11 +122,11 @@ fn json_to_node(v: &Value, win: &WindowGeometry) -> Result<AxNode> {
 
 /// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
 pub(crate) fn tree_from_json(tree: &Value, win: &WindowGeometry) -> Result<AxTree> {
-    // count stays 0 until the caller runs AxTree::assign_ids (per the Accessibility trait contract).
-    Ok(AxTree {
-        root: json_to_node(tree, win)?,
-        count: 0,
-    })
+    let mut budget = WalkBudget::new();
+    let root = json_to_node(tree, win, 0, &mut budget)?;
+    let mut tree = AxTree::new(root);
+    tree.truncated = budget.truncation();
+    Ok(tree)
 }
 
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
@@ -471,7 +503,7 @@ mod tests {
             "class": "android.widget.CheckBox", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
             "checkable": true, "checked": true
         });
-        let n = json_to_node(&on, &win()).unwrap();
+        let n = json_to_node(&on, &win(), 0, &mut WalkBudget::new()).unwrap();
         assert!(
             n.states.checkable && n.states.checked,
             "on checkbox → checkable + checked"
@@ -479,11 +511,89 @@ mod tests {
         let plain = json!({
             "class": "android.widget.TextView", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10}
         });
-        let p = json_to_node(&plain, &win()).unwrap();
+        let p = json_to_node(&plain, &win(), 0, &mut WalkBudget::new()).unwrap();
         assert!(
             !p.states.checkable && !p.states.checked,
             "a node with no checkable/checked keys stays false"
         );
+    }
+
+    /// Device JSON for a root with `n` flat children, each a distinctly-named Button.
+    fn wide_device_json(n: usize) -> Value {
+        let kids: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "class": "android.widget.Button",
+                    "text": format!("btn{i}"),
+                    "bounds": {"x": 0, "y": i, "w": 10, "h": 10},
+                    "children": []
+                })
+            })
+            .collect();
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 100, "h": 100},
+            "children": kids
+        })
+    }
+
+    #[test]
+    fn truncation_stops_the_walk_and_never_shifts_surviving_ids() {
+        // The device numbers refs in pre-order over the SAME node set. If truncation dropped
+        // nodes from the middle instead of stopping at the end, every later id would shift and
+        // set_value would write to the wrong element.
+        let json = wide_device_json(glass_core::MAX_NODES + 50);
+        let mut tree = tree_from_json(&json, &win()).expect("tree parses");
+        tree.assign_ids();
+
+        assert!(tree.truncated.is_some(), "the node cap must have been hit");
+        // `tree_from_json` maps the device root directly (no synthetic wrapper), so the
+        // FrameLayout itself is id 0 and child at array index i is id i+1 — every surviving
+        // child must still carry the name matching its own id-derived index.
+        let third = tree.find(AxNodeId(3)).expect("id 3 survives");
+        assert_eq!(third.name.as_deref(), Some("btn2"));
+    }
+
+    #[test]
+    fn a_complete_tree_of_exactly_max_nodes_reports_no_truncation() {
+        // `tree_from_json` walks the device root itself (no synthetic wrapper), so root (1) +
+        // MAX_NODES-1 flat children = MAX_NODES nodes walked in total, and the LAST child is
+        // what pushes the running count to MAX_NODES. Nothing was declined, so this must NOT
+        // be reported truncated (regression for the false-positive-at-the-cap bug).
+        let json = wide_device_json(glass_core::MAX_NODES - 1);
+        let mut tree = tree_from_json(&json, &win()).expect("tree parses");
+        tree.assign_ids();
+        assert_eq!(tree.count, glass_core::MAX_NODES);
+        assert_eq!(tree.truncated, None);
+    }
+
+    #[test]
+    fn a_tree_of_max_nodes_plus_one_still_reports_nodes_truncation() {
+        // One more child than the complete case above: now there really is a node the walk
+        // declines to visit, so the cap must still fire — proving the fix didn't just
+        // disable it.
+        let json = wide_device_json(glass_core::MAX_NODES);
+        let tree = tree_from_json(&json, &win()).expect("tree parses");
+        assert_eq!(
+            tree.truncated.map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn a_childless_node_at_the_spent_node_budget_records_no_truncation() {
+        // A leaf with no "children" key, reached once the node budget is already spent, must
+        // not be reported truncated merely for declining to explore an empty list.
+        let leaf = json!({
+            "class": "android.widget.TextView",
+            "bounds": {"x": 0, "y": 0, "w": 10, "h": 10}
+        });
+        let mut budget = WalkBudget::new();
+        for _ in 0..glass_core::MAX_NODES {
+            budget.visit();
+        }
+        let _ = json_to_node(&leaf, &win(), 0, &mut budget).unwrap();
+        assert!(budget.truncation().is_none());
     }
 
     #[test]

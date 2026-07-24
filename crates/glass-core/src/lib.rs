@@ -70,11 +70,14 @@ pub use platform::{
 pub mod accessibility;
 pub use accessibility::{
     element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, ElementCondition, ElementInfo, ElementMatch,
+    AxTree, ElementCondition, ElementInfo, ElementMatch, Truncation, TruncationLimit, WalkBudget,
+    MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
 };
 
 pub mod marks;
 pub use marks::Mark;
+
+pub mod outline;
 
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};

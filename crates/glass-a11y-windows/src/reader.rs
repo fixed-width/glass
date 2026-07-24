@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+    TruncationLimit, WalkBudget, MAX_SIBLINGS,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIRangeValuePattern, UISelectionItemPattern, UITogglePattern,
@@ -18,16 +19,6 @@ use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 
 /// Hard cap so a hung UIA provider can't block the calling tool forever.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bounds so a pathological tree can't make a snapshot unbounded (tunable; sized on the box).
-const MAX_DEPTH: usize = 30;
-const MAX_NODES: usize = 1500;
-/// Per-level cap on siblings *examined* (on- or off-screen). `MAX_NODES` only counts
-/// nodes entered, and offscreen siblings are skipped without entering — so an
-/// all-offscreen run (a virtualized list of thousands) or a cyclic `get_next_sibling`
-/// would iterate without ever tripping `MAX_NODES`, spinning the worker thread. Cap the
-/// per-level scan so the walk is genuinely bounded regardless of offscreen breadth.
-/// Generous enough not to truncate real UIs; with `MAX_DEPTH` it bounds total work.
-const MAX_SIBLINGS: usize = 4096;
 /// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
 /// bounds are stable for a static element across snapshot→set_value (window moves cancel),
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
@@ -93,12 +84,10 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     let window = find_app_window(&automation, ctx)?;
 
     let origin = (ctx.window.x, ctx.window.y);
-    let mut count = 0usize;
-    let root_node = walk(&walker, &window, origin, 0, &mut count)?;
-    let mut tree = AxTree {
-        root: root_node,
-        count: 0,
-    };
+    let mut budget = WalkBudget::new();
+    let root_node = walk(&walker, &window, origin, 0, &mut budget)?;
+    let mut tree = AxTree::new(root_node);
+    tree.truncated = budget.truncation();
     tree.assign_ids();
     Ok(tree)
 }
@@ -119,15 +108,17 @@ fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIEleme
         .map_err(uia_err)
 }
 
-/// Recursively build a normalized node, bounded by depth + global node count.
+/// Recursively build a normalized node, bounded by [`WalkBudget`] (node count, nesting depth,
+/// and per-level sibling scan) so a pathological tree can't burn the outer [`SNAPSHOT_TIMEOUT`]
+/// with no tree to show for it.
 fn walk(
     walker: &UITreeWalker,
     el: &UIElement,
     origin: (i32, i32),
     depth: usize,
-    count: &mut usize,
+    budget: &mut WalkBudget,
 ) -> Result<AxNode> {
-    *count += 1;
+    budget.visit();
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
     let raw_role = el.get_localized_control_type().unwrap_or_default();
     let name = nonempty(el.get_name().unwrap_or_default());
@@ -136,19 +127,34 @@ fn walk(
     let states = crate::mapping::map_states(&facts);
 
     let mut children = Vec::new();
-    if depth < MAX_DEPTH && *count < MAX_NODES {
-        let mut child = walker.get_first_child(el).ok();
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let first_child = walker.get_first_child(el).ok();
+    // Tests only whether a first child exists, before `is_offscreen` filters it. A node whose
+    // children are all offscreen, reached once the budget is spent, still records a truncation
+    // though nothing real was declined. Pre-filtering would mean walking the whole
+    // `get_first_child`/`get_next_sibling` chain — the unbounded scan `MAX_SIBLINGS` bounds.
+    if first_child.is_some() && may_explore_children(budget, depth) {
+        // Offscreen children are skipped without entering, so they never count against
+        // `MAX_NODES` — a virtualized list of thousands (or a cyclic `get_next_sibling`
+        // chain) would otherwise scan this level forever. `MAX_SIBLINGS` bounds the
+        // per-level scan regardless of how many are skipped.
+        let mut child = first_child;
         let mut siblings = 0usize;
         while let Some(c) = child {
+            // Checked before processing each child (not after) so the child that merely
+            // completes the tree doesn't get mistaken for one the walk declined to visit.
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
             siblings += 1;
             if siblings > MAX_SIBLINGS {
-                break; // bound the per-level scan (offscreen breadth / cyclic sibling chain)
+                budget.hit(TruncationLimit::Siblings);
+                break;
             }
             if !c.is_offscreen().unwrap_or(false) {
-                children.push(walk(walker, &c, origin, depth + 1, count)?);
-            }
-            if *count >= MAX_NODES {
-                break;
+                children.push(walk(walker, &c, origin, depth + 1, budget)?);
             }
             child = walker.get_next_sibling(&c).ok();
         }
@@ -258,8 +264,8 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 
     // Start at 0 so find_nth's pre-order numbering matches snapshot's walk +
     // assign_ids (root id = 0); the role+name verify backstops any drift.
-    let mut count = 0usize;
-    let el = find_nth(&walker, &window, 0, &mut count, target.id.0)
+    let mut budget = WalkBudget::new();
+    let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
 
     // Verify role + name + bounds (guards a stale id / tree drift). role+name
@@ -300,40 +306,74 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     }
 }
 
-/// Pre-order walk mirroring `walk`'s traversal (offscreen skip + depth/MAX_NODES
-/// bounds) to find the element at pre-order index `target`. A single `count`
-/// serves as both the id (a node's id is `count` at arrival) and the MAX_NODES
-/// bound — identical accounting to `walk`, so ids line up with `assign_ids`.
+/// Whether this node's children may be explored, recording the bound that stopped the walk
+/// when they may not. Callers only consult this once they already know the child list is
+/// non-empty — calling it for a childless node would record a truncation for declining to
+/// explore a list that was never going to be walked anyway.
+///
+/// `walk` and `find_nth` MUST consult this one function at the same point in their
+/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
+/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
+/// id against a different tree and writes to the wrong element. Sharing the decision makes
+/// that divergence impossible to introduce by editing only one of them.
+fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        return false;
+    }
+    if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        return false;
+    }
+    true
+}
+
+/// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
+/// id is the arrival count), then recurse each unskipped child in tree-walker order — **and
+/// stopping at the same depth/node/sibling bounds**. The bounds must stay in lockstep with
+/// `walk`: if this traversal visited nodes `walk` skipped, a `set_value` id would resolve
+/// against a different tree and write to the wrong element.
 fn find_nth(
     walker: &UITreeWalker,
     el: &UIElement,
     depth: usize,
-    count: &mut usize,
+    budget: &mut WalkBudget,
     target: u32,
 ) -> Option<UIElement> {
-    let my_id = *count as u32;
-    *count += 1;
-    if my_id == target {
+    if budget.nodes_walked() == target as usize {
         return Some(el.clone());
     }
-    if depth < MAX_DEPTH && *count < MAX_NODES {
-        let mut child = walker.get_first_child(el).ok();
-        let mut siblings = 0usize;
-        while let Some(c) = child {
-            siblings += 1;
-            if siblings > MAX_SIBLINGS {
-                break; // same per-level bound as walk(), so find_nth can't spin either
-            }
-            if !c.is_offscreen().unwrap_or(false) {
-                if let Some(found) = find_nth(walker, &c, depth + 1, count, target) {
-                    return Some(found);
-                }
-            }
-            if *count >= MAX_NODES {
-                break;
-            }
-            child = walker.get_next_sibling(&c).ok();
+    budget.visit();
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let first_child = walker.get_first_child(el).ok();
+    // Same gap as `walk`: only tests whether a first child exists, before `is_offscreen` runs.
+    // A node whose children are all offscreen, reached once the budget is spent, still records
+    // a truncation though nothing real was declined — left as-is for the same reason: it would
+    // mean walking the whole sibling chain, exactly the scan `MAX_SIBLINGS` exists to bound.
+    if first_child.is_none() || !may_explore_children(budget, depth) {
+        return None;
+    }
+    let mut child = first_child;
+    let mut siblings = 0usize;
+    while let Some(c) = child {
+        // Checked before processing each child (not after) so the child that merely
+        // completes the tree doesn't get mistaken for one the walk declined to visit.
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
         }
+        siblings += 1;
+        if siblings > MAX_SIBLINGS {
+            budget.hit(TruncationLimit::Siblings);
+            break; // same per-level bound as walk(), so find_nth can't spin either
+        }
+        if !c.is_offscreen().unwrap_or(false) {
+            if let Some(found) = find_nth(walker, &c, depth + 1, budget, target) {
+                return Some(found);
+            }
+        }
+        child = walker.get_next_sibling(&c).ok();
     }
     None
 }
@@ -370,7 +410,51 @@ fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, requested: 
 
 #[cfg(test)]
 mod tests {
-    use super::{read_back_confirms, set_value_took};
+    use super::*;
+    use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    #[test]
+    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
+        let mut budget = WalkBudget::new();
+        assert!(may_explore_children(&mut budget, 0));
+        assert!(budget.truncation().is_none());
+    }
+
+    #[test]
+    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, 0));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
 
     #[test]
     fn noop_is_not_taken() {

@@ -11,6 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
+    TruncationLimit, WalkBudget, MAX_SIBLINGS,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -143,11 +144,10 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
         .await
         .map_err(bus_err)?;
 
-    let root_node = Box::pin(walk(&app, &zbus_conn)).await?;
-    let mut tree = AxTree {
-        root: root_node,
-        count: 0,
-    };
+    let mut budget = WalkBudget::new();
+    let root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
+    let mut tree = AxTree::new(root_node);
+    tree.truncated = budget.truncation();
     tree.assign_ids();
     Ok(tree)
 }
@@ -165,8 +165,8 @@ fn writes_value_only(role: glass_core::AxRole, text: &str) -> bool {
 async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     let (app_ref, conn) = find_app(ctx).await?;
     let app = app_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
-    let mut counter = 0u32;
-    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, target.id.0, &mut counter))
+    let mut budget = WalkBudget::new();
+    let node_ref = Box::pin(find_nth(&app_ref, &app, &conn, 0, target.id.0, &mut budget))
         .await?
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
     let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
@@ -229,28 +229,86 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     Err(GlassError::AxElementNotEditable(target.id.0))
 }
 
-/// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit
-/// the node (its id is the arrival counter), then recurse each child in
-/// `get_children` order, **skipping children whose proxy fails to build** (just
-/// like `walk`'s `let Ok(child) = … else continue`, so ids stay aligned). The
-/// proxy is passed by reference and never returned; the owned `ObjectRefOwned`
-/// (cloned on match) is returned, so nothing borrows the connection.
+/// Whether this node's children may be explored, recording the bound that stopped the walk
+/// when they may not. Callers only consult this once they already know the child list is
+/// non-empty — calling it for a childless node would record a truncation for declining to
+/// explore a list that was never going to be walked anyway.
+///
+/// `walk` and `find_nth` MUST consult this one function at the same point in their
+/// traversal. They assign a node's id by arrival order, and `set_value` re-walks to a
+/// caller-supplied id — so a bound applied in one traversal but not the other resolves the
+/// id against a different tree and writes to the wrong element. Sharing the decision makes
+/// that divergence impossible to introduce by editing only one of them.
+//
+// The exactly-at-cap regression — a complete tree of MAX_NODES nodes must report `None`, since
+// the last node to arrive wasn't declined — is unit-tested directly in the Android and iOS
+// mappers, which build a synthetic tree in-process. This reader shares that loop shape but reads
+// a live tree over IPC, and `walk` currently spends several sequential round-trips per node, so a
+// tree at the cap would land on `SNAPSHOT_TIMEOUT` and yield a flaky test rather than a reliable
+// one. That is a cost problem, not a fundamental one: reducing the per-node round-trips (batching
+// the attribute reads, or issuing the independent ones concurrently) brings a live at-cap test
+// back within budget, and it should be added alongside that work.
+fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
+    if budget.depth_exhausted(depth) {
+        budget.hit(TruncationLimit::Depth);
+        return false;
+    }
+    if budget.nodes_exhausted() {
+        budget.hit(TruncationLimit::Nodes);
+        return false;
+    }
+    true
+}
+
+/// Pre-order DFS to the node at index `target`, mirroring `walk` exactly: visit the node (its
+/// id is the arrival count), then recurse each child in `get_children` order, skipping children
+/// whose proxy fails to build — **and stopping at the same depth/node/sibling bounds**. The
+/// bounds must stay in lockstep with `walk`: if this traversal visited nodes `walk` skipped,
+/// a `set_value` id would resolve against a different tree and write to the wrong element.
 async fn find_nth(
     node_ref: &ObjectRefOwned,
     proxy: &AccessibleProxy<'_>,
     conn: &zbus::Connection,
+    depth: usize,
     target: u32,
-    counter: &mut u32,
+    budget: &mut WalkBudget,
 ) -> Result<Option<ObjectRefOwned>> {
-    if *counter == target {
+    if budget.nodes_walked() == target as usize {
         return Ok(Some(node_ref.clone()));
     }
-    *counter += 1;
-    for child_ref in proxy.get_children().await.map_err(bus_err)? {
+    budget.visit();
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let child_refs = proxy.get_children().await.map_err(bus_err)?;
+    if child_refs.is_empty() || !may_explore_children(budget, depth) {
+        return Ok(None);
+    }
+    let mut siblings = 0usize;
+    for child_ref in child_refs {
+        // Checked before processing each child (not after) so the child that merely
+        // completes the tree doesn't get mistaken for one the walk declined to visit.
+        if budget.nodes_exhausted() {
+            budget.hit(TruncationLimit::Nodes);
+            break;
+        }
+        siblings += 1;
+        if siblings > MAX_SIBLINGS {
+            budget.hit(TruncationLimit::Siblings);
+            break;
+        }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
             continue;
         };
-        if let Some(found) = Box::pin(find_nth(&child_ref, &child, conn, target, counter)).await? {
+        if let Some(found) = Box::pin(find_nth(
+            &child_ref,
+            &child,
+            conn,
+            depth + 1,
+            target,
+            budget,
+        ))
+        .await?
+        {
             return Ok(Some(found));
         }
     }
@@ -280,8 +338,17 @@ async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Con
     }
 }
 
-/// Recursively build a normalized node from an AT-SPI accessible.
-async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<AxNode> {
+/// Recursively build a normalized node from an AT-SPI accessible, bounded by
+/// [`WalkBudget`] (node count, nesting depth, and per-level sibling scan) so a
+/// pathological tree can't burn the outer [`SNAPSHOT_TIMEOUT`] with no tree to
+/// show for it.
+async fn walk(
+    proxy: &AccessibleProxy<'_>,
+    conn: &zbus::Connection,
+    depth: usize,
+    budget: &mut WalkBudget,
+) -> Result<AxNode> {
+    budget.visit();
     let role = proxy.get_role().await.map_err(bus_err)?;
     let raw_role = proxy.get_role_name().await.unwrap_or_default();
     let name = nonempty(proxy.name().await.unwrap_or_default());
@@ -289,11 +356,28 @@ async fn walk(proxy: &AccessibleProxy<'_>, conn: &zbus::Connection) -> Result<Ax
     let bounds = extents(proxy, conn).await;
 
     let mut children = Vec::new();
-    for child_ref in proxy.get_children().await.map_err(bus_err)? {
-        let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
-            continue;
-        };
-        children.push(Box::pin(walk(&child, conn)).await?);
+    // Resolved before the gate: a childless node must never be reported truncated for
+    // declining to explore a list that was already empty.
+    let child_refs = proxy.get_children().await.map_err(bus_err)?;
+    if !child_refs.is_empty() && may_explore_children(budget, depth) {
+        let mut siblings = 0usize;
+        for child_ref in child_refs {
+            // Checked before processing each child (not after) so the child that merely
+            // completes the tree doesn't get mistaken for one the walk declined to visit.
+            if budget.nodes_exhausted() {
+                budget.hit(TruncationLimit::Nodes);
+                break;
+            }
+            siblings += 1;
+            if siblings > MAX_SIBLINGS {
+                budget.hit(TruncationLimit::Siblings);
+                break;
+            }
+            let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+                continue;
+            };
+            children.push(Box::pin(walk(&child, conn, depth + 1, budget)).await?);
+        }
     }
 
     let value = read_value(proxy, conn, map_role(role)).await;
@@ -465,6 +549,50 @@ fn nonempty(s: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    #[test]
+    fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
+        let mut budget = WalkBudget::new();
+        assert!(may_explore_children(&mut budget, 0));
+        assert!(budget.truncation().is_none());
+    }
+
+    #[test]
+    fn at_max_depth_the_depth_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn with_the_node_budget_spent_the_nodes_bound_is_recorded_and_children_may_not_be_explored() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, 0));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Nodes)
+        );
+    }
+
+    #[test]
+    fn when_both_bounds_are_exhausted_the_recorded_limit_is_depth() {
+        let mut budget = WalkBudget::new();
+        for _ in 0..MAX_NODES {
+            budget.visit();
+        }
+        assert!(!may_explore_children(&mut budget, MAX_DEPTH));
+        assert_eq!(
+            budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
 
     #[test]
     fn no_matching_app_message_is_developer_framed() {

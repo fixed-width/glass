@@ -6,8 +6,6 @@
 //! `glass-a11y-linux`) map their native roles/states into the normalized types
 //! here; no OS/AT-SPI/D-Bus types appear in this module.
 
-use std::fmt::Write as _;
-
 use crate::error::Result;
 use crate::platform::{Segment, WindowGeometry};
 
@@ -274,15 +272,141 @@ pub struct AxNode {
     pub children: Vec<AxNode>,
 }
 
+/// Bounds on how much of an app's accessibility tree a backend walks. Shared by every OS
+/// backend so a tree's size limits never depend on which platform produced it.
+///
+/// `MAX_NODES` bounds the whole tree; `MAX_DEPTH` bounds nesting; `MAX_SIBLINGS` bounds the
+/// per-level scan, because `MAX_NODES` only counts nodes actually *kept* — a level with a
+/// pathological number of skipped siblings would otherwise iterate without ever tripping it.
+pub const MAX_NODES: usize = 1500;
+/// See [`MAX_NODES`].
+pub const MAX_DEPTH: usize = 30;
+/// See [`MAX_NODES`].
+pub const MAX_SIBLINGS: usize = 4096;
+
+/// Which bound stopped a walk early.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncationLimit {
+    Nodes,
+    Depth,
+    Siblings,
+}
+
+impl TruncationLimit {
+    /// The limit's numeric value, for the disclosure notice. Private: the only caller is
+    /// [`Truncation::notice`] in this module; nothing outside needs the raw number.
+    fn value(self) -> usize {
+        match self {
+            TruncationLimit::Nodes => MAX_NODES,
+            TruncationLimit::Depth => MAX_DEPTH,
+            TruncationLimit::Siblings => MAX_SIBLINGS,
+        }
+    }
+
+    /// Human-readable unit for the disclosure notice.
+    fn label(self) -> &'static str {
+        match self {
+            TruncationLimit::Nodes => "nodes",
+            TruncationLimit::Depth => "levels deep",
+            TruncationLimit::Siblings => "siblings per level",
+        }
+    }
+}
+
+/// Record of a walk that stopped early. Its presence on an [`AxTree`] means elements are
+/// missing from the tree — and therefore cannot be addressed by id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Truncation {
+    pub limit: TruncationLimit,
+    pub nodes_walked: usize,
+}
+
+impl Truncation {
+    /// The disclosure appended to every rendered outline. Says plainly that elements are
+    /// missing and names the pixel fallback — the same shape as [`AxTree::empty_guidance`],
+    /// because a truncated tree fails the agent the same way a treeless one does.
+    pub fn notice(&self) -> String {
+        format!(
+            "… tree truncated at {} {} ({} nodes walked). Some elements are NOT shown and \
+             cannot be addressed by id. Narrow the UI, or drive by pixels: glass_screenshot, \
+             then glass_click at x,y.",
+            self.limit.value(),
+            self.limit.label(),
+            self.nodes_walked,
+        )
+    }
+}
+
+/// Bookkeeping for a bounded pre-order walk. Every backend threads one of these through its
+/// traversal so the caps and the truncation record are computed one way rather than five.
+#[derive(Debug, Default)]
+pub struct WalkBudget {
+    count: usize,
+    truncated: Option<Truncation>,
+}
+
+impl WalkBudget {
+    pub fn new() -> WalkBudget {
+        WalkBudget::default()
+    }
+
+    /// Count a visited node. Call exactly once on entry to each node, before its children.
+    pub fn visit(&mut self) {
+        self.count += 1;
+    }
+
+    pub fn nodes_walked(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the node budget is spent.
+    pub fn nodes_exhausted(&self) -> bool {
+        self.count >= MAX_NODES
+    }
+
+    /// Whether `depth` has reached the nesting bound (so children must not be walked).
+    pub fn depth_exhausted(&self, depth: usize) -> bool {
+        depth >= MAX_DEPTH
+    }
+
+    /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
+    /// while any later hit is a consequence of having continued.
+    pub fn hit(&mut self, limit: TruncationLimit) {
+        let nodes_walked = self.count;
+        self.truncated.get_or_insert(Truncation {
+            limit,
+            nodes_walked,
+        });
+    }
+
+    /// The recorded truncation, or `None` when the walk completed.
+    pub fn truncation(&self) -> Option<Truncation> {
+        self.truncated
+    }
+}
+
 /// The active window's accessibility subtree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxTree {
     pub root: AxNode,
     /// Total node count; set by [`AxTree::assign_ids`].
     pub count: usize,
+    /// `Some` when the backend stopped walking early — see [`Truncation`]. `None` means the
+    /// tree is complete.
+    pub truncated: Option<Truncation>,
 }
 
 impl AxTree {
+    /// A complete (non-truncated) tree. Callers still run [`AxTree::assign_ids`]. A backend
+    /// that stopped early sets [`AxTree::truncated`] afterward.
+    pub fn new(root: AxNode) -> AxTree {
+        AxTree {
+            root,
+            count: 0,
+            truncated: None,
+        }
+    }
+
     /// Number nodes in pre-order DFS (`root = 0`) and set `count`. Backends leave
     /// ids unset; the core assigns them so numbering is identical across OSes.
     pub fn assign_ids(&mut self) {
@@ -312,21 +436,15 @@ impl AxTree {
     /// Render a compact indented outline, one line per node:
     /// `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]` — name/bounds/states
     /// elided when absent. Two spaces of indent per depth level.
+    ///
+    /// Pure tree text — no truncation notice is appended here. Keeping this render pure
+    /// means `scroll_to_element`'s saturation check (which diffs consecutive `to_outline`
+    /// strings) can't be perturbed by a truncation-status flip that has nothing to do with
+    /// scrolling, and it keeps the notice out of the untrusted envelope the caller wraps
+    /// this text in at the MCP boundary. See [`Self::truncation_notice`].
     pub fn to_outline(&self) -> String {
         fn walk(node: &AxNode, depth: usize, out: &mut String) {
-            let indent = "  ".repeat(depth);
-            let _ = write!(out, "{indent}#{} {:?}", node.id.0, node.role);
-            if let Some(name) = &node.name {
-                let _ = write!(out, " {name:?}");
-            }
-            if let Some(b) = &node.bounds {
-                let _ = write!(out, " ({},{} {}x{})", b.x, b.y, b.width, b.height);
-            }
-            let states = node.states.active();
-            if !states.is_empty() {
-                let _ = write!(out, " [{}]", states.join(","));
-            }
-            out.push('\n');
+            crate::outline::write_line(node, depth, out);
             for child in &node.children {
                 walk(child, depth + 1, out);
             }
@@ -334,6 +452,13 @@ impl AxTree {
         let mut out = String::new();
         walk(&self.root, 0, &mut out);
         out
+    }
+
+    /// The trusted truncation steer for the MCP boundary to surface as its own content
+    /// block — NOT baked into a render, so it is never buried inside the untrusted-content
+    /// envelope the app-derived outline is wrapped in. `None` when the tree is complete.
+    pub fn truncation_notice(&self) -> Option<String> {
+        self.truncated.map(|t| t.notice())
     }
 
     /// Guidance to surface when a snapshot exposes nothing to address — only the window
@@ -905,10 +1030,7 @@ mod tests {
     #[test]
     fn empty_guidance_flags_a_treeless_snapshot() {
         // Only the window root, no children → nothing to address → steer to pixels.
-        let empty = AxTree {
-            root: leaf(AxRole::Window, "App"),
-            count: 0,
-        };
+        let empty = AxTree::new(leaf(AxRole::Window, "App"));
         let hint = empty
             .empty_guidance()
             .expect("a root-only tree must yield guidance");
@@ -948,7 +1070,7 @@ mod tests {
             }),
             children: vec![button, leaf(AxRole::Label, "Ready")],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     #[test]
@@ -1100,7 +1222,7 @@ mod tests {
             bounds: None,
             children: vec![clickable, inert],
         };
-        let t = AxTree { root, count: 0 };
+        let t = AxTree::new(root);
         assert!(
             matches!(
                 element_match(&t, Some("Submit"), Some(AxRole::Button), None, ElementCondition::Appears),
@@ -1152,7 +1274,7 @@ mod tests {
             bounds: None,
             children: vec![container],
         };
-        let t = AxTree { root, count: 0 };
+        let t = AxTree::new(root);
         assert!(
             matches!(
                 element_match(
@@ -1306,5 +1428,80 @@ mod tests {
             !checked_but_not_checkable.active().contains(&"checked")
                 && !checked_but_not_checkable.active().contains(&"unchecked")
         );
+    }
+
+    #[test]
+    fn walk_budget_records_the_first_limit_hit_not_the_last() {
+        // The FIRST bound is the cause; a later one is a consequence of continuing to walk.
+        let mut b = WalkBudget::new();
+        b.visit();
+        b.hit(TruncationLimit::Depth);
+        b.hit(TruncationLimit::Nodes);
+        assert_eq!(
+            b.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
+    fn walk_budget_reports_no_truncation_when_no_limit_was_hit() {
+        let mut b = WalkBudget::new();
+        b.visit();
+        assert_eq!(b.truncation(), None);
+    }
+
+    #[test]
+    fn walk_budget_nodes_exhausted_flips_at_the_node_cap() {
+        let mut b = WalkBudget::new();
+        for _ in 0..MAX_NODES - 1 {
+            b.visit();
+        }
+        assert!(!b.nodes_exhausted(), "one visit short of the cap");
+        b.visit();
+        assert!(
+            b.nodes_exhausted(),
+            "the cap is reached at exactly MAX_NODES"
+        );
+    }
+
+    #[test]
+    fn truncation_notice_states_elements_are_missing_and_names_the_pixel_fallback() {
+        let n = Truncation {
+            limit: TruncationLimit::Nodes,
+            nodes_walked: 1500,
+        }
+        .notice();
+        assert!(
+            n.contains("NOT shown") && n.contains("glass_screenshot"),
+            "notice must be unmissable and steer to pixels: {n}"
+        );
+    }
+
+    #[test]
+    fn truncation_notice_is_some_when_the_walk_stopped_early() {
+        // `to_outline` itself stays pure tree text (see its doc comment); the truncation
+        // fact is surfaced separately via `truncation_notice` so a caller can never render
+        // a truncated tree as if it were complete without actively dropping this `Some`.
+        let mut t = sample_tree();
+        t.assign_ids();
+        t.truncated = Some(Truncation {
+            limit: TruncationLimit::Depth,
+            nodes_walked: 42,
+        });
+        assert!(!t.to_outline().contains("truncated"), "pure tree text");
+        let notice = t.truncation_notice().expect("a truncated tree has one");
+        assert!(notice.contains("truncated"), "notice: {notice}");
+    }
+
+    #[test]
+    fn truncation_notice_is_none_when_the_tree_is_complete() {
+        let mut t = sample_tree();
+        t.assign_ids();
+        assert!(t.truncation_notice().is_none());
+    }
+
+    #[test]
+    fn new_builds_a_complete_tree() {
+        assert_eq!(AxTree::new(leaf(AxRole::Window, "App")).truncated, None);
     }
 }

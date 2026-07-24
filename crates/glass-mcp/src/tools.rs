@@ -271,12 +271,21 @@ pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
 
 pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
     let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
-    let body = tree.to_outline();
-    // The outline is app-derived → untrusted-wrapped. When the tree has nothing to
-    // address, add glass's own (trusted, unwrapped) hint steering to the pixel loop.
+    // The agent-facing render: wrapper chains collapsed. The session cache keeps the full
+    // tree, so every elided node is still addressable by id. Truncation is disclosed
+    // separately below, not baked into this text — see the comment there.
+    let body = glass_core::outline::render_compact(&tree);
+    // The outline is app-derived → untrusted-wrapped. glass's own steers (the empty-tree
+    // hint, the truncation notice) are trusted, separate, unwrapped blocks — never baked
+    // into the untrusted-wrapped body, or an instruction of glass's own ("drive by
+    // pixels…") would end up under a directive telling the agent to ignore instructions
+    // in that block.
     let mut contents = vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))];
     if let Some(hint) = tree.empty_guidance() {
         contents.push(OutContent::Text(hint.to_string()));
+    }
+    if let Some(notice) = tree.truncation_notice() {
+        contents.push(OutContent::Text(notice));
     }
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
@@ -331,12 +340,18 @@ fn resolve_return(
             // tree (not pixels) and still returns the freshest tree — the caller asked for it.
             let _ = glass.wait_stable(&settle_params());
             let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
-            Ok((
-                None,
-                vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                    &tree.to_outline(),
-                ))],
-            ))
+            // Same shape as `a11y_snapshot`: the app-derived outline stays untrusted-wrapped;
+            // glass's own steers are separate trusted blocks, not baked into that body.
+            let mut extra = vec![OutContent::Text(crate::untrusted::wrap_untrusted(
+                &glass_core::outline::render_compact(&tree),
+            ))];
+            if let Some(hint) = tree.empty_guidance() {
+                extra.push(OutContent::Text(hint.to_string()));
+            }
+            if let Some(notice) = tree.truncation_notice() {
+                extra.push(OutContent::Text(notice));
+            }
+            Ok((None, extra))
         }
         Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
     }
@@ -425,8 +440,8 @@ pub(crate) mod testutil {
     use glass_core::{
         Accessibility, AppSpec, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
         AxTree, Backend, BaselineStore, Frame, Glass, GlassError, KeyEvent, Platform,
-        PlatformFactory, PointerEvent, Region, Result, Stream, WindowGeometry, WindowId,
-        WindowInfo, WindowOp,
+        PlatformFactory, PointerEvent, Region, Result, Stream, Truncation, TruncationLimit,
+        WindowGeometry, WindowId, WindowInfo, WindowOp,
     };
 
     use super::{OutContent, ToolOutput};
@@ -672,7 +687,7 @@ pub(crate) mod testutil {
             }),
             children: vec![button],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
     }
 
     /// A window root with no child elements — the "app publishes no usable tree" shape.
@@ -692,7 +707,19 @@ pub(crate) mod testutil {
             }),
             children: vec![],
         };
-        AxTree { root, count: 0 }
+        AxTree::new(root)
+    }
+
+    /// `fake_tree` with `truncated` set — the "walk stopped early" shape, for testing that
+    /// the truncation steer surfaces as its own trusted block rather than being baked into
+    /// the untrusted-wrapped outline.
+    pub fn truncated_tree() -> AxTree {
+        let mut t = fake_tree();
+        t.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            nodes_walked: 1500,
+        });
+        t
     }
 
     pub fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
@@ -1015,6 +1042,66 @@ mod tests {
                 );
             }
             _ => panic!("expected the pixel-hint text"),
+        }
+    }
+
+    #[test]
+    fn a11y_snapshot_truncation_steer_is_a_trusted_block_outside_the_untrusted_envelope() {
+        // Regression for the finding that glass's own truncation steer was getting baked
+        // into `render_compact`'s output and so ended up buried inside the untrusted
+        // envelope — under a directive telling the agent to ignore instructions in that
+        // block, even though the steer ("drive by pixels…") IS an instruction from glass
+        // itself. It must be its own trusted, unwrapped `OutContent::Text` block.
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), truncated_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let out = a11y_snapshot(&mut g).unwrap();
+        assert_envelope(&out, "glass_a11y_snapshot");
+        // [0]=envelope, [1]=untrusted-wrapped outline, [2]=glass's trusted truncation steer.
+        assert_eq!(
+            out.0.len(),
+            3,
+            "envelope + wrapped outline + trusted truncation steer"
+        );
+        match &out.0[1] {
+            OutContent::Text(t) => {
+                assert!(
+                    t.starts_with(crate::untrusted::NOTE)
+                        && t.contains("⟦untrusted:")
+                        && t.contains("⟦/untrusted:"),
+                    "the outline itself stays untrusted-wrapped: {t}"
+                );
+                assert!(
+                    !t.contains("truncated"),
+                    "the truncation notice must NOT be baked into the untrusted-wrapped \
+                     outline body: {t}"
+                );
+            }
+            _ => panic!("expected the wrapped outline text"),
+        }
+        match &out.0[2] {
+            OutContent::Text(t) => {
+                assert!(t.contains("truncated"), "truncation steer: {t}");
+                assert!(
+                    t.contains("glass_screenshot"),
+                    "the steer names the pixel fallback: {t}"
+                );
+                assert!(
+                    !t.starts_with(crate::untrusted::NOTE) && !t.contains("⟦untrusted:"),
+                    "the steer is glass's own trusted guidance, outside the untrusted \
+                     markers entirely: {t}"
+                );
+            }
+            _ => panic!("expected the trusted truncation-steer text"),
         }
     }
 
