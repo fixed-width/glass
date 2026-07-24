@@ -240,14 +240,13 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 /// id against a different tree and writes to the wrong element. Sharing the decision makes
 /// that divergence impossible to introduce by editing only one of them.
 //
-// The exactly-at-cap regression — a complete tree of MAX_NODES nodes must report `None`, since
-// the last node to arrive wasn't declined — is unit-tested directly in the Android and iOS
-// mappers, which build a synthetic tree in-process. This reader shares that loop shape but reads
-// a live tree over IPC, and `walk` currently spends several sequential round-trips per node, so a
-// tree at the cap would land on `SNAPSHOT_TIMEOUT` and yield a flaky test rather than a reliable
-// one. That is a cost problem, not a fundamental one: reducing the per-node round-trips (batching
-// the attribute reads, or issuing the independent ones concurrently) brings a live at-cap test
-// back within budget, and it should be added alongside that work.
+// The exactly-at-cap boundary — a *complete* tree of exactly MAX_NODES must report `None`, since
+// the last node to arrive wasn't declined — is unit-tested in the Android/iOS mappers, which
+// build a synthetic tree of a precise size in-process (a live GTK tree can't be sized to the node
+// exactly). The live *over-cap* path — a real AT-SPI tree past MAX_NODES yields a bounded,
+// complete prefix flagged `Nodes` — is covered by `snapshot_past_node_cap_is_bounded_complete_and_flagged`
+// in tests/integration.rs (run via scripts/test-a11y.sh). `walk` issues each node's independent
+// reads concurrently, so a cap-sized live tree snapshots well within `SNAPSHOT_TIMEOUT`.
 fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
     if budget.depth_exhausted(depth) {
         budget.hit(TruncationLimit::Depth);
@@ -349,16 +348,30 @@ async fn walk(
     budget: &mut WalkBudget,
 ) -> Result<AxNode> {
     budget.visit();
-    let role = proxy.get_role().await.map_err(bus_err)?;
-    let raw_role = proxy.get_role_name().await.unwrap_or_default();
-    let name = nonempty(proxy.name().await.unwrap_or_default());
-    let states = map_states(&proxy.get_state().await.map_err(bus_err)?);
-    let bounds = extents(proxy, conn).await;
+    // Issue the six independent per-node reads concurrently on the shared connection and await
+    // the slowest, instead of paying six sequential D-Bus round-trips (~6x the per-node latency).
+    // zbus multiplexes concurrent method calls over one connection. Traversal order, `budget`
+    // accounting, the child-gate, and child recursion below are all unchanged, so node ids stay
+    // in lockstep with `find_nth`. On the error path `join!` completes all six before we bail
+    // (vs. short-circuiting) — the result is identical, at the cost of a few reads on a snapshot
+    // that was already failing.
+    let (role_res, raw_role_res, name_res, state_res, bounds, child_refs_res) = tokio::join!(
+        proxy.get_role(),
+        proxy.get_role_name(),
+        proxy.name(),
+        proxy.get_state(),
+        extents(proxy, conn),
+        proxy.get_children(),
+    );
+    let role = role_res.map_err(bus_err)?;
+    let raw_role = raw_role_res.unwrap_or_default();
+    let name = nonempty(name_res.unwrap_or_default());
+    let states = map_states(&state_res.map_err(bus_err)?);
 
     let mut children = Vec::new();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
-    let child_refs = proxy.get_children().await.map_err(bus_err)?;
+    let child_refs = child_refs_res.map_err(bus_err)?;
     if !child_refs.is_empty() && may_explore_children(budget, depth) {
         let mut siblings = 0usize;
         for child_ref in child_refs {

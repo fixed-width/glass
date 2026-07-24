@@ -804,3 +804,69 @@ fn scroll_to_element_reports_unmatched_for_an_absent_row() {
     assert!(out.reversed, "should have swept both ends; {out:?}");
     glass.stop().expect("stop");
 }
+
+/// A real AT-SPI tree larger than `MAX_NODES` snapshots into a bounded, complete prefix flagged
+/// `Nodes` — the live end-to-end truncation path the in-process Android/iOS mapper unit tests
+/// cannot cover. Also logs the snapshot wall-time (a fast walk is why this test is practical;
+/// asserted for correctness only, never a latency bound, so it cannot flake on a loaded machine).
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn snapshot_past_node_cap_is_bounded_complete_and_flagged() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_bench_fixture.py"
+    );
+    let mut glass = glass_x11_with_a11y();
+    glass
+        .start(&AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![
+                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+                ("GDK_BACKEND".into(), "x11".into()),
+            ],
+            window_hint: Some(WindowHint {
+                title: Some("Glass A11y Bench".into()),
+                class: None,
+            }),
+            timeout_ms: 10_000,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: true,
+        })
+        .expect("bench fixture launch");
+
+    // Give the AT-SPI tree a moment to populate after the window maps (same convention as
+    // snapshot_finds_gtk_widgets et al.), before starting the timed snapshot below. This
+    // fixture realizes ~1300 widgets, so registration with the AT-SPI registry lags the
+    // window map more than the small fixture's does.
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+    let started = std::time::Instant::now();
+    let tree = glass.a11y_snapshot().expect("a11y snapshot");
+    eprintln!(
+        "over-cap snapshot: {} nodes in {:?}",
+        tree.to_outline().lines().count(),
+        started.elapsed()
+    );
+    glass.stop().expect("stop");
+
+    // The Nodes bound fired on a real tree (the fixture is wide/shallow, so neither the depth
+    // nor sibling bound bites first).
+    assert_eq!(
+        tree.truncated.map(|t| t.limit),
+        Some(glass_core::TruncationLimit::Nodes),
+        "a >MAX_NODES tree must be flagged truncated at the Nodes limit"
+    );
+    // Bounded: the kept tree is exactly the node cap (one line per node in the full outline).
+    assert_eq!(
+        tree.to_outline().lines().count(),
+        glass_core::MAX_NODES,
+        "the kept tree is capped at MAX_NODES"
+    );
+    // Complete prefix: real early content is present, not an empty/scaffolding-only stub.
+    assert!(
+        find_role(&tree.root, glass_core::AxRole::Button).is_some(),
+        "the bounded prefix still contains real widgets from the top of the tree"
+    );
+}
