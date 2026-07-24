@@ -200,7 +200,19 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
             ("window", args, None)
         }
         Actuation::ClickElement { method, .. } => {
-            ("click_element", json!({ "method": method }), None)
+            // A failed click has no method: omit the key rather than writing a null, so a
+            // reader never has to distinguish "no method recorded" from "method: null".
+            let args = match method {
+                Some(m) => {
+                    let mut args = json!({ "method": m.label() });
+                    if let Some(reason) = m.native_fallback() {
+                        args["native_fallback"] = json!(reason);
+                    }
+                    args
+                }
+                None => json!({}),
+            };
+            ("click_element", args, None)
         }
         Actuation::SetValue { text, .. } => ("set_value", json!({}), Some((*text).to_string())),
     })
@@ -440,8 +452,8 @@ pub fn resolve(
 mod tests {
     use super::*;
     use glass_core::{
-        Actuation, ActuationContext, AuditOutcome, ElementRef, KeyEvent, MouseButton, PointerEvent,
-        WindowRef,
+        Actuation, ActuationContext, AuditOutcome, ClickMethod, ElementRef, KeyEvent, MouseButton,
+        PointerEvent, WindowRef,
     };
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -632,19 +644,25 @@ mod tests {
         assert_eq!(r["content"]["len"], 1);
     }
 
-    #[test]
-    fn click_element_carries_the_actuating_method() {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let el = ElementRef {
+    fn click_el() -> ElementRef {
+        ElementRef {
             id: 1,
             role: Some("Button".into()),
             name: Some("Save".into()),
+        }
+    }
+
+    #[test]
+    fn click_element_carries_the_actuating_method_and_its_fallback_reason() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let method = ClickMethod::Pointer {
+            native_fallback: "element exposes no activation action".into(),
         };
         s.record(
             &Actuation::ClickElement {
-                element: el,
-                method: Some("pointer"),
+                element: click_el(),
+                method: Some(&method),
             },
             &ActuationContext::default(),
             &ok(),
@@ -652,7 +670,57 @@ mod tests {
         );
         let r = &lines(&buf)[0];
         assert_eq!(r["action"], "click_element");
-        assert_eq!(r["args"]["method"], "pointer");
+        assert_eq!(r["args"]["method"], method.label());
+        assert_eq!(
+            r["args"]["native_fallback"], "element exposes no activation action",
+            "the pointer path records WHY the native action wasn't used: {r}"
+        );
+    }
+
+    #[test]
+    fn click_element_native_action_records_no_fallback_reason() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let method = ClickMethod::NativeAction;
+        s.record(
+            &Actuation::ClickElement {
+                element: click_el(),
+                method: Some(&method),
+            },
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        let r = &lines(&buf)[0];
+        assert_eq!(r["args"]["method"], method.label());
+        assert!(
+            r["args"].get("native_fallback").is_none(),
+            "nothing fell back: {r}"
+        );
+    }
+
+    #[test]
+    fn click_element_failure_omits_method() {
+        // Neither path actuated, so there is no method — the key must be ABSENT, not null.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        s.record(
+            &Actuation::ClickElement {
+                element: click_el(),
+                method: None,
+            },
+            &ActuationContext::default(),
+            &AuditOutcome {
+                ok: false,
+                error: Some("element #1 changed since the snapshot; re-snapshot".into()),
+            },
+            Duration::from_millis(1),
+        );
+        let r = &lines(&buf)[0];
+        assert_eq!(r["action"], "click_element");
+        assert_eq!(r["result"]["ok"], false);
+        assert!(r["args"].get("method").is_none(), "no null method: {r}");
+        assert!(r["args"].get("native_fallback").is_none(), "{r}");
     }
 
     #[test]

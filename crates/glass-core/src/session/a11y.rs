@@ -118,7 +118,7 @@ impl Glass {
         self.emit_audit(
             &crate::audit::Actuation::ClickElement {
                 element,
-                method: result.as_ref().ok().map(ClickMethod::label),
+                method: result.as_ref().ok(),
             },
             crate::audit::AuditOutcome::from_result(&result),
             t.elapsed(),

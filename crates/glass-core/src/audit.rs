@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::accessibility::ClickMethod;
 use crate::error::Result;
 use crate::platform::{AppSpec, KeyEvent, PointerEvent, WindowOp};
 
@@ -75,9 +76,10 @@ pub enum Actuation<'a> {
     },
     ClickElement {
         element: ElementRef,
-        /// `ClickMethod::label()` of the path that actuated; `None` when the
-        /// click errored before either path completed.
-        method: Option<&'static str>,
+        /// How the click actuated — the sink renders its label and, for the pointer
+        /// path, the reason the native action was not used. `None` when the click
+        /// ultimately failed (neither path succeeded).
+        method: Option<&'a ClickMethod>,
     },
     SetValue {
         element: ElementRef,
@@ -124,16 +126,22 @@ mod tests {
             role: Some("Button".into()),
             name: Some("Save".into()),
         };
+        let method = ClickMethod::Pointer {
+            native_fallback: "element exposes no activation action".into(),
+        };
         let act = Actuation::ClickElement {
             element,
-            method: Some("native-action"),
+            method: Some(&method),
         };
-        assert!(matches!(
-            act,
-            Actuation::ClickElement {
-                method: Some("native-action"),
-                ..
-            }
-        ));
+        let Actuation::ClickElement { method: got, .. } = act else {
+            panic!("wrong variant");
+        };
+        // The sink renders both halves; borrowing the whole method (not a pre-rendered
+        // label) is what keeps the fallback reason reachable.
+        assert_eq!(got.map(ClickMethod::label), Some(method.label()));
+        assert_eq!(
+            got.and_then(ClickMethod::native_fallback),
+            Some("element exposes no activation action")
+        );
     }
 }
