@@ -457,11 +457,21 @@ enum ActionAttempt {
     /// An action from the ladder was found and fired; the bool is the
     /// bus-reported success.
     Fired(bool),
-    /// No Action interface, or none of `names` present.
+    /// The node exposes no Action interface, or none of `names` is among its actions.
+    /// Nothing was dispatched.
     Unavailable,
+    /// An AT-SPI call failed, so the outcome is genuinely unknown — in particular a
+    /// failed `DoAction` may still have reached the toolkit. Distinct from
+    /// `Fired(false)` (the toolkit answered "I did not run it") so a caller can't
+    /// report a transport failure as a truthful "did not run".
+    Error(String),
 }
 
 /// Fire the node's first Action whose name is in `names`.
+///
+/// A proxy that cannot be *built* is `Unavailable`: construction dispatches no action, and
+/// the overwhelmingly common cause is the node not implementing the Action interface at all.
+/// From `NActions` onward every RPC failure is `Error`.
 async fn try_action(
     conn: &zbus::Connection,
     node: &AccessibleProxy<'_>,
@@ -479,11 +489,20 @@ async fn try_action(
     let Ok(a) = action.build().await else {
         return ActionAttempt::Unavailable;
     };
-    let n = a.n_actions().await.unwrap_or(0);
+    let n = match a.n_actions().await {
+        Ok(n) => n,
+        Err(e) => return ActionAttempt::Error(format!("NActions: {e}")),
+    };
     for i in 0..n {
-        let name = a.get_name(i).await.unwrap_or_default().to_ascii_lowercase();
+        let name = match a.get_name(i).await {
+            Ok(name) => name.to_ascii_lowercase(),
+            Err(e) => return ActionAttempt::Error(format!("GetName({i}): {e}")),
+        };
         if names.contains(&name.as_str()) {
-            return ActionAttempt::Fired(a.do_action(i).await.unwrap_or(false));
+            return match a.do_action(i).await {
+                Ok(ok) => ActionAttempt::Fired(ok),
+                Err(e) => ActionAttempt::Error(format!("DoAction({i}): {e}")),
+            };
         }
     }
     ActionAttempt::Unavailable
@@ -510,6 +529,10 @@ async fn set_toggle(
     if node.get_state().await.map_err(bus_err)?.contains(flag) == target_on {
         return Ok(()); // already in the desired state
     }
+    // `Error` (an AT-SPI call that failed) folds in with "did not fire" here, keeping
+    // `set_value`'s behavior unchanged: this path verifies the state below and reports
+    // `AxValueNotApplied` on no change, so an ambiguous outcome is caught by that check
+    // rather than needing its own classification.
     if !matches!(
         try_action(conn, node, TOGGLE_ACTION_NAMES).await,
         ActionAttempt::Fired(true)
@@ -559,6 +582,12 @@ async fn invoke_async(ctx: &AxContext, target: &AxTarget) -> Result<()> {
             "the toolkit reported the action did not run".into(),
         )),
         ActionAttempt::Unavailable => Err(GlassError::AxActionUnavailable(target.id.0)),
+        // Not `AxActionUnavailable`: the call may have reached the toolkit, so this must not
+        // be fallback-eligible (see `GlassError::invoke_fallback_eligible`) — a pointer click
+        // on top of a landed action would actuate the control twice.
+        ActionAttempt::Error(msg) => Err(GlassError::AccessibilityUnavailable(format!(
+            "AT-SPI action call failed: {msg}"
+        ))),
     }
 }
 
