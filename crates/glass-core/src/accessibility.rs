@@ -51,6 +51,45 @@ pub enum AxRole {
 }
 
 impl AxRole {
+    /// Every role except [`AxRole::Other`], which is the sink for unmapped native tokens
+    /// rather than a mapping target. Used by the per-backend role-parity tests and by
+    /// [`crate::role_support::ROLE_SUPPORT`].
+    pub const ALL: [AxRole; 33] = [
+        AxRole::Application,
+        AxRole::Window,
+        AxRole::Dialog,
+        AxRole::Group,
+        AxRole::Button,
+        AxRole::ToggleButton,
+        AxRole::RadioButton,
+        AxRole::CheckBox,
+        AxRole::MenuBar,
+        AxRole::Menu,
+        AxRole::MenuItem,
+        AxRole::Label,
+        AxRole::TextField,
+        AxRole::TextArea,
+        AxRole::ComboBox,
+        AxRole::List,
+        AxRole::ListItem,
+        AxRole::Table,
+        AxRole::Cell,
+        AxRole::Tree,
+        AxRole::TreeItem,
+        AxRole::TabList,
+        AxRole::Tab,
+        AxRole::ScrollBar,
+        AxRole::Slider,
+        AxRole::SpinButton,
+        AxRole::ProgressBar,
+        AxRole::Image,
+        AxRole::Link,
+        AxRole::Separator,
+        AxRole::Toolbar,
+        AxRole::StatusBar,
+        AxRole::Heading,
+    ];
+
     /// Whether this role denotes an element a user acts on (clicks / types into) —
     /// the elements worth a Set-of-Mark number. Containers, the window, and static
     /// text return `false`.
