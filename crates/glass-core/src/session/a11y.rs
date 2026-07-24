@@ -112,15 +112,16 @@ impl Glass {
     fn click_element_inner(&mut self, id: AxNodeId) -> Result<ClickMethod> {
         // Native action first: works for occluded/off-screen/boundless elements and
         // (on backends whose action API is out-of-band) doesn't move the cursor.
+        //
+        // Falling back is an allowlist, not a denylist: only an attempt that dispatched
+        // NOTHING may be retried with the pointer (see
+        // [`GlassError::invoke_fallback_eligible`]). Anything else — a reported action
+        // failure, an ambiguous transport error, a drifted tree, the pre-check errors —
+        // propagates, because clicking on top of a native action that may still land would
+        // actuate the control twice while the result claimed only "pointer" ran.
         let native_fallback = match self.try_native_invoke(id) {
             Ok(()) => return Ok(ClickMethod::NativeAction),
-            // Propagate-class: a drifted tree mis-clicks by stale bounds too, and the
-            // pre-checks (no snapshot / unknown id) fail the pointer path identically.
-            Err(
-                e @ (GlassError::AxElementChanged(_)
-                | GlassError::NoAxSnapshot
-                | GlassError::AxElementNotFound(_)),
-            ) => return Err(e),
+            Err(e) if !e.invoke_fallback_eligible() => return Err(e),
             Err(e) => native_fallback_reason(&e),
         };
         let (bounds, checkable, trailing_toggle_backend, active_geo) = {
@@ -431,11 +432,15 @@ impl Glass {
 /// Short, agent-facing reason a native-invoke attempt fell back to the pointer path.
 /// `AxUnsupported`'s own `Display` is snapshot-oriented (it tells the agent to screenshot
 /// instead), which would mislead in a click result — map it.
+///
+/// Only the two fallback-eligible errors reach here (see
+/// [`GlassError::invoke_fallback_eligible`], the single place that decides). The `other` arm
+/// is unreachable defence-in-depth, kept so this stays a total function if the eligibility
+/// set ever widens.
 fn native_fallback_reason(e: &GlassError) -> String {
     match e {
         GlassError::AxUnsupported => "backend has no native action path".into(),
         GlassError::AxActionUnavailable(_) => "element exposes no activation action".into(),
-        GlassError::AxActionFailed(_, msg) => format!("native action failed: {msg}"),
         other => format!("native action error: {other}"),
     }
 }
@@ -1185,23 +1190,24 @@ mod tests {
     }
 
     #[test]
-    fn click_element_falls_back_when_the_action_fails() {
+    fn click_element_action_failure_propagates_and_never_pointer_clicks() {
+        // A native action that reported failure may still have been DISPATCHED (the backend
+        // fires it on a detached worker and can lose the answer), so a pointer click on top
+        // of it would actuate the control twice. Only outcomes that dispatched nothing may
+        // fall back — everything else fails closed.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
         let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Fail);
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
-        let method = g.click_element(AxNodeId(1)).unwrap();
-        match method {
-            ClickMethod::Pointer { native_fallback } => {
-                assert!(
-                    native_fallback.starts_with("native action failed:"),
-                    "{native_fallback}"
-                )
-            }
-            m => panic!("expected pointer fallback, got {m:?}"),
-        }
-        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 20)));
+        assert!(matches!(
+            g.click_element(AxNodeId(1)).unwrap_err(),
+            GlassError::AxActionFailed(1, _)
+        ));
+        assert!(
+            clicks.lock().unwrap().is_empty(),
+            "no pointer event after a possibly-dispatched native action"
+        );
     }
 
     #[test]

@@ -79,8 +79,13 @@ impl Accessibility for WindowsA11y {
         });
         match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
             Ok(r) => r,
+            // The worker thread outlives this timeout, so the pattern call may already have
+            // been dispatched — say so. This error is NOT fallback-eligible (see
+            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
             Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility invoke timed out (UIA not responding)".into(),
+                "accessibility invoke timed out (UIA not responding); the action may still \
+                 land — re-snapshot before retrying"
+                    .into(),
             )),
         }
     }

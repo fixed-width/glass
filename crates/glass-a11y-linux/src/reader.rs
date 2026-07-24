@@ -71,8 +71,13 @@ impl Accessibility for LinuxA11y {
         });
         match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
             Ok(r) => r,
+            // The worker thread outlives this timeout, so the action may already have been
+            // dispatched — say so. This error is NOT fallback-eligible (see
+            // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.
             Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility invoke timed out (a11y bus not responding)".into(),
+                "accessibility invoke timed out (a11y bus not responding); the action may \
+                 still land — re-snapshot before retrying"
+                    .into(),
             )),
         }
     }
