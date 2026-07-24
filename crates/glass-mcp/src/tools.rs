@@ -271,7 +271,9 @@ pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
 
 pub fn a11y_snapshot(glass: &mut Glass) -> ToolResult {
     let tree = glass.a11y_snapshot().map_err(|e| e.to_string())?;
-    let body = tree.to_outline();
+    // The agent-facing render: wrapper chains collapsed, truncation disclosed. The session
+    // cache keeps the full tree, so every elided node is still addressable by id.
+    let body = glass_core::outline::render_compact(&tree);
     // The outline is app-derived → untrusted-wrapped. When the tree has nothing to
     // address, add glass's own (trusted, unwrapped) hint steering to the pixel loop.
     let mut contents = vec![OutContent::Text(crate::untrusted::wrap_untrusted(&body))];
@@ -334,7 +336,7 @@ fn resolve_return(
             Ok((
                 None,
                 vec![OutContent::Text(crate::untrusted::wrap_untrusted(
-                    &tree.to_outline(),
+                    &glass_core::outline::render_compact(&tree),
                 ))],
             ))
         }
