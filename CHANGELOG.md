@@ -31,6 +31,14 @@ internal refactors, CI, or test-only changes.
 - `glass_a11y_snapshot` accepts an optional `max_nodes`: raise the element cap for a large app,
   or pass `0` to remove the element-count limit. The default cap is unchanged, and when a snapshot
   is truncated the notice now reports the actual limit and says how to widen it.
+- `glass_click_element` now actuates via the platform's native accessibility action
+  when the element exposes one (AT-SPI Action on Linux, UIA patterns on Windows,
+  AXPress on macOS), falling back to the synthetic pointer click otherwise. The
+  result's new `method` field reports which path ran (`native-action`/`pointer`),
+  with `native_fallback` explaining any fallback. Native actuation works for
+  occluded or scrolled-off-screen elements and, on macOS, no longer moves the
+  cursor. A click whose element no longer matches the snapshot now errors
+  (`element changed; re-snapshot`) instead of clicking stale coordinates.
 
 ### Fixed
 - A transiently stalled Xvfb no longer fails `glass_start` on Linux/X11: if the private X
