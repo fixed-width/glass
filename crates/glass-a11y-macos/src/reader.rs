@@ -178,6 +178,10 @@ impl Accessibility for MacosA11y {
         if !ffi::action_names(&el).iter().any(|a| a == "AXPress") {
             return Err(GlassError::AxActionUnavailable(target.id.0));
         }
+        // No post-actuation verify here (unlike the Linux/Windows toggle rungs): AXPress is a
+        // generic press with no universal post-state to read back — a checkbox's AXValue, a
+        // button's nothing, a menu item's opened menu — so there is nothing to confirm against.
+        // Accepted parity gap: a control that accepts AXPress without acting reports success.
         ffi::perform_action(&el, "AXPress").map_err(|e| GlassError::AxActionFailed(target.id.0, e))
     }
 }

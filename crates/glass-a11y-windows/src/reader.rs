@@ -25,8 +25,11 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the id sits far enough away to be rejected. Generous to avoid false-rejects.
 const SET_VALUE_BOUNDS_TOL: i64 = 12;
 /// How long `run_set_value` polls the read-back for the value to change before declaring the
-/// write a no-op. A real numeric set lands within a frame or two; well under the 10s outer cap.
+/// write a no-op — also the bound `run_invoke`'s Toggle rung gives the state to flip. A real
+/// numeric set lands within a frame or two; well under the 10s outer cap.
 const SET_VALUE_VERIFY_MS: u64 = 800;
+/// Interval between read-backs while waiting for a write / toggle to land.
+const VERIFY_POLL_MS: u64 = 20;
 
 #[derive(Default)]
 pub struct WindowsA11y;
@@ -322,7 +325,7 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         if Instant::now() >= deadline {
             return Err(GlassError::AxValueNotApplied(target.id.0));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
     }
 }
 
@@ -337,6 +340,9 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 /// first pattern the control exposes wins; a control that publishes none of the four is
 /// `AxActionUnavailable` (the reader itself is fine — this element just offers no actuation verb),
 /// which `click_element` (glass-core) treats as a fall-back-to-pointer signal, not a fatal error.
+///
+/// Only the Toggle rung has a post-state a client can read back, so only it verifies actuation;
+/// the other three are fire-and-report, exactly as their patterns define.
 fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
     let automation = UIAutomation::new().map_err(|e| {
         GlassError::AccessibilityUnavailable(format!("UI Automation unavailable: {e}"))
@@ -365,7 +371,27 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         return p.invoke().map_err(fail);
     }
     if let Ok(p) = el.get_pattern::<UITogglePattern>() {
-        return p.toggle().map_err(fail);
+        // Toggle is the one rung with a readable post-state, so don't take the ack as proof:
+        // a provider that accepts `Toggle()` without applying it would otherwise report a
+        // successful click on a control that never moved. Read before, fire, then poll until
+        // the state differs — same cadence as `run_set_value`'s write verify.
+        let before = p.get_toggle_state().map_err(fail)?;
+        p.toggle().map_err(fail)?;
+        let deadline = Instant::now() + Duration::from_millis(SET_VALUE_VERIFY_MS);
+        loop {
+            if p.get_toggle_state().map_err(fail)? != before {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // `AxActionFailed`, not `AxActionUnavailable`: the toggle WAS dispatched, so
+                // this must not fall back to a pointer click that could actuate it twice.
+                return Err(GlassError::AxActionFailed(
+                    target.id.0,
+                    "the toggle action was acknowledged but the state did not change".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(VERIFY_POLL_MS));
+        }
     }
     if let Ok(p) = el.get_pattern::<UISelectionItemPattern>() {
         return p.select().map_err(fail);
