@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    Result, TruncationLimit, WalkBudget,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -82,7 +82,7 @@ impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let (window_el, scale) = resolve_window(ctx)?;
 
-        let mut budget = WalkBudget::new();
+        let mut budget = WalkBudget::with_limits(ctx.limits);
         let root = walk(&window_el, &ctx.window, scale, 0, &mut budget);
         let mut tree = AxTree::new(root);
         tree.truncated = budget.truncation();
@@ -97,7 +97,7 @@ impl Accessibility for MacosA11y {
         // Start at 0 so `find_nth`'s pre-order numbering matches `snapshot`'s `walk` +
         // `AxTree::assign_ids` (root id = 0); the role+name+bounds fingerprint below
         // backstops any residual drift between the snapshot and this re-walk.
-        let mut budget = WalkBudget::new();
+        let mut budget = WalkBudget::with_limits(ctx.limits);
         let el = find_nth(window_el, 0, &mut budget, target.id.0)
             .ok_or(GlassError::AxElementNotFound(target.id.0))?;
 
@@ -325,7 +325,7 @@ fn walk(
                 break;
             }
             siblings += 1;
-            if siblings > MAX_SIBLINGS {
+            if siblings > budget.max_siblings() {
                 budget.hit(TruncationLimit::Siblings);
                 break;
             }
@@ -416,7 +416,7 @@ fn find_nth(
             break;
         }
         siblings += 1;
-        if siblings > MAX_SIBLINGS {
+        if siblings > budget.max_siblings() {
             budget.hit(TruncationLimit::Siblings);
             break; // same per-level bound as walk(), so find_nth can't spin either
         }

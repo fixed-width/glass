@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    TruncationLimit, WalkBudget,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIRangeValuePattern, UISelectionItemPattern, UITogglePattern,
@@ -84,7 +84,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     let window = find_app_window(&automation, ctx)?;
 
     let origin = (ctx.window.x, ctx.window.y);
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(ctx.limits);
     let root_node = walk(&walker, &window, origin, 0, &mut budget)?;
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
@@ -149,7 +149,7 @@ fn walk(
                 break;
             }
             siblings += 1;
-            if siblings > MAX_SIBLINGS {
+            if siblings > budget.max_siblings() {
                 budget.hit(TruncationLimit::Siblings);
                 break;
             }
@@ -264,7 +264,7 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
 
     // Start at 0 so find_nth's pre-order numbering matches snapshot's walk +
     // assign_ids (root id = 0); the role+name verify backstops any drift.
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(ctx.limits);
     let el = find_nth(&walker, &window, 0, &mut budget, target.id.0)
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
 
@@ -364,7 +364,7 @@ fn find_nth(
             break;
         }
         siblings += 1;
-        if siblings > MAX_SIBLINGS {
+        if siblings > budget.max_siblings() {
             budget.hit(TruncationLimit::Siblings);
             break; // same per-level bound as walk(), so find_nth can't spin either
         }

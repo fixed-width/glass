@@ -1,7 +1,7 @@
 //! Pure mapping from `uiautomator dump` XML into glass's normalized `AxTree`.
 
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, MAX_SIBLINGS,
+    AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 
@@ -71,7 +71,7 @@ pub fn check_dump_status(stdout: &str) -> Result<()> {
 /// Parse uiautomator XML into an `AxTree`. Ids are left unset (the caller runs
 /// `AxTree::assign_ids`). The hierarchy is wrapped in a synthetic `Window` root
 /// sized to the app window.
-pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
+pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Result<AxTree> {
     let doc = roxmltree::Document::parse(xml)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("uiautomator XML parse: {e}")))?;
     let hierarchy = doc.root_element();
@@ -80,7 +80,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
             "uiautomator XML has no <hierarchy> root".into(),
         ));
     }
-    let mut budget = WalkBudget::new();
+    let mut budget = WalkBudget::with_limits(limits);
     let mut children = Vec::new();
     for (i, n) in hierarchy
         .children()
@@ -94,7 +94,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry) -> Result<AxTree> {
             budget.hit(TruncationLimit::Nodes);
             break;
         }
-        if i >= MAX_SIBLINGS {
+        if i >= budget.max_siblings() {
             budget.hit(TruncationLimit::Siblings);
             break;
         }
@@ -177,7 +177,7 @@ fn map_node(
                 budget.hit(TruncationLimit::Nodes);
                 break;
             }
-            if i >= MAX_SIBLINGS {
+            if i >= budget.max_siblings() {
                 budget.hit(TruncationLimit::Siblings);
                 break;
             }
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn build_tree_shapes_the_hierarchy() {
-        let mut tree = build_tree(XML, &win()).unwrap();
+        let mut tree = build_tree(XML, &win(), WalkLimits::DEFAULT).unwrap();
         tree.assign_ids();
         assert_eq!(tree.root.role, AxRole::Window);
         let frame = &tree.root.children[0];
@@ -315,7 +315,7 @@ mod tests {
         // dropped a node from the middle rather than stopping at the end would shift every
         // later id off the node its own index implies.
         let xml = wide_hierarchy_xml(glass_core::MAX_NODES + 50);
-        let mut tree = build_tree(&xml, &win()).unwrap();
+        let mut tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         tree.assign_ids();
 
         assert!(tree.truncated.is_some(), "the node cap must have been hit");
@@ -331,7 +331,7 @@ mod tests {
         // one is what pushes the running count to MAX_NODES. Nothing was declined, so this
         // must NOT be reported truncated (regression for the false-positive-at-the-cap bug).
         let xml = wide_hierarchy_xml(glass_core::MAX_NODES);
-        let tree = build_tree(&xml, &win()).unwrap();
+        let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         assert_eq!(tree.truncated, None);
     }
 
@@ -341,7 +341,7 @@ mod tests {
         // declines to visit, so the cap must still fire — proving the fix didn't just
         // disable it.
         let xml = wide_hierarchy_xml(glass_core::MAX_NODES + 1);
-        let tree = build_tree(&xml, &win()).unwrap();
+        let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         assert_eq!(
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn build_tree_rejects_non_hierarchy_xml() {
         assert!(matches!(
-            build_tree("<other/>", &win()),
+            build_tree("<other/>", &win(), WalkLimits::DEFAULT),
             Err(GlassError::AccessibilityUnavailable(_))
         ));
     }
@@ -395,7 +395,7 @@ mod tests {
             width: 100,
             height: 200,
         };
-        let tree = build_tree(xml, &w).unwrap();
+        let tree = build_tree(xml, &w, WalkLimits::DEFAULT).unwrap();
         let not_real = &tree.root.children[0];
         let real_on = &tree.root.children[1];
         let compose_on = &tree.root.children[2];
