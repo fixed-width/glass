@@ -20,7 +20,7 @@ x11rb.workspace = true
 # reqwest is pinned to rmcp's line (default-features off; loopback needs no TLS)
 # so cargo unifies on one copy.
 glass-mcp = { path = "../glass-mcp" }
-rmcp = { version = "1.7", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 reqwest = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["full"] }
 base64 = "0.23"
