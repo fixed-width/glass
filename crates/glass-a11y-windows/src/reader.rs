@@ -189,7 +189,7 @@ fn walk(
 
     Ok(AxNode {
         id: AxNodeId(0), // assigned by glass_core::AxTree::assign_ids
-        role: crate::mapping::map_role(ct_id),
+        role: crate::mapping::map_role(ct_id, facts.checkable),
         raw_role,
         name,
         value,
@@ -199,17 +199,59 @@ fn walk(
     })
 }
 
+/// Fetch `el`'s UIA Toggle pattern, gated by control type (Button/CheckBox/MenuItem/
+/// SplitButton — the only types that carry it) so this never issues a live cross-process
+/// `get_pattern` call for a control that cannot support it. One fetch answers two questions:
+/// `StateFacts::checkable` is this pattern's mere *presence* (the control exposes on/off
+/// semantics at all, independent of whether the current state is also readable), and
+/// `map_role`'s rule that a toggle-capable `Button` — a formatting-bar button, say — is a
+/// `ToggleButton` rather than a plain one keys off the same presence. Shared by `gather` and
+/// the verify-fingerprint role lookups in `run_set_value`/`run_invoke`, so a node maps to the
+/// same role regardless of which path reads it, and only one COM round-trip is spent per node
+/// either way — the same reason the value-pattern probe below fetches once for two facts.
+///
+/// "This control has no Toggle pattern" and "the fetch failed" both yield `None` — a failure
+/// must not fail a whole snapshot over one node — but they are not the same event, and only one
+/// of them is a bug: a transient failure reports a toggle-capable `Button` as a plain `Button`,
+/// and since the same value feeds the `run_set_value`/`run_invoke` fingerprint, it surfaces to
+/// the caller as `AxElementChanged` ("the tree drifted") for an element that never moved. So the
+/// failure case logs. The two are told apart by the returned code: UIA documents
+/// `GetCurrentPattern` as returning success with a NULL interface for an unsupported pattern,
+/// which the bindings surface as an error carrying a *non-failure* code (`Error::result()` is
+/// `None`); a real COM failure carries a failure `HRESULT`. Neither path costs an extra
+/// round-trip.
+fn toggle_pattern(el: &UIElement, ct_id: u32) -> Option<UITogglePattern> {
+    if !matches!(ct_id, 50000 | 50002 | 50011 | 50031) {
+        // Button/CheckBox/MenuItem/SplitButton
+        return None;
+    }
+    match el.get_pattern::<UITogglePattern>() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if e.result().is_some() {
+                // Dev-tool diagnostic (stderr only, same shape as `select_window`'s in the
+                // macOS reader): without it, a control whose Toggle fetch broke is
+                // indistinguishable after the fact from one that never had the pattern.
+                eprintln!(
+                    "glass-a11y-windows: Toggle-pattern fetch failed on control type {ct_id} \
+                     (HRESULT {:#010x}: {e}); treating the element as not toggle-capable",
+                    e.code()
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Gather state facts + the value string in one pass, gating each pattern probe by control type
 /// so we don't make a live cross-process `get_pattern` call for a pattern the control can't support
 /// (UIA is chatty — each probe is an out-of-process COM round-trip).
 fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<String>) {
     // Fetch the Toggle pattern once: its mere presence is `checkable` (the control exposes
     // on/off semantics at all), independent of whether we can also read its current state.
-    let toggle_pattern = matches!(ct_id, 50000 | 50002 | 50011 | 50031) // Button/CheckBox/MenuItem/SplitButton
-        .then(|| el.get_pattern::<UITogglePattern>().ok())
-        .flatten();
-    let checkable = toggle_pattern.is_some();
-    let toggled_on = toggle_pattern
+    let pattern = toggle_pattern(el, ct_id);
+    let checkable = pattern.is_some();
+    let toggled_on = pattern
         .and_then(|p| p.get_toggle_state().ok())
         .map(|s| s == ToggleState::On)
         .unwrap_or(false);
@@ -300,7 +342,8 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // drift lands a different same-role+name element on this pre-order id, the
     // bounds fingerprint — the element sits elsewhere — rejects it. A target
     // without captured bounds falls back to role+name only.
-    let role = crate::mapping::map_role(el.get_control_type().map_err(uia_err)? as i32 as u32);
+    let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
+    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())
@@ -371,7 +414,8 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
 
     // Same fingerprint gate as run_set_value: role + name + bounds.
-    let role = crate::mapping::map_role(el.get_control_type().map_err(uia_err)? as i32 as u32);
+    let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
+    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())

@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
-    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, Backend, BaselineStore, Glass,
-    GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory, PointerEvent,
-    WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    role_histogram, Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend,
+    BaselineStore, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory,
+    PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
 };
 use glass_windows::WindowsPlatform;
 
@@ -55,6 +55,72 @@ fn charmap_spec() -> AppSpec {
     }
 }
 
+/// No `window_hint`: Notepad's own process (or, on Win11, the descendant its launcher hands
+/// its UI to — see `onbox_handoff_grace`'s doc) is discovered purely by pid-set membership,
+/// so a title hint isn't needed the way it would be for a hand-off to an *unrelated* process
+/// (see `onbox_role_histogram_probe`'s doc for why that shape was left out of the probe).
+fn notepad_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec!["notepad.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
+/// Task Manager's own process directly owns its window — same discoverable-by-pid shape as
+/// charmap/Notepad — *unless* an instance was already running before this test started, in
+/// which case Task Manager's single-instance check makes our freshly spawned process just
+/// activate the existing window and exit. The title hint exists for exactly that case: with
+/// no window in our own pid-set, `poll_decision` keeps polling on the hint alone and the
+/// system-wide title-substring fallback rung picks up the pre-existing window instead.
+fn taskmgr_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec!["taskmgr.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: Some(WindowHint {
+            title: Some("Task Manager".into()),
+            class: None,
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
+/// Bare `explorer.exe` (no path arg): opens the OS default location — "Quick access" on
+/// Windows 10, "Home" on Windows 11 — the same native file-list control, and so the same UIA
+/// tree, any folder view uses (what that tree actually emitted is recorded in
+/// [`onbox_role_histogram_probe`]'s doc). Each File Explorer
+/// window is its own process (unlike Task Manager, Explorer has no single-instance check —
+/// this is why `explorer.exe <uri>` protocol activation, e.g. `ms-settings:`, is the flaky
+/// shape and a plain `explorer.exe` folder-window launch is not), so pid-set discovery is
+/// expected to find it directly. The hint here is `class`, not `title`: `CabinetWClass` is
+/// every File Explorer folder window's documented window class regardless of locale, OS
+/// version, or the current folder's display name — unlike a title, which would vary with
+/// exactly the thing this spec deliberately leaves unset.
+fn explorer_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec!["explorer.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: Some(WindowHint {
+            title: None,
+            class: Some("CabinetWClass".into()),
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
 /// A `Glass` session wired to the real Windows backend + UIA reader (as opposed to the bare
 /// `WindowsPlatform`/`WindowsA11y` the other on-box tests drive directly) — needed wherever a test
 /// wants the production `click_element` orchestration (invoke-first, pointer-fallback,
@@ -74,14 +140,21 @@ fn glass_windows_with_a11y() -> Glass {
     Glass::new(factory, "windows".into(), BaselineStore::new(root), 100)
 }
 
-/// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
-/// build location so the spec isn't pinned to one checkout/user. `sandbox` selects containment.
-fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The repo root: two levels above `crates/glass-windows` (this crate's `CARGO_MANIFEST_DIR`),
+/// baked in at build time — so on the box's own `cargo build`, it reflects wherever that box's
+/// checkout actually lives, not a hardcoded path/user.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("repo root is two levels above crates/glass-windows")
-        .to_path_buf();
+        .to_path_buf()
+}
+
+/// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
+/// build location so the spec isn't pinned to one checkout/user. `sandbox` selects containment.
+fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
+    let repo_root = repo_root();
     let fixture_exe =
         repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
     AppSpec {
@@ -188,6 +261,19 @@ fn first_role_with_bounds<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a 
     }
     for c in &n.children {
         first_role_with_bounds(c, role, out);
+    }
+}
+
+/// Nodes carrying UIA's Toggle pattern that are NOT already a checkbox or radio button —
+/// the evidence for whether a `ToggleButton` mapping has anything to map. `checkable` is
+/// Toggle-pattern availability (see `StateFacts` in glass-a11y-windows), so this needs no
+/// extra UIA call.
+fn toggle_candidates<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
+    if node.states.checkable && !matches!(node.role, AxRole::CheckBox | AxRole::RadioButton) {
+        out.push(node);
+    }
+    for child in &node.children {
+        toggle_candidates(child, out);
     }
 }
 
@@ -901,4 +987,257 @@ fn onbox_contained_launch_adopts_app_not_console() {
         "expected a boxed app window class (Sandbox:<box>:...), got {class:?}"
     );
     p.stop_app().expect("stop_app");
+}
+
+/// Where the role-histogram probe writes its report: `.windows-artifacts` under the repo
+/// root. Mirrors `examples/onbox.rs`'s `out_dir()`/`save()` convention (a resolved-at-runtime
+/// directory + a small write-and-report helper) — but targets `.windows-artifacts` directly
+/// rather than `%USERPROFILE%`. That example's `%USERPROFILE%` files get swept into
+/// `.windows-artifacts` by a step in `tools/windows-validation/run-onbox.ps1` that runs only
+/// for the plain `onbox` example; an `--ignored` test run (this probe's path, via
+/// `scripts/test-windows.sh --tests`) has no such sweep. `.windows-artifacts` itself, though,
+/// is scp'd back to the caller by `scripts/test-windows.sh` after every run regardless — and
+/// it must be, since this probe's stdout is captured by the schtasks bounce into the
+/// interactive session and never reaches the caller at all. So this file is the only way the
+/// histogram gets out.
+fn artifacts_dir() -> std::path::PathBuf {
+    repo_root().join(".windows-artifacts")
+}
+
+/// Write `report` to `name` under [`artifacts_dir`], creating the directory if it doesn't
+/// already exist (`run-onbox.ps1` creates it fresh before every run, but this stays robust
+/// to a direct on-box invocation that skips the harness). Mirrors `examples/onbox.rs`'s
+/// `save()`.
+fn save_report(name: &str, report: &str) {
+    let dir = artifacts_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        println!("    creating {} FAILED: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(name);
+    match std::fs::write(&path, report) {
+        Ok(()) => println!("    saved {}", path.display()),
+        Err(e) => println!("    save {} FAILED: {e}", path.display()),
+    }
+}
+
+/// Render `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
+/// ([`AxRole::Other`]) buckets first, which is already the histogram's own sort order, so
+/// the tokens most worth a human's attention are the first thing in the block. Returns the
+/// text (rather than printing it) so [`probe_role_histogram`] can both print it directly
+/// (useful running straight on a box with a desktop session) and fold it into the artifacts
+/// file that's the only way it reaches a caller through the on-box harness.
+fn render_role_histogram(label: &str, tree: &AxTree) -> String {
+    use std::fmt::Write as _;
+    let hist = role_histogram(tree);
+    let mut out = String::new();
+    let _ = writeln!(out, "\n===== role histogram: {label} =====");
+    let _ = writeln!(
+        out,
+        "{} nodes, {} distinct (token, role) buckets",
+        tree.count,
+        hist.len()
+    );
+    if let Some(t) = &tree.truncated {
+        let _ = writeln!(out, "  NOTE: {}", t.notice());
+    }
+    for entry in &hist {
+        let tag = if entry.role == AxRole::Other {
+            "UNMAPPED"
+        } else {
+            "mapped"
+        };
+        let _ = writeln!(
+            out,
+            "  {tag:>8}  x{:<5} role={:?} token={:?}",
+            entry.count, entry.role, entry.raw_role
+        );
+    }
+    out
+}
+
+/// UIA control-type names glass maps to a role, and that a probed app has actually been seen to
+/// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
+/// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
+/// mean the plumbing between the reader and `map_role` broke. A token that simply does not
+/// appear in a given app asserts nothing — apps differ, and an absent token is not a
+/// regression.
+///
+/// Deliberately NOT listed: `Header`/`HeaderItem`, which the probe does observe but which map
+/// to no role on purpose (a grid's column headers are not document headings), and `Button`,
+/// whose `ToggleButton` promotion is state-dependent rather than a property of the token.
+const MAPPED_TOKENS: &[&str] = &["Document"];
+
+/// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`], described — the
+/// one thing a histogram can check without becoming brittle about which app exposes what.
+/// Everything else the probe prints is evidence for a human, not a pass/fail claim. Returned
+/// rather than asserted so the caller can finish the run, record the findings in the artifacts
+/// file with the histograms that explain them, and only then fail.
+fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
+    role_histogram(tree)
+        .into_iter()
+        .filter(|e| e.role == AxRole::Other && MAPPED_TOKENS.contains(&e.raw_role.as_str()))
+        .map(|e| {
+            format!(
+                "{label}: {} node(s) reported token {:?} as Other, but glass maps that token — \
+                 the reader is not feeding map_role what it reads",
+                e.count, e.raw_role
+            )
+        })
+        .collect()
+}
+
+/// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
+/// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
+/// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
+/// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
+/// launched or a snapshot can't be taken at all: a real breakage, never merely an unexpected
+/// role. Returns any [`mapped_token_violations`], which the caller fails on *after* the report
+/// is saved. Beyond that one check the histogram's contents are never asserted; reading it to
+/// decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
+/// justifies filling is the human's job.
+#[must_use]
+fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec<String> {
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p
+        .start_app(spec)
+        .unwrap_or_else(|e| panic!("{label}: start_app failed: {e}"));
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+        limits: WalkLimits::from_max_nodes(Some(0)),
+    };
+    let tree = a11y
+        .snapshot(&ctx)
+        .unwrap_or_else(|e| panic!("{label}: a11y snapshot failed: {e}"));
+
+    let block = render_role_histogram(label, &tree);
+    print!("{block}");
+    report.push_str(&block);
+
+    // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
+    let mut candidates = Vec::new();
+    toggle_candidates(&tree.root, &mut candidates);
+    if !candidates.is_empty() {
+        use std::fmt::Write as _;
+        let mut toggle_block = String::new();
+        let _ = writeln!(
+            toggle_block,
+            "\n  toggle-capable (checkable, non-checkbox/radio): {} nodes",
+            candidates.len()
+        );
+        let sample_count = candidates.len().min(5);
+        if sample_count > 0 {
+            let _ = writeln!(toggle_block, "    (first {sample_count}):");
+            for node in candidates.iter().take(5) {
+                let name = node.name.as_deref().unwrap_or("(no name)");
+                let _ = writeln!(
+                    toggle_block,
+                    "      role={:?} raw_role={:?} name={:?}",
+                    node.role, node.raw_role, name
+                );
+            }
+        }
+        print!("{toggle_block}");
+        report.push_str(&toggle_block);
+    }
+
+    let _ = p.stop_app();
+    std::thread::sleep(Duration::from_millis(500)); // let the app fully exit before the next probe
+
+    let violations = mapped_token_violations(label, &tree);
+    for v in &violations {
+        let line = format!("\n  VIOLATION: {v}\n");
+        print!("{line}");
+        report.push_str(&line);
+    }
+    violations
+}
+
+/// The evidence step behind the Windows half of the accessibility role-parity work: launch a
+/// handful of stock apps and record each one's `role_histogram` — every native UIA token the
+/// app actually emitted, unmapped (`AxRole::Other`) tokens first. The project's rule is probe
+/// first, map second: a `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` may only get a
+/// match arm for a token that showed up in output like this. So this test's job is to produce
+/// that evidence. It asserts exactly one thing *about* the evidence — a token glass does map
+/// must not come back `AxRole::Other`, which would mean the reader stopped feeding `map_role`
+/// what it reads (see [`MAPPED_TOKENS`]) — and otherwise fails only when an app could not be
+/// launched or snapshotted at all (see [`probe_role_histogram`]). Which role a token *should*
+/// map to is never asserted here; that is the human's reading.
+///
+/// The histogram is both printed to stdout AND written to `role-histogram-windows.txt` under
+/// [`artifacts_dir`] (see that function's doc for why the file is required, not just a nicety
+/// on top of stdout): run through `scripts/test-windows.sh`, this test's stdout is captured by
+/// the schtasks bounce into the interactive session and never reaches the caller, so the file
+/// is the only way the evidence gets out of that path. Printing it too costs nothing and helps
+/// anyone running the test directly on a box with a desktop session.
+///
+/// Runs charmap, Notepad, Task Manager, and File Explorer. charmap/Notepad alone gave clean
+/// output but no tabular UI, so `DataItem` (UIA id 50029), `Header` (50034), and
+/// `HeaderItem` (50035) — exactly the ids the `Table`/`Cell` `Gap` reasons in
+/// `ROLE_SUPPORT` name — went unobserved, and Task Manager's process list and File Explorer's
+/// file list were added to reach them. They got part of the way: both list views did emit
+/// `Header` and `HeaderItem` for their column-header bars, but neither emitted `DataItem` at
+/// all — their rows arrived as `TreeItem`, which is what the `Cell` row's Windows `Gap` reason
+/// in `ROLE_SUPPORT` now records. (`Header`/`HeaderItem` are observed but deliberately left
+/// unmapped: they are a grid's column headers, not document headings — see
+/// `glass_a11y_windows::mapping`.) See [`taskmgr_spec`]/[`explorer_spec`] for why each is
+/// expected to be discovered as reliably as charmap/Notepad despite neither being launched
+/// exactly the same way.
+///
+/// The Settings app (`ms-settings:` via `explorer.exe`) was considered and left out: unlike
+/// the four apps run here, its window has no process relationship to the process glass
+/// launches — `explorer.exe` hands the request to the shell and exits, and the Settings
+/// window belongs to an unrelated process the launched pid-set never contains — so discovery
+/// could only find it through the title-substring fallback rung (a system-wide scan by
+/// window title) rather than the pid-based one every app here uses. That fallback rung
+/// exists in the backend for exactly this shape of app, but this probe declined to depend on
+/// it without on-box verification that it resolves reliably.
+///
+/// This probe also can't surface a UIA `Window` with `IsDialog` true (the `Dialog` row's
+/// Windows `Gap` reason in `ROLE_SUPPORT`): none of the four apps opens a dialog on a cold,
+/// no-input launch, and `role_histogram` only ever sees what `glass-a11y-windows`'s reader
+/// already reads into an `AxNode` — `IsDialog` is not among those fields (reading it is the
+/// gap itself), so no launch sequence run through this probe could reveal it either way.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session; prints role histograms and writes them to .windows-artifacts/role-histogram-windows.txt, asserting only that a token glass maps did not come back Other"]
+fn onbox_role_histogram_probe() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+
+    let mut report = String::new();
+    let mut violations = Vec::new();
+    violations.extend(probe_role_histogram(
+        "charmap.exe (Character Map)",
+        &charmap_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
+        "notepad.exe (Notepad)",
+        &notepad_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
+        "taskmgr.exe (Task Manager)",
+        &taskmgr_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
+        "explorer.exe (File Explorer)",
+        &explorer_spec(),
+        &mut report,
+    ));
+    save_report("role-histogram-windows.txt", &report);
+    // Fail last, after every app has been probed and the artifacts file written: the histograms
+    // are the evidence a violation has to be read against.
+    assert!(
+        violations.is_empty(),
+        "a token glass maps came back unmapped:\n{}",
+        violations.join("\n")
+    );
 }

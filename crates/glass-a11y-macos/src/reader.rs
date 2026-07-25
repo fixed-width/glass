@@ -105,7 +105,7 @@ impl Accessibility for MacosA11y {
         // different same-role+name element on this pre-order id, its bounds sit elsewhere
         // and it is rejected here rather than silently overwritten.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role);
+        let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
         let name = ffi::attribute_string(&el, attr::TITLE)
             .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
@@ -165,7 +165,7 @@ impl Accessibility for MacosA11y {
 
         // Same fingerprint gate as set_value: role + name + bounds.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role);
+        let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
         let name = ffi::attribute_string(&el, attr::TITLE)
             .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
@@ -295,6 +295,39 @@ fn select_window(
     best.map(|(_, w, scale)| (w, scale))
 }
 
+/// `el`'s `AXSubrole`, but only for the base roles whose subrole actually changes the mapped
+/// role ([`mapping::subrole_matters`]) — every other node skips the AX IPC round-trip and gets
+/// `None`.
+///
+/// The one place this read happens, so the three sites that map a role — [`walk`],
+/// `set_value`'s fingerprint and `invoke`'s — cannot gate or read it differently and land on
+/// different roles for the same node (the Windows reader shares its `toggle_pattern` helper for
+/// the same reason: `set_value` re-walks to an id captured from a snapshot, and a fingerprint
+/// computed from a differently-read role would reject an element that never moved).
+///
+/// Reads through the *error-aware* [`ffi::attribute_string_checked`] rather than
+/// [`ffi::attribute_string`], which folds a genuine read failure into the same `None` as a
+/// legitimately-absent attribute: an `AXOutlineRow` whose subrole read broke would silently
+/// degrade to `ListItem` with nothing to show for it. A failure still degrades to `None` — one
+/// unreadable attribute must not fail a whole snapshot — but it logs first, the same
+/// diagnostic-not-silence treatment `ffi::children` and `ffi::action_names` already get. Costs
+/// exactly the one attribute copy the direct read did.
+fn read_subrole(el: &AXUIElement, ax_role: &str) -> Option<String> {
+    if !mapping::subrole_matters(ax_role) {
+        return None;
+    }
+    match ffi::attribute_string_checked(el, attr::SUBROLE) {
+        Ok(sub) => sub,
+        Err(err) => {
+            eprintln!(
+                "glass-a11y-macos: AXSubrole read failed for role={ax_role:?}: {err}; \
+                 treating the element as having no subrole"
+            );
+            None
+        }
+    }
+}
+
 /// Pre-order walk: build this element's [`AxNode`], then recurse into its (non-skipped)
 /// children in array order. `budget` tracks the running node total and records which
 /// bound (if any) stopped the walk early — shared across the whole walk, and with
@@ -309,10 +342,14 @@ fn walk(
     budget.visit();
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
-    let role = mapping::map_role(&ax_role);
+    let subrole = read_subrole(el, &ax_role);
+    let role = mapping::map_role(&ax_role, subrole.as_deref());
     // `raw_role` is normally the same AX role string `map_role` just matched on — the token, not
     // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
-    // mapping key and not worth a second attribute read on every node.
+    // mapping key and not worth a second attribute read on every node. When a subrole was read
+    // and is non-empty it is appended (`"AXRow/AXOutlineRow"`); only `AXRow` is ever read (see
+    // `read_subrole`), so that says which kind of row a row is — an outline row (`TreeItem`)
+    // or a plain table row (`ListItem`) — and nothing more.
     //
     // The fallback is conditional because that trade only holds while `AXRole` says something.
     // A custom or non-standard control is expected to report a generic role — `AXUnknown`, or no
@@ -323,7 +360,10 @@ fn walk(
     let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
         ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role)
     } else {
-        ax_role
+        match &subrole {
+            Some(sub) if !sub.is_empty() => format!("{ax_role}/{sub}"),
+            _ => ax_role,
+        }
     };
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a

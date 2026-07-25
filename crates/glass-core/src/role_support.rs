@@ -98,7 +98,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::Dialog,
             [
                 Mapped,
-                Gap("UIA marks a dialog with the IsDialog property on a Window; not read yet"),
+                Gap(
+                    "UIA marks a dialog with the IsDialog property on a Window; the reader does \
+                     not read it",
+                ),
                 Gap("AXSheet, AXPopover and AXDrawer are not mapped yet"),
                 Gap("dialog windows arrive as a generic layout class"),
                 Gap("alert and action-sheet tokens are not mapped yet"),
@@ -119,10 +122,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::ToggleButton,
             [
                 Mapped,
-                Gap("UIA exposes a toggle as a control type plus the Toggle pattern, which the \
-                     map does not key on yet"),
+                Mapped,
                 Gap("AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
-                     subrole; subroles are not read yet"),
+                     subrole; AXCheckBox is outside the reader's subrole gate, and no probed \
+                     app emitted either subrole"),
                 Mapped,
                 Mapped,
             ],
@@ -174,7 +177,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::TextArea,
             [
                 Mapped,
-                Gap("the UIA Document control type is not mapped yet"),
+                Mapped,
                 Mapped,
                 NotApplicable("Android uses one editable class for single- and multi-line text"),
                 Mapped,
@@ -209,7 +212,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXTable is not mapped yet"),
+                Gap("mac lists report AXOutline rather than AXTable; AXOutline maps to Tree"),
                 Gap("table and grid classes collapse into List"),
                 Gap("no table token is mapped yet"),
             ],
@@ -218,7 +221,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::Cell,
             [
                 Mapped,
-                Gap("the UIA DataItem control type is not mapped yet"),
+                Gap(
+                    "UIA's DataItem control type would carry this, but the data grids probed \
+                     expose their rows as TreeItem",
+                ),
                 Mapped,
                 Gap("no cell class is mapped yet"),
                 Mapped,
@@ -229,7 +235,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXOutline is not mapped yet"),
+                Mapped,
                 NotApplicable("Android has no tree widget"),
                 NotApplicable("UIKit has no outline view"),
             ],
@@ -239,7 +245,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("the outline-row subrole is not read yet"),
+                Mapped,
                 NotApplicable("Android has no tree widget"),
                 NotApplicable("UIKit has no outline view"),
             ],
@@ -312,7 +318,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXSplitter is not mapped yet"),
+                Mapped,
                 NotApplicable("Android dividers are drawn, not exposed as nodes"),
                 NotApplicable("UIKit exposes no separator element"),
             ],
@@ -341,8 +347,9 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::Heading,
             [
                 Mapped,
-                Gap("the UIA Header control types are not mapped yet"),
-                Gap("AXHeading is not mapped yet"),
+                Gap("UIA's Header and HeaderItem are grid column headers, not document \
+                     headings; the normalized set has no column-header role"),
+                Mapped,
                 Gap("heading semantics are not mapped yet"),
                 Gap("the header token is not mapped yet"),
             ],
