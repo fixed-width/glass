@@ -25,10 +25,10 @@ internal refactors, CI, or test-only changes.
   each platform backend can produce, and why a role is unavailable where it is.
 - More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
   and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
-  Android, Material cards, the AppCompat linear layout, the view that hosts a Compose hierarchy
-  and a swipe-paged container; on iOS, content groups (including navigation bars and tab bars) and
-  headings. Windows also distinguishes a button that can be toggled — a formatting bar's Bold or
-  Italic — as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
+  Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
+  hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
+  Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
+  as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
 - Three kinds of element now report a different role than before, so a `role:` filter that used to

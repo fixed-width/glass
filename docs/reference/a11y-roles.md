@@ -17,7 +17,9 @@ A cell reads:
 
 On Android, both readers report a `Window` root: the `uiautomator` reader wraps its dump in a
 window root sized to the app window, and the accessibility-service reader labels the active
-window's own root node, whose widget class stays visible as the node's native token.
+window's own root node. That node keeps its widget class as its native token, so a client
+reading the tree still has it, but the outline does not show it — the root has a role now, and
+the outline only names the token of an element that has none.
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |
@@ -90,7 +92,7 @@ window's own root node, whose widget class stays visible as the node's native to
 - `TabList` / Android — gap: a tab container reports a plain layout class; the tab role lives in the view's id and selected state, not in the class name
 - `Tab` / macOS (AX) — gap: AppKit reports tab items as AXRadioButton inside the tab group; the containing role is not used to disambiguate yet
 - `Tab` / Android — gap: a tab reports a plain layout class with selected=true; nothing in the class name marks it as a tab
-- `Tab` / iOS — gap: a tab bar and its items arrive as AXGroup; the element identifier names the tab bar, the role does not
+- `Tab` / iOS — gap: the tab bars seen in probing arrived as AXGroup, named by the element identifier rather than the role, and no tab-item token appeared
 - `ScrollBar` / Android — n/a: Android scrollbars are drawn, not exposed as nodes
 - `ScrollBar` / iOS — n/a: UIKit scroll indicators are not accessibility elements
 - `SpinButton` / macOS (AX) — gap: AXIncrementor is not mapped yet

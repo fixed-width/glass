@@ -275,8 +275,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                      class name marks it as a tab",
                 ),
                 Gap(
-                    "a tab bar and its items arrive as AXGroup; the element identifier names \
-                     the tab bar, the role does not",
+                    "the tab bars seen in probing arrived as AXGroup, named by the element \
+                     identifier rather than the role, and no tab-item token appeared",
                 ),
             ],
         ),

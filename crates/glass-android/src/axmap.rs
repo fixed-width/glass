@@ -44,8 +44,10 @@ pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("GridView", AxRole::List),
     ("WebView", AxRole::Group),
     // Containers the leaf-suffix rule below cannot catch, each observed in a real app's
-    // tree: a Material card, the AppCompat linear layout (shipped under two package
-    // names), the view that hosts a Compose hierarchy, and a swipe-paged container.
+    // tree: the AndroidX card container, the AppCompat linear layout (shipped under two
+    // package names), the view that hosts a Compose hierarchy, and a swipe-paged container.
+    // Each match is on the exact leaf: Material Components' `MaterialCardView` and the
+    // `ViewPager2` successor have different leaves and are not matched.
     ("CardView", AxRole::Group),
     ("LinearLayoutCompat", AxRole::Group),
     ("ComposeView", AxRole::Group),

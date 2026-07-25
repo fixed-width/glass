@@ -134,7 +134,10 @@ pub(crate) fn tree_from_json(
     // agree about the root, or a `role:` selector written against one misses on the other.
     // The node itself is untouched — no synthetic wrapper — because `AxNodeId(n)` is the
     // device's `ref` n and an extra node would shift every id `set_value` addresses by.
-    // `raw_role` keeps the device's class, so the escape hatch still reports it.
+    // `raw_role` keeps the device's class on the node, so anything that reads the node itself
+    // — the role histogram, a structured client — still has it. It no longer reaches the
+    // outline, though: the outline names a native token only for an element glass has no role
+    // for, and this one is now a Window.
     root.role = AxRole::Window;
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
@@ -537,8 +540,9 @@ mod tests {
         // window — and both Android readers must agree on it, or one `role:` selector
         // cannot address the root on both.
         assert_eq!(tree.root.role, AxRole::Window);
-        // The device's own class stays in raw_role: the role is normalized, the escape
-        // hatch still reports what the platform said.
+        // The device's own class stays in raw_role, where anything reading the node — the
+        // role histogram, a structured client — still finds it. The outline will not print
+        // it: that only names a token for an element with no mapped role.
         assert_eq!(tree.root.raw_role, "android.widget.FrameLayout");
         // Rooting must not add, drop or reorder a node: ids are the device's refs, and
         // set_value addresses by them.
