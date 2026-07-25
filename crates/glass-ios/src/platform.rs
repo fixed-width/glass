@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
@@ -15,11 +15,16 @@ use crate::idb::client::IdbClient;
 use crate::idb::companion::IdbCompanion;
 use crate::injector::IdbInjector;
 use crate::logs::LogStream;
+use crate::simctl::Simctl;
 use crate::target::{SimTarget, SimulatorRegistry};
 
 /// The single foreground app this backend drives.
 struct RunningApp {
     bundle_id: String,
+    /// The launched process, when `simctl launch` reported one in a shape that parsed. Kept for
+    /// the same reason the Android backend keeps it — it is what `app_pid` answers with, and what
+    /// a liveness check on the operation path would need.
+    pid: Option<u32>,
     geometry: WindowGeometry,
     logs: LogStream,
     /// Builds HID events from glass input at the app's real, discovered point→pixel scale.
@@ -86,6 +91,115 @@ fn looks_like_app_path(s: &str) -> bool {
     s.ends_with(".app") || s.contains('/')
 }
 
+/// The launched process id from `simctl launch`'s stdout, which reports `<bundle id>: <pid>`.
+///
+/// `None` for output in any other shape — a pid guessed out of an unexpected line could belong to
+/// another process entirely, and watching the wrong one is worse than not watching.
+pub(crate) fn pid_from_launch_output(stdout: &str, bundle_id: &str) -> Option<u32> {
+    // Matched against the bundle just launched, not "the last colon in the output": a trailing
+    // note like `retrying: 42` would otherwise yield a pid belonging to something else, and
+    // watching the wrong process is worse than watching none.
+    let prefix = format!("{bundle_id}: ");
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(&prefix))
+        .find_map(|pid| pid.trim().parse().ok())
+}
+
+/// Where `simctl launch` is told to write the app's stderr, in the simulator's own filesystem.
+/// One fixed path rather than a per-launch name: it is read only on the failure path, immediately
+/// after the launch that wrote it, and a stale file from a previous launch is overwritten by the
+/// next one.
+const LAUNCH_STDERR_DEVICE_PATH: &str = "/tmp/glass-launch-stderr.txt";
+
+/// How many of the app's last log lines to carry in a launch-failure message. Enough for a
+/// Swift `fatalError` (its message, then the trap) without turning an error into a log dump.
+const LAUNCH_FAILURE_LOG_LINES: usize = 4;
+
+/// How long after launch an app that is going to abort has actually gone.
+///
+/// Measured on a Simulator: an app that rejects a launch argument and calls `fatalError`
+/// disappears from `ps` about 465 ms after `simctl launch` returns, repeatably. The window is set
+/// above that so the check is not a race, and it is spent rather than assumed — the work between
+/// launch and check (a screenshot, and scale discovery when a driver is present) usually covers
+/// it, but that is a property of neighbouring code, and an observe-only launch skips half of it.
+///
+/// A window can only ever bound "died at startup"; an app that exits later is a running app that
+/// stopped, which the next operation reports.
+const LAUNCH_DEATH_WINDOW: Duration = Duration::from_millis(750);
+
+/// The tail of what the app wrote to stderr, read from the simulator's filesystem.
+///
+/// `simctl launch --stderr=` writes inside the device, so the host path is the device's `dataPath`
+/// (from `simctl list devices`) plus that path. Resolved here, on the failure path only, so a
+/// healthy launch pays nothing for it. `None` whenever any step does not work out — this is a
+/// diagnostic, and a missing diagnostic must not become a second failure.
+fn launch_stderr_tail(simctl: &Simctl, udid: &str) -> Option<String> {
+    let json = simctl.run(&["list", "devices", "-j"]).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let data_path = parsed
+        .get("devices")?
+        .as_object()?
+        .values()
+        .filter_map(|runtime| runtime.as_array())
+        .flatten()
+        .find(|device| device.get("udid").and_then(|u| u.as_str()) == Some(udid))?
+        .get("dataPath")?
+        .as_str()?
+        .to_string();
+
+    let text = std::fs::read_to_string(
+        std::path::Path::new(&data_path).join(LAUNCH_STDERR_DEVICE_PATH.trim_start_matches('/')),
+    )
+    .ok()?;
+    let tail: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(LAUNCH_FAILURE_LOG_LINES)
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(tail.into_iter().rev().collect::<Vec<_>>().join(" | "))
+}
+
+/// Whether `pid` is still running, asked of the host: a Simulator app is an ordinary host
+/// process, so `ps` answers for it without this crate taking a `libc` dependency for one probe.
+///
+/// `true` when the answer is not knowable — `ps` missing or failing to run is not evidence the
+/// app died, and refusing a launch on that basis would turn a broken diagnostic into a broken
+/// backend.
+fn pid_is_running(pid: u32) -> bool {
+    // Absolute path: `ps` resolved through `PATH` could be a shim whose non-zero exit would be
+    // read below as "the app died", turning a healthy launch into a confident false report.
+    match Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "state="])
+        .output()
+    {
+        // A process that has exited but not yet been reaped is still listed, in state `Z`. That
+        // is a real window here — the app's parent is `launchd_sim`, not this process — and a
+        // zombie is a dead app, so the state is read rather than just the exit status.
+        Ok(out) if out.status.success() => {
+            let state = String::from_utf8_lossy(&out.stdout);
+            let state = state.trim();
+            !state.is_empty() && !state.starts_with('Z')
+        }
+        // No such process: `ps` exits non-zero and says nothing. Anything it complains about —
+        // a usage error, a restricted environment — is a broken diagnostic rather than evidence
+        // the app died, so it fails open and says so.
+        Ok(out) if out.stderr.is_empty() => false,
+        Ok(out) => {
+            eprintln!(
+                "glass-ios: could not check whether the app is still running: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            true
+        }
+        Err(_) => true,
+    }
+}
+
 /// The `simctl launch` sub-command argv: the verb, the target simulator and bundle, then the
 /// app's own launch arguments.
 ///
@@ -98,6 +212,12 @@ pub(crate) fn launch_args(udid: &str, bundle_id: &str, app_args: &[String]) -> V
     let mut argv = vec![
         "launch".to_string(),
         "--terminate-running-process".to_string(),
+        // The app's own stdout/stderr is not in the device's unified log — a Swift `fatalError`
+        // writes to stderr and traps — so without this a launch failure can only report what the
+        // whole device happened to be saying. The path is inside the simulator's filesystem; the
+        // host side of it is `<device dataPath>/tmp/…`, resolved only when a launch actually
+        // fails (see `launch_stderr_tail`).
+        format!("--stderr={LAUNCH_STDERR_DEVICE_PATH}"),
         udid.to_string(),
         bundle_id.to_string(),
     ];
@@ -348,6 +468,22 @@ impl Platform for IosPlatform {
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
+        // `simctl launch` returns as soon as launchd has spawned the process, so a zero exit says
+        // the app started, not that it is still running: an app that aborts on a bad launch
+        // argument or a failed assertion is already gone. Without this check the screenshot below
+        // captures whatever the Simulator is showing — the home screen — and glass reports that
+        // as the app's window, so the caller's next snapshot describes SpringBoard.
+        let launched_at = Instant::now();
+        let launch_pid = pid_from_launch_output(&String::from_utf8_lossy(&out.stdout), &bundle_id);
+        if launch_pid.is_none() {
+            // Not fatal — the launch itself succeeded — but say so, because the liveness check
+            // below is now off and its absence is otherwise invisible: a future `simctl` that
+            // moves or reshapes this line would silently restore the bug it exists to catch.
+            eprintln!(
+                "glass-ios: could not read the launched pid from `simctl launch` output; an app \
+                 that exits at startup will not be noticed until the next operation"
+            );
+        }
 
         // Capture once, purely to learn the device's pixel dimensions for the geometry we
         // report. These are device *pixels* (the screenshot's raw resolution), not UIKit
@@ -373,13 +509,61 @@ impl Platform for IosPlatform {
             )?)),
             None => None,
         };
+        // Everything above would look identical for an app that died on launch: `simctl launch`
+        // exits 0 once launchd has spawned the process, and the screenshot then captures whatever
+        // the Simulator is showing — the home screen — which would be reported as the app's
+        // window, leaving the caller to snapshot SpringBoard with nothing saying why.
+        //
+        // Asked once at least [`LAUNCH_DEATH_WINDOW`] has passed since the launch, at the last
+        // moment before success is reported: an app that aborts takes a beat to actually go. The
+        // work above usually covers that beat, but an observe-only launch skips scale discovery,
+        // so the remainder is waited for rather than assumed.
+        //
+        // This bounds startup only. An app that dies later is NOT noticed by this backend — every
+        // operation gates on the session being registered, not on the process being alive — so a
+        // capture or snapshot after that describes whatever the Simulator is showing. Closing
+        // that needs a liveness probe on the operation path, which is why the pid is kept.
+        if let Some(pid) = launch_pid {
+            let elapsed = launched_at.elapsed();
+            if let Some(remaining) = LAUNCH_DEATH_WINDOW.checked_sub(elapsed) {
+                std::thread::sleep(remaining);
+            }
+            if !pid_is_running(pid) {
+                // What the app itself said travels in the message rather than being left for
+                // `glass_logs`: this return drops the `LogStream` and never registers a session,
+                // so a caller sent to that tool would be told there is no active session. The
+                // device's unified log would not help anyway — it carries the whole device, so
+                // the app's last words arrive buried in whatever else was running.
+                let printed = match launch_stderr_tail(self.target.simctl(), udid) {
+                    Some(said) => format!("it said: {said}"),
+                    None => "it printed nothing to stderr on the way out".to_string(),
+                };
+                return Err(GlassError::AppNotStarted(format!(
+                    "{bundle_id} launched as pid {pid} and exited before its window could be \
+                     reported. An app that rejects one of its launch arguments, or trips an \
+                     assertion at startup, goes this way — {printed}"
+                )));
+            }
+        }
+
         self.app = Some(RunningApp {
             bundle_id,
+            pid: launch_pid,
             geometry: geometry.clone(),
             logs,
             injector,
         });
         Ok(geometry)
+    }
+
+    /// The launched app's pid, when `simctl launch` reported one this could parse.
+    ///
+    /// The iOS accessibility reader does not correlate by pid — idb describes the whole screen —
+    /// so nothing in this backend consumes it today. It is answered anyway because the trait asks
+    /// a question this backend now knows the answer to, and a caller comparing backends should
+    /// not find iOS uniquely silent.
+    fn app_pid(&self) -> Option<u32> {
+        self.app.as_ref().and_then(|a| a.pid)
     }
 
     fn stop_app(&mut self) -> Result<()> {
@@ -609,6 +793,7 @@ mod state_machine_tests {
             target: SimTarget::for_test(),
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
+                pid: None,
                 geometry: geometry(),
                 logs: LogStream::spawn("fake"),
                 injector: Some(IdbInjector::new(1.0)),
@@ -635,6 +820,7 @@ mod state_machine_tests {
             target: SimTarget::for_test(),
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
+                pid: None,
                 geometry: geometry(),
                 logs: LogStream::spawn("fake"),
                 injector: None,
@@ -869,6 +1055,7 @@ mod launch_args_tests {
             [
                 "launch",
                 "--terminate-running-process",
+                "--stderr=/tmp/glass-launch-stderr.txt",
                 "UDID",
                 "com.example.app"
             ]
@@ -882,12 +1069,26 @@ mod launch_args_tests {
             [
                 "launch",
                 "--terminate-running-process",
+                "--stderr=/tmp/glass-launch-stderr.txt",
                 "UDID",
                 "com.example.app",
                 "--tab=collection",
                 "--verbose"
             ]
         );
+    }
+
+    #[test]
+    fn simctl_options_stay_ahead_of_the_bundle_id_and_app_arguments_behind_it() {
+        // Everything before the bundle id is simctl's, everything after is the app's. The stderr
+        // capture belongs to simctl, so it must not drift into the app's argv.
+        let built = args(&["--tab=collection"]);
+        let bundle = built.iter().position(|a| a == "com.example.app").unwrap();
+        let capture = built
+            .iter()
+            .position(|a| a.starts_with("--stderr="))
+            .expect("the launch captures the app's stderr");
+        assert!(capture < bundle, "--stderr is simctl's own option");
     }
 
     #[test]
@@ -927,5 +1128,84 @@ mod launch_wiring_tests {
             ["--first", "second", "--third=4"],
             "the app's arguments are run[1..], in order, with nothing dropped or duplicated"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_pid_tests {
+    use super::pid_from_launch_output;
+
+    #[test]
+    fn the_pid_follows_the_bundle_id_on_the_launch_line() {
+        assert_eq!(
+            pid_from_launch_output(
+                "tech.fixedwidth.glassfixture: 78539\n",
+                "tech.fixedwidth.glassfixture"
+            ),
+            Some(78539)
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_hide_the_pid() {
+        assert_eq!(
+            pid_from_launch_output("  com.example.app: 42  \n\n", "com.example.app"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn a_pid_on_a_line_belonging_to_something_else_is_not_taken() {
+        // The bug this guards: reading "the last colon-space in the output" would take 42 here,
+        // which is some other process entirely.
+        assert_eq!(
+            pid_from_launch_output(
+                "com.example.app: 7\nnote: retrying: 42\n",
+                "com.example.app"
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            pid_from_launch_output("note: retrying: 42\n", "com.example.app"),
+            None
+        );
+    }
+
+    #[test]
+    fn output_in_an_unrecognized_shape_yields_no_pid_rather_than_a_wrong_one() {
+        // Better to lose the liveness check than to watch the wrong process: a pid parsed out of
+        // an unexpected line could belong to anything.
+        assert_eq!(pid_from_launch_output("", "com.example.app"), None);
+        assert_eq!(
+            pid_from_launch_output("com.example.app\n", "com.example.app"),
+            None
+        );
+        assert_eq!(
+            pid_from_launch_output("com.example.app: not-a-pid\n", "com.example.app"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod pid_liveness_tests {
+    use super::pid_is_running;
+
+    #[test]
+    fn this_very_process_reads_as_running() {
+        assert!(pid_is_running(std::process::id()));
+    }
+
+    #[test]
+    fn a_reaped_child_reads_as_gone() {
+        // Reaped on purpose: an exited-but-unreaped process is a zombie, which `ps` still lists.
+        // That case is handled by reading the state column, but this test is about the ordinary
+        // one — a process that is simply no longer there.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process that exits immediately");
+        let pid = child.id();
+        child.wait().expect("reap it");
+        assert!(!pid_is_running(pid));
     }
 }
