@@ -24,27 +24,37 @@ use glass_core::accessibility::{
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
 
+/// Every iOS role string glass maps, as reported through `idb`.
+pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
+    ("AXButton", AxRole::Button),
+    ("AXStaticText", AxRole::Label),
+    ("AXText", AxRole::Label),
+    ("AXTextField", AxRole::TextField),
+    ("AXSearchField", AxRole::TextField),
+    ("AXTextView", AxRole::TextArea),
+    ("AXImage", AxRole::Image),
+    ("AXSwitch", AxRole::ToggleButton),
+    ("AXToggle", AxRole::ToggleButton),
+    ("AXCheckBox", AxRole::CheckBox),
+    ("AXSlider", AxRole::Slider),
+    ("AXLink", AxRole::Link),
+    ("AXCell", AxRole::Cell),
+    ("AXNavigationBar", AxRole::Toolbar),
+    ("AXToolbar", AxRole::Toolbar),
+    ("AXTabBar", AxRole::TabList),
+    ("AXApplication", AxRole::Application),
+    ("AXWindow", AxRole::Window),
+];
+
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
 /// Unrecognized roles become [`AxRole::Other`]; the caller preserves the native
 /// string in [`AxNode::raw_role`].
-pub fn ax_role(ax_type: &str) -> AxRole {
-    match ax_type {
-        "AXButton" => AxRole::Button,
-        "AXStaticText" | "AXText" => AxRole::Label,
-        "AXTextField" | "AXSearchField" => AxRole::TextField,
-        "AXTextView" => AxRole::TextArea,
-        "AXImage" => AxRole::Image,
-        "AXSwitch" | "AXToggle" => AxRole::ToggleButton,
-        "AXCheckBox" => AxRole::CheckBox,
-        "AXSlider" => AxRole::Slider,
-        "AXLink" => AxRole::Link,
-        "AXCell" => AxRole::Cell,
-        "AXNavigationBar" | "AXToolbar" => AxRole::Toolbar,
-        "AXTabBar" => AxRole::TabList,
-        "AXApplication" => AxRole::Application,
-        "AXWindow" => AxRole::Window,
-        _ => AxRole::Other,
-    }
+pub fn ax_role(role: &str) -> AxRole {
+    ROLE_TOKENS
+        .iter()
+        .find(|(token, _)| *token == role)
+        .map(|(_, r)| *r)
+        .unwrap_or(AxRole::Other)
 }
 
 /// Parse idb's nested accessibility JSON into an [`AxTree`]. Each element's
@@ -581,5 +591,32 @@ mod tests {
         );
         // `checked` carries the state; the label still lives in `value` (unchanged behavior).
         assert_eq!(sw.value.as_deref(), Some("Bold Text"));
+    }
+
+    #[test]
+    fn role_tokens_have_no_duplicates() {
+        for (i, (token, _)) in ROLE_TOKENS.iter().enumerate() {
+            assert!(
+                !ROLE_TOKENS[i + 1..].iter().any(|(other, _)| other == token),
+                "{token} listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        for role in AxRole::ALL {
+            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
+            match support(role, AxBackend::Ios) {
+                RoleSupport::Mapped => {
+                    assert!(mapped, "{role:?} declared Mapped but no token maps to it")
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by a token but the matrix does not declare it"
+                ),
+            }
+        }
     }
 }
