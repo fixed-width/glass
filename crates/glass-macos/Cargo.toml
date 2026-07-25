@@ -49,6 +49,18 @@ harness = false
 name = "bundle_launch"
 harness = false
 
+# Mac-gated role-histogram PROBE (crates/glass-macos/tests/role_probe.rs) — not a pass/fail
+# assertion test. Same harness=false main-thread requirement as `capture`/`input`/`windows`/
+# `a11y`/`bundle_launch` above (`MacosPlatform::start_app` reaches AppKit's
+# `ffi::app_kit_init()`). Launches whatever apps `GLASS_A11Y_PROBE_APPS` names, snapshots each
+# through `glass-a11y-macos` with the node cap lifted, and prints `glass_core::role_histogram`
+# — the native AX-token evidence a `Gap` cell in `glass_core::role_support::ROLE_SUPPORT`
+# needs before a match arm can be written for it. With the variable unset it prints what to
+# set and exits 0. See that file's module doc.
+[[test]]
+name = "role_probe"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 plist = "1"
