@@ -14,10 +14,12 @@
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use crate::teardown::{CloseStep, close_wait_step, wants_close_request};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -33,6 +35,18 @@ use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA,
     PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
 };
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+/// How long the app tree gets to close itself after the `WM_CLOSE` broadcast, before the Job is
+/// closed (`TerminateProcess` for whatever is left). Only an app that will not close pays this in
+/// full — a cooperating one ends the wait the moment its tree is gone. Measured on-box: an isolated
+/// Edge tree (15 processes) is fully gone 328 ms after the broadcast, so the budget is generous
+/// enough for a heavier app's shutdown path without making teardown feel slow.
+const CLOSE_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the close wait re-checks the tree. Short relative to [`CLOSE_GRACE`] so a quick
+/// shutdown is noticed promptly rather than rounded up to the next poll.
+const CLOSE_POLL: Duration = Duration::from_millis(50);
 
 /// Run the optional build step in `cwd` via `cmd /C` (the Windows shell), failing
 /// if it exits non-zero. Mirrors the X11 backend's `sh -c` build step. Unconfined
@@ -117,8 +131,17 @@ impl LaunchedApp {
         self.child.try_wait()
     }
 
-    /// Kill the whole tree (close the job) and reap the root.
+    /// Tear the whole tree down, asking it to close first: broadcast `WM_CLOSE` to the app's own
+    /// top-level windows, give it up to [`CLOSE_GRACE`] to leave through its own shutdown path,
+    /// then close the Job (terminating anything left) and reap the root.
+    ///
+    /// The Job close alone is `TerminateProcess`, which runs no shutdown path at all — an app that
+    /// records whether it exited cleanly then reports a crash on its *next* launch and greets the
+    /// agent with a recovery prompt instead of its normal first screen. See [`crate::teardown`] for
+    /// the measurement behind that and for both decisions this drives.
     pub(crate) fn kill(mut self) {
+        let posted = request_close(&self.live_pids());
+        self.await_close(posted);
         // SAFETY: closing the last job handle terminates the entire tree (KILL_ON_JOB_CLOSE).
         unsafe {
             let _ = CloseHandle(self.job.0);
@@ -126,6 +149,54 @@ impl LaunchedApp {
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
     }
+
+    /// The app's live process set: the Job's authoritative pid list, falling back to the Toolhelp
+    /// parent-link walk when the Job query fails (it reports failure as an empty list). Without the
+    /// fallback, a failed query would leave a handed-off app with no window to ask.
+    fn live_pids(&self) -> Vec<u32> {
+        let pids = self.job_pids();
+        if pids.is_empty() {
+            descendant_pids(self.pid())
+        } else {
+            pids
+        }
+    }
+
+    /// Poll until the tree has closed itself or [`CLOSE_GRACE`] is spent, per
+    /// [`close_wait_step`]. `posted` is how many windows accepted the `WM_CLOSE`.
+    fn await_close(&mut self, posted: usize) {
+        let deadline = Instant::now() + CLOSE_GRACE;
+        loop {
+            let root_exited = matches!(self.child.try_wait(), Ok(Some(_)));
+            let job_reports_live = !self.job_pids().is_empty();
+            let step = close_wait_step(
+                posted,
+                root_exited,
+                job_reports_live,
+                Instant::now() >= deadline,
+            );
+            if step == CloseStep::Proceed {
+                return;
+            }
+            std::thread::sleep(CLOSE_POLL);
+        }
+    }
+}
+
+/// Post `WM_CLOSE` to every top-level window owned by `pids` that [`wants_close_request`] accepts,
+/// returning how many posts the OS accepted.
+///
+/// The count matters: a cross-process post can be refused (UIPI blocks posting to a
+/// higher-integrity process), and a refused window is not one that is going to close — counting it
+/// would make the caller wait out the whole grace for a shutdown nobody was asked to perform.
+fn request_close(pids: &[u32]) -> usize {
+    crate::util::enum_top_windows()
+        .into_iter()
+        .filter(|w| pids.contains(&w.pid) && wants_close_request(w.visible, w.owned, w.toolwindow))
+        // SAFETY: PostMessageW only queues a message on the target window's thread queue — it
+        // writes through no pointer we own and does not block waiting for the app to handle it.
+        .filter(|w| unsafe { PostMessageW(Some(w.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok())
+        .count()
 }
 
 /// Spawn `cmd` CREATE_SUSPENDED with piped stdout/stderr, create a KILL_ON_JOB_CLOSE Job,

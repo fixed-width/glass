@@ -384,6 +384,82 @@ fn onbox_isolated_edge_killtree() {
     );
 }
 
+/// Wait until no msedge.exe carrying `marker` is left, or `budget` elapses. Returns the final
+/// count so a caller can distinguish "the tree closed itself" from "we ran out of patience".
+fn wait_for_no_edge(marker: &str, budget: Duration) -> i32 {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let n = our_edge_count(marker);
+        if n == 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + Edge"]
+fn onbox_stop_app_lets_edge_record_a_clean_exit() {
+    // `stop_app` must ask the app to close before terminating it. Edge is the readable witness:
+    // it records `exit_type` in its profile, and a tree ended by TerminateProcess (closing the
+    // Job, which is all `stop_app` used to do) leaves "Crashed" behind — which is what makes the
+    // next launch open with a "Restore pages?" prompt instead of the app's normal first screen.
+    // Measured on-box before the fix: Crashed. An isolated `--user-data-dir` keeps this away from
+    // the box's own Edge profile.
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let edge = glass_windows::onbox_support::locate_edge()
+        .expect("msedge.exe not found under Program Files; Edge is required for this test");
+    let marker = "glass-clean-exit-test";
+    let udd = glass_windows::onbox_support::scratch_dir(marker);
+    let _ = std::fs::remove_dir_all(&udd);
+
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let spec = AppSpec {
+        build: None,
+        run: vec![
+            edge,
+            format!("--user-data-dir={udd}"),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--new-window".to_string(),
+            "about:blank".to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        window_hint: None,
+        timeout_ms: 25_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    };
+    let _geo = p
+        .start_app(&spec)
+        .expect("isolated Edge discovery (Job-child window)");
+    std::thread::sleep(Duration::from_secs(6)); // let the profile be written and children spawn
+
+    p.stop_app().expect("stop_app");
+    let survivors = wait_for_no_edge(marker, Duration::from_secs(20));
+    // Settle before reading: Edge rewrites Preferences as part of its shutdown, so a read racing
+    // that write could see the in-session "Crashed" and fail for the wrong reason. A fixed settle
+    // (rather than polling until the value reads "Normal") keeps the assertion able to fail.
+    std::thread::sleep(Duration::from_secs(3));
+    let prefs_path = std::path::Path::new(&udd)
+        .join("Default")
+        .join("Preferences");
+    let prefs = std::fs::read_to_string(&prefs_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", prefs_path.display()));
+    let exit_type = glass_windows::onbox_support::exit_type_from_preferences(&prefs)
+        .map(str::to_owned)
+        .unwrap_or_else(|| "<no exit_type key>".to_string());
+    let _ = std::fs::remove_dir_all(&udd);
+
+    assert_eq!(survivors, 0, "stop_app must still leave 0 survivors");
+    assert_eq!(
+        exit_type, "Normal",
+        "stop_app must ask the app to close, not just terminate it"
+    );
+}
+
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a11y_snapshot_and_click() {

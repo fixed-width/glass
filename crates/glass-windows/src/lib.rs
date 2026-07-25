@@ -3,7 +3,7 @@
 //! v1 drives the interactive desktop. The OS-touching modules and the
 //! `WindowsPlatform` impl are gated per-item with `#[cfg(windows)]` (not a
 //! crate-level gate) so the pure [`dpi`] coordinate math still compiles and is
-//! unit-tested on the Linux dev box. Off Windows the crate exposes only `dpi` and the
+//! unit-tested on any host. Off Windows the crate exposes only `dpi` and the
 //! [`capabilities`] map (whose `accessibility` cell is live; every other cell is constant).
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
@@ -16,13 +16,14 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus};
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
-pub mod dpi; // pure coordinate math — cross-platform, unit-tested on the Linux dev box
-pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on the Linux dev box
+pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
+pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on any host
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
 #[doc(hidden)]
 pub mod onbox_support;
-pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on the Linux dev box
-pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on the Linux dev box // env-resolved paths shared by the on-box examples + tests; host-tested
+pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on any host
+pub mod teardown; // pure graceful-close decisions — cross-platform, unit-tested on any host
+pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on any host // env-resolved paths shared by the on-box examples + tests; host-tested
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
