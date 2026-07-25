@@ -262,15 +262,24 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
     }
 }
 
-/// Gracefully terminate the running application with this pid; a no-op if the pid is
-/// already gone. Cleanup-only (unlike `input.rs::focus`'s identical lookup, which treats a
-/// missing pid as the hard error `GlassError::AppExited` because a caller is depending on
-/// the activation landing) — `backend.rs`'s `stop_app` path doesn't need to know whether the
-/// app was already gone before it asked.
-pub(crate) fn terminate_app(pid: i32) {
-    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-        app.terminate();
-    }
+/// Ask the running application with this pid to quit through its own shutdown path —
+/// `-[NSRunningApplication terminate]`, the same request Cmd-Q sends. Returns whether the
+/// request was actually delivered: `false` means the pid owns no running application (it is
+/// not GUI-registered, or is already gone) or AppKit declined to send, and a caller that
+/// needs the process gone must fall back to signalling it.
+///
+/// Only signals are available without this: measured on macOS 26, a directly-spawned bundle
+/// executable asked this way runs `applicationWillTerminate:` and exits in ~390 ms, while
+/// `SIGTERM` and `SIGKILL` both end it with that method never called — an app gets no chance
+/// to flush state under either.
+///
+/// The `false` return is advisory, not an error. `backend.rs`'s `stop_app` path doesn't need
+/// to know whether the app was already gone before it asked (unlike `input.rs::focus`'s
+/// identical lookup, which treats a missing pid as the hard error `GlassError::AppExited`
+/// because a caller is depending on the activation landing).
+pub(crate) fn terminate_app(pid: i32) -> bool {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .is_some_and(|app| app.terminate())
 }
 
 #[cfg(test)]

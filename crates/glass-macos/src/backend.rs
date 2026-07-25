@@ -132,7 +132,9 @@ impl Adopted {
     /// mid-edit and losing the user's work.
     fn reap(self) {
         if self.disposition.should_terminate() {
-            crate::ffi::terminate_app(self.pid);
+            // Whether the request landed is deliberately not acted on: there is no escalation
+            // to fall back to on this path, so a `false` would only be something to report.
+            let _ = crate::ffi::terminate_app(self.pid);
         }
     }
 }

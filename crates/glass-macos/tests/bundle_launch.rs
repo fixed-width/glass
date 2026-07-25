@@ -316,6 +316,28 @@ mod macos_main {
             Ok(())
         });
 
+        // `with_stop_app` has now run `stop_app`, so the fixture has been torn down. It must
+        // have been ASKED to quit, not merely signalled: AppKit runs no shutdown path for a
+        // signal, so `applicationWillTerminate:` — and the `quit: ` line it prints — appear
+        // only if `process::terminate` asked first. Draining after `stop_app` is deliberate;
+        // the line is written during teardown and cannot exist before it.
+        let result = result.and_then(|()| {
+            std::thread::sleep(ACTION_SETTLE); // let the reader thread drain the closing pipe
+            let logs = platform.drain_logs();
+            let saw_quit = logs
+                .iter()
+                .any(|(stream, line)| *stream == Stream::Stdout && line.starts_with("quit: "));
+            if saw_quit {
+                println!("stop_app asked the app to quit: its shutdown path ran before teardown");
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected a captured 'quit: ' stdout line proving stop_app asked the app to \
+                     quit before signalling it; captured logs: {logs:?}"
+                ))
+            }
+        });
+
         let _ = std::fs::remove_dir_all(&build_dir);
         result
     }

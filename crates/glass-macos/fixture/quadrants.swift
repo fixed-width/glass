@@ -249,6 +249,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// AppKit's "you are about to quit" notification — the one an app uses to flush state.
+    /// It runs when the app is *asked* to quit and not when it is signalled, so announcing it
+    /// on stdout (already captured, like the input echoes above) lets a test tell those two
+    /// teardowns apart from outside the process.
+    func applicationWillTerminate(_ notification: Notification) {
+        print("quit: shutdown path ran")
+        fflush(stdout)
+    }
+
     private func makeWindow(origin: NSPoint, title: String, palette: QuadrantPalette) -> FixtureWindow {
         let rect = NSRect(origin: origin, size: windowSize)
         let window = FixtureWindow(
