@@ -31,10 +31,10 @@ unsafe_code = "deny"
 all = { level = "deny", priority = -1 }
 
 [workspace.dependencies]
-thiserror = "1"
+thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 tempfile = "3"
-x11rb = { version = "0.13", features = ["xtest"] }
+x11rb = { version = "0.14", features = ["xtest"] }
 glass-android = { path = "crates/glass-android" }
 glass-ios = { path = "crates/glass-ios" }
 glass-core = { path = "crates/glass-core" }
@@ -62,10 +62,10 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 # which glass-wayland doesn't use (it binds raw wl_seat + zwp_virtual_keyboard and
 # generates its own XKB keymap string). Dropping them removes the libxkbcommon C
 # dependency, keeping the binary free of dynamic C libs (enables fully static musl).
-smithay-client-toolkit = { version = "0.20", default-features = false }
+smithay-client-toolkit = { version = "0.21", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-roxmltree = "0.20"
+roxmltree = "0.21"
 rustix = { version = "1", features = ["process", "pipe", "event", "fs"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 

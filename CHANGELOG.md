@@ -67,6 +67,10 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- A contained app launched on the Wayland backend can now reach an Xwayland display through the
+  ordinary X11 socket (`/tmp/.X11-unix`), which the sandbox's ephemeral `/tmp` previously hid.
+  X11 clients that fall back to the abstract socket were unaffected; ones that don't failed to
+  connect and the launch timed out. The X11 backend already exposed this socket.
 - A transiently stalled Xvfb no longer fails `glass_start` on Linux/X11: if the private X
   server doesn't report its display within 10s, glass kills it and retries once with a fresh
   server (worst-case start latency in the still-failing case is ~24s). When startup still

@@ -10,9 +10,8 @@ use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
     WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
-use smithay_client_toolkit::delegate_output;
+use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
-use smithay_client_toolkit::delegate_shm;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
@@ -259,9 +258,12 @@ impl ShmHandler for State {
     }
 }
 
-delegate_output!(State);
+// SCTK 0.21 folded the per-module `delegate_output!`/`delegate_shm!` macros into one
+// blanket `delegate_dispatch2!`, which routes every SCTK-owned user-data type. Our own
+// `Dispatch<_, ()>` impls below stay hand-written — `()` carries no `Dispatch2` impl,
+// so they don't overlap the blanket one.
+delegate_dispatch2!(State);
 delegate_registry!(State);
-delegate_shm!(State);
 
 // We don't recycle buffers (one pool per capture), so wl_buffer release is a no-op.
 impl Dispatch<wl_buffer::WlBuffer, ()> for State {

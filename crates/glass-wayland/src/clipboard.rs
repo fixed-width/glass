@@ -35,7 +35,7 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
-use smithay_client_toolkit::{delegate_output, delegate_registry, delegate_shm};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry};
 use wayland_client::protocol::{wl_buffer, wl_output};
 
 // ---- MIME types we offer / accept ----
@@ -91,11 +91,10 @@ impl ShmHandler for ClipState {
     }
 }
 
-delegate_output!(ClipState);
+delegate_dispatch2!(ClipState);
 delegate_registry!(ClipState);
-delegate_shm!(ClipState);
 
-// wl_buffer is required by the delegate_shm path.
+// wl_buffer is required by the shm path.
 impl Dispatch<wl_buffer::WlBuffer, ()> for ClipState {
     fn event(
         _: &mut Self,
@@ -230,9 +229,8 @@ impl ShmHandler for ServeState {
     }
 }
 
-delegate_output!(ServeState);
+delegate_dispatch2!(ServeState);
 delegate_registry!(ServeState);
-delegate_shm!(ServeState);
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for ServeState {
     fn event(

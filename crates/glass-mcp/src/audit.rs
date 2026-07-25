@@ -11,7 +11,7 @@ use glass_core::{
     platform::Segment, Actuation, ActuationContext, AuditOutcome, AuditSink, KeyEvent, Modifier,
     MouseButton, PointerEvent, WindowOp,
 };
-use rand::RngCore;
+use rand::TryRng;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -367,10 +367,11 @@ impl AuditSink for JsonlSink {
 
 fn mint_session() -> String {
     let mut b = [0u8; 8];
-    // `try_fill_bytes`, not `fill_bytes`: `record` must never panic, and `OsRng` can
-    // fail. A session id only distinguishes start→stop cycles (it need not be
-    // unpredictable), so on the astronomically-rare RNG error use a fixed fallback tag.
-    if rand::rngs::OsRng.try_fill_bytes(&mut b).is_err() {
+    // The fallible `SysRng` path, not the panicking `rand::rng()` one: `record` must never
+    // panic, and the OS source can fail. A session id only distinguishes start→stop cycles
+    // (it need not be unpredictable), so on the astronomically-rare RNG error use a fixed
+    // fallback tag.
+    if rand::rngs::SysRng.try_fill_bytes(&mut b).is_err() {
         return "s-norand".to_string();
     }
     format!(

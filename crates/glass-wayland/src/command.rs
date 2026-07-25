@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -72,14 +72,19 @@ pub fn sway_config(spec: &AppSpec, runtime_dir: &Path, a11y_bind_dir: Option<&Pa
                     .ok()
             });
             let home_os = ephemeral_home();
-            // Re-expose the launch target — the program and any path token under $HOME or /tmp,
-            // which the ephemeral tmpfs shadows.
-            let mut ro_binds = glass_sandbox_linux::launch_ro_binds(
+            // Always re-expose the X11 socket dir: an Xwayland client reaches the display over
+            // /tmp/.X11-unix/X<n>, which the ephemeral /tmp tmpfs shadows. Clients that fall back
+            // to the abstract socket (`@/tmp/.X11-unix/X<n>`) survive without it, but not every
+            // X11 stack still tries abstract sockets, so bind the real one like glass-x11 does.
+            // Also re-expose the launch target — the program and any path token under $HOME or
+            // /tmp, which the ephemeral tmpfs shadows.
+            let mut ro_binds = vec![PathBuf::from("/tmp/.X11-unix")];
+            ro_binds.extend(glass_sandbox_linux::launch_ro_binds(
                 &prog,
                 &args,
                 Path::new(&home_os),
                 effective_cwd.as_deref(),
-            );
+            ));
             if let Some(dir) = a11y_bind_dir {
                 ro_binds.push(dir.to_path_buf());
             }
@@ -246,6 +251,21 @@ mod tests {
         );
         assert!(
             cfg.contains("'--' 'glass-testapp' '--windows' '2'"),
+            "{cfg}"
+        );
+    }
+
+    /// An Xwayland client under containment reaches the display through
+    /// `/tmp/.X11-unix/X<n>`, which the sandbox's ephemeral `/tmp` tmpfs shadows. Without
+    /// this bind only clients that fall back to the abstract socket can connect.
+    #[test]
+    fn sway_config_binds_the_x11_socket_dir_when_sandboxed() {
+        use glass_core::SandboxLevel;
+        let mut s = spec(&["glass-testapp"]);
+        s.sandbox = SandboxLevel::Default;
+        let cfg = sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
+        assert!(
+            cfg.contains("'--ro-bind-try' '/tmp/.X11-unix' '/tmp/.X11-unix'"),
             "{cfg}"
         );
     }
