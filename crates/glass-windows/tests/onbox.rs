@@ -72,6 +72,54 @@ fn notepad_spec() -> AppSpec {
     }
 }
 
+/// Task Manager's own process directly owns its window — same discoverable-by-pid shape as
+/// charmap/Notepad — *unless* an instance was already running before this test started, in
+/// which case Task Manager's single-instance check makes our freshly spawned process just
+/// activate the existing window and exit. The title hint exists for exactly that case: with
+/// no window in our own pid-set, `poll_decision` keeps polling on the hint alone and the
+/// system-wide title-substring fallback rung picks up the pre-existing window instead.
+fn taskmgr_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec!["taskmgr.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: Some(WindowHint {
+            title: Some("Task Manager".into()),
+            class: None,
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
+/// Bare `explorer.exe` (no path arg): opens the OS default location — "Quick access" on
+/// Windows 10, "Home" on Windows 11 — the same native file-list control (and so the same
+/// DataGrid/DataItem/Header/HeaderItem UIA tree) any folder view uses. Each File Explorer
+/// window is its own process (unlike Task Manager, Explorer has no single-instance check —
+/// this is why `explorer.exe <uri>` protocol activation, e.g. `ms-settings:`, is the flaky
+/// shape and a plain `explorer.exe` folder-window launch is not), so pid-set discovery is
+/// expected to find it directly. The hint here is `class`, not `title`: `CabinetWClass` is
+/// every File Explorer folder window's documented window class regardless of locale, OS
+/// version, or the current folder's display name — unlike a title, which would vary with
+/// exactly the thing this spec deliberately leaves unset.
+fn explorer_spec() -> AppSpec {
+    AppSpec {
+        build: None,
+        run: vec!["explorer.exe".to_string()],
+        cwd: None,
+        env: vec![],
+        window_hint: Some(WindowHint {
+            title: None,
+            class: Some("CabinetWClass".into()),
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
 /// A `Glass` session wired to the real Windows backend + UIA reader (as opposed to the bare
 /// `WindowsPlatform`/`WindowsA11y` the other on-box tests drive directly) — needed wherever a test
 /// wants the production `click_element` orchestration (invoke-first, pointer-fallback,
@@ -1044,15 +1092,30 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
 /// is the only way the evidence gets out of that path. Printing it too costs nothing and helps
 /// anyone running the test directly on a box with a desktop session.
 ///
-/// Runs charmap and Notepad. The Settings app (`ms-settings:` via `explorer.exe`) was
-/// considered and left out: unlike these two, its window has no process relationship to the
-/// process glass launches — `explorer.exe` hands the request to the shell and exits, and the
-/// Settings window belongs to an unrelated process the launched pid-set never contains — so
-/// discovery could only find it through the title-substring fallback rung (a system-wide scan
-/// by window title) rather than the pid-based one charmap/Notepad use. That fallback rung
+/// Runs charmap, Notepad, Task Manager, and File Explorer. charmap/Notepad alone gave clean
+/// output but no tabular UI, so `DataItem` (UIA id 50029), `Header` (50034), and
+/// `HeaderItem` (50035) — exactly the ids the `Table`/`Cell` `Gap` reasons in
+/// `ROLE_SUPPORT` name — went unobserved; Task Manager's process list and File Explorer's
+/// file list are both real UIA `DataGrid`/`DataItem`/`Header` trees, so they were added to
+/// reach those tokens. See [`taskmgr_spec`]/[`explorer_spec`] for why each is expected to be
+/// discovered as reliably as charmap/Notepad despite neither being launched exactly the same
+/// way.
+///
+/// The Settings app (`ms-settings:` via `explorer.exe`) was considered and left out: unlike
+/// the four apps run here, its window has no process relationship to the process glass
+/// launches — `explorer.exe` hands the request to the shell and exits, and the Settings
+/// window belongs to an unrelated process the launched pid-set never contains — so discovery
+/// could only find it through the title-substring fallback rung (a system-wide scan by
+/// window title) rather than the pid-based one every app here uses. That fallback rung
 /// exists in the backend for exactly this shape of app, but this probe declined to depend on
 /// it without on-box verification that it resolves reliably; see the report for the full
 /// reasoning.
+///
+/// This probe also can't surface a UIA `Window` with `IsDialog` true (the `Dialog` row's
+/// Windows `Gap` reason in `ROLE_SUPPORT`): none of the four apps opens a dialog on a cold,
+/// no-input launch, and `role_histogram` only ever sees what `glass-a11y-windows`'s reader
+/// already reads into an `AxNode` — `IsDialog` is not among those fields (reading it is the
+/// gap itself), so no launch sequence run through this probe could reveal it either way.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session; prints role histograms and writes them to .windows-artifacts/role-histogram-windows.txt, asserts nothing about their contents"]
 fn onbox_role_histogram_probe() {
@@ -1062,5 +1125,11 @@ fn onbox_role_histogram_probe() {
     let mut report = String::new();
     probe_role_histogram("charmap.exe (Character Map)", &charmap_spec(), &mut report);
     probe_role_histogram("notepad.exe (Notepad)", &notepad_spec(), &mut report);
+    probe_role_histogram("taskmgr.exe (Task Manager)", &taskmgr_spec(), &mut report);
+    probe_role_histogram(
+        "explorer.exe (File Explorer)",
+        &explorer_spec(),
+        &mut report,
+    );
     save_report("role-histogram-windows.txt", &report);
 }

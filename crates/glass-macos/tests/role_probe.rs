@@ -154,9 +154,17 @@ mod macos_main {
                 limits: WalkLimits::from_max_nodes(Some(0)),
             };
             let mut a11y = MacosA11y::new();
-            let tree = a11y
+            let mut tree = a11y
                 .snapshot(&ctx)
                 .map_err(|e| format!("snapshot({run0}): {e}"))?;
+            // `MacosA11y::snapshot` deliberately leaves `count` (and node ids) at their
+            // zero default — `glass-a11y-macos`'s own doc says numbering is assigned by
+            // `glass-core` so it's identical across backends (`tests/a11y.rs` calls this
+            // too, right after its own snapshot). Skipping it here was the earlier bug: the
+            // printed histogram's bucket counts were always right (`role_histogram` walks
+            // the tree structurally, not by id), but the "N nodes" header read 0 regardless
+            // of how big the tree actually was.
+            tree.assign_ids();
             print_role_histogram(run0, &tree);
             Ok(())
         })
