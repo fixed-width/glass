@@ -47,13 +47,13 @@ pub const CONTROL_TYPES: &[(u32, &str, Option<AxRole>)] = &[
     (50027, "Thumb", None),
     (50028, "DataGrid", Some(AxRole::Table)),
     (50029, "DataItem", None),
-    (50030, "Document", None),
+    (50030, "Document", Some(AxRole::TextArea)),
     // A split button is an actionable button carrying a dropdown.
     (50031, "SplitButton", Some(AxRole::Button)),
     (50032, "Window", Some(AxRole::Window)),
     (50033, "Pane", Some(AxRole::Group)),
-    (50034, "Header", None),
-    (50035, "HeaderItem", None),
+    (50034, "Header", Some(AxRole::Heading)),
+    (50035, "HeaderItem", Some(AxRole::Heading)),
     (50036, "Table", Some(AxRole::Table)),
     (50037, "TitleBar", None),
     (50038, "Separator", Some(AxRole::Separator)),
@@ -69,10 +69,21 @@ fn control_type(control_type_id: u32) -> Option<&'static (u32, &'static str, Opt
         .find(|(id, _, _)| *id == control_type_id)
 }
 
-/// Map a UIA `ControlTypeId` to the normalized `AxRole`; a control type glass does not map —
-/// known or not — becomes `AxRole::Other` (the reader keeps the control type's name in
-/// `raw_role`).
-pub fn map_role(control_type_id: u32) -> AxRole {
+/// Map a UIA `ControlTypeId` plus Toggle-pattern availability to the normalized `AxRole`.
+///
+/// UIA has no dedicated "toggle button" control type — a formatting-bar button (Bold, Italic,
+/// ...) reports as a plain `Button` (50000) and carries the Toggle pattern instead, the same
+/// pattern a `CheckBox`/`RadioButton` carries. `toggleable` is that pattern's *availability*
+/// (see `StateFacts::checkable`), passed in because computing it means a live UIA call this
+/// module cannot make. Only `Button` is affected: `CheckBox` (50002) and `RadioButton` (50013)
+/// already have their own roles regardless of `toggleable`.
+///
+/// A control type glass does not map — known or not — becomes `AxRole::Other` (the reader keeps
+/// the control type's name in `raw_role`).
+pub fn map_role(control_type_id: u32, toggleable: bool) -> AxRole {
+    if control_type_id == 50000 && toggleable {
+        return AxRole::ToggleButton;
+    }
     control_type(control_type_id)
         .and_then(|(_, _, role)| *role)
         .unwrap_or(AxRole::Other)
@@ -131,20 +142,20 @@ mod tests {
 
     #[test]
     fn common_control_types_map() {
-        assert_eq!(map_role(50000), AxRole::Button);
-        assert_eq!(map_role(50002), AxRole::CheckBox);
-        assert_eq!(map_role(50004), AxRole::TextField);
-        assert_eq!(map_role(50011), AxRole::MenuItem);
-        assert_eq!(map_role(50018), AxRole::TabList);
-        assert_eq!(map_role(50019), AxRole::Tab);
-        assert_eq!(map_role(50032), AxRole::Window);
-        assert_eq!(map_role(50020), AxRole::Label);
-        assert_eq!(map_role(50031), AxRole::Button); // SplitButton
+        assert_eq!(map_role(50000, false), AxRole::Button);
+        assert_eq!(map_role(50002, false), AxRole::CheckBox);
+        assert_eq!(map_role(50004, false), AxRole::TextField);
+        assert_eq!(map_role(50011, false), AxRole::MenuItem);
+        assert_eq!(map_role(50018, false), AxRole::TabList);
+        assert_eq!(map_role(50019, false), AxRole::Tab);
+        assert_eq!(map_role(50032, false), AxRole::Window);
+        assert_eq!(map_role(50020, false), AxRole::Label);
+        assert_eq!(map_role(50031, false), AxRole::Button); // SplitButton
     }
     #[test]
     fn unmapped_control_type_is_other() {
-        assert_eq!(map_role(50001), AxRole::Other); // Calendar
-        assert_eq!(map_role(99999), AxRole::Other);
+        assert_eq!(map_role(50001, false), AxRole::Other); // Calendar
+        assert_eq!(map_role(99999, false), AxRole::Other);
     }
     #[test]
     fn offscreen_clears_visible_and_toggle_sets_checked() {
@@ -204,6 +215,42 @@ mod tests {
     }
 
     #[test]
+    fn document_and_headers_map_from_observed_tokens() {
+        // Observed on a stock text editor (Document) and a stock task manager (Header,
+        // HeaderItem) — see the probe test in crates/glass-windows/tests/onbox.rs.
+        assert_eq!(map_role(50030, false), AxRole::TextArea);
+        assert_eq!(map_role(50034, false), AxRole::Heading);
+        assert_eq!(map_role(50035, false), AxRole::Heading);
+    }
+
+    #[test]
+    fn unobserved_control_types_stay_unmapped() {
+        // DataItem is documented but no probed app emitted it — a data grid's rows arrived as
+        // TreeItem. No observation, no arm.
+        assert_eq!(map_role(50029, false), AxRole::Other);
+        assert_eq!(canonical_name(50029), Some("DataItem"));
+    }
+
+    #[test]
+    fn toggleable_button_maps_to_toggle_button() {
+        // Observed on a stock text editor's formatting bar: Button nodes carrying the Toggle
+        // pattern (Bold, Italic, Strikethrough, Link, Clear formatting).
+        assert_eq!(map_role(50000, true), AxRole::ToggleButton);
+    }
+
+    #[test]
+    fn non_toggleable_button_stays_button() {
+        assert_eq!(map_role(50000, false), AxRole::Button);
+    }
+
+    #[test]
+    fn toggleable_checkbox_stays_checkbox() {
+        // The toggle-capable rule is scoped to Button; CheckBox already has its own role and
+        // the probe explicitly excluded it.
+        assert_eq!(map_role(50002, true), AxRole::CheckBox);
+    }
+
+    #[test]
     fn control_types_have_no_duplicate_ids() {
         for (i, (id, _, _)) in CONTROL_TYPES.iter().enumerate() {
             assert!(
@@ -238,14 +285,10 @@ mod tests {
 
     #[test]
     fn a_known_but_unmapped_control_type_still_has_a_name() {
-        // These are exactly the ids the role-support matrix's Windows gaps point at, and what
-        // a probe run has to read; reporting them as `UIA:50029` would defeat that.
+        // DataItem is exactly the id the role-support matrix's remaining Windows Cell gap points
+        // at, and what a probe run has to read; reporting it as `UIA:50029` would defeat that.
         assert_eq!(canonical_name(50029), Some("DataItem"));
-        assert_eq!(canonical_name(50030), Some("Document"));
-        assert_eq!(canonical_name(50034), Some("Header"));
-        assert_eq!(map_role(50029), AxRole::Other);
-        assert_eq!(map_role(50030), AxRole::Other);
-        assert_eq!(map_role(50034), AxRole::Other);
+        assert_eq!(map_role(50029, false), AxRole::Other);
     }
 
     #[test]
@@ -254,8 +297,12 @@ mod tests {
         use glass_core::AxRole;
         for role in AxRole::ALL {
             // Only a row carrying `Some(role)` produces a role; a named-but-unmapped control
-            // type yields `Other` and must not count as coverage.
-            let mapped = CONTROL_TYPES.iter().any(|(_, _, r)| *r == Some(role));
+            // type yields `Other` and must not count as coverage. `ToggleButton` is the one
+            // role no `CONTROL_TYPES` row produces on its own — it comes from `map_role`'s
+            // Button-plus-Toggle-pattern rule — so it is checked by calling the real function
+            // with the fact that triggers it, not by a hardcoded exception.
+            let mapped = CONTROL_TYPES.iter().any(|(_, _, r)| *r == Some(role))
+                || map_role(50000, true) == role;
             match support(role, AxBackend::Windows).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(
