@@ -79,6 +79,11 @@ pub use marks::Mark;
 
 pub mod outline;
 
+pub mod role_support;
+
+pub mod role_histogram;
+pub use role_histogram::{role_histogram, RoleTally};
+
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};
 

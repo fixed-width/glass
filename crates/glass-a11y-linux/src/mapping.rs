@@ -125,4 +125,68 @@ mod tests {
         let m = map_states(&StateSet::new(State::Checkable));
         assert!(m.checkable && !m.checked);
     }
+
+    /// One AT-SPI role per normalized role — the witness list the parity test walks.
+    const ROLE_SAMPLES: &[(Role, AxRole)] = &[
+        (Role::Application, AxRole::Application),
+        (Role::Frame, AxRole::Window),
+        (Role::Dialog, AxRole::Dialog),
+        (Role::Panel, AxRole::Group),
+        (Role::Button, AxRole::Button),
+        (Role::ToggleButton, AxRole::ToggleButton),
+        (Role::RadioButton, AxRole::RadioButton),
+        (Role::CheckBox, AxRole::CheckBox),
+        (Role::MenuBar, AxRole::MenuBar),
+        (Role::Menu, AxRole::Menu),
+        (Role::MenuItem, AxRole::MenuItem),
+        (Role::Label, AxRole::Label),
+        (Role::Entry, AxRole::TextField),
+        (Role::Text, AxRole::TextArea),
+        (Role::ComboBox, AxRole::ComboBox),
+        (Role::List, AxRole::List),
+        (Role::ListItem, AxRole::ListItem),
+        (Role::Table, AxRole::Table),
+        (Role::TableCell, AxRole::Cell),
+        (Role::Tree, AxRole::Tree),
+        (Role::TreeItem, AxRole::TreeItem),
+        (Role::PageTabList, AxRole::TabList),
+        (Role::PageTab, AxRole::Tab),
+        (Role::ScrollBar, AxRole::ScrollBar),
+        (Role::Slider, AxRole::Slider),
+        (Role::SpinButton, AxRole::SpinButton),
+        (Role::ProgressBar, AxRole::ProgressBar),
+        (Role::Image, AxRole::Image),
+        (Role::Link, AxRole::Link),
+        (Role::Separator, AxRole::Separator),
+        (Role::ToolBar, AxRole::Toolbar),
+        (Role::StatusBar, AxRole::StatusBar),
+        (Role::Heading, AxRole::Heading),
+    ];
+
+    #[test]
+    fn every_sample_maps_as_claimed() {
+        for (atspi, expected) in ROLE_SAMPLES {
+            assert_eq!(map_role(*atspi), *expected, "{atspi:?}");
+        }
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        for role in AxRole::ALL {
+            let mapped = ROLE_SAMPLES.iter().any(|(_, r)| *r == role);
+            match support(role, AxBackend::Linux).expect("declared in ROLE_SUPPORT") {
+                RoleSupport::Mapped => {
+                    assert!(
+                        mapped,
+                        "{role:?} declared Mapped but no AT-SPI sample maps to it"
+                    )
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by an AT-SPI role but the matrix does not declare it"
+                ),
+            }
+        }
+    }
 }

@@ -7,37 +7,43 @@
 
 use glass_core::{AxRole, AxStates};
 
+/// Every AX role string glass maps. AX role strings are canonical constants, so lookup is
+/// case-sensitive.
+pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
+    ("AXButton", AxRole::Button),
+    ("AXCheckBox", AxRole::CheckBox),
+    ("AXRadioButton", AxRole::RadioButton),
+    ("AXRadioGroup", AxRole::Group),
+    ("AXTextField", AxRole::TextField),
+    ("AXTextArea", AxRole::TextArea),
+    ("AXStaticText", AxRole::Label),
+    ("AXWindow", AxRole::Window),
+    ("AXGroup", AxRole::Group),
+    ("AXMenu", AxRole::Menu),
+    ("AXMenuItem", AxRole::MenuItem),
+    ("AXMenuBar", AxRole::MenuBar),
+    ("AXImage", AxRole::Image),
+    ("AXLink", AxRole::Link),
+    ("AXSlider", AxRole::Slider),
+    ("AXComboBox", AxRole::ComboBox),
+    ("AXPopUpButton", AxRole::ComboBox),
+    ("AXList", AxRole::List),
+    ("AXRow", AxRole::ListItem),
+    ("AXCell", AxRole::Cell),
+    ("AXToolbar", AxRole::Toolbar),
+    ("AXTabGroup", AxRole::TabList),
+    ("AXProgressIndicator", AxRole::ProgressBar),
+    ("AXScrollBar", AxRole::ScrollBar),
+];
+
 /// Map an AX role string to the normalized `AxRole`; unmapped roles become
-/// `AxRole::Other` (the reader keeps the original string in `raw_role`). AX role
-/// strings are canonical, so the match is case-sensitive.
+/// `AxRole::Other` (the reader keeps the AX role string in `raw_role`).
 pub fn map_role(ax_role: &str) -> AxRole {
-    match ax_role {
-        "AXButton" => AxRole::Button,
-        "AXCheckBox" => AxRole::CheckBox,
-        "AXRadioButton" => AxRole::RadioButton,
-        "AXRadioGroup" => AxRole::Group,
-        "AXTextField" => AxRole::TextField,
-        "AXTextArea" => AxRole::TextArea,
-        "AXStaticText" => AxRole::Label,
-        "AXWindow" => AxRole::Window,
-        "AXGroup" => AxRole::Group,
-        "AXMenu" => AxRole::Menu,
-        "AXMenuItem" => AxRole::MenuItem,
-        "AXMenuBar" => AxRole::MenuBar,
-        "AXImage" => AxRole::Image,
-        "AXLink" => AxRole::Link,
-        "AXSlider" => AxRole::Slider,
-        "AXComboBox" => AxRole::ComboBox,
-        "AXPopUpButton" => AxRole::ComboBox,
-        "AXList" => AxRole::List,
-        "AXRow" => AxRole::ListItem,
-        "AXCell" => AxRole::Cell,
-        "AXToolbar" => AxRole::Toolbar,
-        "AXTabGroup" => AxRole::TabList,
-        "AXProgressIndicator" => AxRole::ProgressBar,
-        "AXScrollBar" => AxRole::ScrollBar,
-        _ => AxRole::Other,
-    }
+    ROLE_TOKENS
+        .iter()
+        .find(|(token, _)| *token == ax_role)
+        .map(|(_, role)| *role)
+        .unwrap_or(AxRole::Other)
 }
 
 /// Plain state facts the reader gathers from an AXUIElement (no objc2/AX types here, so
@@ -180,6 +186,33 @@ mod tests {
         let s = map_states(&f);
         assert!(s.visible && s.selected && s.checked && s.expanded);
         assert!(!s.enabled && !s.focused && !s.focusable && !s.editable);
+    }
+
+    #[test]
+    fn role_tokens_have_no_duplicate_strings() {
+        for (i, (token, _)) in ROLE_TOKENS.iter().enumerate() {
+            assert!(
+                !ROLE_TOKENS[i + 1..].iter().any(|(other, _)| other == token),
+                "{token} listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        for role in AxRole::ALL {
+            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
+            match support(role, AxBackend::MacOs).expect("declared in ROLE_SUPPORT") {
+                RoleSupport::Mapped => {
+                    assert!(mapped, "{role:?} declared Mapped but no AX role maps to it")
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by an AX role but the matrix does not declare it"
+                ),
+            }
+        }
     }
 
     #[test]

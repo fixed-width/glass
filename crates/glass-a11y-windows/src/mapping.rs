@@ -5,42 +5,83 @@
 
 use glass_core::{AxRole, AxStates};
 
-/// Map a UIA `ControlTypeId` to the normalized `AxRole`; unmapped ids become
-/// `AxRole::Other` (the reader keeps the localized control-type name in `raw_role`).
+/// Every documented UIA control type (the contiguous 50000..=50040 range), as
+/// `(ControlTypeId, canonical name, mapped role)`.
+///
+/// The canonical name is the control type's documented English name — it is what the reader puts
+/// in `raw_role`, identical on every machine, unlike UIA's localized control-type string. Every
+/// documented id is listed, so a control type glass does *not* map to a role still reads as e.g.
+/// `DataItem` rather than a bare number; only a vendor-defined or future id falls through to the
+/// reader's numeric `UIA:<id>` form.
+///
+/// The role is `Some` only where glass maps the control type today; `None` means the node gets
+/// [`AxRole::Other`] and is identified by its name alone.
+pub const CONTROL_TYPES: &[(u32, &str, Option<AxRole>)] = &[
+    (50000, "Button", Some(AxRole::Button)),
+    (50001, "Calendar", None),
+    (50002, "CheckBox", Some(AxRole::CheckBox)),
+    (50003, "ComboBox", Some(AxRole::ComboBox)),
+    (50004, "Edit", Some(AxRole::TextField)),
+    (50005, "Hyperlink", Some(AxRole::Link)),
+    (50006, "Image", Some(AxRole::Image)),
+    (50007, "ListItem", Some(AxRole::ListItem)),
+    (50008, "List", Some(AxRole::List)),
+    (50009, "Menu", Some(AxRole::Menu)),
+    (50010, "MenuBar", Some(AxRole::MenuBar)),
+    (50011, "MenuItem", Some(AxRole::MenuItem)),
+    (50012, "ProgressBar", Some(AxRole::ProgressBar)),
+    (50013, "RadioButton", Some(AxRole::RadioButton)),
+    (50014, "ScrollBar", Some(AxRole::ScrollBar)),
+    (50015, "Slider", Some(AxRole::Slider)),
+    (50016, "Spinner", Some(AxRole::SpinButton)),
+    (50017, "StatusBar", Some(AxRole::StatusBar)),
+    (50018, "Tab", Some(AxRole::TabList)),
+    (50019, "TabItem", Some(AxRole::Tab)),
+    (50020, "Text", Some(AxRole::Label)),
+    (50021, "ToolBar", Some(AxRole::Toolbar)),
+    (50022, "ToolTip", None),
+    (50023, "Tree", Some(AxRole::Tree)),
+    (50024, "TreeItem", Some(AxRole::TreeItem)),
+    (50025, "Custom", None),
+    (50026, "Group", Some(AxRole::Group)),
+    (50027, "Thumb", None),
+    (50028, "DataGrid", Some(AxRole::Table)),
+    (50029, "DataItem", None),
+    (50030, "Document", None),
+    // A split button is an actionable button carrying a dropdown.
+    (50031, "SplitButton", Some(AxRole::Button)),
+    (50032, "Window", Some(AxRole::Window)),
+    (50033, "Pane", Some(AxRole::Group)),
+    (50034, "Header", None),
+    (50035, "HeaderItem", None),
+    (50036, "Table", Some(AxRole::Table)),
+    (50037, "TitleBar", None),
+    (50038, "Separator", Some(AxRole::Separator)),
+    (50039, "SemanticZoom", None),
+    (50040, "AppBar", None),
+];
+
+/// The [`CONTROL_TYPES`] row for an id, shared by [`map_role`] and [`canonical_name`] so the two
+/// can never disagree about which ids are known.
+fn control_type(control_type_id: u32) -> Option<&'static (u32, &'static str, Option<AxRole>)> {
+    CONTROL_TYPES
+        .iter()
+        .find(|(id, _, _)| *id == control_type_id)
+}
+
+/// Map a UIA `ControlTypeId` to the normalized `AxRole`; a control type glass does not map —
+/// known or not — becomes `AxRole::Other` (the reader keeps the control type's name in
+/// `raw_role`).
 pub fn map_role(control_type_id: u32) -> AxRole {
-    match control_type_id {
-        50000 => AxRole::Button,
-        50002 => AxRole::CheckBox,
-        50003 => AxRole::ComboBox,
-        50004 => AxRole::TextField, // Edit
-        50005 => AxRole::Link,      // Hyperlink
-        50006 => AxRole::Image,
-        50007 => AxRole::ListItem,
-        50008 => AxRole::List,
-        50009 => AxRole::Menu,
-        50010 => AxRole::MenuBar,
-        50011 => AxRole::MenuItem,
-        50012 => AxRole::ProgressBar,
-        50013 => AxRole::RadioButton,
-        50014 => AxRole::ScrollBar,
-        50015 => AxRole::Slider,
-        50016 => AxRole::SpinButton,
-        50017 => AxRole::StatusBar,
-        50018 => AxRole::TabList, // Tab
-        50019 => AxRole::Tab,     // TabItem
-        50020 => AxRole::Label,   // Text
-        50021 => AxRole::Toolbar,
-        50023 => AxRole::Tree,
-        50024 => AxRole::TreeItem,
-        50026 => AxRole::Group,
-        50028 => AxRole::Table,  // DataGrid
-        50031 => AxRole::Button, // SplitButton — an actionable button with a dropdown
-        50032 => AxRole::Window,
-        50033 => AxRole::Group, // Pane
-        50036 => AxRole::Table,
-        50038 => AxRole::Separator,
-        _ => AxRole::Other,
-    }
+    control_type(control_type_id)
+        .and_then(|(_, _, role)| *role)
+        .unwrap_or(AxRole::Other)
+}
+
+/// The control type's canonical English name, or `None` for an id outside the documented range
+/// (a vendor-defined or future control type).
+pub fn canonical_name(control_type_id: u32) -> Option<&'static str> {
+    control_type(control_type_id).map(|(_, name, _)| *name)
 }
 
 /// Plain state facts the reader gathers from a UIA element (no `uiautomation` types here,
@@ -160,5 +201,73 @@ mod tests {
         assert_eq!(format_range_value(100.0), "100");
         assert_eq!(format_range_value(50.5), "50.5");
         assert_eq!(format_range_value(-3.0), "-3");
+    }
+
+    #[test]
+    fn control_types_have_no_duplicate_ids() {
+        for (i, (id, _, _)) in CONTROL_TYPES.iter().enumerate() {
+            assert!(
+                !CONTROL_TYPES[i + 1..]
+                    .iter()
+                    .any(|(other, _, _)| other == id),
+                "control type {id} listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn every_documented_control_type_is_listed() {
+        // The documented range is contiguous; a hole would mean a real control type reporting
+        // as an opaque number.
+        for id in 50000..=50040u32 {
+            assert!(
+                canonical_name(id).is_some(),
+                "control type {id} has no name"
+            );
+        }
+        assert_eq!(CONTROL_TYPES.len(), 41);
+    }
+
+    #[test]
+    fn canonical_name_is_stable_and_locale_free() {
+        assert_eq!(canonical_name(50000), Some("Button"));
+        assert_eq!(canonical_name(50036), Some("Table"));
+        assert_eq!(canonical_name(49999), None);
+        assert_eq!(canonical_name(50041), None);
+    }
+
+    #[test]
+    fn a_known_but_unmapped_control_type_still_has_a_name() {
+        // These are exactly the ids the role-support matrix's Windows gaps point at, and what
+        // a probe run has to read; reporting them as `UIA:50029` would defeat that.
+        assert_eq!(canonical_name(50029), Some("DataItem"));
+        assert_eq!(canonical_name(50030), Some("Document"));
+        assert_eq!(canonical_name(50034), Some("Header"));
+        assert_eq!(map_role(50029), AxRole::Other);
+        assert_eq!(map_role(50030), AxRole::Other);
+        assert_eq!(map_role(50034), AxRole::Other);
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::AxRole;
+        for role in AxRole::ALL {
+            // Only a row carrying `Some(role)` produces a role; a named-but-unmapped control
+            // type yields `Other` and must not count as coverage.
+            let mapped = CONTROL_TYPES.iter().any(|(_, _, r)| *r == Some(role));
+            match support(role, AxBackend::Windows).expect("declared in ROLE_SUPPORT") {
+                RoleSupport::Mapped => {
+                    assert!(
+                        mapped,
+                        "{role:?} declared Mapped but no control type maps to it"
+                    )
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by a control type but the matrix does not declare it"
+                ),
+            }
+        }
     }
 }

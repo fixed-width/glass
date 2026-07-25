@@ -3,8 +3,11 @@
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
 CheckButton "Enable", an Entry "Field" (initial text "hello"), a SpinButton
 "Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), a
-Switch "Active" (off), and a virtualized GtkListView of 80 rows ("Row 000".."Row
-079") in a small scroller. Run by scripts/test-a11y.sh via glass (which sets DISPLAY).
+Switch "Active" (off), a virtualized GtkListView of 80 rows ("Row 000".."Row
+079") in a small scroller, a Scale "Volume", a ProgressBar "Progress", a
+horizontal Separator, a Toolbar containing a Button "Cut", a LinkButton "Docs",
+and a Notebook with two pages ("One", "Two"). Run by scripts/test-a11y.sh via
+glass (which sets DISPLAY).
 
 Uses Gio.ApplicationFlags.NON_UNIQUE so the app skips D-Bus singleton registration
 and presents its window immediately without waiting for portal services to settle."""
@@ -86,6 +89,42 @@ class FixtureApp(Gtk.Application):
         scroller.set_max_content_height(120)
         scroller.set_child(listview)
         box.append(scroller)
+
+        # Widgets added for the role-coverage test. Labels are deliberately distinct from the
+        # existing fixture widgets so name-based lookups in other tests stay unambiguous.
+        # Accessible names go through update_property, the GTK4 idiom already used above —
+        # GTK3's get_accessible()/ATK path does not exist in GTK4.
+        scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            adjustment=Gtk.Adjustment(value=25, lower=0, upper=100, step_increment=1),
+        )
+        scale.update_property([Gtk.AccessibleProperty.LABEL], ["Volume"])
+        box.append(scale)
+
+        progress = Gtk.ProgressBar()
+        progress.set_fraction(0.4)
+        progress.update_property([Gtk.AccessibleProperty.LABEL], ["Progress"])
+        box.append(progress)
+
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # A plain box carrying the TOOLBAR accessible role — GTK4 sets the role at
+        # construction, so it cannot be changed after the widget exists.
+        toolbar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            accessible_role=Gtk.AccessibleRole.TOOLBAR,
+        )
+        toolbar.append(Gtk.Button(label="Cut"))
+        box.append(toolbar)
+
+        link = Gtk.LinkButton(uri="https://example.invalid", label="Docs")
+        box.append(link)
+
+        notebook = Gtk.Notebook()
+        notebook.append_page(Gtk.Label(label="first page"), Gtk.Label(label="One"))
+        notebook.append_page(Gtk.Label(label="second page"), Gtk.Label(label="Two"))
+        box.append(notebook)
+
         win.set_child(box)
         win.present()
 

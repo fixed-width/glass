@@ -45,6 +45,7 @@ way it does? The explanations.
 - [Environment variables](reference/environment.md) — every `GLASS_*` variable
 - [CLI](reference/cli.md) — `glass-mcp` subcommands
 - [Platform support](reference/platforms.md) — the capability matrix and system requirements
+- [Accessibility roles by platform](reference/a11y-roles.md) — which roles each backend can produce
 - [Audit log](reference/audit-log.md) — the JSONL record schema and redaction
 
 ## Explanation — understand why

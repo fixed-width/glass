@@ -225,6 +225,20 @@ mod macos_main {
             }
         }
 
+        // `raw_role` must be the platform's own AX role token, not `AXRoleDescription`'s
+        // localized human phrase ("button" / "bouton"): the fixture's Save button is an
+        // NSButton, which reports exactly `AXButton` on every machine and every locale.
+        let save_raw = match find_by_name(&tree.root, "Save") {
+            Some(n) => n,
+            None => return Err(format!("no \"Save\" button in tree:\n{outline}")),
+        };
+        if save_raw.raw_role != "AXButton" {
+            return Err(format!(
+                "Save raw_role = {:?}, want \"AXButton\":\n{outline}",
+                save_raw.raw_role
+            ));
+        }
+
         // The outline only proves `name`; confirm `value` is read separately, straight off
         // the field's content — not folded into `name` (that was the bug this test guards).
         let field = match find_text_field(&tree.root) {

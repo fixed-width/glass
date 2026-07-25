@@ -427,12 +427,18 @@ reads the Simulator's accessibility tree over `idb_companion` (install it — se
 
 Capture the active window's accessibility tree as compact text. Returns `{}`; the tree itself
 rides as an untrusted sibling text block, one line per element:
-`#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`.
+`#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`. An element
+whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
+`#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
+visible; a bare `Other` means the platform named no token at all.
 
 - `max_nodes` (integer) — raise the element cap above the default (which protects the token
   budget), or `0` to remove the element-count limit. Omit for the default cap. (Structural
   depth/sibling safety rails still apply, so a pathologically deep tree can still truncate — the
   notice says which limit was hit.) A snapshot renumbers ids, so re-read them after changing this.
+
+Roles are normalized across platforms; see [Accessibility roles by platform](a11y-roles.md) for
+what each backend can produce.
 
 ### `glass_a11y_marks`
 

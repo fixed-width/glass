@@ -143,7 +143,11 @@ fn walk(
 ) -> Result<AxNode> {
     budget.visit();
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let raw_role = el.get_localized_control_type().unwrap_or_default();
+    // `canonical_name` knows every documented control type, mapped or not, so the numeric form
+    // is reached only by a vendor-defined or future id — still reported, never dropped.
+    let raw_role = crate::mapping::canonical_name(ct_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("UIA:{ct_id}"));
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(el, origin);
     let (facts, value) = gather(el, ct_id);

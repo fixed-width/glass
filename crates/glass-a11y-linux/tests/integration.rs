@@ -19,6 +19,32 @@ fn glass_x11_with_a11y() -> Glass {
     Glass::new(factory, "x11".into(), BaselineStore::new(root), 100)
 }
 
+/// The common `AppSpec` for launching the GTK4 fixture under X11 with a11y enabled —
+/// factored out so tests that need only the spec (not a started+settled `Glass`, which
+/// `launch_fixture` below provides) don't duplicate the literal.
+fn fixture_spec() -> AppSpec {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/a11y_fixture.py"
+    );
+    AppSpec {
+        build: None,
+        run: vec!["python3".into(), fixture.into()],
+        cwd: None,
+        env: vec![
+            ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
+            ("GDK_BACKEND".into(), "x11".into()),
+        ],
+        window_hint: Some(WindowHint {
+            title: Some("Glass A11y Fixture".into()),
+            class: None,
+        }),
+        timeout_ms: 10_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: true,
+    }
+}
+
 /// Regression: the real MCP runs the (blocking) `glass_start` from *inside* its
 /// multi-thread tokio runtime. `PrivateBus::start` must bring up the a11y bus without
 /// nesting a runtime — nesting panics ("Cannot start a runtime from within a runtime"),
@@ -106,6 +132,50 @@ fn snapshot_finds_gtk_widgets() {
     );
 
     glass.stop().expect("stop");
+}
+
+/// The AT-SPI map claims full role coverage; this proves the claim on a real bus for the
+/// roles the fixture can actually show. Complements the in-crate column test, which only
+/// checks the map against the declared matrix.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn snapshot_covers_the_declared_linux_roles() {
+    use glass_core::{role_histogram, AxRole};
+
+    let mut glass = glass_x11_with_a11y();
+    glass.start(&fixture_spec()).expect("start fixture");
+    // Give the AT-SPI tree a moment to populate after the window maps, same convention as
+    // snapshot_finds_gtk_widgets et al.
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
+    glass.stop().expect("stop");
+
+    let seen: Vec<AxRole> = role_histogram(&tree).into_iter().map(|t| t.role).collect();
+    // A GTK4 Entry reports AT-SPI `Text`, so the fixture's text input is a `TextArea`, not a
+    // `TextField` — see the existing note on the set_value tests in this file.
+    for expected in [
+        AxRole::Window,
+        AxRole::Button,
+        AxRole::CheckBox,
+        AxRole::TextArea,
+        AxRole::Label,
+        AxRole::ComboBox,
+        AxRole::List,
+        AxRole::ListItem,
+        AxRole::Slider,
+        AxRole::SpinButton,
+        AxRole::ProgressBar,
+        AxRole::Separator,
+        AxRole::Toolbar,
+        AxRole::TabList,
+        AxRole::Tab,
+        AxRole::Link,
+    ] {
+        assert!(
+            seen.contains(&expected),
+            "fixture tree has no {expected:?}; roles seen: {seen:?}"
+        );
+    }
 }
 
 /// Regression guard for the private-bus portal-activation hang: launching a GtkApplication
@@ -373,29 +443,8 @@ fn find_node<'a>(node: &'a glass_core::AxNode, name: &str) -> Option<&'a glass_c
 }
 
 fn launch_fixture() -> Glass {
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/a11y_fixture.py"
-    );
     let mut glass = glass_x11_with_a11y();
-    glass
-        .start(&AppSpec {
-            build: None,
-            run: vec!["python3".into(), fixture.into()],
-            cwd: None,
-            env: vec![
-                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
-                ("GDK_BACKEND".into(), "x11".into()),
-            ],
-            window_hint: Some(WindowHint {
-                title: Some("Glass A11y Fixture".into()),
-                class: None,
-            }),
-            timeout_ms: 10_000,
-            sandbox: glass_core::SandboxLevel::Off,
-            a11y: true,
-        })
-        .expect("launch");
+    glass.start(&fixture_spec()).expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
     glass
 }

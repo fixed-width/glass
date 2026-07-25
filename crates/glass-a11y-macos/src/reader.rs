@@ -310,11 +310,21 @@ fn walk(
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let role = mapping::map_role(&ax_role);
-    // `AXRoleDescription` is the human-readable role ("button", "text field"); fall back to the
-    // raw AX role string when it's absent. If both are absent (an element exposing neither)
-    // `raw_role` is the empty string — a "role unknown" signal, not a guaranteed-populated
-    // field.
-    let raw_role = ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role);
+    // `raw_role` is normally the same AX role string `map_role` just matched on — the token, not
+    // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
+    // mapping key and not worth a second attribute read on every node.
+    //
+    // The fallback is conditional because that trade only holds while `AXRole` says something.
+    // A custom or non-standard control is expected to report a generic role — `AXUnknown`, or no
+    // `AXRole` at all — and put what distinguishes it in `AXRoleDescription`; there the
+    // description is the only descriptor there is, so read it rather than emit a node nothing
+    // can identify. Ordinary nodes never pay for the second read. If both are absent `raw_role`
+    // stays the empty string — a "role unknown" signal, not a guaranteed-populated field.
+    let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
+        ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role)
+    } else {
+        ax_role
+    };
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.

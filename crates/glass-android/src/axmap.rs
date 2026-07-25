@@ -5,36 +5,56 @@ use glass_core::accessibility::{
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 
+/// The Android widget classes glass maps *by name*, keyed by the leaf of the class name
+/// (`android.widget.Button` → `Button`). Multiple vendor classes share one role.
+///
+/// Not the whole map: [`class_to_role`] also has a container rule, which catches any leaf ending
+/// in `Layout` plus `View`/`ViewGroup` — an open-ended set no table can enumerate.
+pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
+    ("Button", AxRole::Button),
+    ("ImageButton", AxRole::Button),
+    ("MaterialButton", AxRole::Button),
+    ("AppCompatButton", AxRole::Button),
+    ("EditText", AxRole::TextField),
+    ("AppCompatEditText", AxRole::TextField),
+    ("AutoCompleteTextView", AxRole::TextField),
+    ("TextInputEditText", AxRole::TextField),
+    ("CheckBox", AxRole::CheckBox),
+    ("AppCompatCheckBox", AxRole::CheckBox),
+    ("CheckedTextView", AxRole::CheckBox),
+    ("RadioButton", AxRole::RadioButton),
+    ("AppCompatRadioButton", AxRole::RadioButton),
+    ("Switch", AxRole::ToggleButton),
+    ("SwitchCompat", AxRole::ToggleButton),
+    ("SwitchMaterial", AxRole::ToggleButton),
+    ("ToggleButton", AxRole::ToggleButton),
+    ("CompoundButton", AxRole::ToggleButton),
+    ("TextView", AxRole::Label),
+    ("AppCompatTextView", AxRole::Label),
+    ("ImageView", AxRole::Image),
+    ("AppCompatImageView", AxRole::Image),
+    ("Spinner", AxRole::ComboBox),
+    ("SeekBar", AxRole::Slider),
+    ("ProgressBar", AxRole::ProgressBar),
+    ("ScrollView", AxRole::List),
+    ("HorizontalScrollView", AxRole::List),
+    ("NestedScrollView", AxRole::List),
+    ("RecyclerView", AxRole::List),
+    ("ListView", AxRole::List),
+    ("GridView", AxRole::List),
+    ("WebView", AxRole::Group),
+];
+
 /// Map an Android widget class (`android.widget.Button`, …) to a normalized role.
 pub fn class_to_role(class: &str) -> AxRole {
     let leaf = class.rsplit('.').next().unwrap_or(class);
-    match leaf {
-        "Button" | "ImageButton" | "MaterialButton" | "AppCompatButton" => AxRole::Button,
-        "EditText" | "AppCompatEditText" | "AutoCompleteTextView" | "TextInputEditText" => {
-            AxRole::TextField
-        }
-        "CheckBox" | "AppCompatCheckBox" | "CheckedTextView" => AxRole::CheckBox,
-        "RadioButton" | "AppCompatRadioButton" => AxRole::RadioButton,
-        "Switch" | "SwitchCompat" | "SwitchMaterial" | "ToggleButton" | "CompoundButton" => {
-            AxRole::ToggleButton
-        }
-        "TextView" | "AppCompatTextView" => AxRole::Label,
-        "ImageView" | "AppCompatImageView" => AxRole::Image,
-        "Spinner" => AxRole::ComboBox,
-        "SeekBar" => AxRole::Slider,
-        "ProgressBar" => AxRole::ProgressBar,
-        "ScrollView"
-        | "HorizontalScrollView"
-        | "NestedScrollView"
-        | "RecyclerView"
-        | "ListView"
-        | "GridView" => AxRole::List,
-        "WebView" => AxRole::Group,
-        other if other.ends_with("Layout") || other == "View" || other == "ViewGroup" => {
-            AxRole::Group
-        }
-        _ => AxRole::Other,
+    if let Some((_, role)) = CLASS_TOKENS.iter().find(|(token, _)| *token == leaf) {
+        return *role;
     }
+    if leaf.ends_with("Layout") || leaf == "View" || leaf == "ViewGroup" {
+        return AxRole::Group;
+    }
+    AxRole::Other
 }
 
 /// Parse uiautomator `bounds="[l,t][r,b]"` (screen-absolute) into a window-relative `AxRect`.
@@ -210,6 +230,12 @@ mod tests {
     use super::*;
     use glass_core::accessibility::AxRole;
     use glass_core::{GlassError, WindowGeometry};
+
+    /// Roles the container rule in [`class_to_role`] can produce (any leaf ending in `Layout`,
+    /// plus `View`/`ViewGroup`). They cannot be expressed as a fixed token list, so
+    /// [`map_matches_declared_column`] counts them alongside [`CLASS_TOKENS`] to check the
+    /// declared column against everything the map can actually produce.
+    const RULE_ROLES: &[AxRole] = &[AxRole::Group];
 
     const XML: &str = concat!(
         "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>",
@@ -412,5 +438,45 @@ mod tests {
             "checkable=false checked=true (Compose under-report) must still map to \
              checkable=true so the Checked condition matches"
         );
+    }
+
+    #[test]
+    fn class_tokens_have_no_duplicates() {
+        for (i, (leaf, _)) in CLASS_TOKENS.iter().enumerate() {
+            assert!(
+                !CLASS_TOKENS[i + 1..].iter().any(|(other, _)| other == leaf),
+                "{leaf} listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn container_rule_still_applies() {
+        assert_eq!(class_to_role("android.widget.LinearLayout"), AxRole::Group);
+        assert_eq!(class_to_role("android.view.ViewGroup"), AxRole::Group);
+        assert_eq!(class_to_role("com.example.CustomThing"), AxRole::Other);
+    }
+
+    #[test]
+    fn map_matches_declared_column() {
+        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        for role in AxRole::ALL {
+            let mapped = CLASS_TOKENS.iter().any(|(_, r)| *r == role)
+                || RULE_ROLES.contains(&role)
+                // Only the uiautomator reader (`build_tree`) synthesizes a Window root; the
+                // on-device AccessibilityService reader roots the tree at the device's node,
+                // which comes from `class_to_role` like any other node. Exempt Window since
+                // `class_to_role` cannot produce it.
+                || role == AxRole::Window;
+            match support(role, AxBackend::Android).expect("declared in ROLE_SUPPORT") {
+                RoleSupport::Mapped => {
+                    assert!(mapped, "{role:?} declared Mapped but no class maps to it")
+                }
+                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                    !mapped,
+                    "{role:?} is produced by a class but the matrix does not declare it"
+                ),
+            }
+        }
     }
 }
