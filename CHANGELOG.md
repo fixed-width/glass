@@ -44,7 +44,9 @@ internal refactors, CI, or test-only changes.
   Android launches an activity rather than a command line — `am start` takes intent extras, not
   program arguments — so anything beyond the `package/.Activity` component and an optional `.apk`
   was being dropped, and the launch reported success for an app configured differently from what
-  was asked. The error names the leftover and points at `env`, which does reach the app.
+  was asked. The error names the element it could not use, so the correction is to drop it. A call
+  that used to succeed can now fail, which is a change rather than an addition: it ships in a
+  minor because the caller is an agent that can read the error and retry within the same session.
 - Every cell of [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) that is not `yes` now
   names the native token behind it as its own clause — `n/a (reports AXStaticText instead)`,
   `gap (AXPopUpButton arrives unmapped)` — instead of leaving it buried in prose. That is the fact
