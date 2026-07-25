@@ -38,19 +38,47 @@ const PROBE_APPS_VAR: &str = "GLASS_A11Y_PROBE_APPS";
 
 /// How long to wait after `start_app` before snapshotting — UIKit keeps building the view
 /// hierarchy for a beat after the app is up, and a tree read too early is missing the content
-/// the probe exists to see. Matches the settle the sibling on-box tests use.
+/// the probe exists to see. A little longer than the sibling on-box tests settle for, on
+/// purpose: they only need the app up, while a probe needs the screen fully populated or its
+/// evidence is a half-drawn tree.
 ///
-/// Overridable with `GLASS_A11Y_PROBE_SETTLE_MS`: a stock app that loads its content
-/// asynchronously (a contact list, a document browser) can still be showing an empty shell at
-/// this default, and an empty shell is evidence of nothing.
+/// Overridable with [`SETTLE_MS_VAR`]: a stock app that loads its content asynchronously (a
+/// contact list, a document browser) can still be showing an empty shell at this default, and
+/// an empty shell is evidence of nothing.
 const STARTUP_SETTLE: Duration = Duration::from_millis(1500);
 
-/// [`STARTUP_SETTLE`], or the `GLASS_A11Y_PROBE_SETTLE_MS` override when it parses.
+/// Overrides [`STARTUP_SETTLE`], in whole milliseconds.
+const SETTLE_MS_VAR: &str = "GLASS_A11Y_PROBE_SETTLE_MS";
+
+/// The smallest tree this probe accepts as evidence. A real app screen reports dozens of
+/// nodes; a snapshot taken before the app finished drawing, or of the wrong window, reports a
+/// near-empty shell — which yields no histogram buckets, no violations, and a green run that
+/// proves nothing. The floor sits well above a root plus a single content node so that case is
+/// caught rather than passed.
+const MIN_EVIDENCE_NODES: usize = 8;
+
+/// [`STARTUP_SETTLE`], or the [`SETTLE_MS_VAR`] override when it is set.
+///
+/// # Panics
+///
+/// Panics when the variable is set to anything but a whole number of milliseconds. Falling
+/// back to the default there would hand the operator the very empty shell they set the knob to
+/// avoid, without saying so.
 fn startup_settle() -> Duration {
-    std::env::var("GLASS_A11Y_PROBE_SETTLE_MS")
-        .ok()
+    let Some(raw) = std::env::var_os(SETTLE_MS_VAR) else {
+        return STARTUP_SETTLE;
+    };
+    let ms: u64 = raw
+        .to_str()
         .and_then(|v| v.trim().parse().ok())
-        .map_or(STARTUP_SETTLE, Duration::from_millis)
+        .unwrap_or_else(|| {
+            panic!(
+                "{SETTLE_MS_VAR}={raw:?} is not a whole number of milliseconds — set it to \
+                 e.g. 4000, or unset it for the {}ms default",
+                STARTUP_SETTLE.as_millis()
+            )
+        });
+    Duration::from_millis(ms)
 }
 
 /// AX role tokens glass maps to a role, and that a probed app has actually been seen to
@@ -90,6 +118,21 @@ fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// A description of `tree` being too small to be evidence of anything, or `None` when it
+/// clears [`MIN_EVIDENCE_NODES`]. Returned for collection alongside the mapping violations
+/// rather than panicking mid-loop, so one bad target still lets the rest print their evidence.
+fn thin_tree_violation(label: &str, tree: &AxTree) -> Option<String> {
+    (tree.count < MIN_EVIDENCE_NODES).then(|| {
+        format!(
+            "{label}: the tree has only {} node(s), under the {MIN_EVIDENCE_NODES} a real \
+             screen clears — usually the app had not finished drawing, the wrong window was \
+             foreground, or a system alert was covering the screen. Whatever this run printed \
+             is not evidence; retry, raising {SETTLE_MS_VAR} if the app is slow to populate.",
+            tree.count
+        )
+    })
 }
 
 /// Print `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
@@ -176,9 +219,14 @@ fn role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({target}): {e}"));
         tree.assign_ids();
         print_role_histogram(target, &tree);
+        violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
+
+        // Inside the loop: `start_app` overwrites the platform's stored running app without
+        // terminating the previous one, so stopping only after the loop would leave every
+        // earlier target running on the Simulator.
+        platform.stop_app().expect("stop_app");
     }
 
-    platform.stop_app().expect("stop_app");
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
