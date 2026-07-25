@@ -45,11 +45,11 @@ xcrun simctl launch booted tech.fixedwidth.glassrolefixture --tab=collection    
 SIMCTL_CHILD_ROLE_FIXTURE_TAB=swiftui xcrun simctl launch booted tech.fixedwidth.glassrolefixture
 ```
 
-The value must be joined with `=`. `simctl launch` forwards `--tab=swiftui` but drops the value of
-a separated `--tab swiftui`, which would otherwise have launched the Controls screen while looking
-like it had worked; the app treats that, and an unrecognized name, as fatal. The collection and
-SwiftUI screens also name themselves in the tree — `screen-collection` and `screen-swiftui` appear
-as element identifiers — and the Controls screen is headed `Controls`.
+`simctl launch` forwards everything after the bundle id to the app verbatim, so `--tab swiftui`
+works as well as `--tab=swiftui`. A `--tab` with no value, or an unrecognized name, is fatal rather
+than a quiet fall back to the first screen. The collection and SwiftUI screens also name themselves
+in the tree — `screen-collection` and `screen-swiftui` appear as element identifiers — and the
+Controls screen is headed `Controls`.
 
 ## Read the tree
 
@@ -72,6 +72,9 @@ GLASS_A11Y_PROBE_APPS="$PWD/build/RoleFixture.app" \
   cargo test -p glass-ios --test role_probe -- --ignored --nocapture
 ```
 
-The probe launches the app without arguments, so it reads the Controls screen; set
-`SIMCTL_CHILD_ROLE_FIXTURE_TAB` in its environment to probe another, or pass `--tab=<name>` after
-the `.app` path in `GLASS_A11Y_PROBE_APPS`-driven runs that build their own `AppSpec`.
+The probe launches the app without arguments, so it reads the Controls screen. It splits
+`GLASS_A11Y_PROBE_APPS` on commas and passes each element as a whole app, so an argument cannot be
+added there — set `SIMCTL_CHILD_ROLE_FIXTURE_TAB` in its environment to probe another screen.
+Driving the app with a launch argument through glass is what
+`crates/glass-ios/tests/launch_args_integration.rs` does (`GLASS_IOS_ROLE_FIXTURE` points it at
+this app's `.app`).

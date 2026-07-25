@@ -4,8 +4,8 @@
 //! directly. This backend has to route them through `simctl launch`, which is a different
 //! mechanism, so the unit test over the argv builder cannot say whether the app ever sees them —
 //! only a launch can. It asserts the app *acted* on the argument rather than merely receiving it:
-//! the role fixture selects its screen from `--tab=<name>`, and each screen names itself in the
-//! tree, so the reading is unambiguous.
+//! the role fixture selects its screen from `--tab=<name>`, and the selected screen is
+//! identifiable in the tree.
 //!
 //! `#[ignore]`d so a plain `cargo test` (Linux dev host, CI) skips it: the backend needs
 //! `xcrun simctl` + `idb_companion` (macOS + Xcode only), a booted Simulator, and the RoleFixture
@@ -33,6 +33,11 @@ use glass_ios::{IosPlatform, SimulatorRegistry};
 fn has_identifier(node: &AxNode, name: &str) -> bool {
     node.name.as_deref() == Some(name) || node.children.iter().any(|c| has_identifier(c, name))
 }
+
+/// How many times to re-read before giving up on a screen appearing, and how long to wait
+/// between: the sibling on-box tests settle for about a second and a half in total.
+const SETTLE_ATTEMPTS: usize = 6;
+const SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn spec_with_args(app: &str, args: &[&str]) -> AppSpec {
     let mut run = vec![app.to_string()];
@@ -67,19 +72,35 @@ fn screen_of(spec: &AppSpec) -> AxTree {
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
     };
-    let tree = a11y.snapshot(&ctx).expect("snapshot");
-    let _ = platform.stop_app();
+    // UIKit keeps building the hierarchy for a beat after the app is up, so a tree read straight
+    // after `start_app` can be half-drawn — which would fail here as "the argument did not
+    // arrive", the most misleading diagnosis available. Retry until the screen is identifiable,
+    // matching the settle the sibling on-box tests use.
+    let mut tree = a11y.snapshot(&ctx).expect("snapshot");
+    for _ in 0..SETTLE_ATTEMPTS {
+        if has_identifier(&tree.root, "the-alert-button")
+            || has_identifier(&tree.root, "screen-collection")
+        {
+            break;
+        }
+        std::thread::sleep(SETTLE_DELAY);
+        tree = a11y.snapshot(&ctx).expect("snapshot");
+    }
+    platform.stop_app().expect("stop_app");
     tree
 }
 
 #[test]
 #[ignore = "on-box only: needs a macOS host with Xcode + idb_companion + a booted iOS \
             Simulator, and GLASS_IOS_ROLE_FIXTURE pointing at the examples/ios-role-fixture .app"]
-fn a_launch_argument_reaches_the_app_and_changes_what_it_shows() {
+fn launch_arguments_reach_the_app_in_both_forms() {
+    // One test rather than three: each leg launches the same fixture on the same Simulator
+    // through the same companion, so as separate `#[test]`s libtest would run them concurrently
+    // and they would fight over it — the failure looking like "the argument did not arrive".
     let app = std::env::var("GLASS_IOS_ROLE_FIXTURE")
         .expect("GLASS_IOS_ROLE_FIXTURE must be set to the RoleFixture.app path");
 
-    // Without arguments the fixture opens on Controls: the baseline, so a passing test cannot be
+    // Without arguments the fixture opens on Controls: the baseline, so a pass below cannot be
     // explained by the app having shown the collection screen regardless.
     let plain = screen_of(&spec_with_args(&app, &[]));
     assert!(
@@ -91,9 +112,22 @@ fn a_launch_argument_reaches_the_app_and_changes_what_it_shows() {
         "the baseline must not already be the screen the argument is supposed to select"
     );
 
-    let with_arg = screen_of(&spec_with_args(&app, &["--tab=collection"]));
+    let joined = screen_of(&spec_with_args(&app, &["--tab=collection"]));
     assert!(
-        has_identifier(&with_arg.root, "screen-collection"),
+        has_identifier(&joined.root, "screen-collection"),
         "--tab=collection in AppSpec::run must reach the app and select the collection screen"
+    );
+    assert!(
+        !has_identifier(&joined.root, "the-alert-button"),
+        "the collection screen must have replaced Controls, not merely appeared alongside it"
+    );
+
+    // The separated form is what the desktop backends deliver intact, and `simctl launch` was
+    // measured to forward it the same way; pinned here so the claim rests on a test rather than
+    // on one probe run.
+    let separated = screen_of(&spec_with_args(&app, &["--tab", "collection"]));
+    assert!(
+        has_identifier(&separated.root, "screen-collection"),
+        "a separated --tab collection must reach the app with its value intact"
     );
 }

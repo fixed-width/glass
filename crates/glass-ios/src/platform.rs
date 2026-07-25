@@ -89,11 +89,11 @@ fn looks_like_app_path(s: &str) -> bool {
 /// The `simctl launch` sub-command argv: the verb, the target simulator and bundle, then the
 /// app's own launch arguments.
 ///
-/// `app_args` is `spec.run[1..]` — everything after the bundle id or `.app` path. `simctl launch`
-/// forwards them to the launched process, where they arrive as `ProcessInfo.arguments`, so a
-/// caller can drive an app that takes a flag. They are placed after the bundle id, which is where
-/// `simctl` stops reading arguments as its own: a caller's `--console` is their app's flag, not a
-/// request for simctl's console mode.
+/// `app_args` go after the bundle id, which is where `simctl launch` stops reading arguments as
+/// its own and starts forwarding: measured against a Simulator, everything past it arrives in the
+/// app's `ProcessInfo.arguments` verbatim — separated pairs (`--tab collection`) as two elements,
+/// joined ones (`--tab=collection`) as one, and a token that collides with a simctl option of its
+/// own (`--console`) as the app's flag rather than simctl's.
 pub(crate) fn launch_args(udid: &str, bundle_id: &str, app_args: &[String]) -> Vec<String> {
     let mut argv = vec![
         "launch".to_string(),
@@ -332,9 +332,10 @@ impl Platform for IosPlatform {
         let mut launch = Command::new(self.target.simctl().program());
         // `spec.run[1..]` are the app's launch arguments; `run[0]` was consumed above as the
         // bundle id (or the `.app` to install first).
-        let sub = launch_args(udid, &bundle_id, spec.run.get(1..).unwrap_or_default());
-        let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
-        launch.args(self.target.simctl().full_args(&sub));
+        // `run[1..]` is in bounds: `bundle_id_from_run` above already rejected an empty `run`.
+        let argv = launch_args(udid, &bundle_id, &spec.run[1..]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        launch.args(self.target.simctl().full_args(&argv));
         for (k, v) in &spec.env {
             launch.env(format!("SIMCTL_CHILD_{k}"), v);
         }
@@ -897,5 +898,34 @@ mod launch_args_tests {
         let bundle = built.iter().position(|a| a == "com.example.app").unwrap();
         let flag = built.iter().position(|a| a == "--console").unwrap();
         assert!(flag > bundle, "app arguments must follow the bundle id");
+    }
+}
+
+#[cfg(test)]
+mod launch_wiring_tests {
+    use super::{bundle_id_from_run, launch_args};
+
+    /// The builder is unit-tested above; this pins the *wiring* — that `start_app` feeds it
+    /// everything after `run[0]` and nothing else. A slice off by one compiles and passes every
+    /// builder test, and that is exactly the bug this backend shipped with.
+    #[test]
+    fn every_element_after_the_launch_target_becomes_an_app_argument() {
+        // Not `com.example.app`: `looks_like_app_path` treats any element ending in `.app` as a
+        // bundle path, so a bundle id whose last label is `app` takes the install branch and
+        // reaches for `plutil`.
+        let run: Vec<String> = ["com.example.myapp", "--first", "second", "--third=4"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (_install, bundle_id) = bundle_id_from_run(&run).expect("a bare bundle id parses");
+
+        let argv = launch_args("UDID", &bundle_id, &run[1..]);
+
+        let bundle_at = argv.iter().position(|a| a == "com.example.myapp").unwrap();
+        assert_eq!(
+            &argv[bundle_at + 1..],
+            ["--first", "second", "--third=4"],
+            "the app's arguments are run[1..], in order, with nothing dropped or duplicated"
+        );
     }
 }

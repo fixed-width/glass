@@ -12,53 +12,89 @@ pub struct LaunchTarget {
     pub apk: Option<String>,
 }
 
+/// Whether `s` is shaped like a launch component — `package/.Activity` or `package/a.b.Class`.
+///
+/// Checked rather than assumed: the old rule was "contains a slash", which claimed anything with
+/// one — a stray `--tab=a/b` became the component, and the real component was then reported as
+/// the element that could not be used. A package is a Java-style dotted identifier, so the
+/// charset rules it out.
+fn is_component(s: &str) -> bool {
+    let Some((package, activity)) = s.split_once('/') else {
+        return false;
+    };
+    if package.is_empty() || activity.is_empty() || activity.contains('/') {
+        return false;
+    }
+    let package_ok = package.starts_with(|c: char| c.is_ascii_alphabetic())
+        && package
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+    // An activity is `.Relative`, `absolute.Class`, or an inner class with `$`.
+    let activity_ok = activity
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '$');
+    package_ok && activity_ok
+}
+
+/// Parse `AppSpec.run` into the launch target.
+///
+/// One classifying pass, so every element is accounted for: an `.apk` to install, the
+/// `package/.Activity` component, and nothing else. Anything unclassifiable — or a second apk or
+/// component — is an error naming the element itself, because Android launches an activity rather
+/// than a command line. `am start` takes intent extras, not a program's argument vector, so there
+/// is nowhere for a trailing element to go — and glass does not map extras today, so there is no
+/// route to offer instead: `spec.env` configures the build command on the host, not the launched
+/// app, which is forked from zygote and never sees the shell's environment. Dropping the element
+/// quietly would launch a differently configured app than the caller asked for and report success.
 pub fn parse_launch(run: &[String]) -> Result<LaunchTarget> {
-    let apk = run.iter().find(|a| a.ends_with(".apk")).cloned();
-    let component = run
-        .iter()
-        .find(|a| a.contains('/') && !a.ends_with(".apk"))
-        .cloned()
-        .ok_or_else(|| {
-            GlassError::AppNotStarted(
-                "AppSpec.run must contain a launch component like \"com.example.app/.MainActivity\""
-                    .into(),
-            )
-        })?;
-    let package = component.split('/').next().unwrap_or_default().to_string();
-    if package.is_empty() {
-        return Err(GlassError::AppNotStarted(format!(
-            "malformed component {component:?}; expected package/.Activity"
-        )));
+    let mut apk: Option<&str> = None;
+    let mut component: Option<&str> = None;
+
+    for element in run {
+        let element = element.as_str();
+        if element.ends_with(".apk") {
+            if let Some(first) = apk {
+                return Err(GlassError::AppNotStarted(format!(
+                    "AppSpec.run names two APKs to install, {first:?} and {element:?}; it takes \
+                     at most one"
+                )));
+            }
+            apk = Some(element);
+        } else if is_component(element) {
+            if let Some(first) = component {
+                return Err(GlassError::AppNotStarted(format!(
+                    "AppSpec.run names two launch components, {first:?} and {element:?}; it takes \
+                     exactly one"
+                )));
+            }
+            component = Some(element);
+        } else {
+            return Err(GlassError::AppNotStarted(format!(
+                "AppSpec.run carries {element:?}, which is neither an APK to install nor a \
+                 package/.Activity component. Android launches an activity rather than a command \
+                 line, so there is no argument vector to put it in: `am start` would need it as \
+                 an intent extra, which this backend does not map yet. Drop it, or have the app \
+                 read the setting from somewhere it can reach"
+            )));
+        }
     }
 
-    // Anything the two rules above did not consume has nowhere to go: `am start` takes intent
-    // extras (`-e key value`), not a program's argument vector, so a trailing element is not
-    // something this backend can honour. Say so rather than launching a differently-configured
-    // app than the caller asked for and reporting success — the other backends really do pass
-    // `run[1..]` to the process, which is exactly why silence here would mislead.
-    let leftover: Vec<&str> = run
-        .iter()
-        .map(String::as_str)
-        .filter(|a| Some(*a) != apk.as_deref() && *a != component)
-        .collect();
-    if !leftover.is_empty() {
-        return Err(GlassError::AppNotStarted(format!(
-            "AppSpec.run carries {} this backend cannot pass on: {}. Android launches an \
-             activity rather than a command line — `am start` takes intent extras, not program \
-             arguments — so put launch configuration in spec.env, which reaches the app",
-            if leftover.len() == 1 {
-                "an element"
-            } else {
-                "elements"
-            },
-            leftover.join(", ")
-        )));
-    }
+    let component = component.ok_or_else(|| {
+        GlassError::AppNotStarted(
+            "AppSpec.run must contain a launch component like \"com.example.app/.MainActivity\""
+                .into(),
+        )
+    })?;
+    let package = component
+        .split('/')
+        .next()
+        .expect("is_component proved a non-empty package before the slash")
+        .to_string();
 
     Ok(LaunchTarget {
-        component,
+        component: component.to_string(),
         package,
-        apk,
+        apk: apk.map(str::to_string),
     })
 }
 
@@ -148,15 +184,22 @@ mod tests {
     }
 
     #[test]
-    fn the_error_points_at_the_env_route_that_does_work() {
+    fn the_error_says_why_rather_than_naming_a_route_that_does_not_work() {
+        // An earlier draft sent the caller to `spec.env`. That is wrong on Android: env
+        // configures the build command on the host, and an app forked from zygote never sees it,
+        // so the advice would have been one more thing that silently does nothing.
         let run = vec![
             "com.example.app/.MainActivity".to_string(),
             "extra".to_string(),
         ];
         let message = parse_launch(&run).unwrap_err().to_string();
         assert!(
-            message.contains("env"),
-            "the error must say where launch configuration does go, got: {message}"
+            message.contains("intent extra"),
+            "the error must name what Android would need, got: {message}"
+        );
+        assert!(
+            !message.contains("spec.env"),
+            "the error must not route to env, which does not reach the app: {message}"
         );
     }
 
@@ -168,5 +211,51 @@ mod tests {
         ];
         let target = parse_launch(&run).expect("apk + component is the documented shape");
         assert_eq!(target.apk.as_deref(), Some("/tmp/app.apk"));
+    }
+
+    #[test]
+    fn a_stray_element_is_named_rather_than_the_real_component() {
+        // The old rule claimed anything containing a slash as the component, so this reported the
+        // real component as the element it could not use — a diagnostic pointing at the one thing
+        // that was right.
+        let run = vec![
+            "--tab=a/b".to_string(),
+            "com.example.app/.MainActivity".to_string(),
+        ];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(
+            message.contains("--tab=a/b"),
+            "the error must name the stray element, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_component_is_an_error_rather_than_silently_one() {
+        let run = vec![
+            "com.example.app/.MainActivity".to_string(),
+            "com.example.app/.MainActivity".to_string(),
+        ];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(
+            message.contains("two launch components"),
+            "a duplicate must not be absorbed, got: {message}"
+        );
+    }
+
+    #[test]
+    fn two_apks_are_an_error() {
+        let run = vec![
+            "/tmp/one.apk".to_string(),
+            "/tmp/two.apk".to_string(),
+            "com.example.app/.MainActivity".to_string(),
+        ];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(message.contains("two APKs"), "got: {message}");
+    }
+
+    #[test]
+    fn a_component_with_a_second_slash_is_not_a_component() {
+        let run = vec!["com.example.app/.Main/extra".to_string()];
+        assert!(parse_launch(&run).is_err());
     }
 }

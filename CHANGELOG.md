@@ -18,8 +18,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
-  the `.app` path or bundle id in `run` reaches the app as its own arguments, the same as on the
-  desktop backends, so an app whose behaviour is selected by a flag can be driven.
+  the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
+  (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is
+  selected by a flag can be driven.
 - `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
   `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
   fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
@@ -97,6 +98,10 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- macOS: an app that hands off to LaunchServices — a bundle whose executable re-execs itself, so
+  glass adopts the resulting process rather than the one it spawned — now receives the launch
+  arguments from `run`. They were dropped on that path while the directly-spawned path passed
+  them, so the same `run` launched differently configured apps depending on which arm ran.
 - A contained app launched on the Wayland backend can now reach an Xwayland display through the
   ordinary X11 socket (`/tmp/.X11-unix`), which the sandbox's ephemeral `/tmp` previously hid.
   X11 clients that fall back to the abstract socket were unaffected; ones that don't failed to

@@ -177,15 +177,17 @@ pub struct A11yBind<'a> {
 pub struct AppSpec {
     /// Optional shell command run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// Program + args to launch. `run[0]` is the executable, and `run[1..]` are its arguments,
-    /// which every backend either passes to the launched process or rejects — the desktop
-    /// backends spawn them directly, iOS forwards them through `simctl launch`. A backend with
-    /// nowhere to put them says so: Android launches an activity rather than a command line, so
-    /// it errors rather than dropping them, since a launch that quietly ignores half its spec
-    /// reports success for an app the caller did not ask for.
+    /// Program + args to launch. `run[0]` is the thing to launch and `run[1..]` are its
+    /// arguments.
     ///
-    /// Mobile backends read `run[0]` differently — an `.app` path or bundle id on iOS, a
-    /// `package/.Activity` component (optionally preceded by an `.apk` to install) on Android.
+    /// A backend must either pass `run[1..]` to the launched process or fail: dropping them
+    /// launches an app the caller did not ask for and reports success, which is the silent
+    /// fallback this crate's contract forbids. Not every platform can carry them — one that
+    /// launches by activity or document rather than by command line has no argument vector to
+    /// fill — and those backends return an error naming what they could not use.
+    ///
+    /// What `run[0]` names is the backend's own business (an executable, a bundle, an installed
+    /// app's identifier); each backend's `start_app` documents the shapes it accepts.
     pub run: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,

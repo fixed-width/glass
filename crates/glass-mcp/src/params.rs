@@ -55,7 +55,11 @@ pub struct WindowHintArgs {
 pub struct StartArgs {
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// Program and arguments to launch; `run[0]` is the executable.
+    /// What to launch, then its arguments. `run[0]` is the executable on a desktop backend, an
+    /// `.app` path or bundle id on `ios`, and a `package/.Activity` component — optionally with
+    /// an `.apk` to install first — on `android`. `run[1..]` are the app's own arguments;
+    /// `android` has no argument vector to put them in and returns an error rather than
+    /// ignoring them.
     pub run: Vec<String>,
     /// Backend to launch under: `"x11"` or `"wayland"` (Linux), `"windows"` (on a
     /// Windows host), `"macos"` (on a macOS host), `"android"` (an AVD emulator, any
@@ -69,7 +73,10 @@ pub struct StartArgs {
     /// refuses an explicit level requested below it.
     pub sandbox: Option<String>,
     pub cwd: Option<String>,
-    /// Extra environment variables for the launched app, as a `{ "KEY": "VALUE" }` object.
+    /// Extra environment variables, as a `{ "KEY": "VALUE" }` object. They reach the launched app
+    /// on the desktop backends and on `ios`; on `android` they configure the `build` command on
+    /// the host only, since an app launched by `am start` is forked from zygote and never sees
+    /// the shell's environment.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     /// Optional `{ title?, class? }` to disambiguate which window is the app's when
