@@ -12,11 +12,12 @@
 //! have — a radio button on iOS, a tree on Android — rest on the platform's own vocabulary
 //! instead, and say so.
 //!
-//! Reasons are readings, and readings age. The mobile columns were last read on 2026-07-25,
-//! against an API 34 emulator and an iOS 26.5 Simulator through `idb`, and the Windows `Heading`
-//! cell the same day against Edge on Windows 11. What the iOS column can say is bounded by what
-//! `idb`'s `accessibility_info` exposes, which may be narrower than what UIKit publishes to
-//! VoiceOver.
+//! Reasons are readings, not guarantees: each says what a control was seen to report, and a
+//! platform is free to change that. When a cell was last read is `git log`'s to answer — a date
+//! written here would be one more thing to update and the first thing to go stale — and what it
+//! was read against is the fixture run's, which prints its platform version. What the iOS column
+//! can say is also bounded by what `idb`'s `accessibility_info` exposes, which may be narrower
+//! than what UIKit publishes to VoiceOver.
 //!
 //! Each backend crate has a unit test that walks its own column and asserts its token table
 //! agrees with what is declared here, so a new mapping cannot land without updating the

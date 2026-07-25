@@ -5,7 +5,9 @@ vocabulary can express. Each control answers one question: what widget class doe
 for it? That answer is what a cell in
 [docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records.
 
-Readings below are from an API 34 emulator on 2026-07-25 — re-run them rather than trusting them.
+The table below is what these controls reported on an API 34 emulator — a reading, not a
+guarantee. Re-run it rather than trusting it; the read step below prints the API level it saw, and
+`build.sh` prints the platform it built against.
 
 | Control | Reported |
 |---|---|
@@ -43,6 +45,7 @@ adb shell am start -n tech.fixedwidth.glassrolefixture/.MainActivity
 Either reader answers the same question — the widget class is the token both key off.
 
 ```bash
+adb shell getprop ro.build.version.sdk      # the API level this reading is from
 adb shell uiautomator dump /sdcard/roles.xml && adb shell cat /sdcard/roles.xml
 ```
 

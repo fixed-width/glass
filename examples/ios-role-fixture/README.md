@@ -5,9 +5,10 @@ iOS's accessibility vocabulary can express. Each control answers one question: w
 does the Simulator report for it? That answer is what a cell in
 [docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records.
 
-Readings below are from an iOS 26.5 Simulator on 2026-07-25, through `idb` — re-run them rather
-than trusting them. They are bounded by what idb's accessibility tree exposes, which may be
-narrower than what UIKit publishes to VoiceOver.
+The table below is what these controls reported on an iOS 26.5 Simulator through `idb` — a
+reading, not a guarantee. Re-run it rather than trusting it; the read step below prints the runtime
+it saw, and `build.sh` prints the SDK it built against. The readings are bounded by what idb's
+accessibility tree exposes, which may be narrower than what UIKit publishes to VoiceOver.
 
 | Control | Reported |
 |---|---|
@@ -56,6 +57,7 @@ With `idb_companion` running against the Simulator, using the `fb-idb` client (`
 Python package from the companion glass itself needs):
 
 ```bash
+xcrun simctl list devices booted            # the runtime this reading is from
 idb ui describe-all --udid <udid> --nested --json
 ```
 

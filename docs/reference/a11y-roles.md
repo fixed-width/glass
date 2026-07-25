@@ -27,10 +27,11 @@ simply does not have — a radio button on iOS, a tree on Android — rest on it
 and say so. A `yes` is map-backed, not reading-backed: it says a token is mapped, not that an app
 was seen to emit it.
 
-Reasons are readings, and readings age. The Android and iOS columns were last read on 2026-07-25,
-against an API 34 emulator and an iOS 26.5 Simulator, and the Windows `Heading` cell the same day
-against Edge on Windows 11. What the iOS column can say is bounded by what `idb`'s accessibility
-tree exposes, which may be narrower than what UIKit publishes to VoiceOver.
+Reasons are readings, not guarantees: each says what a control was seen to report, and a platform
+is free to change that. When a cell was last read is answered by `git log` over
+`crates/glass-core/src/role_support.rs`, and what it was read against by re-running the fixture,
+which prints its platform version. What the iOS column can say is also bounded by what `idb`'s
+accessibility tree exposes, which may be narrower than what UIKit publishes to VoiceOver.
 
 On Android, both readers report a `Window` root: the `uiautomator` reader wraps its dump in a
 window root sized to the app window, and the accessibility-service reader labels the active
