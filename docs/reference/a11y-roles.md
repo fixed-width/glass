@@ -15,9 +15,9 @@ A cell reads:
   or that the concept simply does not exist there.
 - `gap` — the platform has a counterpart glass does not map yet.
 
-On Android, `Window` holds for the `uiautomator` reader, which wraps the dump in a window root
-sized to the app window. The on-device accessibility-service reader instead roots the tree at the
-device's own node, which is classified like any other node from its widget class.
+On Android, both readers report a `Window` root: the `uiautomator` reader wraps its dump in a
+window root sized to the app window, and the accessibility-service reader labels the active
+window's own root node, whose widget class stays visible as the node's native token.
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |
@@ -25,7 +25,7 @@ device's own node, which is classified like any other node from its widget class
 | `Application` | yes | n/a | gap | n/a | yes |
 | `Window` | yes | yes | yes | yes | yes |
 | `Dialog` | yes | gap | gap | gap | gap |
-| `Group` | yes | yes | yes | yes | gap |
+| `Group` | yes | yes | yes | yes | yes |
 | `Button` | yes | yes | yes | yes | yes |
 | `ToggleButton` | yes | yes | gap | yes | yes |
 | `RadioButton` | yes | yes | yes | yes | gap |
@@ -54,7 +54,7 @@ device's own node, which is classified like any other node from its widget class
 | `Separator` | yes | yes | yes | n/a | n/a |
 | `Toolbar` | yes | yes | yes | gap | yes |
 | `StatusBar` | yes | yes | n/a | n/a | n/a |
-| `Heading` | yes | gap | yes | gap | gap |
+| `Heading` | yes | gap | yes | gap | yes |
 
 ### Why a cell is not `yes`
 
@@ -64,8 +64,7 @@ device's own node, which is classified like any other node from its widget class
 - `Dialog` / Windows (UIA) — gap: UIA marks a dialog with the IsDialog property on a Window; the reader does not read it
 - `Dialog` / macOS (AX) — gap: AXSheet, AXPopover and AXDrawer are not mapped yet
 - `Dialog` / Android — gap: dialog windows arrive as a generic layout class
-- `Dialog` / iOS — gap: alert and action-sheet tokens are not mapped yet
-- `Group` / iOS — gap: no container token is mapped yet
+- `Dialog` / iOS — gap: an alert exposes its buttons and text directly under the application element; no alert, sheet or popover token appears
 - `ToggleButton` / macOS (AX) — gap: AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; AXCheckBox is outside the reader's subrole gate, and no probed app emitted either subrole
 - `RadioButton` / iOS — gap: no radio token is mapped yet
 - `MenuBar` / Android — n/a: Android apps have no menu bar
@@ -76,22 +75,22 @@ device's own node, which is classified like any other node from its widget class
 - `MenuItem` / iOS — gap: menu-item tokens are not mapped yet
 - `TextArea` / Android — n/a: Android uses one editable class for single- and multi-line text
 - `ComboBox` / iOS — gap: picker tokens are not mapped yet
-- `List` / iOS — gap: no list token is mapped yet
+- `List` / iOS — gap: collections arrive as AXGroup, which maps to Group; no list token appears
 - `ListItem` / Android — gap: list children report their own widget class, not a list-item role
-- `ListItem` / iOS — gap: no list-item token is mapped yet
+- `ListItem` / iOS — gap: a collection's children report their own element role, not a list-item role
 - `Table` / macOS (AX) — gap: mac lists report AXOutline rather than AXTable; AXOutline maps to Tree
 - `Table` / Android — gap: table and grid classes collapse into List
-- `Table` / iOS — gap: no table token is mapped yet
+- `Table` / iOS — gap: collections arrive as AXGroup, which maps to Group; no table token appears
 - `Cell` / Windows (UIA) — gap: UIA's DataItem control type would carry this, but the data grids probed expose their rows as TreeItem
 - `Cell` / Android — gap: no cell class is mapped yet
 - `Tree` / Android — n/a: Android has no tree widget
 - `Tree` / iOS — n/a: UIKit has no outline view
 - `TreeItem` / Android — n/a: Android has no tree widget
 - `TreeItem` / iOS — n/a: UIKit has no outline view
-- `TabList` / Android — gap: tab-container classes are not mapped yet
+- `TabList` / Android — gap: a tab container reports a plain layout class; the tab role lives in the view's id and selected state, not in the class name
 - `Tab` / macOS (AX) — gap: AppKit reports tab items as AXRadioButton inside the tab group; the containing role is not used to disambiguate yet
-- `Tab` / Android — gap: tab children are not mapped yet
-- `Tab` / iOS — gap: tab-item tokens are not mapped yet
+- `Tab` / Android — gap: a tab reports a plain layout class with selected=true; nothing in the class name marks it as a tab
+- `Tab` / iOS — gap: a tab bar and its items arrive as AXGroup; the element identifier names the tab bar, the role does not
 - `ScrollBar` / Android — n/a: Android scrollbars are drawn, not exposed as nodes
 - `ScrollBar` / iOS — n/a: UIKit scroll indicators are not accessibility elements
 - `SpinButton` / macOS (AX) — gap: AXIncrementor is not mapped yet
@@ -106,6 +105,5 @@ device's own node, which is classified like any other node from its widget class
 - `StatusBar` / Android — n/a: the system status bar is outside the app tree
 - `StatusBar` / iOS — n/a: the system status bar is outside the app tree
 - `Heading` / Windows (UIA) — gap: UIA's Header and HeaderItem are grid column headers, not document headings; the normalized set has no column-header role
-- `Heading` / Android — gap: heading semantics are not mapped yet
-- `Heading` / iOS — gap: the header token is not mapped yet
+- `Heading` / Android — gap: neither reader exposes heading semantics: the uiautomator dump has no heading attribute, and the service protocol does not carry isHeading
 <!-- END GENERATED: role-support -->
