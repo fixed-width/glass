@@ -34,6 +34,23 @@ impl WinInfo {
         self.visible && !self.cloaked && (!self.owned || self.appwindow) && !self.toolwindow
     }
 
+    /// The teardown filter: whether this window should be asked to close before its process
+    /// tree is terminated ([`crate::teardown::wants_close_request`] holds the reasoning).
+    ///
+    /// Contrast [`Self::looks_like_app_window`], which excludes cloaked windows: this one must
+    /// not. A window on another virtual desktop is cloaked but entirely real, and skipping it
+    /// would leave that part of the app to be terminated instead. Keeping both filters here,
+    /// side by side, is what makes that difference visible — and keeps the field projection
+    /// itself in one named place rather than spelled out at the call site.
+    pub fn wants_close_request(&self) -> bool {
+        crate::teardown::wants_close_request(
+            self.visible,
+            self.owned,
+            self.appwindow,
+            self.toolwindow,
+        )
+    }
+
     pub fn hwnd(&self) -> HWND {
         raw_to_hwnd(self.raw)
     }

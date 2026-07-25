@@ -9,7 +9,7 @@
 //! buffered by the time `start_app` returns. This test drives the real `Platform` path and
 //! asserts the launch-time marker reaches `drain_logs()`.
 //!
-//! `#[ignore]`d so a plain `cargo test` (a non-macOS host, CI) skips it: the backend shells out
+//! `#[ignore]`d so a plain `cargo test` skips it everywhere: the backend shells out
 //! to `xcrun simctl` (macOS + Xcode only) and needs a booted Simulator plus an app that logs a
 //! known line at launch. Point it at such an app and tell it the exact line to expect:
 //!

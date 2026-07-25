@@ -172,7 +172,7 @@ mod imp {
                 Launched::Sandboxie(a) => a.try_wait(),
             }
         }
-        pub(crate) fn kill(self) {
+        pub(crate) fn kill(self) -> crate::process::Closed {
             match self {
                 Launched::Unconfined(a) => a.kill(),
                 Launched::Sandboxie(a) => a.kill(),

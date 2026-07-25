@@ -13,22 +13,27 @@
 
 /// Whether a top-level window belonging to the app's process set should be sent a `WM_CLOSE`.
 ///
-/// - `visible`: a window the user could see. Invisible ones are helper/message-only windows
-///   (Chromium keeps several); a `WM_CLOSE` there is at best ignored and at worst closes a
+/// - `visible`: the `WS_VISIBLE` style bit is set (not "the user can see it" — an occluded,
+///   off-screen or cloaked window still has it). Windows without it are helper/message-only
+///   ones (Chromium keeps several); a `WM_CLOSE` there is at best ignored and at worst closes a
 ///   worker the app expected to outlive the request.
 /// - `owned`: has an owner window — i.e. it is a dialog or palette *belonging* to another
-///   window. Skipped because closing the owner is the app's own business: dismissing its
-///   dialogs from outside can cancel work the owner is mid-way through, and a well-behaved
-///   app tears them down itself once the owner closes.
+///   window. Skipped unless `appwindow`, because closing the owner is the app's own business:
+///   dismissing its dialogs from outside can cancel work the owner is mid-way through, and a
+///   well-behaved app tears them down itself once the owner closes.
+/// - `appwindow`: `WS_EX_APPWINDOW`, the app's own declaration that this is a real taskbar-level
+///   window despite having an owner. Honoured for the same reason the discovery ladder honours
+///   it: glass may well be *driving* such a window, and a window glass drives is one it must ask
+///   to close rather than terminate out from under.
 /// - `toolwindow`: `WS_EX_TOOLWINDOW`, a floating palette rather than a real app window.
 ///
-/// Deliberately *not* filtered on `cloaked`: a window on another virtual desktop is cloaked but
-/// entirely real, and skipping it would leave that part of the app to be terminated instead.
-/// (This is why the discovery ladder's [`crate::util::WinInfo::looks_like_app_window`] is not
-/// reused here — it excludes cloaked windows, which is right for "which window do we drive?"
-/// and wrong for "which windows must be asked to close?")
-pub fn wants_close_request(visible: bool, owned: bool, toolwindow: bool) -> bool {
-    visible && !owned && !toolwindow
+/// This is deliberately the discovery ladder's `WinInfo::looks_like_app_window` filter minus its
+/// `!cloaked` clause, and that one difference is the whole reason the two are not one function: a
+/// window on another virtual desktop is cloaked but entirely real. Excluding it is right for
+/// "which window do we drive?" and wrong for "which windows must be asked to close?", where it
+/// would leave that part of the app to be terminated instead.
+pub fn wants_close_request(visible: bool, owned: bool, appwindow: bool, toolwindow: bool) -> bool {
+    visible && (!owned || appwindow) && !toolwindow
 }
 
 /// What the graceful-close wait should do after one poll.
@@ -48,21 +53,23 @@ pub enum CloseStep {
 ///   cross-process post under UIPI). There is nothing to wait *for*, so the grace is skipped
 ///   entirely rather than spent; teardown stays as fast as it was before.
 /// - `root_exited`: the launched root process has been observed exited.
-/// - `job_reports_live`: the Job's pid-set still lists at least one live process. The root
-///   exiting is not enough on its own: a launcher that hands off (Chromium/Electron) leaves
-///   the real UI running in Job-captured children, and proceeding on root-exit alone would
-///   terminate exactly the processes whose clean shutdown we are waiting for. An unreadable
-///   pid-set reports `false` — the wait then rests on `root_exited` alone, which is no worse
-///   than the unconditional terminate this replaces.
+/// - `job_live`: whether the Job's pid-set still lists a live process — `None` when the query
+///   failed, which is a different answer from `Some(false)` ("the job is empty, the tree is
+///   gone") and must not be collapsed into it. The root exiting is not enough on its own: a
+///   launcher that hands off (Chromium/Electron) leaves the real UI running in Job-captured
+///   children, and proceeding on root-exit alone would terminate exactly the processes whose
+///   clean shutdown we are waiting for. `None` therefore keeps waiting — proceeding is the
+///   destructive branch, so an unreadable state must not be read as permission to take it.
+///   The cost of being wrong is bounded by `past_deadline`.
 /// - `past_deadline`: the grace has elapsed. An app may veto its own close (an unsaved-changes
 ///   sheet) or hang; the Job close is the backstop, so teardown always completes.
 pub fn close_wait_step(
     posted: usize,
     root_exited: bool,
-    job_reports_live: bool,
+    job_live: Option<bool>,
     past_deadline: bool,
 ) -> CloseStep {
-    if posted == 0 || past_deadline || (root_exited && !job_reports_live) {
+    if posted == 0 || past_deadline || (root_exited && job_live == Some(false)) {
         CloseStep::Proceed
     } else {
         CloseStep::KeepWaiting
@@ -75,22 +82,30 @@ mod tests {
 
     #[test]
     fn a_plain_visible_top_level_window_is_asked_to_close() {
-        assert!(wants_close_request(true, false, false));
+        assert!(wants_close_request(true, false, false, false));
     }
 
     #[test]
     fn an_invisible_window_is_not_asked_to_close() {
-        assert!(!wants_close_request(false, false, false));
+        assert!(!wants_close_request(false, false, false, false));
     }
 
     #[test]
     fn an_owned_window_is_not_asked_to_close() {
-        assert!(!wants_close_request(true, true, false));
+        assert!(!wants_close_request(true, true, false, false));
+    }
+
+    #[test]
+    fn an_owned_appwindow_is_asked_to_close() {
+        // `WS_EX_APPWINDOW` is the app declaring an owned window to be a real taskbar-level
+        // one, and the discovery ladder adopts such a window — so glass can be driving it.
+        // Filtering it out here would terminate the very window the agent was working in.
+        assert!(wants_close_request(true, true, true, false));
     }
 
     #[test]
     fn a_toolwindow_is_not_asked_to_close() {
-        assert!(!wants_close_request(true, false, true));
+        assert!(!wants_close_request(true, false, false, true));
     }
 
     #[test]
@@ -98,7 +113,7 @@ mod tests {
         // A windowless app must not pay the grace: with no window asked to close, waiting
         // could only ever burn the full budget before terminating anyway.
         assert_eq!(
-            close_wait_step(0, false, true, false),
+            close_wait_step(0, false, Some(true), false),
             CloseStep::Proceed,
             "no window was asked to close, so there is nothing to wait for"
         );
@@ -107,7 +122,7 @@ mod tests {
     #[test]
     fn a_live_tree_within_the_grace_keeps_waiting() {
         assert_eq!(
-            close_wait_step(1, false, true, false),
+            close_wait_step(1, false, Some(true), false),
             CloseStep::KeepWaiting
         );
     }
@@ -117,7 +132,7 @@ mod tests {
         // The launcher-handoff shape: proceeding here would TerminateProcess the very
         // children whose clean shutdown the WM_CLOSE asked for.
         assert_eq!(
-            close_wait_step(1, true, true, false),
+            close_wait_step(1, true, Some(true), false),
             CloseStep::KeepWaiting,
             "handed-off children are still closing"
         );
@@ -125,27 +140,44 @@ mod tests {
 
     #[test]
     fn an_exited_root_with_an_empty_job_proceeds() {
-        assert_eq!(close_wait_step(1, true, false, false), CloseStep::Proceed);
+        assert_eq!(
+            close_wait_step(1, true, Some(false), false),
+            CloseStep::Proceed
+        );
     }
 
     #[test]
     fn a_still_live_tree_past_the_grace_proceeds() {
         // An app that vetoes its own close (unsaved-changes sheet) must not wedge teardown.
         assert_eq!(
-            close_wait_step(1, false, true, true),
+            close_wait_step(1, false, Some(true), true),
             CloseStep::Proceed,
             "the Job close is the backstop once the grace is spent"
         );
     }
 
     #[test]
-    fn an_unreadable_job_pid_set_waits_only_for_the_root() {
-        // `job_reports_live: false` is also what an unreadable pid-set reports, so the
-        // decision must not require a positive "job is empty" signal to ever proceed.
+    fn an_unreadable_job_pid_set_is_not_read_as_an_empty_one() {
+        // The destructive branch requires a *positive* "the job is empty". An unreadable
+        // pid-set (`None`) must keep waiting even once the root has exited: reading it as
+        // "gone" is exactly how a launcher-handoff app's children would get terminated
+        // milliseconds after being asked to close, with a half-written profile on disk.
         assert_eq!(
-            close_wait_step(1, false, false, false),
-            CloseStep::KeepWaiting
+            close_wait_step(1, true, None, false),
+            CloseStep::KeepWaiting,
+            "unknown is not permission to terminate"
         );
-        assert_eq!(close_wait_step(1, true, false, false), CloseStep::Proceed);
+        assert_eq!(
+            close_wait_step(1, true, Some(false), false),
+            CloseStep::Proceed,
+            "a positive empty reading does proceed"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_job_pid_set_still_gives_up_at_the_deadline() {
+        // The grace bounds the cost of never getting a readable answer, so treating `None`
+        // as "keep waiting" can't wedge teardown.
+        assert_eq!(close_wait_step(1, true, None, true), CloseStep::Proceed);
     }
 }

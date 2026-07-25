@@ -130,11 +130,18 @@ impl Adopted {
     /// escalation): an app that vetoes quit (e.g. an unsaved-changes sheet) is left running
     /// by design, trading a possible stray process for never forcibly killing an app
     /// mid-edit and losing the user's work.
+    ///
+    /// Having no escalation to fall back to is exactly why a failed request is *reported*: it
+    /// is the only thing left to do with it, and `stop_app` otherwise returns success while an
+    /// app glass launched is still on screen.
     fn reap(self) {
-        if self.disposition.should_terminate() {
-            // Whether the request landed is deliberately not acted on: there is no escalation
-            // to fall back to on this path, so a `false` would only be something to report.
-            let _ = crate::ffi::terminate_app(self.pid);
+        if self.disposition.should_terminate() && !crate::ffi::terminate_app(self.pid) {
+            eprintln!(
+                "glass: could not ask the app (pid {}) to quit — it is already gone, or no \
+                 longer registered as a running application. If it is still running, quit it \
+                 manually; glass does not force-kill an app it only adopted.",
+                self.pid
+            );
         }
     }
 }
@@ -343,8 +350,16 @@ impl MacosPlatform {
                         // `None` just found above means any instance running now is one we
                         // spawned, so best-effort reclaim it before propagating the error.
                         Err(e) => {
-                            if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id) {
-                                crate::ffi::terminate_app(pid);
+                            if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id)
+                                && !crate::ffi::terminate_app(pid)
+                            {
+                                // The launch error propagating below says nothing about this
+                                // stray app, and there is no `Child` here to escalate with.
+                                eprintln!(
+                                    "glass: the launch failed and the instance it started \
+                                     (pid {pid}) could not be asked to quit; if it is still \
+                                     running, quit it manually"
+                                );
                             }
                             return Err(e);
                         }

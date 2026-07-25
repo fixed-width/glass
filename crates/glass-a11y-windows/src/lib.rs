@@ -4,7 +4,7 @@
 //! `glass-a11y-linux`.
 
 pub mod doctor;
-pub mod mapping; // pure UIA->normalized mapping — cross-platform, unit-tested on any host // checks()/a11y_checks() are OS-free (probe_uia is cfg-split), so its tests run on Linux
+pub mod mapping; // pure UIA->normalized mapping — cross-platform, host-tested
 
 #[cfg(windows)]
 mod reader;

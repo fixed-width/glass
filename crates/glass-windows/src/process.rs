@@ -1,7 +1,9 @@
 //! Process lifecycle for the Windows backend: spawn the app **CREATE_SUSPENDED**,
 //! assign it to a `KILL_ON_JOB_CLOSE` Job before it can fork any children, wire
 //! up log readers, then resume — so a launcher that exits and hands off
-//! (Chromium/Electron) cannot escape the Job. Teardown is "close the job handle".
+//! (Chromium/Electron) cannot escape the Job. Teardown asks the app's windows to close and
+//! only then closes the job handle, which is the backstop for whatever did not go (see
+//! [`LaunchedApp::kill`] and [`crate::teardown`]).
 //!
 //! The FFI here is a verbatim port of the validated
 //! `tools/windows-validation/src/proc.rs` probe (proven on real hardware): the
@@ -9,16 +11,17 @@
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and `AssignProcessToJobObject`, then resume;
 //! plus the Toolhelp thread enum with `ResumeThread`, and the Toolhelp parent-link
 //! descendant walk. It is restructured into reusable lib types but the unsafe bodies
-//! are unchanged.
+//! are unchanged. The `PostMessageW` close request in [`request_close`] is not from that
+//! probe — it was added later, with its own on-box evidence.
 
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
+use glass_core::{AppSpec, GlassError, Result, SandboxLevel, TEARDOWN_BUDGET};
 
-use crate::teardown::{CloseStep, close_wait_step, wants_close_request};
+use crate::teardown::{CloseStep, close_wait_step};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -39,10 +42,22 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
 /// How long the app tree gets to close itself after the `WM_CLOSE` broadcast, before the Job is
 /// closed (`TerminateProcess` for whatever is left). Only an app that will not close pays this in
-/// full — a cooperating one ends the wait the moment its tree is gone. Measured on-box: an isolated
-/// Edge tree (15 processes) is fully gone 328 ms after the broadcast, so the budget is generous
-/// enough for a heavier app's shutdown path without making teardown feel slow.
-const CLOSE_GRACE: Duration = Duration::from_secs(3);
+/// full — a cooperating one ends the wait the moment its tree is gone. Measured on-box, an
+/// isolated Edge tree closed in well under half a second, so this is several times the observed
+/// cost while still leaving the Job close room inside [`TEARDOWN_BUDGET`].
+///
+/// It has to leave that room: when the *process* is going away, `glass-mcp` abandons teardown
+/// once the budget is spent. A grace that filled it would mean the Job was never closed from
+/// here — the tree would instead be terminated as a side effect of the handle closing at process
+/// exit, which is the ungraceful teardown this whole path exists to avoid, arrived at slowly.
+const CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
+// Teardown must finish inside the budget it is given, or `glass-mcp` walks away mid-close. This
+// is the only thing keeping the two numbers — in different crates — honest about each other.
+const _: () = assert!(
+    CLOSE_GRACE.as_millis() * 2 <= TEARDOWN_BUDGET.as_millis(),
+    "CLOSE_GRACE must leave the Job close comfortable room inside glass_core::TEARDOWN_BUDGET"
+);
 
 /// How often the close wait re-checks the tree. Short relative to [`CLOSE_GRACE`] so a quick
 /// shutdown is noticed promptly rather than rounded up to the next poll.
@@ -139,64 +154,165 @@ impl LaunchedApp {
     /// records whether it exited cleanly then reports a crash on its *next* launch and greets the
     /// agent with a recovery prompt instead of its normal first screen. See [`crate::teardown`] for
     /// the measurement behind that and for both decisions this drives.
-    pub(crate) fn kill(mut self) {
-        let posted = request_close(&self.live_pids());
-        self.await_close(posted);
+    pub(crate) fn kill(mut self) -> Closed {
+        let asked = request_close(&self.live_pids());
+        let closed_itself = self.await_close(asked.posted);
         // SAFETY: closing the last job handle terminates the entire tree (KILL_ON_JOB_CLOSE).
         unsafe {
             let _ = CloseHandle(self.job.0);
         }
         let _ = self.child.kill(); // belt-and-suspenders: ensure the root is terminated so wait() can't block
         let _ = self.child.wait(); // reap the now-terminated root; avoids a zombie
+        asked.outcome(closed_itself)
     }
 
     /// The app's live process set: the Job's authoritative pid list, falling back to the Toolhelp
-    /// parent-link walk when the Job query fails (it reports failure as an empty list). Without the
-    /// fallback, a failed query would leave a handed-off app with no window to ask.
+    /// parent-link walk when the Job query fails. Without the fallback, a failed query would leave
+    /// a handed-off app with no window to ask.
+    ///
+    /// Job-authoritative rather than a union with the walk (which is what *discovery* uses): this
+    /// set drives a `WM_CLOSE` broadcast, and Windows parent links go stale when a pid is recycled,
+    /// so a union could put an unrelated application's window in the destructive set. Discovery can
+    /// afford that risk because it only ever reads.
     fn live_pids(&self) -> Vec<u32> {
-        let pids = self.job_pids();
-        if pids.is_empty() {
-            descendant_pids(self.pid())
-        } else {
-            pids
-        }
+        job_pids_checked(self.job.0).unwrap_or_else(|| descendant_pids(self.pid()))
     }
 
     /// Poll until the tree has closed itself or [`CLOSE_GRACE`] is spent, per
     /// [`close_wait_step`]. `posted` is how many windows accepted the `WM_CLOSE`.
-    fn await_close(&mut self, posted: usize) {
+    ///
+    /// Note this reads the Job pid-set through [`job_pids_checked`] rather than [`Self::live_pids`]
+    /// — the two want different things from a failed query, and neither substitutes for the other.
+    /// `live_pids` needs *some* pid set to find windows in, so it falls back to the Toolhelp walk;
+    /// that walk always contains the root, so using it here would report the tree as live on every
+    /// poll and spend the full grace on even a cleanly-closing app. What this needs is the honest
+    /// third answer, `None`, which [`close_wait_step`] reads as "unknown, keep waiting".
+    /// Returns whether the tree closed itself before the grace ran out — a `false` means whatever
+    /// is left is about to be terminated. A `try_wait` error counts as "still running": the pid is
+    /// ours, so a failure is unexpected, and waiting is the safe reading of an unreadable state
+    /// (the deadline bounds the cost). Mirrors `glass-macos`'s `wait_for_exit`.
+    fn await_close(&mut self, posted: usize) -> bool {
         let deadline = Instant::now() + CLOSE_GRACE;
         loop {
             let root_exited = matches!(self.child.try_wait(), Ok(Some(_)));
-            let job_reports_live = !self.job_pids().is_empty();
-            let step = close_wait_step(
-                posted,
-                root_exited,
-                job_reports_live,
-                Instant::now() >= deadline,
-            );
-            if step == CloseStep::Proceed {
-                return;
+            let job_live = job_pids_checked(self.job.0).map(|pids| !pids.is_empty());
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if close_wait_step(posted, root_exited, job_live, false) == CloseStep::Proceed {
+                // Distinguish the two non-deadline exits: nothing was asked (so nothing could
+                // have closed itself) from the tree having actually gone.
+                return posted > 0;
             }
             std::thread::sleep(CLOSE_POLL);
         }
     }
 }
 
-/// Post `WM_CLOSE` to every top-level window owned by `pids` that [`wants_close_request`] accepts,
-/// returning how many posts the OS accepted.
+/// How a launched app's process tree actually went away, so `stop_app` can say so. Terminating an
+/// app that was never asked, or asked and refused, is the outcome this whole path exists to avoid
+/// — reporting it as an unqualified success would leave the agent to rediscover it as a recovery
+/// prompt on the next launch, with nothing connecting the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Closed {
+    /// Asked, and the tree left through its own shutdown path.
+    Gracefully,
+    /// Nothing accepted a close request — a windowless app, or every post was refused — so the
+    /// tree was terminated without being asked. Carries how many windows were asked but refused
+    /// (UIPI blocks posting to a higher-integrity process), which is actionable in a way the
+    /// windowless case is not.
+    TerminatedUnasked { refused: usize },
+    /// Asked, but still alive when the grace ran out: a modal shutdown prompt, or a hang.
+    TerminatedAfterGrace,
+}
+
+/// Report a teardown that could not be graceful. Silent on [`Closed::Gracefully`] — the good
+/// path is the expectation, not news — and on a windowless app, which has no shutdown path to
+/// have missed. Everything else is something the user can act on, and would otherwise only
+/// surface as an unexplained recovery prompt the *next* time the app is launched.
+pub(crate) fn disclose_teardown(closed: Closed) {
+    match closed {
+        Closed::Gracefully | Closed::TerminatedUnasked { refused: 0 } => {}
+        Closed::TerminatedUnasked { refused } => eprintln!(
+            "glass: {refused} close request(s) were refused, so the app was terminated instead \
+             of asked to close. Windows blocks posting to a higher-integrity process (UIPI); \
+             running glass elevated lets it close the app cleanly. An app that records clean \
+             shutdown may report a crash on its next launch."
+        ),
+        Closed::TerminatedAfterGrace => eprintln!(
+            "glass: the app did not close within {CLOSE_GRACE:?} of being asked (a modal \
+             shutdown prompt will do this), so its process tree was terminated. Unsaved state \
+             was not flushed, and the app may report a crash on its next launch."
+        ),
+    }
+}
+
+/// The result of asking an app's windows to close: how many accepted, and how many refused.
+struct Asked {
+    posted: usize,
+    refused: usize,
+}
+
+impl Asked {
+    fn outcome(&self, closed_itself: bool) -> Closed {
+        match (self.posted, closed_itself) {
+            (0, _) => Closed::TerminatedUnasked {
+                refused: self.refused,
+            },
+            (_, true) => Closed::Gracefully,
+            (_, false) => Closed::TerminatedAfterGrace,
+        }
+    }
+}
+
+/// Ask the windows of `pids` to close and wait — up to [`CLOSE_GRACE`] — for `still_live` to
+/// report the tree gone, then report how it went.
 ///
-/// The count matters: a cross-process post can be refused (UIPI blocks posting to a
-/// higher-integrity process), and a refused window is not one that is going to close — counting it
-/// would make the caller wait out the whole grace for a shutdown nobody was asked to perform.
-fn request_close(pids: &[u32]) -> usize {
-    crate::util::enum_top_windows()
+/// For a teardown that owns its own termination sequence and has no Job handle to poll, so it
+/// cannot use [`LaunchedApp::await_close`]: the Sandboxie provider, whose boxed processes are not
+/// in glass's Job at all and whose liveness comes from `Start.exe /listpids`. The caller must
+/// still terminate afterwards — this only ever *asks*, and returns whether asking was enough.
+pub(crate) fn close_pids_and_wait(pids: &[u32], mut still_live: impl FnMut() -> bool) -> Closed {
+    let asked = request_close(pids);
+    if asked.posted == 0 {
+        return asked.outcome(false);
+    }
+    let deadline = Instant::now() + CLOSE_GRACE;
+    loop {
+        if !still_live() {
+            return asked.outcome(true);
+        }
+        if Instant::now() >= deadline {
+            return asked.outcome(false);
+        }
+        std::thread::sleep(CLOSE_POLL);
+    }
+}
+
+/// Post `WM_CLOSE` to every top-level window belonging to a process in `pids` that
+/// [`wants_close_request`] accepts, reporting how many posts the OS accepted and how many it
+/// refused.
+///
+/// The split matters twice over. A refused window is not one that is going to close, so counting
+/// it would make the caller wait out the whole grace for a shutdown nobody was asked to perform.
+/// And a refusal is a *diagnosable* condition — UIPI blocks posting to a higher-integrity process,
+/// so every teardown of that app will be a hard kill until glass is run elevated — which is worth
+/// telling the user rather than absorbing.
+fn request_close(pids: &[u32]) -> Asked {
+    let candidates: Vec<crate::util::WinInfo> = crate::util::enum_top_windows()
         .into_iter()
-        .filter(|w| pids.contains(&w.pid) && wants_close_request(w.visible, w.owned, w.toolwindow))
+        .filter(|w| pids.contains(&w.pid) && w.wants_close_request())
+        .collect();
+    let posted = candidates
+        .iter()
         // SAFETY: PostMessageW only queues a message on the target window's thread queue — it
         // writes through no pointer we own and does not block waiting for the app to handle it.
         .filter(|w| unsafe { PostMessageW(Some(w.hwnd()), WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok())
-        .count()
+        .count();
+    Asked {
+        posted,
+        refused: candidates.len() - posted,
+    }
 }
 
 /// Spawn `cmd` CREATE_SUSPENDED with piped stdout/stderr, create a KILL_ON_JOB_CLOSE Job,
@@ -354,10 +470,20 @@ pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
     keep
 }
 
-/// The job's authoritative PID set (kernel-tracked) — captures children of an exited launcher
-/// (Electron/Chromium handoff) that a Toolhelp parent-link walk can miss. Empty on any query
-/// failure, so the caller can fall back to descendant_pids().
+/// [`job_pids_checked`], flattening an unreadable pid-set to an empty one — for callers that
+/// only need a list to search and treat "couldn't ask" and "nothing there" alike.
 pub(crate) fn job_pids(job: HANDLE) -> Vec<u32> {
+    job_pids_checked(job).unwrap_or_default()
+}
+
+/// The job's authoritative PID set (kernel-tracked) — captures children of an exited launcher
+/// (Electron/Chromium handoff) that a Toolhelp parent-link walk can miss.
+///
+/// `None` means the query itself failed, which is a genuinely different answer from
+/// `Some(vec![])` ("the job is empty, the tree is gone"). Teardown turns on that difference:
+/// reading an unreadable pid-set as "gone" would let [`LaunchedApp::await_close`] terminate a
+/// handed-off app's children on the first poll, immediately after asking them to close.
+pub(crate) fn job_pids_checked(job: HANDLE) -> Option<Vec<u32>> {
     // JOBOBJECT_BASIC_PROCESS_ID_LIST is variable-length: { NumberOfAssignedProcesses: u32,
     // NumberOfProcessIdsInList: u32, ProcessIdList: [usize; 1] (flexible) }. Size the buffer
     // for `cap` pids and grow on failure (too-small buffer), capped to avoid a pathological loop.
@@ -382,10 +508,10 @@ pub(crate) fn job_pids(job: HANDLE) -> Vec<u32> {
             if cap < 8192 {
                 cap *= 4;
                 continue;
-            } // too-small buffer: grow; terminal error: give up empty
-            return Vec::new();
+            } // too-small buffer: grow; terminal error: report the state as unknown
+            return None;
         }
-        return crate::jobpids::parse_job_pid_list(&buf);
+        return Some(crate::jobpids::parse_job_pid_list(&buf));
     }
 }
 

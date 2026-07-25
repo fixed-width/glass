@@ -349,10 +349,6 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // Forces a test-only AX-geometry fallback path (glass-macos/src/axwindow.rs); read only to
     // exercise that path in an integration test, not a supported way to configure glass.
     "GLASS_MACOS_FORCE_AX_GEOMETRY_FALLBACK",
-    // Opts in to the glass-macos tests that need a real Mac to mean anything — a `swiftc` build
-    // and a window-server session (see `scripts/test-macos.sh` and the fixture-driven test in
-    // glass-macos/src/process.rs). A test-suite switch, not a way to configure glass.
-    "GLASS_MACOS_ONBOX",
     // Build-time only: `build.rs` computes the release version and emits it as a
     // `cargo:rustc-env=GLASS_VERSION`, read via `env!` (see `crate::VERSION`). Not read from the
     // process environment and never an operator override.

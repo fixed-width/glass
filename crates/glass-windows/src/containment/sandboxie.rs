@@ -443,7 +443,13 @@ impl SandboxieApp {
     /// and read everything) → clear the box's config section so per-session `glass_<pid>`
     /// boxes don't accumulate in `Sandboxie.ini` (`SbieIni set <box> * ""` — the
     /// maintainer's documented box-clear).
-    pub(crate) fn kill(mut self) {
+    pub(crate) fn kill(mut self) -> crate::process::Closed {
+        // Ask the BOXED app to close before anything terminates it. This has to happen here
+        // rather than in the wrapped `LaunchedApp::kill` below: the boxed processes are not in
+        // glass's Job (the wrapper hands off to SbieSvc and exits, owning no app window), so by
+        // the time that runs there is nothing left for it to find — and `/terminate` would
+        // already have killed the box outright, which is the ungraceful teardown being avoided.
+        let closed = crate::process::close_pids_and_wait(&self.pids(), || !self.pids().is_empty());
         let _ = Command::new(start_exe(&self.dir))
             .args([&format!("/box:{}", self.box_name), "/terminate"])
             .status();
@@ -451,11 +457,14 @@ impl SandboxieApp {
         for h in self.tailers {
             let _ = h.join();
         }
-        self.inner.kill();
+        // The wrapper's own teardown. Its outcome is not the app's — `Start.exe` exits as soon
+        // as it has handed off, so this reports on a process the user never sees.
+        let _ = self.inner.kill();
         if let Some((_, server)) = self.clip.take() {
             server.stop();
         }
         let _ = std::fs::remove_dir_all(&self.logdir);
         clear_box_section(&self.dir, &self.box_name);
+        closed
     }
 }

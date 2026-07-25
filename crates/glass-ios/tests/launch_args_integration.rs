@@ -7,7 +7,7 @@
 //! the role fixture selects its screen from `--tab=<name>`, and the selected screen is
 //! identifiable in the tree.
 //!
-//! `#[ignore]`d so a plain `cargo test` (a non-macOS host, CI) skips it: the backend needs
+//! `#[ignore]`d so a plain `cargo test` skips it everywhere: the backend needs
 //! `xcrun simctl` + `idb_companion` (macOS + Xcode only), a booted Simulator, and the RoleFixture
 //! app from `examples/ios-role-fixture/`. Run explicitly on such a host:
 //!

@@ -268,10 +268,11 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
 /// not GUI-registered, or is already gone) or AppKit declined to send, and a caller that
 /// needs the process gone must fall back to signalling it.
 ///
-/// Only signals are available without this: measured on macOS 26, a directly-spawned bundle
-/// executable asked this way runs `applicationWillTerminate:` and exits in ~390 ms, while
-/// `SIGTERM` and `SIGKILL` both end it with that method never called — an app gets no chance
-/// to flush state under either.
+/// Only signals are available without this, and they run no shutdown path at all: AppKit installs
+/// no `SIGTERM` handler, so the default disposition ends the process with
+/// `applicationWillTerminate:` never called and nothing flushed. Measured against a minimal AppKit
+/// app, which ran that method and exited a few hundred milliseconds after being asked this way,
+/// and did not run it under `SIGTERM`.
 ///
 /// The `false` return is advisory, not an error. `backend.rs`'s `stop_app` path doesn't need
 /// to know whether the app was already gone before it asked (unlike `input.rs::focus`'s

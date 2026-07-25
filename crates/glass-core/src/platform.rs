@@ -1,9 +1,22 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
 use crate::keys::Modifier;
 use crate::logbuf::Stream;
+
+/// The wall-clock budget the whole of teardown gets when the *process* is going away — the
+/// server's stdin closed or a termination signal arrived. `glass-mcp`'s shutdown path spends it
+/// on `Glass::shutdown` and then exits regardless, so anything a [`Platform::stop_app`] impl was
+/// still waiting on is abandoned mid-flight: on a Unix backend that orphans the app to init.
+///
+/// Every backend's teardown must therefore fit inside this, with room for the work that follows
+/// it. A backend that waits on the app being polite has to bound that wait against this constant
+/// — it lives here, rather than as a private number in `glass-mcp`, precisely because the
+/// backends are the ones that have to respect it and they cannot see a private one. Each backend
+/// asserts its own budget against it at compile time; grep for `TEARDOWN_BUDGET` to find them.
+pub const TEARDOWN_BUDGET: Duration = Duration::from_secs(3);
 
 /// How aggressively to contain the process tree a backend launches. Platform-agnostic
 /// *policy*; the Linux mechanism (bubblewrap) lives in the `glass-sandbox-linux` crate.

@@ -3,7 +3,7 @@
 //! clipboard round-trip, stop — exactly the sequence `glass_start`/`glass_screenshot`/
 //! `glass_clipboard_*`/`glass_stop` exercise over MCP.
 //!
-//! `#[ignore]`d so a plain `cargo test` (a non-macOS host, CI) skips it; the backend shells out
+//! `#[ignore]`d so a plain `cargo test` skips it everywhere; the backend shells out
 //! to `xcrun simctl`, which only exists on macOS with Xcode installed, and this test additionally
 //! needs a booted Simulator and a real app to launch. Run explicitly on a macOS host with a
 //! Simulator already booted:

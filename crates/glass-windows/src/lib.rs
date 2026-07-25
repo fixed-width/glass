@@ -20,10 +20,10 @@ pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
 pub mod jobcfg; // pure SandboxLevel -> job-limit descriptor — unit-tested on any host
 pub mod jobpids; // pure JOBOBJECT_BASIC_PROCESS_ID_LIST byte parser — Miri'd on the host
 #[doc(hidden)]
-pub mod onbox_support;
+pub mod onbox_support; // env-resolved paths shared by the on-box examples + tests; host-tested
 pub mod pixels; // pure BGRA->RGBA swizzle — cross-platform, unit-tested on any host
 pub mod teardown; // pure graceful-close decisions — cross-platform, unit-tested on any host
-pub mod vkmap; // pure named-keysym->VK map — cross-platform, unit-tested on any host // env-resolved paths shared by the on-box examples + tests; host-tested
+pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "windows";
@@ -70,8 +70,8 @@ const MULTI_TOUCH: CapabilityStatus = CapabilityStatus::unsupported(None);
 
 /// The `Unsupported` error this backend returns for a multi-touch gesture — one source
 /// for the call site (`send_pointer`'s `Gesture` arm) and its test.
-// Consumed only by the cfg(windows) `input::send_pointer` and the Linux unit test, so a
-// non-test Linux build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
+// Consumed only by the cfg(windows) `input::send_pointer` and the off-target unit test, so a
+// non-test off-target build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
     glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note)
@@ -242,7 +242,10 @@ mod backend {
                 Err(e) => {
                     // Window never appeared (or geometry failed): don't orphan the tree.
                     if let Some(app) = self.app.take() {
-                        app.kill();
+                        // No disclosure here: a launch that never showed a window has no
+                        // shutdown state worth preserving, and the launch error is the
+                        // actionable thing to report.
+                        let _ = app.kill();
                     }
                     self.active_hwnd = None;
                     Err(e)
@@ -252,7 +255,7 @@ mod backend {
 
         fn stop_app(&mut self) -> Result<()> {
             if let Some(app) = self.app.take() {
-                app.kill();
+                crate::process::disclose_teardown(app.kill());
             }
             self.active_hwnd = None;
             Ok(())
@@ -380,7 +383,7 @@ mod backend {
     impl Drop for WindowsPlatform {
         fn drop(&mut self) {
             if let Some(app) = self.app.take() {
-                app.kill();
+                crate::process::disclose_teardown(app.kill());
             }
         }
     }

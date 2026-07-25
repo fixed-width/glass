@@ -18,9 +18,8 @@ fn main() {
         .expect("failed to embed application manifest");
     }
     // Statically link only the VCRuntime, leaving the OS-provided UCRT dynamic (paired
-    // with `+crt-static` in .cargo/config.toml). Gated to a Windows host: that's where
-    // the only commercial msvc builds happen, and it keeps the crate
-    // off non-Windows builds entirely so build.rs always compiles there.
+    // with `+crt-static` in .cargo/config.toml). Gated to a Windows host — the msvc
+    // toolchain this configures only exists there — so build.rs still compiles elsewhere.
     #[cfg(windows)]
     static_vcruntime::metabuild();
 
