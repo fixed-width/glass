@@ -23,6 +23,11 @@ internal refactors, CI, or test-only changes.
   with guidance to use a `settle` action or the terminal `then` observe instead.
 - [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
   each platform backend can produce, and why a role is unavailable where it is.
+- Two example apps hold the controls that page's cells are decided from — one screen of stock
+  `android.widget` controls in [`examples/android-role-fixture/`](examples/android-role-fixture/)
+  (builds without Gradle) and the UIKit and SwiftUI equivalents in
+  [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so anyone can read the same trees
+  back.
 - More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
   and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
   Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
@@ -31,6 +36,17 @@ internal refactors, CI, or test-only changes.
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
+- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) now separates a role no backend
+  vocabulary can carry from one glass has not mapped yet by putting the control on screen and
+  reading the tree back, rather than by what a platform's API reference implies. Fifteen cells
+  that read "not mapped yet" turned out to be unreachable and now say so with what the control
+  actually reports: an iOS stepper arrives as two buttons, a progress view as a generic element, a
+  picker as a slider, an alert and a pull-down menu as loose buttons, a table view and its rows as
+  a group of static text; an Android toolbar arrives as a plain `ViewGroup` and a popup menu as a
+  `ListView`. The cells whose token does arrive now name it — Android's `TabWidget`, `TableLayout`
+  and `NumberPicker` — as do the ones whose semantics sit in a field neither Android reader
+  carries (`CollectionItemInfo`). No role mapping changed; this is what the page claims, not what
+  glass produces.
 - Three kinds of element now report a different role than before, so a `role:` filter that used to
   match them no longer does. On Windows, a button that can be toggled (a formatting bar's Bold or
   Italic) reports `ToggleButton` instead of `Button`; on macOS, a row inside an outline view

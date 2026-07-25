@@ -8,3 +8,7 @@ Small apps for trying glass's build → see → interact → debug loop. Each li
   [Drive a native iOS app](../docs/how-to/drive-an-ios-app.md).
 - [`ios-fixture/`](ios-fixture/) — the SwiftUI app the `glass-ios` on-box tests drive: four
   elements with stable accessibility identifiers, plus a launch-time log marker.
+- [`android-role-fixture/`](android-role-fixture/) — stock `android.widget` controls, one per
+  question about what Android's accessibility vocabulary can express. Builds without Gradle.
+- [`ios-role-fixture/`](ios-role-fixture/) — the same for UIKit and SwiftUI. Both back the cells
+  in [docs/reference/a11y-roles.md](../docs/reference/a11y-roles.md).
