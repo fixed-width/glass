@@ -131,3 +131,30 @@ fn launch_arguments_reach_the_app_in_both_forms() {
         "a separated --tab collection must reach the app with its value intact"
     );
 }
+
+#[test]
+#[ignore = "on-box only: needs a macOS host with Xcode + idb_companion + a booted iOS \
+            Simulator, and GLASS_IOS_ROLE_FIXTURE pointing at the examples/ios-role-fixture .app"]
+fn an_app_that_dies_on_a_bad_argument_is_reported_as_failed_rather_than_started() {
+    // The other half of forwarding arguments: an app can now reject one. `simctl launch` exits 0
+    // as soon as launchd spawns the process, so without a liveness check `start_app` would
+    // screenshot the home screen and report it as the app's window — the caller's next snapshot
+    // would describe SpringBoard and nothing would say why.
+    //
+    // The fixture treats an unrecognized `--tab` as fatal, which is exactly that shape.
+    let app = std::env::var("GLASS_IOS_ROLE_FIXTURE")
+        .expect("GLASS_IOS_ROLE_FIXTURE must be set to the RoleFixture.app path");
+
+    let reg = SimulatorRegistry::new();
+    let mut platform =
+        IosPlatform::from_env(&reg).expect("from_env: resolve/boot a Simulator and open idb");
+    let result = platform.start_app(&spec_with_args(&app, &["--tab=no-such-screen"]));
+    let _ = platform.stop_app();
+
+    let error = result.expect_err("an app that aborted on launch must not report a window");
+    let message = error.to_string();
+    assert!(
+        message.contains("exited before its window"),
+        "the error must say the app died rather than blaming window discovery, got: {message}"
+    );
+}

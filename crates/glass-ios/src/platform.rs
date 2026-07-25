@@ -86,6 +86,28 @@ fn looks_like_app_path(s: &str) -> bool {
     s.ends_with(".app") || s.contains('/')
 }
 
+/// The launched process id from `simctl launch`'s stdout, which reports `<bundle id>: <pid>`.
+///
+/// `None` for output in any other shape — a pid guessed out of an unexpected line could belong to
+/// another process entirely, and watching the wrong one is worse than not watching.
+pub(crate) fn pid_from_launch_output(stdout: &str) -> Option<u32> {
+    let (_bundle, pid) = stdout.trim().rsplit_once(": ")?;
+    pid.trim().parse().ok()
+}
+
+/// Whether `pid` is still running, asked of the host: a Simulator app is an ordinary host
+/// process, so `ps` answers for it without this crate taking a `libc` dependency for one probe.
+///
+/// `true` when the answer is not knowable — `ps` missing or failing to run is not evidence the
+/// app died, and refusing a launch on that basis would turn a broken diagnostic into a broken
+/// backend.
+fn pid_is_running(pid: u32) -> bool {
+    match Command::new("ps").args(["-p", &pid.to_string()]).output() {
+        Ok(out) => out.status.success(),
+        Err(_) => true,
+    }
+}
+
 /// The `simctl launch` sub-command argv: the verb, the target simulator and bundle, then the
 /// app's own launch arguments.
 ///
@@ -348,6 +370,12 @@ impl Platform for IosPlatform {
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
+        // `simctl launch` returns as soon as launchd has spawned the process, so a zero exit says
+        // the app started, not that it is still running: an app that aborts on a bad launch
+        // argument or a failed assertion is already gone. Without this check the screenshot below
+        // captures whatever the Simulator is showing — the home screen — and glass reports that
+        // as the app's window, so the caller's next snapshot describes SpringBoard.
+        let launch_pid = pid_from_launch_output(&String::from_utf8_lossy(&out.stdout));
 
         // Capture once, purely to learn the device's pixel dimensions for the geometry we
         // report. These are device *pixels* (the screenshot's raw resolution), not UIKit
@@ -373,6 +401,25 @@ impl Platform for IosPlatform {
             )?)),
             None => None,
         };
+        // Everything above would look identical for an app that died on launch: `simctl launch`
+        // exits 0 once launchd has spawned the process, and the screenshot then captures whatever
+        // the Simulator is showing — the home screen — which would be reported as the app's
+        // window, leaving the caller to snapshot SpringBoard with nothing saying why.
+        //
+        // Asked here, at the last moment before success is reported, rather than straight after
+        // the launch: an app that aborts takes a beat to actually go, and the work above (a
+        // screenshot, and the scale discovery when a driver is present) is the beat. An app that
+        // dies *after* this point is a running app that stopped — the next operation reports it.
+        if let Some(pid) = launch_pid
+            && !pid_is_running(pid)
+        {
+            return Err(GlassError::AppNotStarted(format!(
+                "{bundle_id} launched as pid {pid} and exited before its window could be \
+                 reported. An app that rejects one of its launch arguments, or trips an \
+                 assertion at startup, goes this way — `glass_logs` carries what it printed"
+            )));
+        }
+
         self.app = Some(RunningApp {
             bundle_id,
             geometry: geometry.clone(),
@@ -927,5 +974,35 @@ mod launch_wiring_tests {
             ["--first", "second", "--third=4"],
             "the app's arguments are run[1..], in order, with nothing dropped or duplicated"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_pid_tests {
+    use super::pid_from_launch_output;
+
+    #[test]
+    fn the_pid_follows_the_bundle_id_on_the_launch_line() {
+        assert_eq!(
+            pid_from_launch_output("tech.fixedwidth.glassfixture: 78539\n"),
+            Some(78539)
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_does_not_hide_the_pid() {
+        assert_eq!(
+            pid_from_launch_output("  com.example.app: 42  \n\n"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn output_in_an_unrecognized_shape_yields_no_pid_rather_than_a_wrong_one() {
+        // Better to lose the liveness check than to watch the wrong process: a pid parsed out of
+        // an unexpected line could belong to anything.
+        assert_eq!(pid_from_launch_output(""), None);
+        assert_eq!(pid_from_launch_output("com.example.app\n"), None);
+        assert_eq!(pid_from_launch_output("com.example.app: not-a-pid\n"), None);
     }
 }
