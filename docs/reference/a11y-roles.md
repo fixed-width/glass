@@ -28,9 +28,9 @@ and say so. A `yes` is map-backed, not reading-backed: it says a token is mapped
 was seen to emit it.
 
 Reasons are readings, and readings age. The Android and iOS columns were last read on 2026-07-25,
-against an API 34 emulator and an iOS 26.5 Simulator. What the iOS column can say is bounded by
-what `idb`'s accessibility tree exposes, which may be narrower than what UIKit publishes to
-VoiceOver.
+against an API 34 emulator and an iOS 26.5 Simulator, and the Windows `Heading` cell the same day
+against Edge on Windows 11. What the iOS column can say is bounded by what `idb`'s accessibility
+tree exposes, which may be narrower than what UIKit publishes to VoiceOver.
 
 On Android, both readers report a `Window` root: the `uiautomator` reader wraps its dump in a
 window root sized to the app window, and the accessibility-service reader labels the active
@@ -99,7 +99,7 @@ now, and the outline only names the token of an element that has none.
 - `Table` / macOS (AX) — gap: mac lists report AXOutline rather than AXTable; AXOutline maps to Tree
 - `Table` / Android — gap: android.widget.TableLayout and TableRow both arrive as tokens: TableLayout folds into Group via the container rule, TableRow lands in Other, and GridView maps to List
 - `Table` / iOS — n/a: a table view reports AXGroup like any other container; no table token appears
-- `Cell` / Windows (UIA) — gap: UIA's DataItem control type would carry this, but the data grids probed expose their rows as TreeItem
+- `Cell` / Windows (UIA) — gap: UIA's DataItem control type would carry this and is not mapped: the data grids probed expose their rows as TreeItem instead, though Edge does report an HTML table's header cells as DataItem
 - `Cell` / Android — gap: CollectionItemInfo holds the row and column index, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds. No cell class exists to fall back on — a cell is whatever view the app put in the row
 - `Tree` / Android — n/a: Android has no tree widget
 - `Tree` / iOS — n/a: UIKit has no outline view
@@ -122,6 +122,6 @@ now, and the outline only names the token of an element that has none.
 - `StatusBar` / macOS (AX) — n/a: AppKit exposes status items as menu-bar items
 - `StatusBar` / Android — n/a: the system status bar is outside the app tree
 - `StatusBar` / iOS — n/a: the system status bar is outside the app tree
-- `Heading` / Windows (UIA) — gap: UIA's Header and HeaderItem are grid column headers, not document headings; the normalized set has no column-header role
+- `Heading` / Windows (UIA) — gap: UIA marks a heading with the HeadingLevel property — an h1 arrives as Text carrying level 80051 — and the reader maps by control type alone, so it never sees it. Header and HeaderItem are a grid's column headers, a different concept the normalized set has no role for
 - `Heading` / Android — gap: AccessibilityNodeInfo's isHeading marks a heading, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds
 <!-- END GENERATED: role-support -->

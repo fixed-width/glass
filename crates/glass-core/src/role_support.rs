@@ -13,9 +13,10 @@
 //! instead, and say so.
 //!
 //! Reasons are readings, and readings age. The mobile columns were last read on 2026-07-25,
-//! against an API 34 emulator and an iOS 26.5 Simulator through `idb`. What the iOS column can
-//! say is bounded by what `idb`'s `accessibility_info` exposes, which may be narrower than what
-//! UIKit publishes to VoiceOver.
+//! against an API 34 emulator and an iOS 26.5 Simulator through `idb`, and the Windows `Heading`
+//! cell the same day against Edge on Windows 11. What the iOS column can say is bounded by what
+//! `idb`'s `accessibility_info` exposes, which may be narrower than what UIKit publishes to
+//! VoiceOver.
 //!
 //! Each backend crate has a unit test that walks its own column and asserts its token table
 //! agrees with what is declared here, so a new mapping cannot land without updating the
@@ -277,8 +278,9 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
             [
                 Mapped,
                 Gap(
-                    "UIA's DataItem control type would carry this, but the data grids probed \
-                     expose their rows as TreeItem",
+                    "UIA's DataItem control type would carry this and is not mapped: the data \
+                     grids probed expose their rows as TreeItem instead, though Edge does report \
+                     an HTML table's header cells as DataItem",
                 ),
                 Mapped,
                 Gap(
@@ -433,8 +435,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
             [
                 Mapped,
                 Gap(
-                    "UIA's Header and HeaderItem are grid column headers, not document \
-                     headings; the normalized set has no column-header role",
+                    "UIA marks a heading with the HeadingLevel property — an h1 arrives as Text \
+                     carrying level 80051 — and the reader maps by control type alone, so it \
+                     never sees it. Header and HeaderItem are a grid's column headers, a \
+                     different concept the normalized set has no role for",
                 ),
                 Mapped,
                 Gap(
