@@ -5,12 +5,17 @@
 //! roles nothing in the backend's vocabulary carries them, others simply are not mapped yet.
 //! This module states which is which, so the difference is a checked fact rather than folklore.
 //!
-//! Where a control exists to look at, which of the two a cell gets is decided by observation
-//! rather than by what a platform's API reference implies: the control is put on screen and the
-//! tree is read back. `examples/android-role-fixture/` and `examples/ios-role-fixture/` hold
-//! those controls so a cell can be re-read. Cells for a control the platform simply does not
-//! have — a radio button on iOS, a tree on Android — rest on the platform's own vocabulary
-//! instead, and say so.
+//! Where a control exists to look at, which state a cell gets is decided by observation rather
+//! than by what a platform's API reference implies: the control is put on screen and the tree is
+//! read back. `examples/android-role-fixture/` and `examples/ios-role-fixture/` hold those
+//! controls so a cell can be re-read.
+//!
+//! What that can and cannot establish is the point of [`Basis`]. A cell saying the control was
+//! watched arriving unmarked is a bounded reading — one OS version, one reader, the controls
+//! tried — and on Android and iOS it could never be more than that, because those vocabularies
+//! are open: an app sets its own `AccessibilityNodeInfo` class name, and iOS role strings come
+//! from the Simulator's translator. None of these cells claims a role is impossible; they claim
+//! nothing was found carrying it.
 //!
 //! Reasons are readings, not guarantees: each says what a control was seen to report, and a
 //! platform is free to change that. When a cell was last read is `git log`'s to answer — a date
@@ -83,9 +88,12 @@ impl AxBackend {
 pub enum RoleSupport {
     /// At least one native token maps to this role.
     Mapped,
-    /// Closing this would take a platform change, not a glass change: either the platform has
-    /// no such control, or it draws one the accessibility layer never marks.
+    /// Nothing glass reads carries the role, so no mapping could reach it. [`Basis`] says on what
+    /// footing — which is not the same footing in every cell, and never an exhaustiveness proof.
     NotApplicable {
+        /// What kind of unavailability this is: the control does not exist, exists but arrives
+        /// unmarked, or is exposed somewhere glass does not walk.
+        basis: Basis,
         /// The native token the control was observed to report in this role's place, in the
         /// form that backend's own resolver accepts. `None` where nothing stands in for it —
         /// the platform has no such control (no menu bar on iOS), or the concept sits outside
@@ -135,10 +143,32 @@ impl RoleSupport {
     }
 }
 
+/// On what footing a [`RoleSupport::NotApplicable`] cell stands. None of these is a proof of
+/// impossibility: they record what reading a real control found, bounded by the controls tried,
+/// the OS version, and the reader. Two of the three vocabularies are open — an Android app sets
+/// its own `AccessibilityNodeInfo` class name, and iOS role strings come from the Simulator's
+/// translator — so on those columns no amount of reading could close the question. Only UIA
+/// names a closed, documented set of control types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Basis {
+    /// The platform has no such control to expose — a radio button on iOS, a tree on Android.
+    /// The claim is about the platform's controls, so no reading of an app could overturn it
+    /// short of an app building the concept itself out of other controls.
+    Absent,
+    /// The control exists and is on screen, and no reading found a token carrying its role: it is
+    /// drawn but unmarked, or folded into a token that means something else. This is the bounded
+    /// one — it says what was watched, not what is possible.
+    Unmarked,
+    /// The control exists and is exposed, but outside what glass walks — the system status bar
+    /// belongs to the OS shell, not to the app whose tree is being read.
+    Elsewhere,
+}
+
 /// Role coverage per backend. Cells are ordered as [`AxBackend::ALL`], and the row type is sized
 /// from it so a new backend is a compile error here rather than a silent column mismatch.
 pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
     use AxRole as R;
+    use Basis::{Absent, Elsewhere, Unmarked};
     use RoleSupport::{Gap, Mapped, NotApplicable};
     &[
         (
@@ -146,6 +176,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
             [
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("Window"),
                     why: "UIA has no application control type; the app root is a Window",
                 },
@@ -154,6 +185,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                     why: "AXApplication is the app element but is not mapped yet",
                 },
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "Android exposes windows, not an application element",
                 },
@@ -175,12 +207,14 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                     why: "AXSheet, AXPopover and AXDrawer are not mapped yet",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("android.widget.FrameLayout"),
                     why: "a framework AlertDialog's panels report FrameLayout and LinearLayout under \
                      android:id/parentPanel, and AccessibilityWindowInfo's window types carry no \
                      dialog kind for a reader to fall back on",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "an alert and an action sheet each expose their title, message and buttons \
                      directly under the application element, with no container token between",
@@ -212,7 +246,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
-                    instead: Some("AXTabGroup"),
+                    basis: Absent,
+                    instead: None,
                     why: "UIKit has no radio control; a UISegmentedControl — the nearest equivalent \
                      — reports one AXTabGroup with no per-segment element",
                 },
@@ -226,10 +261,12 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "Android apps have no menu bar",
                 },
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "iOS apps have no menu bar",
                 },
@@ -242,11 +279,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("android.widget.ListView"),
                     why: "a popup menu reports android.widget.ListView; no menu token appears \
                      anywhere in the tree it opens",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXGroup"),
                     why: "a button's pull-down UIMenu opens as an AXGroup of AXButtons alongside a \
                      Dismiss context menu button; no menu token appears",
@@ -260,11 +299,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("android.widget.LinearLayout"),
                     why: "a menu entry reports its item view's layout class — a LinearLayout or \
                      RelativeLayout holding a TextView title",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXButton"),
                     why: "a menu entry reports AXButton, the same token as any other button",
                 },
@@ -279,6 +320,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("android.widget.EditText"),
                     why: "Android uses one editable class for single- and multi-line text",
                 },
@@ -308,6 +350,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXGroup"),
                     why: "a UITableView and a SwiftUI List both report AXGroup, and their rows report \
                      AXStaticText; no list token appears",
@@ -328,6 +371,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                      own widget class is all that arrives",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXStaticText"),
                     why: "table and collection rows report AXStaticText, including a cell explicitly \
                      exposed as its own accessibility element",
@@ -350,6 +394,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                      GridView maps to List",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXGroup"),
                     why: "a table view reports AXGroup like any other container; no table token \
                      appears",
@@ -384,10 +429,12 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "Android has no tree widget",
                 },
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "UIKit has no outline view",
                 },
@@ -400,10 +447,12 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "Android has no tree widget",
                 },
                 NotApplicable {
+                    basis: Absent,
                     instead: None,
                     why: "UIKit has no outline view",
                 },
@@ -441,6 +490,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                      not, and a Material tab strip carries the role in the view id instead",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXGroup"),
                     why: "a tab bar reports AXGroup and no per-item element appears in idb's \
                      describe; a segmented control reports one AXTabGroup, also with no \
@@ -455,10 +505,12 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "Android scrollbars are drawn, not exposed as nodes",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "UIKit scroll indicators are not accessibility elements",
                 },
@@ -479,6 +531,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                     why: "android.widget.NumberPicker does arrive as a token and is not mapped yet",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXButton"),
                     why: "a UIStepper decomposes into two AXButtons labelled Decrement and \
                      Increment; no stepper token appears",
@@ -493,6 +546,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("AXGenericElement"),
                     why: "a UIProgressView reports AXGenericElement carrying its percentage as the \
                      value; no progress token appears",
@@ -507,6 +561,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "Android links are spans inside a text view, not separate nodes",
                 },
@@ -520,10 +575,12 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "Android dividers are drawn, not exposed as nodes",
                 },
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "UIKit exposes no separator element",
                 },
@@ -536,6 +593,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: Some("android.view.ViewGroup"),
                     why: "android.widget.Toolbar was watched to report android.view.ViewGroup — a \
                      subclass inherits the accessibility class name of the framework class it \
@@ -551,14 +609,17 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable {
+                    basis: Unmarked,
                     instead: None,
                     why: "AppKit exposes status items as menu-bar items",
                 },
                 NotApplicable {
+                    basis: Elsewhere,
                     instead: None,
                     why: "the system status bar is outside the app tree",
                 },
                 NotApplicable {
+                    basis: Elsewhere,
                     instead: None,
                     why: "the system status bar is outside the app tree",
                 },
@@ -621,9 +682,15 @@ pub fn render_markdown() -> String {
     for (role, cells) in ROLE_SUPPORT {
         let _ = write!(out, "| `{role:?}` |");
         for cell in cells {
+            // `absent`, `unmarked` and `elsewhere` render apart rather than collapsing into one
+            // `n/a`: they are different claims, and only the middle one is a bounded reading.
             let mark = match cell {
                 RoleSupport::Mapped => "yes",
-                RoleSupport::NotApplicable { .. } => "n/a",
+                RoleSupport::NotApplicable { basis, .. } => match basis {
+                    Basis::Absent => "absent",
+                    Basis::Unmarked => "unmarked",
+                    Basis::Elsewhere => "elsewhere",
+                },
                 RoleSupport::Gap { .. } => "gap",
             };
             let _ = write!(out, " {mark} |");
@@ -639,8 +706,13 @@ pub fn render_markdown() -> String {
             // is looking for, and the fact each backend's column test checks.
             let (kind, token) = match cell {
                 RoleSupport::Mapped => continue,
-                RoleSupport::NotApplicable { instead, .. } => {
-                    ("n/a", instead.map(|t| format!("reports `{t}` instead")))
+                RoleSupport::NotApplicable { basis, instead, .. } => {
+                    let kind = match basis {
+                        Basis::Absent => "absent",
+                        Basis::Unmarked => "unmarked",
+                        Basis::Elsewhere => "elsewhere",
+                    };
+                    (kind, instead.map(|t| format!("reports `{t}` instead")))
                 }
                 RoleSupport::Gap { unmapped, .. } => {
                     ("gap", unmapped.map(|t| format!("`{t}` arrives unmapped")))
@@ -702,9 +774,14 @@ mod tests {
             support(AxRole::Button, AxBackend::Linux),
             Some(RoleSupport::Mapped)
         );
+        // iOS has no menu bar to expose, so this one is Absent rather than merely unmarked —
+        // the basis is part of what the cell claims, so pin it.
         assert!(matches!(
             support(AxRole::MenuBar, AxBackend::Ios),
-            Some(RoleSupport::NotApplicable { .. })
+            Some(RoleSupport::NotApplicable {
+                basis: Basis::Absent,
+                ..
+            })
         ));
     }
 
@@ -724,6 +801,29 @@ mod tests {
                     !token.contains(' ') && !token.is_empty(),
                     "{role:?}/{backend:?}: {token:?} is prose, not a single native token"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_control_reports_nothing_in_its_place() {
+        // `Absent` says the platform has no such control. A control that does not exist cannot
+        // have been watched reporting something else, so naming a token there would mean one of
+        // the two is wrong — most likely the basis, which is the stronger claim of the pair.
+        for (role, cells) in ROLE_SUPPORT {
+            for (i, cell) in cells.iter().enumerate() {
+                if let RoleSupport::NotApplicable {
+                    basis: Basis::Absent,
+                    instead: Some(token),
+                    ..
+                } = cell
+                {
+                    panic!(
+                        "{role:?}/{:?}: declared Absent but names {token} as what it reports \
+                         instead — if a control reported that, it is Unmarked, not Absent",
+                        AxBackend::ALL[i]
+                    );
+                }
             }
         }
     }
