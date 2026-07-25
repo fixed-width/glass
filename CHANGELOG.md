@@ -104,8 +104,9 @@ internal refactors, CI, or test-only changes.
   exits successfully once the process is spawned, so an app that rejects a launch argument or
   trips an assertion at startup was reported as running, and the screenshot behind that geometry
   was the Simulator home screen — the next snapshot described SpringBoard with nothing saying why.
-  The launch now fails with the app's bundle id and pid, pointing at `glass_logs` for what it
-  printed on the way out.
+  The launch now fails, naming the bundle id, the pid, and what the app itself wrote to stderr on
+  the way out — a Swift `fatalError` message, say. That output is captured for the first time
+  here: the device's unified log carries the whole simulator, not the app.
 - macOS: an app that hands off to LaunchServices — a bundle whose executable re-execs itself, so
   glass adopts the resulting process rather than the one it spawned — now receives the launch
   arguments from `run`. They were dropped on that path while the directly-spawned path passed
