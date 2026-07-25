@@ -5,8 +5,11 @@ use glass_core::accessibility::{
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 
-/// Every Android widget class glass maps, keyed by the leaf of the class name
+/// The Android widget classes glass maps *by name*, keyed by the leaf of the class name
 /// (`android.widget.Button` → `Button`). Multiple vendor classes share one role.
+///
+/// Not the whole map: [`class_to_role`] also has a container rule, which catches any leaf ending
+/// in `Layout` plus `View`/`ViewGroup` — an open-ended set no table can enumerate.
 pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("Button", AxRole::Button),
     ("ImageButton", AxRole::Button),
@@ -41,12 +44,6 @@ pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("GridView", AxRole::List),
     ("WebView", AxRole::Group),
 ];
-
-/// Roles the container rule in [`class_to_role`] can produce (any leaf ending in `Layout`,
-/// plus `View`/`ViewGroup`). These roles cannot be expressed as a fixed token list, so the
-/// column test counts them to verify full role support coverage.
-#[allow(dead_code)]
-pub const RULE_ROLES: &[AxRole] = &[AxRole::Group];
 
 /// Map an Android widget class (`android.widget.Button`, …) to a normalized role.
 pub fn class_to_role(class: &str) -> AxRole {
@@ -233,6 +230,12 @@ mod tests {
     use super::*;
     use glass_core::accessibility::AxRole;
     use glass_core::{GlassError, WindowGeometry};
+
+    /// Roles the container rule in [`class_to_role`] can produce (any leaf ending in `Layout`,
+    /// plus `View`/`ViewGroup`). They cannot be expressed as a fixed token list, so
+    /// [`map_matches_declared_column`] counts them alongside [`CLASS_TOKENS`] to check the
+    /// declared column against everything the map can actually produce.
+    const RULE_ROLES: &[AxRole] = &[AxRole::Group];
 
     const XML: &str = concat!(
         "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>",
