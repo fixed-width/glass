@@ -5,10 +5,13 @@
 //! prints `glass_core::role_histogram`: every native AX role string the app
 //! actually emitted, unmapped ([`glass_core::AxRole::Other`]) tokens first. The project's rule
 //! is probe first, map second — a `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` may
-//! only get a match arm for a token that showed up in output like this — so this file's only
-//! job is to produce that evidence. It never asserts what the tokens should be, and fails a
-//! run only when a snapshot could not be taken at all for one of the requested apps (a real
-//! breakage, distinct from an app simply exposing something unexpected).
+//! only get a match arm for a token that showed up in output like this — so this file's job is
+//! to produce that evidence. It asserts exactly one thing *about* the evidence: a token glass
+//! does map must not come back `AxRole::Other`, which would mean the reader stopped feeding
+//! `map_role` what it reads (see `macos_main::MAPPED_TOKENS`). Otherwise it fails a run only
+//! when an app could not be launched or snapshotted at all — a real breakage, distinct from an
+//! app simply exposing something unexpected. Which role a token *should* map to is never
+//! asserted here.
 //!
 //! With `GLASS_A11Y_PROBE_APPS` unset (or set but empty), prints what to set and exits 0 —
 //! the same skip-not-fail convention `tests/a11y.rs` uses for its own missing fixture, so a
@@ -66,6 +69,43 @@ mod macos_main {
         std::process::exit(1);
     }
 
+    /// AX role tokens glass maps to a role, and that a probed app has actually been seen to
+    /// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
+    /// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
+    /// mean the plumbing between the reader and `mapping::map_role` broke. A token that simply
+    /// does not appear in a given app asserts nothing — apps differ, and an absent token is not
+    /// a regression.
+    ///
+    /// `"AXRow/AXOutlineRow"` is the `raw_role` the reader builds for a row whose `AXSubrole`
+    /// says it is an outline row (`role`/`subrole`, joined) — the one node shape where reading
+    /// the subrole changes the mapped role, so it is exactly the wiring most worth pinning.
+    const MAPPED_TOKENS: &[&str] = &[
+        "AXOutline",
+        "AXScrollArea",
+        "AXSplitGroup",
+        "AXSplitter",
+        "AXHeading",
+        "AXMenuButton",
+        "AXRow/AXOutlineRow",
+    ];
+
+    /// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`], described —
+    /// the one thing a histogram can check without becoming brittle about which app exposes
+    /// what. Everything else the probe prints is evidence for a human, not a pass/fail claim.
+    fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
+        role_histogram(tree)
+            .into_iter()
+            .filter(|e| e.role == AxRole::Other && MAPPED_TOKENS.contains(&e.raw_role.as_str()))
+            .map(|e| {
+                format!(
+                    "{label}: {} node(s) reported token {:?} as Other, but glass maps that \
+                     token — the reader is not feeding map_role what it reads",
+                    e.count, e.raw_role
+                )
+            })
+            .collect()
+    }
+
     /// Print `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
     /// ([`AxRole::Other`]) buckets first, which is already the histogram's own sort order, so
     /// the tokens most worth a human's attention are the first thing printed.
@@ -118,11 +158,12 @@ mod macos_main {
     /// Launch `run0`, snapshot it with the node cap lifted (so a big app's tree is never
     /// truncated mid-probe — depth/siblings keep their generous structural-rail defaults
     /// regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, then stop
-    /// it. Returns `Err` only when the app could not be launched or a snapshot could not be
-    /// taken at all — a real breakage, never merely an unexpected role (see this file's
-    /// module doc). What the histogram actually contains is never asserted here; that's the
-    /// human's job, reading the printed output to decide which `Gap` cell in
-    /// `glass_core::role_support::ROLE_SUPPORT` a real native token now justifies filling.
+    /// it. Returns `Err` when the app could not be launched, a snapshot could not be taken at
+    /// all, or a token glass maps came back unmapped ([`mapped_token_violations`]) — never
+    /// merely because an app exposed something unexpected (see this file's module doc). Beyond
+    /// that one check the histogram's contents are never asserted; reading the printed output
+    /// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native
+    /// token now justifies filling is the human's job.
     fn probe_one(run0: &str) -> Result<(), String> {
         println!("\n--- launching {run0} ---");
         let mut platform =
@@ -166,7 +207,14 @@ mod macos_main {
             // of how big the tree actually was.
             tree.assign_ids();
             print_role_histogram(run0, &tree);
-            Ok(())
+            // Checked after the histogram is printed, so the evidence that explains a failure
+            // is already in the output when the failure is reported.
+            let violations = mapped_token_violations(run0, &tree);
+            if violations.is_empty() {
+                Ok(())
+            } else {
+                Err(violations.join("\n"))
+            }
         })
     }
 

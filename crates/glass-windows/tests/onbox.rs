@@ -95,8 +95,9 @@ fn taskmgr_spec() -> AppSpec {
 }
 
 /// Bare `explorer.exe` (no path arg): opens the OS default location — "Quick access" on
-/// Windows 10, "Home" on Windows 11 — the same native file-list control (and so the same
-/// DataGrid/DataItem/Header/HeaderItem UIA tree) any folder view uses. Each File Explorer
+/// Windows 10, "Home" on Windows 11 — the same native file-list control, and so the same UIA
+/// tree, any folder view uses (what that tree actually emitted is recorded in
+/// [`onbox_role_histogram_probe`]'s doc). Each File Explorer
 /// window is its own process (unlike Task Manager, Explorer has no single-instance check —
 /// this is why `explorer.exe <uri>` protocol activation, e.g. `ms-settings:`, is the flaky
 /// shape and a plain `explorer.exe` folder-window launch is not), so pid-set discovery is
@@ -1055,15 +1056,48 @@ fn render_role_histogram(label: &str, tree: &AxTree) -> String {
     out
 }
 
+/// UIA control-type names glass maps to a role, and that a probed app has actually been seen to
+/// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
+/// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
+/// mean the plumbing between the reader and `map_role` broke. A token that simply does not
+/// appear in a given app asserts nothing — apps differ, and an absent token is not a
+/// regression.
+///
+/// Deliberately NOT listed: `Header`/`HeaderItem`, which the probe does observe but which map
+/// to no role on purpose (a grid's column headers are not document headings), and `Button`,
+/// whose `ToggleButton` promotion is state-dependent rather than a property of the token.
+const MAPPED_TOKENS: &[&str] = &["Document"];
+
+/// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`], described — the
+/// one thing a histogram can check without becoming brittle about which app exposes what.
+/// Everything else the probe prints is evidence for a human, not a pass/fail claim. Returned
+/// rather than asserted so the caller can finish the run, record the findings in the artifacts
+/// file with the histograms that explain them, and only then fail.
+fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
+    role_histogram(tree)
+        .into_iter()
+        .filter(|e| e.role == AxRole::Other && MAPPED_TOKENS.contains(&e.raw_role.as_str()))
+        .map(|e| {
+            format!(
+                "{label}: {} node(s) reported token {:?} as Other, but glass maps that token — \
+                 the reader is not feeding map_role what it reads",
+                e.count, e.raw_role
+            )
+        })
+        .collect()
+}
+
 /// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
 /// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
 /// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
 /// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
 /// launched or a snapshot can't be taken at all: a real breakage, never merely an unexpected
-/// role. What the histogram actually contains is never asserted here; that's the human's job,
-/// reading it to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real
-/// native token now justifies filling.
-fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
+/// role. Returns any [`mapped_token_violations`], which the caller fails on *after* the report
+/// is saved. Beyond that one check the histogram's contents are never asserted; reading it to
+/// decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
+/// justifies filling is the human's job.
+#[must_use]
+fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec<String> {
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let geo = p
         .start_app(spec)
@@ -1115,15 +1149,26 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
 
     let _ = p.stop_app();
     std::thread::sleep(Duration::from_millis(500)); // let the app fully exit before the next probe
+
+    let violations = mapped_token_violations(label, &tree);
+    for v in &violations {
+        let line = format!("\n  VIOLATION: {v}\n");
+        print!("{line}");
+        report.push_str(&line);
+    }
+    violations
 }
 
 /// The evidence step behind the Windows half of the accessibility role-parity work: launch a
 /// handful of stock apps and record each one's `role_histogram` — every native UIA token the
 /// app actually emitted, unmapped (`AxRole::Other`) tokens first. The project's rule is probe
 /// first, map second: a `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` may only get a
-/// match arm for a token that showed up in output like this. So this test's only job is to
-/// produce that evidence — it never asserts what the tokens should be, and fails only when a
-/// snapshot could not be taken at all (see [`probe_role_histogram`]).
+/// match arm for a token that showed up in output like this. So this test's job is to produce
+/// that evidence. It asserts exactly one thing *about* the evidence — a token glass does map
+/// must not come back `AxRole::Other`, which would mean the reader stopped feeding `map_role`
+/// what it reads (see [`MAPPED_TOKENS`]) — and otherwise fails only when an app could not be
+/// launched or snapshotted at all (see [`probe_role_histogram`]). Which role a token *should*
+/// map to is never asserted here; that is the human's reading.
 ///
 /// The histogram is both printed to stdout AND written to `role-histogram-windows.txt` under
 /// [`artifacts_dir`] (see that function's doc for why the file is required, not just a nicety
@@ -1135,11 +1180,15 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
 /// Runs charmap, Notepad, Task Manager, and File Explorer. charmap/Notepad alone gave clean
 /// output but no tabular UI, so `DataItem` (UIA id 50029), `Header` (50034), and
 /// `HeaderItem` (50035) — exactly the ids the `Table`/`Cell` `Gap` reasons in
-/// `ROLE_SUPPORT` name — went unobserved; Task Manager's process list and File Explorer's
-/// file list are both real UIA `DataGrid`/`DataItem`/`Header` trees, so they were added to
-/// reach those tokens. See [`taskmgr_spec`]/[`explorer_spec`] for why each is expected to be
-/// discovered as reliably as charmap/Notepad despite neither being launched exactly the same
-/// way.
+/// `ROLE_SUPPORT` name — went unobserved, and Task Manager's process list and File Explorer's
+/// file list were added to reach them. They got part of the way: both list views did emit
+/// `Header` and `HeaderItem` for their column-header bars, but neither emitted `DataItem` at
+/// all — their rows arrived as `TreeItem`, which is what the `Cell` row's Windows `Gap` reason
+/// in `ROLE_SUPPORT` now records. (`Header`/`HeaderItem` are observed but deliberately left
+/// unmapped: they are a grid's column headers, not document headings — see
+/// `glass_a11y_windows::mapping`.) See [`taskmgr_spec`]/[`explorer_spec`] for why each is
+/// expected to be discovered as reliably as charmap/Notepad despite neither being launched
+/// exactly the same way.
 ///
 /// The Settings app (`ms-settings:` via `explorer.exe`) was considered and left out: unlike
 /// the four apps run here, its window has no process relationship to the process glass
@@ -1148,8 +1197,7 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
 /// could only find it through the title-substring fallback rung (a system-wide scan by
 /// window title) rather than the pid-based one every app here uses. That fallback rung
 /// exists in the backend for exactly this shape of app, but this probe declined to depend on
-/// it without on-box verification that it resolves reliably; see the report for the full
-/// reasoning.
+/// it without on-box verification that it resolves reliably.
 ///
 /// This probe also can't surface a UIA `Window` with `IsDialog` true (the `Dialog` row's
 /// Windows `Gap` reason in `ROLE_SUPPORT`): none of the four apps opens a dialog on a cold,
@@ -1157,19 +1205,39 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
 /// already reads into an `AxNode` — `IsDialog` is not among those fields (reading it is the
 /// gap itself), so no launch sequence run through this probe could reveal it either way.
 #[test]
-#[ignore = "on-box only: needs the interactive desktop session; prints role histograms and writes them to .windows-artifacts/role-histogram-windows.txt, asserts nothing about their contents"]
+#[ignore = "on-box only: needs the interactive desktop session; prints role histograms and writes them to .windows-artifacts/role-histogram-windows.txt, asserting only that a token glass maps did not come back Other"]
 fn onbox_role_histogram_probe() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
 
     let mut report = String::new();
-    probe_role_histogram("charmap.exe (Character Map)", &charmap_spec(), &mut report);
-    probe_role_histogram("notepad.exe (Notepad)", &notepad_spec(), &mut report);
-    probe_role_histogram("taskmgr.exe (Task Manager)", &taskmgr_spec(), &mut report);
-    probe_role_histogram(
+    let mut violations = Vec::new();
+    violations.extend(probe_role_histogram(
+        "charmap.exe (Character Map)",
+        &charmap_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
+        "notepad.exe (Notepad)",
+        &notepad_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
+        "taskmgr.exe (Task Manager)",
+        &taskmgr_spec(),
+        &mut report,
+    ));
+    violations.extend(probe_role_histogram(
         "explorer.exe (File Explorer)",
         &explorer_spec(),
         &mut report,
-    );
+    ));
     save_report("role-histogram-windows.txt", &report);
+    // Fail last, after every app has been probed and the artifacts file written: the histograms
+    // are the evidence a violation has to be read against.
+    assert!(
+        violations.is_empty(),
+        "a token glass maps came back unmapped:\n{}",
+        violations.join("\n")
+    );
 }
