@@ -209,10 +209,38 @@ fn walk(
 /// the verify-fingerprint role lookups in `run_set_value`/`run_invoke`, so a node maps to the
 /// same role regardless of which path reads it, and only one COM round-trip is spent per node
 /// either way — the same reason the value-pattern probe below fetches once for two facts.
+///
+/// "This control has no Toggle pattern" and "the fetch failed" both yield `None` — a failure
+/// must not fail a whole snapshot over one node — but they are not the same event, and only one
+/// of them is a bug: a transient failure reports a toggle-capable `Button` as a plain `Button`,
+/// and since the same value feeds the `run_set_value`/`run_invoke` fingerprint, it surfaces to
+/// the caller as `AxElementChanged` ("the tree drifted") for an element that never moved. So the
+/// failure case logs. The two are told apart by the returned code: UIA documents
+/// `GetCurrentPattern` as returning success with a NULL interface for an unsupported pattern,
+/// which the bindings surface as an error carrying a *non-failure* code (`Error::result()` is
+/// `None`); a real COM failure carries a failure `HRESULT`. Neither path costs an extra
+/// round-trip.
 fn toggle_pattern(el: &UIElement, ct_id: u32) -> Option<UITogglePattern> {
-    matches!(ct_id, 50000 | 50002 | 50011 | 50031) // Button/CheckBox/MenuItem/SplitButton
-        .then(|| el.get_pattern::<UITogglePattern>().ok())
-        .flatten()
+    if !matches!(ct_id, 50000 | 50002 | 50011 | 50031) {
+        // Button/CheckBox/MenuItem/SplitButton
+        return None;
+    }
+    match el.get_pattern::<UITogglePattern>() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            if e.result().is_some() {
+                // Dev-tool diagnostic (stderr only, same shape as `select_window`'s in the
+                // macOS reader): without it, a control whose Toggle fetch broke is
+                // indistinguishable after the fact from one that never had the pattern.
+                eprintln!(
+                    "glass-a11y-windows: Toggle-pattern fetch failed on control type {ct_id} \
+                     (HRESULT {:#010x}: {e}); treating the element as not toggle-capable",
+                    e.code()
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Gather state facts + the value string in one pass, gating each pattern probe by control type

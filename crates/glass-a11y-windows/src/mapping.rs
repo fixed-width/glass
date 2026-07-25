@@ -75,10 +75,14 @@ fn control_type(control_type_id: u32) -> Option<&'static (u32, &'static str, Opt
 ///
 /// UIA has no dedicated "toggle button" control type — a formatting-bar button (Bold, Italic,
 /// ...) reports as a plain `Button` (50000) and carries the Toggle pattern instead, the same
-/// pattern a `CheckBox`/`RadioButton` carries. `toggleable` is that pattern's *availability*
+/// pattern a `CheckBox` carries. A `RadioButton` does not: UIA documents the Toggle pattern as
+/// never supported on a radio button, whose on/off is *selection* (SelectionItem), which is why
+/// the reader's pattern gate leaves it out. `toggleable` is that pattern's *availability*
 /// (see `StateFacts::checkable`), passed in because computing it means a live UIA call this
 /// module cannot make. Only `Button` is affected: `CheckBox` (50002) and `RadioButton` (50013)
-/// already have their own roles regardless of `toggleable`.
+/// already have their own roles regardless of `toggleable`, and so do the other two control
+/// types the reader fetches the pattern for — `MenuItem` (50011), which really can arrive
+/// toggle-capable as a checkable menu entry, and `SplitButton` (50031).
 ///
 /// A control type glass does not map — known or not — becomes `AxRole::Other` (the reader keeps
 /// the control type's name in `raw_role`).
@@ -266,6 +270,21 @@ mod tests {
     }
 
     #[test]
+    fn toggleable_menu_item_stays_menu_item() {
+        // Not hypothetical: the reader fetches the Toggle pattern for MenuItem, and a checkable
+        // menu entry really does carry it, so `toggleable == true` reaches here in production.
+        // "Only Button is affected" has to hold for it.
+        assert_eq!(map_role(50011, true), AxRole::MenuItem);
+    }
+
+    #[test]
+    fn toggleable_split_button_stays_button() {
+        // The fourth control type in the reader's Toggle-pattern gate. A SplitButton maps to
+        // Button either way — the toggle-capable rule is scoped to control type 50000 alone.
+        assert_eq!(map_role(50031, true), AxRole::Button);
+    }
+
+    #[test]
     fn control_types_have_no_duplicate_ids() {
         for (i, (id, _, _)) in CONTROL_TYPES.iter().enumerate() {
             assert!(
@@ -294,6 +313,12 @@ mod tests {
     fn canonical_name_is_stable_and_locale_free() {
         assert_eq!(canonical_name(50000), Some("Button"));
         assert_eq!(canonical_name(50036), Some("Table"));
+        // Document and Header are what the reader puts in `raw_role` for two control types a
+        // probe run has to be able to read back by name — Header especially, since it maps to
+        // no role at all (see `observed_column_headers_are_not_headings`) and the name is the
+        // only thing identifying it.
+        assert_eq!(canonical_name(50030), Some("Document"));
+        assert_eq!(canonical_name(50034), Some("Header"));
         assert_eq!(canonical_name(49999), None);
         assert_eq!(canonical_name(50041), None);
     }
