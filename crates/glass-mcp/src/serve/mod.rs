@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use axum::routing::get;
 use axum::Router;
-use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
+use axum::routing::get;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::GlassServer;

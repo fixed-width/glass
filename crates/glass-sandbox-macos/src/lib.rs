@@ -16,9 +16,9 @@ pub mod doctor;
 pub mod profile;
 mod reachability;
 
-pub use doctor::{availability, checks, Availability};
-pub use profile::{build_profile, ProfileOpts};
-pub use reachability::{launch_reallows, LaunchReallows};
+pub use doctor::{Availability, availability, checks};
+pub use profile::{ProfileOpts, build_profile};
+pub use reachability::{LaunchReallows, launch_reallows};
 
 #[cfg(target_os = "macos")]
 mod ffi;

@@ -172,7 +172,7 @@ mod macos_main {
                 return Err(format!(
                     "swiftc exited with {s} building {}",
                     source.display()
-                ))
+                ));
             }
             Err(e) => return Err(format!("failed to run swiftc: {e}")),
         }

@@ -380,37 +380,36 @@ impl Glass {
                     .map(|n| n.states),
             )
         };
-        if trailing {
-            if let Some(st) = node_state {
-                if st.checkable {
-                    // A checkable switch expects a boolean; unrecognized text must NOT fall
-                    // through to the tap+type delegate (which would silently no-op a UISwitch).
-                    // Erroring here preserves the "never a silent ok" invariant — and the error
-                    // must tell the agent to pass a boolean, not misdirect it (a generic
-                    // "value not applied — use keystrokes" would send it down a futile path).
-                    let want = parse_bool(text)
-                        .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
-                    if st.checked == want {
-                        return Ok(()); // truthful no-op, no actuation
-                    }
-                    self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
-                    let outcome = crate::poll::poll_until(
-                        TOGGLE_VERIFY_INTERVAL_MS,
-                        TOGGLE_VERIFY_TIMEOUT_MS,
-                        || {
-                            let tree = self.a11y_resnapshot()?;
-                            let now = find_checkable_near(&tree.root, target.bounds.as_ref())
-                                .is_some_and(|n| n.states.checked == want);
-                            Ok(now.then_some(()))
-                        },
-                    )?;
-                    return if outcome.value.is_some() {
-                        Ok(())
-                    } else {
-                        Err(GlassError::AxValueNotApplied(id.0))
-                    };
-                }
+        if trailing
+            && let Some(st) = node_state
+            && st.checkable
+        {
+            // A checkable switch expects a boolean; unrecognized text must NOT fall
+            // through to the tap+type delegate (which would silently no-op a UISwitch).
+            // Erroring here preserves the "never a silent ok" invariant — and the error
+            // must tell the agent to pass a boolean, not misdirect it (a generic
+            // "value not applied — use keystrokes" would send it down a futile path).
+            let want = parse_bool(text)
+                .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
+            if st.checked == want {
+                return Ok(()); // truthful no-op, no actuation
             }
+            self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+            let outcome = crate::poll::poll_until(
+                TOGGLE_VERIFY_INTERVAL_MS,
+                TOGGLE_VERIFY_TIMEOUT_MS,
+                || {
+                    let tree = self.a11y_resnapshot()?;
+                    let now = find_checkable_near(&tree.root, target.bounds.as_ref())
+                        .is_some_and(|n| n.states.checked == want);
+                    Ok(now.then_some(()))
+                },
+            )?;
+            return if outcome.value.is_some() {
+                Ok(())
+            } else {
+                Err(GlassError::AxValueNotApplied(id.0))
+            };
         }
         let s = self.active_mut()?;
         s.accessibility
@@ -556,13 +555,13 @@ fn find_combo_near<'a>(
     };
     let (tx, ty) = rect_center(t);
     fn walk<'a>(node: &'a AxNode, tx: i64, ty: i64, best: &mut Option<(&'a AxNode, i64)>) {
-        if node.role == AxRole::ComboBox {
-            if let Some(b) = &node.bounds {
-                let (cx, cy) = rect_center(b);
-                let d = (cx - tx).pow(2) + (cy - ty).pow(2);
-                if best.is_none_or(|(_, bd)| d < bd) {
-                    *best = Some((node, d));
-                }
+        if node.role == AxRole::ComboBox
+            && let Some(b) = &node.bounds
+        {
+            let (cx, cy) = rect_center(b);
+            let d = (cx - tx).pow(2) + (cy - ty).pow(2);
+            if best.is_none_or(|(_, bd)| d < bd) {
+                *best = Some((node, d));
             }
         }
         for c in &node.children {
@@ -590,13 +589,13 @@ fn find_checkable_near<'a>(
     let t = bounds?;
     let (tx, ty) = rect_center(t);
     fn walk<'a>(node: &'a AxNode, tx: i64, ty: i64, best: &mut Option<(&'a AxNode, i64)>) {
-        if node.states.checkable {
-            if let Some(b) = &node.bounds {
-                let (cx, cy) = rect_center(b);
-                let d = (cx - tx).pow(2) + (cy - ty).pow(2);
-                if best.is_none_or(|(_, bd)| d < bd) {
-                    *best = Some((node, d));
-                }
+        if node.states.checkable
+            && let Some(b) = &node.bounds
+        {
+            let (cx, cy) = rect_center(b);
+            let d = (cx - tx).pow(2) + (cy - ty).pow(2);
+            if best.is_none_or(|(_, bd)| d < bd) {
+                *best = Some((node, d));
             }
         }
         for c in &node.children {
@@ -639,10 +638,10 @@ fn collect_list_items(node: &AxNode, out: &mut Vec<(String, bool)>) {
 /// First non-empty accessible name in this subtree (an option's text lives on a
 /// nested label, not the `ListItem` itself).
 fn first_label(node: &AxNode) -> Option<String> {
-    if let Some(n) = &node.name {
-        if !n.is_empty() {
-            return Some(n.clone());
-        }
+    if let Some(n) = &node.name
+        && !n.is_empty()
+    {
+        return Some(n.clone());
     }
     node.children.iter().find_map(first_label)
 }

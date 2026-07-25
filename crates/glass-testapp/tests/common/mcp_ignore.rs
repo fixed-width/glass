@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use glass_mcp::serve::config::ServeConfig;
 use rmcp::model::CallToolRequestParams;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{Peer, RoleClient, ServiceExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The blink rectangle glass-testapp's `--blink` mode animates (see its BLINK_* constants) —
 /// fully inside the top-left quadrant, well clear of any seam, so masking it can't

@@ -1,4 +1,4 @@
-use glass_core::pixels::{to_opaque_rgba, SourceOrder};
+use glass_core::pixels::{SourceOrder, to_opaque_rgba};
 use glass_core::{GlassError, Result};
 
 /// Convert raw `GetImage` ZPixmap data to tightly packed RGBA8.

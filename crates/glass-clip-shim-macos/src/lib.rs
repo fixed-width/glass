@@ -21,7 +21,7 @@ mod imp {
 
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, Imp, Sel};
-    use objc2::{sel, ClassType};
+    use objc2::{ClassType, sel};
     use objc2_app_kit::NSPasteboard;
     use objc2_foundation::NSString;
 

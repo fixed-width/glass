@@ -7,7 +7,7 @@ use core::ffi::c_void;
 
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
 use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 
 /// RAII lock over a moveable `HGLOBAL`: `GlobalLock` on construction, `GlobalUnlock` on drop. The
@@ -77,8 +77,8 @@ impl OwnedHGlobal {
         {
             // SAFETY: `h` was just returned by GlobalAlloc, so it is valid.
             let mut lock = unsafe { HGlobalLock::new(owned.h) }?; // on None, `owned` drops -> free
-                                                                  // GlobalAlloc may round the block UP, so the locked slice can be longer than requested;
-                                                                  // copy into the exact prefix (a whole-slice copy_from_slice would panic on a mismatch).
+            // GlobalAlloc may round the block UP, so the locked slice can be longer than requested;
+            // copy into the exact prefix (a whole-slice copy_from_slice would panic on a mismatch).
             lock.as_mut_bytes()[..bytes.len()].copy_from_slice(bytes);
             // `lock` drops here -> GlobalUnlock.
         }

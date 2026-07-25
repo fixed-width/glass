@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glass_core::{AppSpec, Check, CheckStatus};
-use rustix::process::{kill_process_group, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::command::{build_sway_command, sway_config};
 use crate::platform::resolve_sway;

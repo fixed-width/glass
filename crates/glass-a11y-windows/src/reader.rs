@@ -532,10 +532,10 @@ fn find_nth(
             budget.hit(TruncationLimit::Siblings);
             break; // same per-level bound as walk(), so find_nth can't spin either
         }
-        if !c.is_offscreen().unwrap_or(false) {
-            if let Some(found) = find_nth(walker, &c, depth + 1, budget, target) {
-                return Some(found);
-            }
+        if !c.is_offscreen().unwrap_or(false)
+            && let Some(found) = find_nth(walker, &c, depth + 1, budget, target)
+        {
+            return Some(found);
         }
         child = walker.get_next_sibling(&c).ok();
     }

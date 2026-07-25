@@ -44,7 +44,7 @@ fn press(action: proto::hid_event::hid_press_action::Action, down: bool) -> prot
 }
 
 fn touch(pt: proto::Point, down: bool) -> proto::HidEvent {
-    use proto::hid_event::{hid_press_action::Action, HidTouch};
+    use proto::hid_event::{HidTouch, hid_press_action::Action};
     press(Action::Touch(HidTouch { point: Some(pt) }), down)
 }
 
@@ -61,7 +61,7 @@ fn swipe(from: proto::Point, to: proto::Point, secs: f64) -> proto::HidEvent {
 }
 
 fn key(code: u16, down: bool) -> proto::HidEvent {
-    use proto::hid_event::{hid_press_action::Action, HidKey};
+    use proto::hid_event::{HidKey, hid_press_action::Action};
     press(
         Action::Key(HidKey {
             keycode: code as u64,
@@ -131,7 +131,7 @@ impl IdbInjector {
                     "multi_touch",
                     crate::BACKEND,
                     crate::capabilities().multi_touch.note,
-                ))
+                ));
             }
         })
     }
@@ -302,10 +302,11 @@ mod pointer_tests {
     #[test]
     fn move_is_empty_and_gesture_unsupported() {
         let inj = IdbInjector::new(3.0);
-        assert!(inj
-            .pointer_events(&PointerEvent::Move { x: 1, y: 2 })
-            .unwrap()
-            .is_empty());
+        assert!(
+            inj.pointer_events(&PointerEvent::Move { x: 1, y: 2 })
+                .unwrap()
+                .is_empty()
+        );
         let g = PointerEvent::Gesture {
             pointers: vec![],
             duration_ms: 100,

@@ -27,8 +27,8 @@ use common::Xvfb;
 use glass_mcp::serve::config::ServeConfig;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
@@ -172,10 +172,10 @@ impl StdioServer {
             }
             match self.lines.recv_timeout(remaining) {
                 Ok(line) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                        if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
-                            return v;
-                        }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim())
+                        && v.get("id").and_then(|i| i.as_i64()) == Some(id)
+                    {
+                        return v;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {

@@ -3,7 +3,7 @@
 use glass_core::{Glass, KeyEvent, Modifier, PointerEvent};
 
 use crate::params::*;
-use crate::tools::{parse_button, ToolOutput, ToolResult};
+use crate::tools::{ToolOutput, ToolResult, parse_button};
 
 pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, String> {
     let mut out = Vec::new();
@@ -297,8 +297,10 @@ mod tests {
             count: None,
             modifiers: Some(vec!["hyper".into()]),
         };
-        assert!(click(&mut g, &bad)
-            .unwrap_err()
-            .contains("unknown modifier"));
+        assert!(
+            click(&mut g, &bad)
+                .unwrap_err()
+                .contains("unknown modifier")
+        );
     }
 }

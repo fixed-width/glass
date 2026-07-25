@@ -130,7 +130,7 @@ fn write(pb: &NSPasteboard, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_named, read, set_named, shim_present, write, SHIM_SENTINEL_TYPE};
+    use super::{SHIM_SENTINEL_TYPE, get_named, read, set_named, shim_present, write};
     use objc2::rc::Retained;
     use objc2_app_kit::NSPasteboard;
     use objc2_foundation::NSString;

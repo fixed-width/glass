@@ -1,6 +1,12 @@
 //! End-to-end X11 tests. These are `#[ignore]`d so the default `cargo test`
 //! stays green without a display; run them via `scripts/test-x11.sh`.
 
+// A few tests set `PATH` / `GLASS_DBUS_DAEMON` on the process to force a launch failure that
+// has no other seam. `env::set_var` is `unsafe` from edition 2024 on (it races concurrent env
+// readers); `scripts/test-x11.sh` runs this suite with `--test-threads=1`, so there are none.
+// Each site carries a `// SAFETY:` note; the file opts out of `unsafe_code = "deny"`.
+#![allow(unsafe_code)]
+
 mod common;
 
 use common::Xvfb;
@@ -288,10 +294,10 @@ fn collect_keysyms(p: &mut X11Platform, want: usize, tries: u32) -> Vec<u32> {
     let mut got = Vec::new();
     for _ in 0..tries {
         for (_s, line) in p.drain_logs() {
-            if let Some((_, n)) = line.split_once("keysym=") {
-                if let Ok(ks) = n.trim().parse::<u32>() {
-                    got.push(ks);
-                }
+            if let Some((_, n)) = line.split_once("keysym=")
+                && let Ok(ks) = n.trim().parse::<u32>()
+            {
+                got.push(ks);
             }
         }
         if got.len() >= want {
@@ -421,14 +427,15 @@ fn crop_extracts_region_of_real_capture() {
     assert_eq!(pixel(&straddle, 70, 30), [0, 255, 0, 255]); // src x≈190 -> green
 
     // Out of bounds is rejected, not clamped.
-    assert!(full
-        .crop(&glass_core::Region {
+    assert!(
+        full.crop(&glass_core::Region {
             x: 0,
             y: 0,
             width: 999,
             height: 1
         })
-        .is_err());
+        .is_err()
+    );
 
     p.stop_app().unwrap();
 }
@@ -1132,7 +1139,8 @@ fn fail_closed_when_bwrap_missing() {
     struct PathGuard(std::ffi::OsString);
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            std::env::set_var("PATH", &self.0);
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", &self.0) };
         }
     }
 
@@ -1140,7 +1148,8 @@ fn fail_closed_when_bwrap_missing() {
     let sandboxed_err = {
         let _guard = {
             let original = std::env::var_os("PATH").unwrap_or_default();
-            std::env::set_var("PATH", "/nonexistent");
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", "/nonexistent") };
             PathGuard(original)
         };
         let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
@@ -1179,16 +1188,21 @@ fn a11y_true_fails_launch_when_bus_cannot_start() {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.0 {
-                Some(v) => std::env::set_var("GLASS_DBUS_DAEMON", v),
-                None => std::env::remove_var("GLASS_DBUS_DAEMON"),
+                // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+                Some(v) => unsafe { std::env::set_var("GLASS_DBUS_DAEMON", v) },
+                // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+                None => unsafe { std::env::remove_var("GLASS_DBUS_DAEMON") },
             }
         }
     }
     let _guard = EnvGuard(std::env::var_os("GLASS_DBUS_DAEMON"));
-    std::env::set_var(
-        "GLASS_DBUS_DAEMON",
-        "/nonexistent/glass-no-such-dbus-daemon",
-    );
+    // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+    unsafe {
+        std::env::set_var(
+            "GLASS_DBUS_DAEMON",
+            "/nonexistent/glass-no-such-dbus-daemon",
+        )
+    };
 
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
@@ -1413,12 +1427,11 @@ fn click_with_modifier_reaches_app() {
     let mut saw_ctrl = false;
     for _ in 0..40 {
         for (_s, line) in p.drain_logs() {
-            if let Some(rest) = line.strip_prefix("EVENT button=") {
-                if let Some(s) = rest.split("state=").nth(1) {
-                    if s.trim().parse::<u16>().unwrap_or(0) & 0x04 != 0 {
-                        saw_ctrl = true;
-                    }
-                }
+            if let Some(rest) = line.strip_prefix("EVENT button=")
+                && let Some(s) = rest.split("state=").nth(1)
+                && s.trim().parse::<u16>().unwrap_or(0) & 0x04 != 0
+            {
+                saw_ctrl = true;
             }
         }
         if saw_ctrl {
@@ -1625,7 +1638,8 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     struct PathGuard(std::ffi::OsString);
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            std::env::set_var("PATH", &self.0);
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", &self.0) };
         }
     }
 
@@ -1644,7 +1658,8 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     let mut prepended = bindir.clone().into_os_string();
     prepended.push(":");
     prepended.push(&original_path);
-    std::env::set_var("PATH", &prepended);
+    // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+    unsafe { std::env::set_var("PATH", &prepended) };
     let _path_guard = PathGuard(original_path);
 
     let spec = AppSpec {

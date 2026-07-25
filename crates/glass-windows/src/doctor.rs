@@ -318,9 +318,9 @@ fn gather_wgc() -> bool {
 #[cfg(windows)]
 fn gather_dpi() -> DpiAwareness {
     use windows::Win32::UI::HiDpi::{
-        AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-        DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, DPI_AWARENESS_CONTEXT_UNAWARE,
+        AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+        DPI_AWARENESS_CONTEXT_UNAWARE, GetThreadDpiAwarenessContext,
     };
 
     // SAFETY: GetThreadDpiAwarenessContext returns a pseudo-handle for the calling

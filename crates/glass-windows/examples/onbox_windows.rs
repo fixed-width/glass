@@ -22,8 +22,8 @@ fn main() {
 mod imp {
     use std::time::Duration;
 
-    use glass_core::platform::{AppSpec, KeyEvent, Platform, WindowHint};
     use glass_core::SandboxLevel;
+    use glass_core::platform::{AppSpec, KeyEvent, Platform, WindowHint};
     use glass_windows::WindowsPlatform;
 
     fn is_blank(px: &[u8]) -> bool {
@@ -99,15 +99,15 @@ mod imp {
             Err(e) => println!("  send_key FAIL {e}"),
         }
         std::thread::sleep(Duration::from_millis(900));
-        if let (Some(f1), Ok(f2)) = (f1, p.capture_frame(None)) {
-            if f1.pixels.len() == f2.pixels.len() {
-                let n = changed(&f1.pixels, &f2.pixels);
-                println!(
-                    "  input-effect {}  changed_pixels={}",
-                    if n > 0 { "PASS" } else { "FAIL (no change)" },
-                    n
-                );
-            }
+        if let (Some(f1), Ok(f2)) = (f1, p.capture_frame(None))
+            && f1.pixels.len() == f2.pixels.len()
+        {
+            let n = changed(&f1.pixels, &f2.pixels);
+            println!(
+                "  input-effect {}  changed_pixels={}",
+                if n > 0 { "PASS" } else { "FAIL (no change)" },
+                n
+            );
         }
         let _ = p.stop_app();
         println!("  stop_app done");

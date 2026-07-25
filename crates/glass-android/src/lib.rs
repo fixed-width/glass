@@ -23,7 +23,7 @@ mod sdk;
 mod target;
 
 pub use a11y::AndroidA11y;
-pub use a11y_service::{a11y_apk, A11yServiceRegistry, ServiceA11y};
+pub use a11y_service::{A11yServiceRegistry, ServiceA11y, a11y_apk};
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::EmulatorRegistry;
 pub use platform::AndroidPlatform;
@@ -121,11 +121,12 @@ mod capability_tests {
         );
         let c = capabilities_with(true, false);
         assert_eq!(c.accessibility.status, Support::Degraded);
-        assert!(c
-            .accessibility
-            .note
-            .unwrap()
-            .contains("GLASS_ANDROID_A11Y_APK"));
+        assert!(
+            c.accessibility
+                .note
+                .unwrap()
+                .contains("GLASS_ANDROID_A11Y_APK")
+        );
         assert_eq!(c.window_move_resize.status, Support::Unsupported);
     }
 

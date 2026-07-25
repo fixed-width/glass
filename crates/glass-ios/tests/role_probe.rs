@@ -27,9 +27,9 @@
 
 use std::time::Duration;
 
-use glass_core::accessibility::{AxContext, WalkLimits};
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader
-use glass_core::{role_histogram, AppSpec, AxRole, AxTree, Platform, SandboxLevel};
+use glass_core::accessibility::{AxContext, WalkLimits};
+use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 
 /// Comma-separated bundle ids or `.app` paths to probe, e.g. `com.apple.Preferences`. Unset

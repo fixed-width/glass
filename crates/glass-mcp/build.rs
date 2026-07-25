@@ -39,12 +39,12 @@ fn glass_version() -> String {
     // Release builds are a TAG push in CI, where `GITHUB_REF_TYPE=tag` and `GITHUB_REF_NAME` is the
     // tag (e.g. `v1.0.1`). Gate on the ref TYPE: `GITHUB_REF_NAME` is also set on branch/PR builds
     // (as the branch name), which must NOT become the version.
-    if std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag") {
-        if let Ok(tag) = std::env::var("GITHUB_REF_NAME") {
-            let v = tag.strip_prefix('v').unwrap_or(&tag).trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
+    if std::env::var("GITHUB_REF_TYPE").as_deref() == Ok("tag")
+        && let Ok(tag) = std::env::var("GITHUB_REF_NAME")
+    {
+        let v = tag.strip_prefix('v').unwrap_or(&tag).trim();
+        if !v.is_empty() {
+            return v.to_string();
         }
     }
     // Local builds: derive from the nearest tag (with a `-dirty` / commit suffix when not exactly
@@ -52,12 +52,11 @@ fn glass_version() -> String {
     if let Ok(out) = std::process::Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
         .output()
+        && out.status.success()
     {
-        if out.status.success() {
-            let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !d.is_empty() {
-                return d.strip_prefix('v').unwrap_or(&d).to_string();
-            }
+        let d = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !d.is_empty() {
+            return d.strip_prefix('v').unwrap_or(&d).to_string();
         }
     }
     // No tag and no git (e.g. a source tarball with no VCS): fall back to the crate version.

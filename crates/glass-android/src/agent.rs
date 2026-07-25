@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use glass_core::{GlassError, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::adb::Adb;
 use crate::conn::Conn;
@@ -171,10 +171,10 @@ impl AgentRegistry {
             .map_err(|_| GlassError::Backend("agent registry lock poisoned".into()))?;
 
         // Cache hit: same serial (or both unset) — reuse the existing port.
-        if let Some(p) = guard.as_ref() {
-            if p.serial.as_deref() == adb.serial() {
-                return Ok(p.port);
-            }
+        if let Some(p) = guard.as_ref()
+            && p.serial.as_deref() == adb.serial()
+        {
+            return Ok(p.port);
         }
         // Serial changed (or first-ever call with a stale entry): tear down the stale agent.
         // Taking it out of the guard drops it, which kills + reaps the child via Drop.
@@ -251,16 +251,16 @@ impl AgentRegistry {
 
     /// Kill the device agent (via the host child) and remove the forward. Best-effort.
     pub fn shutdown(&self) {
-        if let Ok(mut guard) = self.state.lock() {
-            if let Some(p) = guard.take() {
-                let adb = Adb::from_env();
-                let adb = match &p.serial {
-                    Some(s) => adb.with_serial(s.clone()),
-                    None => adb,
-                };
-                let _ = adb.run(["forward", "--remove", &format!("tcp:{}", p.port)]);
-                // p drops here → Drop kills + reaps the child
-            }
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(p) = guard.take()
+        {
+            let adb = Adb::from_env();
+            let adb = match &p.serial {
+                Some(s) => adb.with_serial(s.clone()),
+                None => adb,
+            };
+            let _ = adb.run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+            // p drops here → Drop kills + reaps the child
         }
     }
 }
@@ -275,7 +275,7 @@ fn wait_for_agent(port: u16) -> Result<AgentClient> {
             Err(e) if Instant::now() >= deadline => {
                 return Err(GlassError::Backend(format!(
                     "agent never came up on :{port}: {e}"
-                )))
+                )));
             }
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }

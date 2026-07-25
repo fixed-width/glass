@@ -42,7 +42,7 @@ const SCREEN_IS_LOCKED_KEY: &str = "CGSSessionScreenIsLocked";
 // `CFDictionary<CFString, CFType>` here (instead of a bare pointer + a manual cast at
 // every call site) pushes the unsafety to one declaration instead of many.
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *mut CFDictionary<CFString, CFType>;
 }
 

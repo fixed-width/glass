@@ -3,7 +3,7 @@
 //! The pixel module is cross-platform (no OS calls), so this runs on the Linux
 //! dev box even though the WGC capture path it feeds is Windows-only.
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use glass_windows::pixels::bgra_to_rgba;
 use std::hint::black_box;
 

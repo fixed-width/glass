@@ -22,8 +22,8 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use glass_clip_hook::store::PrivateClipboard;
@@ -333,10 +333,10 @@ fn spawn_tailer(
                 // Final drain done above; flush any trailing partial line.
                 let line = std::mem::take(&mut pending);
                 let line = line.trim_end_matches(['\r', '\n']);
-                if !line.is_empty() {
-                    if let Ok(mut g) = sink.lock() {
-                        g.push((stream, line.to_string()));
-                    }
+                if !line.is_empty()
+                    && let Ok(mut g) = sink.lock()
+                {
+                    g.push((stream, line.to_string()));
                 }
                 return;
             }

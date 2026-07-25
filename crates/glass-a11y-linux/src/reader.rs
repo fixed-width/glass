@@ -212,10 +212,10 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
     // keyboard navigation), never reaching here.
     {
         use glass_core::AxRole::{CheckBox, RadioButton, ToggleButton};
-        if matches!(role, CheckBox | ToggleButton | RadioButton) {
-            if let Some(on) = parse_bool(text) {
-                return set_toggle(&conn, &node, role, on, target.id.0).await;
-            }
+        if matches!(role, CheckBox | ToggleButton | RadioButton)
+            && let Some(on) = parse_bool(text)
+        {
+            return set_toggle(&conn, &node, role, on, target.id.0).await;
         }
     }
 
@@ -230,14 +230,14 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             .destination(dest.clone())
             .ok()
             .and_then(|b| b.path(path.clone()).ok());
-        if let Some(b) = editable {
-            if let Ok(et) = b.build().await {
-                match et.set_text_contents(text).await {
-                    Ok(true) => return Ok(()),
-                    // EditableText is present but rejected the write — don't try Value.
-                    Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
-                    Err(_) => {} // interface absent / call failed — fall through to Value
-                }
+        if let Some(b) = editable
+            && let Ok(et) = b.build().await
+        {
+            match et.set_text_contents(text).await {
+                Ok(true) => return Ok(()),
+                // EditableText is present but rejected the write — don't try Value.
+                Ok(false) => return Err(GlassError::AxElementNotEditable(target.id.0)),
+                Err(_) => {} // interface absent / call failed — fall through to Value
             }
         }
     }
@@ -246,12 +246,11 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
             .destination(dest)
             .ok()
             .and_then(|b| b.path(path).ok());
-        if let Some(b) = value_proxy {
-            if let Ok(vp) = b.build().await {
-                if vp.set_current_value(v).await.is_ok() {
-                    return Ok(());
-                }
-            }
+        if let Some(b) = value_proxy
+            && let Ok(vp) = b.build().await
+            && vp.set_current_value(v).await.is_ok()
+        {
+            return Ok(());
         }
     }
     Err(GlassError::AxElementNotEditable(target.id.0))

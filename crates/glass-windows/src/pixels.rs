@@ -1,6 +1,6 @@
 //! Pure pixel-format helpers (no OS calls), unit-tested on the Linux dev box.
 
-use glass_core::pixels::{to_opaque_rgba_in_place, SourceOrder};
+use glass_core::pixels::{SourceOrder, to_opaque_rgba_in_place};
 
 /// Convert a BGRA8 pixel buffer (WGC's native layout) to RGBA8 in place, forcing
 /// every alpha to 255 (WGC alpha is unreliable for opaque windows). Delegates the

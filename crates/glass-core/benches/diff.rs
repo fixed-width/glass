@@ -3,9 +3,9 @@
 
 mod common;
 
-use common::{gradient, with_changed, SIZES};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use glass_core::{diff, diff_perceptual, StabilityTracker};
+use common::{SIZES, gradient, with_changed};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use glass_core::{StabilityTracker, diff, diff_perceptual};
 use std::hint::black_box;
 
 fn bench_diff(c: &mut Criterion) {

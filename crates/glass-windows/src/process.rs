@@ -19,19 +19,19 @@ use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
-    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenThread, ResumeThread, CREATE_SUSPENDED, PROCESS_QUERY_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+    CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 /// Run the optional build step in `cwd` via `cmd /C` (the Windows shell), failing
@@ -333,11 +333,11 @@ fn resume_process(pid: u32) {
         };
         if Thread32First(snap, &mut te).is_ok() {
             loop {
-                if te.th32OwnerProcessID == pid {
-                    if let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME, false, te.th32ThreadID) {
-                        ResumeThread(h);
-                        let _ = CloseHandle(h);
-                    }
+                if te.th32OwnerProcessID == pid
+                    && let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME, false, te.th32ThreadID)
+                {
+                    ResumeThread(h);
+                    let _ = CloseHandle(h);
                 }
                 if Thread32Next(snap, &mut te).is_err() {
                     break;

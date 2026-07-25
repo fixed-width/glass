@@ -139,8 +139,8 @@ mod tests {
 
     #[test]
     fn shutdown_runs_the_hook() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let fired = Arc::new(AtomicBool::new(false));
         let f = fired.clone();
         let mut g =

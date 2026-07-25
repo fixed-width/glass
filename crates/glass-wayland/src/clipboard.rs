@@ -452,7 +452,7 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
                 Err(e) => {
                     return Err(GlassError::Backend(format!(
                         "clipboard get: read pipe: {e}"
-                    )))
+                    )));
                 }
             },
             Err(rustix::io::Errno::INTR) => continue,
@@ -734,7 +734,7 @@ fn serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{read_to_eof_bounded, CLIP_READ_TIMEOUT};
+    use super::{CLIP_READ_TIMEOUT, read_to_eof_bounded};
     use glass_core::GlassError;
     use std::io::Write;
     use std::time::Duration;
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn pick_mime_prefers_charset_utf8_then_plain_then_utf8_string() {
-        use super::{pick_mime, MIME_PLAIN, MIME_UTF8, MIME_UTF8_STR};
+        use super::{MIME_PLAIN, MIME_UTF8, MIME_UTF8_STR, pick_mime};
         let list = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
 
         // Preference order wins over the order the owner advertised them in.

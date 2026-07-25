@@ -229,7 +229,7 @@ mod tests {
 
 #[cfg(test)]
 mod run_drag_tests {
-    use super::{run_drag, DragGesture, DragSink};
+    use super::{DragGesture, DragSink, run_drag};
     use crate::Result;
     use std::time::Duration;
 

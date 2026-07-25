@@ -18,11 +18,11 @@ use glass_core::{GlassError, Result};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, SetWindowPos,
-    ShowWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    BringWindowToTop, GetWindowThreadProcessId, IsIconic, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
 };
 
-use crate::util::{enum_top_windows, extended_frame_bounds, find_by_title, window_rect, WinInfo};
+use crate::util::{WinInfo, enum_top_windows, extended_frame_bounds, find_by_title, window_rect};
 
 /// A DWM frame `RECT` (left/top/right/bottom, physical pixels) as window geometry.
 pub(crate) fn rect_to_geometry(r: RECT) -> WindowGeometry {
@@ -72,18 +72,17 @@ pub(crate) fn find_app_window(
     // (find_by_title), intentionally looser than the x11 backend's exact-title match, since real
     // window titles carry dynamic prefixes/suffixes. Rung 3 matches the class exactly.
     if let Some(hint) = hint {
-        if let Some(title) = &hint.title {
-            if let Some(w) = find_by_title(title).into_iter().next() {
-                return Some(w);
-            }
+        if let Some(title) = &hint.title
+            && let Some(w) = find_by_title(title).into_iter().next()
+        {
+            return Some(w);
         }
-        if let Some(class) = &hint.class {
-            if let Some(w) = enum_top_windows()
+        if let Some(class) = &hint.class
+            && let Some(w) = enum_top_windows()
                 .into_iter()
                 .find(|w| w.looks_like_app_window() && w.class == *class)
-            {
-                return Some(w);
-            }
+        {
+            return Some(w);
         }
     }
     None

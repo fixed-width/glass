@@ -33,18 +33,17 @@ pub const SHIM_DYLIB_NAME: &str = "libglass_clip_shim_macos.dylib";
 /// exist: callers treat that as "not injectable" (fail-closed — no resolvable shim, no
 /// injection).
 pub fn resolve_shim(exe_dir: &Path, env_override: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = env_override {
-        if path.is_file() {
-            return Some(path);
-        }
+    if let Some(path) = env_override
+        && path.is_file()
+    {
+        return Some(path);
     }
     if let Some(bundled) = exe_dir
         .parent()
         .map(|contents| contents.join("Frameworks").join(SHIM_DYLIB_NAME))
+        && bundled.is_file()
     {
-        if bundled.is_file() {
-            return Some(bundled);
-        }
+        return Some(bundled);
     }
     let next_to_exe = exe_dir.join(SHIM_DYLIB_NAME);
     if next_to_exe.is_file() {

@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn map_matches_declared_column() {
-        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             let mapped = ROLE_SAMPLES.iter().any(|(_, r)| *r == role);
             match support(role, AxBackend::Linux).expect("declared in ROLE_SUPPORT") {

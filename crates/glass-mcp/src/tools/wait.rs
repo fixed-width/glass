@@ -2,9 +2,9 @@
 //! text-only JSON (region can opt into an image). Mirrors the capture-tool style.
 
 use glass_core::{
-    frame_to_webp, AxRole, ElementCondition, Glass, RegionUntil, ScrollDirection,
-    ScrollToElementParams, Stream, WaitElementParams, WaitLogParams, WaitRegionParams,
-    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    AxRole, ElementCondition, Glass, RegionUntil, SCROLL_TO_DEFAULT_STEP,
+    SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementParams, Stream,
+    WaitElementParams, WaitLogParams, WaitRegionParams, frame_to_webp,
 };
 use serde_json::json;
 
@@ -438,16 +438,20 @@ mod tests {
         let mut g = started_a11y();
         let mut a = elem_args();
         a.role = Some("notarole".into());
-        assert!(wait_for_element(&mut g, &a)
-            .unwrap_err()
-            .contains("unknown role"));
+        assert!(
+            wait_for_element(&mut g, &a)
+                .unwrap_err()
+                .contains("unknown role")
+        );
 
         let mut b = elem_args();
         b.name = Some("Save".into());
         b.condition = Some("nope".into());
-        assert!(wait_for_element(&mut g, &b)
-            .unwrap_err()
-            .contains("unknown condition"));
+        assert!(
+            wait_for_element(&mut g, &b)
+                .unwrap_err()
+                .contains("unknown condition")
+        );
     }
 
     #[test]
@@ -622,9 +626,11 @@ mod tests {
         let mut a = region_args();
         a.until = Some("matches".into());
         a.baseline = None;
-        assert!(wait_for_region(&mut g, &a)
-            .unwrap_err()
-            .contains("baseline"));
+        assert!(
+            wait_for_region(&mut g, &a)
+                .unwrap_err()
+                .contains("baseline")
+        );
     }
 
     #[test]
@@ -632,14 +638,18 @@ mod tests {
         let mut g = started_frames(vec![Frame::solid(2, 2, [0, 0, 0, 255])]);
         let mut a = region_args();
         a.until = Some("sideways".into());
-        assert!(wait_for_region(&mut g, &a)
-            .unwrap_err()
-            .contains("unknown until"));
+        assert!(
+            wait_for_region(&mut g, &a)
+                .unwrap_err()
+                .contains("unknown until")
+        );
         let mut b = region_args();
         b.mode = Some("fuzzy".into());
-        assert!(wait_for_region(&mut g, &b)
-            .unwrap_err()
-            .contains("unknown mode"));
+        assert!(
+            wait_for_region(&mut g, &b)
+                .unwrap_err()
+                .contains("unknown mode")
+        );
     }
 
     #[test]
@@ -816,9 +826,11 @@ mod tests {
             interval_ms: Some(0),
             timeout_ms: Some(0),
         };
-        assert!(wait_for_log(&mut g, &empty)
-            .unwrap_err()
-            .contains("non-empty"));
+        assert!(
+            wait_for_log(&mut g, &empty)
+                .unwrap_err()
+                .contains("non-empty")
+        );
         let bad = WaitForLogArgs {
             contains: "x".into(),
             stream: Some("weird".into()),
@@ -826,9 +838,11 @@ mod tests {
             interval_ms: Some(0),
             timeout_ms: Some(0),
         };
-        assert!(wait_for_log(&mut g, &bad)
-            .unwrap_err()
-            .contains("unknown stream"));
+        assert!(
+            wait_for_log(&mut g, &bad)
+                .unwrap_err()
+                .contains("unknown stream")
+        );
     }
 
     #[test]

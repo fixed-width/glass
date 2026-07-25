@@ -124,11 +124,16 @@ unsafe fn alloc_global(data: &[u8]) -> windows::Win32::Foundation::HGLOBAL {
 unsafe fn read_global_bytes(fmt: u32) -> Option<Vec<u8>> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::GetClipboardData;
-    let hr = GetClipboardData(fmt).ok()?;
+    // SAFETY: the caller holds the clipboard open for this call, so the returned handle stays
+    // owned by the clipboard and valid until it is closed.
+    let hr = unsafe { GetClipboardData(fmt) }.ok()?;
     if hr.is_invalid() {
         return None;
     }
-    let lock = HGlobalLock::new(HGLOBAL(hr.0))?;
+    // SAFETY: `hr` is that non-null clipboard handle; `HGlobalLock` returns `None` rather than
+    // locking if it is not a lockable HGLOBAL (e.g. a GDI CF_BITMAP), and unlocks on drop
+    // without freeing — the clipboard keeps ownership.
+    let lock = unsafe { HGlobalLock::new(HGLOBAL(hr.0)) }?;
     Some(lock.as_bytes().to_vec())
 }
 
@@ -139,13 +144,13 @@ unsafe fn read_global_bytes(fmt: u32) -> Option<Vec<u8>> {
 /// hook captured/served/synthesized that format from the private store.
 #[cfg(windows)]
 fn run_multi() -> i32 {
-    use windows::core::PCWSTR;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
         SetClipboardData,
     };
     use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_UNICODETEXT};
+    use windows::core::PCWSTR;
 
     // Three payloads.
     let utf16: Vec<u16> = "FROM-BOX-MULTI"
@@ -317,11 +322,7 @@ impl windows::Win32::System::Com::IEnumFORMATETC_Impl for ProbeEnum_Impl {
                 // SAFETY: caller out-param; may be null (then ignored).
                 unsafe { *pceltfetched = n };
             }
-            if n == celt {
-                S_OK
-            } else {
-                S_FALSE
-            }
+            if n == celt { S_OK } else { S_FALSE }
         })
     }
     fn Skip(&self, celt: u32) -> windows::core::Result<()> {
@@ -368,9 +369,9 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
         pformatetcin: *const windows::Win32::System::Com::FORMATETC,
     ) -> windows::core::Result<windows::Win32::System::Com::STGMEDIUM> {
         use std::mem::ManuallyDrop;
-        use windows::core::Error;
         use windows::Win32::Foundation::{DV_E_FORMATETC, E_OUTOFMEMORY};
         use windows::Win32::System::Com::{STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+        use windows::core::Error;
         guard_res(|| {
             // SAFETY: OLE guarantees a valid FORMATETC pointer for the call.
             let req = unsafe { &*pformatetcin };
@@ -399,8 +400,8 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
         _: *const windows::Win32::System::Com::FORMATETC,
         _: *mut windows::Win32::System::Com::STGMEDIUM,
     ) -> windows::core::Result<()> {
-        use windows::core::Error;
         use windows::Win32::Foundation::DV_E_FORMATETC;
+        use windows::core::Error;
         guard_res(|| Err(Error::from_hresult(DV_E_FORMATETC)))
     }
     fn QueryGetData(
@@ -441,8 +442,8 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
         _: *const windows::Win32::System::Com::STGMEDIUM,
         _: windows::core::BOOL,
     ) -> windows::core::Result<()> {
-        use windows::core::Error;
         use windows::Win32::Foundation::E_NOTIMPL;
+        use windows::core::Error;
         guard_res(|| Err(Error::from_hresult(E_NOTIMPL)))
     }
     fn EnumFormatEtc(
@@ -450,9 +451,9 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
         dwdirection: u32,
     ) -> windows::core::Result<windows::Win32::System::Com::IEnumFORMATETC> {
         use std::sync::atomic::AtomicUsize;
-        use windows::core::Error;
         use windows::Win32::Foundation::E_NOTIMPL;
         use windows::Win32::System::Com::DATADIR_GET;
+        use windows::core::Error;
         guard_res(|| {
             if dwdirection != DATADIR_GET.0 as u32 {
                 return Err(Error::from_hresult(E_NOTIMPL));
@@ -470,18 +471,18 @@ impl windows::Win32::System::Com::IDataObject_Impl for ProbeData_Impl {
         _: u32,
         _: windows::core::Ref<windows::Win32::System::Com::IAdviseSink>,
     ) -> windows::core::Result<u32> {
-        use windows::core::Error;
         use windows::Win32::Foundation::OLE_E_ADVISENOTSUPPORTED;
+        use windows::core::Error;
         guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
     fn DUnadvise(&self, _: u32) -> windows::core::Result<()> {
-        use windows::core::Error;
         use windows::Win32::Foundation::OLE_E_ADVISENOTSUPPORTED;
+        use windows::core::Error;
         guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
     fn EnumDAdvise(&self) -> windows::core::Result<windows::Win32::System::Com::IEnumSTATDATA> {
-        use windows::core::Error;
         use windows::Win32::Foundation::OLE_E_ADVISENOTSUPPORTED;
+        use windows::core::Error;
         guard_res(|| Err(Error::from_hresult(OLE_E_ADVISENOTSUPPORTED)))
     }
 }
@@ -507,13 +508,18 @@ unsafe fn take_stgmedium_bytes(
     medium: &mut windows::Win32::System::Com::STGMEDIUM,
 ) -> Option<Vec<u8>> {
     use windows::Win32::System::Ole::ReleaseStgMedium;
-    let h = medium.u.hGlobal;
+    // SAFETY: `medium` is a `TYMED_HGLOBAL` STGMEDIUM per the contract above, so `hGlobal` is
+    // the initialized union member.
+    let h = unsafe { medium.u.hGlobal };
     let out = if h.0.is_null() {
         None
     } else {
-        HGlobalLock::new(h).map(|lock| lock.as_bytes().to_vec())
+        // SAFETY: `h` is that medium's live HGLOBAL; the lock is dropped (unlocking it) before
+        // the medium is released below.
+        unsafe { HGlobalLock::new(h) }.map(|lock| lock.as_bytes().to_vec())
     };
-    ReleaseStgMedium(medium as *mut _);
+    // SAFETY: `medium` is the caller's live STGMEDIUM, released exactly once here.
+    unsafe { ReleaseStgMedium(medium as *mut _) };
     out
 }
 
@@ -554,7 +560,7 @@ fn make_hdrop_blob() -> Vec<u8> {
 fn run_hdrop() -> i32 {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Com::{
-        CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
+        COINIT_APARTMENTTHREADED, CoInitializeEx, DVASPECT_CONTENT, FORMATETC, IDataObject,
         TYMED_HGLOBAL,
     };
     use windows::Win32::System::DataExchange::{
@@ -664,15 +670,15 @@ fn run_hdrop() -> i32 {
 /// OLE round-trip probe — see the module-level comment above.
 #[cfg(windows)]
 fn run_ole() -> i32 {
-    use windows::core::PCWSTR;
     use windows::Win32::System::Com::{
-        CoInitializeEx, IDataObject, COINIT_APARTMENTTHREADED, DVASPECT_CONTENT, FORMATETC,
+        COINIT_APARTMENTTHREADED, CoInitializeEx, DVASPECT_CONTENT, FORMATETC, IDataObject,
         TYMED_HGLOBAL,
     };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
     };
-    use windows::Win32::System::Ole::{OleGetClipboard, OleSetClipboard, CF_UNICODETEXT};
+    use windows::Win32::System::Ole::{CF_UNICODETEXT, OleGetClipboard, OleSetClipboard};
+    use windows::core::PCWSTR;
 
     let cf_text = CF_UNICODETEXT.0;
     let text = "OLE-FROM-BOX";
@@ -757,12 +763,12 @@ fn run_ole() -> i32 {
         // SAFETY: standard user32 read; the returned handle is owned by the clipboard (not freed).
         let mut u32_text = String::new();
         if OpenClipboard(None).is_ok() {
-            if let Ok(hr) = GetClipboardData(cf_text as u32) {
-                if !hr.is_invalid() {
-                    let g = windows::Win32::Foundation::HGLOBAL(hr.0);
-                    if let Some(lock) = HGlobalLock::new(g) {
-                        u32_text = utf16_to_string(lock.as_bytes());
-                    }
+            if let Ok(hr) = GetClipboardData(cf_text as u32)
+                && !hr.is_invalid()
+            {
+                let g = windows::Win32::Foundation::HGLOBAL(hr.0);
+                if let Some(lock) = HGlobalLock::new(g) {
+                    u32_text = utf16_to_string(lock.as_bytes());
                 }
             }
             let _ = CloseClipboard();

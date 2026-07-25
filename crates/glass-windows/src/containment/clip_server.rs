@@ -6,8 +6,8 @@
 //! we [`PrivateClipboard::apply`] and answer. The boxed `glass_clip_hook` DLL is the client.
 //! Sandboxie's `OpenPipePath` lets the box reach this host pipe (always applied).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,6 @@ use glass_clip_hook::proto::{self, Request, Response};
 use glass_clip_hook::store::PrivateClipboard;
 use glass_core::{GlassError, Result};
 
-use windows::core::BOOL;
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
@@ -25,6 +23,8 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+use windows::core::BOOL;
+use windows::core::PCWSTR;
 
 /// SDDL for the pipe DACL: Everyone (WD) + SYSTEM generic-all. Everyone is required merely so the
 /// box's client can *connect*: with `KeepTokenIntegrity=y` the Sandboxie token's access check is

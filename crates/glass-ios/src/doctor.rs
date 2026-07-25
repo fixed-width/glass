@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use glass_core::{Check, CheckStatus, GlassError};
 
-use crate::device::{parse_devices, resolve, Resolve, SimDevice};
-use crate::idb::companion::{companion_bin, companion_present_with, IdbCompanion};
+use crate::device::{Resolve, SimDevice, parse_devices, resolve};
+use crate::idb::companion::{IdbCompanion, companion_bin, companion_present_with};
 use crate::simctl::Simctl;
 
 /// Observed host state for the iOS doctor checks. Captured by `run`, consumed by the
@@ -198,7 +198,7 @@ fn self_test_with(bin: &str) -> CompanionProbe {
     {
         Ok(c) => c,
         Err(e) => {
-            return CompanionProbe::SelfTestFailed(format!("spawn {bin} {SELF_TEST_ARG}: {e}"))
+            return CompanionProbe::SelfTestFailed(format!("spawn {bin} {SELF_TEST_ARG}: {e}"));
         }
     };
     let deadline = Instant::now() + SELF_TEST_TIMEOUT;

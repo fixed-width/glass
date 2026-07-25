@@ -78,11 +78,10 @@ pub enum RoleSupport {
 
 /// Role coverage per backend. Cells are ordered as [`AxBackend::ALL`], and the row type is sized
 /// from it so a new backend is a compile error here rather than a silent column mismatch.
-pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
-    {
-        use AxRole as R;
-        use RoleSupport::{Gap, Mapped, NotApplicable};
-        &[
+pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
+    use AxRole as R;
+    use RoleSupport::{Gap, Mapped, NotApplicable};
+    &[
         (
             R::Application,
             [
@@ -117,9 +116,11 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
+                Gap(
+                    "AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
                      subrole; AXCheckBox is outside the reader's subrole gate, and no probed \
-                     app emitted either subrole"),
+                     app emitted either subrole",
+                ),
                 Mapped,
                 Mapped,
             ],
@@ -268,8 +269,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AppKit reports tab items as AXRadioButton inside the tab group; the \
-                     containing role is not used to disambiguate yet"),
+                Gap(
+                    "AppKit reports tab items as AXRadioButton inside the tab group; the \
+                     containing role is not used to disambiguate yet",
+                ),
                 Gap(
                     "a tab reports a plain layout class with selected=true; nothing in the \
                      class name marks it as a tab",
@@ -356,8 +359,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::Heading,
             [
                 Mapped,
-                Gap("UIA's Header and HeaderItem are grid column headers, not document \
-                     headings; the normalized set has no column-header role"),
+                Gap(
+                    "UIA's Header and HeaderItem are grid column headers, not document \
+                     headings; the normalized set has no column-header role",
+                ),
                 Mapped,
                 Gap(
                     "neither reader exposes heading semantics: the uiautomator dump has no \
@@ -367,7 +372,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             ],
         ),
     ]
-    };
+};
 
 /// Declared support for one role on one backend, or `None` when [`ROLE_SUPPORT`] has no row for
 /// `role`.

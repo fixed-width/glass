@@ -504,10 +504,10 @@ fn find_nth(
             budget.hit(TruncationLimit::Siblings);
             break; // same per-level bound as walk(), so find_nth can't spin either
         }
-        if !should_skip(&child) {
-            if let Some(found) = find_nth(child, depth + 1, budget, target) {
-                return Some(found);
-            }
+        if !should_skip(&child)
+            && let Some(found) = find_nth(child, depth + 1, budget, target)
+        {
+            return Some(found);
         }
     }
     None
@@ -588,7 +588,7 @@ mod tests {
     use glass_core::{MAX_DEPTH, MAX_NODES};
 
     use super::{
-        may_explore_children, read_back_confirms, set_value_took, TruncationLimit, WalkBudget,
+        TruncationLimit, WalkBudget, may_explore_children, read_back_confirms, set_value_took,
     };
 
     #[test]

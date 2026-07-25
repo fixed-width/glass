@@ -5,11 +5,11 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::*;
-use x11rb::protocol::Event;
-use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::*;
+use x11rb::wrapper::ConnectionExt as _;
 
 const WIDTH: u16 = 320;
 const HEIGHT: u16 = 240;

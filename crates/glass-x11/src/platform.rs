@@ -9,9 +9,9 @@ use glass_core::{
 use glass_proc_linux::{proc_tree_pids, spawn_reader};
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
+use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
-use x11rb::protocol::ErrorKind;
 use x11rb::rust_connection::RustConnection;
 
 const XT_MOTION: u8 = 6; // MotionNotify
@@ -331,13 +331,13 @@ impl X11Platform {
                 self.window = Some(win);
                 return Ok(win);
             }
-            if let Some(child) = self.child.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    return Err(GlassError::app_exited_during_discovery(
-                        status.code(),
-                        spec.sandbox,
-                    ));
-                }
+            if let Some(child) = self.child.as_mut()
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                return Err(GlassError::app_exited_during_discovery(
+                    status.code(),
+                    spec.sandbox,
+                ));
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::Timeout(spec.timeout_ms));
@@ -407,19 +407,16 @@ impl X11Platform {
         if !mapped {
             return Ok(false);
         }
-        if !pids.is_empty() {
-            if let Some(reply) = self
+        if !pids.is_empty()
+            && let Some(reply) = self
                 .conn
                 .get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
                 .ok()
                 .and_then(|c| c.reply().ok())
-            {
-                if let Some(win_pid) = reply.value32().and_then(|mut v| v.next()) {
-                    if pids.contains(&win_pid) {
-                        return Ok(true);
-                    }
-                }
-            }
+            && let Some(win_pid) = reply.value32().and_then(|mut v| v.next())
+            && pids.contains(&win_pid)
+        {
+            return Ok(true);
         }
         if let Some(hint) = hint {
             let name = self.window_name(win);
@@ -871,15 +868,14 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 
 impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        if spec.sandbox != glass_core::SandboxLevel::Off {
-            if let glass_sandbox_linux::Availability::Unavailable(why) =
+        if spec.sandbox != glass_core::SandboxLevel::Off
+            && let glass_sandbox_linux::Availability::Unavailable(why) =
                 glass_sandbox_linux::availability()
-            {
-                return Err(GlassError::SandboxUnavailable(format!(
-                    "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+        {
+            return Err(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
                      sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-                )));
-            }
+            )));
         }
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never touches the
@@ -912,12 +908,10 @@ impl Platform for X11Platform {
                 // Give the launched window keyboard focus so synthetic keys reach
                 // it (no WM in the headless Xvfb assigns focus). Best-effort: a
                 // focus failure must not fail an otherwise-successful launch.
-                if let Some(win) = self.window {
-                    if let Err(e) = self.focus_window(win) {
-                        eprintln!(
-                            "glass: focus-on-launch failed (keys may not reach the window): {e}"
-                        );
-                    }
+                if let Some(win) = self.window
+                    && let Err(e) = self.focus_window(win)
+                {
+                    eprintln!("glass: focus-on-launch failed (keys may not reach the window): {e}");
                 }
                 Ok(geo)
             }
@@ -1195,17 +1189,16 @@ impl Platform for X11Platform {
 /// both are stable identifiers. Title and class are OR'd: any provided field
 /// that matches is enough.
 fn hint_matches(name: Option<&str>, class: Option<(&str, &str)>, hint: &WindowHint) -> bool {
-    if let Some(title) = &hint.title {
-        if name == Some(title.as_str()) {
-            return true;
-        }
+    if let Some(title) = &hint.title
+        && name == Some(title.as_str())
+    {
+        return true;
     }
-    if let Some(want) = &hint.class {
-        if let Some((instance, class)) = class {
-            if instance == want.as_str() || class == want.as_str() {
-                return true;
-            }
-        }
+    if let Some(want) = &hint.class
+        && let Some((instance, class)) = class
+        && (instance == want.as_str() || class == want.as_str())
+    {
+        return true;
     }
     false
 }
@@ -1218,8 +1211,8 @@ impl Drop for X11Platform {
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
         self.kill_child(); // also stops clipboard_owner
-                           // Redundant safety: kill_child already calls take(), but be explicit
-                           // in case clipboard_owner was set after the last kill_child call.
+        // Redundant safety: kill_child already calls take(), but be explicit
+        // in case clipboard_owner was set after the last kill_child call.
         if let Some(owner) = self.clipboard_owner.take() {
             owner.stop();
         }
@@ -1308,7 +1301,7 @@ mod tests {
 
 #[cfg(test)]
 mod env_display_tests {
-    use super::{display_target, normalize_display, DisplayTarget};
+    use super::{DisplayTarget, display_target, normalize_display};
 
     #[test]
     fn unset_or_blank_spawns() {

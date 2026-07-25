@@ -27,7 +27,9 @@ pub fn resolve_on_path(program: &OsStr) -> Option<PathBuf> {
 }
 
 /// [`resolve_on_path`] against an explicit `$PATH` value — the testable seam (no global env).
-pub(crate) fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+/// Public so the backends' own resolution paths can be tested the same way, without a test
+/// mutating the process environment (unsound: `set_var` races any concurrent reader).
+pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|dir| dir.join(program))
         .find(|cand| is_executable_file(cand))

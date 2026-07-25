@@ -5,8 +5,8 @@ use serde_json::json;
 
 use crate::params::*;
 use crate::tools::{
-    click, diff, drag, key, mouse_move, screenshot, scroll, type_text, wait_stable, OutContent,
-    ToolOutput, ToolResult,
+    OutContent, ToolOutput, ToolResult, click, diff, drag, key, mouse_move, screenshot, scroll,
+    type_text, wait_stable,
 };
 
 /// Split a sub-tool's enveloped output into (its `result` payload, its non-envelope
@@ -67,13 +67,13 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> ToolResult {
     // sequence for a pure argument-shape error). An explicit `"none"` is the documented
     // no-observe default and passes.
     for (i, action) in a.actions.iter().enumerate() {
-        if let Action::Type(args) = action {
-            if matches!(args.return_.as_deref(), Some(r) if r != "none") {
-                return Err(format!(
-                    "action[{i}] (type): `return` is not accepted inside glass_do — use a \
+        if let Action::Type(args) = action
+            && matches!(args.return_.as_deref(), Some(r) if r != "none")
+        {
+            return Err(format!(
+                "action[{i}] (type): `return` is not accepted inside glass_do — use a \
                      `settle` action or the terminal `then` observe"
-                ));
-            }
+            ));
         }
     }
     let n = a.actions.len();
@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use crate::tools::start as start_tool;
     use crate::tools::testutil::*;
-    use crate::tools::{baseline_save, OutContent};
+    use crate::tools::{OutContent, baseline_save};
     use glass_core::Frame;
     use std::sync::{Arc, Mutex};
 

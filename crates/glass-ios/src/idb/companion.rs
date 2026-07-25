@@ -295,7 +295,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Build an env getter from a fixed set of pairs.
-    fn env(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    fn env(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let m: HashMap<&'static str, &'static str> = pairs.iter().copied().collect();
         move |k: &str| m.get(k).map(|s| s.to_string())
     }

@@ -10,8 +10,8 @@
 
 mod common;
 
-use common::mcp_ignore::assert_blink_region_e2e;
 use common::Xvfb;
+use common::mcp_ignore::assert_blink_region_e2e;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 

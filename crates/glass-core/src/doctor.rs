@@ -213,8 +213,10 @@ mod tests {
             Section::new(
                 "wayland",
                 Some("wayland".into()),
-                vec![Check::new("sway >=1.12", CheckStatus::Fail, "not found")
-                    .with_remedy("build it")],
+                vec![
+                    Check::new("sway >=1.12", CheckStatus::Fail, "not found")
+                        .with_remedy("build it"),
+                ],
             ),
         ])
     }

@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use glass_core::{AppSpec, AxNodeId, AxTree, Glass, SandboxLevel};
 
-use common::mcp_cost;
 use common::Xvfb;
+use common::mcp_cost;
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires an X server + AT-SPI bus; run via scripts/verification-cost.sh"]

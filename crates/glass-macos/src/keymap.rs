@@ -90,10 +90,10 @@ pub fn key_for(ch: char) -> Option<(u16, bool)> {
         ('?', '/'),
         ('~', '`'),
     ];
-    if let Some(&(_, base)) = SHIFTED.iter().find(|&&(c, _)| c == ch) {
-        if let Some(&(_, code)) = BASE.iter().find(|&&(c, _)| c == base) {
-            return Some((code, true));
-        }
+    if let Some(&(_, base)) = SHIFTED.iter().find(|&&(c, _)| c == ch)
+        && let Some(&(_, code)) = BASE.iter().find(|&&(c, _)| c == base)
+    {
+        return Some((code, true));
     }
     None
 }

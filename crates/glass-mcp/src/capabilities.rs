@@ -328,15 +328,19 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&render_json(Some("android")).unwrap()).unwrap();
         assert_eq!(v["capabilities"]["input"]["status"], "degraded");
-        assert!(v["capabilities"]["input"]["note"]
-            .as_str()
-            .unwrap()
-            .contains("GLASS_ANDROID_AGENT_JAR"));
-        assert!(v["capabilities"]["input"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t == "glass_type"));
+        assert!(
+            v["capabilities"]["input"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("GLASS_ANDROID_AGENT_JAR")
+        );
+        assert!(
+            v["capabilities"]["input"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "glass_type")
+        );
         // a plain `supported` op omits `note`.
         let v: serde_json::Value =
             serde_json::from_str(&render_json(Some("x11")).unwrap()).unwrap();

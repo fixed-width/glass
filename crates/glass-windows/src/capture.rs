@@ -12,7 +12,7 @@
 //! unreliable for opaque windows and is normalized to opaque (255) downstream by
 //! [`crate::pixels::bgra_to_rgba`], which also does the BGRA -> RGBA swizzle.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use glass_core::frame::{Frame, Region};
 use glass_core::{GlassError, Result};

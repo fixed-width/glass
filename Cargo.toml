@@ -6,7 +6,7 @@ members = ["crates/glass-core", "crates/glass-x11", "crates/glass-testapp", "cra
 exclude = ["crates/glass-fixture-egui"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 # Apache-2.0 (the patent grant matters for OS-level input/capture).
 # Third-party deps stay permissive (MIT/Apache, no copyleft) per CLAUDE.md.
 # publish = false: open-source but not (yet) pushed to crates.io.

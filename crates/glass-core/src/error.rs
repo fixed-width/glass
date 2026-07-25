@@ -82,7 +82,9 @@ pub enum GlassError {
     )]
     AxElementNotClickable(u32),
 
-    #[error("element #{0} is not editable via the accessibility API (its a11y projection exposes no writable value — a common toolkit gap even when the element accepts typed input); focus it with glass_click, then enter text with glass_type / glass_key instead")]
+    #[error(
+        "element #{0} is not editable via the accessibility API (its a11y projection exposes no writable value — a common toolkit gap even when the element accepts typed input); focus it with glass_click, then enter text with glass_type / glass_key instead"
+    )]
     AxElementNotEditable(u32),
 
     #[error("element #{0} has no option matching {1:?}; available options: {2}")]
@@ -91,7 +93,9 @@ pub enum GlassError {
     #[error("element #{0} changed since the snapshot; re-snapshot")]
     AxElementChanged(u32),
 
-    #[error("set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)")]
+    #[error(
+        "set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)"
+    )]
     AxValueNotApplied(u32),
 
     #[error("element #{0} exposes no native activation action")]
@@ -100,10 +104,14 @@ pub enum GlassError {
     #[error("native action on element #{0} failed: {1}")]
     AxActionFailed(u32, String),
 
-    #[error("set_value on element #{0} is a switch/checkbox and expects a boolean — one of true/false, on/off, 1/0, yes/no (got {1:?})")]
+    #[error(
+        "set_value on element #{0} is a switch/checkbox and expects a boolean — one of true/false, on/off, 1/0, yes/no (got {1:?})"
+    )]
     AxValueNotBoolean(u32, String),
 
-    #[error("element #{0} is inside a popover glass could not map to a window; select_window it and click by coordinate")]
+    #[error(
+        "element #{0} is inside a popover glass could not map to a window; select_window it and click by coordinate"
+    )]
     AxElementInUnmappedPopover(u32),
 
     #[error("accessibility unavailable: {0}")]

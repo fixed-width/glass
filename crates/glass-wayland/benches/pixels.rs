@@ -3,7 +3,7 @@
 //! Uses a padded stride (`w*4 + PAD`) so the row loop does real work dropping
 //! padding, and `Xrgb8888` so it exercises the R/B-swap path.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use glass_wayland::pixels::to_rgba;
 use std::hint::black_box;
 use wayland_client::protocol::wl_shm::Format;

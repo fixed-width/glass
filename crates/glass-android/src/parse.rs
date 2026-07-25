@@ -39,14 +39,16 @@ struct WinBlock {
 fn finish_block(b: WinBlock, out: &mut Vec<ParsedWindow>) {
     // Skip the transient starting window (title `Splash Screen <pkg>`): a real app-package
     // window during launch, but not one the agent should drive.
-    if b.pkg_match && b.on_screen && !b.title.starts_with("Splash Screen") {
-        if let Some(frame) = b.frame {
-            out.push(ParsedWindow {
-                id: b.id,
-                title: b.title,
-                frame,
-            });
-        }
+    if b.pkg_match
+        && b.on_screen
+        && !b.title.starts_with("Splash Screen")
+        && let Some(frame) = b.frame
+    {
+        out.push(ParsedWindow {
+            id: b.id,
+            title: b.title,
+            frame,
+        });
     }
 }
 

@@ -223,22 +223,26 @@ mod tests {
 
     #[test]
     fn region_check_fits_validates_bounds() {
-        assert!(Region {
-            x: 0,
-            y: 0,
-            width: 4,
-            height: 4
-        }
-        .check_fits(4, 4)
-        .is_ok());
-        assert!(Region {
-            x: 2,
-            y: 2,
-            width: 2,
-            height: 2
-        }
-        .check_fits(4, 4)
-        .is_ok());
+        assert!(
+            Region {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4
+            }
+            .check_fits(4, 4)
+            .is_ok()
+        );
+        assert!(
+            Region {
+                x: 2,
+                y: 2,
+                width: 2,
+                height: 2
+            }
+            .check_fits(4, 4)
+            .is_ok()
+        );
         for bad in [
             Region {
                 x: 0,

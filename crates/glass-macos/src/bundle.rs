@@ -7,7 +7,7 @@
 // macOS. Same pattern as `glass-windows/src/doctor.rs`.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use glass_core::{platform::SandboxLevel, GlassError, Result};
+use glass_core::{GlassError, Result, platform::SandboxLevel};
 use std::path::{Component, Path, PathBuf};
 
 /// True when `run[0]` names a `.app` bundle directory (the trigger for the NSWorkspace-capable

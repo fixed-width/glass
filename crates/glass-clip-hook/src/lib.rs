@@ -39,7 +39,7 @@ pub use hglobal::{HGlobalLock, OwnedHGlobal};
 /// Sandboxie InjectDll entry point (called after SbieDll, before the app's entry). Inert unless
 /// `GLASS_CLIP_PIPE` is set (only the target app's process tree carries it). See [`hook`].
 #[cfg(windows)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn InjectDllMain(_h_sbie_dll: isize, _unused: usize) {
     // A panic unwinding across this `extern "system"` frame into the host app would be UB.
     // `catch_unwind` contains it (member-crate `panic = "abort"` is ignored by Cargo — only the

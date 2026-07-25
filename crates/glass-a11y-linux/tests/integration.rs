@@ -140,7 +140,7 @@ fn snapshot_finds_gtk_widgets() {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_covers_the_declared_linux_roles() {
-    use glass_core::{role_histogram, AxRole};
+    use glass_core::{AxRole, role_histogram};
 
     let mut glass = glass_x11_with_a11y();
     glass.start(&fixture_spec()).expect("start fixture");

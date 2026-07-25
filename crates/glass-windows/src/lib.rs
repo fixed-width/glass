@@ -151,7 +151,7 @@ mod backend {
             hint: Option<&WindowHint>,
             timeout_ms: u64,
         ) -> Result<WindowGeometry> {
-            use crate::discovery::{poll_decision, PollStep};
+            use crate::discovery::{PollStep, poll_decision};
 
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             // Latched once the root process is observed exited (its code preserved). A
@@ -184,12 +184,11 @@ mod backend {
                 // (some packaged apps activate via a system broker) the pid-set can't
                 // follow, so a title/class hint may still locate that window after the
                 // launcher exits. `poll_decision` encodes the policy.
-                if root_exit.is_none() {
-                    if let Some(app) = self.app.as_mut() {
-                        if let Ok(Some(status)) = app.try_wait() {
-                            root_exit = Some(status.code());
-                        }
-                    }
+                if root_exit.is_none()
+                    && let Some(app) = self.app.as_mut()
+                    && let Ok(Some(status)) = app.try_wait()
+                {
+                    root_exit = Some(status.code());
                 }
                 // A live process in the set other than the (now-exited) root means a Job-captured
                 // child is up that may still own a window (Chromium/Edge/Electron) — keep polling.

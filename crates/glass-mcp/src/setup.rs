@@ -212,10 +212,10 @@ fn enable_instruction(label: &str, app_path: &str) -> String {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn app_bundle_path(exe: &Path) -> String {
     // `is_inside_app_bundle` guarantees the three-parents-up ancestor is the `*.app` dir.
-    if is_inside_app_bundle(exe) {
-        if let Some(bundle) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-            return bundle.to_string_lossy().into_owned();
-        }
+    if is_inside_app_bundle(exe)
+        && let Some(bundle) = exe.parent().and_then(Path::parent).and_then(Path::parent)
+    {
+        return bundle.to_string_lossy().into_owned();
     }
     DEFAULT_APP_PATH.to_string()
 }

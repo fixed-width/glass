@@ -8,7 +8,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use glass_core::GlassError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The protocol version this client speaks (must match the agent's hello `proto`).
 pub(crate) const PROTO: i64 = 1;

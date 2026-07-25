@@ -7,7 +7,7 @@
 use std::ptr::NonNull;
 
 use objc2_core_foundation::{
-    kCFBooleanTrue, CFBoolean, CFDictionary, CFRetained, CFString, CFType,
+    CFBoolean, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
 };
 
 use glass_core::Result;
@@ -31,8 +31,12 @@ impl Permission {
     }
     fn remedy(self) -> &'static str {
         match self {
-            Permission::ScreenRecording => "enable glass in System Settings > Privacy & Security > Screen Recording (run inside a logged-in session; grant persists for the signed binary)",
-            Permission::Accessibility => "enable glass in System Settings > Privacy & Security > Accessibility",
+            Permission::ScreenRecording => {
+                "enable glass in System Settings > Privacy & Security > Screen Recording (run inside a logged-in session; grant persists for the signed binary)"
+            }
+            Permission::Accessibility => {
+                "enable glass in System Settings > Privacy & Security > Accessibility"
+            }
         }
     }
     fn denied(self) -> glass_core::GlassError {
@@ -61,13 +65,13 @@ impl Permission {
 
 // Both are plain C functions; no objc2 needed for preflight.
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     // Apple declares this post-10.15 API with C99 `bool`, guaranteed to be 0/1 — unlike
     // the legacy `Boolean`/`u8` ABI on `AXIsProcessTrusted` below.
     fn CGPreflightScreenCaptureAccess() -> bool;
 }
 #[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     // Apple declares this `Boolean` (= `unsigned char`), NOT C99 `_Bool`. Binding it as
     // `u8` and comparing `!= 0` avoids the Rust-`bool` validity invariant (only 0/1 are
     // legal bit patterns; any other byte would be instant UB), matching `accessibility-sys`.
@@ -155,7 +159,7 @@ pub fn open_pane(url: &str) -> Result<()> {
 // and must never be called from `preflight`/`doctor`, which must stay non-prompting.
 
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     // Triggers the Screen Recording consent flow (adds glass to the privacy pane if it
     // isn't already listed, and shows the system dialog on first request) and returns
     // the current grant state. Post-10.15 API, C99 `bool` ABI — like
@@ -163,7 +167,7 @@ extern "C" {
     fn CGRequestScreenCaptureAccess() -> bool;
 }
 #[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     // With an options dict carrying `kAXTrustedCheckOptionPrompt = true`, shows the
     // Accessibility consent dialog (when not already trusted) and returns the current
     // trust state. `Boolean` (u8), not C99 `bool` — see `AXIsProcessTrusted` above for

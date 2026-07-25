@@ -83,11 +83,7 @@ fn parse_with_header(b: &[u8], header_bytes: usize) -> Option<DibInfo> {
             if bpp != 16 && bpp != 32 {
                 return None;
             }
-            if header_bytes == BIH {
-                12
-            } else {
-                0
-            }
+            if header_bytes == BIH { 12 } else { 0 }
         }
         _ => return None, // BI_RLE8/4, BI_JPEG, BI_PNG, BI_ALPHABITFIELDS
     };
@@ -239,7 +235,7 @@ mod tests {
         let mut h = bih_2x2_32();
         h[4..8].copy_from_slice(&i32::MAX.to_le_bytes()); // width = 2^31-1
         h[8..12].copy_from_slice(&i32::MAX.to_le_bytes()); // height = 2^31-1
-                                                           // stride*height overflows usize math if done naively; parse must reject, not panic/overflow.
+        // stride*height overflows usize math if done naively; parse must reject, not panic/overflow.
         assert!(parse_dib(&h).is_none());
     }
 

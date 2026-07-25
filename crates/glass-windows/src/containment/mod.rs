@@ -20,7 +20,7 @@ mod clip_onbox;
 mod build_onbox;
 
 #[cfg(windows)]
-pub(crate) use imp::{resolve_containment, ClipboardRoute, Launched, LogSink};
+pub(crate) use imp::{ClipboardRoute, Launched, LogSink, resolve_containment};
 
 // Re-export the Sandboxie availability/dir probes so the doctor can report posture
 // without reaching into the private `sandboxie` module path.
@@ -44,7 +44,7 @@ mod imp {
     use glass_core::logbuf::Stream;
     use glass_core::{AppSpec, GlassError, Result};
 
-    use super::config::{decide, Decision, ProviderChoice};
+    use super::config::{Decision, ProviderChoice, decide};
 
     /// Log lines captured from the app, tagged by stream. (Lifted from lib.rs.)
     pub(crate) type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;

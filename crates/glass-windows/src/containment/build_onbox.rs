@@ -6,7 +6,7 @@
 use glass_core::{AppSpec, SandboxLevel};
 
 use super::imp::Containment;
-use super::sandboxie::{available, sandboxie_dir, Sandboxie};
+use super::sandboxie::{Sandboxie, available, sandboxie_dir};
 
 fn spec_with_build(build: String) -> AppSpec {
     AppSpec {

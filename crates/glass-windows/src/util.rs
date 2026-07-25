@@ -2,16 +2,15 @@
 //! DWM frame bounds / cloaked detection, and the "is this a real app window" filter.
 
 use std::ffi::c_void;
-use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_APPWINDOW,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
+use windows::core::BOOL;
 
 /// A snapshot of one top-level window. Stores the HWND as a raw `isize` so the
 /// value is `Send` and easy to print; reconstruct with [`raw_to_hwnd`].

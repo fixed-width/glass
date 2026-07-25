@@ -1,6 +1,12 @@
 //! End-to-end Wayland-backend tests. `#[ignore]`d; run via
 //! `scripts/test-wayland.sh` (which skips if no glass-discoverable sway >=1.12).
 
+// Two tests set `PATH` on the process to force a launch failure that has no other seam.
+// `env::set_var` is `unsafe` from edition 2024 on (it races concurrent env readers);
+// `scripts/test-wayland.sh` runs this suite with `--test-threads=1`, so there are none.
+// Each site carries a `// SAFETY:` note; the file opts out of `unsafe_code = "deny"`.
+#![allow(unsafe_code)]
+
 use glass_core::{AppSpec, GlassError, Platform};
 use glass_wayland::WaylandPlatform;
 
@@ -286,10 +292,10 @@ fn collect_keysyms(p: &mut WaylandPlatform, want: usize, tries: u32) -> Vec<u32>
     let mut got = Vec::new();
     for _ in 0..tries {
         for (_s, line) in p.drain_logs() {
-            if let Some((_, n)) = line.split_once("keysym=") {
-                if let Ok(ks) = n.trim().parse::<u32>() {
-                    got.push(ks);
-                }
+            if let Some((_, n)) = line.split_once("keysym=")
+                && let Ok(ks) = n.trim().parse::<u32>()
+            {
+                got.push(ks);
             }
         }
         if got.len() >= want {
@@ -587,14 +593,16 @@ fn fail_closed_when_bwrap_missing_wayland() {
     struct PathGuard(std::ffi::OsString);
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            std::env::set_var("PATH", &self.0);
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", &self.0) };
         }
     }
 
     let sandboxed_err = {
         let _guard = {
             let original = std::env::var_os("PATH").unwrap_or_default();
-            std::env::set_var("PATH", "/nonexistent");
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", "/nonexistent") };
             PathGuard(original)
         };
         let mut p = WaylandPlatform::new().unwrap();
@@ -741,7 +749,8 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     struct PathGuard(std::ffi::OsString);
     impl Drop for PathGuard {
         fn drop(&mut self) {
-            std::env::set_var("PATH", &self.0);
+            // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+            unsafe { std::env::set_var("PATH", &self.0) };
         }
     }
 
@@ -758,7 +767,8 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     let mut prepended = bindir.clone().into_os_string();
     prepended.push(":");
     prepended.push(&original_path);
-    std::env::set_var("PATH", &prepended);
+    // SAFETY: `--test-threads=1` (see the header) — no concurrent env reader.
+    unsafe { std::env::set_var("PATH", &prepended) };
     let _path_guard = PathGuard(original_path);
 
     let sandboxed_spec = AppSpec {

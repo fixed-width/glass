@@ -50,17 +50,17 @@ pub fn render(frame: &Frame, tree: &AxTree) -> (Frame, Vec<Mark>) {
 }
 
 fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
-    if node.role.is_interactable() {
-        if let Some(b) = node.bounds {
-            if b.width > 0 && b.height > 0 {
-                draw_mark(frame, b, node.id.0);
-                legend.push(Mark {
-                    id: node.id,
-                    role: node.role,
-                    name: node.name.clone(),
-                });
-            }
-        }
+    if node.role.is_interactable()
+        && let Some(b) = node.bounds
+        && b.width > 0
+        && b.height > 0
+    {
+        draw_mark(frame, b, node.id.0);
+        legend.push(Mark {
+            id: node.id,
+            role: node.role,
+            name: node.name.clone(),
+        });
     }
     for child in &node.children {
         collect(child, frame, legend);

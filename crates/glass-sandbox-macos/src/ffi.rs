@@ -3,9 +3,9 @@
 //! a single syscall, returning an alloc-free `io::Error` on failure. `sandbox_init` accepts
 //! an inline SBPL string with flag `0`; it is deprecated-but-shipping (Apple + Chromium).
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{CStr, c_char, c_int};
 
-extern "C" {
+unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
 }
 
