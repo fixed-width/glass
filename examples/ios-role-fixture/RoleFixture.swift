@@ -190,23 +190,26 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     /// The screen to show, as an index into the tab controller.
     ///
     /// Named by `ROLE_FIXTURE_TAB=controls|collection|swiftui` in the environment, or by a
-    /// `--tab=<name>` launch argument. The environment is what glass can set (`AppSpec::env`
-    /// reaches the app as `SIMCTL_CHILD_*`), since `AppSpec::run`'s tail is not passed through to
-    /// `simctl launch`; the argument form is for driving `simctl` by hand.
+    /// `--tab=<name>` launch argument. Either reaches the app through glass — `AppSpec::env`
+    /// arrives as `SIMCTL_CHILD_*`, and `AppSpec::run`'s tail is forwarded to `simctl launch` —
+    /// or through `simctl` driven by hand.
     ///
-    /// Only the joined `--tab=<name>` form works: `simctl launch` forwards it, but drops the
-    /// value of a separated `--tab <name>`, which would leave this reading a flag with nothing
-    /// after it. That case is fatal here rather than silently first-tab, as is a name it does not
-    /// recognize. This app exists to put one specific screen in front of a reader whose tree
-    /// becomes evidence, and a tree carries no marker of which screen produced it — so falling
-    /// back quietly would hand them a plausible reading of the wrong screen.
+    /// Both `--tab=<name>` and `--tab <name>` work: `simctl launch` forwards everything after the
+    /// bundle id to the app verbatim, separated pairs included. A `--tab` with nothing after it,
+    /// or a name this does not recognize, is fatal rather than silently first-tab: this app exists
+    /// to put one specific screen in front of a reader whose tree becomes evidence, and a tree
+    /// carries no marker of which screen produced it, so falling back quietly would hand them a
+    /// plausible reading of the wrong screen.
     private static func requestedTab() -> Int {
         let arguments = ProcessInfo.processInfo.arguments
         var requested = ProcessInfo.processInfo.environment["ROLE_FIXTURE_TAB"]
         if let inline = arguments.first(where: { $0.hasPrefix("--tab=") }) {
             requested = String(inline.dropFirst("--tab=".count))
-        } else if arguments.contains("--tab") {
-            fatalError("--tab needs its value joined: --tab=controls|collection|swiftui")
+        } else if let flag = arguments.firstIndex(of: "--tab") {
+            guard flag + 1 < arguments.count else {
+                fatalError("--tab needs a value: controls, collection or swiftui")
+            }
+            requested = arguments[flag + 1]
         }
         guard let name = requested else { return 0 }
         switch name {

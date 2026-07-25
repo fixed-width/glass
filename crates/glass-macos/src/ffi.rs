@@ -64,10 +64,11 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::MainThreadMarker;
+use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplication, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration,
 };
-use objc2_foundation::{NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 
 use glass_core::{GlassError, Result};
 
@@ -195,11 +196,27 @@ pub(crate) fn running_pid_for_bundle_id(bundle_id: &str) -> Option<i32> {
 /// [`GlassError::Timeout`] covers a completion handler that never fires within `timeout_ms`;
 /// a handler dropped without ever firing (the channel sender gone) is reported as
 /// [`GlassError::AppNotStarted`] instead, kept distinct from that never-fired-in-time timeout.
-pub(crate) fn launch_bundle(bundle: &Path, timeout_ms: u64) -> Result<i32> {
+pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> Result<i32> {
     let (tx, rx) = mpsc::channel::<std::result::Result<i32, String>>();
 
     let url = NSURL::fileURLWithPath(&NSString::from_str(&bundle.to_string_lossy()));
     let configuration = NSWorkspaceOpenConfiguration::configuration();
+    // `AppSpec::run[1..]` are the app's arguments, and this path must not be the one that quietly
+    // loses them: the direct spawn above passes them to the process, so a bundle that falls back
+    // to LaunchServices has to carry them too, or the same spec would launch two different apps
+    // depending on which arm ran.
+    //
+    // Behaviourally unproven on hardware: `tests/bundle_launch.rs`'s handoff check adopts
+    // TextEdit, and handing it a document changes the window it opens enough that the check's own
+    // window discovery stops matching — so the observation costs a second fixture bundle (one
+    // whose stub exits, forcing this path, and which records its argv). Until that exists this
+    // rests on `setArguments:` doing what it documents, which is weaker evidence than the rest of
+    // this module carries.
+    if !args.is_empty() {
+        let args: Vec<Retained<NSString>> = args.iter().map(|a| NSString::from_str(a)).collect();
+        let args: Vec<&NSString> = args.iter().map(|a| a.as_ref()).collect();
+        configuration.setArguments(&NSArray::from_slice(&args));
+    }
     let workspace = NSWorkspace::sharedWorkspace();
 
     // The completion handler decides success/failure synchronously inside the callback (this

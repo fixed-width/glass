@@ -330,7 +330,11 @@ impl MacosPlatform {
                     // main-thread-affinity notes), that handler could need a run-loop turn this
                     // blocked thread isn't pumping. Wired here per the design; the on-box round
                     // confirms whether it actually stalls.
-                    None => match crate::ffi::launch_bundle(bundle, spec.timeout_ms) {
+                    None => match crate::ffi::launch_bundle(
+                        bundle,
+                        spec.run.get(1..).unwrap_or_default(),
+                        spec.timeout_ms,
+                    ) {
                         Ok(pid) => (pid, crate::bundle::Disposition::Fresh),
                         // `launch_bundle` can start the app yet still error before its pid is
                         // delivered (e.g. its completion handler timed out) — an orphan. The

@@ -17,6 +17,10 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
+  the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
+  (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is
+  selected by a flag can be driven.
 - `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
   `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
   fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
@@ -36,6 +40,13 @@ internal refactors, CI, or test-only changes.
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
+- `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
+  Android launches an activity rather than a command line — `am start` takes intent extras, not
+  program arguments — so anything beyond the `package/.Activity` component and an optional `.apk`
+  was being dropped, and the launch reported success for an app configured differently from what
+  was asked. The error names the element it could not use, so the correction is to drop it. A call
+  that used to succeed can now fail, which is a change rather than an addition: it ships in a
+  minor because the caller is an agent that can read the error and retry within the same session.
 - Every cell of [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) that is not `yes` now
   names the native token behind it as its own clause — `n/a (reports AXStaticText instead)`,
   `gap (AXPopUpButton arrives unmapped)` — instead of leaving it buried in prose. That is the fact
@@ -89,6 +100,10 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- macOS: an app that hands off to LaunchServices — a bundle whose executable re-execs itself, so
+  glass adopts the resulting process rather than the one it spawned — now receives the launch
+  arguments from `run`. They were dropped on that path while the directly-spawned path passed
+  them, so the same `run` launched differently configured apps depending on which arm ran.
 - A contained app launched on the Wayland backend can now reach an Xwayland display through the
   ordinary X11 socket (`/tmp/.X11-unix`), which the sandbox's ephemeral `/tmp` previously hid.
   X11 clients that fall back to the abstract socket were unaffected; ones that don't failed to

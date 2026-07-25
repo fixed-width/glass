@@ -81,10 +81,18 @@ ids are in [Conventions](#conventions) above):
 
 Build, launch, and locate a native GUI app; returns its window geometry.
 
-- `run` (array of string, **required**) — program and arguments; `run[0]` is the executable.
+- `run` (array of string, **required**) — what to launch, then its arguments. `run[0]` is the
+  executable on a desktop backend, an `.app` path or bundle id on `ios`, and a
+  `package/.Activity` component — optionally with an `.apk` to install first — on `android`.
+  `run[1..]` are the app's own arguments, passed to the launched process; `android` launches an
+  activity rather than a command line, so it has nowhere to put them and returns an error naming
+  what it could not use rather than ignoring it.
 - `build` (string) — shell command run in `cwd` before launching.
 - `cwd` (string) — working directory for `build` and `run`.
-- `env` (object) — extra environment variables for the launched app, as `{ "KEY": "VALUE" }` pairs.
+- `env` (object) — extra environment variables, as `{ "KEY": "VALUE" }` pairs. They reach the
+  launched app on the desktop backends and on `ios`; on `android` they configure the `build`
+  command on the host only, since an app launched by `am start` is forked from zygote and never
+  sees the shell's environment.
 - `backend` (string) — `"x11"` or `"wayland"` (Linux), `"windows"` (Windows host), `"macos"` (macOS
   host), `"android"` (an AVD emulator, any host), or `"ios"` (an iOS Simulator, macOS host). Omit for
   the server default (`GLASS_BACKEND`, else `windows` on Windows, `macos` on macOS, else `x11`).
