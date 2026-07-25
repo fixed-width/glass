@@ -5,14 +5,19 @@ roles. This page states which roles each backend can produce.
 
 Each node also carries the backend's own token — the AT-SPI role, the UIA control type, the AX
 role string, the Android widget class, the iOS role string. When glass has no mapping for a
-token the role is `Other` and the token is still reported, so nothing is hidden; a `role:`
-selector just will not match it.
+token the role is `Other` and the outline shows the token in brackets — `Other(AXDisclosureTriangle)`
+— so nothing is hidden; a `role:` selector just will not match it.
 
 A cell reads:
 
 - `yes` — the backend produces this role.
-- `n/a` — the platform has no counterpart. The reason says what it does instead.
+- `n/a` — the platform has no counterpart. The reason says why: what the platform does instead,
+  or that the concept simply does not exist there.
 - `gap` — the platform has a counterpart glass does not map yet.
+
+On Android, `Window` holds for the `uiautomator` reader, which wraps the dump in a window root
+sized to the app window. The on-device accessibility-service reader instead roots the tree at the
+device's own node, which is classified like any other node from its widget class.
 
 <!-- BEGIN GENERATED: role-support -->
 | Role | Linux (AT-SPI) | Windows (UIA) | macOS (AX) | Android | iOS |
@@ -22,7 +27,7 @@ A cell reads:
 | `Dialog` | yes | gap | gap | gap | gap |
 | `Group` | yes | yes | yes | yes | gap |
 | `Button` | yes | yes | yes | yes | yes |
-| `ToggleButton` | yes | gap | n/a | yes | yes |
+| `ToggleButton` | yes | gap | gap | yes | yes |
 | `RadioButton` | yes | yes | yes | yes | gap |
 | `CheckBox` | yes | yes | yes | yes | yes |
 | `MenuBar` | yes | yes | yes | n/a | n/a |
@@ -62,7 +67,7 @@ A cell reads:
 - `Dialog` / iOS — gap: alert and action-sheet tokens are not mapped yet
 - `Group` / iOS — gap: no container token is mapped yet
 - `ToggleButton` / Windows (UIA) — gap: UIA exposes a toggle as a control type plus the Toggle pattern, which the map does not key on yet
-- `ToggleButton` / macOS (AX) — n/a: AppKit reports switches as AXCheckBox; there is no separate toggle-button role
+- `ToggleButton` / macOS (AX) — gap: AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; subroles are not read yet
 - `RadioButton` / iOS — gap: no radio token is mapped yet
 - `MenuBar` / Android — n/a: Android apps have no menu bar
 - `MenuBar` / iOS — n/a: iOS apps have no menu bar

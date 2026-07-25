@@ -175,7 +175,7 @@ mod tests {
         use glass_core::role_support::{support, AxBackend, RoleSupport};
         for role in AxRole::ALL {
             let mapped = ROLE_SAMPLES.iter().any(|(_, r)| *r == role);
-            match support(role, AxBackend::Linux) {
+            match support(role, AxBackend::Linux).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(
                         mapped,

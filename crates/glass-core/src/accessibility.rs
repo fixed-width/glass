@@ -90,6 +90,53 @@ impl AxRole {
         AxRole::Heading,
     ];
 
+    /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
+    /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
+    /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
+    /// every one of them; this match stops compiling until the variant is classified — listed in
+    /// the first arm and in `ALL`, or in the second arm as a deliberate exclusion.
+    #[expect(dead_code, reason = "exists only for its exhaustive match")]
+    fn all_is_exhaustive(role: AxRole) {
+        match role {
+            AxRole::Application
+            | AxRole::Window
+            | AxRole::Dialog
+            | AxRole::Group
+            | AxRole::Button
+            | AxRole::ToggleButton
+            | AxRole::RadioButton
+            | AxRole::CheckBox
+            | AxRole::MenuBar
+            | AxRole::Menu
+            | AxRole::MenuItem
+            | AxRole::Label
+            | AxRole::TextField
+            | AxRole::TextArea
+            | AxRole::ComboBox
+            | AxRole::List
+            | AxRole::ListItem
+            | AxRole::Table
+            | AxRole::Cell
+            | AxRole::Tree
+            | AxRole::TreeItem
+            | AxRole::TabList
+            | AxRole::Tab
+            | AxRole::ScrollBar
+            | AxRole::Slider
+            | AxRole::SpinButton
+            | AxRole::ProgressBar
+            | AxRole::Image
+            | AxRole::Link
+            | AxRole::Separator
+            | AxRole::Toolbar
+            | AxRole::StatusBar
+            | AxRole::Heading => {}
+            // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
+            // mapping target.
+            AxRole::Other => {}
+        }
+    }
+
     /// Whether this role denotes an element a user acts on (clicks / types into) —
     /// the elements worth a Set-of-Mark number. Containers, the window, and static
     /// text return `false`.

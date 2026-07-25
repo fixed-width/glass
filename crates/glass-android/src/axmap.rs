@@ -465,7 +465,7 @@ mod tests {
                 // which comes from `class_to_role` like any other node. Exempt Window since
                 // `class_to_role` cannot produce it.
                 || role == AxRole::Window;
-            match support(role, AxBackend::Android) {
+            match support(role, AxBackend::Android).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no class maps to it")
                 }

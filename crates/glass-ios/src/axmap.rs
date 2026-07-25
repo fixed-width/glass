@@ -608,7 +608,7 @@ mod tests {
         use glass_core::role_support::{support, AxBackend, RoleSupport};
         for role in AxRole::ALL {
             let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
-            match support(role, AxBackend::Ios) {
+            match support(role, AxBackend::Ios).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no token maps to it")
                 }

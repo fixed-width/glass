@@ -37,6 +37,21 @@ impl AxBackend {
         AxBackend::Ios,
     ];
 
+    /// Compile-time guard for [`AxBackend::ALL`] — never called, and exists only for its
+    /// exhaustive match. Every completeness claim on the matrix is quantified over `ALL`, so a
+    /// new backend that is not added there would silently weaken all of them; this match stops
+    /// compiling until the new variant is listed here and in `ALL`.
+    #[expect(dead_code, reason = "exists only for its exhaustive match")]
+    fn all_is_exhaustive(backend: AxBackend) {
+        match backend {
+            AxBackend::Linux
+            | AxBackend::Windows
+            | AxBackend::MacOs
+            | AxBackend::Android
+            | AxBackend::Ios => {}
+        }
+    }
+
     /// Human-readable column heading, naming the native vocabulary.
     pub fn label(self) -> &'static str {
         match self {
@@ -54,14 +69,16 @@ impl AxBackend {
 pub enum RoleSupport {
     /// At least one native token maps to this role.
     Mapped,
-    /// The platform has no counterpart. The reason says what it does instead.
+    /// The platform has no counterpart. The reason says why — either what the platform does
+    /// instead, or simply that the concept does not exist there.
     NotApplicable(&'static str),
     /// The platform has a counterpart glass does not map yet. The reason says what is missing.
     Gap(&'static str),
 }
 
-/// Role coverage per backend. Cells are ordered as [`AxBackend::ALL`].
-pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; 5])] =
+/// Role coverage per backend. Cells are ordered as [`AxBackend::ALL`], and the row type is sized
+/// from it so a new backend is a compile error here rather than a silent column mismatch.
+pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
     {
         use AxRole as R;
         use RoleSupport::{Gap, Mapped, NotApplicable};
@@ -104,8 +121,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; 5])] =
                 Mapped,
                 Gap("UIA exposes a toggle as a control type plus the Toggle pattern, which the \
                      map does not key on yet"),
-                NotApplicable("AppKit reports switches as AXCheckBox; there is no separate \
-                               toggle-button role"),
+                Gap("AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
+                     subrole; subroles are not read yet"),
                 Mapped,
                 Mapped,
             ],
@@ -333,18 +350,19 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; 5])] =
     ]
     };
 
-/// Declared support for one role on one backend. Panics only if [`ROLE_SUPPORT`] is missing a
-/// row, which the module's own test forbids.
-pub fn support(role: AxRole, backend: AxBackend) -> RoleSupport {
-    let idx = AxBackend::ALL
-        .iter()
-        .position(|b| *b == backend)
-        .expect("AxBackend::ALL covers every backend");
+/// Declared support for one role on one backend, or `None` when [`ROLE_SUPPORT`] has no row for
+/// `role`.
+///
+/// [`AxRole::Other`] is the sink for unmapped native tokens rather than a mapping target, so it
+/// deliberately has no row: asking about it — which is what walking a real snapshot's roles
+/// does — answers `None` instead of failing. Total; the backend lookup cannot fail because
+/// [`AxBackend::ALL`] is exhaustive.
+pub fn support(role: AxRole, backend: AxBackend) -> Option<RoleSupport> {
+    let idx = AxBackend::ALL.iter().position(|b| *b == backend)?;
     ROLE_SUPPORT
         .iter()
         .find(|(r, _)| *r == role)
         .map(|(_, cells)| cells[idx])
-        .unwrap_or_else(|| panic!("ROLE_SUPPORT has no row for {role:?}"))
 }
 
 /// Render [`ROLE_SUPPORT`] as the markdown block in `docs/reference/a11y-roles.md`: a
@@ -438,12 +456,19 @@ mod tests {
     fn support_reads_the_right_cell() {
         assert_eq!(
             support(AxRole::Button, AxBackend::Linux),
-            RoleSupport::Mapped
+            Some(RoleSupport::Mapped)
         );
         assert!(matches!(
             support(AxRole::MenuBar, AxBackend::Ios),
-            RoleSupport::NotApplicable(_)
+            Some(RoleSupport::NotApplicable(_))
         ));
+    }
+
+    #[test]
+    fn support_of_other_is_none_rather_than_a_panic() {
+        // `Other` has no row by design, and a caller asking about every role in a real
+        // snapshot will hit it — that must answer `None`, not blow up mid-walk.
+        assert_eq!(support(AxRole::Other, AxBackend::Linux), None);
     }
 
     #[test]
@@ -451,7 +476,7 @@ mod tests {
         // AT-SPI is the reference vocabulary: every role must be reachable there.
         for role in AxRole::ALL {
             assert_eq!(
-                support(role, AxBackend::Linux),
+                support(role, AxBackend::Linux).expect("declared in ROLE_SUPPORT"),
                 RoleSupport::Mapped,
                 "{role:?} unmapped on the reference backend"
             );

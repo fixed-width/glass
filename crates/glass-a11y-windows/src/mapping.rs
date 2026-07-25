@@ -203,7 +203,7 @@ mod tests {
         use glass_core::AxRole;
         for role in AxRole::ALL {
             let mapped = ROLE_TOKENS.iter().any(|(_, _, r)| *r == role);
-            match support(role, AxBackend::Windows) {
+            match support(role, AxBackend::Windows).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(
                         mapped,
