@@ -190,9 +190,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     /// The screen to show, as an index into the tab controller.
     ///
     /// Named by `ROLE_FIXTURE_TAB=controls|collection|swiftui` in the environment, or by a
-    /// `--tab=<name>` launch argument. The environment is what glass can set (`AppSpec::env`
-    /// reaches the app as `SIMCTL_CHILD_*`), since `AppSpec::run`'s tail is not passed through to
-    /// `simctl launch`; the argument form is for driving `simctl` by hand.
+    /// `--tab=<name>` launch argument. Either reaches the app through glass — `AppSpec::env`
+    /// arrives as `SIMCTL_CHILD_*`, and `AppSpec::run`'s tail is forwarded to `simctl launch` —
+    /// or through `simctl` driven by hand.
     ///
     /// Only the joined `--tab=<name>` form works: `simctl launch` forwards it, but drops the
     /// value of a separated `--tab <name>`, which would leave this reading a flag with nothing

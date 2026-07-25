@@ -37,8 +37,8 @@ xcrun simctl launch booted tech.fixedwidth.glassrolefixture
 
 The tab bar's items are not accessibility elements, so nothing in the tree can be aimed at to
 switch tabs — and a synthetic tap at the bar's coordinates does not switch them either. The screen
-is chosen at launch instead, by environment variable (what glass can set, via `AppSpec::env`) or
-by launch argument (for driving `simctl` by hand):
+is chosen at launch instead, by environment variable or by launch argument. Both reach the app
+through glass (`AppSpec::env` and `AppSpec::run`'s tail) as well as through `simctl` by hand:
 
 ```bash
 xcrun simctl launch booted tech.fixedwidth.glassrolefixture --tab=collection    # or: swiftui
@@ -73,4 +73,5 @@ GLASS_A11Y_PROBE_APPS="$PWD/build/RoleFixture.app" \
 ```
 
 The probe launches the app without arguments, so it reads the Controls screen; set
-`SIMCTL_CHILD_ROLE_FIXTURE_TAB` in its environment to probe another.
+`SIMCTL_CHILD_ROLE_FIXTURE_TAB` in its environment to probe another, or pass `--tab=<name>` after
+the `.app` path in `GLASS_A11Y_PROBE_APPS`-driven runs that build their own `AppSpec`.

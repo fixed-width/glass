@@ -4,6 +4,7 @@ use glass_core::{GlassError, Result};
 ///
 /// Convention: the first element containing `/` that does not end in `.apk` is the
 /// launch component `package/.Activity`; an element ending in `.apk` is installed first.
+/// Those two are the whole vocabulary — see [`parse_launch`] for why nothing else is allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchTarget {
     pub component: String,
@@ -29,6 +30,31 @@ pub fn parse_launch(run: &[String]) -> Result<LaunchTarget> {
             "malformed component {component:?}; expected package/.Activity"
         )));
     }
+
+    // Anything the two rules above did not consume has nowhere to go: `am start` takes intent
+    // extras (`-e key value`), not a program's argument vector, so a trailing element is not
+    // something this backend can honour. Say so rather than launching a differently-configured
+    // app than the caller asked for and reporting success — the other backends really do pass
+    // `run[1..]` to the process, which is exactly why silence here would mislead.
+    let leftover: Vec<&str> = run
+        .iter()
+        .map(String::as_str)
+        .filter(|a| Some(*a) != apk.as_deref() && *a != component)
+        .collect();
+    if !leftover.is_empty() {
+        return Err(GlassError::AppNotStarted(format!(
+            "AppSpec.run carries {} this backend cannot pass on: {}. Android launches an \
+             activity rather than a command line — `am start` takes intent extras, not program \
+             arguments — so put launch configuration in spec.env, which reaches the app",
+            if leftover.len() == 1 {
+                "an element"
+            } else {
+                "elements"
+            },
+            leftover.join(", ")
+        )));
+    }
+
     Ok(LaunchTarget {
         component,
         package,
@@ -102,5 +128,45 @@ mod tests {
             ["shell", "am", "start", "-W", "-n", "p/.A"]
         );
         assert_eq!(force_stop_args("p"), ["shell", "am", "force-stop", "p"]);
+    }
+
+    #[test]
+    fn an_element_that_is_neither_the_apk_nor_the_component_is_an_error() {
+        // `am start` takes intent extras, not app arguments, so there is nowhere for a trailing
+        // element to go. Dropping it quietly would launch a differently-configured app than the
+        // caller asked for and report success.
+        let run = vec![
+            "com.example.app/.MainActivity".to_string(),
+            "--tab=collection".to_string(),
+        ];
+        let err = parse_launch(&run).expect_err("a leftover element must not be ignored");
+        let message = err.to_string();
+        assert!(
+            message.contains("--tab=collection"),
+            "the error must name what it could not use, got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_error_points_at_the_env_route_that_does_work() {
+        let run = vec![
+            "com.example.app/.MainActivity".to_string(),
+            "extra".to_string(),
+        ];
+        let message = parse_launch(&run).unwrap_err().to_string();
+        assert!(
+            message.contains("env"),
+            "the error must say where launch configuration does go, got: {message}"
+        );
+    }
+
+    #[test]
+    fn an_apk_and_a_component_together_are_still_accepted() {
+        let run = vec![
+            "/tmp/app.apk".to_string(),
+            "com.example.app/.MainActivity".to_string(),
+        ];
+        let target = parse_launch(&run).expect("apk + component is the documented shape");
+        assert_eq!(target.apk.as_deref(), Some("/tmp/app.apk"));
     }
 }

@@ -17,6 +17,9 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
+  the `.app` path or bundle id in `run` reaches the app as its own arguments, the same as on the
+  desktop backends, so an app whose behaviour is selected by a flag can be driven.
 - `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
   `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
   fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
@@ -36,6 +39,11 @@ internal refactors, CI, or test-only changes.
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
+- `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
+  Android launches an activity rather than a command line — `am start` takes intent extras, not
+  program arguments — so anything beyond the `package/.Activity` component and an optional `.apk`
+  was being dropped, and the launch reported success for an app configured differently from what
+  was asked. The error names the leftover and points at `env`, which does reach the app.
 - Every cell of [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) that is not `yes` now
   names the native token behind it as its own clause — `n/a (reports AXStaticText instead)`,
   `gap (AXPopUpButton arrives unmapped)` — instead of leaving it buried in prose. That is the fact

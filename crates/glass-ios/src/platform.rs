@@ -86,6 +86,25 @@ fn looks_like_app_path(s: &str) -> bool {
     s.ends_with(".app") || s.contains('/')
 }
 
+/// The `simctl launch` sub-command argv: the verb, the target simulator and bundle, then the
+/// app's own launch arguments.
+///
+/// `app_args` is `spec.run[1..]` — everything after the bundle id or `.app` path. `simctl launch`
+/// forwards them to the launched process, where they arrive as `ProcessInfo.arguments`, so a
+/// caller can drive an app that takes a flag. They are placed after the bundle id, which is where
+/// `simctl` stops reading arguments as its own: a caller's `--console` is their app's flag, not a
+/// request for simctl's console mode.
+pub(crate) fn launch_args(udid: &str, bundle_id: &str, app_args: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "launch".to_string(),
+        "--terminate-running-process".to_string(),
+        udid.to_string(),
+        bundle_id.to_string(),
+    ];
+    argv.extend(app_args.iter().cloned());
+    argv
+}
+
 /// Split `spec.run` into `(optional install path, bundle id)`. `run[0]` naming a path (it
 /// ends in `.app` or contains a `/`) is installed via `simctl install`, with its bundle id
 /// read from the bundle's `Info.plist`; otherwise `run[0]` is used directly as the bundle id
@@ -311,12 +330,11 @@ impl Platform for IosPlatform {
         // `simctl launch` to the launched process, so `spec.env` is set that way rather than on
         // this (glass's own) process.
         let mut launch = Command::new(self.target.simctl().program());
-        launch.args(self.target.simctl().full_args(&[
-            "launch",
-            "--terminate-running-process",
-            udid,
-            &bundle_id,
-        ]));
+        // `spec.run[1..]` are the app's launch arguments; `run[0]` was consumed above as the
+        // bundle id (or the `.app` to install first).
+        let sub = launch_args(udid, &bundle_id, spec.run.get(1..).unwrap_or_default());
+        let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
+        launch.args(self.target.simctl().full_args(&sub));
         for (k, v) in &spec.env {
             launch.env(format!("SIMCTL_CHILD_{k}"), v);
         }
@@ -831,5 +849,53 @@ mod state_machine_tests {
             p.set_clipboard("x").unwrap_err(),
             GlassError::NoActiveSession
         ));
+    }
+}
+
+#[cfg(test)]
+mod launch_args_tests {
+    use super::launch_args;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let extra: Vec<String> = extra.iter().map(|s| (*s).to_string()).collect();
+        launch_args("UDID", "com.example.app", &extra)
+    }
+
+    #[test]
+    fn a_run_with_no_arguments_launches_the_bundle_alone() {
+        assert_eq!(
+            args(&[]),
+            [
+                "launch",
+                "--terminate-running-process",
+                "UDID",
+                "com.example.app"
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_follow_the_bundle_id_in_order() {
+        assert_eq!(
+            args(&["--tab=collection", "--verbose"]),
+            [
+                "launch",
+                "--terminate-running-process",
+                "UDID",
+                "com.example.app",
+                "--tab=collection",
+                "--verbose"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_argument_that_looks_like_a_simctl_flag_still_lands_after_the_bundle_id() {
+        // Everything after the bundle id belongs to the app, not to simctl: a caller passing
+        // `--console` means their app's flag, and it must not be read as simctl's own.
+        let built = args(&["--console"]);
+        let bundle = built.iter().position(|a| a == "com.example.app").unwrap();
+        let flag = built.iter().position(|a| a == "--console").unwrap();
+        assert!(flag > bundle, "app arguments must follow the bundle id");
     }
 }
