@@ -39,7 +39,7 @@ pub fn run_chord<S: ChordSink>(sink: &mut S) -> crate::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_chord, ChordSink, CHORD_DWELL};
+    use super::{CHORD_DWELL, ChordSink, run_chord};
     use crate::Result;
 
     #[derive(Debug, PartialEq)]

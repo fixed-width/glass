@@ -333,8 +333,8 @@ mod tests {
 
     #[test]
     fn map_matches_declared_column() {
-        use glass_core::role_support::{support, AxBackend, RoleSupport};
         use glass_core::AxRole;
+        use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             // Only a row carrying `Some(role)` produces a role; a named-but-unmapped control
             // type yields `Other` and must not count as coverage. `ToggleButton` is the one

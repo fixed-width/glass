@@ -58,11 +58,11 @@ impl SharedLog {
     /// wakes a readiness waiter so it stops waiting for a line that will never come.
     pub fn mark_done(&self) {
         let (lock, cv) = &*self.0;
-        if let Ok(mut inner) = lock.lock() {
-            if !inner.finished {
-                inner.finished = true;
-                cv.notify_all();
-            }
+        if let Ok(mut inner) = lock.lock()
+            && !inner.finished
+        {
+            inner.finished = true;
+            cv.notify_all();
         }
     }
 

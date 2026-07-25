@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use glass_core::{GlassError, Result};
 
-use crate::device::{parse_devices, resolve, Resolve};
+use crate::device::{Resolve, parse_devices, resolve};
 use crate::simctl::Simctl;
 
 /// UDIDs of simulators glass booted itself, so they can be shut down explicitly rather than

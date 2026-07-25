@@ -7,9 +7,9 @@
 use glass_core::{Check, CheckStatus};
 
 use crate::adb::Adb;
-use crate::avd::{decide, parse_list_avds, resolve_emulator_bin, Action, Lifecycle};
+use crate::avd::{Action, Lifecycle, decide, parse_list_avds, resolve_emulator_bin};
 use crate::axmap::check_dump_status;
-use crate::target::{parse_devices, Device};
+use crate::target::{Device, parse_devices};
 
 /// Skip detail the deep-capture checks (`screencap`, `uiautomator`) emit when `--deep`
 /// wasn't requested. Exposed so `glass-mcp` can recognise it and correct the wording when

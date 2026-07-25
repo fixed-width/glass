@@ -113,7 +113,7 @@ pub fn build_tree(
         _ => {
             return Err(GlassError::AccessibilityUnavailable(
                 "idb a11y JSON: unexpected root".into(),
-            ))
+            ));
         }
     };
     let root = AxNode {
@@ -293,8 +293,8 @@ fn frame_to_rect(f: &Value, scale: f64) -> Option<AxRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::{AxNode, AxRole};
     use glass_core::WindowGeometry;
+    use glass_core::accessibility::{AxNode, AxRole};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/describe_nested.json");
 
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn map_matches_declared_column() {
-        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
             match support(role, AxBackend::Ios).expect("declared in ROLE_SUPPORT") {

@@ -11,20 +11,20 @@
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
     DV_E_FORMATETC, E_NOTIMPL, E_OUTOFMEMORY, E_UNEXPECTED, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
-    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
-    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
+    IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
+use windows::core::{BOOL, Error, HRESULT, Ref, Result, implement};
 
 use crate::proto::FormatKey;
 
 use super::{
-    alloc_hglobal_bytes, id_of, key_of, locale_blob, unicode_to_codepage, CF_DIBV5, CF_LOCALE,
-    CF_OEMTEXT, CF_TEXT,
+    CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT, alloc_hglobal_bytes, id_of, key_of, locale_blob,
+    unicode_to_codepage,
 };
 
 /// Run a vtable-method body, converting a panic (UB across the `extern "system"` COM boundary) into
@@ -90,11 +90,7 @@ impl IEnumFORMATETC_Impl for StoreEnum_Impl {
                 // SAFETY: caller out-param; may be null (then ignored).
                 unsafe { *pceltfetched = n };
             }
-            if n == celt {
-                S_OK
-            } else {
-                S_FALSE
-            }
+            if n == celt { S_OK } else { S_FALSE }
         })
     }
     fn Skip(&self, celt: u32) -> Result<()> {

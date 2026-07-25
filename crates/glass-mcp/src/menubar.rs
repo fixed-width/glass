@@ -48,7 +48,7 @@ pub fn run(_cfg: ServeConfig) -> anyhow::Result<()> {
 mod macos {
     use std::io::ErrorKind;
 
-    use glass_macos::onboarding_window::{run_checklist, ChecklistActions};
+    use glass_macos::onboarding_window::{ChecklistActions, run_checklist};
 
     use super::ServeConfig;
     use crate::serve;

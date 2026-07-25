@@ -43,8 +43,8 @@ mod macos_main {
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        role_histogram, Accessibility, AppSpec, AxContext, AxRole, AxTree, Platform, SandboxLevel,
-        WalkLimits,
+        Accessibility, AppSpec, AxContext, AxRole, AxTree, Platform, SandboxLevel, WalkLimits,
+        role_histogram,
     };
     use glass_macos::MacosPlatform;
 

@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn map_matches_declared_column() {
-        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             let mapped = CLASS_TOKENS.iter().any(|(_, r)| *r == role)
                 || RULE_ROLES.contains(&role)

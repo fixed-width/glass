@@ -248,16 +248,24 @@ fn find_launcher() -> Option<PathBuf> {
 /// resolvable binary can still fail to spawn — but it catches the common "AT-SPI not
 /// installed" and misconfigured-path cases.
 pub fn available() -> std::result::Result<(), String> {
-    if find_launcher().is_none() {
+    // `tool_path` returns an explicit path (from GLASS_DBUS_DAEMON) or the bare "dbus-daemon"
+    // name resolved on PATH at spawn time. Only an explicit path can be checked here.
+    available_with(
+        find_launcher(),
+        &glass_core::tool_path("GLASS_DBUS_DAEMON", "dbus-daemon"),
+    )
+}
+
+/// [`available`] against already-resolved inputs — the testable seam (no global env), so a test
+/// can force either branch without `set_var` racing a concurrent env reader.
+fn available_with(launcher: Option<PathBuf>, dbus: &str) -> std::result::Result<(), String> {
+    if launcher.is_none() {
         return Err(
             "at-spi-bus-launcher not found (install at-spi2-core), or set GLASS_ATSPI_LAUNCHER"
                 .into(),
         );
     }
-    // `tool_path` returns an explicit path (from GLASS_DBUS_DAEMON) or the bare "dbus-daemon"
-    // name resolved on PATH at spawn time. Only an explicit path can be checked here.
-    let dbus = glass_core::tool_path("GLASS_DBUS_DAEMON", "dbus-daemon");
-    if dbus.contains('/') && !std::path::Path::new(&dbus).is_file() {
+    if dbus.contains('/') && !std::path::Path::new(dbus).is_file() {
         return Err(format!("dbus-daemon not found at {dbus}"));
     }
     Ok(())
@@ -380,26 +388,26 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// An unresolvable launcher must report unavailable with an actionable message, whether or
+    /// not at-spi2-core is installed on the test host. Drives the seam directly rather than
+    /// pointing `GLASS_ATSPI_LAUNCHER` at a nonexistent path — mutating the process environment
+    /// would race every other test in this binary (and is `unsafe` from edition 2024 on).
     #[test]
     fn available_errors_when_the_atspi_launcher_is_missing() {
-        // Point the launcher override at a nonexistent path so the check is deterministic
-        // regardless of whether at-spi2-core is installed on the test host. Restore on drop.
-        struct Guard(Option<std::ffi::OsString>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("GLASS_ATSPI_LAUNCHER", v),
-                    None => std::env::remove_var("GLASS_ATSPI_LAUNCHER"),
-                }
-            }
-        }
-        let _g = Guard(std::env::var_os("GLASS_ATSPI_LAUNCHER"));
-        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/nonexistent/glass-no-atspi");
-        let err = available().expect_err("missing launcher must report unavailable");
+        let err = available_with(None, "dbus-daemon")
+            .expect_err("missing launcher must report unavailable");
         assert!(
             err.contains("at-spi-bus-launcher"),
             "actionable message: {err}"
         );
+    }
+
+    /// The other preflight branch: an explicit `$GLASS_DBUS_DAEMON` path that is not a file.
+    #[test]
+    fn available_errors_when_an_explicit_dbus_daemon_path_is_missing() {
+        let err = available_with(Some(PathBuf::from("/bin/true")), "/nonexistent/dbus-daemon")
+            .expect_err("an explicit dbus-daemon path that is not a file must be reported");
+        assert!(err.contains("dbus-daemon not found"), "actionable: {err}");
     }
 
     #[test]
@@ -474,18 +482,25 @@ mod tests {
     /// there is no activation fallback. If that launcher never claims the name (here a stand-in
     /// that exits immediately without claiming it), `PrivateBus::start` must fail loudly and
     /// promptly — naming the dead launcher — rather than hanging or returning a broken address.
+    ///
+    /// Drives `PrivateBus::start`, which resolves the launcher from the environment, so this one
+    /// must set `GLASS_ATSPI_LAUNCHER` on the process — hence the `unsafe_code` opt-out.
     #[test]
     #[ignore = "spawns a private dbus-daemon; run via test-a11y.sh"]
+    #[allow(unsafe_code)]
     fn launcher_that_never_claims_the_name_fails_fast() {
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {
-                std::env::remove_var("GLASS_ATSPI_LAUNCHER");
+                // SAFETY: test-a11y.sh runs this suite with `--test-threads=1`, so no other
+                // thread is reading the environment while it is mutated.
+                unsafe { std::env::remove_var("GLASS_ATSPI_LAUNCHER") };
             }
         }
         // /bin/true is a real file (find_launcher accepts it) that exits 0 without ever
         // claiming org.a11y.Bus.
-        std::env::set_var("GLASS_ATSPI_LAUNCHER", "/bin/true");
+        // SAFETY: as above — single-threaded harness (`--test-threads=1`).
+        unsafe { std::env::set_var("GLASS_ATSPI_LAUNCHER", "/bin/true") };
         let _guard = EnvGuard;
 
         let started = Instant::now();

@@ -63,10 +63,10 @@ pub fn build_profile(level: SandboxLevel, opts: &ProfileOpts) -> String {
     if is_safe_reallow(&opts.cwd) {
         emit_read_allow(&mut p, &opts.cwd);
     }
-    if let Some(dir) = opts.program.parent().filter(|d| !d.as_os_str().is_empty()) {
-        if is_safe_reallow(dir) {
-            emit_read_allow(&mut p, dir);
-        }
+    if let Some(dir) = opts.program.parent().filter(|d| !d.as_os_str().is_empty())
+        && is_safe_reallow(dir)
+    {
+        emit_read_allow(&mut p, dir);
     }
     for b in opts.ro_binds.iter().filter(|b| is_safe_reallow(b)) {
         emit_read_allow(&mut p, b);

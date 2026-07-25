@@ -8,12 +8,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use glass_core::{
-    platform::Segment, Actuation, ActuationContext, AuditOutcome, AuditSink, KeyEvent, Modifier,
-    MouseButton, PointerEvent, WindowOp,
+    Actuation, ActuationContext, AuditOutcome, AuditSink, KeyEvent, Modifier, MouseButton,
+    PointerEvent, WindowOp, platform::Segment,
 };
 use rand::TryRng;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,14 +539,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f["text"], "s");
-        assert!(render_content(
-            "s",
-            &AuditConfig {
-                content: ContentMode::None,
-                prefix_len: 8
-            }
-        )
-        .is_none());
+        assert!(
+            render_content(
+                "s",
+                &AuditConfig {
+                    content: ContentMode::None,
+                    prefix_len: 8
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -841,7 +843,7 @@ mod tests {
     fn end_to_end_actuations_logged_reads_not() {
         use crate::params::*;
         use crate::tools;
-        use crate::tools::testutil::{glass_with, FakePlatform};
+        use crate::tools::testutil::{FakePlatform, glass_with};
         use glass_core::Frame;
 
         let dir = tempfile::tempdir().unwrap();

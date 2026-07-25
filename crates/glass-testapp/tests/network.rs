@@ -12,10 +12,10 @@ use std::time::Duration;
 use base64::Engine;
 use common::Xvfb;
 use glass_mcp::serve::config::ServeConfig;
-use rmcp::model::CallToolRequestParams;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
+use rmcp::model::CallToolRequestParams;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 

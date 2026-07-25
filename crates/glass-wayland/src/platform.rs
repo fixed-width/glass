@@ -33,7 +33,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 
 use std::collections::HashMap;
 
-use crate::command::{build_sway_command, sway_config, LogSink};
+use crate::command::{LogSink, build_sway_command, sway_config};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
 
@@ -128,12 +128,12 @@ pub(crate) fn resolve_sway() -> Result<PathBuf> {
             return Ok(cand);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("sway/bin/sway");
-            if cand.is_file() {
-                return Ok(cand);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join("sway/bin/sway");
+        if cand.is_file() {
+            return Ok(cand);
         }
     }
     Err(GlassError::Backend(
@@ -877,15 +877,14 @@ impl Platform for WaylandPlatform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         // Fail-closed: if a sandbox was requested but bwrap is unavailable, error
         // immediately rather than launching unconfined.
-        if spec.sandbox != glass_core::SandboxLevel::Off {
-            if let glass_sandbox_linux::Availability::Unavailable(why) =
+        if spec.sandbox != glass_core::SandboxLevel::Off
+            && let glass_sandbox_linux::Availability::Unavailable(why) =
                 glass_sandbox_linux::availability()
-            {
-                return Err(GlassError::SandboxUnavailable(format!(
-                    "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
+        {
+            return Err(GlassError::SandboxUnavailable(format!(
+                "{why}. Install bubblewrap / enable unprivileged user namespaces, or pass \
                      sandbox:\"off\" (GLASS_SANDBOX=off) to run unconfined. See `glass-mcp doctor`."
-                )));
-            }
+            )));
         }
 
         // Run the build step (if any) before the compositor starts. The build is

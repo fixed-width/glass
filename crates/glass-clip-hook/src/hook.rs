@@ -13,14 +13,14 @@
 
 use std::sync::OnceLock;
 
-use windows::core::{PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HGLOBAL};
 use windows::Win32::Security::RevertToSelf;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
+use windows::core::{PCSTR, PCWSTR};
 
 use crate::hglobal::{HGlobalLock, OwnedHGlobal};
 
@@ -278,7 +278,7 @@ pub(crate) fn alloc_hglobal_bytes(bytes: &[u8]) -> Option<HGLOBAL> {
 
 /// CF_UNICODETEXT bytes → CF_TEXT/CF_OEMTEXT bytes via the real code page (ANSI/OEM).
 pub(crate) fn unicode_to_codepage(utf16_bytes: &[u8], oem: bool) -> Vec<u8> {
-    use windows::Win32::Globalization::{WideCharToMultiByte, CP_ACP, CP_OEMCP};
+    use windows::Win32::Globalization::{CP_ACP, CP_OEMCP, WideCharToMultiByte};
     let units: Vec<u16> = utf16_bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -303,10 +303,14 @@ pub(crate) fn unicode_to_codepage(utf16_bytes: &[u8], oem: bool) -> Vec<u8> {
 /// Caller transmutes the returned address to the export's exact ABI signature.
 pub(crate) unsafe fn user32_proc(name: &[u8]) -> Option<*const ()> {
     // `name` must be a NUL-terminated ASCII byte string (e.g. b"OpenClipboard\0").
-    // SAFETY: "user32.dll\0" is a valid module name literal; GetModuleHandleW returns the loaded
-    // module (user32 is always present in a GUI process). GetProcAddress returns the export or None.
-    let module = GetModuleHandleW(PCWSTR::from_raw(USER32_W.as_ptr())).ok()?;
-    let proc = GetProcAddress(module, PCSTR::from_raw(name.as_ptr()));
+    // SAFETY: "user32.dll\0" is a valid NUL-terminated module name literal; GetModuleHandleW
+    // returns the loaded module (user32 is always present in a GUI process) without taking a
+    // reference, so there is nothing to free. GetProcAddress reads `name` as a NUL-terminated
+    // string — the caller's contract — and returns the export or None.
+    let proc = unsafe {
+        let module = GetModuleHandleW(PCWSTR::from_raw(USER32_W.as_ptr())).ok()?;
+        GetProcAddress(module, PCSTR::from_raw(name.as_ptr()))
+    };
     proc.map(|f| f as *const ())
 }
 
@@ -330,10 +334,13 @@ static USER32_W: [u16; 11] = [
 /// # Safety
 /// Caller transmutes the returned address to the export's exact ABI signature.
 pub(crate) unsafe fn ole32_proc(name: &[u8]) -> Option<*const ()> {
-    // SAFETY: "ole32.dll\0" is a valid module name; an OLE-using app has it loaded. We do NOT
-    // LoadLibrary it — if it isn't loaded, the app isn't using OLE and there's nothing to hook.
-    let module = GetModuleHandleW(PCWSTR::from_raw(OLE32_W.as_ptr())).ok()?;
-    let proc = GetProcAddress(module, PCSTR::from_raw(name.as_ptr()));
+    // SAFETY: "ole32.dll\0" is a valid NUL-terminated module name; an OLE-using app has it
+    // loaded, and we do NOT LoadLibrary it — if it isn't loaded, the app isn't using OLE and
+    // there's nothing to hook. `name` is NUL-terminated per the caller's contract.
+    let proc = unsafe {
+        let module = GetModuleHandleW(PCWSTR::from_raw(OLE32_W.as_ptr())).ok()?;
+        GetProcAddress(module, PCSTR::from_raw(name.as_ptr()))
+    };
     proc.map(|f| f as *const ())
 }
 

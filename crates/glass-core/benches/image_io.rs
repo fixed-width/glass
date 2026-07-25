@@ -3,8 +3,8 @@
 
 mod common;
 
-use common::{gradient, noise, SIZES};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use common::{SIZES, gradient, noise};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use glass_core::{frame_from_webp, frame_to_webp};
 use std::hint::black_box;
 

@@ -55,10 +55,10 @@ pub fn keysym_for_keyname(name: &str) -> Option<u32> {
         return Some(named);
     }
     // Function keys F1..F12 -> 0xffbe..0xffc9
-    if let Some(num) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
-        if (1..=12).contains(&num) {
-            return Some(0xffbd + num);
-        }
+    if let Some(num) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok())
+        && (1..=12).contains(&num)
+    {
+        return Some(0xffbd + num);
     }
     // Single character (case-sensitive; uppercase needs Shift, handled by caller).
     let mut chars = name.chars();

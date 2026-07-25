@@ -1,7 +1,7 @@
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
 use std::simd::cmp::{SimdOrd, SimdPartialOrd};
-use std::simd::{u8x32, Simd};
+use std::simd::{Simd, u8x32};
 
 /// Axis-aligned bounding box of changed pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,11 +382,7 @@ fn color_delta(a: &[u8], oa: usize, b: &[u8], ob: usize, y_only: bool) -> f32 {
     let di = rgb2i(ar, ag, ab) - rgb2i(br, bg, bb);
     let dq = rgb2q(ar, ag, ab) - rgb2q(br, bg, bb);
     let delta = 0.5053 * dy * dy + 0.299 * di * di + 0.1957 * dq * dq;
-    if dy < 0.0 {
-        -delta
-    } else {
-        delta
-    }
+    if dy < 0.0 { -delta } else { delta }
 }
 
 /// True if the pixel at (x,y) has 3+ identical neighbors (frame edges count) — the

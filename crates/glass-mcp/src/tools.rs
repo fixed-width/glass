@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use glass_core::{
-    frame_to_webp, AppSpec, AxNodeId, Glass, MouseButton, WindowGeometry, WindowHint, WindowId,
-    WindowOp,
+    AppSpec, AxNodeId, Glass, MouseButton, WindowGeometry, WindowHint, WindowId, WindowOp,
+    frame_to_webp,
 };
 use serde_json::json;
 
@@ -190,14 +190,15 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
     // up the accessibility bus must still launch and pixel-drive. When a11y is on only because
     // it defaults on (not explicitly requested) and the bus can't start here, launch without
     // it. An explicit a11y:true is left to fail loudly at the backend (no silent fallback).
-    if spec.a11y && a.a11y.is_none() {
-        if let Err(why) = a11y_bus_preflight() {
-            eprintln!(
-                "glass: accessibility is on by default but this host can't start its bus \
+    if spec.a11y
+        && a.a11y.is_none()
+        && let Err(why) = a11y_bus_preflight()
+    {
+        eprintln!(
+            "glass: accessibility is on by default but this host can't start its bus \
                  ({why}); launching without it — pass a11y:true to require it."
-            );
-            spec.a11y = false;
-        }
+        );
+        spec.a11y = false;
     }
     let geo = match a.backend.as_deref() {
         Some(b) => glass.start_on(b, &spec),
@@ -644,7 +645,7 @@ pub(crate) mod testutil {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir); // keep the dir alive for the test
-                               // Factory yields the pre-scripted platform once.
+        // Factory yields the pre-scripted platform once.
         let mut held: Option<Box<dyn Platform + Send>> = Some(Box::new(platform));
         let factory: PlatformFactory = Box::new(move |_backend| {
             let platform = held
@@ -691,7 +692,7 @@ pub(crate) mod testutil {
         fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
             match self.set_outcome {
                 SetOutcome::NotEditable => {
-                    return Err(GlassError::AxElementNotEditable(target.id.0))
+                    return Err(GlassError::AxElementNotEditable(target.id.0));
                 }
                 SetOutcome::Changed => return Err(GlassError::AxElementChanged(target.id.0)),
                 SetOutcome::Ok => {}
@@ -1308,14 +1309,16 @@ mod tests {
         })
         .unwrap();
         a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
-        assert!(click_element(
-            &mut g,
-            &ClickElementArgs {
-                id: 1,
-                return_: None
-            }
-        )
-        .is_ok());
+        assert!(
+            click_element(
+                &mut g,
+                &ClickElementArgs {
+                    id: 1,
+                    return_: None
+                }
+            )
+            .is_ok()
+        );
         let err = click_element(
             &mut g,
             &ClickElementArgs {
@@ -1561,14 +1564,16 @@ mod tests {
             _ => panic!("expected a11y outline text"),
         }
         // the snapshot refreshed last_ax -> a follow-up id-based action still resolves
-        assert!(click_element(
-            &mut g,
-            &ClickElementArgs {
-                id: 1,
-                return_: None
-            }
-        )
-        .is_ok());
+        assert!(
+            click_element(
+                &mut g,
+                &ClickElementArgs {
+                    id: 1,
+                    return_: None
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1746,14 +1751,16 @@ mod tests {
             "outline appended"
         );
         // the snapshot refreshed last_ax -> a follow-up id-based action still resolves
-        assert!(click_element(
-            &mut g,
-            &ClickElementArgs {
-                id: 1,
-                return_: None
-            }
-        )
-        .is_ok());
+        assert!(
+            click_element(
+                &mut g,
+                &ClickElementArgs {
+                    id: 1,
+                    return_: None
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]

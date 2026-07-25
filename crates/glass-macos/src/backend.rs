@@ -415,12 +415,10 @@ fn release_clip(clip: Option<&ClipLaunch>) {
 /// from a window that was confirmed present), and the next capture/a11y/input op surfaces that
 /// `AppExited` with a structured error, so here we log and continue rather than fail the launch.
 fn activate_launched(app_pid: Option<u32>) {
-    if let Some(pid) = app_pid {
-        if let Err(e) = crate::input::focus(pid as i32) {
-            eprintln!(
-                "glass-macos: launched app (pid {pid}) exited before it could be activated: {e}"
-            );
-        }
+    if let Some(pid) = app_pid
+        && let Err(e) = crate::input::focus(pid as i32)
+    {
+        eprintln!("glass-macos: launched app (pid {pid}) exited before it could be activated: {e}");
     }
 }
 

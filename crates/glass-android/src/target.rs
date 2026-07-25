@@ -1,7 +1,7 @@
 use glass_core::{GlassError, Result};
 
 use crate::adb::Adb;
-use crate::avd::{boot_avd, decide, Action, EmulatorRegistry, Lifecycle};
+use crate::avd::{Action, EmulatorRegistry, Lifecycle, boot_avd, decide};
 
 /// One row of `adb devices`.
 #[derive(Clone, Debug, PartialEq, Eq)]

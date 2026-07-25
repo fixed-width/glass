@@ -37,15 +37,15 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use block2::RcBlock;
-use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCRunningApplication, SCShareableContent, SCWindow,
 };
 
 use glass_core::platform::WindowGeometry;
-use glass_core::{poll_until, GlassError, Result};
+use glass_core::{GlassError, Result, poll_until};
 
 /// A discovered on-screen window: enough to re-find or capture it later without holding
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see

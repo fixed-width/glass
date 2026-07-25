@@ -1,6 +1,6 @@
 //! Capture, visual-diff, and log tools.
 
-use glass_core::{frame_to_webp, Frame, Glass, Region, Stream};
+use glass_core::{Frame, Glass, Region, Stream, frame_to_webp};
 use serde_json::json;
 
 use crate::params::*;
@@ -112,7 +112,7 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
         other => {
             return Err(format!(
                 "unknown diff mode '{other}' (use perceptual/exact)"
-            ))
+            ));
         }
     }
     .map_err(|e| e.to_string())?;
@@ -138,17 +138,17 @@ pub fn diff(glass: &mut Glass, a: &DiffArgs) -> ToolResult {
     // changed region (token-minimal, exactly what differs). Nothing changed ->
     // no image.
     let mut image = None;
-    if a.include_image.unwrap_or(false) {
-        if let Some(b) = r.bbox {
-            let region = Region {
-                x: b.x,
-                y: b.y,
-                width: b.width,
-                height: b.height,
-            };
-            let cropped = current.crop(&region).map_err(|e| e.to_string())?;
-            image = Some(frame_to_webp(&cropped).map_err(|e| e.to_string())?);
-        }
+    if a.include_image.unwrap_or(false)
+        && let Some(b) = r.bbox
+    {
+        let region = Region {
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: b.height,
+        };
+        let cropped = current.crop(&region).map_err(|e| e.to_string())?;
+        image = Some(frame_to_webp(&cropped).map_err(|e| e.to_string())?);
     }
     Ok(ToolOutput::image_result("glass_diff", image, body, vec![]))
 }

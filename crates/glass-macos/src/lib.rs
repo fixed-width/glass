@@ -115,7 +115,7 @@ pub use permissions::{
     screen_recording_pane_url,
 };
 #[cfg(target_os = "macos")]
-pub use session::{session_locked, session_state, SessionState};
+pub use session::{SessionState, session_locked, session_state};
 
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "macos";

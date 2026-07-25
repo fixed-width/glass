@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn unicodetext_yields_text_triad_and_locale() {
         let avail = available(&[Standard(13)]); // CF_UNICODETEXT
-                                                // canonical first, then synthesized, in a stable order
+        // canonical first, then synthesized, in a stable order
         assert_eq!(avail[0], Standard(13));
         for k in [Standard(1), Standard(7), Standard(16)] {
             assert!(avail.contains(&k), "missing {k:?}");

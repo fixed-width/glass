@@ -17,10 +17,10 @@ use std::time::Duration;
 use glass_mcp::serve::config::ServeConfig;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{Peer, RoleClient, ServiceExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Repo root: `crates/glass-testapp` is two levels below it.
 fn repo_root() -> PathBuf {
@@ -91,10 +91,11 @@ async fn try_call(
         if let Some(t) = c.as_text() {
             all_text.push_str(&t.text);
             all_text.push('\n');
-            if let Ok(v) = serde_json::from_str::<Value>(&t.text) {
-                if v.get("ok").is_some() && v.get("result").is_some() {
-                    result = v["result"].clone();
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(&t.text)
+                && v.get("ok").is_some()
+                && v.get("result").is_some()
+            {
+                result = v["result"].clone();
             }
         }
     }
@@ -247,10 +248,11 @@ impl CallMeter {
                 self.text_bytes += t.text.len() as u64;
                 all_text.push_str(&t.text);
                 all_text.push('\n');
-                if let Ok(v) = serde_json::from_str::<Value>(&t.text) {
-                    if v.get("ok").is_some() && v.get("result").is_some() {
-                        result = v["result"].clone();
-                    }
+                if let Ok(v) = serde_json::from_str::<Value>(&t.text)
+                    && v.get("ok").is_some()
+                    && v.get("result").is_some()
+                {
+                    result = v["result"].clone();
                 }
             } else if let Some(img) = c.as_image() {
                 self.image_count += 1;
@@ -355,8 +357,13 @@ impl std::fmt::Display for ArmReport {
         write!(
             f,
             "{:<14} round_trips={} req_bytes={} text_bytes={} ~text_tokens={} images={} img_dims={:?}",
-            self.name, self.round_trips, self.request_bytes, self.text_bytes,
-            self.approx_text_tokens(), self.image_count, self.image_dims
+            self.name,
+            self.round_trips,
+            self.request_bytes,
+            self.text_bytes,
+            self.approx_text_tokens(),
+            self.image_count,
+            self.image_dims
         )
     }
 }

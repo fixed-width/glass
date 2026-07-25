@@ -684,9 +684,11 @@ mod tests {
         ];
         soften_inactive_android(&mut checks, false);
         assert_eq!(checks[0].status, CheckStatus::Warn); // Fail → Warn
-        assert!(checks[0]
-            .detail
-            .contains("only required when the android backend is selected"));
+        assert!(
+            checks[0]
+                .detail
+                .contains("only required when the android backend is selected")
+        );
         assert_eq!(checks[0].remedy.as_deref(), Some("install platform-tools")); // remedy preserved
         assert_eq!(checks[1].status, CheckStatus::Warn); // Warn untouched
         assert_eq!(checks[2].status, CheckStatus::Skip); // Skip untouched
@@ -778,9 +780,11 @@ mod tests {
         let checks = ios_checks_assembled(base, idb_companion_check(true), false);
         let xcode = checks.iter().find(|c| c.name == "xcode").unwrap();
         assert_eq!(xcode.status, CheckStatus::Warn); // Fail → Warn
-        assert!(xcode
-            .detail
-            .contains("only required when the ios backend is selected"));
+        assert!(
+            xcode
+                .detail
+                .contains("only required when the ios backend is selected")
+        );
         assert_eq!(
             xcode.remedy.as_deref(),
             Some("install Xcode from the App Store")

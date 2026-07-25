@@ -299,7 +299,7 @@ mod macos_main {
             other => {
                 return Err(format!(
                     "expected AxElementNotEditable for Save, got {other:?}"
-                ))
+                ));
             }
         }
 
@@ -335,7 +335,7 @@ mod macos_main {
             other => {
                 return Err(format!(
                     "expected AxActionUnavailable for Status, got {other:?}"
-                ))
+                ));
             }
         }
 
@@ -351,7 +351,7 @@ mod macos_main {
             None => {
                 return Err(format!(
                     "\"Save\" node has no bounds in re-snapshot:\n{outline2}"
-                ))
+                ));
             }
         };
         let (cx, cy) = match save_bounds.clamped_center(ctx.window.width, ctx.window.height) {
@@ -360,7 +360,7 @@ mod macos_main {
                 return Err(format!(
                     "\"Save\" bounds {save_bounds:?} have zero area against window {:?}",
                     ctx.window
-                ))
+                ));
             }
         };
         let click_event = PointerEvent::Click {

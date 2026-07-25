@@ -21,7 +21,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 /// Grace period a process gets to exit after SIGTERM before SIGKILL.
 pub const REAP_GRACE: Duration = Duration::from_secs(2);
@@ -145,7 +145,7 @@ pub fn spawn_reader<S: Copy + Send + 'static, R: Read + Send + 'static>(
 
 #[cfg(test)]
 mod reap_tests {
-    use super::{reap_graceful, reap_group, REAP_GRACE};
+    use super::{REAP_GRACE, reap_graceful, reap_group};
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};

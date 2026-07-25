@@ -6,15 +6,15 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use retour::static_detour;
-use windows::core::{Interface, HRESULT};
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::System::Com::{
-    IDataObject, IStream, DATADIR_GET, FORMATETC, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
+    DATADIR_GET, FORMATETC, IDataObject, IStream, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
 use windows::Win32::System::Ole::ReleaseStgMedium;
+use windows::core::{HRESULT, Interface};
 
 use crate::proto::{FormatKey, MAX_ITEM_BYTES, MAX_TOTAL_BYTES};
 
@@ -47,16 +47,21 @@ thread_local! {
 /// # Safety
 /// `stream` is a live `IStream` from a `GetData` STGMEDIUM we own until `ReleaseStgMedium`.
 unsafe fn read_stream_bytes(stream: &IStream) -> Option<Vec<u8>> {
-    stream.Seek(0, STREAM_SEEK_SET, None).ok()?;
+    // SAFETY: `stream` is live for this call per the contract above.
+    unsafe { stream.Seek(0, STREAM_SEEK_SET, None) }.ok()?;
     let mut out: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let mut got = 0u32;
-        let hr = stream.Read(
-            chunk.as_mut_ptr() as *mut c_void,
-            chunk.len() as u32,
-            Some(&mut got),
-        );
+        // SAFETY: as above, plus `chunk` is a live local buffer and the length passed is its
+        // real length, so a conformant `Read` writes within it and reports how much in `got`.
+        let hr = unsafe {
+            stream.Read(
+                chunk.as_mut_ptr() as *mut c_void,
+                chunk.len() as u32,
+                Some(&mut got),
+            )
+        };
         if hr.is_err() || got == 0 {
             break;
         }
@@ -75,7 +80,9 @@ unsafe fn read_stream_bytes(stream: &IStream) -> Option<Vec<u8>> {
 unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
     let mut out: Vec<(FormatKey, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
-    let Ok(en) = data.EnumFormatEtc(DATADIR_GET.0 as u32) else {
+    // SAFETY: `data` is live for this call per the contract above. The returned enumerator is
+    // an owned COM reference the `windows` wrapper releases on drop.
+    let Ok(en) = (unsafe { data.EnumFormatEtc(DATADIR_GET.0 as u32) }) else {
         return out;
     };
     // Bound the enumeration: a non-conformant boxed `IDataObject` whose enumerator never reports
@@ -85,7 +92,9 @@ unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
         let mut fe = [FORMATETC::default()];
         let mut fetched = 0u32;
         // The consuming `IEnumFORMATETC::Next` wrapper takes (&mut [FORMATETC], Option<*mut u32>).
-        if en.Next(&mut fe, Some(&mut fetched)).is_err() || fetched == 0 {
+        // SAFETY: `en` is the live enumerator from above; `fe`/`fetched` are live locals, and the
+        // wrapper passes `fe`'s real length so a conformant `Next` writes within it.
+        if unsafe { en.Next(&mut fe, Some(&mut fetched)) }.is_err() || fetched == 0 {
             break;
         }
         let base = &fe[0];
@@ -97,25 +106,35 @@ unsafe fn marshal(data: &IDataObject) -> Vec<(FormatKey, Vec<u8>)> {
                 lindex: base.lindex,
                 tymed: tymed.0 as u32,
             };
-            if data.QueryGetData(&req) != S_OK {
+            // SAFETY: `data` is live; `req` is a fully-initialized local whose `ptd` came from
+            // the enumerator's own descriptor, so it is valid for as long as `fe` is.
+            if unsafe { data.QueryGetData(&req) } != S_OK {
                 continue;
             }
-            let Ok(mut stg) = data.GetData(&req) else {
+            // SAFETY: as above. The returned medium is owned by us until `ReleaseStgMedium`.
+            let Ok(mut stg) = (unsafe { data.GetData(&req) }) else {
                 continue;
             };
             // A non-conformant GetData may return a different medium than requested; reading the
             // union by the requested tymed would then read the wrong member (UB). Validate first,
             // releasing the medium so there is no leak before we skip.
             if stg.tymed != tymed.0 as u32 {
-                ReleaseStgMedium(&mut stg);
+                // SAFETY: `stg` is the medium we own and have not yet released.
+                unsafe { ReleaseStgMedium(&mut stg) };
                 continue;
             }
-            let bytes = if tymed == TYMED_HGLOBAL {
-                read_bytes_from_hglobal(stg.u.hGlobal)
-            } else {
-                (*stg.u.pstm).as_ref().and_then(|s| read_stream_bytes(s))
+            // SAFETY: the `tymed` check above proves which union member is the initialized one,
+            // so each arm reads the member matching the medium the app actually returned. Both
+            // handles stay valid until the `ReleaseStgMedium` below.
+            let bytes = unsafe {
+                if tymed == TYMED_HGLOBAL {
+                    read_bytes_from_hglobal(stg.u.hGlobal)
+                } else {
+                    (*stg.u.pstm).as_ref().and_then(|s| read_stream_bytes(s))
+                }
             };
-            ReleaseStgMedium(&mut stg);
+            // SAFETY: still the medium we own, released exactly once on this path.
+            unsafe { ReleaseStgMedium(&mut stg) };
             if let Some(b) = bytes {
                 if b.len() <= MAX_ITEM_BYTES && total + b.len() <= MAX_TOTAL_BYTES {
                     total += b.len();

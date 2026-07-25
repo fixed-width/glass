@@ -716,9 +716,11 @@ mod key_tests {
 
     #[test]
     fn empty_text_injects_nothing() {
-        assert!(key_commands(&KeyEvent::Text(String::new()))
-            .unwrap()
-            .is_empty());
+        assert!(
+            key_commands(&KeyEvent::Text(String::new()))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -856,7 +858,7 @@ mod key_tests {
         assert_eq!(android_keycode(u32::from('9')), Some(16));
         assert_eq!(android_keycode(0xffbe), Some(131)); // F1
         assert_eq!(android_keycode(0xffc9), Some(142)); // F12
-                                                        // An unmapped keysym yields None (so the chord path reports InvalidKey).
+        // An unmapped keysym yields None (so the chord path reports InvalidKey).
         assert_eq!(android_keycode(0xff67), None); // Menu — not mapped
     }
 

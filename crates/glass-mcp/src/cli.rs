@@ -183,10 +183,12 @@ mod tests {
         assert_eq!(c.audit_log.as_deref(), Some("/p"));
         let c = Cli::try_parse_from(["glass-mcp", "serve", "--http", "--audit-log", "/q"]).unwrap();
         assert_eq!(c.audit_log.as_deref(), Some("/q"));
-        assert!(Cli::try_parse_from(["glass-mcp"])
-            .unwrap()
-            .audit_log
-            .is_none());
+        assert!(
+            Cli::try_parse_from(["glass-mcp"])
+                .unwrap()
+                .audit_log
+                .is_none()
+        );
     }
 
     #[test]

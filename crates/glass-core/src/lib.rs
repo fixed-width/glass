@@ -16,21 +16,21 @@ pub mod frame;
 pub use frame::{Frame, Region};
 
 pub mod pixels;
-pub use pixels::{to_opaque_rgba, to_opaque_rgba_in_place, SourceOrder};
+pub use pixels::{SourceOrder, to_opaque_rgba, to_opaque_rgba_in_place};
 
 pub mod drag;
-pub use drag::{run_drag, DragGesture, DragSink};
+pub use drag::{DragGesture, DragSink, run_drag};
 
 pub mod chord;
-pub use chord::{run_chord, ChordSink, CHORD_DWELL};
+pub use chord::{CHORD_DWELL, ChordSink, run_chord};
 
 pub mod coords;
 
 pub mod scroll;
-pub use scroll::{run_scroll, ScrollSink, SCROLL_DWELL};
+pub use scroll::{SCROLL_DWELL, ScrollSink, run_scroll};
 
 pub mod typing;
-pub use typing::{run_type, TypeSink, TYPE_DWELL};
+pub use typing::{TYPE_DWELL, TypeSink, run_type};
 
 pub mod keys;
 pub use keys::Modifier;
@@ -40,8 +40,8 @@ pub use image_io::{frame_from_webp, frame_to_webp};
 
 pub mod diff;
 pub use diff::{
-    diff, diff_perceptual, diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox,
-    DiffResult, IgnoreMask, RegionUntil,
+    BBox, DiffResult, IgnoreMask, RegionUntil, diff, diff_perceptual, diff_perceptual_with_mask,
+    diff_with_mask, region_satisfied,
 };
 pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Section};
@@ -53,7 +53,7 @@ pub mod stability;
 pub use stability::StabilityTracker;
 
 pub mod poll;
-pub use poll::{poll_until, PollOutcome};
+pub use poll::{PollOutcome, poll_until};
 
 pub mod baseline;
 pub use baseline::BaselineStore;
@@ -63,15 +63,15 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 
 pub mod platform;
 pub use platform::{
-    A11yBind, AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel, Segment,
-    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp, MAX_GESTURE_POINTERS,
+    A11yBind, AppSpec, KeyEvent, MAX_GESTURE_POINTERS, MouseButton, Platform, PointerEvent,
+    SandboxLevel, Segment, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
 
 pub mod accessibility;
 pub use accessibility::{
-    element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
-    AxTree, ClickMethod, ElementCondition, ElementInfo, ElementMatch, Truncation, TruncationLimit,
-    WalkBudget, WalkLimits, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
+    ClickMethod, ElementCondition, ElementInfo, ElementMatch, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
+    Truncation, TruncationLimit, WalkBudget, WalkLimits, element_match,
 };
 
 pub mod marks;
@@ -82,15 +82,15 @@ pub mod outline;
 pub mod role_support;
 
 pub mod role_histogram;
-pub use role_histogram::{role_histogram, RoleTally};
+pub use role_histogram::{RoleTally, role_histogram};
 
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};
 
 pub mod session;
 pub use session::{
-    Backend, Glass, PlatformFactory, ScrollDirection, ScrollToElementOutcome,
-    ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,
-    WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
-    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    Backend, Glass, PlatformFactory, SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    ScrollDirection, ScrollToElementOutcome, ScrollToElementParams, WaitElementOutcome,
+    WaitElementParams, WaitLogOutcome, WaitLogParams, WaitRegionOutcome, WaitRegionParams,
+    WaitStableOutcome, WaitStableParams,
 };

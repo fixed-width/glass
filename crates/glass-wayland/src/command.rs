@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use glass_core::{AppSpec, SandboxLevel, Stream};
-use glass_sandbox_linux::{ephemeral_home, wrap_argv, WrapOpts};
+use glass_sandbox_linux::{WrapOpts, ephemeral_home, wrap_argv};
 
 pub type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use glass_core::logbuf::Stream;
 use glass_core::{AppSpec, SandboxLevel};
 
-use super::sandboxie::{available, sandboxie_dir, Sandboxie};
+use super::sandboxie::{Sandboxie, available, sandboxie_dir};
 
 /// `<profile>` dir (release/debug) holding the built `glass_clip_hook.dll` and `examples/`.
 /// `current_exe` = `<profile>/deps/glass_windows-HASH.exe`.
@@ -34,10 +34,10 @@ fn wait_for_log(
 ) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(g) = sink.lock() {
-            if let Some((_, line)) = g.iter().find(|(_, l)| l.contains(needle)) {
-                return Some(line.clone());
-            }
+        if let Ok(g) = sink.lock()
+            && let Some((_, line)) = g.iter().find(|(_, l)| l.contains(needle))
+        {
+            return Some(line.clone());
         }
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -263,7 +263,9 @@ fn private_clipboard_multiformat() {
         ambient_after, sentinel,
         "AMBIENT CLIPBOARD WAS TOUCHED — isolation breach"
     );
-    println!("PASS: boxed multi-format (text + HTML + DIB + synthesized CF_BITMAP) served by the private store; ambient untouched");
+    println!(
+        "PASS: boxed multi-format (text + HTML + DIB + synthesized CF_BITMAP) served by the private store; ambient untouched"
+    );
 }
 
 #[test]
@@ -381,7 +383,9 @@ fn private_clipboard_ole() {
         ambient_after, sentinel,
         "AMBIENT CLIPBOARD WAS TOUCHED — isolation breach"
     );
-    println!("PASS: boxed OLE copy served by the private store + visible to user32 (coherence); ambient untouched");
+    println!(
+        "PASS: boxed OLE copy served by the private store + visible to user32 (coherence); ambient untouched"
+    );
 }
 
 #[test]

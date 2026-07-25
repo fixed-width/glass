@@ -6,10 +6,10 @@
 use std::time::Duration;
 
 use glass_mcp::serve::config::ServeConfig;
-use rmcp::model::CallToolRequestParams;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt;
+use rmcp::model::CallToolRequestParams;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 /// Bind 127.0.0.1:0, start serve in the background, return the bound URL.
 async fn start_server(token: Option<&str>) -> String {

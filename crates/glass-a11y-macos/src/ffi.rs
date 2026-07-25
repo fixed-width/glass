@@ -65,7 +65,7 @@ pub(crate) mod attr {
 // this crate already enables), so [`is_settable`]/[`set_string_value`] call those directly
 // instead of duplicating the raw externs.
 #[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     // Apple declares this `Boolean` (= `unsigned char`), NOT C99 `_Bool`. Binding it as
     // `u8` and comparing `!= 0` avoids Rust-`bool`'s validity invariant (only 0/1 are legal
     // bit patterns), matching `permissions.rs`.

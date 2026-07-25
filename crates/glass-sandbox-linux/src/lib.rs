@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
-use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
+use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path_in};
 
 /// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
 /// containment breaks shared-memory rendering on the headless display: `wrap_argv` passes
@@ -122,6 +122,24 @@ pub fn launch_ro_binds(
     home: &Path,
     cwd: Option<&Path>,
 ) -> Vec<PathBuf> {
+    launch_ro_binds_in(
+        program,
+        args,
+        home,
+        cwd,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`launch_ro_binds`] against an explicit `$PATH` value — the testable seam (no global env), so
+/// a test can exercise the bare-name branch without `set_var` racing a concurrent env reader.
+fn launch_ro_binds_in(
+    program: &OsStr,
+    args: &[OsString],
+    home: &Path,
+    cwd: Option<&Path>,
+    path: Option<&OsStr>,
+) -> Vec<PathBuf> {
     let home = canon(home);
     let shadowed_roots = [home.as_path(), Path::new("/tmp")];
     let mut out: Vec<PathBuf> = Vec::new();
@@ -133,7 +151,7 @@ pub fn launch_ro_binds(
         if let Some(p) = abs_token(Path::new(program), cwd) {
             push_token_binds(&mut out, &p, &shadowed_roots);
         }
-    } else if let Some(resolved) = resolve_on_path(program) {
+    } else if let Some(resolved) = path.and_then(|p| resolve_on_path_in(program, p)) {
         // A bare name → resolve via `$PATH` like execvp. Bind the resolving directory ONLY when
         // it is under a shadowed root (a `$HOME`/`/tmp` PATH dir such as `~/.cargo/bin`, an asdf
         // shim); a match under `/usr/bin` etc. is already visible via `--ro-bind / /`.
@@ -168,8 +186,8 @@ fn push_token_binds(out: &mut Vec<PathBuf>, lit: &Path, roots: &[&Path]) {
         return;
     }
     let real = canon(lit); // the resolved target (symlinks followed)
-                           // Never auto-expose a shadowed root itself (or an ancestor of one) — binding it would re-mount
-                           // the real subtree over the tmpfs. Such a target needs cwd / sandbox off.
+    // Never auto-expose a shadowed root itself (or an ancestor of one) — binding it would re-mount
+    // the real subtree over the tmpfs. Such a target needs cwd / sandbox off.
     if roots.iter().any(|root| root.starts_with(&real)) {
         return;
     }
@@ -639,9 +657,10 @@ mod tests {
             home.path(),
         );
         assert_eq!(out, vec![script.canonicalize().unwrap()]); // guard: never bind home itself as a dir
-        assert!(!out
-            .iter()
-            .any(|p| *p == home.path().canonicalize().unwrap()));
+        assert!(
+            !out.iter()
+                .any(|p| *p == home.path().canonicalize().unwrap())
+        );
     }
 
     #[test]
@@ -773,18 +792,11 @@ mod tests {
     // --- bare-name program via $PATH ---------------------------------------------------------
 
     /// A bare-name program installed only under a `$HOME` `PATH` dir (`~/.cargo/bin`, an asdf shim)
-    /// is hidden by the home tmpfs, so its resolving directory must be bound. Prepends a home bin
-    /// dir to `PATH` (keeping the rest, so concurrent readers still resolve their own binaries) and
-    /// installs a uniquely named executable there; a RAII guard restores `PATH` even on panic.
+    /// is hidden by the home tmpfs, so its resolving directory must be bound. Passes the `$PATH` to
+    /// resolve against explicitly — mutating the process `PATH` would race every other test in this
+    /// binary (and is `unsafe` from edition 2024 on, for that reason).
     #[test]
     fn bare_name_program_on_a_home_path_dir_binds_that_dir() {
-        struct PathGuard(std::ffi::OsString);
-        impl Drop for PathGuard {
-            fn drop(&mut self) {
-                std::env::set_var("PATH", &self.0);
-            }
-        }
-
         let home = tempfile::tempdir().unwrap();
         let bindir = home.path().join(".local/bin");
         std::fs::create_dir_all(&bindir).unwrap();
@@ -793,20 +805,13 @@ mod tests {
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cwd = tempfile::tempdir().unwrap();
-        let out = {
-            let original = std::env::var_os("PATH").unwrap_or_default();
-            let mut prepended = bindir.clone().into_os_string();
-            prepended.push(":");
-            prepended.push(&original);
-            std::env::set_var("PATH", &prepended);
-            let _guard = PathGuard(original);
-            launch_ro_binds(
-                OsStr::new("glass-uniq-tool-xyzzy"),
-                &[],
-                home.path(),
-                Some(cwd.path()),
-            )
-        };
+        let out = launch_ro_binds_in(
+            OsStr::new("glass-uniq-tool-xyzzy"),
+            &[],
+            home.path(),
+            Some(cwd.path()),
+            Some(bindir.as_os_str()),
+        );
         assert_eq!(out, vec![bindir.canonicalize().unwrap()]);
     }
 

@@ -23,8 +23,8 @@ fn main() {
 #[cfg(windows)]
 mod imp {
     use glass_core::{
-        frame_to_webp, AppSpec, Frame, KeyEvent, MouseButton, Platform, PointerEvent, WindowHint,
-        WindowOp,
+        AppSpec, Frame, KeyEvent, MouseButton, Platform, PointerEvent, WindowHint, WindowOp,
+        frame_to_webp,
     };
     use glass_windows::WindowsPlatform;
     use std::time::Duration;

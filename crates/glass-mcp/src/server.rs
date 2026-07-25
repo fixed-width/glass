@@ -7,7 +7,7 @@ use glass_core::Glass;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use crate::audit::AuditReport;
@@ -521,8 +521,7 @@ impl GlassServer {
 /// Server-level instructions shown once to the agent, describing glass's tool loop.
 /// Must not name a backend (see `descriptions_name_no_backend`): capability support is a
 /// runtime property, not documentation.
-const SERVER_INSTRUCTIONS: &str =
-    "glass gives you a build → see → interact → debug loop over a real native GUI \
+const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact → debug loop over a real native GUI \
      app — no app integration needed. One active session; tools target it implicitly; \
      choose a backend at glass_start (defaults to the host; see the `backend` param). \
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\

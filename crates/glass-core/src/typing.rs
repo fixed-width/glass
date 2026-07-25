@@ -40,7 +40,7 @@ pub fn run_type<S: TypeSink>(sink: &mut S, text: &str, dwell: Duration) -> crate
 
 #[cfg(test)]
 mod tests {
-    use super::{run_type, TypeSink};
+    use super::{TypeSink, run_type};
     use crate::Result;
     use std::time::Duration;
 

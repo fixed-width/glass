@@ -27,7 +27,7 @@ mod tests {
     use super::*;
     use crate::params::{ClipboardSetArgs, StartArgs};
     use crate::tools::testutil::*;
-    use crate::tools::{start as start_tool, OutContent};
+    use crate::tools::{OutContent, start as start_tool};
 
     fn started() -> Glass {
         let mut g = glass_with(FakePlatform::new(100, 100));

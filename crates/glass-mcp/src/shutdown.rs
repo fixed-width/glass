@@ -27,7 +27,7 @@ pub async fn run_shutdown(sessions: Arc<Mutex<Glass>>, budget: Duration) {
 /// the default-terminate behavior, so the select in `main` can run teardown first.
 #[cfg(unix)]
 pub async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::select! {

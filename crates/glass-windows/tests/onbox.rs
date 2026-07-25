@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
-    role_histogram, Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend,
-    BaselineStore, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory,
-    PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
+    Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory, PointerEvent,
+    WalkLimits, WindowGeometry, WindowHint, WindowOp, role_histogram,
 };
 use glass_windows::WindowsPlatform;
 

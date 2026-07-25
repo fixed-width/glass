@@ -37,7 +37,7 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
 // at the crate root, unlike the `request_*`/`*_granted`/`open_pane` predicates); import them here
 // so `run`/`grant_row_widgets` name them unqualified. macOS-gated: the module is macOS-only.
 #[cfg(target_os = "macos")]
-use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
+use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
 
 /// Onboarding entry — see the module doc for the full A/B/C flow. Short-circuit if a healthy
 /// agent is already serving with both grants (A); otherwise, if both grants are held in this

@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use glass_core::{GlassError, Result};
@@ -292,7 +292,7 @@ impl Drop for Xvfb {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_displayfd, start_binary, ReadErr, Xvfb};
+    use super::{ReadErr, Xvfb, read_displayfd, start_binary};
     use glass_core::{GlassError, Result};
     use std::process::{Command, Stdio};
     use std::time::Duration;

@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn map_matches_declared_column() {
-        use glass_core::role_support::{support, AxBackend, RoleSupport};
+        use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
             // The outline-row/table-row split happens outside the token table (see
             // `map_role`'s subrole check), so table membership alone would miss TreeItem.

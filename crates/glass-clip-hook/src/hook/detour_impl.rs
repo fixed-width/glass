@@ -13,16 +13,16 @@
 use std::cell::{Cell, RefCell};
 
 use retour::static_detour;
-use windows::core::BOOL;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, HGDIOBJ};
+use windows::core::BOOL;
 
 use crate::proto::FormatKey;
 
 use super::{
-    alloc_hglobal_bytes, id_of, key_of, locale_blob, read_bytes_from_hglobal, store_empty,
-    store_get_bytes, store_list, store_seq, store_set_all, unicode_to_codepage, user32_proc,
-    CF_BITMAP, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT,
+    CF_BITMAP, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT, alloc_hglobal_bytes, id_of, key_of,
+    locale_blob, read_bytes_from_hglobal, store_empty, store_get_bytes, store_list, store_seq,
+    store_set_all, unicode_to_codepage, user32_proc,
 };
 
 // Exact raw ABI signatures of the user32 exports (from windows-rs `link!` declarations).
@@ -149,12 +149,12 @@ fn resolve_bytes(fmt: u32, key: &FormatKey) -> Option<Vec<u8>> {
 /// Build a GDI `HBITMAP` from a validated `CF_DIB` blob. Cached + freed via `DeleteObject`.
 fn make_bitmap_handle(dib: &[u8]) -> Option<HANDLE> {
     use windows::Win32::Graphics::Gdi::{
-        CreateDIBitmap, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, CBM_INIT, DIB_RGB_COLORS,
+        BITMAPINFO, BITMAPINFOHEADER, CBM_INIT, CreateDIBitmap, DIB_RGB_COLORS, GetDC, ReleaseDC,
     };
     let info = crate::dib::parse_dib(dib)?; // validated geometry → bounds-safe offsets
-                                            // SAFETY: `dib` parsed clean (header + table + bits within bounds). The header ptr is read as a
-                                            // BITMAPINFOHEADER/BITMAPINFO; `bits` = dib + header_bytes + color_table_bytes is in-bounds and
-                                            // sized by `info`. GetDC/ReleaseDC are paired.
+    // SAFETY: `dib` parsed clean (header + table + bits within bounds). The header ptr is read as a
+    // BITMAPINFOHEADER/BITMAPINFO; `bits` = dib + header_bytes + color_table_bytes is in-bounds and
+    // sized by `info`. GetDC/ReleaseDC are paired.
     unsafe {
         let hdc = GetDC(None);
         if hdc.is_invalid() {

@@ -23,10 +23,10 @@ fn read_response(reader: &mut impl BufRead, id: i64) -> serde_json::Value {
         if reader.read_line(&mut line).unwrap() == 0 {
             panic!("server closed stdout before responding to id {id}");
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
-                return v;
-            }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim())
+            && v.get("id").and_then(|i| i.as_i64()) == Some(id)
+        {
+            return v;
         }
     }
     panic!("no response with id {id}");

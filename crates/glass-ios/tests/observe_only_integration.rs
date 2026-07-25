@@ -16,6 +16,11 @@
 //!   cargo test -p glass-ios --test observe_only_integration -- --ignored --nocapture
 //! ```
 
+// `env::set_var` is `unsafe` from edition 2024 on (it races concurrent env readers). This
+// binary holds exactly one test, so nothing else in the process reads the environment while
+// it is set. The site carries a `// SAFETY:` note; the file opts out of `unsafe_code = "deny"`.
+#![allow(unsafe_code)]
+
 use glass_core::{
     AppSpec, GlassError, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel,
 };
@@ -40,10 +45,13 @@ fn observe_only_survives_without_a_companion() {
 
     // Force the no-companion path regardless of what's installed on the host: an
     // unresolvable binary makes the driver fail to start, so the backend degrades.
-    std::env::set_var(
-        "GLASS_IDB_COMPANION",
-        "/nonexistent/definitely-not-idb_companion",
-    );
+    // SAFETY: the only test in this binary (see the header) — no concurrent env reader.
+    unsafe {
+        std::env::set_var(
+            "GLASS_IDB_COMPANION",
+            "/nonexistent/definitely-not-idb_companion",
+        )
+    };
 
     let spec = AppSpec {
         build: None,

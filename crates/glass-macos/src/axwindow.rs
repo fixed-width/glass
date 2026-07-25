@@ -53,7 +53,7 @@ use std::ptr::NonNull;
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    kCFBooleanTrue, CFArray, CFRetained, CFString, CFType, CGPoint, CGSize,
+    CFArray, CFRetained, CFString, CFType, CGPoint, CGSize, kCFBooleanTrue,
 };
 
 use glass_core::platform::WindowGeometry;
@@ -73,7 +73,7 @@ use crate::coords::point_to_global_pixel;
 // major. `ax_window_for_cgwindowid`'s geometry fallback exists specifically so a broken
 // symbol degrades this crate's window ops rather than making them entirely non-functional.
 #[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn _AXUIElementGetWindow(element: &AXUIElement, out_wid: *mut u32) -> AXError;
 }
 

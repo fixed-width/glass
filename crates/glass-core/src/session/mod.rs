@@ -2,13 +2,13 @@
 //! its operations are grouped into submodules (each adds an `impl Glass` block).
 
 use crate::accessibility::{
-    element_match, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree,
-    ClickMethod, ElementCondition, ElementInfo, ElementMatch, WalkLimits,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, ClickMethod,
+    ElementCondition, ElementInfo, ElementMatch, WalkLimits, element_match,
 };
 use crate::baseline::BaselineStore;
 use crate::diff::{
-    diff_perceptual_with_mask, diff_with_mask, region_satisfied, BBox, DiffResult, IgnoreMask,
-    RegionUntil,
+    BBox, DiffResult, IgnoreMask, RegionUntil, diff_perceptual_with_mask, diff_with_mask,
+    region_satisfied,
 };
 use crate::error::{GlassError, Result};
 use crate::frame::{Frame, Region};
@@ -30,9 +30,9 @@ mod wait;
 mod window;
 
 pub use wait::{
-    ScrollDirection, ScrollToElementOutcome, ScrollToElementParams, WaitElementOutcome,
-    WaitElementParams, WaitLogOutcome, WaitLogParams, WaitRegionOutcome, WaitRegionParams,
-    WaitStableOutcome, WaitStableParams, SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome,
+    ScrollToElementParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams,
+    WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };
 
 struct ActiveSession {
@@ -241,7 +241,14 @@ mod tests {
         let got = sink.0.lock().unwrap().clone();
         assert_eq!(
             got,
-            vec!["launch:true", "click:true", "type:true", "window:true", "click_element:true", "stop:true"],
+            vec![
+                "launch:true",
+                "click:true",
+                "type:true",
+                "window:true",
+                "click_element:true",
+                "stop:true"
+            ],
             "reads (screenshot, a11y_snapshot, window-geometry) produce no records; click_element records ONCE (not also as click)"
         );
     }

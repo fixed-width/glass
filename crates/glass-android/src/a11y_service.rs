@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
@@ -397,14 +397,14 @@ impl A11yServiceRegistry {
     /// Restore the device's prior accessibility state and remove the forward. Best-effort,
     /// idempotent. No process to kill (disabling unbinds the service).
     pub fn shutdown(&self) {
-        if let Ok(mut g) = self.state.lock() {
-            if let Some(a) = g.take() {
-                let adb = match &a.serial {
-                    Some(s) => Adb::from_env().with_serial(s.clone()),
-                    None => Adb::from_env(),
-                };
-                restore_a11y(&adb, &a.prior_enabled, &a.prior_a11y_enabled, a.port);
-            }
+        if let Ok(mut g) = self.state.lock()
+            && let Some(a) = g.take()
+        {
+            let adb = match &a.serial {
+                Some(s) => Adb::from_env().with_serial(s.clone()),
+                None => Adb::from_env(),
+            };
+            restore_a11y(&adb, &a.prior_enabled, &a.prior_a11y_enabled, a.port);
         }
     }
 }

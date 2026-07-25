@@ -69,23 +69,29 @@ mod tests {
 
     #[test]
     fn health_both_granted_predicate() {
-        assert!(HealthStatus {
-            ok: true,
-            screen_recording: Some(true),
-            accessibility: Some(true)
-        }
-        .grants_ready());
-        assert!(!HealthStatus {
-            ok: true,
-            screen_recording: Some(true),
-            accessibility: Some(false)
-        }
-        .grants_ready());
-        assert!(!HealthStatus {
-            ok: true,
-            screen_recording: None,
-            accessibility: None
-        }
-        .grants_ready());
+        assert!(
+            HealthStatus {
+                ok: true,
+                screen_recording: Some(true),
+                accessibility: Some(true)
+            }
+            .grants_ready()
+        );
+        assert!(
+            !HealthStatus {
+                ok: true,
+                screen_recording: Some(true),
+                accessibility: Some(false)
+            }
+            .grants_ready()
+        );
+        assert!(
+            !HealthStatus {
+                ok: true,
+                screen_recording: None,
+                accessibility: None
+            }
+            .grants_ready()
+        );
     }
 }

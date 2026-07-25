@@ -1,4 +1,4 @@
-use crate::diff::{diff_with_mask, IgnoreMask};
+use crate::diff::{IgnoreMask, diff_with_mask};
 use crate::error::Result;
 use crate::frame::Frame;
 

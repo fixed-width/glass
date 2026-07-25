@@ -716,10 +716,11 @@ mod state_machine_tests {
         // With no companion, there is no accessibility reader — and no connect is attempted
         // (Ok(None), not an error), so observe-only start-up never blocks on it.
         let p = observe_only_platform();
-        assert!(p
-            .accessibility()
-            .expect("no connect is attempted without a driver")
-            .is_none());
+        assert!(
+            p.accessibility()
+                .expect("no connect is attempted without a driver")
+                .is_none()
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@
 //!   workspace's `-D warnings` gate.
 
 use std::path::Path;
-use std::sync::{mpsc, Once};
+use std::sync::{Once, mpsc};
 use std::time::Duration;
 
 use block2::RcBlock;

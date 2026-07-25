@@ -1,4 +1,4 @@
-use glass_core::pixels::{to_opaque_rgba, SourceOrder};
+use glass_core::pixels::{SourceOrder, to_opaque_rgba};
 use glass_core::{GlassError, Result};
 use wayland_client::protocol::wl_shm::Format;
 
@@ -35,7 +35,7 @@ pub fn to_rgba(
         other => {
             return Err(GlassError::CaptureFailed(format!(
                 "unsupported screencopy format {other:?}"
-            )))
+            )));
         }
     }
     Ok(out)
@@ -185,7 +185,9 @@ mod tests {
         let out = to_rgba(&src, Format::Bgr888, 2, 2, 8).unwrap();
         assert_eq!(
             out,
-            vec![10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255]
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255
+            ]
         );
     }
 

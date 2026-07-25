@@ -32,11 +32,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process, Pid, Signal};
+use rustix::process::{Pid, Signal, kill_process};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
 use glass_core::{GlassError, Result, Stream};
-use glass_sandbox_macos::{build_profile, launch_reallows, ProfileOpts};
+use glass_sandbox_macos::{ProfileOpts, build_profile, launch_reallows};
 
 /// Per-spawn counter feeding one component of
 /// [`crate::clipboard_route::session_pasteboard_name`] (combined there with this process's pid
@@ -117,7 +117,12 @@ const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 /// [`crate::shim_path`] (unit-tested on the Linux dev box); this wrapper only supplies the
 /// two OS-touching inputs it needs.
 fn shim_dylib_path() -> Option<PathBuf> {
-    let env_override = std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from);
+    shim_dylib_path_with(std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from))
+}
+
+/// [`shim_dylib_path`] against an already-read override — the testable seam (no global env), so
+/// a test can exercise the override tier without `set_var` racing a concurrent env reader.
+fn shim_dylib_path_with(env_override: Option<PathBuf>) -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     crate::shim_path::resolve_shim(&exe_dir, env_override)
 }
@@ -252,10 +257,10 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
         // glass's own target dir and is not expected to collide with a launch target, and the
         // `.contains()` dedup below is defensive regardless (not load-bearing on that expectation).
         let mut ro_files = reallows.ro_files;
-        if let Some(f) = shim_file {
-            if !ro_files.contains(&f) {
-                ro_files.push(f);
-            }
+        if let Some(f) = shim_file
+            && !ro_files.contains(&f)
+        {
+            ro_files.push(f);
         }
         // Pasteboard is allowed only for an injectable target (the shim's redirect is the
         // actual isolation there); a hardened/non-injectable target keeps it denied, same as
@@ -635,8 +640,7 @@ mod tests {
         // unsigned marker (codesign echoes `Executable=<path>`, and the path is the
         // caller-chosen `spec.run[0]`) must still fail closed — the marker in path text must
         // not override a real `flags=(...runtime...)` line.
-        let report =
-            "Executable=/tmp/code object is not signed at all/App.app/Contents/MacOS/App\n\
+        let report = "Executable=/tmp/code object is not signed at all/App.app/Contents/MacOS/App\n\
                       CodeDirectory v=20400 flags=0x10000(runtime) hashes=3+3 location=embedded\n";
         assert!(!injectable_from_codesign_report(report, true));
     }
@@ -672,14 +676,7 @@ mod tests {
         }
         let _cleanup = Cleanup(dylib.clone());
 
-        let previous = std::env::var(SHIM_DYLIB_ENV).ok();
-        std::env::set_var(SHIM_DYLIB_ENV, &dylib);
-        let resolved = shim_dylib_path();
-        match previous {
-            Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
-            None => std::env::remove_var(SHIM_DYLIB_ENV),
-        }
-        assert_eq!(resolved, Some(dylib));
+        assert_eq!(shim_dylib_path_with(Some(dylib.clone())), Some(dylib));
     }
 
     #[test]
@@ -689,15 +686,8 @@ mod tests {
         // not be trusted blind: it falls through to the remaining tiers (or `None`) rather
         // than handing dyld an unopenable path, same fail-closed discipline as those tiers.
         let bogus = PathBuf::from("/nonexistent/glass-clip-shim-test.dylib");
-        let previous = std::env::var(SHIM_DYLIB_ENV).ok();
-        std::env::set_var(SHIM_DYLIB_ENV, &bogus);
-        let resolved = shim_dylib_path();
-        match previous {
-            Some(v) => std::env::set_var(SHIM_DYLIB_ENV, v),
-            None => std::env::remove_var(SHIM_DYLIB_ENV),
-        }
         assert_ne!(
-            resolved,
+            shim_dylib_path_with(Some(bogus.clone())),
             Some(bogus),
             "a nonexistent override must not be returned as-is"
         );

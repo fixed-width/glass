@@ -38,8 +38,8 @@ use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
 use glass_wayland::WaylandPlatform;
 #[cfg(target_os = "linux")]
 use glass_x11::X11Platform;
-use rmcp::transport::stdio;
 use rmcp::ServiceExt;
+use rmcp::transport::stdio;
 
 use crate::server::GlassServer;
 
@@ -271,7 +271,7 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
 /// (a real relaunch belongs to the onboarder, not this harness).
 #[cfg(target_os = "macos")]
 pub fn run_debug_checklist() -> anyhow::Result<()> {
-    use glass_macos::onboarding_window::{run_checklist, ChecklistActions, GrantRow};
+    use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
     let actions = ChecklistActions {
         rows: vec![
             GrantRow {
@@ -444,9 +444,10 @@ mod tests {
         // The temp root can be shared across users/sessions; a per-pid segment keeps each
         // server's baselines separate and user-owned.
         let dir = super::default_baseline_dir();
-        assert!(dir
-            .to_string_lossy()
-            .contains(&std::process::id().to_string()));
+        assert!(
+            dir.to_string_lossy()
+                .contains(&std::process::id().to_string())
+        );
     }
 
     #[test]

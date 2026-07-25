@@ -48,7 +48,7 @@ use objc2_core_graphics::{
 use glass_core::keys::Modifier;
 use glass_core::platform::{KeyEvent, MouseButton, PointerEvent};
 use glass_core::{
-    run_drag, run_scroll, run_type, DragGesture, DragSink, GlassError, Result, ScrollSink, TypeSink,
+    DragGesture, DragSink, GlassError, Result, ScrollSink, TypeSink, run_drag, run_scroll, run_type,
 };
 
 use crate::coords::pixel_to_global_point;
@@ -303,10 +303,10 @@ fn send_chord(chord: &str, source: Option<&CGEventSource>) -> Result<()> {
 /// chord instead).
 fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
     let mut chars = token.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if let Some(mapped) = keymap::key_for(c) {
-            return Some(mapped);
-        }
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && let Some(mapped) = keymap::key_for(c)
+    {
+        return Some(mapped);
     }
     keymap::keycode_for_keyname(token).map(|code| (code, false))
 }

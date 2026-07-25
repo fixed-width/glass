@@ -3,7 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use glass_core::{AppSpec, SandboxLevel};
-use glass_sandbox_linux::{ephemeral_home, wrap_argv, WrapOpts};
+use glass_sandbox_linux::{WrapOpts, ephemeral_home, wrap_argv};
 
 /// Build the launch command for `spec.run`, forcing `DISPLAY=<display>` (and, when `a11y`
 /// is given, `DBUS_SESSION_BUS_ADDRESS=<addr>` + `XDG_RUNTIME_DIR=<dir>` so the child both
@@ -295,9 +295,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.contains(&"--unshare-user".to_string()));
-        assert!(args
-            .windows(3)
-            .any(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"]));
+        assert!(
+            args.windows(3)
+                .any(|w| w == ["--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix"])
+        );
         let dd = args.iter().position(|x| x == "--").unwrap();
         assert_eq!(&args[dd + 1..], &["/bin/app", "--flag"]);
         let disp = cmd

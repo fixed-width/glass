@@ -37,7 +37,7 @@ use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidA11y, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
 use glass_core::accessibility::{Accessibility, AxContext, WalkLimits};
-use glass_core::{role_histogram, AppSpec, AxRole, AxTree, Platform, SandboxLevel};
+use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
 
 /// Comma-separated `package/activity` components to probe, e.g.
 /// `com.android.settings/.Settings`. Each element is exactly what `AppSpec::run`'s first

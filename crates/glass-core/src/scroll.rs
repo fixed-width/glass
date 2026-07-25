@@ -43,7 +43,7 @@ pub fn run_scroll<S: ScrollSink>(sink: &mut S, has_modifiers: bool) -> crate::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{run_scroll, ScrollSink, SCROLL_DWELL};
+    use super::{SCROLL_DWELL, ScrollSink, run_scroll};
     use crate::Result;
 
     #[derive(Debug, PartialEq)]
