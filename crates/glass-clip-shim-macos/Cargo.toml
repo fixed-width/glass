@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard"] }
-ctor = "0.1"
+ctor = "1"
 
 [lints]
 workspace = true

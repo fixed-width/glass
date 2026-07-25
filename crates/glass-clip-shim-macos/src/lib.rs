@@ -109,8 +109,11 @@ mod imp {
 /// Runs once when the dylib is loaded (via `DYLD_INSERT_LIBRARIES`), before the host
 /// process's `main`. See the module doc for what it does and why it's inert unless glass
 /// opted this specific process in.
+// `ctor(unsafe)`: ctor 1.0 makes the pre-`main` contract explicit — the body runs before
+// the Rust runtime is initialized, so it must not assume std is set up. `install()` only
+// reads an env var and swizzles, which is safe at load time.
 #[cfg(target_os = "macos")]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn glass_clip_shim_load() {
     imp::install();
 }

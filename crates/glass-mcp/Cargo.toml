@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
-base64 = "0.22"
+base64 = "0.23"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", optional = true }
@@ -32,9 +32,9 @@ tower = { version = "0.5", optional = true }
 tokio-util = { version = "0.7", optional = true }
 # Non-optional: the untrusted-conduit nonce (untrusted.rs, compiled in every build,
 # incl. --no-default-features) needs a CSPRNG, as does network token generation.
-rand = { version = "0.8" }
+rand = { version = "0.10" }
 # Audit log: SHA-256 content digests (redacted by default) + RFC3339 timestamps.
-sha2 = "0.10"
+sha2 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = { version = "0.3", optional = true }
 
