@@ -50,12 +50,13 @@ const STARTUP_SETTLE: Duration = Duration::from_millis(1500);
 /// Overrides [`STARTUP_SETTLE`], in whole milliseconds.
 const SETTLE_MS_VAR: &str = "GLASS_A11Y_PROBE_SETTLE_MS";
 
-/// The smallest tree this probe accepts as evidence. A real app screen reports dozens of
-/// nodes; a snapshot taken before the app finished drawing, or of the wrong window, reports a
-/// near-empty shell — which yields no histogram buckets, no violations, and a green run that
-/// proves nothing. The floor sits well above a root plus a single content node so that case is
-/// caught rather than passed.
-const MIN_EVIDENCE_NODES: usize = 8;
+/// The smallest tree this probe accepts as evidence. A snapshot taken before the app finished
+/// drawing, or of the wrong window, reports a near-empty shell — which yields no histogram
+/// buckets, no violations, and a green run that proves nothing. The floor is deliberately low:
+/// the synthetic window root plus the application element account for two nodes on their own,
+/// and a legitimate iOS screen can still be small (a document browser's empty state is six).
+/// So this catches "we could not look", not "this app is sparse".
+const MIN_EVIDENCE_NODES: usize = 4;
 
 /// [`STARTUP_SETTLE`], or the [`SETTLE_MS_VAR`] override when it is set.
 ///
@@ -68,6 +69,11 @@ fn startup_settle() -> Duration {
     let Some(raw) = std::env::var_os(SETTLE_MS_VAR) else {
         return STARTUP_SETTLE;
     };
+    // Set but blank reads as unset, the same way an empty PROBE_APPS_VAR does — a shell that
+    // exports an unfilled variable has asked for nothing, not for a broken value.
+    if raw.to_str().is_some_and(|v| v.trim().is_empty()) {
+        return STARTUP_SETTLE;
+    }
     let ms: u64 = raw
         .to_str()
         .and_then(|v| v.trim().parse().ok())
