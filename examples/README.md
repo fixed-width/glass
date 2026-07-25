@@ -6,3 +6,5 @@ Small apps for trying glass's build → see → interact → debug loop. Each li
   [project README's quickstart](../README.md#try-it-in-60-seconds).
 - [`ios-greeter/`](ios-greeter/) — a tiny SwiftUI app driven in the iOS Simulator. See
   [Drive a native iOS app](../docs/how-to/drive-an-ios-app.md).
+- [`ios-fixture/`](ios-fixture/) — the SwiftUI app the `glass-ios` on-box tests drive: four
+  elements with stable accessibility identifiers, plus a launch-time log marker.
