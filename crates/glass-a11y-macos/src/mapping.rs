@@ -36,9 +36,21 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXScrollBar", AxRole::ScrollBar),
 ];
 
-/// Map an AX role string to the normalized `AxRole`; unmapped roles become
-/// `AxRole::Other` (the reader keeps the AX role string in `raw_role`).
-pub fn map_role(ax_role: &str) -> AxRole {
+/// AppKit uses `AXSubrole` to say what an element really is only for a handful of base roles —
+/// an `AXRow` is a table row or an outline row, an `AXWindow` is a plain window or a dialog or
+/// a sheet, an `AXTextField` may be a search field. Every other role is already unambiguous,
+/// and each subrole read is an AX IPC round-trip, so the reader asks only for these.
+pub fn subrole_matters(ax_role: &str) -> bool {
+    matches!(
+        ax_role,
+        "AXWindow" | "AXTextField" | "AXRow" | "AXGroup" | "AXUnknown"
+    )
+}
+
+/// Map an AX role string, plus its `AXSubrole` when the reader took one, to the normalized
+/// `AxRole`; unmapped roles become `AxRole::Other` (the reader keeps the token in `raw_role`).
+pub fn map_role(ax_role: &str, subrole: Option<&str>) -> AxRole {
+    let _ = subrole;
     ROLE_TOKENS
         .iter()
         .find(|(token, _)| *token == ax_role)
@@ -101,18 +113,18 @@ mod tests {
 
     #[test]
     fn maps_common_ax_roles() {
-        assert_eq!(map_role("AXButton"), AxRole::Button);
-        assert_eq!(map_role("AXCheckBox"), AxRole::CheckBox);
-        assert_eq!(map_role("AXTextField"), AxRole::TextField);
-        assert_eq!(map_role("AXTextArea"), AxRole::TextArea);
-        assert_eq!(map_role("AXStaticText"), AxRole::Label);
-        assert_eq!(map_role("AXWindow"), AxRole::Window);
+        assert_eq!(map_role("AXButton", None), AxRole::Button);
+        assert_eq!(map_role("AXCheckBox", None), AxRole::CheckBox);
+        assert_eq!(map_role("AXTextField", None), AxRole::TextField);
+        assert_eq!(map_role("AXTextArea", None), AxRole::TextArea);
+        assert_eq!(map_role("AXStaticText", None), AxRole::Label);
+        assert_eq!(map_role("AXWindow", None), AxRole::Window);
     }
 
     #[test]
     fn unmapped_role_is_other() {
-        assert_eq!(map_role("AXRuler"), AxRole::Other);
-        assert_eq!(map_role(""), AxRole::Other);
+        assert_eq!(map_role("AXRuler", None), AxRole::Other);
+        assert_eq!(map_role("", None), AxRole::Other);
     }
 
     #[test]
@@ -130,24 +142,24 @@ mod tests {
 
     #[test]
     fn maps_additional_ax_roles() {
-        assert_eq!(map_role("AXRadioButton"), AxRole::RadioButton);
-        assert_eq!(map_role("AXGroup"), AxRole::Group);
-        assert_eq!(map_role("AXMenu"), AxRole::Menu);
-        assert_eq!(map_role("AXMenuItem"), AxRole::MenuItem);
-        assert_eq!(map_role("AXMenuBar"), AxRole::MenuBar);
-        assert_eq!(map_role("AXImage"), AxRole::Image);
-        assert_eq!(map_role("AXLink"), AxRole::Link);
-        assert_eq!(map_role("AXSlider"), AxRole::Slider);
-        assert_eq!(map_role("AXComboBox"), AxRole::ComboBox);
-        assert_eq!(map_role("AXPopUpButton"), AxRole::ComboBox);
-        assert_eq!(map_role("AXList"), AxRole::List);
-        assert_eq!(map_role("AXRow"), AxRole::ListItem);
-        assert_eq!(map_role("AXCell"), AxRole::Cell);
-        assert_eq!(map_role("AXToolbar"), AxRole::Toolbar);
-        assert_eq!(map_role("AXTabGroup"), AxRole::TabList);
-        assert_eq!(map_role("AXRadioGroup"), AxRole::Group);
-        assert_eq!(map_role("AXProgressIndicator"), AxRole::ProgressBar);
-        assert_eq!(map_role("AXScrollBar"), AxRole::ScrollBar);
+        assert_eq!(map_role("AXRadioButton", None), AxRole::RadioButton);
+        assert_eq!(map_role("AXGroup", None), AxRole::Group);
+        assert_eq!(map_role("AXMenu", None), AxRole::Menu);
+        assert_eq!(map_role("AXMenuItem", None), AxRole::MenuItem);
+        assert_eq!(map_role("AXMenuBar", None), AxRole::MenuBar);
+        assert_eq!(map_role("AXImage", None), AxRole::Image);
+        assert_eq!(map_role("AXLink", None), AxRole::Link);
+        assert_eq!(map_role("AXSlider", None), AxRole::Slider);
+        assert_eq!(map_role("AXComboBox", None), AxRole::ComboBox);
+        assert_eq!(map_role("AXPopUpButton", None), AxRole::ComboBox);
+        assert_eq!(map_role("AXList", None), AxRole::List);
+        assert_eq!(map_role("AXRow", None), AxRole::ListItem);
+        assert_eq!(map_role("AXCell", None), AxRole::Cell);
+        assert_eq!(map_role("AXToolbar", None), AxRole::Toolbar);
+        assert_eq!(map_role("AXTabGroup", None), AxRole::TabList);
+        assert_eq!(map_role("AXRadioGroup", None), AxRole::Group);
+        assert_eq!(map_role("AXProgressIndicator", None), AxRole::ProgressBar);
+        assert_eq!(map_role("AXScrollBar", None), AxRole::ScrollBar);
     }
 
     #[test]
@@ -213,6 +225,29 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn subrole_is_read_only_where_it_disambiguates() {
+        // Reading AXSubrole costs an AX IPC round-trip per node, so the reader takes it only
+        // for the base roles where AppKit uses a subrole to say what an element really is.
+        for role in ["AXWindow", "AXTextField", "AXRow", "AXGroup", "AXUnknown"] {
+            assert!(subrole_matters(role), "{role} must be gated in");
+        }
+        for role in ["AXButton", "AXStaticText", "AXCell", "AXImage", ""] {
+            assert!(
+                !subrole_matters(role),
+                "{role} must not pay for a subrole read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subrole_does_not_change_any_mapping_yet() {
+        // This task wires the subrole through; nothing keys on it until the mapping task.
+        assert_eq!(map_role("AXRow", None), AxRole::ListItem);
+        assert_eq!(map_role("AXRow", Some("AXOutlineRow")), AxRole::ListItem);
+        assert_eq!(map_role("AXButton", Some("AXAnything")), AxRole::Button);
     }
 
     #[test]

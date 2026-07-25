@@ -105,7 +105,10 @@ impl Accessibility for MacosA11y {
         // different same-role+name element on this pre-order id, its bounds sit elsewhere
         // and it is rejected here rather than silently overwritten.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role);
+        let subrole = mapping::subrole_matters(&ax_role)
+            .then(|| ffi::attribute_string(&el, attr::SUBROLE))
+            .flatten();
+        let role = mapping::map_role(&ax_role, subrole.as_deref());
         let name = ffi::attribute_string(&el, attr::TITLE)
             .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
@@ -165,7 +168,10 @@ impl Accessibility for MacosA11y {
 
         // Same fingerprint gate as set_value: role + name + bounds.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
-        let role = mapping::map_role(&ax_role);
+        let subrole = mapping::subrole_matters(&ax_role)
+            .then(|| ffi::attribute_string(&el, attr::SUBROLE))
+            .flatten();
+        let role = mapping::map_role(&ax_role, subrole.as_deref());
         let name = ffi::attribute_string(&el, attr::TITLE)
             .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
@@ -309,10 +315,18 @@ fn walk(
     budget.visit();
 
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
-    let role = mapping::map_role(&ax_role);
+    // `AXSubrole` costs an AX IPC round-trip, so it's read only for the base roles where
+    // AppKit actually uses it to disambiguate (`mapping::subrole_matters`) — every other node
+    // skips it.
+    let subrole = mapping::subrole_matters(&ax_role)
+        .then(|| ffi::attribute_string(el, attr::SUBROLE))
+        .flatten();
+    let role = mapping::map_role(&ax_role, subrole.as_deref());
     // `raw_role` is normally the same AX role string `map_role` just matched on — the token, not
     // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
-    // mapping key and not worth a second attribute read on every node.
+    // mapping key and not worth a second attribute read on every node. When a subrole was read
+    // and is non-empty, it's appended (`"AXRow/AXOutlineRow"`) so a probe can see what
+    // disambiguated the role.
     //
     // The fallback is conditional because that trade only holds while `AXRole` says something.
     // A custom or non-standard control is expected to report a generic role — `AXUnknown`, or no
@@ -323,7 +337,10 @@ fn walk(
     let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
         ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role)
     } else {
-        ax_role
+        match &subrole {
+            Some(sub) if !sub.is_empty() => format!("{ax_role}/{sub}"),
+            _ => ax_role,
+        }
     };
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
