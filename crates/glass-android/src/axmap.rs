@@ -43,6 +43,16 @@ pub const CLASS_TOKENS: &[(&str, AxRole)] = &[
     ("ListView", AxRole::List),
     ("GridView", AxRole::List),
     ("WebView", AxRole::Group),
+    // Containers the leaf-suffix rule below cannot catch, each observed in a real app's
+    // tree: the AndroidX card container, the AppCompat linear layout (shipped under two
+    // package names), the view that hosts a Compose hierarchy, and a swipe-paged container.
+    // Each match is on the exact leaf: Material Components' `MaterialCardView` and the
+    // `ViewPager2` successor have different leaves and are not matched.
+    ("CardView", AxRole::Group),
+    ("LinearLayoutCompat", AxRole::Group),
+    ("ComposeView", AxRole::Group),
+    // A pager holds pages, not list items, so it is a Group rather than a List.
+    ("ViewPager", AxRole::Group),
 ];
 
 /// Map an Android widget class (`android.widget.Button`, …) to a normalized role.
@@ -441,6 +451,23 @@ mod tests {
     }
 
     #[test]
+    fn container_classes_the_probe_found_map_to_group() {
+        // Every class here was observed in a real app's uiautomator dump landing in
+        // AxRole::Other. They are all containers, and the container rule cannot catch
+        // them: "CardView" and "ComposeView" do not end in "Layout", "LinearLayoutCompat"
+        // ends in "Compat", and "ViewPager" is neither "View" nor "ViewGroup".
+        for class in [
+            "androidx.cardview.widget.CardView",
+            "androidx.appcompat.widget.LinearLayoutCompat",
+            "android.support.v7.widget.LinearLayoutCompat",
+            "androidx.compose.ui.platform.ComposeView",
+            "androidx.viewpager.widget.ViewPager",
+        ] {
+            assert_eq!(class_to_role(class), AxRole::Group, "{class}");
+        }
+    }
+
+    #[test]
     fn class_tokens_have_no_duplicates() {
         for (i, (leaf, _)) in CLASS_TOKENS.iter().enumerate() {
             assert!(
@@ -463,10 +490,12 @@ mod tests {
         for role in AxRole::ALL {
             let mapped = CLASS_TOKENS.iter().any(|(_, r)| *r == role)
                 || RULE_ROLES.contains(&role)
-                // Only the uiautomator reader (`build_tree`) synthesizes a Window root; the
-                // on-device AccessibilityService reader roots the tree at the device's node,
-                // which comes from `class_to_role` like any other node. Exempt Window since
-                // `class_to_role` cannot produce it.
+                // Neither reader produces Window from a class name: the uiautomator reader
+                // wraps its dump in a synthetic Window root, and the accessibility-service
+                // reader sets Window on the active window's own root node (see
+                // `a11y_service::tree_from_json`). Exempt it — `class_to_role` cannot
+                // produce it, and the Android column declares it Mapped because both
+                // readers really do report it.
                 || role == AxRole::Window;
             match support(role, AxBackend::Android).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {

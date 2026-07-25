@@ -24,18 +24,22 @@ internal refactors, CI, or test-only changes.
 - [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
   each platform backend can produce, and why a role is unavailable where it is.
 - More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
-  and their rows, split views and their dividers, scroll areas, headings, and menu buttons.
+  and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
+  Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
+  hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
   Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
-- Two kinds of element now report a different role than before, so a `role:` filter that used to
+- Three kinds of element now report a different role than before, so a `role:` filter that used to
   match them no longer does. On Windows, a button that can be toggled (a formatting bar's Bold or
   Italic) reports `ToggleButton` instead of `Button`; on macOS, a row inside an outline view
-  reports `TreeItem` instead of `ListItem`. `role:` matches exactly — the fallback that also
-  accepts a generically-classified element only rescues ones reported as `Group` or `Other` — so
-  a `glass_wait_for_element` (or any other element selector) asking for `role: "button"` or
-  `role: "listitem"` on those elements needs the new role.
+  reports `TreeItem` instead of `ListItem`; on Android, the root element of a tree read through the
+  on-device accessibility service reports `Window` instead of the role its widget class implied,
+  matching what the `uiautomator` reader has always reported. `role:` matches exactly — the
+  fallback that also accepts a generically-classified element only rescues ones reported as `Group`
+  or `Other` — so a `glass_wait_for_element` (or any other element selector) asking for
+  `role: "button"` or `role: "listitem"` on those elements needs the new role.
 - The `glass_a11y_snapshot` outline now names the platform's own role token for an element glass
   has no role mapping for: the line reads `Other(AXDisclosureTriangle)` rather than a bare
   `Other`, so a custom control is still identifiable. The token is the platform's stable

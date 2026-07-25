@@ -104,19 +104,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 ),
                 Gap("AXSheet, AXPopover and AXDrawer are not mapped yet"),
                 Gap("dialog windows arrive as a generic layout class"),
-                Gap("alert and action-sheet tokens are not mapped yet"),
+                Gap(
+                    "an alert exposes its buttons and text directly under the application \
+                     element; no alert, sheet or popover token appears",
+                ),
             ],
         ),
-        (
-            R::Group,
-            [
-                Mapped,
-                Mapped,
-                Mapped,
-                Mapped,
-                Gap("no container token is mapped yet"),
-            ],
-        ),
+        (R::Group, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (R::Button, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (
             R::ToggleButton,
@@ -195,7 +189,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
         ),
         (
             R::List,
-            [Mapped, Mapped, Mapped, Mapped, Gap("no list token is mapped yet")],
+            [
+                Mapped,
+                Mapped,
+                Mapped,
+                Mapped,
+                Gap("collections arrive as AXGroup, which maps to Group; no list token appears"),
+            ],
         ),
         (
             R::ListItem,
@@ -204,7 +204,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Mapped,
                 Mapped,
                 Gap("list children report their own widget class, not a list-item role"),
-                Gap("no list-item token is mapped yet"),
+                Gap("a collection's children report their own element role, not a list-item role"),
             ],
         ),
         (
@@ -214,7 +214,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Mapped,
                 Gap("mac lists report AXOutline rather than AXTable; AXOutline maps to Tree"),
                 Gap("table and grid classes collapse into List"),
-                Gap("no table token is mapped yet"),
+                Gap("collections arrive as AXGroup, which maps to Group; no table token appears"),
             ],
         ),
         (
@@ -256,7 +256,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Mapped,
                 Mapped,
                 Mapped,
-                Gap("tab-container classes are not mapped yet"),
+                Gap(
+                    "a tab container reports a plain layout class; the tab role lives in the \
+                     view's id and selected state, not in the class name",
+                ),
                 Mapped,
             ],
         ),
@@ -267,8 +270,14 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Mapped,
                 Gap("AppKit reports tab items as AXRadioButton inside the tab group; the \
                      containing role is not used to disambiguate yet"),
-                Gap("tab children are not mapped yet"),
-                Gap("tab-item tokens are not mapped yet"),
+                Gap(
+                    "a tab reports a plain layout class with selected=true; nothing in the \
+                     class name marks it as a tab",
+                ),
+                Gap(
+                    "the tab bars seen in probing arrived as AXGroup, named by the element \
+                     identifier rather than the role, and no tab-item token appeared",
+                ),
             ],
         ),
         (
@@ -350,8 +359,11 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Gap("UIA's Header and HeaderItem are grid column headers, not document \
                      headings; the normalized set has no column-header role"),
                 Mapped,
-                Gap("heading semantics are not mapped yet"),
-                Gap("the header token is not mapped yet"),
+                Gap(
+                    "neither reader exposes heading semantics: the uiautomator dump has no \
+                     heading attribute, and the service protocol does not carry isHeading",
+                ),
+                Mapped,
             ],
         ),
     ]

@@ -44,6 +44,14 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXTabBar", AxRole::TabList),
     ("AXApplication", AxRole::Application),
     ("AXWindow", AxRole::Window),
+    // A content container, and the only structural token most probed screens exposed: in
+    // those apps the navigation bar and the tab bar arrived as AXGroup as well, named by the
+    // element's identifier rather than by its role. That is what was seen there, not a rule
+    // about UIKit — an app that does report AXNavigationBar or AXTabBar still maps to Toolbar
+    // or TabList through the rows above.
+    ("AXGroup", AxRole::Group),
+    // A screen or section title.
+    ("AXHeading", AxRole::Heading),
 ];
 
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
@@ -591,6 +599,21 @@ mod tests {
         );
         // `checked` carries the state; the label still lives in `value` (unchanged behavior).
         assert_eq!(sw.value.as_deref(), Some("Bold Text"));
+    }
+
+    #[test]
+    fn tokens_the_probe_found_map_to_their_roles() {
+        // Both were observed across most stock apps probed: AXGroup wraps content — in those
+        // apps the navigation bar and the tab bar arrived as AXGroup too, named by the
+        // element identifier rather than by the role — and AXHeading is a screen or section
+        // title. An app that reports AXNavigationBar or AXTabBar instead still maps to
+        // Toolbar or TabList; those rows are unchanged.
+        assert_eq!(ax_role("AXGroup"), AxRole::Group);
+        assert_eq!(ax_role("AXHeading"), AxRole::Heading);
+        // A generic element carries no role at all, so it stays Other and the native token
+        // stays visible in the outline. Mapping it to Group would claim a structure that
+        // the platform never reported.
+        assert_eq!(ax_role("AXGenericElement"), AxRole::Other);
     }
 
     #[test]
