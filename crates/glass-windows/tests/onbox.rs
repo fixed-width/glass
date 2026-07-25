@@ -97,11 +97,13 @@ fn taskmgr_spec() -> AppSpec {
 /// Bare `explorer.exe` (no path arg): opens the OS default location — "Quick access" on
 /// Windows 10, "Home" on Windows 11 — the same native file-list control, and so the same UIA
 /// tree, any folder view uses (what that tree actually emitted is recorded in
-/// [`onbox_role_histogram_probe`]'s doc). Each File Explorer
-/// window is its own process (unlike Task Manager, Explorer has no single-instance check —
-/// this is why `explorer.exe <uri>` protocol activation, e.g. `ms-settings:`, is the flaky
-/// shape and a plain `explorer.exe` folder-window launch is not), so pid-set discovery is
-/// expected to find it directly. The hint here is `class`, not `title`: `CabinetWClass` is
+/// [`onbox_role_histogram_probe`]'s doc). The `class` hint is what actually finds it: the
+/// spawned `explorer.exe` hands the request to the already-running shell and exits, so the
+/// folder window belongs to a process that was there before glass started and is in no pid set
+/// glass tracks. That also means `stop_app` cannot close it — teardown reaches the process tree
+/// glass launched, which by then is gone — so the probe closes the adopted window itself (see
+/// [`close_adopted_window`]); without that, every run would leave a folder window on the
+/// desktop. The hint is `class`, not `title`: `CabinetWClass` is
 /// every File Explorer folder window's documented window class regardless of locale, OS
 /// version, or the current folder's display name — unlike a title, which would vary with
 /// exactly the thing this spec deliberately leaves unset.
@@ -1163,6 +1165,25 @@ fn mapped_token_violations(label: &str, tree: &AxTree) -> Vec<String> {
         .collect()
 }
 
+/// Ask a still-open adopted window to close, for the case `stop_app` cannot reach: a window
+/// owned by a process glass did not launch (a launcher that hands off to a long-running shell).
+/// `WM_CLOSE` rather than terminating anything — the owner here is the user's shell process.
+/// A no-op when the handle is absent or its window is already gone.
+fn close_adopted_window(raw: Option<i64>) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_CLOSE};
+
+    let Some(raw) = raw else { return };
+    let hwnd = windows::Win32::Foundation::HWND(raw as *mut std::ffi::c_void);
+    // SAFETY: both calls only query/queue against an HWND — no pointer we own is written
+    // through, and neither blocks on the target thread. A stale handle fails `IsWindow`.
+    unsafe {
+        if IsWindow(Some(hwnd)).as_bool() {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 /// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
 /// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
 /// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
@@ -1223,7 +1244,14 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
         report.push_str(&toggle_block);
     }
 
+    let adopted = p.active_window_handle();
     let _ = p.stop_app();
+    // `stop_app` tears down the process tree glass launched, which is not always the process
+    // that owns the window it adopted: a Win11 File Explorer folder window belongs to the
+    // already-running shell `explorer.exe`, so the process glass spawned exits immediately and
+    // the window it drove outlives teardown. This probe opens four apps in a row and would
+    // otherwise leave one window behind on every run, so it closes what it adopted.
+    close_adopted_window(adopted);
     std::thread::sleep(Duration::from_millis(500)); // let the app fully exit before the next probe
 
     let violations = mapped_token_violations(label, &tree);
