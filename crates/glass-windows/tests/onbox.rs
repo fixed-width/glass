@@ -91,14 +91,21 @@ fn glass_windows_with_a11y() -> Glass {
     Glass::new(factory, "windows".into(), BaselineStore::new(root), 100)
 }
 
-/// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
-/// build location so the spec isn't pinned to one checkout/user. `sandbox` selects containment.
-fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The repo root: two levels above `crates/glass-windows` (this crate's `CARGO_MANIFEST_DIR`),
+/// baked in at build time — so on the box's own `cargo build`, it reflects wherever that box's
+/// checkout actually lives, not a hardcoded path/user.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("repo root is two levels above crates/glass-windows")
-        .to_path_buf();
+        .to_path_buf()
+}
+
+/// The egui input/a11y fixture (built on demand; excluded from the workspace). Paths derive from the
+/// build location so the spec isn't pinned to one checkout/user. `sandbox` selects containment.
+fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
+    let repo_root = repo_root();
     let fixture_exe =
         repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
     AppSpec {
@@ -920,19 +927,57 @@ fn onbox_contained_launch_adopts_app_not_console() {
     p.stop_app().expect("stop_app");
 }
 
-/// Print `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
+/// Where the role-histogram probe writes its report: `.windows-artifacts` under the repo
+/// root. Mirrors `examples/onbox.rs`'s `out_dir()`/`save()` convention (a resolved-at-runtime
+/// directory + a small write-and-report helper) — but targets `.windows-artifacts` directly
+/// rather than `%USERPROFILE%`. That example's `%USERPROFILE%` files get swept into
+/// `.windows-artifacts` by a step in `tools/windows-validation/run-onbox.ps1` that runs only
+/// for the plain `onbox` example; an `--ignored` test run (this probe's path, via
+/// `scripts/test-windows.sh --tests`) has no such sweep. `.windows-artifacts` itself, though,
+/// is scp'd back to the caller by `scripts/test-windows.sh` after every run regardless — and
+/// it must be, since this probe's stdout is captured by the schtasks bounce into the
+/// interactive session and never reaches the caller at all. So this file is the only way the
+/// histogram gets out.
+fn artifacts_dir() -> std::path::PathBuf {
+    repo_root().join(".windows-artifacts")
+}
+
+/// Write `report` to `name` under [`artifacts_dir`], creating the directory if it doesn't
+/// already exist (`run-onbox.ps1` creates it fresh before every run, but this stays robust
+/// to a direct on-box invocation that skips the harness). Mirrors `examples/onbox.rs`'s
+/// `save()`.
+fn save_report(name: &str, report: &str) {
+    let dir = artifacts_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        println!("    creating {} FAILED: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(name);
+    match std::fs::write(&path, report) {
+        Ok(()) => println!("    saved {}", path.display()),
+        Err(e) => println!("    save {} FAILED: {e}", path.display()),
+    }
+}
+
+/// Render `role_histogram(tree)` as one line per `(token, role)` bucket — unmapped
 /// ([`AxRole::Other`]) buckets first, which is already the histogram's own sort order, so
-/// the tokens most worth a human's attention are the first thing printed.
-fn print_role_histogram(label: &str, tree: &AxTree) {
+/// the tokens most worth a human's attention are the first thing in the block. Returns the
+/// text (rather than printing it) so [`probe_role_histogram`] can both print it directly
+/// (useful running straight on a box with a desktop session) and fold it into the artifacts
+/// file that's the only way it reaches a caller through the on-box harness.
+fn render_role_histogram(label: &str, tree: &AxTree) -> String {
+    use std::fmt::Write as _;
     let hist = role_histogram(tree);
-    println!("\n===== role histogram: {label} =====");
-    println!(
+    let mut out = String::new();
+    let _ = writeln!(out, "\n===== role histogram: {label} =====");
+    let _ = writeln!(
+        out,
         "{} nodes, {} distinct (token, role) buckets",
         tree.count,
         hist.len()
     );
     if let Some(t) = &tree.truncated {
-        println!("  NOTE: {}", t.notice());
+        let _ = writeln!(out, "  NOTE: {}", t.notice());
     }
     for entry in &hist {
         let tag = if entry.role == AxRole::Other {
@@ -940,22 +985,24 @@ fn print_role_histogram(label: &str, tree: &AxTree) {
         } else {
             "mapped"
         };
-        println!(
+        let _ = writeln!(
+            out,
             "  {tag:>8}  x{:<5} role={:?} token={:?}",
             entry.count, entry.role, entry.raw_role
         );
     }
+    out
 }
 
 /// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
 /// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
-/// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, then
-/// stop the app. Panics — failing the test — only when the app can't be launched or a
-/// snapshot can't be taken at all: a real breakage, never merely an unexpected role. What the
-/// histogram actually contains is never asserted here; that's the human's job, reading the
-/// printed output to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a
-/// real native token now justifies filling.
-fn probe_role_histogram(label: &str, spec: &AppSpec) {
+/// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
+/// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
+/// launched or a snapshot can't be taken at all: a real breakage, never merely an unexpected
+/// role. What the histogram actually contains is never asserted here; that's the human's job,
+/// reading it to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real
+/// native token now justifies filling.
+fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let geo = p
         .start_app(spec)
@@ -974,19 +1021,28 @@ fn probe_role_histogram(label: &str, spec: &AppSpec) {
         .snapshot(&ctx)
         .unwrap_or_else(|e| panic!("{label}: a11y snapshot failed: {e}"));
 
-    print_role_histogram(label, &tree);
+    let block = render_role_histogram(label, &tree);
+    print!("{block}");
+    report.push_str(&block);
 
     let _ = p.stop_app();
     std::thread::sleep(Duration::from_millis(500)); // let the app fully exit before the next probe
 }
 
 /// The evidence step behind the Windows half of the accessibility role-parity work: launch a
-/// handful of stock apps and print each one's `role_histogram` — every native UIA token the
+/// handful of stock apps and record each one's `role_histogram` — every native UIA token the
 /// app actually emitted, unmapped (`AxRole::Other`) tokens first. The project's rule is probe
 /// first, map second: a `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` may only get a
 /// match arm for a token that showed up in output like this. So this test's only job is to
 /// produce that evidence — it never asserts what the tokens should be, and fails only when a
 /// snapshot could not be taken at all (see [`probe_role_histogram`]).
+///
+/// The histogram is both printed to stdout AND written to `role-histogram-windows.txt` under
+/// [`artifacts_dir`] (see that function's doc for why the file is required, not just a nicety
+/// on top of stdout): run through `scripts/test-windows.sh`, this test's stdout is captured by
+/// the schtasks bounce into the interactive session and never reaches the caller, so the file
+/// is the only way the evidence gets out of that path. Printing it too costs nothing and helps
+/// anyone running the test directly on a box with a desktop session.
 ///
 /// Runs charmap and Notepad. The Settings app (`ms-settings:` via `explorer.exe`) was
 /// considered and left out: unlike these two, its window has no process relationship to the
@@ -998,11 +1054,13 @@ fn probe_role_histogram(label: &str, spec: &AppSpec) {
 /// it without on-box verification that it resolves reliably; see the report for the full
 /// reasoning.
 #[test]
-#[ignore = "on-box only: needs the interactive desktop session; prints role histograms, asserts nothing about their contents"]
+#[ignore = "on-box only: needs the interactive desktop session; prints role histograms and writes them to .windows-artifacts/role-histogram-windows.txt, asserts nothing about their contents"]
 fn onbox_role_histogram_probe() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
 
-    probe_role_histogram("charmap.exe (Character Map)", &charmap_spec());
-    probe_role_histogram("notepad.exe (Notepad)", &notepad_spec());
+    let mut report = String::new();
+    probe_role_histogram("charmap.exe (Character Map)", &charmap_spec(), &mut report);
+    probe_role_histogram("notepad.exe (Notepad)", &notepad_spec(), &mut report);
+    save_report("role-histogram-windows.txt", &report);
 }
