@@ -234,7 +234,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXOutline is not mapped yet"),
+                Mapped,
                 NotApplicable("Android has no tree widget"),
                 NotApplicable("UIKit has no outline view"),
             ],
@@ -244,7 +244,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("the outline-row subrole is not read yet"),
+                Mapped,
                 NotApplicable("Android has no tree widget"),
                 NotApplicable("UIKit has no outline view"),
             ],
@@ -317,7 +317,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXSplitter is not mapped yet"),
+                Mapped,
                 NotApplicable("Android dividers are drawn, not exposed as nodes"),
                 NotApplicable("UIKit exposes no separator element"),
             ],
@@ -347,7 +347,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             [
                 Mapped,
                 Mapped,
-                Gap("AXHeading is not mapped yet"),
+                Mapped,
                 Gap("heading semantics are not mapped yet"),
                 Gap("the header token is not mapped yet"),
             ],

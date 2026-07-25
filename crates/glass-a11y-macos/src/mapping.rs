@@ -34,6 +34,12 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXTabGroup", AxRole::TabList),
     ("AXProgressIndicator", AxRole::ProgressBar),
     ("AXScrollBar", AxRole::ScrollBar),
+    ("AXOutline", AxRole::Tree),
+    ("AXScrollArea", AxRole::Group),
+    ("AXSplitGroup", AxRole::Group),
+    ("AXSplitter", AxRole::Separator),
+    ("AXHeading", AxRole::Heading),
+    ("AXMenuButton", AxRole::Button),
 ];
 
 /// AppKit uses `AXSubrole` to say what an element really is only for a handful of base roles —
@@ -50,7 +56,11 @@ pub fn subrole_matters(ax_role: &str) -> bool {
 /// Map an AX role string, plus its `AXSubrole` when the reader took one, to the normalized
 /// `AxRole`; unmapped roles become `AxRole::Other` (the reader keeps the token in `raw_role`).
 pub fn map_role(ax_role: &str, subrole: Option<&str>) -> AxRole {
-    let _ = subrole;
+    // A row's subrole is what separates an outline row from a table row; AppKit reports both
+    // as AXRow. Every other disambiguation the probe found is expressible in the table.
+    if ax_role == "AXRow" && subrole == Some("AXOutlineRow") {
+        return AxRole::TreeItem;
+    }
     ROLE_TOKENS
         .iter()
         .find(|(token, _)| *token == ax_role)
@@ -214,7 +224,10 @@ mod tests {
     fn map_matches_declared_column() {
         use glass_core::role_support::{support, AxBackend, RoleSupport};
         for role in AxRole::ALL {
-            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
+            // The outline-row/table-row split happens outside the token table (see
+            // `map_role`'s subrole check), so table membership alone would miss TreeItem.
+            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role)
+                || map_role("AXRow", Some("AXOutlineRow")) == role;
             match support(role, AxBackend::MacOs).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no AX role maps to it")
@@ -243,11 +256,38 @@ mod tests {
     }
 
     #[test]
-    fn a_subrole_does_not_change_any_mapping_yet() {
-        // This task wires the subrole through; nothing keys on it until the mapping task.
-        assert_eq!(map_role("AXRow", None), AxRole::ListItem);
-        assert_eq!(map_role("AXRow", Some("AXOutlineRow")), AxRole::ListItem);
+    fn a_subrole_that_does_not_disambiguate_leaves_the_mapping_unchanged() {
+        // AXRow/AXOutlineRow is the one subrole combination that changes the mapped role (see
+        // `an_outline_row_is_a_tree_item_a_plain_row_is_a_list_item`); every other role ignores
+        // whatever subrole the reader happened to pass.
         assert_eq!(map_role("AXButton", Some("AXAnything")), AxRole::Button);
+    }
+
+    #[test]
+    fn observed_tokens_map() {
+        // Every token here was observed in a stock-app probe run. Nothing is mapped that a
+        // real app did not emit.
+        assert_eq!(map_role("AXOutline", None), AxRole::Tree);
+        assert_eq!(map_role("AXScrollArea", None), AxRole::Group);
+        assert_eq!(map_role("AXSplitGroup", None), AxRole::Group);
+        assert_eq!(map_role("AXSplitter", None), AxRole::Separator);
+        assert_eq!(map_role("AXHeading", None), AxRole::Heading);
+        assert_eq!(map_role("AXMenuButton", None), AxRole::Button);
+    }
+
+    #[test]
+    fn an_outline_row_is_a_tree_item_a_plain_row_is_a_list_item() {
+        assert_eq!(map_role("AXRow", Some("AXOutlineRow")), AxRole::TreeItem);
+        assert_eq!(map_role("AXRow", None), AxRole::ListItem);
+        assert_eq!(map_role("AXRow", Some("AXTableRow")), AxRole::ListItem);
+    }
+
+    #[test]
+    fn an_unobserved_token_stays_unmapped() {
+        // AXTable never appeared in any probed app — the lists are outlines. No arm.
+        assert_eq!(map_role("AXTable", None), AxRole::Other);
+        // A column is a table sub-structure with no counterpart in the normalized set.
+        assert_eq!(map_role("AXColumn", None), AxRole::Other);
     }
 
     #[test]

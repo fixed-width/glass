@@ -41,8 +41,8 @@ device's own node, which is classified like any other node from its widget class
 | `ListItem` | yes | yes | yes | gap | gap |
 | `Table` | yes | yes | gap | gap | gap |
 | `Cell` | yes | gap | yes | gap | yes |
-| `Tree` | yes | yes | gap | n/a | n/a |
-| `TreeItem` | yes | yes | gap | n/a | n/a |
+| `Tree` | yes | yes | yes | n/a | n/a |
+| `TreeItem` | yes | yes | yes | n/a | n/a |
 | `TabList` | yes | yes | yes | gap | yes |
 | `Tab` | yes | yes | gap | gap | gap |
 | `ScrollBar` | yes | yes | yes | n/a | n/a |
@@ -51,10 +51,10 @@ device's own node, which is classified like any other node from its widget class
 | `ProgressBar` | yes | yes | yes | yes | gap |
 | `Image` | yes | yes | yes | yes | yes |
 | `Link` | yes | yes | yes | n/a | yes |
-| `Separator` | yes | yes | gap | n/a | n/a |
+| `Separator` | yes | yes | yes | n/a | n/a |
 | `Toolbar` | yes | yes | yes | gap | yes |
 | `StatusBar` | yes | yes | n/a | n/a | n/a |
-| `Heading` | yes | yes | gap | gap | gap |
+| `Heading` | yes | yes | yes | gap | gap |
 
 ### Why a cell is not `yes`
 
@@ -84,10 +84,8 @@ device's own node, which is classified like any other node from its widget class
 - `Table` / iOS — gap: no table token is mapped yet
 - `Cell` / Windows (UIA) — gap: UIA's DataItem control type would carry this, but the data grids probed expose their rows as TreeItem
 - `Cell` / Android — gap: no cell class is mapped yet
-- `Tree` / macOS (AX) — gap: AXOutline is not mapped yet
 - `Tree` / Android — n/a: Android has no tree widget
 - `Tree` / iOS — n/a: UIKit has no outline view
-- `TreeItem` / macOS (AX) — gap: the outline-row subrole is not read yet
 - `TreeItem` / Android — n/a: Android has no tree widget
 - `TreeItem` / iOS — n/a: UIKit has no outline view
 - `TabList` / Android — gap: tab-container classes are not mapped yet
@@ -101,14 +99,12 @@ device's own node, which is classified like any other node from its widget class
 - `SpinButton` / iOS — gap: the stepper token is not mapped yet
 - `ProgressBar` / iOS — gap: no progress token is mapped yet
 - `Link` / Android — n/a: Android links are spans inside a text view, not separate nodes
-- `Separator` / macOS (AX) — gap: AXSplitter is not mapped yet
 - `Separator` / Android — n/a: Android dividers are drawn, not exposed as nodes
 - `Separator` / iOS — n/a: UIKit exposes no separator element
 - `Toolbar` / Android — gap: the toolbar class is not mapped yet
 - `StatusBar` / macOS (AX) — n/a: AppKit exposes status items as menu-bar items
 - `StatusBar` / Android — n/a: the system status bar is outside the app tree
 - `StatusBar` / iOS — n/a: the system status bar is outside the app tree
-- `Heading` / macOS (AX) — gap: AXHeading is not mapped yet
 - `Heading` / Android — gap: heading semantics are not mapped yet
 - `Heading` / iOS — gap: the header token is not mapped yet
 <!-- END GENERATED: role-support -->
