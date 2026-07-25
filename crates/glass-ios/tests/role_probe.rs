@@ -62,9 +62,9 @@ const MIN_EVIDENCE_NODES: usize = 4;
 ///
 /// # Panics
 ///
-/// Panics when the variable is set to anything but a whole number of milliseconds. Falling
-/// back to the default there would hand the operator the very empty shell they set the knob to
-/// avoid, without saying so.
+/// Panics when the variable is set to a non-blank value that is not a whole number of
+/// milliseconds; set-but-blank reads as unset. Falling back to the default on a typo would hand
+/// the operator the very empty shell they set the knob to avoid, without saying so.
 fn startup_settle() -> Duration {
     let Some(raw) = std::env::var_os(SETTLE_MS_VAR) else {
         return STARTUP_SETTLE;

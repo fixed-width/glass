@@ -69,9 +69,9 @@ const MIN_EVIDENCE_NODES: usize = 4;
 ///
 /// # Panics
 ///
-/// Panics when the variable is set to anything but a whole number of milliseconds. Falling
-/// back to the default there would hand the operator the very half-drawn tree they set the
-/// knob to avoid, without saying so.
+/// Panics when the variable is set to a non-blank value that is not a whole number of
+/// milliseconds; set-but-blank reads as unset. Falling back to the default on a typo would hand
+/// the operator the very half-drawn tree they set the knob to avoid, without saying so.
 fn startup_settle() -> Duration {
     let Some(raw) = std::env::var_os(SETTLE_MS_VAR) else {
         return STARTUP_SETTLE;
@@ -207,6 +207,19 @@ fn spec_for(component: &str) -> AppSpec {
     }
 }
 
+/// Restores the device's accessibility settings — `enabled_accessibility_services`,
+/// `accessibility_enabled` and the `adb forward` — when it drops. `A11yServiceRegistry::ensure`
+/// records the prior values and `shutdown` puts them back, so the only question is whether
+/// `shutdown` is reached: a guard reaches it on the panicking path too, which a plain call at
+/// the end of the test does not.
+struct RestoreServiceState<'a>(&'a A11yServiceRegistry);
+
+impl Drop for RestoreServiceState<'_> {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 /// The node cap lifted, so a big app's tree is never truncated mid-probe. Depth and per-level
 /// sibling rails keep their generous structural defaults regardless.
 fn uncapped() -> WalkLimits {
@@ -287,6 +300,10 @@ fn service_role_histogram_probe() {
     let client = registry
         .ensure(&platform.resolved_adb(), &apk)
         .expect("install + enable + connect the accessibility service");
+    // Held for the rest of the run so the settings go back however this probe leaves — a
+    // panicking start_app or snapshot mid-loop would otherwise strand the device in exactly
+    // the state the hoisted `ensure` above exists to avoid.
+    let _restore = RestoreServiceState(&registry);
     let mut a11y = ServiceA11y::new(client, String::new());
     let mut violations = Vec::new();
 
@@ -315,8 +332,9 @@ fn service_role_histogram_probe() {
         platform.stop_app().expect("stop_app");
     }
 
-    registry.shutdown(); // restores enabled_accessibility_services + removes the forward
     drop(platform);
     agents.shutdown();
+    // `_restore` puts the device's accessibility settings back as it drops, after this
+    // assertion has decided the run — on the failing path as much as the passing one.
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
