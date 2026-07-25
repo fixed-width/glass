@@ -39,7 +39,19 @@ const PROBE_APPS_VAR: &str = "GLASS_A11Y_PROBE_APPS";
 /// How long to wait after `start_app` before snapshotting — UIKit keeps building the view
 /// hierarchy for a beat after the app is up, and a tree read too early is missing the content
 /// the probe exists to see. Matches the settle the sibling on-box tests use.
+///
+/// Overridable with `GLASS_A11Y_PROBE_SETTLE_MS`: a stock app that loads its content
+/// asynchronously (a contact list, a document browser) can still be showing an empty shell at
+/// this default, and an empty shell is evidence of nothing.
 const STARTUP_SETTLE: Duration = Duration::from_millis(1500);
+
+/// [`STARTUP_SETTLE`], or the `GLASS_A11Y_PROBE_SETTLE_MS` override when it parses.
+fn startup_settle() -> Duration {
+    std::env::var("GLASS_A11Y_PROBE_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .map_or(STARTUP_SETTLE, Duration::from_millis)
+}
 
 /// AX role tokens glass maps to a role, and that a probed app has actually been seen to
 /// report. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
@@ -139,7 +151,7 @@ fn role_histogram_probe() {
         let window = platform
             .start_app(&spec)
             .unwrap_or_else(|e| panic!("start_app({target}): {e}"));
-        std::thread::sleep(STARTUP_SETTLE);
+        std::thread::sleep(startup_settle());
 
         let mut a11y = platform
             .accessibility()
