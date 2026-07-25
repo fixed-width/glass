@@ -42,15 +42,17 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXMenuButton", AxRole::Button),
 ];
 
-/// AppKit uses `AXSubrole` to say what an element really is only for a handful of base roles —
-/// an `AXRow` is a table row or an outline row, an `AXWindow` is a plain window or a dialog or
-/// a sheet, an `AXTextField` may be a search field. Every other role is already unambiguous,
-/// and each subrole read is an AX IPC round-trip, so the reader asks only for these.
+/// Whether the reader should read this base role's `AXSubrole`.
+///
+/// Each subrole read is an AX IPC round-trip on every matching node, so the gate is exactly the
+/// roles whose subrole [`map_role`] actually consults — today `AXRow` alone, where
+/// `AXOutlineRow` separates an outline row ([`AxRole::TreeItem`]) from a plain table row
+/// ([`AxRole::ListItem`]). AppKit gives other base roles subroles too (an `AXWindow` is a plain
+/// window or a dialog or a sheet, an `AXTextField` may be a search field), and they belong here
+/// as soon as something maps them — until then reading them would spend a round-trip per node
+/// on a value nothing reads.
 pub fn subrole_matters(ax_role: &str) -> bool {
-    matches!(
-        ax_role,
-        "AXWindow" | "AXTextField" | "AXRow" | "AXGroup" | "AXUnknown"
-    )
+    ax_role == "AXRow"
 }
 
 /// Map an AX role string, plus its `AXSubrole` when the reader took one, to the normalized
@@ -243,11 +245,21 @@ mod tests {
     #[test]
     fn subrole_is_read_only_where_it_disambiguates() {
         // Reading AXSubrole costs an AX IPC round-trip per node, so the reader takes it only
-        // for the base roles where AppKit uses a subrole to say what an element really is.
-        for role in ["AXWindow", "AXTextField", "AXRow", "AXGroup", "AXUnknown"] {
-            assert!(subrole_matters(role), "{role} must be gated in");
-        }
-        for role in ["AXButton", "AXStaticText", "AXCell", "AXImage", ""] {
+        // for the one base role whose subrole `map_role` consults.
+        assert!(subrole_matters("AXRow"), "AXRow must be gated in");
+        // AXWindow/AXTextField/AXGroup/AXUnknown do carry meaningful subroles, but nothing maps
+        // them, so the read would be paid for and thrown away.
+        for role in [
+            "AXWindow",
+            "AXTextField",
+            "AXGroup",
+            "AXUnknown",
+            "AXButton",
+            "AXStaticText",
+            "AXCell",
+            "AXImage",
+            "",
+        ] {
             assert!(
                 !subrole_matters(role),
                 "{role} must not pay for a subrole read"
