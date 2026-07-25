@@ -54,7 +54,7 @@ device's own node, which is classified like any other node from its widget class
 | `Separator` | yes | yes | yes | n/a | n/a |
 | `Toolbar` | yes | yes | yes | gap | yes |
 | `StatusBar` | yes | yes | n/a | n/a | n/a |
-| `Heading` | yes | yes | yes | gap | gap |
+| `Heading` | yes | gap | yes | gap | gap |
 
 ### Why a cell is not `yes`
 
@@ -66,7 +66,7 @@ device's own node, which is classified like any other node from its widget class
 - `Dialog` / Android — gap: dialog windows arrive as a generic layout class
 - `Dialog` / iOS — gap: alert and action-sheet tokens are not mapped yet
 - `Group` / iOS — gap: no container token is mapped yet
-- `ToggleButton` / macOS (AX) — gap: AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; subroles are not read yet
+- `ToggleButton` / macOS (AX) — gap: AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; AXCheckBox is outside the reader's subrole gate, and no probed app emitted either subrole
 - `RadioButton` / iOS — gap: no radio token is mapped yet
 - `MenuBar` / Android — n/a: Android apps have no menu bar
 - `MenuBar` / iOS — n/a: iOS apps have no menu bar
@@ -105,6 +105,7 @@ device's own node, which is classified like any other node from its widget class
 - `StatusBar` / macOS (AX) — n/a: AppKit exposes status items as menu-bar items
 - `StatusBar` / Android — n/a: the system status bar is outside the app tree
 - `StatusBar` / iOS — n/a: the system status bar is outside the app tree
+- `Heading` / Windows (UIA) — gap: UIA's Header and HeaderItem are grid column headers, not document headings; the normalized set has no column-header role
 - `Heading` / Android — gap: heading semantics are not mapped yet
 - `Heading` / iOS — gap: the header token is not mapped yet
 <!-- END GENERATED: role-support -->

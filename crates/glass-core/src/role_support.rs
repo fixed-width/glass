@@ -124,7 +124,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Mapped,
                 Mapped,
                 Gap("AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
-                     subrole; subroles are not read yet"),
+                     subrole; AXCheckBox is outside the reader's subrole gate, and no probed \
+                     app emitted either subrole"),
                 Mapped,
                 Mapped,
             ],
@@ -346,7 +347,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
             R::Heading,
             [
                 Mapped,
-                Mapped,
+                Gap("UIA's Header and HeaderItem are grid column headers, not document \
+                     headings; the normalized set has no column-header role"),
                 Mapped,
                 Gap("heading semantics are not mapped yet"),
                 Gap("the header token is not mapped yet"),

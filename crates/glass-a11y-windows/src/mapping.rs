@@ -52,8 +52,10 @@ pub const CONTROL_TYPES: &[(u32, &str, Option<AxRole>)] = &[
     (50031, "SplitButton", Some(AxRole::Button)),
     (50032, "Window", Some(AxRole::Window)),
     (50033, "Pane", Some(AxRole::Group)),
-    (50034, "Header", Some(AxRole::Heading)),
-    (50035, "HeaderItem", Some(AxRole::Heading)),
+    // Header/HeaderItem are a grid's column-header bar and its individual column headers, not
+    // document headings — deliberately unmapped; see `observed_column_headers_are_not_headings`.
+    (50034, "Header", None),
+    (50035, "HeaderItem", None),
     (50036, "Table", Some(AxRole::Table)),
     (50037, "TitleBar", None),
     (50038, "Separator", Some(AxRole::Separator)),
@@ -215,12 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn document_and_headers_map_from_observed_tokens() {
-        // Observed on a stock text editor (Document) and a stock task manager (Header,
-        // HeaderItem) — see the probe test in crates/glass-windows/tests/onbox.rs.
+    fn document_maps_from_an_observed_token() {
+        // Observed on a stock text editor — see the probe test in
+        // crates/glass-windows/tests/onbox.rs.
         assert_eq!(map_role(50030, false), AxRole::TextArea);
-        assert_eq!(map_role(50034, false), AxRole::Heading);
-        assert_eq!(map_role(50035, false), AxRole::Heading);
     }
 
     #[test]
@@ -229,6 +229,19 @@ mod tests {
         // TreeItem. No observation, no arm.
         assert_eq!(map_role(50029, false), AxRole::Other);
         assert_eq!(canonical_name(50029), Some("DataItem"));
+    }
+
+    #[test]
+    fn observed_column_headers_are_not_headings() {
+        // Header/HeaderItem WERE observed (a stock task manager's and file manager's list
+        // views), so this pin is not about missing evidence: UIA's Header is a grid's
+        // column-header bar and HeaderItem one of its column headers, whereas every other
+        // backend's Heading means a document/section heading (AT-SPI maps only Role::Heading
+        // and lets ColumnHeader fall through). Mapping these would make `role:"heading"` match
+        // a file list's column header here and nothing at all on Linux for the same app, so
+        // they stay `Other` — identified by the name UIA already gives them.
+        assert_eq!(map_role(50034, false), AxRole::Other);
+        assert_eq!(map_role(50035, false), AxRole::Other);
     }
 
     #[test]
