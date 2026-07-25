@@ -69,6 +69,10 @@ const MAPPED_CLASSES: &[&str] = &[
     "android.view.View",
     "android.view.ViewGroup",
     "androidx.recyclerview.widget.RecyclerView",
+    "androidx.cardview.widget.CardView",
+    "androidx.appcompat.widget.LinearLayoutCompat",
+    "androidx.compose.ui.platform.ComposeView",
+    "androidx.viewpager.widget.ViewPager",
 ];
 
 /// Every [`MAPPED_CLASSES`] bucket in `tree` that came back [`AxRole::Other`], described — the

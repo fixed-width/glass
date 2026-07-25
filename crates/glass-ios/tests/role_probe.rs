@@ -68,7 +68,12 @@ const MAPPED_TOKENS: &[&str] = &[
     "AXNavigationBar",
     "AXApplication",
     "AXWindow",
+    "AXGroup",
+    "AXHeading",
 ];
+
+// `AXGenericElement` is deliberately absent: it carries no role, so `Other` with the token
+// preserved is the correct outcome, and a probe run that reports it is reporting the truth.
 
 /// Every [`MAPPED_TOKENS`] bucket in `tree` that came back [`AxRole::Other`], described — the
 /// one thing a histogram can check without becoming brittle about which app exposes what.
