@@ -21,8 +21,13 @@ internal refactors, CI, or test-only changes.
   `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
   fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
   with guidance to use a `settle` action or the terminal `then` observe instead.
+- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
+  each platform backend can produce, and why a role is unavailable where it is.
 
 ### Changed
+- The `raw_role` reported for each accessibility node on Windows and macOS is now the platform's
+  own role token (the UIA control-type name, the AX role string) instead of a localized display
+  string, so it is the same on every machine.
 - `glass_a11y_snapshot` now returns a compacted outline: chains of unnamed single-child
   container elements are collapsed. Element ids are unchanged and every element remains
   addressable with `glass_click_element` / `glass_set_value`.
