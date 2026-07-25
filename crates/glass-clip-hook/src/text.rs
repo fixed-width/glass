@@ -1,4 +1,4 @@
-//! Pure clipboard text codecs (no Win32), unit-tested + Miri-checked on the Linux dev box.
+//! Pure clipboard text codecs (no Win32), unit-tested + Miri-checked on any host.
 //!
 //! The `cfg(windows)` hook does the `unsafe` FFI — locking an `HGLOBAL` into a slice *bounded by
 //! `GlobalSize`* — and defers the actual NUL-terminated parse/encode to these helpers. So the

@@ -1,5 +1,4 @@
-//! Pure window-relative ↔ global coordinate math. Cross-platform → unit-tested on the
-//! Linux dev box.
+//! Pure window-relative ↔ global coordinate math. Cross-platform → unit-tested on any host.
 //!
 //! The point↔pixel scale kernel itself lives in [`glass_core::coords`] so glass-macos
 //! (capture/window ops) and glass-a11y-macos (the a11y reader) share ONE implementation —

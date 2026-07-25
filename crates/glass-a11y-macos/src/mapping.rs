@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Pure mapping from AXUIElement role strings + gathered state facts into glass's
-//! normalized `AxRole`/`AxStates`. No AXUIElement/objc2 calls — unit-tested directly on
-//! the Linux dev box. AX role strings (`kAXRoleAttribute`'s value) are the stable
+//! normalized `AxRole`/`AxStates`. No AXUIElement/objc2 calls — unit-tested directly on any
+//! host. AX role strings (`kAXRoleAttribute`'s value) are the stable
 //! `"AXButton"`/`"AXTextField"`/... constants; the reader passes the string so this
 //! module needs no macOS-only dependency.
 

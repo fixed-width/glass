@@ -4,7 +4,7 @@
 //! `InjectDll64=`, which detours the user32 clipboard APIs and proxies them to a host store
 //! over a named pipe; (2) a pure **library** (`rlib`) exposing the wire [`proto`]col and the
 //! host-side [`store`], reused by `glass-windows`. Only [`hook`] is Win32 — the rest is pure
-//! and unit-tested on the Linux dev box.
+//! and unit-tested on any host.
 
 // FFI backend: the Win32 hook needs `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
@@ -15,7 +15,7 @@ pub mod proto;
 pub mod store;
 
 // Pure clipboard text codecs the windows hook defers to. Compiled for windows (the hook) and for
-// test (so the suite runs + Miri-checks on the Linux dev box); unused on a non-test non-windows
+// test (so the suite runs + Miri-checks on any host); unused on a non-test non-windows
 // build, hence the cfg gate.
 #[cfg(any(windows, test))]
 mod text;

@@ -1,5 +1,5 @@
 //! Pure mapping from UI Automation control-type ids + gathered state facts into glass's
-//! normalized `AxRole`/`AxStates`. No UIA calls — unit-tested directly on the Linux dev box.
+//! normalized `AxRole`/`AxStates`. No UIA calls — unit-tested directly on any host.
 //! Control-type ids are the stable UIA `ControlTypeId` constants (50000..=50040); the reader
 //! passes the numeric id so this module needs no `uiautomation` dependency.
 

@@ -66,7 +66,7 @@ glass-core.workspace = true
 plist = "1"
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
-# modules still build on the Linux dev box with zero macOS deps. Versions pinned to
+# modules still build on any host with zero macOS deps. Versions pinned to
 # exactly what the objc2 spike proved compiles + runs cleanly
 # (zero warnings) against the real frameworks on macOS. Each `objc2-*` framework crate
 # gates its ObjC types behind per-type Cargo features; `default-features = false` +
@@ -216,7 +216,7 @@ tempfile.workspace = true
 
 # Mac-only: the accessibility-reader integration test (tests/a11y.rs) drives the standalone
 # `glass-a11y-macos` snapshot. Kept in the cfg(macos) dev-dep table so the crate still
-# builds/tests on the Linux dev box (where the cfg(macos) test is a bare skip `main`).
+# builds/tests on any host (where the cfg(macos) test is a bare skip `main`).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 glass-a11y-macos.workspace = true
 

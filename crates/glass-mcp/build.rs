@@ -19,7 +19,7 @@ fn main() {
     }
     // Statically link only the VCRuntime, leaving the OS-provided UCRT dynamic (paired
     // with `+crt-static` in .cargo/config.toml). Gated to a Windows host: that's where
-    // the only commercial msvc builds happen (CI + the dev box), and it keeps the crate
+    // the only commercial msvc builds happen, and it keeps the crate
     // off non-Windows builds entirely so build.rs always compiles there.
     #[cfg(windows)]
     static_vcruntime::metabuild();

@@ -1,4 +1,4 @@
-//! Pure pixel-format helpers (no OS calls), unit-tested on the Linux dev box.
+//! Pure pixel-format helpers (no OS calls), unit-tested on any host.
 
 use glass_core::pixels::{SourceOrder, to_opaque_rgba_in_place};
 

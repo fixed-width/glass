@@ -1,5 +1,5 @@
-//! Pure SBPL (Seatbelt) profile generator. No `unsafe`, no OS calls — unit-tested on the
-//! Linux dev box. The profile is deny-default and keeps the launched app drivable
+//! Pure SBPL (Seatbelt) profile generator. No `unsafe`, no OS calls — unit-tested on any host. The
+//! profile is deny-default and keeps the launched app drivable
 //! (WindowServer + AX) while containing filesystem, process, and (at `Strict`) network.
 //!
 //! Filesystem model (matches Linux's `--ro-bind / /` + `--tmpfs $HOME`): the whole

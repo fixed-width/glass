@@ -114,7 +114,7 @@ const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 
 /// [`crate::shim_path::resolve_shim`] against the real environment: the running executable's
 /// directory and [`SHIM_DYLIB_ENV`]. The tier logic itself is pure and lives in
-/// [`crate::shim_path`] (unit-tested on the Linux dev box); this wrapper only supplies the
+/// [`crate::shim_path`] (unit-tested on any host); this wrapper only supplies the
 /// two OS-touching inputs it needs.
 fn shim_dylib_path() -> Option<PathBuf> {
     shim_dylib_path_with(std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from))
@@ -464,7 +464,7 @@ mod tests {
     /// launched with a `cwd` OUTSIDE `$HOME` would fail to start (it could not even be read to be
     /// exec'd). This is the macOS analog of the Linux
     /// `sandbox_default_reaches_launch_target_via_argument_path` integration test; it runs on real
-    /// macOS hardware (CI macOS runner + on-device), not on the Linux dev box.
+    /// macOS hardware (CI macOS runner + on-device) only.
     #[test]
     #[cfg(target_os = "macos")]
     fn default_sandbox_reaches_launch_target_under_home_when_cwd_is_elsewhere() {

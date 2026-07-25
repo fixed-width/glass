@@ -6,8 +6,7 @@
 //! over SSH (session 0) it is driven via the scheduled-task bridge:
 //!   cargo run -p glass-windows --example onbox
 //!
-//! On non-Windows hosts it is a no-op, so `cargo test` / `clippy --all-targets` stay green on the
-//! Linux dev box.
+//! On non-Windows hosts it is a no-op, so `cargo test` / `clippy --all-targets` stay green on any host.
 
 // On-box FFI harness: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
 // `// SAFETY:`-documented).

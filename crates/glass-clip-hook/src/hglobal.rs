@@ -1,7 +1,7 @@
 //! RAII guards over Win32 `HGLOBAL` moveable memory, shared by the clipboard read/write paths
 //! (`glass-windows` clipboard + the injected `hook`). All `GlobalLock`/`GlobalUnlock`/`GlobalAlloc`/
 //! `GlobalFree`/`from_raw_parts` `unsafe` lives here once, behind safe APIs. Windows-only; the crate
-//! cross-compiles to `x86_64-pc-windows-gnu` so this is compile-checked on the Linux dev box.
+//! cross-compiles to `x86_64-pc-windows-gnu` so this is compile-checked on any host.
 
 use core::ffi::c_void;
 

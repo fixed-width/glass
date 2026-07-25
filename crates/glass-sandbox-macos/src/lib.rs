@@ -1,6 +1,6 @@
 //! macOS process containment (Seatbelt) for glass, implementing `SandboxLevel::Default`/
 //! `Strict`. The pure [`build_profile`] SBPL generator ([`profile`]) is cross-platform and
-//! unit-tested on the Linux dev box — likewise [`launch_reallows`] ([`reachability`]), which
+//! unit-tested on any host — likewise [`launch_reallows`] ([`reachability`]), which
 //! computes the re-allows a launch needs to reach its own target under the profile's home
 //! deny; the `sandbox_init` FFI ([`ffi`]) is macOS-only mechanism. [`doctor`] is
 //! cross-platform: it reports `Ok` on macOS and `Unavailable` elsewhere, so `glass doctor`

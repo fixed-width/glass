@@ -1,5 +1,5 @@
 //! Pure US-layout ASCII → (virtual keycode, needs-shift). Cross-platform so it is
-//! unit-tested on the Linux dev box; Plan 3's CGEvent input casts `u16 as CGKeyCode`.
+//! unit-tested on any host; Plan 3's CGEvent input casts `u16 as CGKeyCode`.
 //! Keycodes are the documented Carbon `kVK_ANSI_*` values (validated in inject_input.swift).
 
 /// Map an ASCII character to its US-layout virtual keycode and whether Shift is held.

@@ -1,4 +1,4 @@
-//! Pure clip-shim dylib path resolution. Cross-platform → unit-tested on the Linux dev box,
+//! Pure clip-shim dylib path resolution. Cross-platform → unit-tested on any host,
 //! same split as [`crate::clipboard_route`]/[`crate::coords`]/[`crate::keymap`]: no OS calls
 //! here, only `Path`/`PathBuf` arithmetic and existence checks against whatever paths the
 //! caller hands in. `glass_macos::process::shim_dylib_path` (macOS-only) is the thin wrapper

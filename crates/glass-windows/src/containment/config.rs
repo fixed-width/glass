@@ -1,5 +1,5 @@
 //! Pure provider/box configuration logic for Windows containment — no Win32, no process
-//! spawning — so the policy is unit-tested on the Linux dev box. The cfg(windows) Sandboxie
+//! spawning — so the policy is unit-tested on any host. The cfg(windows) Sandboxie
 //! provider consumes these.
 
 // `decide`/`Decision`/`ProviderChoice` are consumed by the cfg(windows) containment seam,

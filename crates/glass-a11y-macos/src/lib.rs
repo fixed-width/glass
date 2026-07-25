@@ -5,7 +5,7 @@
 // `mapping` module stays `unsafe`-free by convention.
 #![allow(unsafe_code)]
 
-pub mod mapping; // pure AX->normalized mapping — cross-platform, unit-tested on the Linux dev box
+pub mod mapping; // pure AX->normalized mapping — cross-platform, unit-tested on any host
 
 // The cfg(macos) AXUIElement reader: `ffi` holds every `unsafe` AX read primitive, `reader`
 // the `unsafe`-free root selection + pre-order walk behind glass-core's `Accessibility`

@@ -10,7 +10,7 @@ publish.workspace = true
 glass-core.workspace = true
 
 # macOS-only FFI deps (objc2 family), used by the cfg-gated reader/ffi modules. Kept
-# in this target table so `mapping.rs` still builds on the Linux dev box with zero macOS
+# in this target table so `mapping.rs` still builds on any host with zero macOS
 # deps. Versions/features copied verbatim from `crates/glass-macos/Cargo.toml` so
 # `--locked` stays satisfiable against the already-resolved lockfile.
 [target.'cfg(target_os = "macos")'.dependencies]

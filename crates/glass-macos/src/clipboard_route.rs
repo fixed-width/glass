@@ -1,6 +1,6 @@
 //! Pure clipboard-routing policy for the macOS backend. Decides how `glass_clipboard_get/set`
 //! behave for the active session, mirroring the Windows `ClipboardRoute`. No OS calls — unit
-//! -tested on the Linux dev box.
+//! -tested on any host.
 #![forbid(unsafe_code)]
 
 use glass_core::platform::SandboxLevel;
