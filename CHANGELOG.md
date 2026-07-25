@@ -25,9 +25,11 @@ internal refactors, CI, or test-only changes.
   each platform backend can produce, and why a role is unavailable where it is.
 
 ### Changed
-- The `raw_role` reported for each accessibility node on Windows and macOS is now the platform's
-  own role token (the UIA control-type name, the AX role string) instead of a localized display
-  string, so it is the same on every machine.
+- The `glass_a11y_snapshot` outline now names the platform's own role token for an element glass
+  has no role mapping for: the line reads `Other(AXDisclosureTriangle)` rather than a bare
+  `Other`, so a custom control is still identifiable. The token is the platform's stable
+  identifier — the AT-SPI role, the UIA control-type name, the AX role string, the Android widget
+  class, the iOS role string — and reads the same on every machine.
 - `glass_a11y_snapshot` now returns a compacted outline: chains of unnamed single-child
   container elements are collapsed. Element ids are unchanged and every element remains
   addressable with `glass_click_element` / `glass_set_value`.

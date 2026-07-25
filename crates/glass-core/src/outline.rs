@@ -40,11 +40,21 @@ fn is_scaffolding(node: &AxNode) -> bool {
 /// Write one node's line: `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]`, name/bounds/
 /// states elided when absent, two spaces of indent per depth level.
 ///
+/// A node glass has no role mapping for renders as `Other(<native token>)` — the AT-SPI role,
+/// UIA control-type name, AX role string, Android widget class or iOS role string the backend
+/// reported. A bare `Other` therefore means the backend named no token at all, not that glass
+/// dropped one. `role:` selectors still will not match either.
+///
 /// Shared by [`AxTree::to_outline`] and [`render_compact`] so the two renders cannot drift —
 /// a test asserts they are identical for a tree with nothing to elide.
 pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth);
-    let _ = write!(out, "{indent}#{} {:?}", node.id.0, node.role);
+    let _ = write!(out, "{indent}#{}", node.id.0);
+    if node.role == AxRole::Other && !node.raw_role.is_empty() {
+        let _ = write!(out, " Other({})", node.raw_role);
+    } else {
+        let _ = write!(out, " {:?}", node.role);
+    }
     if let Some(name) = &node.name {
         let _ = write!(out, " {name:?}");
     }
@@ -245,6 +255,54 @@ mod tests {
             !render_compact(&t).contains("truncated"),
             "render_compact is pure tree text now"
         );
+    }
+
+    #[test]
+    fn an_unmapped_node_renders_its_native_token() {
+        // The whole point of keeping `raw_role`: an element glass has no role for is still
+        // identifiable by the token the platform reported.
+        let mut n = node(AxRole::Other, Some("Details"));
+        n.raw_role = "AXDisclosureTriangle".into();
+        n.states = AxStates {
+            enabled: true,
+            ..AxStates::default()
+        };
+        let out = render_compact(&tree_of(n));
+        assert!(
+            out.contains("Other(AXDisclosureTriangle) \"Details\" [enabled]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_node_without_a_token_stays_a_bare_other() {
+        let mut n = node(AxRole::Other, Some("Mystery"));
+        n.states = AxStates {
+            focusable: true,
+            ..AxStates::default()
+        };
+        let out = render_compact(&tree_of(n));
+        assert!(out.contains("Other \"Mystery\""), "{out}");
+    }
+
+    #[test]
+    fn a_mapped_role_never_shows_its_native_token() {
+        // Only `Other` carries the token; every other role renders exactly as before.
+        let mut b = node(AxRole::Button, Some("Save"));
+        b.raw_role = "AXButton".into();
+        let out = render_compact(&tree_of(b));
+        assert!(out.contains("Button \"Save\""), "{out}");
+        assert!(!out.contains("AXButton"), "{out}");
+    }
+
+    #[test]
+    fn the_full_and_compact_renders_agree_on_an_unmapped_node() {
+        // `to_outline` and `render_compact` share `write_line`; this pins that they stay
+        // consistent for the token-carrying line specifically.
+        let mut n = node(AxRole::Other, Some("Details"));
+        n.raw_role = "AXDisclosureTriangle".into();
+        let t = tree_of(n);
+        assert_eq!(render_compact(&t), t.to_outline());
     }
 
     #[test]

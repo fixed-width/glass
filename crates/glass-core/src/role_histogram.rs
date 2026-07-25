@@ -28,9 +28,11 @@ pub fn role_histogram(tree: &AxTree) -> Vec<RoleTally> {
     let mut tallies: Vec<RoleTally> = Vec::new();
     visit(&tree.root, &mut tallies);
     tallies.sort_by(|a, b| {
-        let unmapped = |t: &RoleTally| t.role != AxRole::Other;
-        unmapped(a)
-            .cmp(&unmapped(b))
+        // `false` sorts before `true`, so ordering on "is mapped" puts the unmapped buckets —
+        // what a probe run is looking for — first.
+        let mapped = |t: &RoleTally| t.role != AxRole::Other;
+        mapped(a)
+            .cmp(&mapped(b))
             .then(b.count.cmp(&a.count))
             .then(a.raw_role.cmp(&b.raw_role))
             .then(format!("{:?}", a.role).cmp(&format!("{:?}", b.role)))
