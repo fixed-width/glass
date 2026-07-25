@@ -199,31 +199,34 @@ fn walk(
     })
 }
 
-/// Whether `el` publishes the UIA Toggle pattern, gated by control type (Button/CheckBox/
-/// MenuItem/SplitButton — the only types that carry it) so this never issues a live
-/// cross-process `get_pattern` call for a control that cannot support it. This is the one fact
-/// two different things key off: `StateFacts::checkable` (toggle-pattern availability) and
+/// Fetch `el`'s UIA Toggle pattern, gated by control type (Button/CheckBox/MenuItem/
+/// SplitButton — the only types that carry it) so this never issues a live cross-process
+/// `get_pattern` call for a control that cannot support it. One fetch answers two questions:
+/// `StateFacts::checkable` is this pattern's mere *presence* (the control exposes on/off
+/// semantics at all, independent of whether the current state is also readable), and
 /// `map_role`'s rule that a toggle-capable `Button` — a formatting-bar button, say — is a
-/// `ToggleButton` rather than a plain one. Shared by `gather` and the verify-fingerprint role
-/// lookups in `run_set_value`/`run_invoke` so a node maps to the same role regardless of which
-/// path reads it.
-fn has_toggle_pattern(el: &UIElement, ct_id: u32) -> bool {
+/// `ToggleButton` rather than a plain one keys off the same presence. Shared by `gather` and
+/// the verify-fingerprint role lookups in `run_set_value`/`run_invoke`, so a node maps to the
+/// same role regardless of which path reads it, and only one COM round-trip is spent per node
+/// either way — the same reason the value-pattern probe below fetches once for two facts.
+fn toggle_pattern(el: &UIElement, ct_id: u32) -> Option<UITogglePattern> {
     matches!(ct_id, 50000 | 50002 | 50011 | 50031) // Button/CheckBox/MenuItem/SplitButton
-        && el.get_pattern::<UITogglePattern>().is_ok()
+        .then(|| el.get_pattern::<UITogglePattern>().ok())
+        .flatten()
 }
 
 /// Gather state facts + the value string in one pass, gating each pattern probe by control type
 /// so we don't make a live cross-process `get_pattern` call for a pattern the control can't support
 /// (UIA is chatty — each probe is an out-of-process COM round-trip).
 fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<String>) {
-    let checkable = has_toggle_pattern(el, ct_id);
-    let toggled_on = checkable
-        && el
-            .get_pattern::<UITogglePattern>()
-            .ok()
-            .and_then(|p| p.get_toggle_state().ok())
-            .map(|s| s == ToggleState::On)
-            .unwrap_or(false);
+    // Fetch the Toggle pattern once: its mere presence is `checkable` (the control exposes
+    // on/off semantics at all), independent of whether we can also read its current state.
+    let pattern = toggle_pattern(el, ct_id);
+    let checkable = pattern.is_some();
+    let toggled_on = pattern
+        .and_then(|p| p.get_toggle_state().ok())
+        .map(|s| s == ToggleState::On)
+        .unwrap_or(false);
     let selected = matches!(ct_id, 50007 | 50019 | 50024 | 50029) // ListItem/TabItem/TreeItem/DataItem
         && el.get_pattern::<UISelectionItemPattern>().ok()
             .and_then(|p| p.is_selected().ok()).unwrap_or(false);
@@ -312,7 +315,7 @@ fn run_set_value(ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
     // bounds fingerprint — the element sits elsewhere — rejects it. A target
     // without captured bounds falls back to role+name only.
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role(ct_id, has_toggle_pattern(&el, ct_id));
+    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())
@@ -384,7 +387,7 @@ fn run_invoke(ctx: &AxContext, target: &AxTarget) -> Result<()> {
 
     // Same fingerprint gate as run_set_value: role + name + bounds.
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
-    let role = crate::mapping::map_role(ct_id, has_toggle_pattern(&el, ct_id));
+    let role = crate::mapping::map_role(ct_id, toggle_pattern(&el, ct_id).is_some());
     let name = nonempty(el.get_name().unwrap_or_default());
     let bounds = window_relative_bounds(&el, (ctx.window.x, ctx.window.y));
     if !target.matches(role, name.as_deref())

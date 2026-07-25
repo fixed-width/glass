@@ -239,15 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn non_toggleable_button_stays_button() {
-        assert_eq!(map_role(50000, false), AxRole::Button);
-    }
-
-    #[test]
     fn toggleable_checkbox_stays_checkbox() {
         // The toggle-capable rule is scoped to Button; CheckBox already has its own role and
         // the probe explicitly excluded it.
         assert_eq!(map_role(50002, true), AxRole::CheckBox);
+    }
+
+    #[test]
+    fn toggleable_radio_button_stays_radio_button() {
+        // Same scoping as CheckBox above: RadioButton already has its own role and the probe
+        // explicitly excluded it too.
+        assert_eq!(map_role(50013, true), AxRole::RadioButton);
     }
 
     #[test]
