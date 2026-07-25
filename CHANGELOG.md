@@ -100,6 +100,15 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- macOS: launching a stock Apple app no longer leaves a crash report and a "quit unexpectedly"
+  dialog behind. glass direct-spawns a bundle's inner executable to get piped logs and
+  containment, but macOS gives a system app a launch constraint requiring it to be started by
+  LaunchServices, so the kernel killed the spawned process — measured, 10 of 12 stock apps tried.
+  The launch then succeeded anyway through the LaunchServices fallback, which is why this went
+  unnoticed. glass now recognizes Apple platform code and hands those launches off without
+  attempting the spawn. Your own app is unaffected: only Apple-signed system code takes the new
+  path, and only when `sandbox` is `off` (a contained launch cannot be handed off at all, so it
+  still tries — Terminal and Disk Utility, for instance, do run contained).
 - Windows and macOS: `glass_stop` now asks the app to close before killing it, so the app runs
   its own shutdown path. Both backends previously went straight to terminating the process —
   Windows by closing the job object, macOS by signalling — which an app that records whether it

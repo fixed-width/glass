@@ -270,8 +270,9 @@ impl MacosPlatform {
     /// (`bundle::resolve_inner_exec`) exactly like a plain exec — same logs, containment, and
     /// window-tracking as the non-bundle path — and only fall back to handing the launch off
     /// to `NSWorkspace` if that direct spawn's process exits before a window ever appears
-    /// (`GlassError::AppExited`, e.g. an app that re-execs itself via LaunchServices and
-    /// leaves the direct-spawned process a dead stub). Any other discovery failure (e.g.
+    /// (`GlassError::AppExited` — an app that re-execs itself via LaunchServices and leaves the
+    /// direct-spawned process a dead stub, or one the kernel refused to run as a child at all;
+    /// see the platform-code note below). Any other discovery failure (e.g.
     /// `GlassError::Timeout`) is NOT treated as a handoff signal — the direct-spawned process
     /// is still alive and simply never grew a window, so it's terminated and the error
     /// propagated, same as the plain-exec path.
@@ -281,7 +282,35 @@ impl MacosPlatform {
     /// `NSWorkspace`-launched process is never `direct.env`'s `DYLD_INSERT_LIBRARIES`
     /// target), so its `ClipboardRoute` is decided directly as the sandbox-off/no-shim case
     /// rather than via [`decide_clip`].
+    ///
+    /// **Apple platform code is handed off without attempting the spawn**, when the spec allows
+    /// a handoff at all. macOS gives a system app a launch constraint requiring it to be started
+    /// by launchd/LaunchServices, and the kernel `SIGKILL`s one spawned as another process's
+    /// child — `EXC_CRASH SIGKILL (Code Signature Invalid)`, `CODESIGNING` / "Launch Constraint
+    /// Violation". The launch still succeeded, via the fallback below, but every attempt left a
+    /// crash report and a "quit unexpectedly" dialog for the user. Measured: 10 of 12 stock apps
+    /// tried (Notes, Preview, Calculator, TextEdit, Reminders, Music, Chess, Dictionary, Console,
+    /// Activity Monitor) die that way; Terminal and Disk Utility survive, as does Safari.
+    ///
+    /// Nothing in the signature distinguishes those two groups — both are `Platform identifier=`
+    /// code, and App Sandbox does not correlate (Music and Console carry no app-sandbox
+    /// entitlement and still die) — so this cannot predict which system apps *would* have
+    /// spawned. It gives up the attempt for all of them rather than crash-report its way to the
+    /// same place, which costs those few their piped logs: an `NSWorkspace` launch has no stdio
+    /// to capture.
+    ///
+    /// **Only when `sandbox: off`.** A contained launch cannot be handed off at all (the gate),
+    /// so extending this to one would turn "run this system app contained" into an error whose
+    /// only remedy is `sandbox: off` — pushing the caller to run system code *less* contained
+    /// than they asked for, to avoid a crash dialog. Not a trade worth making: contained system
+    /// apps do work (Terminal and Disk Utility run fine under the profile), and glass's
+    /// containment is there for the app under development, which is never Apple platform code.
+    /// A constrained app asked for with containment therefore still attempts the spawn, dies,
+    /// and reaches the same gate error it always did.
     fn start_bundle(&mut self, spec: &AppSpec, bundle: &Path) -> Result<WindowGeometry> {
+        if spec.sandbox == SandboxLevel::Off && process::is_apple_platform_code(bundle) {
+            return self.adopt_via_launch_services(spec, bundle);
+        }
         // A-preferred: direct-spawn the inner executable (logs + containment + window
         // tracking), exactly as the plain-exec path does for a non-bundle `run[0]`.
         let inner = crate::bundle::resolve_inner_exec(bundle)?;
@@ -317,80 +346,95 @@ impl MacosPlatform {
                 // just below).
                 process::terminate(&mut child);
                 release_clip(clip.as_ref());
-                // Only an early inner-exec exit (`AppExited`) is the handoff signal — a stub
-                // that re-launched the real app through LaunchServices. Any other failure
-                // (e.g. `Timeout`: the process is alive but never grew a window) is propagated
-                // as-is, exactly as the plain-exec path does. NOTE: `AppExited` here conflates
-                // a genuine early crash of the inner exec with a deliberate re-exec stub; both
-                // fall through to the handoff below, which then either finds/relaunches a real
-                // window or fails.
+                // Only an early inner-exec exit (`AppExited`) is the handoff signal. Any other
+                // failure (e.g. `Timeout`: the process is alive but never grew a window) is
+                // propagated as-is, exactly as the plain-exec path does.
+                //
+                // NOTE: `AppExited` conflates several things — an app that re-execs itself
+                // through LaunchServices and leaves a dead stub, a genuine early crash of the
+                // inner exec, and (before the platform-code check above) the kernel killing a
+                // system app for a launch-constraint violation. All fall through to the handoff,
+                // which then either finds/relaunches a real window or fails.
                 let GlassError::AppExited(_) = e else {
                     return Err(e);
                 };
-                // Fail-closed: only sandbox:off may adopt an app glass can no longer contain.
-                crate::bundle::handoff_gate(spec.sandbox)?;
-                let id = crate::bundle::bundle_identifier(bundle)?;
-                let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
-                    Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
-                    // NOTE (runtime-verified in Task 4): `ffi::launch_bundle` blocks this
-                    // thread on a channel until `NSWorkspace`'s completion handler fires: if
-                    // LaunchServices needs the main run loop to spin to complete the launch,
-                    // and this call runs on the true main thread (see this module's
-                    // main-thread-affinity notes), that handler could need a run-loop turn this
-                    // blocked thread isn't pumping. Wired here per the design; the on-box round
-                    // confirms whether it actually stalls.
-                    None => match crate::ffi::launch_bundle(
-                        bundle,
-                        spec.run.get(1..).unwrap_or_default(),
-                        spec.timeout_ms,
-                    ) {
-                        Ok(pid) => (pid, crate::bundle::Disposition::Fresh),
-                        // `launch_bundle` can start the app yet still error before its pid is
-                        // delivered (e.g. its completion handler timed out) — an orphan. The
-                        // `None` just found above means any instance running now is one we
-                        // spawned, so best-effort reclaim it before propagating the error.
-                        Err(e) => {
-                            if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id)
-                                && !crate::ffi::terminate_app(pid)
-                            {
-                                // The launch error propagating below says nothing about this
-                                // stray app, and there is no `Child` here to escalate with.
-                                eprintln!(
-                                    "glass: the launch failed and the instance it started \
-                                     (pid {pid}) could not be asked to quit; if it is still \
-                                     running, quit it manually"
-                                );
-                            }
-                            return Err(e);
-                        }
-                    },
-                };
-                // Don't orphan a fresh launch whose window never appears in time: adopt only
-                // after discovery succeeds, since `self.adopted` (what `stop_app`/`Drop` reap)
-                // isn't set until below. Reaping here terminates only a `Fresh` launch — an
-                // already-running instance we merely re-found is not ours to kill.
-                let m = match Self::discover_window_pid(pid, spec.timeout_ms) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        Adopted { pid, disposition }.reap();
-                        return Err(e);
-                    }
-                };
-                self.child = None;
-                // `app_pid` is `u32` (every other pid in this struct comes from
-                // `std::process::Child::id()`); AppKit's pids are `i32` but always
-                // non-negative for a real process, so this cast is exact, matching every
-                // other `pid as {i32,u32}` cast in this file (see e.g. `resolve_active_window`'s
-                // call sites, which cast the other direction).
-                self.app_pid = Some(pid as u32);
-                self.active_window = Some(m.window_id);
-                self.adopted = Some(Adopted { pid, disposition });
-                self.clip = None;
-                self.clipboard_route =
-                    crate::clipboard_route::decide_route(SandboxLevel::Off, None);
-                Ok(m.geometry)
+                self.adopt_via_launch_services(spec, bundle)
             }
         }
+    }
+
+    /// Hand the launch to `NSWorkspace`/LaunchServices and adopt the resulting process: the
+    /// fallback when a direct spawn produced no window, and the direct route for Apple platform
+    /// code (see [`Self::start_bundle`], which explains both entries).
+    ///
+    /// Fails closed unless `sandbox: off` — glass cannot Seatbelt-contain an app LaunchServices
+    /// owns, so it refuses rather than silently dropping the containment the caller asked for.
+    fn adopt_via_launch_services(
+        &mut self,
+        spec: &AppSpec,
+        bundle: &Path,
+    ) -> Result<WindowGeometry> {
+        // Fail-closed: only sandbox:off may adopt an app glass can no longer contain.
+        crate::bundle::handoff_gate(spec.sandbox)?;
+        let id = crate::bundle::bundle_identifier(bundle)?;
+        let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
+            Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
+            // NOTE (runtime-verified in Task 4): `ffi::launch_bundle` blocks this
+            // thread on a channel until `NSWorkspace`'s completion handler fires: if
+            // LaunchServices needs the main run loop to spin to complete the launch,
+            // and this call runs on the true main thread (see this module's
+            // main-thread-affinity notes), that handler could need a run-loop turn this
+            // blocked thread isn't pumping. Wired here per the design; the on-box round
+            // confirms whether it actually stalls.
+            None => match crate::ffi::launch_bundle(
+                bundle,
+                spec.run.get(1..).unwrap_or_default(),
+                spec.timeout_ms,
+            ) {
+                Ok(pid) => (pid, crate::bundle::Disposition::Fresh),
+                // `launch_bundle` can start the app yet still error before its pid is
+                // delivered (e.g. its completion handler timed out) — an orphan. The
+                // `None` just found above means any instance running now is one we
+                // spawned, so best-effort reclaim it before propagating the error.
+                Err(e) => {
+                    if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id)
+                        && !crate::ffi::terminate_app(pid)
+                    {
+                        // The launch error propagating below says nothing about this
+                        // stray app, and there is no `Child` here to escalate with.
+                        eprintln!(
+                            "glass: the launch failed and the instance it started \
+                             (pid {pid}) could not be asked to quit; if it is still \
+                             running, quit it manually"
+                        );
+                    }
+                    return Err(e);
+                }
+            },
+        };
+        // Don't orphan a fresh launch whose window never appears in time: adopt only
+        // after discovery succeeds, since `self.adopted` (what `stop_app`/`Drop` reap)
+        // isn't set until below. Reaping here terminates only a `Fresh` launch — an
+        // already-running instance we merely re-found is not ours to kill.
+        let m = match Self::discover_window_pid(pid, spec.timeout_ms) {
+            Ok(m) => m,
+            Err(e) => {
+                Adopted { pid, disposition }.reap();
+                return Err(e);
+            }
+        };
+        self.child = None;
+        // `app_pid` is `u32` (every other pid in this struct comes from
+        // `std::process::Child::id()`); AppKit's pids are `i32` but always
+        // non-negative for a real process, so this cast is exact, matching every
+        // other `pid as {i32,u32}` cast in this file (see e.g. `resolve_active_window`'s
+        // call sites, which cast the other direction).
+        self.app_pid = Some(pid as u32);
+        self.active_window = Some(m.window_id);
+        self.adopted = Some(Adopted { pid, disposition });
+        self.clip = None;
+        self.clipboard_route = crate::clipboard_route::decide_route(SandboxLevel::Off, None);
+        Ok(m.geometry)
     }
 }
 

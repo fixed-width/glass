@@ -13,9 +13,11 @@
 //!    launch went through `process::spawn`'s child path rather than the handoff path below:
 //!    `self.child`/`self.adopted` are private to `glass-macos`, but only a direct-spawned
 //!    child has its stdout/stderr piped into the log buffer at all (see check 2).
-//! 2. **Handoff app** (`NSWorkspace` adopt): `/System/Applications/TextEdit.app` re-execs
-//!    itself through LaunchServices, so its directly-spawned stub exits before a window
-//!    appears and `start_bundle` hands off to `NSWorkspace` — `start_app(sandbox: Off)`
+//! 2. **Handoff app** (`NSWorkspace` adopt): `/System/Applications/TextEdit.app` is Apple
+//!    platform code, so `start_bundle` hands it to `NSWorkspace` without attempting the direct
+//!    spawn at all (see that function's doc — the kernel kills a directly-spawned system app for
+//!    a launch-constraint violation, and the attempt left a crash report behind). So
+//!    `start_app(sandbox: Off)`
 //!    returns `Ok`, `drain_logs` is empty (the adopted pid was never `process::spawn`ed, so
 //!    nothing was ever piped), and a live `glass_a11y_macos::MacosA11y::snapshot` against the
 //!    adopted window returns a non-empty AX tree. Also confirms `stop_app`'s terminate path:
@@ -70,9 +72,12 @@ mod macos_main {
     };
     use glass_macos::MacosPlatform;
 
-    /// A stock-macOS handoff app: re-execs itself through LaunchServices, so directly
-    /// spawning `Contents/MacOS/TextEdit` exits before a window appears and
-    /// `start_bundle` falls into its `NSWorkspace` branch — exactly the fixture checks 2
+    /// A stock-macOS handoff app. NOTE the mechanism is not what it looks like: it does not
+    /// re-exec itself through LaunchServices. Directly spawning `Contents/MacOS/TextEdit` gets
+    /// the process `SIGKILL`ed by the kernel for a launch-constraint violation (`CODESIGNING`),
+    /// which used to reach `start_bundle` as the same `AppExited` signal a re-exec stub would —
+    /// and left a crash report each time. `start_bundle` now recognizes platform code and hands
+    /// off without spawning, which is the path checks 2
     /// and 3 need, without shipping a second custom `.app`. Present on every stock macOS
     /// install (unlike a third-party app), so no availability probe is needed.
     const TEXT_EDIT: &str = "/System/Applications/TextEdit.app";

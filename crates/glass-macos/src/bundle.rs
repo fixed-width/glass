@@ -92,6 +92,25 @@ impl Disposition {
     }
 }
 
+/// Whether a `codesign --display --verbose=2` report describes **Apple platform code** — a
+/// binary signed as part of the OS rather than by a developer. codesign prints a
+/// `Platform identifier=<n>` line for exactly those, and for nothing else: a third-party app,
+/// ad-hoc signed code, and unsigned code all lack it.
+///
+/// This is what [`crate::backend`]'s bundle path uses to decide not to direct-spawn a system
+/// app. It answers "is this OS code", NOT "does this carry a launch constraint" — nothing in a
+/// signature exposes the latter, and the two are not the same population (Terminal and Safari
+/// are platform code and spawn fine). See `start_bundle` for why the broader question is the one
+/// worth acting on.
+///
+/// Fail-open: anything unrecognized reports `false`, which keeps the existing direct-spawn
+/// behaviour rather than diverting an app on a guess.
+pub fn platform_code_from_codesign_report(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim_start().starts_with("Platform identifier="))
+}
+
 fn plist_string(bundle: &Path, key: &str) -> Result<String> {
     let path = bundle.join("Contents/Info.plist");
     let val = plist::Value::from_file(&path)
@@ -201,6 +220,40 @@ mod tests {
             resolve_inner_exec(&app),
             Err(GlassError::AppNotStarted(_))
         ));
+    }
+
+    #[test]
+    fn platform_code_is_recognized_by_its_codesign_line() {
+        let report =
+            "Identifier=com.apple.TextEdit\nPlatform identifier=26\nTeamIdentifier=not set\n";
+        assert!(platform_code_from_codesign_report(report));
+    }
+
+    #[test]
+    fn a_third_party_signature_is_not_platform_code() {
+        // A Developer ID app: has a team, no platform identifier. Diverting one of these to the
+        // LaunchServices handoff would cost it its piped logs and its containment for nothing.
+        let report = "Identifier=com.google.android.studio\nCodeDirectory v=20500 size=6373 flags=0x10000(runtime)\nTeamIdentifier=EQHXZ8M8AV\n";
+        assert!(!platform_code_from_codesign_report(report));
+    }
+
+    #[test]
+    fn an_unreadable_report_is_not_platform_code() {
+        // Fail-open: codesign missing, or output glass can't parse, must leave the launch on the
+        // path it would have taken anyway.
+        assert!(!platform_code_from_codesign_report(""));
+        assert!(!platform_code_from_codesign_report(
+            "code object is not signed at all"
+        ));
+    }
+
+    #[test]
+    fn the_platform_line_must_be_the_key_not_a_substring() {
+        // `Platform identifier=` is matched at the start of a line so an app whose *name* or
+        // path contains the phrase can't fake it — codesign echoes `Executable=<path>`, and that
+        // path comes from the caller's spec.
+        let report = "Executable=/tmp/Platform identifier=26/Evil.app/Contents/MacOS/Evil\nTeamIdentifier=X\n";
+        assert!(!platform_code_from_codesign_report(report));
     }
 
     #[test]

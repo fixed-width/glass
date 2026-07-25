@@ -110,6 +110,28 @@ fn target_is_injectable(program: &Path) -> bool {
     injectable_from_codesign_report(&stderr, status_success)
 }
 
+/// Whether `bundle` is Apple platform code — OS code rather than a developer's app. Shells out
+/// to the same `codesign --display --verbose=2` that [`target_is_injectable`] reads (the report
+/// goes to stderr, not stdout); the decision itself is
+/// [`crate::bundle::platform_code_from_codesign_report`], which carries the reasoning.
+///
+/// Fail-open: if codesign can't be run or its output isn't UTF-8, this reports `false` and the
+/// caller keeps the launch path it would have taken anyway.
+pub(crate) fn is_apple_platform_code(bundle: &Path) -> bool {
+    let Ok(output) = Command::new("codesign")
+        .arg("--display")
+        .arg("--verbose=2")
+        .arg(bundle)
+        .output()
+    else {
+        return false;
+    };
+    let Ok(stderr) = String::from_utf8(output.stderr) else {
+        return false;
+    };
+    crate::bundle::platform_code_from_codesign_report(&stderr)
+}
+
 /// Env var overriding [`shim_dylib_path`]'s resolution — tests and non-standard layouts.
 const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 
@@ -608,6 +630,50 @@ mod tests {
             matches!(err, GlassError::AppNotStarted(_)),
             "expected AppNotStarted, got {err:?}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ad_hoc_signed_code_is_not_apple_platform_code() {
+        // The fail-open direction, and the one that matters for a glass user: their own app must
+        // keep the direct-spawn path (piped logs, containment) and never be diverted to the
+        // LaunchServices handoff. Ad-hoc signing a copy of a system binary strips the platform
+        // signature, which is exactly the difference being detected.
+        let dir = std::env::temp_dir().join(format!("glass-platform-code-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let copy = dir.join("echo");
+        std::fs::copy("/bin/echo", &copy).expect("copy /bin/echo");
+        let signed = Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(&copy)
+            .status()
+            .expect("run codesign");
+        assert!(signed.success(), "ad-hoc signing the copy failed");
+
+        let is_platform = is_apple_platform_code(&copy);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !is_platform,
+            "ad-hoc signed code must not be treated as Apple platform code"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "on-device only: reads the signatures of this machine's stock apps"]
+    fn stock_apps_are_apple_platform_code() {
+        // Both of these are platform code; only the first is killed when direct-spawned. That
+        // asymmetry is the whole reason `start_bundle` acts on "is this OS code" rather than
+        // trying to predict the kill — see its doc.
+        for app in [
+            "/System/Applications/TextEdit.app",
+            "/System/Applications/Utilities/Terminal.app",
+        ] {
+            assert!(
+                is_apple_platform_code(Path::new(app)),
+                "{app} should be recognized as Apple platform code"
+            );
+        }
     }
 
     #[test]
