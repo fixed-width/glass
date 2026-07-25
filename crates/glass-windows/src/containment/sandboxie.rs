@@ -444,12 +444,6 @@ impl SandboxieApp {
     /// boxes don't accumulate in `Sandboxie.ini` (`SbieIni set <box> * ""` — the
     /// maintainer's documented box-clear).
     pub(crate) fn kill(mut self) -> crate::process::Closed {
-        // Ask the BOXED app to close before anything terminates it. This has to happen here
-        // rather than in the wrapped `LaunchedApp::kill` below: the boxed processes are not in
-        // glass's Job (the wrapper hands off to SbieSvc and exits, owning no app window), so by
-        // the time that runs there is nothing left for it to find — and `/terminate` would
-        // already have killed the box outright, which is the ungraceful teardown being avoided.
-        let closed = crate::process::close_pids_and_wait(&self.pids(), || !self.pids().is_empty());
         let _ = Command::new(start_exe(&self.dir))
             .args([&format!("/box:{}", self.box_name), "/terminate"])
             .status();
@@ -465,6 +459,13 @@ impl SandboxieApp {
         }
         let _ = std::fs::remove_dir_all(&self.logdir);
         clear_box_section(&self.dir, &self.box_name);
-        closed
+        // A boxed app is terminated without ever being asked to close, unlike an unconfined
+        // one. Measured on-box: `PostMessageW(WM_CLOSE)` to a boxed app's top-level windows
+        // *succeeds* — two posts accepted, none refused — and the app neither closes nor runs
+        // its shutdown path, because Sandboxie filters window messages across the box boundary.
+        // The request has to come from inside the box to land, which needs an in-box helper
+        // process; until then a contained app records an unclean exit the same way every
+        // teardown did before this path existed.
+        crate::process::Closed::TerminatedUnasked { refused: 0 }
     }
 }

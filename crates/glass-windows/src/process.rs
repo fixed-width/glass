@@ -265,30 +265,6 @@ impl Asked {
     }
 }
 
-/// Ask the windows of `pids` to close and wait — up to [`CLOSE_GRACE`] — for `still_live` to
-/// report the tree gone, then report how it went.
-///
-/// For a teardown that owns its own termination sequence and has no Job handle to poll, so it
-/// cannot use [`LaunchedApp::await_close`]: the Sandboxie provider, whose boxed processes are not
-/// in glass's Job at all and whose liveness comes from `Start.exe /listpids`. The caller must
-/// still terminate afterwards — this only ever *asks*, and returns whether asking was enough.
-pub(crate) fn close_pids_and_wait(pids: &[u32], mut still_live: impl FnMut() -> bool) -> Closed {
-    let asked = request_close(pids);
-    if asked.posted == 0 {
-        return asked.outcome(false);
-    }
-    let deadline = Instant::now() + CLOSE_GRACE;
-    loop {
-        if !still_live() {
-            return asked.outcome(true);
-        }
-        if Instant::now() >= deadline {
-            return asked.outcome(false);
-        }
-        std::thread::sleep(CLOSE_POLL);
-    }
-}
-
 /// Post `WM_CLOSE` to every top-level window belonging to a process in `pids` that
 /// [`wants_close_request`] accepts, reporting how many posts the OS accepted and how many it
 /// refused.
