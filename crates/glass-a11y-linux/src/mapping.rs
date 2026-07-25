@@ -182,7 +182,7 @@ mod tests {
                         "{role:?} declared Mapped but no AT-SPI sample maps to it"
                     )
                 }
-                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
+                RoleSupport::NotApplicable { .. } | RoleSupport::Gap { .. } => assert!(
                     !mapped,
                     "{role:?} is produced by an AT-SPI role but the matrix does not declare it"
                 ),

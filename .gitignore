@@ -28,5 +28,8 @@ perf.data.old
 # Fixture cruft
 **/__pycache__/
 
-# Built .app bundles from the iOS examples' build.sh
+# Build output from the examples' build.sh — .app bundles (iOS) and the APK (Android)
 /examples/*/build/
+# The Android role fixture's throwaway signing key, generated on first build. It lives outside
+# build/ so rebuilds keep signing with the same key; see that example's build.sh.
+/examples/android-role-fixture/.signing-key.jks

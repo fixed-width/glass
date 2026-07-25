@@ -234,10 +234,24 @@ mod tests {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no AX role maps to it")
                 }
-                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
-                    !mapped,
-                    "{role:?} is produced by an AX role but the matrix does not declare it"
-                ),
+                cell => {
+                    assert!(
+                        !mapped,
+                        "{role:?} is produced by an AX role but the matrix does not declare it"
+                    );
+                    // The named AX role must not resolve to the very role the cell says is out
+                    // of reach. No subrole is passed: a cell naming a bare role is claiming that
+                    // role's own mapping. Largely a second line behind the `!mapped` assertion
+                    // above; a misspelt AX role resolves to `Other` and passes, which only an
+                    // on-box read catches.
+                    if let Some(token) = cell.named_token() {
+                        assert_ne!(
+                            map_role(token, None),
+                            role,
+                            "{role:?} is declared out of reach naming {token}, which maps to it"
+                        );
+                    }
+                }
             }
         }
     }

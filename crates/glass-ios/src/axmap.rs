@@ -44,11 +44,12 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXTabBar", AxRole::TabList),
     ("AXApplication", AxRole::Application),
     ("AXWindow", AxRole::Window),
-    // A content container, and the only structural token most probed screens exposed: in
-    // those apps the navigation bar and the tab bar arrived as AXGroup as well, named by the
-    // element's identifier rather than by its role. That is what was seen there, not a rule
-    // about UIKit — an app that does report AXNavigationBar or AXTabBar still maps to Toolbar
-    // or TabList through the rows above.
+    // A content container, and the only structural token most probed screens exposed: navigation
+    // bars, tab bars and collections all arrived as AXGroup, named by the element's identifier
+    // rather than by its role. That is what was seen, not a rule about UIKit — an app that does
+    // report AXNavigationBar or AXTabBar still maps to Toolbar or TabList through the rows above.
+    // The Toolbar, TabList and List rows of `glass_core::role_support::ROLE_SUPPORT` carry what
+    // each was read to report.
     ("AXGroup", AxRole::Group),
     // A screen or section title.
     ("AXHeading", AxRole::Heading),
@@ -614,6 +615,13 @@ mod tests {
         // stays visible in the outline. Mapping it to Group would claim a structure that
         // the platform never reported.
         assert_eq!(ax_role("AXGenericElement"), AxRole::Other);
+        // Two tokens the role fixture (examples/ios-role-fixture) was seen to emit that nothing
+        // maps yet: a segmented control reports AXTabGroup, and a menu-style SwiftUI Picker
+        // reports AXPopUpButton. Pinned as Other so the observation lives somewhere a reader
+        // hits, and so mapping either later is a deliberate edit rather than a silent one — see
+        // the TabList and ComboBox rows of `glass_core::role_support::ROLE_SUPPORT`.
+        assert_eq!(ax_role("AXTabGroup"), AxRole::Other);
+        assert_eq!(ax_role("AXPopUpButton"), AxRole::Other);
     }
 
     #[test]
@@ -635,10 +643,25 @@ mod tests {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no token maps to it")
                 }
-                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
-                    !mapped,
-                    "{role:?} is produced by a token but the matrix does not declare it"
-                ),
+                cell => {
+                    assert!(
+                        !mapped,
+                        "{role:?} is produced by a token but the matrix does not declare it"
+                    );
+                    // The named token must not resolve to the very role the cell says is out
+                    // of reach. Largely a second line behind the `!mapped` assertion above —
+                    // if the token produced the role, that one fires too — but it pins the
+                    // token itself, so a cell rewritten to name a different token is checked
+                    // against the map rather than against nothing. A misspelt token resolves
+                    // to `Other` and passes: only an on-box read catches that.
+                    if let Some(token) = cell.named_token() {
+                        assert_ne!(
+                            ax_role(token),
+                            role,
+                            "{role:?} is declared out of reach naming {token}, which maps to it"
+                        );
+                    }
+                }
             }
         }
     }
