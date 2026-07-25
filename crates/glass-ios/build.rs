@@ -9,10 +9,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // protox parses the proto and returns a prost `FileDescriptorSet`.
     let fds = protox::compile([proto], ["proto"])?;
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
-    // tonic-build 0.12: `compile_fds` consumes a prost FileDescriptorSet and writes
-    // the generated `<package>.rs` into `out_dir`. Client only (no server stubs).
-    tonic_build::configure()
+    // `compile_fds` consumes a prost FileDescriptorSet and writes the generated
+    // `<package>.rs` into `out_dir`. Client only (no server stubs). tonic 0.14 moved
+    // prost codegen out of `tonic-build` into `tonic-prost-build`, whose output leans on
+    // the `tonic-prost` runtime crate for the codec.
+    // `build_transport(false)`: the generated client would otherwise carry an inherent
+    // `connect(dst)` constructor for `Channel`, which collides with idb's own `connect`
+    // RPC of the same name. glass dials the UDS itself and hands the ready `Channel` to
+    // `CompanionServiceClient::new`, so the constructor is dead weight either way.
+    tonic_prost_build::configure()
         .build_server(false)
+        .build_transport(false)
         .out_dir(&out)
         .compile_fds(fds)?;
     Ok(())
