@@ -9,7 +9,9 @@
 //! Simulator already booted:
 //!
 //! ```sh
-//! GLASS_IOS_APP=/path/to/YourApp.app cargo test -p glass-ios --test smoke_integration -- --ignored
+//! ./examples/ios-fixture/build.sh   # or point at any other .app
+//! GLASS_IOS_APP="$PWD/examples/ios-fixture/build/GlassFixture.app" \
+//!   cargo test -p glass-ios --test smoke_integration -- --ignored
 //! ```
 //!
 //! `GLASS_IOS_APP` must be a `.app` bundle path (not a bare bundle id) so `start_app` installs

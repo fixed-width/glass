@@ -14,10 +14,14 @@
 //! known line at launch. Point it at such an app and tell it the exact line to expect:
 //!
 //! ```sh
-//! GLASS_IOS_APP=/path/to/StartupLogger.app \
-//! GLASS_IOS_STARTUP_MARKER='GLASS_IOS_STARTUP_MARKER' \
+//! ./examples/ios-fixture/build.sh
+//! GLASS_IOS_APP="$PWD/examples/ios-fixture/build/GlassFixture.app" \
+//! GLASS_IOS_STARTUP_MARKER=GLASS_FIXTURE_LAUNCHED \
 //!   cargo test -p glass-ios --test startup_log_integration -- --ignored --nocapture
 //! ```
+//!
+//! `examples/ios-fixture/` emits its marker from `App.init`, which is the earliest point that
+//! matters here; any other app works as long as it logs before its first frame.
 //!
 //! The marker MUST be emitted at the app's earliest launch point (not a delayed `onAppear`),
 //! so it exercises the race the fix closes. `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` select the

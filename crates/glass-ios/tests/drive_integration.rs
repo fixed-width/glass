@@ -9,10 +9,11 @@
 //!
 //! `#[ignore]`d so a plain `cargo test` (Linux dev host, CI) skips it: the backend needs
 //! `xcrun simctl` + `idb_companion` (macOS + Xcode only), a booted Simulator, and the
-//! GlassFixture app. Run explicitly on such a host:
+//! GlassFixture app from `examples/ios-fixture/`. Run explicitly on such a host:
 //!
 //! ```sh
-//! GLASS_IOS_APP=/path/to/GlassFixture.app \
+//! ./examples/ios-fixture/build.sh
+//! GLASS_IOS_APP="$PWD/examples/ios-fixture/build/GlassFixture.app" \
 //!   cargo test -p glass-ios --test drive_integration -- --ignored --nocapture
 //! ```
 //!
@@ -22,7 +23,8 @@
 //!
 //! The fixture exposes four accessibility elements (by `AXUniqueId`): `statusLabel` (shows
 //! READY, flips to TAPPED when the button is tapped), `tapButton`, `inputField`, and
-//! `echoLabel` (mirrors the field's text, or `(empty)`).
+//! `echoLabel` (mirrors the field's text, or `(empty)`) — see
+//! `examples/ios-fixture/README.md`.
 
 use std::time::Duration;
 
@@ -93,10 +95,10 @@ fn tap(x: i32, y: i32) -> PointerEvent {
 
 #[test]
 #[ignore = "on-box only: needs a macOS host with Xcode + idb_companion + a booted iOS \
-            Simulator, and GLASS_IOS_APP pointing at the GlassFixture .app"]
+            Simulator, and GLASS_IOS_APP pointing at the examples/ios-fixture .app"]
 fn drive_fixture_snapshot_tap_and_type_end_to_end() {
     let app = std::env::var("GLASS_IOS_APP")
-        .expect("GLASS_IOS_APP must be set to the GlassFixture .app path");
+        .expect("GLASS_IOS_APP must be set to the examples/ios-fixture GlassFixture.app path");
 
     let spec = AppSpec {
         build: None,

@@ -11,7 +11,8 @@
 //! fixture `.app`. Run explicitly on a macOS host with a Simulator booted:
 //!
 //! ```sh
-//! GLASS_IOS_APP=/path/to/GlassFixture.app \
+//! ./examples/ios-fixture/build.sh
+//! GLASS_IOS_APP="$PWD/examples/ios-fixture/build/GlassFixture.app" \
 //!   cargo test -p glass-ios --test observe_only_integration -- --ignored --nocapture
 //! ```
 
@@ -32,10 +33,10 @@ fn tap(x: i32, y: i32) -> PointerEvent {
 
 #[test]
 #[ignore = "on-box only: needs a macOS host with Xcode + a booted iOS Simulator and \
-            GLASS_IOS_APP pointing at the GlassFixture .app; forces the no-companion path"]
+            GLASS_IOS_APP pointing at the examples/ios-fixture .app; forces the no-companion path"]
 fn observe_only_survives_without_a_companion() {
     let app = std::env::var("GLASS_IOS_APP")
-        .expect("GLASS_IOS_APP must be set to the GlassFixture .app path");
+        .expect("GLASS_IOS_APP must be set to the examples/ios-fixture GlassFixture.app path");
 
     // Force the no-companion path regardless of what's installed on the host: an
     // unresolvable binary makes the driver fail to start, so the backend degrades.

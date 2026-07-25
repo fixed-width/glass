@@ -27,3 +27,6 @@ perf.data.old
 
 # Fixture cruft
 **/__pycache__/
+
+# Built .app bundles from the iOS examples' build.sh
+/examples/*/build/
