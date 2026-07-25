@@ -263,6 +263,19 @@ fn first_role_with_bounds<'a>(n: &'a AxNode, role: AxRole, out: &mut Option<&'a 
     }
 }
 
+/// Nodes carrying UIA's Toggle pattern that are NOT already a checkbox or radio button —
+/// the evidence for whether a `ToggleButton` mapping has anything to map. `checkable` is
+/// Toggle-pattern availability (see `StateFacts` in glass-a11y-windows), so this needs no
+/// extra UIA call.
+fn toggle_candidates<'a>(node: &'a AxNode, out: &mut Vec<&'a AxNode>) {
+    if node.states.checkable && !matches!(node.role, AxRole::CheckBox | AxRole::RadioButton) {
+        out.push(node);
+    }
+    for child in &node.children {
+        toggle_candidates(child, out);
+    }
+}
+
 /// Count msedge.exe processes whose command line carries `marker` (our isolated user-data-dir), via
 /// CIM so the box's background Edge isn't counted.
 fn our_edge_count(marker: &str) -> i32 {
@@ -1072,6 +1085,33 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) {
     let block = render_role_histogram(label, &tree);
     print!("{block}");
     report.push_str(&block);
+
+    // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
+    let mut candidates = Vec::new();
+    toggle_candidates(&tree.root, &mut candidates);
+    if !candidates.is_empty() {
+        use std::fmt::Write as _;
+        let mut toggle_block = String::new();
+        let _ = writeln!(
+            toggle_block,
+            "\n  toggle-capable (checkable, non-checkbox/radio): {} nodes",
+            candidates.len()
+        );
+        let sample_count = candidates.len().min(5);
+        if sample_count > 0 {
+            let _ = writeln!(toggle_block, "    (first {sample_count}):");
+            for node in candidates.iter().take(5) {
+                let name = node.name.as_deref().unwrap_or("(no name)");
+                let _ = writeln!(
+                    toggle_block,
+                    "      role={:?} raw_role={:?} name={:?}",
+                    node.role, node.raw_role, name
+                );
+            }
+        }
+        print!("{toggle_block}");
+        report.push_str(&toggle_block);
+    }
 
     let _ = p.stop_app();
     std::thread::sleep(Duration::from_millis(500)); // let the app fully exit before the next probe
