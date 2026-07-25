@@ -5,7 +5,7 @@
 //! session currently holds the slot and admits the newcomer. This is what makes
 //! reconnect work under `serve --http`. A streamable-HTTP session is decoupled
 //! from its TCP connection by design (so it can survive a drop and resume), and
-//! (as of rmcp 1.7.0) rmcp only tears it down on an explicit `DELETE` or after
+//! (as of rmcp 2.2.0) rmcp only tears it down on an explicit `DELETE` or after
 //! its `keep_alive` idle timeout (default 5 min). An agent that dies or restarts almost never
 //! sends `DELETE`, so its session lingers as a zombie — and a plain admission
 //! gate would reject the agent's own reconnect until that zombie expired.

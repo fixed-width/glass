@@ -6,7 +6,7 @@ use base64::Engine;
 use glass_core::Glass;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use tokio::sync::Mutex;
 
@@ -36,10 +36,10 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
         .0
         .into_iter()
         .map(|c| match c {
-            OutContent::Text(t) => Content::text(t),
+            OutContent::Text(t) => ContentBlock::text(t),
             OutContent::Image(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                Content::image(b64, "image/webp")
+                ContentBlock::image(b64, "image/webp")
             }
         })
         .collect();
@@ -54,7 +54,7 @@ fn to_call_result(out: ToolOutput) -> CallToolResult {
 fn map_tool_result(result: ToolResult) -> CallToolResult {
     match result {
         Ok(out) => to_call_result(out),
-        Err(msg) => CallToolResult::error(vec![Content::text(msg)]),
+        Err(msg) => CallToolResult::error(vec![ContentBlock::text(msg)]),
     }
 }
 

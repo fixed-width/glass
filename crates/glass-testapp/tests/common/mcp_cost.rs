@@ -237,7 +237,7 @@ impl CallMeter {
     /// block is present.
     pub fn record_response(
         &mut self,
-        content: &[rmcp::model::Content],
+        content: &[rmcp::model::ContentBlock],
     ) -> (Value, String, Option<(u32, u32)>) {
         let mut all_text = String::new();
         let mut result = Value::Null;
@@ -628,7 +628,7 @@ async fn restart_fixture(client: &Peer<RoleClient>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::Content;
+    use rmcp::model::ContentBlock;
 
     #[test]
     fn meter_counts_text_and_images_and_reads_dims() {
@@ -636,8 +636,8 @@ mod tests {
         m.record_request("glass_screenshot", &json!({ "include_image": true }));
         // A screenshot response: image block leads, then the envelope carrying dims.
         let content = vec![
-            Content::image("Zm9vYmFy".to_string(), "image/webp".to_string()), // 8 b64 chars
-            Content::text(
+            ContentBlock::image("Zm9vYmFy".to_string(), "image/webp".to_string()), // 8 b64 chars
+            ContentBlock::text(
                 json!({ "ok": true, "tool": "glass_screenshot",
                                   "result": { "width": 400, "height": 300 } })
                 .to_string(),
