@@ -23,6 +23,9 @@ internal refactors, CI, or test-only changes.
   with guidance to use a `settle` action or the terminal `then` observe instead.
 - [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
   each platform backend can produce, and why a role is unavailable where it is.
+- More elements report a real role instead of `Other`: on Windows, documents and column headers;
+  on macOS, outlines and their rows, split views and their dividers, scroll areas, headings, and
+  menu buttons. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
 - The `glass_a11y_snapshot` outline now names the platform's own role token for an element glass
