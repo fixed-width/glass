@@ -443,29 +443,8 @@ fn find_node<'a>(node: &'a glass_core::AxNode, name: &str) -> Option<&'a glass_c
 }
 
 fn launch_fixture() -> Glass {
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/a11y_fixture.py"
-    );
     let mut glass = glass_x11_with_a11y();
-    glass
-        .start(&AppSpec {
-            build: None,
-            run: vec!["python3".into(), fixture.into()],
-            cwd: None,
-            env: vec![
-                ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
-                ("GDK_BACKEND".into(), "x11".into()),
-            ],
-            window_hint: Some(WindowHint {
-                title: Some("Glass A11y Fixture".into()),
-                class: None,
-            }),
-            timeout_ms: 10_000,
-            sandbox: glass_core::SandboxLevel::Off,
-            a11y: true,
-        })
-        .expect("launch");
+    glass.start(&fixture_spec()).expect("launch");
     std::thread::sleep(std::time::Duration::from_millis(3_000));
     glass
 }
