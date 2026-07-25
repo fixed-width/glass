@@ -143,6 +143,8 @@ fn walk(
 ) -> Result<AxNode> {
     budget.visit();
     let ct_id = el.get_control_type().map_err(uia_err)? as i32 as u32;
+    // `canonical_name` knows every documented control type, mapped or not, so the numeric form
+    // is reached only by a vendor-defined or future id — still reported, never dropped.
     let raw_role = crate::mapping::canonical_name(ct_id)
         .map(str::to_string)
         .unwrap_or_else(|| format!("UIA:{ct_id}"));
