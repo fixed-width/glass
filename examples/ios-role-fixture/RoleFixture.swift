@@ -3,12 +3,12 @@ import UIKit
 
 /// The controls whose accessibility vocabulary decides a cell in glass's role matrix
 /// (`glass_core::role_support::ROLE_SUPPORT`), built from stock UIKit classes. Reading this app
-/// back through `idb ui describe-all` answers one question per control: what AX role string does
-/// the Simulator report for it?
+/// back through `idb ui describe-all --nested --json` — the format glass itself reads — answers
+/// one question per control: what AX role string does the Simulator report for it?
 ///
-/// A role is marked unreachable in the matrix only where a control was watched to arrive
-/// carrying no token for it — a stepper arriving as two buttons, a picker as a slider. This app
-/// is how that is watched.
+/// Where a control exists to look at, that reading is what decides whether its cell is a gap or
+/// unreachable: a stepper arriving as two buttons, a picker as a slider. It bounds the claim to
+/// what idb exposes, which may be narrower than what UIKit publishes to VoiceOver.
 final class ControlsViewController: UIViewController, UITableViewDataSource, UITableViewDelegate,
     UIPickerViewDataSource, UIPickerViewDelegate
 {
@@ -40,6 +40,11 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
         picker.delegate = self
         picker.accessibilityIdentifier = "the-picker"
 
+        let sheetButton = UIButton(type: .system)
+        sheetButton.setTitle("action sheet", for: .normal)
+        sheetButton.accessibilityIdentifier = "the-sheet-button"
+        sheetButton.addTarget(self, action: #selector(showSheet), for: .touchUpInside)
+
         let alertButton = UIButton(type: .system)
         alertButton.setTitle("alert dialog", for: .normal)
         alertButton.accessibilityIdentifier = "the-alert-button"
@@ -57,10 +62,13 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
             ])
 
         let stack = UIStackView(arrangedSubviews: [
-            segmented, stepper, progress, picker, alertButton, menuButton, table,
+            segmented, stepper, progress, picker, sheetButton, alertButton, menuButton, table,
         ])
         stack.axis = .vertical
         stack.spacing = 8
+        // Each screen names itself in the tree: the tab bar's items are not elements, so a
+        // reading otherwise carries nothing saying which screen produced it.
+        stack.accessibilityIdentifier = "screen-controls"
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -79,6 +87,16 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(alert, animated: false)
+    }
+
+    /// An action sheet as well as an alert: they are separate presentation styles, and one
+    /// carrying no container token says nothing about the other.
+    @objc private func showSheet() {
+        let sheet = UIAlertController(
+            title: "Sheet title", message: "Sheet message", preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Sheet one", style: .default))
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(sheet, animated: false)
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
@@ -120,7 +138,7 @@ final class CollectionViewController: UICollectionViewController {
         super.viewDidLoad()
         title = "Collection"
         collectionView.backgroundColor = .systemBackground
-        collectionView.accessibilityIdentifier = "the-collection"
+        collectionView.accessibilityIdentifier = "screen-collection"
         collectionView.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "cell")
     }
 
@@ -154,8 +172,14 @@ struct SwiftUIScreen: View {
                     Text("Two").tag(1)
                 }
                 .pickerStyle(.inline)
+                Picker("Pick menu", selection: $pick) {
+                    Text("Menu one").tag(0)
+                    Text("Menu two").tag(1)
+                }
+                .pickerStyle(.menu)
             }
         }
+        .accessibilityIdentifier("screen-swiftui")
     }
 }
 
@@ -163,18 +187,34 @@ struct SwiftUIScreen: View {
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
-    /// The tab named by a `--tab controls|collection|swiftui` launch argument, as an index into
-    /// the tab controller. Anything else — absent, misspelled, out of range — is the first tab,
-    /// so a typo shows a working screen rather than an empty one.
+    /// The screen to show, as an index into the tab controller.
+    ///
+    /// Named by `ROLE_FIXTURE_TAB=controls|collection|swiftui` in the environment, or by a
+    /// `--tab=<name>` launch argument. The environment is what glass can set (`AppSpec::env`
+    /// reaches the app as `SIMCTL_CHILD_*`), since `AppSpec::run`'s tail is not passed through to
+    /// `simctl launch`; the argument form is for driving `simctl` by hand.
+    ///
+    /// Only the joined `--tab=<name>` form works: `simctl launch` forwards it, but drops the
+    /// value of a separated `--tab <name>`, which would leave this reading a flag with nothing
+    /// after it. That case is fatal here rather than silently first-tab, as is a name it does not
+    /// recognize. This app exists to put one specific screen in front of a reader whose tree
+    /// becomes evidence, and a tree carries no marker of which screen produced it — so falling
+    /// back quietly would hand them a plausible reading of the wrong screen.
     private static func requestedTab() -> Int {
         let arguments = ProcessInfo.processInfo.arguments
-        guard let flag = arguments.firstIndex(of: "--tab"), flag + 1 < arguments.count else {
-            return 0
+        var requested = ProcessInfo.processInfo.environment["ROLE_FIXTURE_TAB"]
+        if let inline = arguments.first(where: { $0.hasPrefix("--tab=") }) {
+            requested = String(inline.dropFirst("--tab=".count))
+        } else if arguments.contains("--tab") {
+            fatalError("--tab needs its value joined: --tab=controls|collection|swiftui")
         }
-        switch arguments[flag + 1] {
+        guard let name = requested else { return 0 }
+        switch name {
+        case "controls": return 0
         case "collection": return 1
         case "swiftui": return 2
-        default: return 0
+        default:
+            fatalError("unknown tab '\(name)' — use controls, collection or swiftui")
         }
     }
 

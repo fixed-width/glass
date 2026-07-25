@@ -15,6 +15,7 @@ import android.widget.ListView;
 import android.widget.NumberPicker;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TabHost;
 import android.widget.TableLayout;
 import android.widget.TableRow;
@@ -28,12 +29,21 @@ import android.widget.Toolbar;
  * {@code android.widget} class with no support library, so a {@code uiautomator dump} of this app
  * answers one question per control: what widget class does Android report for it?
  *
- * <p>A role is marked unreachable in the matrix only where a control was watched to arrive
- * carrying no token for it — a toolbar reporting {@code android.view.ViewGroup}, a popup menu
- * reporting {@code android.widget.ListView}. This app is how that is watched.
+ * <p>Where a control exists to look at, that reading is what decides whether its matrix cell is a
+ * gap or unreachable — a toolbar reporting {@code android.view.ViewGroup}, a popup menu reporting
+ * {@code android.widget.ListView}. This app is how it is watched.
  *
  * <p>The two popups need a tap, so they sit behind buttons: the menu and the dialog each replace
  * the dump's topmost window, and are read from a dump of their own.
+ *
+ * <p>The screen scrolls and its sizes are in dp rather than raw pixels, so every control is
+ * reachable on a short screen too. A control scrolled out of view is missing from the dump
+ * entirely, and a missing node reads exactly like a missing token — which is the one mistake
+ * this app must not make.
+ *
+ * <p>{@link TabHost} and {@link TabWidget} are deprecated, and deliberately so here: they are
+ * what emits the framework tab tokens the matrix records. Replacing them with the Material tab
+ * strip real apps use would change the evidence rather than modernize it.
  */
 public class MainActivity extends Activity {
 
@@ -52,11 +62,11 @@ public class MainActivity extends Activity {
         toolbar.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
         root.addView(toolbar, matchWrap());
 
-        root.addView(tabs(), matchHeight(260));
+        root.addView(tabs(), matchHeight(dp(130)));
         root.addView(label("list"), matchWrap());
-        root.addView(list(), matchHeight(160));
+        root.addView(list(), matchHeight(dp(80)));
         root.addView(label("grid"), matchWrap());
-        root.addView(grid(), matchHeight(160));
+        root.addView(grid(), matchHeight(dp(80)));
         root.addView(label("table"), matchWrap());
         root.addView(table(), matchWrap());
 
@@ -73,7 +83,9 @@ public class MainActivity extends Activity {
         root.addView(menuButton(), matchWrap());
         root.addView(dialogButton(), matchWrap());
 
-        setContentView(root);
+        ScrollView scroller = new ScrollView(this);
+        scroller.addView(root);
+        setContentView(scroller);
     }
 
     /** A framework {@link PopupMenu} with two entries, opened by tapping the button. */
@@ -128,7 +140,7 @@ public class MainActivity extends Activity {
         FrameLayout content = new FrameLayout(this);
         content.setId(android.R.id.tabcontent);
         holder.addView(widget, matchWrap());
-        holder.addView(content, matchHeight(180));
+        holder.addView(content, matchHeight(dp(90)));
         host.addView(holder, matchWrap());
         host.setup();
 
@@ -203,5 +215,10 @@ public class MainActivity extends Activity {
 
     private LinearLayout.LayoutParams matchHeight(int height) {
         return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height);
+    }
+
+    /** Density-independent pixels to device pixels, so a height means the same on any screen. */
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }

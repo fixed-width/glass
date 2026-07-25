@@ -36,17 +36,17 @@ internal refactors, CI, or test-only changes.
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
-- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) now separates a role no backend
-  vocabulary can carry from one glass has not mapped yet by putting the control on screen and
-  reading the tree back, rather than by what a platform's API reference implies. Fifteen cells
-  that read "not mapped yet" turned out to be unreachable and now say so with what the control
-  actually reports: an iOS stepper arrives as two buttons, a progress view as a generic element, a
-  picker as a slider, an alert and a pull-down menu as loose buttons, a table view and its rows as
-  a group of static text; an Android toolbar arrives as a plain `ViewGroup` and a popup menu as a
-  `ListView`. The cells whose token does arrive now name it — Android's `TabWidget`, `TableLayout`
-  and `NumberPicker` — as do the ones whose semantics sit in a field neither Android reader
-  carries (`CollectionItemInfo`). No role mapping changed; this is what the page claims, not what
-  glass produces.
+- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) now splits a role glass could still
+  reach from one only a platform change could, and decides which by putting the control on screen
+  and reading the tree back rather than by what a platform's API reference implies. Fourteen cells
+  marked `gap` turned out to be unreachable and now say so with what the control actually reports:
+  an iOS stepper arrives as two buttons, a progress view as a generic element, an alert and an
+  action sheet as loose buttons, a table view and its rows as a group of static text; an Android
+  toolbar arrives as a plain `ViewGroup` and a popup menu as a `ListView`. The cells that stay
+  `gap` now name what is there and unread — Android's `TabWidget`, `TableLayout` and
+  `NumberPicker`, iOS's `AXPopUpButton` for a menu-style picker, and the `CollectionItemInfo` and
+  `isHeading` fields neither Android reader carries. Each column also records when it was last
+  read. No role mapping changed; this is what the page claims, not what glass produces.
 - Three kinds of element now report a different role than before, so a `role:` filter that used to
   match them no longer does. On Windows, a button that can be toggled (a formatting bar's Bold or
   Italic) reports `ToggleButton` instead of `Button`; on macOS, a row inside an outline view

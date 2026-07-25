@@ -5,10 +5,17 @@
 //! roles nothing in the backend's vocabulary carries them, others simply are not mapped yet.
 //! This module states which is which, so the difference is a checked fact rather than folklore.
 //!
-//! Which of the two a cell gets is decided by observation, not by what a platform's API
-//! reference implies exists: a control is put on screen and the tree is read back. A cell says
-//! [`RoleSupport::NotApplicable`] only where the control was watched to arrive carrying no
-//! token for its role.
+//! Where a control exists to look at, which of the two a cell gets is decided by observation
+//! rather than by what a platform's API reference implies: the control is put on screen and the
+//! tree is read back. `examples/android-role-fixture/` and `examples/ios-role-fixture/` hold
+//! those controls so a cell can be re-read. Cells for a control the platform simply does not
+//! have — a radio button on iOS, a tree on Android — rest on the platform's own vocabulary
+//! instead, and say so.
+//!
+//! Reasons are readings, and readings age. The mobile columns were last read on 2026-07-25,
+//! against an API 34 emulator and an iOS 26.5 Simulator through `idb`. What the iOS column can
+//! say is bounded by what `idb`'s `accessibility_info` exposes, which may be narrower than what
+//! UIKit publishes to VoiceOver.
 //!
 //! Each backend crate has a unit test that walks its own column and asserts its token table
 //! agrees with what is declared here, so a new mapping cannot land without updating the
@@ -74,13 +81,14 @@ impl AxBackend {
 pub enum RoleSupport {
     /// At least one native token maps to this role.
     Mapped,
-    /// No token in the vocabulary this backend reads carries the role, so no mapping could
-    /// reach it. That covers both a concept the platform does not have and one it draws on
-    /// screen without marking in its accessibility vocabulary. The reason says which, and what
-    /// the control was observed to report instead.
+    /// Closing this would take a platform change, not a glass change: either the platform has
+    /// no such control, or it draws one the accessibility layer never marks. The reason says
+    /// which, and what the control was observed to report instead.
     NotApplicable(&'static str),
-    /// The vocabulary does carry it — a token arrives, or a documented field holds it — and
-    /// glass does not map it yet. The reason names what is there and unread.
+    /// Closing this is glass's own work: the platform already carries the role somewhere glass
+    /// reads or could read — a token that arrives unmapped, a documented field the reader
+    /// ignores, a protocol its own companion could send. The reason names what is there and
+    /// unread.
     Gap(&'static str),
 }
 
@@ -111,12 +119,13 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 ),
                 Gap("AXSheet, AXPopover and AXDrawer are not mapped yet"),
                 NotApplicable(
-                    "an AlertDialog's panels report FrameLayout and LinearLayout, and Android \
-                     has no dialog window type; nothing in the vocabulary marks a dialog",
+                    "a framework AlertDialog's panels report FrameLayout and LinearLayout under \
+                     android:id/parentPanel, and AccessibilityWindowInfo's window types carry no \
+                     dialog kind for a reader to fall back on",
                 ),
                 NotApplicable(
-                    "an alert exposes its title, message and buttons directly under the \
-                     application element; no alert, sheet or popover token appears",
+                    "an alert and an action sheet each expose their title, message and buttons \
+                     directly under the application element, with no container token between",
                 ),
             ],
         ),
@@ -171,8 +180,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                      anywhere in the tree it opens",
                 ),
                 NotApplicable(
-                    "a UIMenu opens as an AXGroup of AXButtons alongside a Dismiss context menu \
-                     button; no menu token appears",
+                    "a button's pull-down UIMenu opens as an AXGroup of AXButtons alongside a \
+                     Dismiss context menu button; no menu token appears",
                 ),
             ],
         ),
@@ -208,9 +217,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 Mapped,
-                NotApplicable(
-                    "a UIPickerView reports AXSlider and a SwiftUI Picker reports a heading with \
-                     buttons; no picker token appears",
+                Gap(
+                    "a menu-style SwiftUI Picker reports AXPopUpButton, which is not mapped yet; \
+                     the inline style reports a heading with buttons, and a UIPickerView reports \
+                     AXSlider",
                 ),
             ],
         ),
@@ -234,9 +244,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 Gap(
-                    "a list child reports its own widget class; the row and column live in \
-                     AccessibilityNodeInfo's CollectionItemInfo, which the uiautomator dump has \
-                     no attribute for and the service protocol does not send",
+                    "AccessibilityNodeInfo's CollectionItemInfo marks a list child, and neither \
+                     reader carries it: the uiautomator dump has no such attribute and the \
+                     service reader parses only class, text, description and bounds. The child's \
+                     own widget class is all that arrives",
                 ),
                 NotApplicable(
                     "table and collection rows report AXStaticText, including a cell explicitly \
@@ -251,9 +262,9 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Gap("mac lists report AXOutline rather than AXTable; AXOutline maps to Tree"),
                 Gap(
-                    "android.widget.TableLayout and TableRow do arrive — the container rule \
-                     folds any leaf ending in Layout into Group — and GridView maps to List; \
-                     CollectionInfo's row and column counts reach neither reader",
+                    "android.widget.TableLayout and TableRow both arrive as tokens: TableLayout \
+                     folds into Group via the container rule, TableRow lands in Other, and \
+                     GridView maps to List",
                 ),
                 NotApplicable(
                     "a table view reports AXGroup like any other container; no table token \
@@ -271,9 +282,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 ),
                 Mapped,
                 Gap(
-                    "no cell class exists — a cell is whatever view the app put in the row; the \
-                     row and column index live in CollectionItemInfo, which reaches neither \
-                     reader",
+                    "CollectionItemInfo holds the row and column index, and neither reader \
+                     carries it: the uiautomator dump has no such attribute and the service \
+                     reader parses only class, text, description and bounds. No cell class \
+                     exists to fall back on — a cell is whatever view the app put in the row",
                 ),
                 Mapped,
             ],
@@ -306,7 +318,8 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Gap(
                     "android.widget.TabWidget and TabHost do arrive as tokens and are not mapped \
-                     yet; a Material tab strip reports a plain layout class instead",
+                     yet; the Material tab strips seen in stock apps report a plain layout class \
+                     instead, naming their tabs only by content description",
                 ),
                 Mapped,
             ],
@@ -321,13 +334,14 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                      containing role is not used to disambiguate yet",
                 ),
                 Gap(
-                    "a tab reports a plain layout class with selected=true — under a TabWidget \
-                     parent in the framework widget, named only by the view id in a Material \
-                     tab strip — so nothing in the class name marks it as a tab",
+                    "a framework tab arrives as a LinearLayout with selected=true under a \
+                     TabWidget parent, which together identify it; the class name alone does \
+                     not, and a Material tab strip carries the role in the view id instead",
                 ),
                 NotApplicable(
-                    "a tab bar reports AXGroup and its items are not exposed as elements at all; \
-                     a segmented control reports one AXTabGroup with no per-segment element",
+                    "a tab bar reports AXGroup and no per-item element appears in idb's \
+                     describe; a segmented control reports one AXTabGroup, also with no \
+                     per-segment element",
                 ),
             ],
         ),
@@ -396,8 +410,10 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 Mapped,
                 Mapped,
                 NotApplicable(
-                    "android.widget.Toolbar reports android.view.ViewGroup, so no toolbar token \
-                     reaches either reader",
+                    "android.widget.Toolbar was watched to report android.view.ViewGroup — a \
+                     subclass inherits the accessibility class name of the framework class it \
+                     extends, and the AppCompat and Material toolbars override neither, so all \
+                     three arrive as ViewGroup",
                 ),
                 Mapped,
             ],
@@ -422,8 +438,9 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
                 ),
                 Mapped,
                 Gap(
-                    "neither reader exposes heading semantics: the uiautomator dump has no \
-                     heading attribute, and the service protocol does not carry isHeading",
+                    "AccessibilityNodeInfo's isHeading marks a heading, and neither reader \
+                     carries it: the uiautomator dump has no such attribute and the service \
+                     reader parses only class, text, description and bounds",
                 ),
                 Mapped,
             ],

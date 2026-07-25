@@ -3,10 +3,11 @@
 One screen of stock `android.widget` controls, for deciding what Android's accessibility
 vocabulary can express. Each control answers one question: what widget class does Android report
 for it? That answer is what a cell in
-[docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records — a role is marked
-`n/a` there only where a control was watched to arrive carrying no token for it.
+[docs/reference/a11y-roles.md](../../docs/reference/a11y-roles.md) records.
 
-| Control | Reports (API 34 emulator) |
+Readings below are from an API 34 emulator on 2026-07-25 — re-run them rather than trusting them.
+
+| Control | Reported |
 |---|---|
 | `Toolbar` | `android.view.ViewGroup` — no toolbar token |
 | `TabHost` / `TabWidget` | themselves; a tab item is a `LinearLayout` with `selected=true` |
@@ -19,10 +20,17 @@ for it? That answer is what a cell in
 
 The last two need a tap. Each opens as the topmost window, so dump it separately.
 
+A subclass inherits the accessibility class name of the framework class it extends unless it
+overrides `getAccessibilityClassName()` — which is why the toolbar arrives as `ViewGroup`, and why
+`androidx.appcompat.widget.Toolbar` and `MaterialToolbar`, neither of which overrides it, arrive
+that way too.
+
 ## Build and install
 
-Needs a JDK and an Android SDK (`ANDROID_HOME`, or `~/android-sdk`). No Gradle — the build is
-`javac` → `d8` → `aapt2` → `apksigner`, signed with a throwaway key it generates:
+Needs a JDK, `zip`, and an Android SDK (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, or one of
+`~/Android/Sdk`, `~/Library/Android/sdk`, `~/android-sdk`). No Gradle — the build is `javac` →
+`d8` → `aapt2` → `apksigner`, signed with a throwaway key generated on first build and kept
+across rebuilds so `adb install -r` keeps working:
 
 ```bash
 ./build.sh                                   # → build/role-fixture.apk
@@ -32,7 +40,7 @@ adb shell am start -n tech.fixedwidth.glassrolefixture/.MainActivity
 
 ## Read the tree
 
-Either reader answers the same question — the class is the token both key off.
+Either reader answers the same question — the widget class is the token both key off.
 
 ```bash
 adb shell uiautomator dump /sdcard/roles.xml && adb shell cat /sdcard/roles.xml
@@ -45,7 +53,10 @@ GLASS_A11Y_PROBE_APPS=tech.fixedwidth.glassrolefixture/.MainActivity \
   cargo test -p glass-android --test role_probe -- --ignored --nocapture
 ```
 
-Semantics Android carries outside the class name — `CollectionInfo`, `CollectionItemInfo`,
-`isHeading` — reach neither reader: the `uiautomator` dump has no attribute for them and the
-on-device service protocol does not send them. That is why those cells stay `gap` rather than
-`n/a`.
+That covers the `uiautomator` reader; add `GLASS_ANDROID_A11Y_APK=<path>` to run the same probe
+through the on-device accessibility service, which otherwise skips.
+
+Semantics Android carries outside the widget class — `CollectionInfo`, `CollectionItemInfo`,
+`isHeading` — reach neither reader: the `uiautomator` dump has no attribute for them, and the
+service reader parses only class, text, description and bounds. Those cells stay `gap` rather than
+`n/a`, because closing them is glass's own work; this fixture cannot show them either way.
