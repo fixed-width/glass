@@ -434,6 +434,9 @@ rides as an untrusted sibling text block, one line per element:
   depth/sibling safety rails still apply, so a pathologically deep tree can still truncate — the
   notice says which limit was hit.) A snapshot renumbers ids, so re-read them after changing this.
 
+Roles are normalized across platforms; see [Accessibility roles by platform](a11y-roles.md) for
+what each backend can produce.
+
 ### `glass_a11y_marks`
 
 Screenshot of the active window with a numbered Set-of-Mark box on each interactable element, plus a

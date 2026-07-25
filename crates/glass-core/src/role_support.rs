@@ -347,6 +347,52 @@ pub fn support(role: AxRole, backend: AxBackend) -> RoleSupport {
         .unwrap_or_else(|| panic!("ROLE_SUPPORT has no row for {role:?}"))
 }
 
+/// Render [`ROLE_SUPPORT`] as the markdown block in `docs/reference/a11y-roles.md`: a
+/// role × backend table of `yes` / `n/a` / `gap`, then the reason for every cell that is not
+/// `yes`. A test asserts the doc matches this output.
+pub fn render_markdown() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    out.push_str("| Role |");
+    for b in AxBackend::ALL {
+        let _ = write!(out, " {} |", b.label());
+    }
+    out.push_str("\n|---|");
+    out.push_str(&"---|".repeat(AxBackend::ALL.len()));
+    out.push('\n');
+
+    for (role, cells) in ROLE_SUPPORT {
+        let _ = write!(out, "| `{role:?}` |");
+        for cell in cells {
+            let mark = match cell {
+                RoleSupport::Mapped => "yes",
+                RoleSupport::NotApplicable(_) => "n/a",
+                RoleSupport::Gap(_) => "gap",
+            };
+            let _ = write!(out, " {mark} |");
+        }
+        out.push('\n');
+    }
+
+    out.push_str("\n### Why a cell is not `yes`\n\n");
+    for (role, cells) in ROLE_SUPPORT {
+        for (i, cell) in cells.iter().enumerate() {
+            let (kind, reason) = match cell {
+                RoleSupport::Mapped => continue,
+                RoleSupport::NotApplicable(r) => ("n/a", *r),
+                RoleSupport::Gap(r) => ("gap", *r),
+            };
+            let _ = writeln!(
+                out,
+                "- `{role:?}` / {} — {kind}: {reason}",
+                AxBackend::ALL[i].label()
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
