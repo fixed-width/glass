@@ -107,16 +107,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                 Gap("alert and action-sheet tokens are not mapped yet"),
             ],
         ),
-        (
-            R::Group,
-            [
-                Mapped,
-                Mapped,
-                Mapped,
-                Mapped,
-                Gap("no container token is mapped yet"),
-            ],
-        ),
+        (R::Group, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (R::Button, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (
             R::ToggleButton,
@@ -351,7 +342,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] =
                      headings; the normalized set has no column-header role"),
                 Mapped,
                 Gap("heading semantics are not mapped yet"),
-                Gap("the header token is not mapped yet"),
+                Mapped,
             ],
         ),
     ]
