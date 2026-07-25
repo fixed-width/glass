@@ -488,10 +488,12 @@ mod tests {
         for role in AxRole::ALL {
             let mapped = CLASS_TOKENS.iter().any(|(_, r)| *r == role)
                 || RULE_ROLES.contains(&role)
-                // Only the uiautomator reader (`build_tree`) synthesizes a Window root; the
-                // on-device AccessibilityService reader roots the tree at the device's node,
-                // which comes from `class_to_role` like any other node. Exempt Window since
-                // `class_to_role` cannot produce it.
+                // Neither reader produces Window from a class name: the uiautomator reader
+                // wraps its dump in a synthetic Window root, and the accessibility-service
+                // reader sets Window on the active window's own root node (see
+                // `a11y_service::tree_from_json`). Exempt it — `class_to_role` cannot
+                // produce it, and the Android column declares it Mapped because both
+                // readers really do report it.
                 || role == AxRole::Window;
             match support(role, AxBackend::Android).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {

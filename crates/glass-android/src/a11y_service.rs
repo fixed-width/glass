@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxStates, AxTarget, AxTree,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
     TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
@@ -127,7 +127,15 @@ pub(crate) fn tree_from_json(
     limits: WalkLimits,
 ) -> Result<AxTree> {
     let mut budget = WalkBudget::with_limits(limits);
-    let root = json_to_node(tree, win, 0, &mut budget)?;
+    let mut root = json_to_node(tree, win, 0, &mut budget)?;
+    // The device answers with the root of the ACTIVE WINDOW, so this node is the window —
+    // whatever layout class it happens to carry. Say so, for the same reason the
+    // uiautomator reader wraps its dump in a Window root: both Android readers have to
+    // agree about the root, or a `role:` selector written against one misses on the other.
+    // The node itself is untouched — no synthetic wrapper — because `AxNodeId(n)` is the
+    // device's `ref` n and an extra node would shift every id `set_value` addresses by.
+    // `raw_role` keeps the device's class, so the escape hatch still reports it.
+    root.role = AxRole::Window;
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
     Ok(tree)
@@ -498,6 +506,48 @@ mod tests {
         let save = t.find(AxNodeId(2)).unwrap();
         assert_eq!(save.role, AxRole::Button);
         assert_eq!(save.name.as_deref(), Some("Save"));
+    }
+
+    /// One device `tree` response: a root layout with two children, shaped like the real
+    /// protocol (bounds in screen coordinates, flags as bools).
+    fn device_tree() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.TextView", "text": "Settings",
+                 "bounds": {"x": 0, "y": 100, "w": 400, "h": 60}, "children": []},
+                {"class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 0, "y": 200, "w": 400, "h": 60}, "children": []}
+            ]
+        })
+    }
+
+    #[test]
+    fn the_root_is_a_window_like_the_uiautomator_reader() {
+        let win = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        };
+        let mut tree = tree_from_json(&device_tree(), &win, WalkLimits::DEFAULT).expect("builds");
+        tree.assign_ids();
+        // The service asks the device for the active window's root, so that node IS the
+        // window — and both Android readers must agree on it, or one `role:` selector
+        // cannot address the root on both.
+        assert_eq!(tree.root.role, AxRole::Window);
+        // The device's own class stays in raw_role: the role is normalized, the escape
+        // hatch still reports what the platform said.
+        assert_eq!(tree.root.raw_role, "android.widget.FrameLayout");
+        // Rooting must not add, drop or reorder a node: ids are the device's refs, and
+        // set_value addresses by them.
+        assert_eq!(tree.root.id, AxNodeId(0));
+        assert_eq!(tree.count, 3);
+        assert_eq!(tree.root.children[0].id, AxNodeId(1));
+        assert_eq!(tree.root.children[0].role, AxRole::Label);
+        assert_eq!(tree.root.children[1].id, AxNodeId(2));
+        assert_eq!(tree.root.children[1].role, AxRole::Button);
     }
 
     #[test]
