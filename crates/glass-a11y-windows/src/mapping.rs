@@ -350,10 +350,29 @@ mod tests {
                         "{role:?} declared Mapped but no control type maps to it"
                     )
                 }
-                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
-                    !mapped,
-                    "{role:?} is produced by a control type but the matrix does not declare it"
-                ),
+                cell => {
+                    assert!(
+                        !mapped,
+                        "{role:?} is produced by a control type but the matrix does not declare it"
+                    );
+                    // Windows is the one column where a named token is checked for existence,
+                    // not just for what it maps to: `CONTROL_TYPES` carries every documented UIA
+                    // control type by name, so a typo or an invented name fails here rather than
+                    // resolving quietly to `Other` the way a bad AX role or widget class would.
+                    if let Some(token) = cell.named_token() {
+                        let named = CONTROL_TYPES
+                            .iter()
+                            .find(|(_, name, _)| *name == token)
+                            .unwrap_or_else(|| {
+                                panic!("{role:?} names {token}, not a UIA control type")
+                            });
+                        assert_ne!(
+                            named.2,
+                            Some(role),
+                            "{role:?} is declared out of reach naming {token}, which maps to it"
+                        );
+                    }
+                }
             }
         }
     }

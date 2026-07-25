@@ -36,6 +36,12 @@ internal refactors, CI, or test-only changes.
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
 
 ### Changed
+- Every cell of [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) that is not `yes` now
+  names the native token behind it as its own clause — `n/a (reports AXStaticText instead)`,
+  `gap (AXPopUpButton arrives unmapped)` — instead of leaving it buried in prose. That is the fact
+  an agent holding an `Other(...)` in a snapshot is looking for, and it is data rather than text:
+  each backend's tests resolve it through that backend's own map, and on Windows, where UIA names
+  every documented control type, an invented one fails the build.
 - [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) now splits a role glass could still
   reach from one only a platform change could, and decides which by putting the control on screen
   and reading the tree back rather than by what a platform's API reference implies. Fourteen cells

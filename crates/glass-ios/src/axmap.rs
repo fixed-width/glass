@@ -643,10 +643,25 @@ mod tests {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no token maps to it")
                 }
-                RoleSupport::NotApplicable(_) | RoleSupport::Gap(_) => assert!(
-                    !mapped,
-                    "{role:?} is produced by a token but the matrix does not declare it"
-                ),
+                cell => {
+                    assert!(
+                        !mapped,
+                        "{role:?} is produced by a token but the matrix does not declare it"
+                    );
+                    // The named token must not resolve to the very role the cell says is out
+                    // of reach. Largely a second line behind the `!mapped` assertion above —
+                    // if the token produced the role, that one fires too — but it pins the
+                    // token itself, so a cell rewritten to name a different token is checked
+                    // against the map rather than against nothing. A misspelt token resolves
+                    // to `Other` and passes: only an on-box read catches that.
+                    if let Some(token) = cell.named_token() {
+                        assert_ne!(
+                            ax_role(token),
+                            role,
+                            "{role:?} is declared out of reach naming {token}, which maps to it"
+                        );
+                    }
+                }
             }
         }
     }

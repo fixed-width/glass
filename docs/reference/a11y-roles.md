@@ -77,49 +77,49 @@ now, and the outline only names the token of an element that has none.
 
 ### Why a cell is not `yes`
 
-- `Application` / Windows (UIA) — n/a: UIA has no application control type; the app root is a Window
-- `Application` / macOS (AX) — gap: AXApplication is the app element but is not mapped yet
+- `Application` / Windows (UIA) — n/a (reports `Window` instead): UIA has no application control type; the app root is a Window
+- `Application` / macOS (AX) — gap (`AXApplication` arrives unmapped): AXApplication is the app element but is not mapped yet
 - `Application` / Android — n/a: Android exposes windows, not an application element
 - `Dialog` / Windows (UIA) — gap: UIA marks a dialog with the IsDialog property on a Window; the reader does not read it
-- `Dialog` / macOS (AX) — gap: AXSheet, AXPopover and AXDrawer are not mapped yet
-- `Dialog` / Android — n/a: a framework AlertDialog's panels report FrameLayout and LinearLayout under android:id/parentPanel, and AccessibilityWindowInfo's window types carry no dialog kind for a reader to fall back on
+- `Dialog` / macOS (AX) — gap (`AXSheet` arrives unmapped): AXSheet, AXPopover and AXDrawer are not mapped yet
+- `Dialog` / Android — n/a (reports `android.widget.FrameLayout` instead): a framework AlertDialog's panels report FrameLayout and LinearLayout under android:id/parentPanel, and AccessibilityWindowInfo's window types carry no dialog kind for a reader to fall back on
 - `Dialog` / iOS — n/a: an alert and an action sheet each expose their title, message and buttons directly under the application element, with no container token between
-- `ToggleButton` / macOS (AX) — gap: AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; AXCheckBox is outside the reader's subrole gate, and no probed app emitted either subrole
-- `RadioButton` / iOS — n/a: UIKit has no radio control; a UISegmentedControl — the nearest equivalent — reports one AXTabGroup with no per-segment element
+- `ToggleButton` / macOS (AX) — gap (`AXCheckBox` arrives unmapped): AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; AXCheckBox is outside the reader's subrole gate, and no probed app emitted either subrole
+- `RadioButton` / iOS — n/a (reports `AXTabGroup` instead): UIKit has no radio control; a UISegmentedControl — the nearest equivalent — reports one AXTabGroup with no per-segment element
 - `MenuBar` / Android — n/a: Android apps have no menu bar
 - `MenuBar` / iOS — n/a: iOS apps have no menu bar
-- `Menu` / Android — n/a: a popup menu reports android.widget.ListView; no menu token appears anywhere in the tree it opens
-- `Menu` / iOS — n/a: a button's pull-down UIMenu opens as an AXGroup of AXButtons alongside a Dismiss context menu button; no menu token appears
-- `MenuItem` / Android — n/a: a menu entry reports its item view's layout class — a LinearLayout or RelativeLayout holding a TextView title
-- `MenuItem` / iOS — n/a: a menu entry reports AXButton, the same token as any other button
-- `TextArea` / Android — n/a: Android uses one editable class for single- and multi-line text
-- `ComboBox` / iOS — gap: a menu-style SwiftUI Picker reports AXPopUpButton, which is not mapped yet; the inline style reports a heading with buttons, and a UIPickerView reports AXSlider
-- `List` / iOS — n/a: a UITableView and a SwiftUI List both report AXGroup, and their rows report AXStaticText; no list token appears
+- `Menu` / Android — n/a (reports `android.widget.ListView` instead): a popup menu reports android.widget.ListView; no menu token appears anywhere in the tree it opens
+- `Menu` / iOS — n/a (reports `AXGroup` instead): a button's pull-down UIMenu opens as an AXGroup of AXButtons alongside a Dismiss context menu button; no menu token appears
+- `MenuItem` / Android — n/a (reports `android.widget.LinearLayout` instead): a menu entry reports its item view's layout class — a LinearLayout or RelativeLayout holding a TextView title
+- `MenuItem` / iOS — n/a (reports `AXButton` instead): a menu entry reports AXButton, the same token as any other button
+- `TextArea` / Android — n/a (reports `android.widget.EditText` instead): Android uses one editable class for single- and multi-line text
+- `ComboBox` / iOS — gap (`AXPopUpButton` arrives unmapped): a menu-style SwiftUI Picker reports AXPopUpButton, which is not mapped yet; the inline style reports a heading with buttons, and a UIPickerView reports AXSlider
+- `List` / iOS — n/a (reports `AXGroup` instead): a UITableView and a SwiftUI List both report AXGroup, and their rows report AXStaticText; no list token appears
 - `ListItem` / Android — gap: AccessibilityNodeInfo's CollectionItemInfo marks a list child, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds. The child's own widget class is all that arrives
-- `ListItem` / iOS — n/a: table and collection rows report AXStaticText, including a cell explicitly exposed as its own accessibility element
+- `ListItem` / iOS — n/a (reports `AXStaticText` instead): table and collection rows report AXStaticText, including a cell explicitly exposed as its own accessibility element
 - `Table` / macOS (AX) — gap: mac lists report AXOutline rather than AXTable; AXOutline maps to Tree
-- `Table` / Android — gap: android.widget.TableLayout and TableRow both arrive as tokens: TableLayout folds into Group via the container rule, TableRow lands in Other, and GridView maps to List
-- `Table` / iOS — n/a: a table view reports AXGroup like any other container; no table token appears
-- `Cell` / Windows (UIA) — gap: UIA's DataItem control type would carry this and is not mapped: the data grids probed expose their rows as TreeItem instead, though Edge does report an HTML table's header cells as DataItem
+- `Table` / Android — gap (`android.widget.TableLayout` arrives unmapped): android.widget.TableLayout and TableRow both arrive as tokens: TableLayout folds into Group via the container rule, TableRow lands in Other, and GridView maps to List
+- `Table` / iOS — n/a (reports `AXGroup` instead): a table view reports AXGroup like any other container; no table token appears
+- `Cell` / Windows (UIA) — gap (`DataItem` arrives unmapped): UIA's DataItem control type would carry this and is not mapped: the data grids probed expose their rows as TreeItem instead, though Edge does report an HTML table's header cells as DataItem
 - `Cell` / Android — gap: CollectionItemInfo holds the row and column index, and neither reader carries it: the uiautomator dump has no such attribute and the service reader parses only class, text, description and bounds. No cell class exists to fall back on — a cell is whatever view the app put in the row
 - `Tree` / Android — n/a: Android has no tree widget
 - `Tree` / iOS — n/a: UIKit has no outline view
 - `TreeItem` / Android — n/a: Android has no tree widget
 - `TreeItem` / iOS — n/a: UIKit has no outline view
-- `TabList` / Android — gap: android.widget.TabWidget and TabHost do arrive as tokens and are not mapped yet; the Material tab strips seen in stock apps report a plain layout class instead, naming their tabs only by content description
-- `Tab` / macOS (AX) — gap: AppKit reports tab items as AXRadioButton inside the tab group; the containing role is not used to disambiguate yet
+- `TabList` / Android — gap (`android.widget.TabWidget` arrives unmapped): android.widget.TabWidget and TabHost do arrive as tokens and are not mapped yet; the Material tab strips seen in stock apps report a plain layout class instead, naming their tabs only by content description
+- `Tab` / macOS (AX) — gap (`AXRadioButton` arrives unmapped): AppKit reports tab items as AXRadioButton inside the tab group; the containing role is not used to disambiguate yet
 - `Tab` / Android — gap: a framework tab arrives as a LinearLayout with selected=true under a TabWidget parent, which together identify it; the class name alone does not, and a Material tab strip carries the role in the view id instead
-- `Tab` / iOS — n/a: a tab bar reports AXGroup and no per-item element appears in idb's describe; a segmented control reports one AXTabGroup, also with no per-segment element
+- `Tab` / iOS — n/a (reports `AXGroup` instead): a tab bar reports AXGroup and no per-item element appears in idb's describe; a segmented control reports one AXTabGroup, also with no per-segment element
 - `ScrollBar` / Android — n/a: Android scrollbars are drawn, not exposed as nodes
 - `ScrollBar` / iOS — n/a: UIKit scroll indicators are not accessibility elements
-- `SpinButton` / macOS (AX) — gap: AXIncrementor is not mapped yet
-- `SpinButton` / Android — gap: android.widget.NumberPicker does arrive as a token and is not mapped yet
-- `SpinButton` / iOS — n/a: a UIStepper decomposes into two AXButtons labelled Decrement and Increment; no stepper token appears
-- `ProgressBar` / iOS — n/a: a UIProgressView reports AXGenericElement carrying its percentage as the value; no progress token appears
+- `SpinButton` / macOS (AX) — gap (`AXIncrementor` arrives unmapped): AXIncrementor is not mapped yet
+- `SpinButton` / Android — gap (`android.widget.NumberPicker` arrives unmapped): android.widget.NumberPicker does arrive as a token and is not mapped yet
+- `SpinButton` / iOS — n/a (reports `AXButton` instead): a UIStepper decomposes into two AXButtons labelled Decrement and Increment; no stepper token appears
+- `ProgressBar` / iOS — n/a (reports `AXGenericElement` instead): a UIProgressView reports AXGenericElement carrying its percentage as the value; no progress token appears
 - `Link` / Android — n/a: Android links are spans inside a text view, not separate nodes
 - `Separator` / Android — n/a: Android dividers are drawn, not exposed as nodes
 - `Separator` / iOS — n/a: UIKit exposes no separator element
-- `Toolbar` / Android — n/a: android.widget.Toolbar was watched to report android.view.ViewGroup — a subclass inherits the accessibility class name of the framework class it extends, and the AppCompat and Material toolbars override neither, so all three arrive as ViewGroup
+- `Toolbar` / Android — n/a (reports `android.view.ViewGroup` instead): android.widget.Toolbar was watched to report android.view.ViewGroup — a subclass inherits the accessibility class name of the framework class it extends, and the AppCompat and Material toolbars override neither, so all three arrive as ViewGroup
 - `StatusBar` / macOS (AX) — n/a: AppKit exposes status items as menu-bar items
 - `StatusBar` / Android — n/a: the system status bar is outside the app tree
 - `StatusBar` / iOS — n/a: the system status bar is outside the app tree
