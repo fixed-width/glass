@@ -1,5 +1,5 @@
 //! Pure window-relative / global ↔ point/pixel coordinate scale math. Cross-platform →
-//! unit-tested on the Linux dev box.
+//! unit-tested on any host.
 //!
 //! This is the single source of truth for point↔pixel conversion on macOS, shared by
 //! `glass-macos` (capture/window ops) and `glass-a11y-macos` (the accessibility reader) so
@@ -63,7 +63,7 @@ pub fn point_to_global_pixel(pt: (f64, f64), scale: f64) -> (i32, i32) {
 /// `capture.rs`'s captured frame always agree on width/height in pixels.
 ///
 /// Pure `f64` math (no `CGRect` dependency) so the Retina (2x) scaling is unit-tested here
-/// even on a 1x dev box — `scwindow.rs` itself only compiles on macOS.
+/// even on a 1x host — `scwindow.rs` itself only compiles on macOS.
 ///
 /// Each field rounds independently (`f64::round`, ties away from zero) rather than
 /// truncating, so a fractional point value doesn't consistently lose a pixel. Width/height

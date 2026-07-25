@@ -3,8 +3,9 @@
 //! Mirrors `glass-x11`/`glass-wayland`'s `spawn`+`spawn_reader`+`LogSink` shape: a plain
 //! `std::process::Command` built from [`AppSpec`], stdout/stderr piped into a shared,
 //! `Arc<Mutex<_>>`-guarded log buffer via one reader thread per stream, so
-//! `MacosPlatform::drain_logs` can read it without blocking the readers. `terminate`
-//! mirrors `glass-proc-linux::reap`'s SIGTERM -> brief wait -> SIGKILL -> reap sequence,
+//! `MacosPlatform::drain_logs` can read it without blocking the readers. `terminate` asks
+//! the app to quit first — AppKit runs no shutdown path for a signal — and only then falls
+//! back to `glass-proc-linux::reap`'s SIGTERM -> brief wait -> SIGKILL -> reap sequence,
 //! reimplemented here (rather than depending on that crate) because it is `/proc`-based
 //! and therefore Linux-only.
 //!
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant};
 use rustix::process::{Pid, Signal, kill_process};
 
 use glass_core::platform::{AppSpec, SandboxLevel};
-use glass_core::{GlassError, Result, Stream};
+use glass_core::{GlassError, Result, Stream, TEARDOWN_BUDGET};
 use glass_sandbox_macos::{ProfileOpts, build_profile, launch_reallows};
 
 /// Per-spawn counter feeding one component of
@@ -114,7 +115,7 @@ const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 
 /// [`crate::shim_path::resolve_shim`] against the real environment: the running executable's
 /// directory and [`SHIM_DYLIB_ENV`]. The tier logic itself is pure and lives in
-/// [`crate::shim_path`] (unit-tested on the Linux dev box); this wrapper only supplies the
+/// [`crate::shim_path`] (unit-tested on any host); this wrapper only supplies the
 /// two OS-touching inputs it needs.
 fn shim_dylib_path() -> Option<PathBuf> {
     shim_dylib_path_with(std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from))
@@ -133,10 +134,34 @@ fn shim_dylib_path_with(env_override: Option<PathBuf>) -> Option<PathBuf> {
 /// it from the main thread — the same shape `glass-x11`/`glass-wayland` use.
 pub(crate) type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 
-/// How long [`terminate`] waits after SIGTERM before escalating to SIGKILL. Short: a
-/// terminate call is already the "shut it down" path (`stop_app` or a failed launch's
-/// cleanup), not a place to make the caller wait for a slow shutdown handler.
+/// How long [`terminate`] waits after SIGTERM before escalating to SIGKILL. Short: by the time
+/// a signal is being sent the app has already declined (or could not be sent) the quit request
+/// that precedes it, so this is the escape hatch, not a place to wait out a shutdown handler.
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+/// How long [`terminate`] waits for the app to quit through its own shutdown path after being
+/// asked ([`crate::ffi::terminate_app`], which carries the measurement), before falling back to
+/// signals. An app that cannot be asked skips this entirely rather than spending it; only one
+/// that was asked and will not go pays it in full — several times over what a cooperating app
+/// was measured to need. Matches the Windows backend's close grace.
+///
+/// The ladder that follows this — `SIGTERM`, [`TERMINATE_GRACE`], `SIGKILL` — has to fit inside
+/// [`TEARDOWN_BUDGET`] too, and it is the part that actually guarantees the app is gone. When the
+/// *process* is going away, `glass-mcp` abandons teardown once that budget is spent, and a
+/// `spawn_blocking` teardown thread cannot be cancelled: a grace long enough to swallow the budget
+/// would mean the signals were never sent at all and the app outlived glass, orphaned to launchd.
+const QUIT_GRACE: Duration = Duration::from_millis(1500);
+
+// The whole ladder must finish inside the budget glass-mcp allows teardown, or it is abandoned
+// partway and the child is orphaned. This is the only thing keeping the numbers — in different
+// crates — honest about each other.
+const _: () = assert!(
+    QUIT_GRACE.as_millis() + TERMINATE_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    "the ask + signal ladder must complete inside glass_core::TEARDOWN_BUDGET"
+);
+
+/// How often the exit waits re-check the child.
+const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Spawn `spec.run` (with `spec.cwd`/`spec.env` applied) with stdout/stderr piped into
 /// `logs` via one reader thread per stream. Returns [`GlassError::AppNotStarted`] if the
@@ -332,32 +357,61 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
     });
 }
 
-/// Idempotently terminate `child`: SIGTERM, wait up to [`TERMINATE_GRACE`] for exit, then
-/// SIGKILL, then reap. Safe to call on an already-exited (or already-terminated) child —
-/// `try_wait` is checked first so a second call never re-signals a pid the kernel may have
-/// since recycled.
+/// Idempotently terminate `child`: ask it to quit, wait up to [`QUIT_GRACE`], then SIGTERM,
+/// wait up to [`TERMINATE_GRACE`], then SIGKILL, then reap. A child that *cannot* be asked —
+/// anything not registered as a running application, which is every console-shaped process —
+/// skips the quit grace entirely rather than spending it, so its teardown is as fast as it was
+/// before. Safe to call on an already-exited (or already-terminated) child — `try_wait` is
+/// checked first so a second call never re-signals a pid the kernel may have since recycled.
+///
+/// The quit request comes first because signals give a Cocoa app no shutdown path at all:
+/// AppKit installs no `SIGTERM` handler, so the default disposition ends the process with
+/// `applicationWillTerminate:` never called and nothing flushed — measured, not assumed (see
+/// [`crate::ffi::terminate_app`]). An app that ignores or vetoes the request still gets the
+/// full signal ladder afterwards, so teardown always completes; this only adds the chance to
+/// leave cleanly, it does not make the process harder to stop.
+///
+/// This is the child-backed path. A LaunchServices-adopted app (`backend.rs`'s `Adopted`) that
+/// glass started is asked the same way but never escalated — glass will not force-kill an app it
+/// only adopted — and one that was merely re-found running is not asked at all; see
+/// `Adopted::reap`.
 pub(crate) fn terminate(child: &mut Child) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
 
+    // A pid too large for `i32` cannot be a macOS pid, so a conversion failure lands in the
+    // same place as an app that isn't GUI-registered: couldn't ask, fall through to signals.
+    let asked = i32::try_from(child.id()).is_ok_and(crate::ffi::terminate_app);
+    if asked && wait_for_exit(child, QUIT_GRACE) {
+        // `wait_for_exit` only reports true via `try_wait() == Ok(Some(_))`, which has already
+        // reaped; this just collects the status so the call reads the same as the path below.
+        let _ = child.wait();
+        return;
+    }
+
     let pid = Pid::from_child(child);
     let _ = kill_process(pid, Signal::TERM);
-
-    let deadline = Instant::now() + TERMINATE_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) if Instant::now() >= deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            // `try_wait` failing is unexpected (the pid is ours) but not a reason to spin
-            // forever — fall through to the SIGKILL/reap below.
-            Err(_) => break,
-        }
-    }
+    // Whether SIGTERM was enough or not, SIGKILL follows — it is idempotent on an exited child.
+    let _ = wait_for_exit(child, TERMINATE_GRACE);
 
     let _ = child.kill(); // SIGKILL, tolerates an already-exited child.
     let _ = child.wait(); // Reap so the child doesn't linger as a zombie.
+}
+
+/// Poll `child` for exit for up to `grace`, reporting whether it exited within it. A
+/// `try_wait` error ends the wait reporting "still running": the pid is ours, so a failure is
+/// unexpected, and the caller escalating is the safe reading of an unreadable state.
+fn wait_for_exit(child: &mut Child, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() >= deadline => return false,
+            Ok(None) => std::thread::sleep(EXIT_POLL),
+            Err(_) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +518,7 @@ mod tests {
     /// launched with a `cwd` OUTSIDE `$HOME` would fail to start (it could not even be read to be
     /// exec'd). This is the macOS analog of the Linux
     /// `sandbox_default_reaches_launch_target_via_argument_path` integration test; it runs on real
-    /// macOS hardware (CI macOS runner + on-device), not on the Linux dev box.
+    /// macOS hardware (CI macOS runner + on-device) only.
     #[test]
     #[cfg(target_os = "macos")]
     fn default_sandbox_reaches_launch_target_under_home_when_cwd_is_elsewhere() {
@@ -564,6 +618,150 @@ mod tests {
         terminate(&mut child);
         let status = child.try_wait().expect("try_wait after terminate");
         assert!(status.is_some(), "child should have exited after terminate");
+    }
+
+    /// How long the AppKit fixture gets to finish launching before it is torn down. Until it
+    /// is a *running application* there is nothing to ask, so terminating early would exercise
+    /// the signal fallback and quietly pass for the wrong reason.
+    #[cfg(target_os = "macos")]
+    const FIXTURE_LAUNCH_SETTLE: Duration = Duration::from_secs(3);
+
+    /// How long the reader thread gets to drain the fixture's closing pipe. `terminate`
+    /// returns once the child is reaped; the last line it printed may still be in flight.
+    #[cfg(target_os = "macos")]
+    const LOG_DRAIN_SETTLE: Duration = Duration::from_millis(500);
+
+    /// Build `fixture/quadrants.swift` to a fresh temp path, returning (binary, build dir).
+    #[cfg(target_os = "macos")]
+    fn build_quit_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixture")
+            .join("quadrants.swift");
+        let build_dir =
+            std::env::temp_dir().join(format!("glass-quit-fixture-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&build_dir).expect("create fixture build dir");
+        let fixture = build_dir.join("quit-fixture");
+        let status = Command::new("swiftc")
+            .arg("-O")
+            // `-parse-as-library`: the fixture declares its entry point with `@main`, which
+            // swiftc rejects in a file it would otherwise treat as a top-level script. Same
+            // flags `tests/capture.rs` builds this fixture with.
+            .arg("-parse-as-library")
+            .arg(&source)
+            .arg("-o")
+            .arg(&fixture)
+            .status()
+            .expect("run swiftc");
+        assert!(status.success(), "swiftc failed on {}", source.display());
+        (fixture, build_dir)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "on-device only: needs swiftc and a window-server session"]
+    fn terminate_asks_a_gui_app_to_quit_before_signalling_it() {
+        // The whole point of the quit request: AppKit installs no SIGTERM handler, so a
+        // signalled Cocoa app never runs `applicationWillTerminate:`. The fixture announces
+        // that method on stdout, so the captured line exists only if `terminate` asked first —
+        // no signal-only teardown can produce it.
+        //
+        // `#[ignore]`d rather than self-skipping on an env var: it needs `swiftc` to build the
+        // fixture and a real window-server session for that fixture to become a running
+        // application, so on a CI runner it would report a pass having asserted nothing.
+        // `scripts/test-macos.sh` runs it explicitly under `GLASS_MACOS_ONBOX=1`.
+
+        let (fixture, build_dir) = build_quit_fixture("ask");
+        let sink = empty_sink();
+        let (mut child, _clip) = spawn(
+            &spec(&[fixture.to_string_lossy().as_ref()]),
+            Arc::clone(&sink),
+        )
+        .expect("spawn the AppKit fixture");
+        std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
+
+        terminate(&mut child);
+        std::thread::sleep(LOG_DRAIN_SETTLE);
+
+        let logs = sink.lock().expect("log sink mutex").clone();
+        let _ = std::fs::remove_dir_all(&build_dir);
+        assert!(
+            logs.iter()
+                .any(|(stream, line)| *stream == Stream::Stdout && line.starts_with("quit: ")),
+            "terminate must ask the app to quit before signalling it; captured logs: {logs:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "on-device only: needs swiftc and a window-server session"]
+    fn terminate_finishes_off_an_app_that_refuses_to_quit() {
+        // `terminate`'s doc promises that an app which vetoes the request still gets the full
+        // signal ladder, so teardown always completes — the one claim on this path that a
+        // cooperating fixture cannot exercise. `GLASS_FIXTURE_VETO_QUIT` makes the fixture
+        // answer `NSTerminateCancel`, standing in for an unsaved-changes sheet.
+        //
+        // The elapsed bound is the load-bearing half: it pins the ladder inside the budget
+        // `glass-mcp` allows teardown. Overrun it and `glass_stop` is abandoned mid-wait with
+        // the app never signalled at all — orphaned to launchd, outliving glass itself.
+        let (fixture, build_dir) = build_quit_fixture("veto");
+        let mut spec = spec(&[fixture.to_string_lossy().as_ref()]);
+        spec.env = vec![("GLASS_FIXTURE_VETO_QUIT".to_string(), "1".to_string())];
+
+        let sink = empty_sink();
+        let (mut child, _clip) = spawn(&spec, Arc::clone(&sink)).expect("spawn the AppKit fixture");
+        std::thread::sleep(FIXTURE_LAUNCH_SETTLE);
+
+        let started = Instant::now();
+        terminate(&mut child);
+        let elapsed = started.elapsed();
+        std::thread::sleep(LOG_DRAIN_SETTLE);
+        let logs = sink.lock().expect("log sink mutex").clone();
+        let _ = std::fs::remove_dir_all(&build_dir);
+
+        assert!(
+            logs.iter().any(
+                |(stream, line)| *stream == Stream::Stdout && line.starts_with("quit: refused")
+            ),
+            "the fixture must actually have refused, or this proves nothing; captured: {logs:?}"
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("try_wait after terminate")
+                .is_some(),
+            "a vetoing app must still be gone after terminate"
+        );
+        assert!(
+            elapsed < TEARDOWN_BUDGET,
+            "terminate took {elapsed:?}, over the {TEARDOWN_BUDGET:?} glass-mcp allows teardown \
+             — past that the app is left running and glass exits without it"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn terminate_signals_a_non_gui_child_without_waiting_out_the_quit_grace() {
+        // `/bin/sleep` is not a running *application*, so there is nothing to ask and
+        // `terminate_app` reports that. The quit grace must then be skipped entirely rather
+        // than spent — otherwise asking first would add `QUIT_GRACE` to the teardown of every
+        // app glass cannot ask, which is every console-shaped one.
+        let (mut child, _clip) =
+            spawn(&spec(&["/bin/sleep", "100"]), empty_sink()).expect("spawn /bin/sleep");
+        let started = Instant::now();
+        terminate(&mut child);
+        let elapsed = started.elapsed();
+        assert!(
+            child
+                .try_wait()
+                .expect("try_wait after terminate")
+                .is_some(),
+            "child should have exited after terminate"
+        );
+        assert!(
+            elapsed < QUIT_GRACE,
+            "terminate took {elapsed:?} — it waited out the quit grace ({QUIT_GRACE:?}) for a \
+             process it could not ask"
+        );
     }
 
     #[test]

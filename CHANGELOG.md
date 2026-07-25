@@ -100,6 +100,16 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- Windows and macOS: `glass_stop` now asks the app to close before killing it, so the app runs
+  its own shutdown path. Both backends previously went straight to terminating the process —
+  Windows by closing the job object, macOS by signalling — which an app that records whether it
+  exited cleanly reports as a crash the *next* time it starts. A Chromium-based browser opened
+  with a "Restore pages?" prompt instead of its normal first screen, so an agent driving it saw
+  a different first screen on every run. An app that ignores or refuses the request is still
+  terminated, and glass now says so on stderr rather than reporting an unqualified success.
+  Windows launches under Sandboxie containment are the exception and still get the old
+  teardown: a close request sent from outside the box is accepted by the OS but never reaches
+  the app, so landing one needs a helper running inside the box.
 - iOS: `glass_start` no longer reports a window for an app that died on launch. `simctl launch`
   exits successfully once the process is spawned, so an app that rejects a launch argument or
   trips an assertion at startup was reported as running, and the screenshot behind that geometry

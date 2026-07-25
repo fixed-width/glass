@@ -97,7 +97,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// A representative synthetic bare home root for a few different usernames — used to sweep the
-    /// predicates without needing real files under `/Users` (impossible on this Linux dev box).
+    /// predicates without needing real files under `/Users` (impossible off macOS).
     const SYNTHETIC_HOME_ROOTS: &[&str] = &["/Users/dev", "/Users/alice", "/Users/ci-runner"];
 
     // -------------------------------------------------------------------------
@@ -130,7 +130,7 @@ mod tests {
     // -------------------------------------------------------------------------
     // 2. Arg directly under a bare home root → the FILE in ro_files, the home root NOT in ro_binds.
     // PREDICATE-ONLY: `push_reallows` requires `std::fs::metadata(lit)` to succeed before routing,
-    // and this dev box has no real `/Users` tree to place a file under — placing one is impossible
+    // and a non-macOS host has no real `/Users` tree to place a file under — placing one is impossible
     // without root and would not be legitimate for a portable unit test. Verified instead: the two
     // predicates `push_reallows` actually branches on for this exact scenario. Full end-to-end
     // exercise of this branch is verified on real macOS hardware (Seatbelt does not run here).

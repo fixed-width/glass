@@ -262,15 +262,25 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
     }
 }
 
-/// Gracefully terminate the running application with this pid; a no-op if the pid is
-/// already gone. Cleanup-only (unlike `input.rs::focus`'s identical lookup, which treats a
-/// missing pid as the hard error `GlassError::AppExited` because a caller is depending on
-/// the activation landing) — `backend.rs`'s `stop_app` path doesn't need to know whether the
-/// app was already gone before it asked.
-pub(crate) fn terminate_app(pid: i32) {
-    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-        app.terminate();
-    }
+/// Ask the running application with this pid to quit through its own shutdown path —
+/// `-[NSRunningApplication terminate]`, the same request Cmd-Q sends. Returns whether the
+/// request was actually delivered: `false` means the pid owns no running application (it is
+/// not GUI-registered, or is already gone) or AppKit declined to send, and a caller that
+/// needs the process gone must fall back to signalling it.
+///
+/// Only signals are available without this, and they run no shutdown path at all: AppKit installs
+/// no `SIGTERM` handler, so the default disposition ends the process with
+/// `applicationWillTerminate:` never called and nothing flushed. Measured against a minimal AppKit
+/// app, which ran that method and exited a few hundred milliseconds after being asked this way,
+/// and did not run it under `SIGTERM`.
+///
+/// The `false` return is advisory, not an error. `backend.rs`'s `stop_app` path doesn't need
+/// to know whether the app was already gone before it asked (unlike `input.rs::focus`'s
+/// identical lookup, which treats a missing pid as the hard error `GlassError::AppExited`
+/// because a caller is depending on the activation landing).
+pub(crate) fn terminate_app(pid: i32) -> bool {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .is_some_and(|app| app.terminate())
 }
 
 #[cfg(test)]

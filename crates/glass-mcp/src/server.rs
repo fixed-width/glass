@@ -132,7 +132,11 @@ impl GlassServer {
         self.run(move |g| tools::start(g, &a)).await
     }
 
-    #[tool(description = "Stop the running app and end the session.")]
+    #[tool(
+        description = "Stop the running app and end the session. The app is asked to close first, \
+                       so it saves state and starts clean next time; one that will not close is \
+                       terminated, which takes a moment longer."
+    )]
     async fn glass_stop(&self) -> Result<CallToolResult, McpError> {
         self.run(tools::stop).await
     }

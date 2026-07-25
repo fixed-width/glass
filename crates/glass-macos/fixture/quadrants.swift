@@ -29,10 +29,11 @@
 // stdout, flushing after each — used by the capture test only to confirm the process is
 // alive, but not for pixel assertions.
 //
-// This fixture is shared by THREE integration tests: the Plan 2 capture test (relies on
-// the 4-quadrant colors + exact 400x400 borderless window size), the Plan 3 input test
-// (relies on the event reporting below), and the Plan 4 window test (relies on the
-// SECOND window described next). `QuadrantView` is made key/first-responder so it
+// This fixture is shared by FIVE tests: the Plan 2 capture test (relies on the 4-quadrant
+// colors + exact 400x400 borderless window size), the Plan 3 input test (relies on the
+// event reporting below), the Plan 4 window test (relies on the SECOND window described
+// next), the bundle-launch test, and glass-macos's own `terminate` unit tests (which rely
+// on the `quit:` line and on GLASS_FIXTURE_VETO_QUIT, both described below). `QuadrantView` is made key/first-responder so it
 // actually receives keyboard and mouse events, and reports each one to stdout as a
 // single flushed line so the driving test can assert on injected input landing
 // correctly:
@@ -46,6 +47,13 @@
 //   scroll: <dx>,<dy>      — one line per scrollWheel, `scrollingDeltaX`/`scrollingDeltaY`
 //                             verbatim (sign as macOS reports it), for verifying the
 //                             scroll-wheel sign convention against the tool boundary.
+//   quit: ...              — once, from `applicationWillTerminate:`. AppKit runs that
+//                             method when the app is ASKED to quit and not when it is
+//                             signalled, so its presence tells a test which teardown ran.
+//
+// GLASS_FIXTURE_VETO_QUIT=1 makes the app refuse the quit request (`NSTerminateCancel`),
+// standing in for a real app's unsaved-changes sheet — so a test can drive the case where
+// asking politely is not enough and the signal ladder has to finish the job.
 //
 // Both windows report through these same three prefixes (they're separate instances of
 // the same `QuadrantView` class) — a deliberate simplification: only Plan 4 Task 6's
@@ -247,6 +255,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         primary.makeFirstResponder(primary.contentView)
 
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// AppKit's "you are about to quit" notification — the one an app uses to flush state.
+    /// It runs when the app is *asked* to quit and not when it is signalled, so announcing it
+    /// on stdout (already captured, like the input echoes above) lets a test tell those two
+    /// teardowns apart from outside the process.
+    func applicationWillTerminate(_ notification: Notification) {
+        print("quit: shutdown path ran")
+        fflush(stdout)
+    }
+
+    /// Opt-in refusal, for testing the teardown path where asking is not enough. A real app
+    /// does this from an unsaved-changes sheet; there is no way to distinguish the two from
+    /// outside, which is the point.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if ProcessInfo.processInfo.environment["GLASS_FIXTURE_VETO_QUIT"] == "1" {
+            print("quit: refused")
+            fflush(stdout)
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     private func makeWindow(origin: NSPoint, title: String, palette: QuadrantPalette) -> FixtureWindow {

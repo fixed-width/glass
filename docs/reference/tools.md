@@ -113,6 +113,20 @@ Returns the located window's geometry: `{x, y, width, height}`.
 
 Stop the running app and end the session. No parameters. Returns `{}`.
 
+The app is asked to close before anything terminates it, so it runs its own shutdown path and
+saves whatever it saves on quit. This matters for the *next* run: an app that records whether it
+exited cleanly — a Chromium-based browser, say — otherwise opens with a crash-recovery prompt
+instead of its normal first screen, so a driven app's first screen changes from run to run.
+
+An app that ignores the request, or blocks on a "save changes?" prompt, is terminated anyway after
+a short grace, so `glass_stop` always completes. That case is reported on stderr rather than in the
+result, along with what to do about it where anything can be — the result stays `{}` either way.
+
+Two exceptions: a Windows app launched under Sandboxie containment (`sandbox` of `default` or
+`strict`) is terminated without being asked, because a close request from outside the box never
+reaches it; and an app with no window has nothing to ask, so it is terminated immediately as
+before.
+
 ## Capture & visual comparison
 
 ### `glass_screenshot`

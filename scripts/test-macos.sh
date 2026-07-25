@@ -12,7 +12,8 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
-# Pure + macOS unit tests only (`--lib`). `crates/glass-macos/tests/capture.rs` is now a
+# Pure + macOS unit tests only (`--lib`), minus the `#[ignore]`d ones that need a window
+# server (GLASS_MACOS_ONBOX below runs those). `crates/glass-macos/tests/capture.rs` is now a
 # real `[[test]]` target (see Cargo.toml), so a plain `cargo test -p glass-macos` with no
 # `--lib` filter would also try to build+run it — and it needs a granted, WindowServer
 # -connected context (a gui/501 LaunchAgent) that a plain on-box or CI run doesn't have,
@@ -30,6 +31,13 @@ cargo test -p glass-macos --lib "${1:-}"
 # gui/501 LaunchAgent so it inherits the grant. Plain `./scripts/test-macos.sh` (no env
 # set) never touches this.
 if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
+  # The `--ignore`d unit tests that need a real Mac to mean anything: they build a Swift
+  # fixture and launch it into the window server, so a plain `cargo test` (and CI) must skip
+  # them. Unlike the integration binaries below, these DO run here — this is the only
+  # invocation that runs them, and it must be from a session with a window server.
+  echo "GLASS_MACOS_ONBOX=1: running the on-device --lib tests..."
+  cargo test -p glass-macos --lib -- --ignored "${1:-}"
+
   echo "GLASS_MACOS_ONBOX=1: building the capture integration test binary..."
   cargo test -p glass-macos --test capture --no-run
 
@@ -47,4 +55,9 @@ if [[ "${GLASS_MACOS_ONBOX:-0}" == "1" ]]; then
   # out-of-band via the same GlassProbe.app LaunchAgent procedure.
   echo "GLASS_MACOS_ONBOX=1: building the window integration test binary..."
   cargo test -p glass-macos --test windows --no-run
+
+  # Same story for crates/glass-macos/tests/bundle_launch.rs — building it here is what keeps
+  # its assertions from rotting between granted runs, which are rare and manual.
+  echo "GLASS_MACOS_ONBOX=1: building the bundle-launch integration test binary..."
+  cargo test -p glass-macos --test bundle_launch --no-run
 fi

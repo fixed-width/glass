@@ -1,7 +1,7 @@
 //! Pure mapping from [`SandboxLevel`] to the set of Job-object limits the Windows
 //! backend applies (Job-based in-OS hardening). No Win32 here — the cfg(windows)
 //! `build_kill_on_close_job` translates this descriptor into `JOBOBJECT_*` flags — so
-//! the policy is unit-tested on the Linux dev box.
+//! the policy is unit-tested on any host.
 
 // Consumed only by the cfg(windows) job builder + the Linux unit tests, so a non-test
 // Linux build sees these as dead.

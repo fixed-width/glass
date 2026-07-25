@@ -7,7 +7,7 @@
 //! box also carrying `OpenClipboard=n`) the *only* way these calls can succeed is if the injected
 //! hook intercepts them and serves the private store — so a correct `READBACK` proves interception.
 //! Deliberately uses the raw user32 path (not OLE / .NET `Clipboard`), which is exactly what the
-//! v1 hook detours. Windows-only; a no-op elsewhere so the Linux dev box stays green.
+//! v1 hook detours. Windows-only; a no-op elsewhere so non-Windows builds stay green.
 //!   cargo build -p glass-clip-hook --release --example clipprobe
 
 // On-box FFI probe: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is

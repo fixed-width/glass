@@ -7,7 +7,7 @@
 //! center lands on that element (the READY→TAPPED flip), and typed text — both raw
 //! `send_key` and the `set_value` clear-then-type sequence — reaches the field.
 //!
-//! `#[ignore]`d so a plain `cargo test` (Linux dev host, CI) skips it: the backend needs
+//! `#[ignore]`d so a plain `cargo test` skips it everywhere: the backend needs
 //! `xcrun simctl` + `idb_companion` (macOS + Xcode only), a booted Simulator, and the
 //! GlassFixture app from `examples/ios-fixture/`. Run explicitly on such a host:
 //!
