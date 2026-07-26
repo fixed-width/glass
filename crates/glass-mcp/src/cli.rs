@@ -102,7 +102,7 @@ pub enum Command {
     /// works. Experimental: not part of the stable tool surface.
     Smoke {
         /// Backend to exercise. The smoke runner drives x11 and wayland.
-        #[arg(long, default_value = "x11")]
+        #[arg(long, default_value = crate::smoke::DEFAULT_BACKEND)]
         backend: String,
         /// Write the JSON report to PATH (the text report always goes to stdout).
         #[arg(long, value_name = "PATH")]

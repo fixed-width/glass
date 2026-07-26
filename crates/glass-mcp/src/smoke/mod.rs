@@ -34,6 +34,10 @@ pub fn drivable_backends() -> Vec<&'static str> {
     DRIVABLE.iter().map(|(name, _)| *name).collect()
 }
 
+/// What a bare `smoke` drives. Derived from the table so `--backend`'s clap default and the
+/// error telling a caller what to pass cannot name different backends.
+pub const DEFAULT_BACKEND: &str = DRIVABLE[0].0;
+
 /// The clause both resolution errors carry, spelled once so a test can scope its assertion to
 /// the span derived from [`DRIVABLE`] rather than to surrounding prose that also names backends.
 const DRIVES_CLAUSE: &str = "the smoke runner drives: ";
@@ -57,8 +61,7 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
         .ok_or_else(|| {
             format!(
                 "no smoke candidates for backend {name:?} yet — {DRIVES_CLAUSE}{drivable}. \
-                 Pass --backend {}.",
-                drivable_backends()[0]
+                 Pass --backend {DEFAULT_BACKEND}."
             )
         })
 }
@@ -93,8 +96,7 @@ fn planned_rows() -> Vec<(u8, &'static str)> {
 /// Every check name a report can carry. The known-limits ledger is validated against this,
 /// so an entry naming a check that does not exist fails a test rather than silently never
 /// matching and hard-failing a release over an accepted limitation.
-#[cfg(test)]
-pub(crate) fn all_check_names() -> Vec<&'static str> {
+pub fn all_check_names() -> Vec<&'static str> {
     planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
@@ -419,6 +421,24 @@ mod tests {
                 drives.contains(b),
                 "the drives clause must name {b:?}: {err}"
             );
+        }
+    }
+
+    /// Nothing else requires a [`DRIVABLE`] name to be the canonical spelling `recognized_backend`
+    /// returns. `("Wayland", …)` compiles, never matches the lookup below it, and conceals itself:
+    /// the error prose and the CLI help test both read this table, so both go on calling a dead
+    /// row drivable while `--backend Wayland` errors.
+    #[test]
+    fn every_drivable_row_can_actually_be_resolved() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, candidates) in DRIVABLE {
+            assert_eq!(
+                crate::recognized_backend(name),
+                Some(*name),
+                "{name:?} is not the canonical spelling glass resolves to"
+            );
+            assert!(!candidates.is_empty(), "{name:?} has no candidate apps");
+            assert!(seen.insert(*name), "{name:?} appears twice");
         }
     }
 
