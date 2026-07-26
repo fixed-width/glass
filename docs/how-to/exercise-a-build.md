@@ -1,12 +1,6 @@
 # Exercise a build with `smoke`
 
-> **Setting glass up, or something isn't working?** Run
-> [`glass-mcp doctor`](../reference/cli.md#doctor). It checks the environment glass needs — display
-> server, containment runtime, tool paths — and prints how to fix whatever is missing. That is the
-> command for "is my install healthy?", and unlike this one it is stable and needs nothing installed
-> to answer.
-
-`glass-mcp smoke` answers a narrower question: does **this build** drive a real app end to end? It
+`glass-mcp smoke` answers one question: does **this build** drive a real app end to end? It
 launches a stock app, captures a screenshot, reads the accessibility tree, writes to a field and
 confirms the value landed, then shuts the session down — through glass's own MCP tools, over a real
 MCP connection.
@@ -22,8 +16,7 @@ the one in your hand, not whichever `glass-mcp` is on `PATH`.
 
 ## What it needs
 
-`doctor` inspects the host; `smoke` drives an app on it, so a real run needs two things `doctor`
-does not:
+A real run drives an app, so it needs:
 
 - **A target app.** The smoke runner drives x11, where it probes for the first of `xed`,
   `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
