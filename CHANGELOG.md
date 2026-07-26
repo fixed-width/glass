@@ -42,6 +42,8 @@ internal refactors, CI, or test-only changes.
   (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
   diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
   of parsing prose. Purely additive: `report` is unchanged.
+- `glass-mcp smoke --backend x11` — drives glass's own MCP tools against a real app and
+  reports whether this build works. Experimental; see `docs/how-to/verify-your-install.md`.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.

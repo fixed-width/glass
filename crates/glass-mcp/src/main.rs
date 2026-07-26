@@ -131,5 +131,26 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::DebugGrants) => run_debug_grants(),
         Some(Command::DebugChecklist) => run_debug_checklist(),
+        Some(Command::Smoke {
+            backend,
+            report,
+            app,
+            self_check,
+            dry_run,
+        }) => {
+            let _ = self_check; // wired in the next task
+            let r = glass_mcp::smoke::run(glass_mcp::smoke::SmokeOptions {
+                backend,
+                app,
+                expect_version: std::env::var("GLASS_SMOKE_EXPECT_VERSION").ok(),
+                dry_run,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            print!("{}", r.to_markdown());
+            if let Some(path) = report {
+                std::fs::write(&path, serde_json::to_string_pretty(&r)?)?;
+            }
+            std::process::exit(r.exit_code());
+        }
     }
 }

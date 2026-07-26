@@ -33,6 +33,8 @@ way it does? The explanations.
 **Contribute**
 
 - [Build from source](how-to/build-from-source.md) — all platforms; macOS signing + LaunchAgent
+- [Verify your install](how-to/verify-your-install.md) — `glass-mcp smoke`: drive glass's own tools
+  against a real app and confirm this build works
 - [Benchmark and profile](how-to/benchmarking.md)
 - [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
   screenshot-every-step, round-trips and tokens

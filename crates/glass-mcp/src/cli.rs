@@ -97,6 +97,25 @@ pub enum Command {
     /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
     #[command(hide = true)]
     DebugChecklist,
+    /// Drive glass's own MCP tools against a real app and report whether this build
+    /// works. Experimental: not part of the stable tool surface.
+    Smoke {
+        /// Backend to exercise. Today: `x11`.
+        #[arg(long, default_value = "x11")]
+        backend: String,
+        /// Write the JSON report to PATH (markdown always goes to stdout).
+        #[arg(long, value_name = "PATH")]
+        report: Option<String>,
+        /// Force a target app instead of probing for the first available one.
+        #[arg(long)]
+        app: Option<String>,
+        /// Prove the checks can fail: run them against injected faults.
+        #[arg(long)]
+        self_check: bool,
+        /// Print what would run and exit, touching nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]

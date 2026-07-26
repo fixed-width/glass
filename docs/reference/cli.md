@@ -60,3 +60,17 @@ macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+
+## `smoke`
+
+**Experimental** — see [Stability and versioning](stability.md#experimental-subcommands). Drive
+glass's own MCP tools against a real app and report whether this build works end to end. See
+[how-to/verify-your-install.md](../how-to/verify-your-install.md) for what each check means and how
+to read the report.
+
+- `--backend <name>` — backend to exercise (default `x11`; the only one today).
+- `--report <path>` — also write the JSON report to `path` (the markdown table always goes to
+  stdout).
+- `--app <name>` — force a specific candidate app instead of probing for the first one present.
+- `--dry-run` — print the plan and exit without touching anything.
+- `--self-check` — reserved for a future fault-injection mode; has no effect yet.
