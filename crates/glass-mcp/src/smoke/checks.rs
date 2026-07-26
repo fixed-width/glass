@@ -30,7 +30,16 @@ fn excerpt(s: &str) -> String {
 pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     let mut run = vec![Value::String(p.app.bin.to_string())];
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
-    let args = json!({ "run": run, "backend": p.backend, "a11y": true });
+    let mut args = json!({ "run": run, "backend": p.backend, "a11y": true });
+    if !p.app.env.is_empty() {
+        let env: serde_json::Map<String, Value> = p
+            .app
+            .env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect();
+        args["env"] = Value::Object(env);
+    }
     outcome(
         1,
         "start",
@@ -367,7 +376,7 @@ pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::profile::X11_CANDIDATES;
+    use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::{CallResult, ScriptedTransport};
 
@@ -389,6 +398,22 @@ mod tests {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
         }
+    }
+
+    fn wayland_profile() -> Profile {
+        Profile {
+            backend: "wayland".into(),
+            app: &WAYLAND_CANDIDATES[0],
+        }
+    }
+
+    fn started() -> CallResult {
+        ok(
+            "glass_start",
+            json!({ "x": 0, "y": 0, "width": 800, "height": 600 }),
+            &[],
+            0,
+        )
     }
 
     #[test]
@@ -415,6 +440,24 @@ mod tests {
             "must say what was missing: {}",
             out.detail
         );
+    }
+
+    #[test]
+    fn start_sends_the_candidates_env_on_the_wire() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Ok(started()))]);
+        let _ = check_start(&mut t, &wayland_profile());
+        let args = t.args_for("glass_start").expect("glass_start was called");
+        assert_eq!(args["env"]["GDK_BACKEND"], json!("wayland"));
+    }
+
+    /// An empty `env` object is a different payload from no `env` key, and the server is free to
+    /// treat them differently — so a candidate that declares none must send none.
+    #[test]
+    fn start_sends_no_env_key_for_a_candidate_that_needs_none() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Ok(started()))]);
+        let _ = check_start(&mut t, &profile());
+        let args = t.args_for("glass_start").expect("glass_start was called");
+        assert!(args.get("env").is_none(), "got: {args}");
     }
 
     #[test]
