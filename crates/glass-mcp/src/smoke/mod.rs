@@ -34,6 +34,10 @@ pub fn drivable_backends() -> Vec<&'static str> {
     DRIVABLE.iter().map(|(name, _)| *name).collect()
 }
 
+/// The clause both resolution errors carry, spelled once so a test can scope its assertion to
+/// the span derived from [`DRIVABLE`] rather than to surrounding prose that also names backends.
+const DRIVES_CLAUSE: &str = "the smoke runner drives: ";
+
 /// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
 /// backend-recognition predicate — and return the canonical name alongside its candidate apps.
 /// Keying the table off what that returns is what stops `smoke --backend X11` being rejected
@@ -42,7 +46,7 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
     let drivable = drivable_backends().join(", ");
     let Some(name) = crate::recognized_backend(backend) else {
         return Err(format!(
-            "unknown backend {backend:?} — glass knows: {}. The smoke runner drives: {drivable}.",
+            "unknown backend {backend:?} — glass knows: {}; {DRIVES_CLAUSE}{drivable}.",
             crate::BACKENDS.join(", ")
         ));
     };
@@ -52,8 +56,8 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
         .map(|(n, c)| (*n, *c))
         .ok_or_else(|| {
             format!(
-                "no smoke candidates for backend {name:?} yet — the smoke runner drives: \
-                 {drivable}. Pass --backend {}.",
+                "no smoke candidates for backend {name:?} yet — {DRIVES_CLAUSE}{drivable}. \
+                 Pass --backend {}.",
                 drivable_backends()[0]
             )
         })
@@ -248,6 +252,18 @@ mod tests {
         r.checks.iter().map(|c| (c.step, c.name.as_str())).collect()
     }
 
+    /// The span of a resolution error interpolated from [`DRIVABLE`], up to the period that ends
+    /// the clause. Both surrounding sentences also name backends — `crate::BACKENDS` before it,
+    /// `Pass --backend x11.` after — so an assertion over the whole message holds vacuously.
+    fn drives_clause(err: &str) -> &str {
+        let (_, rest) = err
+            .split_once(DRIVES_CLAUSE)
+            .unwrap_or_else(|| panic!("must have a drives clause: {err}"));
+        rest.split_once('.')
+            .unwrap_or_else(|| panic!("the drives clause must end in a period: {err}"))
+            .0
+    }
+
     fn detail_of<'a>(r: &'a SmokeReport, name: &str) -> &'a str {
         &r.checks
             .iter()
@@ -397,8 +413,12 @@ mod tests {
             err.contains("android"),
             "must name the backend asked for: {err}"
         );
+        let drives = drives_clause(&err);
         for b in drivable_backends() {
-            assert!(err.contains(b), "must name {b:?} as drivable: {err}");
+            assert!(
+                drives.contains(b),
+                "the drives clause must name {b:?}: {err}"
+            );
         }
     }
 
@@ -447,8 +467,7 @@ mod tests {
     }
 
     /// The prose naming what is drivable is derived from the table, so a backend cannot land
-    /// while a message still says otherwise: checked on the "drives" clause alone, because
-    /// `crate::BACKENDS` names every backend in an earlier clause too and would mask a broken one.
+    /// while a message still says otherwise.
     #[test]
     fn an_unknown_backend_names_every_drivable_backend() {
         let err = run_with(
@@ -460,9 +479,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        let (_, drives) = err
-            .split_once("The smoke runner drives: ")
-            .expect("must have a drives clause");
+        let drives = drives_clause(&err);
         for b in drivable_backends() {
             assert!(
                 drives.contains(b),
