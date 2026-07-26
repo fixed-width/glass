@@ -113,8 +113,12 @@ pub enum Command {
         /// Version the binary must report (the release tag). Omit to skip that check.
         #[arg(long, value_name = "TAG")]
         expect_version: Option<String>,
-        /// Prove the checks can fail: run them against injected faults.
-        #[arg(long)]
+        /// Prove the checks can fail: run them against injected faults, then exit. Runs
+        /// nothing else, so it cannot be combined with the flags that configure a real run.
+        #[arg(
+            long,
+            conflicts_with_all = ["backend", "report", "app", "expect_version", "dry_run"]
+        )]
         self_check: bool,
         /// Print what would run and exit, touching nothing.
         #[arg(long)]
@@ -293,6 +297,39 @@ mod tests {
     fn uninstall_subcommand_parses() {
         let cli = Cli::try_parse_from(["glass-mcp", "uninstall"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Uninstall)));
+    }
+
+    #[test]
+    fn smoke_self_check_parses_on_its_own() {
+        let cli = Cli::try_parse_from(["glass-mcp", "smoke", "--self-check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Smoke {
+                self_check: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn smoke_self_check_conflicts_with_the_flags_it_would_ignore() {
+        // `--self-check` runs the fault injection and exits; silently ignoring a real run's
+        // flags would let `smoke --self-check --expect-version 1.1.0` look like it checked
+        // the version.
+        for other in [
+            vec!["--dry-run"],
+            vec!["--backend", "x11"],
+            vec!["--app", "xterm"],
+            vec!["--expect-version", "1.1.0"],
+            vec!["--report", "/tmp/r.json"],
+        ] {
+            let mut argv = vec!["glass-mcp", "smoke", "--self-check"];
+            argv.extend(other.iter().copied());
+            let Err(err) = Cli::try_parse_from(&argv) else {
+                panic!("{argv:?} must be rejected, not silently ignored");
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

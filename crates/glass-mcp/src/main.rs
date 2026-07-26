@@ -154,7 +154,15 @@ async fn main() -> anyhow::Result<()> {
                 expect_version,
                 dry_run,
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Setup failed before any check ran, so there is no report to write — say so,
+            // rather than leaving the caller looking for a `--report` file that was never
+            // created.
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "smoke could not start: {e}\nNo report was written: the run never \
+                     reached a check."
+                )
+            })?;
             print!("{}", r.to_markdown());
             if let Some(path) = report {
                 std::fs::write(&path, serde_json::to_string_pretty(&r)?)?;
