@@ -45,10 +45,10 @@ pub struct StdioClient {
     /// Joined before the tail is read, so the tail includes the last thing the server said.
     stderr_reader: Option<JoinHandle<()>>,
     next_id: i64,
-    /// What the server reported in `initialize`'s `serverInfo.version`. Never seeded from
-    /// this binary's own `crate::VERSION`: client and server are the same executable here, so
-    /// a seeded value would match `--expect-version` even from a server that stopped
-    /// reporting a version at all — check 1 would pass without the server ever answering.
+    /// What the server reported in `initialize`'s `serverInfo.version`, or `None` if it
+    /// reported none. Never seeded from this binary's own `crate::VERSION`: client and server
+    /// are the same executable here, so a seeded value would put a version in the report that
+    /// the server never actually answered with.
     version: Option<String>,
     /// Per-request deadline. Fixed at `CALL_TIMEOUT` in production
     /// (`spawn`); overridable so tests can exercise the timeout path without
@@ -119,17 +119,18 @@ impl StdioClient {
         if init.get("result").is_none() {
             return Err(format!("initialize failed: {init}"));
         }
-        let version = init["result"]["serverInfo"]["version"]
+        // A missing `serverInfo.version` is recorded, not fatal. No check asserts on it — the
+        // report carries it so a reader can tell which build produced the run — so aborting
+        // here would throw away every check's evidence over a missing label.
+        self.version = init["result"]["serverInfo"]["version"]
             .as_str()
-            .ok_or_else(|| {
-                format!(
-                    "initialize returned no `serverInfo.version` string (got {}); the version \
-                 check has nothing to compare against",
-                    init["result"]["serverInfo"]["version"]
-                )
-            })?;
-        self.version = Some(version.to_string());
+            .map(str::to_string);
         self.notify("notifications/initialized", serde_json::json!({}))
+    }
+
+    /// The version the server reported at `initialize`; `None` when it reported none.
+    pub fn server_version(&self) -> Option<String> {
+        self.version.clone()
     }
 
     fn send(&mut self, msg: &Value) -> Result<(), String> {
@@ -294,12 +295,6 @@ impl McpTransport for StdioClient {
             return Err(format!("{tool}: JSON-RPC error {err}"));
         }
         Ok(CallResult::from_mcp(&v["result"]))
-    }
-
-    fn server_version(&mut self) -> Result<String, String> {
-        self.version
-            .clone()
-            .ok_or_else(|| "the server reported no version at initialize".to_string())
     }
 }
 

@@ -18,7 +18,6 @@ pub struct CallResult {
 
 pub trait McpTransport {
     fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String>;
-    fn server_version(&mut self) -> Result<String, String>;
 }
 
 impl CallResult {
@@ -76,7 +75,6 @@ impl CallResult {
 /// Replays a fixed script. Used by the unit tests and by `--self-check`.
 pub struct ScriptedTransport {
     queue: std::collections::VecDeque<(String, Result<CallResult, String>)>,
-    version: String,
 }
 
 impl ScriptedTransport {
@@ -86,23 +84,9 @@ impl ScriptedTransport {
                 .into_iter()
                 .map(|(t, r)| (t.to_string(), r))
                 .collect(),
-            version: DEFAULT_SCRIPTED_VERSION.into(),
         }
     }
-
-    /// Report `version` from [`McpTransport::server_version`] instead of the default, so a
-    /// test that cares about the version says which one it means rather than restating
-    /// this module's placeholder.
-    #[must_use]
-    pub fn with_version(mut self, version: &str) -> Self {
-        self.version = version.to_string();
-        self
-    }
 }
-
-/// What [`ScriptedTransport`] reports as the server version unless
-/// [`ScriptedTransport::with_version`] says otherwise.
-pub const DEFAULT_SCRIPTED_VERSION: &str = "0.0.0-scripted";
 
 impl McpTransport for ScriptedTransport {
     fn call(&mut self, tool: &str, _args: Value) -> Result<CallResult, String> {
@@ -111,10 +95,6 @@ impl McpTransport for ScriptedTransport {
             Some((expected, r)) if expected == tool => r,
             Some((expected, _)) => Err(format!("expected {expected}, got {tool}")),
         }
-    }
-
-    fn server_version(&mut self) -> Result<String, String> {
-        Ok(self.version.clone())
     }
 }
 

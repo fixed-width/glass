@@ -48,14 +48,12 @@ Then the real thing, which does need a target app installed:
 glass-mcp smoke --backend x11
 ```
 
-Three flags matter while you're working; [CLI](../reference/cli.md#smoke) lists them all.
+Two flags matter while you're working; [CLI](../reference/cli.md#smoke) lists them all.
 
 - `--app <name>` — drive a specific candidate instead of the first one probing finds. It selects
   among the candidates above; it does not make an app appear. A real run naming one you don't have
   fails at check 2; add `--dry-run` and the plan tells you up front instead.
 - `--report <path>` — also write the run as JSON, which is what to attach when filing an issue.
-- `--expect-version <tag>` — require the binary to report exactly this release tag, catching a stale
-  or mismatched artifact before anything else runs. A `--dry-run` compares nothing.
 
 ## Read the result
 

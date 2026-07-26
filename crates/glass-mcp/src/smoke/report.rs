@@ -117,13 +117,23 @@ impl std::fmt::Display for TargetApp {
 #[derive(Debug, Clone, Serialize)]
 pub struct SmokeReport {
     pub backend: String,
-    pub version: String,
+    /// The version the server reported at `initialize`, or `None` when it reported none.
+    /// Nothing asserts on it — it is here so a report attached to an issue says which build
+    /// produced it — so a server that omits it is recorded as `null` rather than ending the
+    /// run. `null` is a discriminant a JSON consumer reads directly, unlike a placeholder
+    /// string it would have to recognise.
+    pub version: Option<String>,
     pub mode: RunMode,
     pub app: TargetApp,
     pub checks: Vec<CheckOutcome>,
 }
 
 impl SmokeReport {
+    /// How the header names the server's version.
+    fn version_label(&self) -> &str {
+        self.version.as_deref().unwrap_or("(version not reported)")
+    }
+
     /// Only a hard `Fail` fails a run. A known limitation that failed (`XFail`) and one
     /// that started passing (`XPass`) are both reportable, neither is a failure.
     pub fn failed(&self) -> bool {
@@ -160,7 +170,7 @@ impl SmokeReport {
             out,
             "# glass smoke — {} — {verdict}\n\nglass-mcp {} · app: `{}`\n",
             cell(&self.backend),
-            cell(&self.version),
+            cell(self.version_label()),
             cell(&self.app.to_string())
         );
         let _ = writeln!(out, "| # | check | status | detail |");
@@ -213,7 +223,7 @@ mod tests {
     fn report(checks: Vec<CheckOutcome>) -> SmokeReport {
         SmokeReport {
             backend: "x11".into(),
-            version: "1.1.0".into(),
+            version: Some("1.1.0".into()),
             mode: RunMode::Full,
             app: TargetApp::Selected("xterm".into()),
             checks,
@@ -223,8 +233,8 @@ mod tests {
     #[test]
     fn a_failed_check_fails_the_report() {
         let r = report(vec![
-            CheckOutcome::pass(1, "version", "1.1.0"),
-            CheckOutcome::fail(2, "start", "no geometry returned"),
+            CheckOutcome::pass(2, "start", "800x600"),
+            CheckOutcome::fail(3, "capabilities+doctor", "doctor FAIL: display"),
         ]);
         assert!(r.failed());
         assert_eq!(r.exit_code(), 1);
@@ -301,7 +311,7 @@ mod tests {
     /// used to head its report `PASS`, agreeing with exit 0 and nine uniform `skip` rows.
     #[test]
     fn a_dry_run_heading_says_it_exercised_nothing() {
-        let mut r = report(vec![CheckOutcome::skip(1, "version", "dry run")]);
+        let mut r = report(vec![CheckOutcome::skip(2, "start", "dry run")]);
         r.mode = RunMode::DryRun;
         let md = r.to_markdown();
         assert!(
@@ -333,7 +343,7 @@ mod tests {
     #[test]
     fn a_pipe_or_newline_in_a_header_value_cannot_break_the_report() {
         const HOSTILE: &str = "we\nird | value";
-        let row = || vec![CheckOutcome::pass(1, "version", "1.1.0")];
+        let row = || vec![CheckOutcome::pass(2, "start", "800x600")];
         // What the report looks like with nothing hostile in it. Deriving the expected line
         // count beats writing one down: it stays right as the header gains or loses lines.
         let clean = report(row()).to_markdown().lines().count();
@@ -341,7 +351,7 @@ mod tests {
         let mut with_app = report(row());
         with_app.app = TargetApp::Selected(HOSTILE.into());
         let mut with_version = report(row());
-        with_version.version = HOSTILE.into();
+        with_version.version = Some(HOSTILE.into());
         let mut with_backend = report(row());
         with_backend.backend = HOSTILE.into();
 
@@ -375,9 +385,9 @@ mod tests {
     fn markdown_names_the_app_and_every_check_and_flags_stale_limits() {
         let mut xpass = CheckOutcome::pass(9, "gesture", "multi-contact worked");
         xpass.status = CheckStatus::XPass;
-        let md = report(vec![CheckOutcome::pass(1, "version", "1.1.0"), xpass]).to_markdown();
+        let md = report(vec![CheckOutcome::pass(2, "start", "800x600"), xpass]).to_markdown();
         assert!(md.contains("xterm"), "selected app must appear: {md}");
-        assert!(md.contains("version"), "every check must appear: {md}");
+        assert!(md.contains("start"), "every check must appear: {md}");
         assert!(md.contains("gesture"), "every check must appear: {md}");
         assert!(
             md.to_lowercase().contains("stale limitation"),

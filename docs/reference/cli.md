@@ -78,8 +78,6 @@ covers running it and acting on a red result.
   name must be one of the backend's candidates; a name that is not is a usage error. A real run does
   not check the named binary for presence, so naming an app that is not installed fails at the
   `start` check; a `--dry-run` does check, and marks the plan unavailable.
-- `--expect-version <tag>` — version the binary must report (check 1); omit to skip that check. A
-  `--dry-run` compares nothing, and check 1's `detail` says so.
 - `--dry-run` — print the plan and exit without spawning a server, launching an app, or calling a
   tool. Every check is a `skip`, the heading reads `PASS (plan only)`, and the exit code is 0. With
   `--report`, the plan is written as JSON like any other run. Unlike a real run, this does not

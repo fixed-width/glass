@@ -19,7 +19,6 @@ server is given `GLASS_BACKEND` set to the backend under test, overriding any am
 
 | # | Name | What it asserts |
 |---|---|---|
-| 1 | `version` | The binary reports the version `--expect-version` named. `skip` when the flag is absent. |
 | 2 | `start` | `glass_start` launches the target app and returns window geometry. |
 | 3 | `capabilities+doctor` | `glass_capabilities` reports the backend under test as the active one, and `glass_doctor`'s `overall` verdict for that backend is not `fail`. An `overall` that is absent, or a value other than `ok`, `warn` or `fail`, also fails: there is no verdict to grade, which is not the same as "not `fail`". |
 | 4 | `screenshot` | `glass_screenshot` returns an image block and its dimensions. |
@@ -89,7 +88,7 @@ When any check is `xpass`, a `## Stale limitations` section follows the table, n
 | Field | Description |
 |---|---|
 | `backend` | The backend exercised. |
-| `version` | The version the server reported over MCP. Under `--dry-run` no server is spawned, so it is the version compiled into the binary you invoked. |
+| `version` | The version the server reported over MCP, or `null` if it reported none. Under `--dry-run` no server is spawned, so it is the version compiled into the binary you invoked. |
 | `mode` | `"full"` for a run that drove the checks, `"dry_run"` for a plan. |
 | `app.state` | `"selected"` when the run had a target app, `"unavailable"` when it had none. Only a `--dry-run` report can be `"unavailable"`. |
 | `app.value` | The candidate's label when `selected`, so reports from different hosts are comparable; when `unavailable`, the same note the `start` row carries. |

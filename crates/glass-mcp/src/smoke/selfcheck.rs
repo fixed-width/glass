@@ -214,7 +214,7 @@ mod tests {
     fn an_empty_expect_detail_is_rejected_rather_than_matching_anything() {
         let s = Scenario {
             name: "unnamed assertion",
-            outcome: CheckOutcome::fail(1, "version", "any failure at all"),
+            outcome: CheckOutcome::fail(2, "start", "any failure at all"),
             expect_detail: "",
         };
         assert!(

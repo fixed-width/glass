@@ -34,8 +34,8 @@ fn read_report(path: &std::path::Path) -> serde_json::Value {
 /// this a check that degraded to a skip — `interaction` when the app stops exposing an
 /// editable element, say — would keep CI green forever while proving nothing.
 ///
-/// `version` is skipped without `--expect-version`, and `capabilities+doctor` grades the host
-/// environment rather than the fixture, so neither is pinned to `pass` here.
+/// `capabilities+doctor` grades the host environment rather than the fixture, so it is not
+/// pinned to `pass` here.
 const MUST_PASS: [&str; 7] = [
     "start",
     "screenshot",

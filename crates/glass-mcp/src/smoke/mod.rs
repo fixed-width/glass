@@ -14,16 +14,12 @@ use std::ffi::OsStr;
 
 use profile::{Candidate, Profile, X11_CANDIDATES};
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
-use transport::McpTransport;
 
 pub struct SmokeOptions {
     /// Backend to exercise (see [`candidates_for`] for the supported set).
     pub backend: String,
     /// Force a specific candidate app instead of probing for the first one present on the host.
     pub app: Option<String>,
-    /// Version the binary must report (the release tag). `None` skips check 1, recording why
-    /// rather than omitting it — see [`version_check`].
-    pub expect_version: Option<String>,
     /// Print the plan and exit without calling anything.
     pub dry_run: bool,
 }
@@ -53,8 +49,7 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
 /// discipline, is asserted inside every other check rather than standing alone.
 /// Used by `--dry-run` and to keep the report shape stable whether or not a
 /// check ran.
-const CHECK_NAMES: [(u8, &str); 8] = [
-    (1, "version"),
+const CHECK_NAMES: [(u8, &str); 7] = [
     (2, "start"),
     (3, "capabilities+doctor"),
     (4, "screenshot"),
@@ -86,35 +81,19 @@ pub(crate) fn all_check_names() -> Vec<&'static str> {
     planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
-/// Check 1. Runs [`checks::check_version`] when `--expect-version` was given; otherwise records
-/// a `Skip` rather than omitting the check, so a real run's rows match `--dry-run`'s preview
-/// (which always previews all nine, `version` included) instead of the row count depending on
-/// whether the flag was passed.
-fn version_check(t: &mut dyn McpTransport, expect_version: Option<&str>) -> CheckOutcome {
-    match expect_version {
-        Some(expected) => checks::check_version(t, expected),
-        None => CheckOutcome::skip(1, "version", "no --expect-version given"),
-    }
-}
-
 /// The step whose `detail` carries an unavailable app: `start` is the check that would hit
 /// the gap, and the one the how-to already sends a reader to when a run goes wrong.
 const START_STEP: u8 = 2;
 
 /// `--dry-run`'s rows: every check a real run would produce, each a `skip` saying what it
-/// would have done. Two of them say more than "dry run", because two of the run's inputs are
-/// only visible here — the missing target app, and an `--expect-version` that a dry run does
-/// not compare against anything.
-fn plan_checks(app: &TargetApp, expect_version: Option<&str>) -> Vec<CheckOutcome> {
+/// would have done. One of them says more than "dry run", because one of the run's inputs is
+/// only visible here: the missing target app.
+fn plan_checks(app: &TargetApp) -> Vec<CheckOutcome> {
     planned_rows()
         .into_iter()
         .map(|(step, name)| {
             let detail = match (step, app.note()) {
                 (START_STEP, Some(note)) => note.to_string(),
-                (1, _) => match expect_version {
-                    Some(tag) => format!("dry run — would compare the server's version to {tag:?}"),
-                    None => "dry run — no --expect-version given".to_string(),
-                },
                 _ => "dry run".to_string(),
             };
             CheckOutcome::skip(step, name, detail)
@@ -169,9 +148,11 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
         };
         return Ok(SmokeReport {
             backend: backend.to_string(),
-            version: crate::VERSION.to_string(),
+            // No server is spawned, so nothing reports a version over MCP; this is the one
+            // compiled into the binary that would have been spawned.
+            version: Some(crate::VERSION.to_string()),
             mode: RunMode::DryRun,
-            checks: plan_checks(&app, opts.expect_version.as_deref()),
+            checks: plan_checks(&app),
             app,
         });
     }
@@ -195,9 +176,10 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     // re-reads the server's active backend and fails on a mismatch, so this plumbing breaking
     // is a visible failure rather than a silently misdirected verdict.
     let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", backend)])?;
-    let version = t.server_version()?;
+    // Reported, not asserted on: a server that answers `initialize` without a version is
+    // recorded as such rather than aborting a run whose checks are all still runnable.
+    let version = t.server_version();
     let mut out = vec![
-        version_check(&mut t, opts.expect_version.as_deref()),
         checks::check_start(&mut t, &p),
         checks::check_health(&mut t, &p),
         checks::check_screenshot(&mut t),
@@ -222,14 +204,11 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::report::CheckStatus;
-    use crate::smoke::transport::ScriptedTransport;
 
     /// Every row a report must carry, in order, written out rather than derived from
     /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
     /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d X11 gate.
-    const CANONICAL_ROWS: [(u8, &str); 9] = [
-        (1, "version"),
+    const CANONICAL_ROWS: [(u8, &str); 8] = [
         (2, "start"),
         (3, "capabilities+doctor"),
         (4, "screenshot"),
@@ -252,7 +231,6 @@ mod tests {
             SmokeOptions {
                 backend: "x11".into(),
                 app: app.map(str::to_string),
-                expect_version: None,
                 dry_run: true,
             },
             path,
@@ -270,30 +248,6 @@ mod tests {
             .find(|c| c.name == name)
             .unwrap_or_else(|| panic!("no {name:?} row in {:?}", rows(r)))
             .detail
-    }
-
-    #[test]
-    fn expect_version_none_is_a_skip_not_an_omission() {
-        // A real run's row count must match `--dry-run`'s preview regardless of whether
-        // `--expect-version` was given, so a missing flag records why check 1 didn't run
-        // rather than dropping it from the report.
-        let mut t = ScriptedTransport::new(vec![]);
-        let out = version_check(&mut t, None);
-        assert_eq!(out.step, 1);
-        assert_eq!(out.name, "version");
-        assert_eq!(out.status, CheckStatus::Skip);
-    }
-
-    #[test]
-    fn expect_version_some_reaches_check_version_pass_and_fail() {
-        let mut t = ScriptedTransport::new(vec![]).with_version("1.1.0");
-        let pass = version_check(&mut t, Some("1.1.0"));
-        assert_eq!(pass.status, CheckStatus::Pass);
-
-        let mut t = ScriptedTransport::new(vec![]).with_version("1.0.0");
-        let fail = version_check(&mut t, Some("1.1.0"));
-        assert_eq!(fail.status, CheckStatus::Fail);
-        assert!(fail.detail.contains("1.1.0"), "got: {}", fail.detail);
     }
 
     /// The invariant `run_with` is built on: the preview and a real run carry the same rows.
@@ -391,35 +345,12 @@ mod tests {
         );
     }
 
-    /// A dry run compares no versions, so a plan that took `--expect-version` and said only
-    /// "dry run" hid an ignored argument — the thing `--self-check` rejects flags to avoid.
-    #[test]
-    fn a_plan_says_the_expected_version_was_not_compared() {
-        let (_dir, path) = host_with(&["zenity"]);
-        let r = run_with(
-            SmokeOptions {
-                backend: "x11".into(),
-                app: None,
-                expect_version: Some("1.2.3".into()),
-                dry_run: true,
-            },
-            Some(&path),
-        )
-        .expect("a plan");
-        let version = detail_of(&r, "version");
-        assert!(
-            version.contains("would compare") && version.contains("1.2.3"),
-            "got: {version}"
-        );
-    }
-
     #[test]
     fn an_unknown_backend_is_rejected_by_name() {
         let err = run_with(
             SmokeOptions {
                 backend: "beos".into(),
                 app: None,
-                expect_version: None,
                 dry_run: true,
             },
             None,
@@ -438,7 +369,6 @@ mod tests {
             SmokeOptions {
                 backend: "X11".into(),
                 app: None,
-                expect_version: None,
                 dry_run: true,
             },
             Some(&path),
@@ -456,7 +386,6 @@ mod tests {
             SmokeOptions {
                 backend: "wayland".into(),
                 app: None,
-                expect_version: None,
                 dry_run: true,
             },
             None,
@@ -478,7 +407,6 @@ mod tests {
             SmokeOptions {
                 backend: "x11".into(),
                 app: Some("emacs".into()),
-                expect_version: None,
                 dry_run: true,
             },
             Some(&path),

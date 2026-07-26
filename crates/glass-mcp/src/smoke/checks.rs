@@ -27,22 +27,6 @@ fn excerpt(s: &str) -> String {
     format!("{}…", s.chars().take(MAX).collect::<String>())
 }
 
-pub fn check_version(t: &mut dyn McpTransport, expected: &str) -> CheckOutcome {
-    outcome(
-        1,
-        "version",
-        t.server_version().and_then(|got| {
-            if got == expected {
-                Ok(got)
-            } else {
-                Err(format!(
-                    "binary reports {got}, expected {expected} — wrong or stale artifact"
-                ))
-            }
-        }),
-    )
-}
-
 pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     let mut run = vec![Value::String(p.app.bin.to_string())];
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
@@ -414,21 +398,6 @@ mod tests {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
         }
-    }
-
-    #[test]
-    fn version_must_match_the_expected_tag() {
-        let mut t = ScriptedTransport::new(vec![]).with_version("1.1.0");
-        assert_eq!(check_version(&mut t, "1.1.0").status, CheckStatus::Pass);
-
-        let mut t = ScriptedTransport::new(vec![]).with_version("1.0.0");
-        let out = check_version(&mut t, "1.1.0");
-        assert_eq!(out.status, CheckStatus::Fail);
-        assert!(
-            out.detail.contains("1.1.0") && out.detail.contains("1.0.0"),
-            "must name both versions: {}",
-            out.detail
-        );
     }
 
     #[test]
