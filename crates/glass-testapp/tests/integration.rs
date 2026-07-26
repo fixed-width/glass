@@ -1568,6 +1568,46 @@ fn stop_app_leaves_a_window_it_did_not_launch_alone() {
     );
 }
 
+/// A display that is running but not answering must not hold teardown open. Sending the close
+/// request is a series of blocking X round trips and x11rb has no per-request timeout, so without
+/// a bound `stop_app` never returns — and glass-mcp enforces its teardown budget by abandoning
+/// the thread, which would leave the app running after glass itself had exited.
+///
+/// `SIGSTOP` on the X server is the only way to produce that state from a test: the socket stays
+/// open and accepts writes, and no reply ever comes.
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn stop_app_does_not_hang_when_the_x_server_stops_answering() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    let pid = wait_for_app_pid(&mut p);
+    let server = xvfb.pid();
+    let signal = |sig: &str| {
+        std::process::Command::new("kill")
+            .args([sig, &server.to_string()])
+            .status()
+            .expect("signal the X server");
+    };
+    signal("-STOP");
+    let t = std::time::Instant::now();
+    let stopped = p.stop_app();
+    let elapsed = t.elapsed();
+    // Let the server run again so its own teardown (and this Xvfb's Drop) behaves normally.
+    signal("-CONT");
+    stopped.expect("stop_app must still report success");
+    assert!(
+        elapsed < glass_core::TEARDOWN_BUDGET,
+        "stop_app must give up on an unresponsive display inside the teardown budget ({:?}); \
+         this took {elapsed:?}",
+        glass_core::TEARDOWN_BUDGET
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the app must be signalled even when it could not be asked (pid {pid} survived)"
+    );
+}
+
 /// An app that never opted into `WM_DELETE_WINDOW` has no handler for the message and will not
 /// act on it, so teardown must fall back to signalling it rather than waiting out the grace.
 #[test]

@@ -109,6 +109,10 @@ internal refactors, CI, or test-only changes.
   attempting the spawn. Your own app is unaffected: only Apple-signed system code takes the new
   path, and only when `sandbox` is `off` (a contained launch cannot be handed off at all, so it
   still tries — Terminal and Disk Utility, for instance, do run contained).
+- An X11 display that stops answering no longer hangs `glass_stop`. Sending the close request is
+  a series of blocking X round trips, so it now runs under a deadline; past it glass reports the
+  display as unresponsive and goes straight to signalling the app, instead of holding teardown
+  open until the process is killed.
 - A Wayland session whose compositor stops responding no longer hangs glass. Every sway IPC
   request is bounded, and a connection that has timed out is not reused — a late reply arriving
   on it could otherwise be read as the *next* request's, reporting a close request as delivered
