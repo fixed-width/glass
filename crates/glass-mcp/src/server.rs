@@ -593,8 +593,9 @@ impl ServerHandler for GlassServer {
 /// `docs/reference/tools.md` to this; [`crate::tools::testutil::assert_envelope`] binds a
 /// test's expected envelope `tool` string to it too, so a co-typo shared between a tool impl
 /// and its test (e.g. both saying `"glass_stop"` when the registered name is `"glass_stopp"`)
-/// fails loudly instead of passing green.
-#[cfg(test)]
+/// fails loudly instead of passing green. Also used at runtime (not just in tests) by
+/// [`crate::smoke::envelope::names_a_remedy`], which needs to recognize a message that
+/// points at a real tool by name.
 pub(crate) fn registered_tools() -> std::collections::BTreeSet<String> {
     GlassServer::tool_router()
         .list_all()

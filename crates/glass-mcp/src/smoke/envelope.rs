@@ -51,14 +51,23 @@ pub fn untrusted_sibling(r: &CallResult) -> Result<&str, String> {
 /// a value to pass, an action to take). A message that states only a cause
 /// ("no clickable on-screen geometry") fails, which is the regression this guards.
 ///
-/// Two extra signals beyond generic English pointer verbs, added after the first real
-/// run against `glass-core`'s actual `GlassError` text (this file's earlier test cases
-/// were all hand-written, never checked against it): `"re-snapshot"` is the codebase-wide
-/// idiom for "take a fresh accessibility snapshot before retrying" (used identically by
-/// `AxElementNotFound` and `AxElementChanged`); and naming one of glass's own `glass_`-
-/// prefixed tools is inherently a pointer, however the surrounding sentence is phrased
-/// (`AxElementNotEditable` names three: "focus it with glass_click, then enter text with
-/// glass_type / glass_key instead" — no generic pointer verb, but plainly actionable).
+/// Beyond generic English pointer verbs, `"re-snapshot"` is also recognized: it's the
+/// codebase-wide idiom for "take a fresh accessibility snapshot before retrying" (used
+/// identically by `GlassError::AxElementNotFound` and `AxElementChanged`) — added after the
+/// first real run against `glass-core`'s actual error text (this file's earlier test cases
+/// were all hand-written, never checked against it).
+///
+/// A message that names one of glass's own registered tools is also inherently a pointer,
+/// however the sentence is phrased (`AxElementNotEditable` names three: "focus it with
+/// glass_click, then enter text with glass_type / glass_key instead" — no generic pointer
+/// verb, but plainly actionable). That check matches against [`crate::server::registered_tools`]
+/// — the live `#[tool]` registry — rather than a bare `"glass_"` substring, deliberately:
+/// app-controlled or backend-controlled text can contain that prefix in a path or filename
+/// with no tool in sight (e.g. the Android reader forwarding raw `uiautomator` stdout that
+/// happens to mention its own dump path, `/sdcard/glass_dump.xml`, or the Windows clipboard
+/// shim's `glass_clip_hook.dll`) — see the regression tests below. Matching the exact
+/// registered names avoids that false positive and stays correct as tools are added or
+/// renamed, so resist simplifying this back to `contains("glass_")`.
 pub fn names_a_remedy(msg: &str) -> bool {
     const POINTERS: [&str; 9] = [
         "call ",
@@ -72,7 +81,12 @@ pub fn names_a_remedy(msg: &str) -> bool {
         "re-snapshot",
     ];
     let lower = msg.to_lowercase();
-    POINTERS.iter().any(|p| lower.contains(p)) || lower.contains("glass_")
+    let tools = crate::server::registered_tools();
+    POINTERS
+        .iter()
+        .copied()
+        .chain(tools.iter().map(String::as_str))
+        .any(|pointer| lower.contains(pointer))
 }
 
 #[cfg(test)]
@@ -173,27 +187,55 @@ mod tests {
     }
 
     /// Regression for the x11 end-to-end run (`tests/smoke_x11.rs`): `glass_click_element`
-    /// on a stale id returned `GlassError::AxElementNotFound`'s real message, and the
-    /// pre-existing `POINTERS` list didn't recognize its "re-snapshot" remedy clause —
-    /// a false negative caught only once the harness ran against real glass, not a
-    /// scripted transport. Constructed from the live enum (not a copied string) so this
-    /// tracks `glass-core`'s actual wording rather than a frozen snapshot of it.
+    /// on a stale id returned this exact message, and the pre-existing `POINTERS` list
+    /// didn't recognize its "re-snapshot" remedy clause — a false negative caught only
+    /// once the harness ran against real glass, not a scripted transport. Constructed from
+    /// the live enum (not a copied string) so this tracks `glass-core`'s actual wording
+    /// rather than a frozen snapshot of it.
     #[test]
-    fn recognizes_glass_cores_actual_remedy_wording() {
-        let not_found = glass_core::GlassError::AxElementNotFound(999_999).to_string();
+    fn recognizes_ax_element_not_found_re_snapshot_wording() {
+        let msg = glass_core::GlassError::AxElementNotFound(999_999).to_string();
+        assert!(names_a_remedy(&msg), "should recognize re-snapshot: {msg}");
+    }
+
+    /// Same "re-snapshot" idiom, the sibling variant for a stale (rather than missing) id.
+    #[test]
+    fn recognizes_ax_element_changed_re_snapshot_wording() {
+        let msg = glass_core::GlassError::AxElementChanged(2).to_string();
+        assert!(names_a_remedy(&msg), "should recognize re-snapshot: {msg}");
+    }
+
+    /// This variant names three tools ("focus it with glass_click, then enter text with
+    /// glass_type / glass_key instead") without using any generic pointer verb, so it only
+    /// passes via the registered-tool-name signal, not `POINTERS`.
+    #[test]
+    fn recognizes_ax_element_not_editable_named_tools() {
+        let msg = glass_core::GlassError::AxElementNotEditable(0).to_string();
         assert!(
-            names_a_remedy(&not_found),
-            "should recognize re-snapshot: {not_found}"
+            names_a_remedy(&msg),
+            "should recognize the named glass_ tools: {msg}"
         );
-        let changed = glass_core::GlassError::AxElementChanged(2).to_string();
-        assert!(
-            names_a_remedy(&changed),
-            "should recognize re-snapshot: {changed}"
-        );
-        let not_editable = glass_core::GlassError::AxElementNotEditable(0).to_string();
-        assert!(
-            names_a_remedy(&not_editable),
-            "should recognize the named glass_ tools: {not_editable}"
-        );
+    }
+
+    /// Regression for the false positive a bare `contains("glass_")` check would produce:
+    /// the Android a11y reader forwards raw `uiautomator` stdout verbatim into
+    /// `GlassError::AccessibilityUnavailable` (`glass-android/src/axmap.rs`'s
+    /// `check_dump_status`), and the dump file it polls is `/sdcard/glass_dump.xml`
+    /// (`glass-android/src/a11y.rs`'s `DUMP_PATH`) — so a real device failure can read
+    /// "uiautomator dump failed: /sdcard/glass_dump.xml: Permission denied", stating only a
+    /// cause, naming no tool at all.
+    #[test]
+    fn android_dump_path_is_not_mistaken_for_a_tool_name() {
+        let msg = "uiautomator dump failed: /sdcard/glass_dump.xml: Permission denied";
+        assert!(!names_a_remedy(msg), "should not be actionable: {msg}");
+    }
+
+    /// Same false-positive shape on Windows: the injected clipboard-shim DLL is
+    /// `glass_clip_hook.dll` (`glass-windows/src/containment/config.rs`'s `hook_dll_path`),
+    /// so a load failure naming that file, and nothing else, must still read as cause-only.
+    #[test]
+    fn windows_clip_hook_dll_path_is_not_mistaken_for_a_tool_name() {
+        let msg = "failed to load glass_clip_hook.dll: The specified module could not be found.";
+        assert!(!names_a_remedy(msg), "should not be actionable: {msg}");
     }
 }
