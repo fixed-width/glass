@@ -100,6 +100,18 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- Linux (`backend: "wayland"`): glass now recovers a window an X11 app opened that the compositor
+  never surfaced. Under load, a window the app maps can reach the compositor's Xwayland server and
+  never reach the compositor itself — sway has no view for it, so `glass_list_windows` leaves it
+  out, and when it is the app's only window `glass_start` waits for a window that never arrives
+  and times out on a healthy app. The window stays lost however long you wait, and redrawing does
+  not bring it back (measured on glass's own two-window X11 fixture: 6 of 15 launches on a loaded
+  machine). glass now cross-checks the X server's mapped toplevels against the compositor's window
+  list and re-maps the ones the compositor never saw, once per window and only after it has been
+  missing on two checks in a row, saying on stderr when it did. A launch that still finds no
+  window now says the recovery ran and did not take, instead of reporting a bare timeout. An app
+  with no X11 side (a native Wayland app) has nothing to recover and nothing is ever re-mapped
+  for it.
 - Linux (`backend: "x11"`): `glass_stop` no longer signals an app that should have been asked to
   close. The close request went out on a short-lived X connection that was closed immediately
   afterwards, and a request the server had not processed yet was discarded with it — so the app

@@ -65,9 +65,10 @@ struct ActiveSession {
     output_size: (u32, u32), // compositor output extent (for pointer normalization)
     ids: HashMap<String, WindowId>, // foreign-toplevel identifier -> stable WindowId
     next_id: u64,
-    active: Option<String>,      // active window's foreign-toplevel identifier
-    active_rect: WindowGeometry, // active window's output rect (capture/input origin)
-    geometry: WindowGeometry,    // active window geometry (session contract)
+    recovery: crate::xwayland::Recovery, // re-maps toplevels the compositor lost (Xwayland apps)
+    active: Option<String>,              // active window's foreign-toplevel identifier
+    active_rect: WindowGeometry,         // active window's output rect (capture/input origin)
+    geometry: WindowGeometry,            // active window geometry (session contract)
     time: u32,
 }
 
@@ -133,19 +134,34 @@ impl WaylandPlatform {
     }
 }
 
+/// The X11 window id of each window sway currently reports — what a lost-window cross-check
+/// compares the X server's mapped toplevels against. Native Wayland views have no X11 id and are
+/// simply absent.
+fn x11_ids(wins: &[SwayWindow]) -> Vec<u32> {
+    wins.iter().filter_map(|w| w.x11_window).collect()
+}
+
+/// How long a launch waits before looking on the X side for a window the compositor lost: half
+/// the launch's own budget, so the check and the re-map still fit in the other half, and never
+/// less than one [`crate::xwayland::CHECK_INTERVAL`] (a caller's very short timeout would
+/// otherwise leave no room to look at all).
+fn start_recovery_after(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms / 2).max(crate::xwayland::CHECK_INTERVAL)
+}
+
 /// The launched app's own processes: everything in the session's process tree except the
 /// compositor itself and the Xwayland it starts. Used as the liveness signal during teardown.
+///
+/// The Xwayland filter is a guard, not a routine exclusion: sway reparents Xwayland to init, so
+/// it is normally outside this tree already (which is why finding it needs the scan in
+/// `crate::xwayland::session_display` rather than a walk from here). Keeping the filter costs one
+/// `/proc/<pid>/comm` read per process and means teardown cannot start waiting on the
+/// compositor's own plumbing if that reparenting ever stops happening.
 fn app_pids(tree: &[u32], sway_pid: u32) -> Vec<u32> {
     tree.iter()
         .copied()
-        .filter(|&pid| pid != sway_pid && !is_xwayland(pid))
+        .filter(|&pid| pid != sway_pid && !crate::xwayland::is_xwayland(pid))
         .collect()
-}
-
-/// Whether `pid` is the compositor's Xwayland, read from `/proc/<pid>/comm`. Xwayland exits with
-/// the compositor and is glass's own plumbing, so waiting on it would mean waiting for sway.
-fn is_xwayland(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "Xwayland")
 }
 
 /// Ask every window in the session to close.
@@ -655,14 +671,33 @@ fn bring_up_session(
     // capture/input have an active target before the first list_windows.
     let mut ids: HashMap<String, WindowId> = HashMap::new();
     let mut next_id = 0u64;
+    let mut recovery = crate::xwayland::Recovery::new(runtime_dir.path());
     let (active, active_rect) = {
         let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+        // An X11 app's only window can reach Xwayland's X server and never reach the compositor
+        // (see `crate::xwayland`), and no amount of further waiting brings it — so once the app
+        // has had a fair chance to show a window, stop only waiting and go look on the X side.
+        //
+        // Half the launch budget, because here the two states are hardest to tell apart: a window
+        // mapped in X and not yet in the compositor's tree is the normal state mid-handshake, and
+        // a slow toolkit under load can sit there for a while. Waiting out half the budget makes
+        // an arriving window very unlikely to be mistaken for a lost one, and still leaves the
+        // other half to notice, re-map, and see the window appear.
+        let start_grace = Instant::now() + start_recovery_after(spec.timeout_ms);
         loop {
             let _ = queue.roundtrip(&mut state); // keep the wayland queue serviced
-            let wins = ipc.windows().unwrap_or_default();
+            // Distinguish "sway says no windows" from "sway did not answer": an unanswered
+            // request is not evidence the app has no windows, and feeding that emptiness to the
+            // cross-check below would make every window the app really has look lost.
+            let listed = ipc.windows();
+            let wins = listed.as_deref().unwrap_or_default();
             if let Some(w) = wins.iter().find(|w| w.focused).or_else(|| wins.first()) {
                 mint_id(&mut ids, &mut next_id, &w.identifier);
                 break (Some(w.identifier.clone()), rect_to_geom(&w.rect));
+            }
+            let now = Instant::now();
+            if now >= start_grace && listed.is_ok() {
+                recovery.recover_if_due(now, &x11_ids(wins));
             }
             if let Ok(Some(status)) = child.try_wait() {
                 // Reap the whole group (see the socket-wait loop above): an
@@ -675,11 +710,26 @@ fn bring_up_session(
             }
             if Instant::now() >= deadline {
                 glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
+                // Say what glass saw. A launch that gives up after re-mapping a window the app
+                // really had is a different problem from an app that never opened one, and a
+                // bare timeout would send the reader looking at the app.
+                let unrecovered = recovery.unrecovered();
+                if unrecovered > 0 {
+                    return Err(GlassError::Backend(format!(
+                        "the app mapped {unrecovered} X11 window(s) the compositor never \
+                         surfaced; glass re-mapped them and they still did not appear within \
+                         {}ms. The session's Xwayland may be wedged — retry the launch.",
+                        spec.timeout_ms
+                    )));
+                }
                 return Err(GlassError::Timeout(spec.timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(40));
         }
     };
+    // The caller's first enumeration must cross-check rather than fall inside the interval this
+    // discovery loop already spent.
+    recovery.rearm();
     let geometry = active_rect.clone();
     let session = ActiveSession {
         child,
@@ -696,6 +746,7 @@ fn bring_up_session(
         output_size,
         ids,
         next_id,
+        recovery,
         active,
         active_rect,
         geometry: geometry.clone(),
@@ -1367,7 +1418,18 @@ impl Platform for WaylandPlatform {
             .queue
             .roundtrip(&mut session.state)
             .map_err(|e| GlassError::Backend(format!("roundtrip: {e}")))?;
-        let wins: Vec<SwayWindow> = session.ipc.windows()?;
+        let mut wins: Vec<SwayWindow> = session.ipc.windows()?;
+        // A window the app mapped can be missing here through no fault of the app (see
+        // `crate::xwayland`). Enumerating is where that shows up, so it is where glass repairs
+        // it — otherwise the caller is told the app has fewer windows than it does.
+        if session
+            .recovery
+            .recover_if_due(Instant::now(), &x11_ids(&wins))
+            > 0
+        {
+            std::thread::sleep(crate::xwayland::REMAP_SETTLE);
+            wins = session.ipc.windows()?;
+        }
         let mut out = Vec::with_capacity(wins.len());
         for w in &wins {
             let id = mint_id(&mut session.ids, &mut session.next_id, &w.identifier);
@@ -1434,7 +1496,28 @@ impl Platform for WaylandPlatform {
 
 #[cfg(test)]
 mod tests {
-    use super::{nudge_x, parse_sway_version};
+    use super::{nudge_x, parse_sway_version, start_recovery_after};
+
+    /// A launch spends half its budget waiting for the compositor before suspecting a window was
+    /// lost, so a slow app that is merely still starting is not interfered with.
+    #[test]
+    fn a_launch_waits_out_half_its_budget_before_looking_for_a_lost_window() {
+        assert_eq!(
+            start_recovery_after(10_000),
+            std::time::Duration::from_millis(5_000)
+        );
+    }
+
+    /// A caller's very short timeout would leave no room to look at all; one check interval is
+    /// the floor, so recovery still gets one chance.
+    #[test]
+    fn a_short_launch_budget_still_leaves_room_for_one_check() {
+        assert_eq!(
+            start_recovery_after(200),
+            crate::xwayland::CHECK_INTERVAL,
+            "the grace must never fall below one check interval"
+        );
+    }
 
     #[test]
     fn parse_sway_version_handles_real_and_garbage() {

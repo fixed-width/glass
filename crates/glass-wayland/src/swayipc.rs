@@ -27,6 +27,10 @@ pub struct Node {
     pub rect: Rect,
     #[serde(default)]
     pub foreign_toplevel_identifier: Option<String>,
+    /// The X11 window id, for a view sway manages through Xwayland (absent for native
+    /// Wayland views). sway names this field `window`, as i3 does.
+    #[serde(default, rename = "window")]
+    pub x11_window: Option<u32>,
     #[serde(default)]
     pub window_properties: Option<WindowProperties>,
     #[serde(default)]
@@ -57,6 +61,8 @@ pub struct Window {
     pub rect: Rect,
     pub focused: bool,
     pub identifier: String,
+    /// X11 window id when the view came in through Xwayland; `None` for a native Wayland view.
+    pub x11_window: Option<u32>,
 }
 
 impl Node {
@@ -85,6 +91,7 @@ impl Node {
                 },
                 focused: self.focused,
                 identifier: id.clone(),
+                x11_window: self.x11_window,
             });
         }
         for c in self.nodes.iter().chain(self.floating_nodes.iter()) {
@@ -279,6 +286,33 @@ mod tests {
         );
         assert!(w.focused);
         assert_eq!(w.identifier, "abc123");
+    }
+
+    /// An Xwayland view carries the X11 window id sway manages it under. Recovering a toplevel
+    /// the compositor never surfaced needs that id to tell "sway already has this window" from
+    /// "this window is missing", so it must survive the flattening.
+    #[test]
+    fn keeps_the_x11_window_id_of_an_xwayland_view() {
+        let json = r#"{"id":1,"name":"root","rect":{"x":0,"y":0,"width":1,"height":1},
+          "nodes":[{"id":7,"name":"glass-testapp","window":4194304,"shell":"xwayland",
+            "rect":{"x":0,"y":0,"width":320,"height":240},
+            "foreign_toplevel_identifier":"abc123"}],
+          "floating_nodes":[]}"#;
+        let root: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(root.windows()[0].x11_window, Some(4_194_304));
+    }
+
+    /// A native Wayland view has no X11 window id; it must read as absent rather than as some
+    /// placeholder id that could collide with a real X window.
+    #[test]
+    fn native_wayland_view_has_no_x11_window_id() {
+        let json = r#"{"id":1,"name":"root","rect":{"x":0,"y":0,"width":1,"height":1},
+          "nodes":[{"id":7,"name":"app","app_id":"app","shell":"xdg_shell",
+            "rect":{"x":0,"y":0,"width":320,"height":240},
+            "foreign_toplevel_identifier":"abc123"}],
+          "floating_nodes":[]}"#;
+        let root: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(root.windows()[0].x11_window, None);
     }
 
     #[test]
