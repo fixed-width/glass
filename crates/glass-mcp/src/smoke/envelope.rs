@@ -9,6 +9,22 @@ const UNTRUSTED_MARKER: &str = "⟦untrusted:";
 
 /// Assert the frozen `{ok,tool,result}` envelope and return the inner `result`.
 pub fn check_envelope(tool: &str, r: &CallResult) -> Result<Value, String> {
+    // An error result is reported as what it is, before anything looks for an envelope.
+    // `CallResult::from_mcp` deliberately leaves `envelope: None` on `isError` — the message
+    // is not an envelope and must never be parsed as one — so without this arm every ordinary
+    // tool failure fell through to "no envelope in the first content block" and told the
+    // operator the frozen protocol surface had broken, while the server's actual explanation
+    // sat unread in `siblings`. Whatever the server said is what the caller needs to triage,
+    // so it is forwarded whole rather than excerpted.
+    if r.is_error {
+        let msg = r.siblings.join(" ");
+        return Err(if msg.trim().is_empty() {
+            // Silence would be worse than an odd message: the call really did fail.
+            format!("{tool} returned an error with no message")
+        } else {
+            format!("{tool} returned an error: {msg}")
+        });
+    }
     let env = r.envelope.as_ref().ok_or_else(|| {
         format!("{tool}: no `{{ok,tool,result}}` envelope in the first content block")
     })?;
@@ -132,8 +148,11 @@ mod tests {
         assert_eq!(result["width"], json!(800));
     }
 
+    /// A missing envelope on a *successful* result is a genuine freeze violation and must
+    /// keep failing with exactly this message. The `is_error` arm above sits in front of it,
+    /// so this pins that the arm did not swallow the case it was added beside.
     #[test]
-    fn a_missing_envelope_is_rejected() {
+    fn a_missing_envelope_on_a_successful_result_is_still_rejected() {
         let c = CallResult {
             is_error: false,
             envelope: None,
@@ -141,7 +160,49 @@ mod tests {
             images: 0,
         };
         let err = check_envelope("glass_start", &c).unwrap_err();
-        assert!(err.contains("envelope"), "got: {err}");
+        assert_eq!(
+            err,
+            "glass_start: no `{ok,tool,result}` envelope in the first content block"
+        );
+    }
+
+    /// The defect this arm exists for: an ordinary tool failure reported the frozen protocol
+    /// surface as broken — "no `{ok,tool,result}` envelope in the first content block" — while
+    /// the server's own explanation sat unread in `siblings`. Built from the live `GlassError`
+    /// rather than a literal, so it tracks glass-core's actual wording.
+    #[test]
+    fn a_tool_error_carries_the_servers_own_message() {
+        let msg =
+            glass_core::GlassError::AccessibilityUnavailable("no a11y bus".into()).to_string();
+        let c = CallResult {
+            is_error: true,
+            envelope: None,
+            siblings: vec![msg.clone()],
+            images: 0,
+        };
+        let err = check_envelope("glass_a11y_snapshot", &c).unwrap_err();
+        assert!(
+            err.contains(&msg),
+            "the server's explanation must reach the report: {err}"
+        );
+        assert!(
+            !err.contains("no `{ok,tool,result}` envelope"),
+            "a tool error must not be reported as a broken protocol surface: {err}"
+        );
+    }
+
+    /// An `isError` with nothing in it would otherwise render as a sentence that stops at a
+    /// colon. The call still failed, so it has to say something.
+    #[test]
+    fn a_tool_error_with_no_message_still_says_the_call_failed() {
+        let c = CallResult {
+            is_error: true,
+            envelope: None,
+            siblings: vec![],
+            images: 0,
+        };
+        let err = check_envelope("glass_logs", &c).unwrap_err();
+        assert_eq!(err, "glass_logs returned an error with no message");
     }
 
     #[test]

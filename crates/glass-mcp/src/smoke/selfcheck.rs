@@ -50,6 +50,7 @@ pub fn run_self_check() -> Result<String, String> {
         untrusted_text_in_result_scenario(),
         noop_interaction_scenario(),
         remedyless_error_scenario(),
+        dropped_error_message_scenario(),
     ];
 
     for s in &scenarios {
@@ -198,6 +199,32 @@ fn remedyless_error_scenario() -> Scenario {
         name: "remedy-less error message",
         outcome: checks::check_error_honesty(&mut t),
         expect_detail: "no remedy",
+    }
+}
+
+/// Scenario 5: an ordinary tool error, whose message the report must carry. `check_envelope`'s
+/// `is_error` arm is what must catch this; the substring is glass-core's own wording for the
+/// injected error, which no other failure path in `check_logs` produces. That is what makes the
+/// scenario meaningful: deleting the arm does not make it pass, it makes `check_logs` fall
+/// through to "no `{ok,tool,result}` envelope in the first content block" — still `Fail`, but
+/// no longer naming what the server said, so the fault reports as escaped.
+///
+/// Driven through `check_logs` deliberately: the four scenarios above exercise `screenshot`,
+/// `a11y snapshot`, `interaction` and `error honesty`, so this reaches a check none of them do.
+fn dropped_error_message_scenario() -> Scenario {
+    let mut t = ScriptedTransport::new(vec![(
+        "glass_logs",
+        Ok(CallResult {
+            is_error: true,
+            envelope: None,
+            siblings: vec![glass_core::GlassError::NoActiveSession.to_string()],
+            images: 0,
+        }),
+    )]);
+    Scenario {
+        name: "tool error message dropped",
+        outcome: checks::check_logs(&mut t),
+        expect_detail: "no active session",
     }
 }
 
