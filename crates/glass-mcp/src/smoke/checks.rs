@@ -18,7 +18,7 @@ fn outcome(step: u8, name: &str, r: Result<String, String>) -> CheckOutcome {
 }
 
 /// A bounded excerpt for a failure detail: enough to triage, never a whole captured log
-/// buffer pasted into one report cell.
+/// buffer pasted onto one report line.
 fn excerpt(s: &str) -> String {
     const MAX: usize = 120;
     if s.chars().count() <= MAX {
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(check_error_honesty(&mut t).status, CheckStatus::Pass);
     }
 
-    /// Reproduced live: check 5 failed, and this check then went green on `NoAxSnapshot`'s
+    /// Reproduced live: check 4 failed, and this check then went green on `NoAxSnapshot`'s
     /// remedy ("call glass_a11y_snapshot first") — an error about a missing snapshot, not
     /// about the stale id it set out to provoke. Green precisely in a run already broken.
     #[test]

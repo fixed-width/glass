@@ -362,7 +362,10 @@ mod tests {
                 .find(|l| l.contains("start"))
                 .expect("a row")
                 .to_string();
-            row.find("1 start").expect("the step number")
+            // Counted in characters, not bytes: the glyphs are multi-byte, so a byte offset
+            // would only agree with the visual column by coincidence.
+            let byte = row.find("1 start").expect("the step number");
+            row[..byte].chars().count()
         })
         .collect();
         assert_eq!(
@@ -441,17 +444,32 @@ mod tests {
     fn a_newline_in_a_detail_does_not_add_a_line_or_hide_a_later_check() {
         // The dangerous one: a detail that spills onto its own line reads as a row of its own
         // and pushes everything after it — the failing check, the summary — further away.
-        let text = report(vec![
-            CheckOutcome::fail(1, "start", "line one\nline two"),
-            CheckOutcome::fail(8, "stop", "the row that must not vanish"),
-        ])
-        .to_text();
+        let rows = |detail: &str| {
+            vec![
+                CheckOutcome::fail(1, "start", detail),
+                CheckOutcome::fail(8, "stop", "the row that must not vanish"),
+            ]
+        };
+        // Compared against a baseline whose detail carries the same text with no newline in
+        // it, the way the header's sibling test does. Counting lines that merely *look* like
+        // rows would not fail if the collapsing were removed: a spilled fragment starts at
+        // column 0, so an indent-prefix filter would not count it and the total would still
+        // come out right.
+        let clean = report(rows("line one line two")).to_text();
+        let text = report(rows("line one\nline two")).to_text();
+        assert_eq!(
+            text.lines().count(),
+            clean.lines().count(),
+            "the newline added a line to the report: {text}"
+        );
+        assert!(
+            text.contains("1 start: line one line two"),
+            "the newline must be collapsed in place: {text}"
+        );
         assert!(
             text.contains("the row that must not vanish"),
             "a later row must survive an earlier row's newline: {text}"
         );
-        let rows = text.lines().filter(|l| l.starts_with("  ")).count();
-        assert_eq!(rows, 2, "exactly one line per check: {text}");
     }
 
     /// The failure this pins: a plan-only run on a machine that cannot run the checks at all

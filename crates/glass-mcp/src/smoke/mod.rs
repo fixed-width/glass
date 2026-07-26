@@ -171,7 +171,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
     // takes no backend argument — its verdict grades whatever that resolution produced. So
     // hand it the backend under test rather than inheriting whatever the caller's shell has
-    // set, or check 3 would grade a backend this run is not exercising. `check_health`
+    // set, or check 2 would grade a backend this run is not exercising. `check_health`
     // re-reads the server's active backend and fails on a mismatch, so this plumbing breaking
     // is a visible failure rather than a silently misdirected verdict.
     let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", backend)])?;

@@ -88,8 +88,8 @@ of what each check asserts and what each status means.
    per-check remedy guidance than `smoke`'s one-line summary.
 3. If check 4 (`a11y snapshot`) failed, the accessibility bus is the usual cause — `doctor` reports
    whether it's reachable and how to start it. See [Before you run it](#before-you-run-it).
-4. If check 1 (`start`) or later failed, try `--app` with a different candidate you have installed,
-   to see whether the failure is specific to the app that got picked rather than to glass itself.
+4. If neither of those applies, try `--app` with a different candidate you have installed, to see
+   whether the failure is specific to the app that got picked rather than to glass itself.
    `glass-mcp smoke --dry-run --app <name>` confirms the one you chose is actually runnable before
    you spend a full run on it.
 5. Re-run with `--report <path>` and attach the JSON when

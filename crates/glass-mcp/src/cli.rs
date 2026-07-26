@@ -104,7 +104,7 @@ pub enum Command {
         /// Backend to exercise. Today: `x11`.
         #[arg(long, default_value = "x11")]
         backend: String,
-        /// Write the JSON report to PATH (markdown always goes to stdout).
+        /// Write the JSON report to PATH (the text report always goes to stdout).
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
         /// Force a target app instead of probing for the first available one.
