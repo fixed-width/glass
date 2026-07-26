@@ -69,9 +69,9 @@ the statuses, and the report's fields are described in
 [smoke checks and report](smoke.md); [how-to/exercise-a-build.md](../how-to/exercise-a-build.md)
 covers running it and acting on a red result.
 
-- `--backend <name>` — backend to exercise. This build supports only `x11`, which is the default. Also sets
-  `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so the session and
-  `glass_doctor`'s verdict always agree on which backend is under test.
+- `--backend <name>` — backend to exercise. The smoke runner drives only `x11`, which is the
+  default. Also sets `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so
+  the session and `glass_doctor`'s verdict always agree on which backend is under test.
 - `--report <path>` — also write the JSON report to `path` (the text report always goes to stdout).
 - `--app <name>` — force a specific candidate app instead of probing for the first one present. The
   name must be one of the backend's candidates; a name that is not is a usage error. A real run does

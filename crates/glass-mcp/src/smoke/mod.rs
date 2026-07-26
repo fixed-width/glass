@@ -39,7 +39,7 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
     match name {
         "x11" => Ok((name, &X11_CANDIDATES)),
         other => Err(format!(
-            "no smoke candidates for backend {other:?} yet — this build drives: x11. \
+            "no smoke candidates for backend {other:?} yet — the smoke runner drives: x11. \
              Pass --backend x11."
         )),
     }

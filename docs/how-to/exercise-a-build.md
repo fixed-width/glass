@@ -25,7 +25,7 @@ the one in your hand, not whichever `glass-mcp` is on `PATH`.
 `doctor` inspects the host; `smoke` drives an app on it, so a real run needs two things `doctor`
 does not:
 
-- **A target app.** On the X11 backend — the only one this build supports — it probes for the first of `xed`,
+- **A target app.** The smoke runner drives x11, where it probes for the first of `xed`,
   `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
 - **A running accessibility bus.** Checks 4 and 5 read and drive the accessibility tree, which on
   Linux means AT-SPI must be running (the `at-spi2-core` package on Debian/Ubuntu). Without it
