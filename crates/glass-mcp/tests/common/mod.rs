@@ -143,9 +143,11 @@ pub fn sway_probe(server: &str) -> SwayProbe {
             "wayland section had no \"sway >=1.12\" check: {wayland}"
         ));
     };
-    if check["status"] == "ok" {
-        SwayProbe::Available
-    } else {
-        SwayProbe::Absent
+    match check["status"].as_str() {
+        Some("ok") => SwayProbe::Available,
+        Some("warn" | "fail" | "skip") => SwayProbe::Absent,
+        other => SwayProbe::Broken(format!(
+            "sway >=1.12 check had unrecognized status {other:?}: {wayland}"
+        )),
     }
 }
