@@ -233,8 +233,8 @@ mod tests {
     #[test]
     fn a_failed_check_fails_the_report() {
         let r = report(vec![
-            CheckOutcome::pass(2, "start", "800x600"),
-            CheckOutcome::fail(3, "capabilities+doctor", "doctor FAIL: display"),
+            CheckOutcome::pass(1, "start", "800x600"),
+            CheckOutcome::fail(2, "capabilities+doctor", "doctor FAIL: display"),
         ]);
         assert!(r.failed());
         assert_eq!(r.exit_code(), 1);
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn a_pipe_in_a_detail_does_not_shift_the_row() {
         let md = report(vec![CheckOutcome::fail(
-            2,
+            1,
             "start",
             "backend said: a | b | c",
         )])
@@ -295,8 +295,8 @@ mod tests {
         // The dangerous one: an unescaped newline ends the table, so every check after this
         // point silently disappears from the report — the failing one included.
         let md = report(vec![
-            CheckOutcome::fail(2, "start", "line one\nline two"),
-            CheckOutcome::fail(10, "stop", "the row that must not vanish"),
+            CheckOutcome::fail(1, "start", "line one\nline two"),
+            CheckOutcome::fail(8, "stop", "the row that must not vanish"),
         ])
         .to_markdown();
         assert!(
@@ -311,7 +311,7 @@ mod tests {
     /// used to head its report `PASS`, agreeing with exit 0 and nine uniform `skip` rows.
     #[test]
     fn a_dry_run_heading_says_it_exercised_nothing() {
-        let mut r = report(vec![CheckOutcome::skip(2, "start", "dry run")]);
+        let mut r = report(vec![CheckOutcome::skip(1, "start", "dry run")]);
         r.mode = RunMode::DryRun;
         let md = r.to_markdown();
         assert!(
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn a_pipe_or_newline_in_a_header_value_cannot_break_the_report() {
         const HOSTILE: &str = "we\nird | value";
-        let row = || vec![CheckOutcome::pass(2, "start", "800x600")];
+        let row = || vec![CheckOutcome::pass(1, "start", "800x600")];
         // What the report looks like with nothing hostile in it. Deriving the expected line
         // count beats writing one down: it stays right as the header gains or loses lines.
         let clean = report(row()).to_markdown().lines().count();
@@ -385,7 +385,7 @@ mod tests {
     fn markdown_names_the_app_and_every_check_and_flags_stale_limits() {
         let mut xpass = CheckOutcome::pass(9, "gesture", "multi-contact worked");
         xpass.status = CheckStatus::XPass;
-        let md = report(vec![CheckOutcome::pass(2, "start", "800x600"), xpass]).to_markdown();
+        let md = report(vec![CheckOutcome::pass(1, "start", "800x600"), xpass]).to_markdown();
         assert!(md.contains("xterm"), "selected app must appear: {md}");
         assert!(md.contains("start"), "every check must appear: {md}");
         assert!(md.contains("gesture"), "every check must appear: {md}");

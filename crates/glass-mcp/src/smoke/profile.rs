@@ -304,7 +304,7 @@ mod tests {
     }
 
     /// The bug this pins: `xed` present but not executable is not an app. Reading it as one
-    /// selects a candidate that cannot launch, so the run fails at check 2 with a launch error
+    /// selects a candidate that cannot launch, so the run fails at check 1 with a launch error
     /// instead of falling through to a candidate that would have worked.
     #[cfg(unix)]
     #[test]

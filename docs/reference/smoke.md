@@ -19,18 +19,18 @@ server is given `GLASS_BACKEND` set to the backend under test, overriding any am
 
 | # | Name | What it asserts |
 |---|---|---|
-| 2 | `start` | `glass_start` launches the target app and returns window geometry. |
-| 3 | `capabilities+doctor` | `glass_capabilities` reports the backend under test as the active one, and `glass_doctor`'s `overall` verdict for that backend is not `fail`. An `overall` that is absent, or a value other than `ok`, `warn` or `fail`, also fails: there is no verdict to grade, which is not the same as "not `fail`". |
-| 4 | `screenshot` | `glass_screenshot` returns an image block and its dimensions. |
-| 5 | `a11y snapshot` | `glass_a11y_snapshot` returns a non-empty accessibility tree, delivered as untrusted app text. |
-| 6 | `interaction` | `glass_set_value` writes to an editable element and `glass_wait_for_element` reports the written value on an element of that role. A match naming a different element id fails; a match naming no id is recorded as landed but unconfirmed. The pixel path (`glass_click`, `glass_key`) is exercised, then the window list is re-read, so an app dismissed by the pixel path is caught here. `skip` when check 5 read no tree, when the tree exposes no editable element, or when the element's role is one glass cannot address by name. |
-| 8 | `logs` | `glass_logs` returns the app's output as untrusted app text, and the wrapped body parses as the `{"lines":[…]}` document `glass_logs` emits. The wrapper is required even when the app logged nothing. |
-| 9 | `error honesty` | `glass_click_element` on a nonexistent id returns an error about that id which names a remedy, not only a cause. `skip` when the server answered about something else — no active session, or no snapshot yet — since that is not the error this check provokes. |
-| 10 | `stop` | `glass_stop` ends the session cleanly. |
+| 1 | `start` | `glass_start` launches the target app and returns window geometry. |
+| 2 | `capabilities+doctor` | `glass_capabilities` reports the backend under test as the active one, and `glass_doctor`'s `overall` verdict for that backend is not `fail`. An `overall` that is absent, or a value other than `ok`, `warn` or `fail`, also fails: there is no verdict to grade, which is not the same as "not `fail`". |
+| 3 | `screenshot` | `glass_screenshot` returns an image block and its dimensions. |
+| 4 | `a11y snapshot` | `glass_a11y_snapshot` returns a non-empty accessibility tree, delivered as untrusted app text. |
+| 5 | `interaction` | `glass_set_value` writes to an editable element and `glass_wait_for_element` reports the written value on an element of that role. A match naming a different element id fails; a match naming no id is recorded as landed but unconfirmed. The pixel path (`glass_click`, `glass_key`) is exercised, then the window list is re-read, so an app dismissed by the pixel path is caught here. `skip` when check 4 read no tree, when the tree exposes no editable element, or when the element's role is one glass cannot address by name. |
+| 6 | `logs` | `glass_logs` returns the app's output as untrusted app text, and the wrapped body parses as the `{"lines":[…]}` document `glass_logs` emits. The wrapper is required even when the app logged nothing. |
+| 7 | `error honesty` | `glass_click_element` on a nonexistent id returns an error about that id which names a remedy, not only a cause. `skip` when the server answered about something else — no active session, or no snapshot yet — since that is not the error this check provokes. |
+| 8 | `stop` | `glass_stop` ends the session cleanly. |
 
-There is no check 7. Envelope discipline — that every tool result follows the `{ok, tool, result}`
-shape described in [Tools](tools.md#result-envelope) — is asserted inside every check above rather
-than standing alone.
+Envelope discipline — that every tool result follows the `{ok, tool, result}` shape described in
+[Tools](tools.md#result-envelope) — is not a check of its own: it is asserted inside every check
+above.
 
 Under `--dry-run` none of this is asserted: every check is a `skip` whose `detail` says what it would
 have done. `start`'s `detail` is where a missing target app is reported.

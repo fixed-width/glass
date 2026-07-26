@@ -45,22 +45,21 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
     }
 }
 
-/// The checks, in order, except `stop` (appended last) — step 7, envelope
-/// discipline, is asserted inside every other check rather than standing alone.
-/// Used by `--dry-run` and to keep the report shape stable whether or not a
-/// check ran.
+/// The checks, in order, except `stop` (appended last). Envelope discipline is not among
+/// them and never was a step of its own: it is asserted inside every check below. Used by
+/// `--dry-run` and to keep the report shape stable whether or not a check ran.
 const CHECK_NAMES: [(u8, &str); 7] = [
-    (2, "start"),
-    (3, "capabilities+doctor"),
-    (4, "screenshot"),
-    (5, "a11y snapshot"),
-    (6, "interaction"),
-    (8, "logs"),
-    (9, "error honesty"),
+    (1, "start"),
+    (2, "capabilities+doctor"),
+    (3, "screenshot"),
+    (4, "a11y snapshot"),
+    (5, "interaction"),
+    (6, "logs"),
+    (7, "error honesty"),
 ];
 
 /// The last check, run after every other one whatever they reported.
-const STOP_CHECK: (u8, &str) = (10, "stop");
+const STOP_CHECK: (u8, &str) = (8, "stop");
 
 /// Every `(step, name)` a report carries, in order. A `--dry-run` preview is built from this
 /// directly and a real run's rows must match it — which is why the end-to-end gate compares a
@@ -83,7 +82,7 @@ pub(crate) fn all_check_names() -> Vec<&'static str> {
 
 /// The step whose `detail` carries an unavailable app: `start` is the check that would hit
 /// the gap, and the one the how-to already sends a reader to when a run goes wrong.
-const START_STEP: u8 = 2;
+const START_STEP: u8 = 1;
 
 /// `--dry-run`'s rows: every check a real run would produce, each a `skip` saying what it
 /// would have done. One of them says more than "dry run", because one of the run's inputs is
@@ -209,14 +208,14 @@ mod tests {
     /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
     /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d X11 gate.
     const CANONICAL_ROWS: [(u8, &str); 8] = [
-        (2, "start"),
-        (3, "capabilities+doctor"),
-        (4, "screenshot"),
-        (5, "a11y snapshot"),
-        (6, "interaction"),
-        (8, "logs"),
-        (9, "error honesty"),
-        (10, "stop"),
+        (1, "start"),
+        (2, "capabilities+doctor"),
+        (3, "screenshot"),
+        (4, "a11y snapshot"),
+        (5, "interaction"),
+        (6, "logs"),
+        (7, "error honesty"),
+        (8, "stop"),
     ];
 
     /// A search path holding real executables named `bins` — empty for the shape of a bare CI

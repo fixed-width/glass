@@ -32,7 +32,7 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
     let args = json!({ "run": run, "backend": p.backend, "a11y": true });
     outcome(
-        2,
+        1,
         "start",
         t.call("glass_start", args).and_then(|r| {
             let result = check_envelope("glass_start", &r)?;
@@ -47,7 +47,7 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
 }
 
 pub fn check_health(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
-    outcome(3, "capabilities+doctor", health(t, p))
+    outcome(2, "capabilities+doctor", health(t, p))
 }
 
 /// Every verdict `glass_doctor`'s `overall` can report (`glass_core::Diagnosis::overall`
@@ -123,7 +123,7 @@ fn health(t: &mut dyn McpTransport, p: &Profile) -> Result<String, String> {
 
 pub fn check_screenshot(t: &mut dyn McpTransport) -> CheckOutcome {
     outcome(
-        4,
+        3,
         "screenshot",
         t.call("glass_screenshot", json!({})).and_then(|r| {
             let result = check_envelope("glass_screenshot", &r)?;
@@ -155,7 +155,7 @@ pub fn check_a11y(t: &mut dyn McpTransport) -> (CheckOutcome, Option<Vec<Outline
         nodes = Some(parsed);
         Ok(detail)
     })();
-    (outcome(5, "a11y snapshot", r), nodes)
+    (outcome(4, "a11y snapshot", r), nodes)
 }
 
 /// The text the interaction check writes: a fresh nonce per run. A fixed string could
@@ -173,19 +173,19 @@ fn probe_text() -> String {
 /// "the tool returned ok" is not evidence the app changed, and neither is a re-read of the
 /// outline.
 ///
-/// `nodes` is `None` when check 5 never produced a tree; that is reported as its own skip
+/// `nodes` is `None` when check 4 never produced a tree; that is reported as its own skip
 /// reason rather than blamed on the app.
 pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>) -> CheckOutcome {
     let Some(nodes) = nodes else {
         return CheckOutcome::skip(
-            6,
+            5,
             "interaction",
-            "no accessibility tree was read (check 5 failed), so there was nothing to drive",
+            "no accessibility tree was read (check 4 failed), so there was nothing to drive",
         );
     };
     let Some(target) = crate::smoke::profile::first_editable(nodes) else {
         return CheckOutcome::skip(
-            6,
+            5,
             "interaction",
             "the tree was read but exposes no editable element",
         );
@@ -198,7 +198,7 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
     // role glass itself cannot address.
     if glass_core::AxRole::from_name(&target.role).is_none() {
         return CheckOutcome::skip(
-            6,
+            5,
             "interaction",
             format!(
                 "target element #{id} has no addressable role ({}) to verify against",
@@ -209,7 +209,7 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
     let role = target.role.as_str();
     let probe = probe_text();
     outcome(
-        6,
+        5,
         "interaction",
         (|| {
             let set = t.call("glass_set_value", json!({ "id": id, "text": probe }))?;
@@ -245,7 +245,7 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
             check_envelope("glass_click", &click)?;
             // `Home` deliberately: it moves the caret and nothing else. Anything with dismiss
             // or commit semantics — `Escape` (a GtkDialog's cancel binding), `Return`, `alt+F4`
-            // — can close the target app right here, and checks 8-10 would not notice: logs
+            // — can close the target app right here, and checks 6-8 would not notice: logs
             // read a retained buffer, error honesty resolves against the cached snapshot, and
             // stopping an already-exited child is not an error. So do not "simplify" this to a
             // more familiar key.
@@ -289,7 +289,7 @@ fn matched_element_id(r: &CallResult) -> Option<u64> {
 
 pub fn check_logs(t: &mut dyn McpTransport) -> CheckOutcome {
     outcome(
-        8,
+        6,
         "logs",
         t.call("glass_logs", json!({})).and_then(|r| {
             check_envelope("glass_logs", &r)?;
@@ -322,7 +322,7 @@ const STALE_ELEMENT_ID: u32 = 999_999;
 
 /// Deliberate misuse must return an error that names a remedy, not only a cause.
 pub fn check_error_honesty(t: &mut dyn McpTransport) -> CheckOutcome {
-    const STEP: u8 = 9;
+    const STEP: u8 = 7;
     const NAME: &str = "error honesty";
     let r = match t.call("glass_click_element", json!({ "id": STALE_ELEMENT_ID })) {
         Ok(r) => r,
@@ -364,7 +364,7 @@ pub fn check_error_honesty(t: &mut dyn McpTransport) -> CheckOutcome {
 
 pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
     outcome(
-        10,
+        8,
         "stop",
         t.call("glass_stop", json!({})).and_then(|r| {
             check_envelope("glass_stop", &r)?;
@@ -788,7 +788,7 @@ mod tests {
         let out = check_interaction(&mut t, None);
         assert_eq!(out.status, CheckStatus::Skip);
         assert!(
-            out.detail.contains("check 5"),
+            out.detail.contains("check 4"),
             "must point at the snapshot check: {}",
             out.detail
         );
