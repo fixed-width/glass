@@ -2,6 +2,7 @@
 //! shipped binary works. Experimental surface: not covered by the 1.x freeze.
 
 pub mod checks;
+pub mod client;
 pub mod envelope;
 pub mod ledger;
 pub mod profile;
