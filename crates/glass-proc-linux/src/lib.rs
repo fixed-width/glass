@@ -29,10 +29,15 @@ pub const REAP_GRACE: Duration = Duration::from_secs(2);
 /// How long an app that was *asked* to close gets to leave through its own shutdown path
 /// before glass falls back to signalling it.
 ///
-/// Signals give a GUI toolkit no shutdown path at all: GTK and Qt install no `SIGTERM`
-/// handler, so a signalled app never runs its close/shutdown handlers — measured with a GTK 4
-/// client on both Linux backends. Asking first (an X11 `WM_DELETE_WINDOW` client message, or
-/// `kill` on the compositor's container under Wayland) is what lets the app flush its state.
+/// A signalled toolkit app runs no shutdown path at all, because the toolkit installs no
+/// `SIGTERM` handler and the default disposition kills the process outright: verified with GTK 4
+/// on both Linux backends, where a signalled client recorded nothing on the way out and an asked
+/// one ran its close and shutdown handlers (Qt is believed to behave the same way; that was not
+/// tested). Asking first — an X11 `WM_DELETE_WINDOW` client message, or a close request through
+/// the compositor under Wayland — is what lets the app flush its state.
+///
+/// The value also has to leave room for the signal ladder inside the budget teardown gets as a
+/// whole; each backend asserts that against `glass_core::TEARDOWN_BUDGET` at compile time.
 pub const CLOSE_GRACE: Duration = Duration::from_millis(1500);
 
 /// SIGTERM→SIGKILL grace for an app that was already asked to close and did not.
@@ -47,57 +52,135 @@ pub const APP_REAP_GRACE: Duration = Duration::from_millis(1000);
 /// every teardown as an unqualified success. Signalling an app that was never asked destroys
 /// whatever it would have flushed on exit, and the user only learns of it the next time the
 /// app starts up in a recovered/crashed state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closed {
-    /// Asked, and the app left through its own shutdown path.
+    /// Asked, and the app left on its own before the grace ran out.
     Gracefully,
-    /// Nothing was asked, so the app was signalled without a chance to shut down. Carries how
-    /// many of its windows were there but could not be asked — an X11 client that never opted
-    /// into `WM_DELETE_WINDOW`, say — which is a different situation from an app that had no
-    /// window to ask (a teardown after a failed launch, or a windowless process).
-    SignalledUnasked { unaskable: usize },
+    /// Nothing was asked, so the app was signalled without a chance to shut down. `reason` says
+    /// why when there is something to say — windows that were there but could not be asked, or
+    /// an enumeration that failed. `None` means there was simply no window to ask (a teardown
+    /// after a failed launch, or a windowless process), which is not worth reporting.
+    SignalledUnasked { reason: Option<String> },
     /// Asked, but still running when [`CLOSE_GRACE`] ran out (a modal save prompt, or a hang),
     /// so it was signalled anyway.
     SignalledAfterGrace,
 }
 
-/// Classify a teardown from how many of the app's windows were asked to close, how many were
-/// there but could not be asked, and whether the app then exited on its own. Pure so it can be
-/// tested off a display.
-pub fn close_outcome(asked: usize, unaskable: usize, exited: bool) -> Closed {
-    match (asked, exited) {
-        (0, _) => Closed::SignalledUnasked { unaskable },
-        (_, true) => Closed::Gracefully,
-        (_, false) => Closed::SignalledAfterGrace,
+/// The result of asking an app's windows to close: how many the request reached, and why the
+/// rest could not be asked. Backends build one of these and hand it to [`Asked::outcome`], so
+/// the counts are never two bare numbers a caller could swap.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Asked {
+    asked: usize,
+    reason: Option<String>,
+}
+
+impl Asked {
+    /// Nothing to ask: the app has no window. Reported as nothing at all — there was no
+    /// shutdown path to miss.
+    pub const fn none() -> Asked {
+        Asked {
+            asked: 0,
+            reason: None,
+        }
+    }
+
+    /// `total` windows were found and `asked` of them accepted a close request. `why_not`
+    /// describes the rest in the backend's own terms — the caller knows whether they lacked a
+    /// protocol, sat outside the launched process tree, or were refused by a compositor.
+    pub fn counted(total: usize, asked: usize, why_not: impl FnOnce(usize) -> String) -> Asked {
+        let unaskable = total.saturating_sub(asked);
+        Asked {
+            asked,
+            reason: (unaskable > 0).then(|| why_not(unaskable)),
+        }
+    }
+
+    /// glass could not find out what to ask — the window enumeration itself failed. Distinct
+    /// from [`Asked::none`] on purpose: "the app has no window" is routine, "glass could not
+    /// look" is a failure of glass's own machinery and must not pass for it.
+    pub fn blocked(reason: impl Into<String>) -> Asked {
+        Asked {
+            asked: 0,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// Whether anything was actually asked to close.
+    pub fn any(&self) -> bool {
+        self.asked > 0
+    }
+
+    /// Wait for the app to leave on its own — but only if something was asked. With nothing
+    /// asked there is no shutdown to wait for, so the grace is skipped rather than spent.
+    pub fn await_close(&self, grace: Duration, done: impl FnMut() -> bool) -> bool {
+        self.any() && await_condition(grace, done)
+    }
+
+    /// [`Asked::await_close`] for the common case: wait for the spawned child itself to exit.
+    ///
+    /// The wait NEVER signals — that is the whole point, an app asked to close must be left
+    /// alone to run its shutdown path. A `try_wait` error counts as "did not exit", not as an
+    /// exit: the caller's fallback is the signal ladder, which is what actually guarantees the
+    /// process is gone, and skipping it on a reading we could not make would leave the app
+    /// running.
+    pub fn await_child_exit(&self, child: &mut Child, grace: Duration) -> bool {
+        self.await_close(grace, || matches!(child.try_wait(), Ok(Some(_))))
+    }
+
+    /// Classify the teardown: `closed_itself` is whether the app left before the grace ran out.
+    pub fn outcome(self, closed_itself: bool) -> Closed {
+        match (self.asked, closed_itself) {
+            (0, _) => Closed::SignalledUnasked {
+                reason: self.reason,
+            },
+            (_, true) => Closed::Gracefully,
+            (_, false) => Closed::SignalledAfterGrace,
+        }
     }
 }
 
-/// Report a teardown that could not be graceful. Silent on [`Closed::Gracefully`] — the good
-/// path is the expectation, not news — and on an app with no window to ask, which has no
-/// shutdown path to have missed (this also runs on the failed-launch path, where a warning
-/// would be pure noise). The rest is something the user can act on, and would otherwise surface
-/// only as an unexplained recovery prompt the *next* time the app is launched.
-pub fn disclose_teardown(closed: Closed) {
+/// What the user should be told about a teardown, or `None` when there is nothing to say.
+///
+/// Silent on [`Closed::Gracefully`] — the good path is the expectation, not news — and on an app
+/// with no window to ask, which had no shutdown path to miss (that arm also covers the
+/// failed-launch teardown, where a warning would be pure noise). Split from the printing so the
+/// wording is testable; [`disclose_teardown`] is the printing half.
+pub fn teardown_notice(closed: &Closed) -> Option<String> {
     match closed {
-        Closed::Gracefully | Closed::SignalledUnasked { unaskable: 0 } => {}
-        Closed::SignalledUnasked { unaskable } => eprintln!(
-            "glass: {unaskable} window(s) of the app could not be asked to close, so it was \
-             signalled instead. An X11 client that never opted into the WM_DELETE_WINDOW \
-             protocol cannot be asked; toolkit apps opt in. An app that flushes state on exit \
-             did not get to, and may report a crash on its next launch."
-        ),
-        Closed::SignalledAfterGrace => eprintln!(
+        Closed::Gracefully => None,
+        Closed::SignalledUnasked { reason } => reason.as_ref().map(|why| {
+            format!(
+                "glass: the app was signalled instead of being asked to close ({why}). An app \
+                 that flushes state on exit did not get to, and may report a crash on its next \
+                 launch."
+            )
+        }),
+        Closed::SignalledAfterGrace => Some(format!(
             "glass: the app did not close within {CLOSE_GRACE:?} of being asked (a modal \
-             shutdown prompt will do this), so it was signalled. Unsaved state was not flushed, \
-             and the app may report a crash on its next launch."
-        ),
+             shutdown prompt, or an app that ignores close requests, will do this), so it was \
+             signalled. Unsaved state was not flushed, and the app may report a crash on its \
+             next launch."
+        )),
     }
 }
+
+/// Print [`teardown_notice`] to stderr (stdout is the MCP channel).
+pub fn disclose_teardown(closed: &Closed) {
+    if let Some(notice) = teardown_notice(closed) {
+        eprintln!("{notice}");
+    }
+}
+
+/// How often the waits and the signal ladder re-check. One constant so a change here cannot
+/// leave a doc comment elsewhere claiming they match.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Poll `done` until it reports true or `grace` is spent. Returns whether it reported true.
 ///
-/// The polling interval matches [`reap`]'s, and `done` is called once before any sleep so an
-/// app that has already gone costs nothing.
+/// `done` is called once before any sleep, so an app that has already gone costs nothing. Note
+/// the deadline is only checked *between* calls: `done` must not block for longer than the
+/// caller is willing to wait.
 pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + grace;
     loop {
@@ -107,19 +190,55 @@ pub fn await_condition(grace: Duration, mut done: impl FnMut() -> bool) -> bool 
         if Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// Wait up to `grace` for the child to exit on its own, WITHOUT signalling it. Returns whether
-/// it did; the caller still has to `wait()` (or reap) it. Used after asking an app to close: an
-/// app that leaves through its own shutdown path must not then be signalled for it.
+/// Whether any of `pids` is still a live process.
+pub fn any_alive(pids: &[u32]) -> bool {
+    pids.iter()
+        .any(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+/// Reap a whole launch: the child glass spawned, its process group, and every pid in `tree` — a
+/// snapshot of the launch's `/proc` subtree taken *before* any of it exited. SIGTERM everything,
+/// wait up to `grace` for it all to go, then SIGKILL whatever is left, then reap the child.
 ///
-/// A `try_wait` error counts as "did not exit", not as an exit: the caller's fallback is the
-/// signal ladder, which is what actually guarantees the process is gone, and skipping it on a
-/// reading we could not make would leave the app running.
-pub fn await_exit(child: &mut Child, grace: Duration) -> bool {
-    await_condition(grace, || matches!(child.try_wait(), Ok(Some(_))))
+/// The snapshot is load-bearing, because neither of the other two handles is enough on its own:
+///
+/// - The parent link goes away with the parent. Once the child is reaped its descendants are
+///   reparented to init, so a later `proc_tree_pids` no longer finds them.
+/// - The process group does not contain everything the launch produced. sway calls `setsid` for
+///   every app it `exec`s, so under the Wayland backend the app is in neither the compositor's
+///   group nor its session — measured: after a SIGTERM to sway's group, the exec'd tree was
+///   still running, reparented to init.
+///
+/// A pid is only signalled while `/proc/<pid>` still exists. That check races pid reuse the same
+/// way every `kill`-based reaper on Linux does; the alternative is leaking the app's children on
+/// every teardown.
+pub fn reap_launch(child: &mut Child, tree: &[u32], grace: Duration) {
+    let leader = Pid::from_raw(child.id() as i32);
+    let signal_all = |signal| {
+        if let Some(leader) = leader {
+            let _ = kill_process_group(leader, signal);
+        }
+        for &pid in tree {
+            if std::path::Path::new(&format!("/proc/{pid}")).exists()
+                && let Some(pid) = Pid::from_raw(pid as i32)
+            {
+                let _ = kill_process(pid, signal);
+            }
+        }
+    };
+    signal_all(Signal::TERM);
+    let gone = await_condition(grace, || {
+        matches!(child.try_wait(), Ok(Some(_))) && !any_alive(tree)
+    });
+    if !gone {
+        signal_all(Signal::KILL);
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 /// Gracefully reap a single child: SIGTERM, poll for exit up to `grace`, then
@@ -155,7 +274,7 @@ fn reap(child: &mut Child, grace: Duration, group: bool) {
                     }
                     break;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => std::thread::sleep(POLL_INTERVAL),
                 Err(_) => break,
             }
         }
@@ -241,7 +360,9 @@ pub fn spawn_reader<S: Copy + Send + 'static, R: Read + Send + 'static>(
 
 #[cfg(test)]
 mod reap_tests {
-    use super::{REAP_GRACE, reap_graceful, reap_group};
+    use super::{
+        Asked, CLOSE_GRACE, Closed, REAP_GRACE, reap_graceful, reap_group, teardown_notice,
+    };
     use std::io::{BufRead, BufReader};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -324,28 +445,33 @@ mod reap_tests {
         assert_eq!(REAP_GRACE, Duration::from_secs(2));
     }
 
+    /// An `Asked` that stands for "one window accepted the close request", for the waits below.
+    fn one_window_asked() -> Asked {
+        Asked::counted(1, 1, |_| unreachable!("nothing was left unasked"))
+    }
+
     #[test]
-    fn await_exit_reports_a_child_that_leaves_on_its_own() {
+    fn await_child_exit_reports_a_child_that_leaves_on_its_own() {
         let mut c = Command::new("true").spawn().unwrap();
         assert!(
-            super::await_exit(&mut c, Duration::from_secs(5)),
+            one_window_asked().await_child_exit(&mut c, Duration::from_secs(5)),
             "a child that exits by itself must be reported as exited"
         );
         let _ = c.wait();
     }
 
     #[test]
-    fn await_exit_does_not_signal_the_child_it_waits_for() {
+    fn await_child_exit_does_not_signal_the_child_it_waits_for() {
         // The whole point of the wait: an app that was ASKED to close must be left alone to run
-        // its own shutdown path. If await_exit signalled, this would return true and the pid
-        // would be gone.
+        // its own shutdown path. If the wait signalled, this would return true and the pid would
+        // be gone.
         let mut c = Command::new("sleep").arg("30").spawn().unwrap();
         let grace = Duration::from_millis(200);
         assert!(
-            !super::await_exit(&mut c, grace),
+            !one_window_asked().await_child_exit(&mut c, grace),
             "a still-running child must be reported as not exited"
         );
-        assert!(alive(c.id()), "await_exit must not signal the child");
+        assert!(alive(c.id()), "the wait must not signal the child");
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -373,54 +499,125 @@ mod reap_tests {
 
     #[test]
     fn an_app_that_was_never_asked_is_reported_as_signalled_unasked() {
+        let asked = Asked::counted(2, 0, |n| format!("{n} cannot be asked"));
         assert_eq!(
-            super::close_outcome(0, 2, false),
-            super::Closed::SignalledUnasked { unaskable: 2 }
+            asked.clone().outcome(false),
+            Closed::SignalledUnasked {
+                reason: Some("2 cannot be asked".into())
+            }
         );
         // Even if the app happened to exit on its own, nothing asked it to — the caller has no
         // basis for reporting a graceful close.
         assert_eq!(
-            super::close_outcome(0, 2, true),
-            super::Closed::SignalledUnasked { unaskable: 2 }
+            asked.outcome(true),
+            Closed::SignalledUnasked {
+                reason: Some("2 cannot be asked".into())
+            }
         );
     }
 
     #[test]
     fn an_asked_app_that_exits_is_reported_as_graceful() {
-        assert_eq!(super::close_outcome(1, 0, true), super::Closed::Gracefully);
+        let asked = Asked::counted(1, 1, |_| unreachable!("nothing was left unasked"));
+        assert_eq!(asked.outcome(true), Closed::Gracefully);
     }
 
     #[test]
     fn an_asked_app_that_stays_is_reported_as_signalled_after_the_grace() {
-        assert_eq!(
-            super::close_outcome(1, 0, false),
-            super::Closed::SignalledAfterGrace
-        );
+        let asked = Asked::counted(1, 1, |_| unreachable!("nothing was left unasked"));
+        assert_eq!(asked.outcome(false), Closed::SignalledAfterGrace);
     }
 
     #[test]
-    fn an_app_with_no_window_to_ask_is_distinguishable_from_one_that_refused_the_ask() {
+    fn an_app_with_no_window_to_ask_says_nothing() {
         // Teardown also runs on the failed-launch path, where there is no window and nothing was
-        // missed. `disclose_teardown` stays silent on that, so the two must not collapse into one
-        // outcome.
-        assert_eq!(
-            super::close_outcome(0, 0, false),
-            super::Closed::SignalledUnasked { unaskable: 0 }
-        );
-        assert_ne!(
-            super::close_outcome(0, 0, false),
-            super::close_outcome(0, 1, false)
+        // missed. That must stay silent, while a window glass could not ask must not.
+        assert_eq!(teardown_notice(&Asked::none().outcome(false)), None);
+        assert!(
+            teardown_notice(&Asked::counted(1, 0, |n| format!("{n} unaskable")).outcome(false))
+                .is_some()
         );
     }
 
     #[test]
-    fn the_close_and_signal_graces_leave_the_teardown_budget_headroom() {
-        // The backends bind these to glass_core::TEARDOWN_BUDGET at compile time; this crate
-        // has no glass-core dependency, so assert the shape they rely on: the ask gets the
-        // larger share (it is the one that produces a clean shutdown) and the pair stays well
-        // under the 3s budget.
+    fn an_enumeration_failure_is_reported_rather_than_read_as_nothing_to_ask() {
+        // The failure mode this guards: glass's own machinery breaks (an unreachable display or
+        // compositor), nothing is asked, the app is signalled — and the user is told nothing,
+        // because it looks exactly like an app that had no window.
+        let notice = teardown_notice(&Asked::blocked("the compositor went away").outcome(false))
+            .expect("a blocked ask must be disclosed");
+        assert!(
+            notice.contains("the compositor went away"),
+            "the reason must reach the user: {notice}"
+        );
+    }
+
+    #[test]
+    fn nothing_asked_means_the_close_grace_is_not_spent() {
+        // An app that could not be asked has no shutdown to wait for; spending the grace on it
+        // would add over a second to every such teardown.
+        let t = Instant::now();
+        assert!(!Asked::none().await_close(Duration::from_secs(30), || false));
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "waited {:?} for a close nobody was asked to perform",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_graceful_close_is_not_worth_reporting() {
+        assert_eq!(teardown_notice(&Closed::Gracefully), None);
+    }
+
+    #[test]
+    fn an_app_that_ignored_the_request_is_reported_with_the_grace_it_was_given() {
+        let notice = teardown_notice(&Closed::SignalledAfterGrace).expect("must be disclosed");
+        assert!(
+            notice.contains(&format!("{CLOSE_GRACE:?}")),
+            "the notice should say how long the app was given: {notice}"
+        );
+    }
+
+    #[test]
+    fn the_close_grace_gets_the_larger_share_of_the_ladder() {
+        // The ask is the half that produces a clean shutdown, so it gets the longer wait; the
+        // signal ladder only has to make sure the app is gone. The budget the pair has to fit
+        // inside is `glass_core::TEARDOWN_BUDGET`, which this crate deliberately cannot see —
+        // each backend binds them to it with a compile-time assertion.
         assert!(super::CLOSE_GRACE > super::APP_REAP_GRACE);
-        assert!(super::CLOSE_GRACE + super::APP_REAP_GRACE < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn reap_launch_reaps_a_child_that_left_the_process_group() {
+        // sway does exactly this to every app it execs: `setsid` puts the app in its own group
+        // and session, where a signal to the launcher's group never reaches it. Reaping the
+        // snapshot is what covers that.
+        let mut leader = Command::new("sh")
+            .args(["-c", "setsid sleep 30 & echo started; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "started");
+        std::thread::sleep(Duration::from_millis(100)); // let setsid re-exec into its own session
+        let tree = super::proc_tree_pids(leader.id());
+        let escaped: Vec<u32> = tree.iter().copied().filter(|&p| p != leader.id()).collect();
+        assert!(
+            !escaped.is_empty(),
+            "the launch should have a child to reap"
+        );
+        super::reap_launch(&mut leader, &tree, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !super::any_alive(&escaped),
+            "reap_launch must reach every process the launch produced, group or no group: \
+             {escaped:?} survived"
+        );
     }
 }
 

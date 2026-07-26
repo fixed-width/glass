@@ -258,11 +258,10 @@ fn wait_for_app_pid(p: &mut WaylandPlatform) -> u32 {
     panic!("fixture never reported its pid");
 }
 
-/// Teardown must ask the app to close before signalling the compositor's process group.
-/// Signalling gives a toolkit app no shutdown path at all (GTK and Qt install no `SIGTERM`
-/// handler), so state it would flush on exit is lost. Under Wayland the ask goes through sway,
-/// which sends the client a close request; the fixture prints `EVENT closed_gracefully` from
-/// the handler that only runs when it was asked.
+/// Teardown must ask the app to close before signalling it: a signalled toolkit app runs no
+/// shutdown path at all (see `glass_proc_linux::CLOSE_GRACE`), so state it would flush on exit is
+/// lost. Under Wayland the ask goes through sway, which sends the client a close request; the
+/// fixture prints `EVENT closed_gracefully` from the handler that only runs when it was asked.
 #[test]
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn stop_app_asks_the_app_to_close_before_signalling_it() {
@@ -284,12 +283,96 @@ fn stop_app_asks_the_app_to_close_before_signalling_it() {
     );
 }
 
-/// An app that never opted into `WM_DELETE_WINDOW` is required to ignore the close request sway
-/// sends it, so teardown falls back to signalling the compositor's group — and must still leave
-/// nothing behind.
+/// Teardown must reap what the app forked, not just what dies with the display.
+///
+/// This is the test that binds the signal actually reaching the launch. sway `setsid`s every app
+/// it `exec`s, so the app is in neither the compositor's process group nor its session; a
+/// teardown that signals only that group still *looks* correct, because a display client dies on
+/// its own when its compositor goes away. A forked child that never talks to the display does
+/// not — it is left running with `ppid 1`.
 #[test]
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
-fn stop_app_signals_an_app_that_cannot_be_asked_to_close() {
+fn stop_app_reaps_the_apps_forked_child() {
+    let mut p = WaylandPlatform::new().unwrap();
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--fork-child".to_string()],
+            APP_TIMEOUT_MS,
+        ),
+    );
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..READY_TRIES {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT child_pid=") {
+                child_pid = rest.trim().parse().ok();
+            }
+        }
+        if child_pid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("fixture should report its forked child pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "the forked child should be alive while the app runs"
+    );
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "stop_app must reap the app's forked child (pid {child_pid}), not orphan it"
+    );
+}
+
+/// An app that was asked and does not go must be signalled once the grace runs out, and the
+/// whole teardown must still fit the budget glass-mcp allows it.
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_signals_an_app_that_ignores_the_close_request() {
+    let mut p = WaylandPlatform::new().unwrap();
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--ignore-close".to_string()],
+            APP_TIMEOUT_MS,
+        ),
+    );
+    let pid = wait_for_app_pid(&mut p);
+    let t = std::time::Instant::now();
+    p.stop_app().unwrap();
+    let elapsed = t.elapsed();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("EVENT ignoring_close_request")),
+        "the compositor should have passed the close request to the app; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "an app that ignores the request must still be signalled (pid {pid} survived)"
+    );
+    assert!(
+        elapsed >= glass_proc_linux::CLOSE_GRACE,
+        "the app must get the whole close grace before being signalled (took {elapsed:?})"
+    );
+    assert!(
+        elapsed < glass_core::TEARDOWN_BUDGET,
+        "teardown must fit in the budget glass-mcp gives it ({:?}); this took {elapsed:?}",
+        glass_core::TEARDOWN_BUDGET
+    );
+}
+
+/// A client that never opted into `WM_DELETE_WINDOW` cannot be asked, and under Wayland glass
+/// cannot tell: sway acknowledges the `kill` command either way, and wlroots closes the X
+/// connection of a client that has no close protocol. What teardown must still guarantee is
+/// what this pins — the app is gone, its shutdown path did not run, and no compositor is left
+/// behind. (The X11 backend, which reads `WM_PROTOCOLS` itself, does report this case.)
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_leaves_nothing_behind_when_the_app_cannot_be_asked() {
     let before = sway_pids();
     let mut p = WaylandPlatform::new().unwrap();
     start(

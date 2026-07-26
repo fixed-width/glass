@@ -34,11 +34,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // behaves like a real toolkit app that does NOT grab focus in a WM-less
     // session — letting tests verify that glass itself focuses the window.
     let no_wm_pid = std::env::args().any(|a| a == "--no-wm-pid");
-    // `--no-wm-delete` drops WM_DELETE_WINDOW from WM_PROTOCOLS, so the fixture behaves like an
-    // app that cannot be *asked* to close (a raw X11 client that never opted into the protocol)
-    // and glass has to fall back to signalling it. Default (registered) matches every real
-    // toolkit app.
+    // `--no-wm-delete` withholds the WM_PROTOCOLS advertisement, so the fixture looks like a raw
+    // X11 client that never opted into the protocol and glass has to fall back to signalling it.
+    // Default (advertised) matches every real toolkit app. The handler below stays wired up
+    // either way, deliberately: that is what makes the negative tests binding — if glass ever
+    // sent a close request to a window that never advertised the protocol, the fixture would
+    // print `EVENT closed_gracefully` and those tests would fail.
     let no_wm_delete = std::env::args().any(|a| a == "--no-wm-delete");
+    // `--ignore-close` advertises WM_DELETE_WINDOW and then does nothing with it — a real app
+    // sitting on a "save changes?" prompt, or one that has hung. glass has to give up on the ask
+    // and signal instead, which is the only way to reach that path from a test.
+    let ignore_close = std::env::args().any(|a| a == "--ignore-close");
+    // `--close-delay-ms N` spends N ms inside the close handler before exiting, standing in for
+    // an app flushing state on the way out. It is how a test can tell "glass waited for the app"
+    // from "the app happened to be quick".
+    let close_delay = std::env::args()
+        .position(|a| a == "--close-delay-ms")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
     let reparent = std::env::args().any(|a| a == "--reparent");
     let no_self_focus = std::env::args().any(|a| a == "--no-self-focus");
     // `--fork-child` spawns a long-lived child process (a `sleep`) and prints its
@@ -235,18 +249,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::mem::forget(kid); // don't reap on drop; glass's group-reap must get it
     }
 
-    // Announce readiness on stdout (one line, flushed) so tests can sync. The pid line lets a
+    // Announce readiness on stdout (two lines, flushed) so tests can sync. The pid line lets a
     // teardown test check the process itself is gone, which `_NET_WM_PID` cannot answer once the
     // window has been destroyed.
     println!("EVENT pid={}", std::process::id());
     println!("READY w={WIDTH} h={HEIGHT}");
     std::io::stdout().flush()?;
 
+    let close = Close {
+        protocols: wm_protocols,
+        delete: wm_delete_window,
+        ignore: ignore_close,
+        delay_ms: close_delay,
+    };
     if blink {
-        run_blink_loop(&conn, win, gc, &extras, (wm_protocols, wm_delete_window))
+        run_blink_loop(&conn, win, gc, &extras, &close)
     } else {
-        run_event_loop(&conn, win, gc, &extras, (wm_protocols, wm_delete_window))
+        run_event_loop(&conn, win, gc, &extras, &close)
     }
+}
+
+/// How the fixture answers a close request: the atoms that identify one, plus the two knobs
+/// (`--ignore-close`, `--close-delay-ms`) that let a test drive the paths a cooperative app
+/// never takes.
+struct Close {
+    protocols: Atom,
+    delete: Atom,
+    ignore: bool,
+    delay_ms: u64,
 }
 
 /// Whether the event loop should keep running after an event.
@@ -263,10 +293,9 @@ fn dispatch_event(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
-    close: (Atom, Atom),
+    close: &Close,
     event: Event,
 ) -> Result<Flow, Box<dyn std::error::Error>> {
-    let (wm_protocols, wm_delete_window) = close;
     match event {
         // A close request (what a window manager sends on a close-button click, and what glass
         // sends when tearing the app down). Announce that the app's own shutdown path ran, then
@@ -274,8 +303,14 @@ fn dispatch_event(
         // its first data word are checked, so an unrelated client message whose payload happens
         // to carry the atom's value cannot pass for one.
         Event::ClientMessage(e)
-            if e.type_ == wm_protocols && e.data.as_data32()[0] == wm_delete_window =>
+            if e.type_ == close.protocols && e.data.as_data32()[0] == close.delete =>
         {
+            if close.ignore {
+                println!("EVENT ignoring_close_request");
+                std::io::stdout().flush()?;
+                return Ok(Flow::Continue);
+            }
+            std::thread::sleep(Duration::from_millis(close.delay_ms));
             println!("EVENT closed_gracefully");
             std::io::stdout().flush()?;
             return Ok(Flow::Quit);
@@ -325,7 +360,7 @@ fn run_event_loop(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
-    close: (Atom, Atom),
+    close: &Close,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = conn.wait_for_event()?;
@@ -342,7 +377,7 @@ fn run_blink_loop(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
-    close: (Atom, Atom),
+    close: &Close,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     loop {
