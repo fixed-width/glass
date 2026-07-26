@@ -2,3 +2,4 @@
 //! shipped binary works. Experimental surface: not covered by the 1.x freeze.
 
 pub mod report;
+pub mod transport;
