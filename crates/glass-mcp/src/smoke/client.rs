@@ -5,13 +5,10 @@
 //! call with a timeout, so a dedicated reader thread owns the blocking read
 //! loop and forwards each line over an `mpsc` channel; [`wait_for_response`]
 //! bounds the wait on that channel with `recv_timeout` against a deadline that
-//! spans the *whole* call. That's what makes a genuinely silent server — one
-//! that accepts a request and then never writes another byte — fail with "no
-//! response within Ns" instead of hanging the caller forever, not just a
-//! server that's merely slow to produce the matching id. `send`'s write to the
-//! child's stdin has no equivalent bound: a single JSON-RPC message here is
-//! small enough to fit in the OS pipe buffer without blocking in practice, but
-//! that write is not itself deadline-bounded.
+//! spans the *whole* call, so a server that accepts a request and then never
+//! writes another byte fails with "no response within Ns" instead of hanging
+//! the caller forever. `send`'s write to the child's stdin has no equivalent
+//! bound.
 
 use crate::smoke::transport::{CallResult, McpTransport};
 use serde_json::Value;
@@ -26,9 +23,8 @@ use std::time::{Duration, Instant};
 /// A server that has not answered in this long is treated as hung.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How many of the server's last stderr lines to keep for a failure detail. Enough to carry
-/// a panic message or a degrade warning; bounded so a chatty server cannot grow this without
-/// limit over a long run.
+/// How many of the server's last stderr lines to keep for a failure detail: enough for a
+/// panic message or a degrade warning, bounded so a chatty server cannot grow it without limit.
 const STDERR_TAIL_LINES: usize = 20;
 
 #[derive(Debug)]
@@ -119,9 +115,8 @@ impl StdioClient {
         if init.get("result").is_none() {
             return Err(format!("initialize failed: {init}"));
         }
-        // A missing `serverInfo.version` is recorded, not fatal. No check asserts on it — the
-        // report carries it so a reader can tell which build produced the run — so aborting
-        // here would throw away every check's evidence over a missing label.
+        // A missing `serverInfo.version` is recorded, not fatal: no check asserts on it, so
+        // aborting here would throw away every check's evidence over a missing label.
         self.version = init["result"]["serverInfo"]["version"]
             .as_str()
             .map(str::to_string);
@@ -169,9 +164,8 @@ impl StdioClient {
 
     /// The tail of the server's stderr, as a suffix for a failure detail — empty when it
     /// said nothing there. Call only after [`Self::kill_and_reap`]: with the child reaped its
-    /// stderr write end is closed, so joining the reader here is prompt and guarantees the
-    /// tail includes the last thing the server managed to say (typically the panic that
-    /// killed it, which is precisely what "server closed stdout" alone fails to explain).
+    /// stderr write end is closed, so joining the reader here is prompt and the tail includes
+    /// the last thing the server managed to say — typically the panic that killed it.
     fn stderr_note(&mut self) -> String {
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
@@ -188,14 +182,9 @@ impl StdioClient {
         )
     }
 
-    /// Kill and reap the child. Safe to call more than once: `std::process::
-    /// Child` guarantees a repeat `kill`/`wait` is a no-op rather than acting
-    /// on an unrelated process, though the mechanism differs by platform —
-    /// Unix caches the exit status after a successful `wait` and skips
-    /// re-signaling (which would otherwise risk hitting a pid recycled for a
-    /// different process); Windows targets a specific kernel object handle,
-    /// which can never alias to a different process no matter how many times
-    /// it's signaled or waited on.
+    /// Kill and reap the child. Safe to call more than once: `std::process::Child` caches
+    /// the exit status after a successful `wait` on Unix and holds a handle to one specific
+    /// kernel object on Windows, so a repeat `kill`/`wait` cannot signal a recycled pid.
     fn kill_and_reap(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -204,10 +193,8 @@ impl StdioClient {
 
 /// Reads newline-delimited JSON from `stdout` on a dedicated thread and
 /// forwards each raw line to `tx`, until the pipe closes (EOF), a read fails,
-/// or the receiving end is dropped. Owning the blocking read here — instead of
-/// on the thread that's waiting for a specific response — is what lets that
-/// caller bound its wait with `recv_timeout` rather than being at the mercy of
-/// a `read_line` call `std` gives no way to time out directly on a pipe.
+/// or the receiving end is dropped. Owning the blocking read here is what lets
+/// the waiting caller bound its wait with `recv_timeout`.
 fn spawn_stdout_reader(
     mut stdout: BufReader<ChildStdout>,
     tx: Sender<String>,
@@ -256,10 +243,9 @@ fn spawn_stderr_reader(
 /// Waits on `rx` for a JSON-RPC message whose `id` matches, skipping
 /// notifications and responses to other in-flight calls. `budget` bounds the
 /// *whole* wait, not each individual receive: `remaining` shrinks against a
-/// fixed deadline rather than resetting to `budget` on every loop iteration,
-/// so a server that keeps producing unrelated output without ever answering
-/// this request still times out instead of having its deadline pushed back by
-/// every line that arrives.
+/// fixed deadline rather than resetting on every loop iteration, so a server
+/// that keeps producing unrelated output without ever answering this request
+/// still times out.
 fn wait_for_response(rx: &Receiver<String>, id: i64, budget: Duration) -> Result<Value, String> {
     let deadline = Instant::now() + budget;
     loop {
@@ -300,13 +286,10 @@ impl McpTransport for StdioClient {
 
 impl Drop for StdioClient {
     fn drop(&mut self) {
-        // Idempotent even if `request` already did this on a timeout — see
-        // `kill_and_reap`.
+        // Idempotent even if `request` already did this on a timeout — see `kill_and_reap`.
         self.kill_and_reap();
-        // The reader thread's blocked `read_line` only returns once the
-        // child's stdout write end closes, which the kill+wait above
-        // guarantees (the kernel closes it as part of process teardown), so
-        // joining here should be near-instant rather than a real wait.
+        // The reader thread's blocked `read_line` returns only once the child's stdout write
+        // end closes, which the kill+wait above guarantees — so this join must stay after it.
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -373,10 +356,8 @@ mod tests {
     #[test]
     fn wait_for_response_bounds_a_chatty_but_never_matching_server() {
         let (tx, rx) = mpsc::channel::<String>();
-        // Simulates a server that keeps emitting unrelated output (heartbeats,
-        // notifications) but never answers this request. If the deadline were
-        // reset on every arriving line instead of spanning the whole call,
-        // this would hang forever instead of timing out.
+        // A server that keeps emitting unrelated output but never answers this request. If
+        // the deadline reset on every arriving line, this would hang instead of timing out.
         thread::spawn(move || {
             loop {
                 let noise = r#"{"jsonrpc":"2.0","method":"notifications/noise"}"#.to_string();
@@ -396,11 +377,10 @@ mod tests {
         );
     }
 
-    /// `#[cfg(unix)]`: a server that talks only on stderr and never answers on stdout —
-    /// the shape of one that panics or degrades at startup. `sh` with no arguments reads
-    /// commands from stdin, so it rejects each JSON-RPC line on stderr ("not found") and
-    /// never writes a response. Without the stderr capture the whole failure would read
-    /// "no response within Ns", with nothing at all saying why.
+    /// A server that talks only on stderr and never answers on stdout — the shape of one
+    /// that panics or degrades at startup. `sh` with no arguments reads commands from stdin,
+    /// so it rejects each JSON-RPC line on stderr and never writes a response. Without the
+    /// stderr capture the failure would read "no response within Ns" and nothing more.
     #[cfg(unix)]
     #[test]
     fn a_failure_carries_the_servers_stderr_into_the_message() {
@@ -416,14 +396,11 @@ mod tests {
         );
     }
 
-    /// `#[cfg(unix)]` only (not `#[ignore]`): spawns a real, indefinitely-
-    /// running process with no arguments (`yes`, a standard coreutil present
-    /// on every Unix this crate builds for — unlike the genuinely
-    /// environment-dependent `#[ignore]`d tests elsewhere in this crate that
-    /// need Xvfb) and drives it through `StdioClient::spawn_with_timeout` end
-    /// to end. Verifies the actual guarantee — that a timed-out request kills
-    /// the child rather than leaving it running — which `wait_for_response`'s
-    /// unit tests above can't reach (they never touch a real `Child`).
+    /// Spawns a real, indefinitely-running process (`yes`, a standard coreutil present on
+    /// every Unix this crate builds for) and drives it through `spawn_with_timeout` end to
+    /// end. Verifies the actual guarantee — that a timed-out request kills the child rather
+    /// than leaving it running — which `wait_for_response`'s unit tests cannot reach: they
+    /// never touch a real `Child`.
     #[cfg(unix)]
     #[test]
     fn a_timed_out_request_kills_the_child() {
@@ -438,11 +415,9 @@ mod tests {
             err.contains("no response within"),
             "expected a timeout, got {err}"
         );
-        // If `kill_and_reap` failed to actually terminate `yes` (which never
-        // exits on its own), `Child::wait` inside it would block for as long
-        // as `yes` keeps running — effectively forever. Finishing quickly is
-        // itself the evidence the child was really killed, not just that the
-        // deadline fired.
+        // If `kill_and_reap` had not terminated `yes` (which never exits on its own), the
+        // `Child::wait` inside it would block for as long as `yes` keeps running. Finishing
+        // quickly is the evidence the child was really killed, not just that the deadline fired.
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "kill+reap of the child must not hang: {:?}",

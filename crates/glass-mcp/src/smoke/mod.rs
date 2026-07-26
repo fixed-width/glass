@@ -25,10 +25,9 @@ pub struct SmokeOptions {
 }
 
 /// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
-/// backend-recognition predicate — and return the canonical name alongside its candidate
-/// apps. Keying the table off what that returns, rather than matching a literal here, is
-/// what stops `smoke --backend X11` being rejected while `GLASS_BACKEND=X11` is honoured
-/// everywhere else in the binary.
+/// backend-recognition predicate — and return the canonical name alongside its candidate apps.
+/// Keying the table off what that returns is what stops `smoke --backend X11` being rejected
+/// while `GLASS_BACKEND=X11` is honoured everywhere else in the binary.
 fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]), String> {
     let Some(name) = crate::recognized_backend(backend) else {
         return Err(format!(
@@ -62,8 +61,8 @@ const CHECK_NAMES: [(u8, &str); 7] = [
 const STOP_CHECK: (u8, &str) = (8, "stop");
 
 /// Every `(step, name)` a report carries, in order. A `--dry-run` preview is built from this
-/// directly and a real run's rows must match it — which is why the end-to-end gate compares a
-/// real run against a `--dry-run` of the same binary rather than against a hand-copied list.
+/// directly and a real run's rows must match it, which is why the end-to-end gate compares a
+/// real run against a `--dry-run` of the same binary rather than a hand-copied list.
 fn planned_rows() -> Vec<(u8, &'static str)> {
     CHECK_NAMES
         .iter()
@@ -107,9 +106,7 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
 
 /// `run`'s actual logic, taking the search path to probe as a parameter rather than reading
 /// `PATH` itself — the seam that lets tests drive it against a directory they control instead
-/// of the host's real environment. `run` is the only caller that should ever pass the host's
-/// `PATH`; every unit test below goes through this with an explicit path, so none of them
-/// depends on which target apps the machine running the suite happens to have installed.
+/// of the host's real environment. `run` is the only caller that should pass the host's `PATH`.
 fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, String> {
     let (backend, candidates) = candidates_for(&opts.backend)?;
 
@@ -128,12 +125,10 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     };
 
     if opts.dry_run {
-        // Unlike a real run, dry-run must not fail just because no candidate is present: its
-        // whole purpose is "see the plan before driving anything", and the moment a user most
-        // wants that is while setting up — before any candidate is installed. So the plan
-        // records the gap instead of erroring. A forced `--app` is probed too: a plan naming an
-        // app the host does not have is indistinguishable from one it does, and the how-to
-        // sends a stuck reader to `--app` precisely when something is already wrong.
+        // Unlike a real run, dry-run must not fail just because no candidate is present — the
+        // moment a user most wants the plan is while setting up — so it records the gap
+        // instead of erroring. A forced `--app` is probed too: a plan naming an app the host
+        // does not have is otherwise indistinguishable from one it does.
         let app = match forced {
             Some(c) if !profile::runnable(c, path) => TargetApp::Unavailable(format!(
                 "would fail: --app {} was given, but {} is not runnable on PATH",
@@ -169,14 +164,11 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
     // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
-    // takes no backend argument — its verdict grades whatever that resolution produced. So
-    // hand it the backend under test rather than inheriting whatever the caller's shell has
-    // set, or check 2 would grade a backend this run is not exercising. `check_health`
-    // re-reads the server's active backend and fails on a mismatch, so this plumbing breaking
-    // is a visible failure rather than a silently misdirected verdict.
+    // grades whatever that resolution produced. So hand it the backend under test rather than
+    // inheriting the caller's shell, or check 2 would grade a backend this run is not
+    // exercising. `check_health` re-reads the active backend, so this plumbing breaking is a
+    // visible failure rather than a silently misdirected verdict.
     let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", backend)])?;
-    // Reported, not asserted on: a server that answers `initialize` without a version is
-    // recorded as such rather than aborting a run whose checks are all still runnable.
     let version = t.server_version();
     let mut out = vec![
         checks::check_start(&mut t, &p),
@@ -250,8 +242,7 @@ mod tests {
     }
 
     /// The invariant `run_with` is built on: the preview and a real run carry the same rows.
-    /// Pinned against a written-out list, so deleting a [`CHECK_NAMES`] entry fails a test
-    /// instead of silently shortening every report.
+    /// Pinned against a written-out list, so deleting a [`CHECK_NAMES`] entry fails a test.
     #[test]
     fn a_plan_previews_every_check_in_order() {
         let (_dir, path) = host_with(&[]);
@@ -272,9 +263,8 @@ mod tests {
         assert_eq!(r.exit_code(), 0);
     }
 
-    /// The degrade this branch added: previewing before any candidate is installed must not
-    /// fail. What changed is where the gap is *reported* — the `start` row, the check that
-    /// would hit it, rather than the slot that names the selected app.
+    /// Previewing before any candidate is installed must not fail; the gap is reported on the
+    /// `start` row, the check that would hit it, not in the slot that names the selected app.
     #[test]
     fn a_plan_with_no_candidate_says_so_on_the_check_that_would_fail() {
         let (_dir, path) = host_with(&[]);
@@ -310,8 +300,7 @@ mod tests {
     }
 
     /// `--app` selects among the candidates; it does not conjure one. A plan naming an app the
-    /// host does not have looked exactly like a plan that could run — and the how-to sends a
-    /// stuck reader to `--app` precisely when something is already wrong.
+    /// host does not have looked exactly like a plan that could run.
     #[test]
     fn a_plan_marks_a_forced_app_that_is_not_installed() {
         let (_dir, path) = host_with(&["zenity"]);
@@ -360,9 +349,8 @@ mod tests {
 
     #[test]
     fn a_backend_name_is_recognized_the_same_way_the_rest_of_the_binary_recognizes_it() {
-        // `recognized_backend` is case-insensitive, so `GLASS_BACKEND=X11` is honoured
-        // everywhere else; a second, stricter recognition site here would reject the same
-        // spelling the binary otherwise accepts.
+        // `recognized_backend` is case-insensitive, so a second, stricter recognition site
+        // here would reject a spelling the rest of the binary accepts.
         let (_dir, path) = host_with(&[]);
         let r = run_with(
             SmokeOptions {
@@ -397,8 +385,7 @@ mod tests {
     }
 
     /// A name that is not in the candidate table at all is a typo in the caller's input, not
-    /// an environment gap — so it stays a hard error in both modes, unlike a candidate that
-    /// is simply not installed.
+    /// an environment gap, so it stays a hard error in both modes.
     #[test]
     fn an_explicit_app_override_must_exist_in_the_candidate_list() {
         let (_dir, path) = host_with(&[]);

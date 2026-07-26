@@ -22,9 +22,8 @@ pub trait McpTransport {
 
 impl CallResult {
     /// A successful call carrying glass's `{ok,tool,result}` envelope. The one place that
-    /// shape is built for a double — the checks' tests, `--self-check`'s fault injection and
-    /// the envelope tests all go through here, so a change to the frozen envelope shape can't
-    /// be honoured by one caller and missed by another.
+    /// shape is built for a double, so a change to the frozen envelope shape cannot be
+    /// honoured by one caller and missed by another.
     pub fn ok(tool: &str, result: Value, siblings: &[&str], images: usize) -> Self {
         Self {
             is_error: false,
@@ -45,10 +44,10 @@ impl CallResult {
             match item["type"].as_str() {
                 Some("text") => {
                     let text = item["text"].as_str().unwrap_or_default().to_string();
-                    // An error result carries a message, never an envelope: parsing it as
-                    // one would let a stray JSON-shaped error masquerade as a pass. The first
-                    // text block (regardless of preceding non-text items) is the envelope; later
-                    // text blocks are siblings.
+                    // An error result carries a message, never an envelope: parsing it as one
+                    // would let a stray JSON-shaped error masquerade as a pass. The first TEXT
+                    // block — not `content[0]` — is the envelope; later text blocks are
+                    // siblings.
                     if !seen_text_block && !is_error {
                         seen_text_block = true;
                         envelope = serde_json::from_str::<Value>(&text).ok();

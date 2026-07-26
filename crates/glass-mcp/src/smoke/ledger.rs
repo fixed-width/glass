@@ -59,10 +59,9 @@ mod tests {
         reason: "single contact only",
     }];
 
-    /// An entry only ever does anything if both its names match exactly what the run
-    /// produces — [`apply_with`] compares them with `==`. A typo therefore does not fail
-    /// loudly, it just never matches: the limitation everyone believes is accepted hard-fails
-    /// the release instead.
+    /// An entry only does anything if both its names match exactly what the run produces —
+    /// [`apply_with`] compares them with `==`. A typo does not fail loudly, it just never
+    /// matches: the limitation everyone believes is accepted hard-fails the release instead.
     fn validate(ledger: &[LedgerEntry]) -> Result<(), String> {
         let names = crate::smoke::all_check_names();
         for e in ledger {
@@ -88,8 +87,7 @@ mod tests {
     #[test]
     fn a_limit_naming_a_check_that_does_not_exist_is_rejected() {
         // The shipped ledger is empty today, so the test above passes vacuously; this one
-        // proves the validation would actually catch the plausible typo — `"a11y"` for the
-        // real `"a11y snapshot"` — rather than pass on anything.
+        // proves the validation catches the plausible typo — `"a11y"` for `"a11y snapshot"`.
         let err = validate(&[LedgerEntry {
             backend: "x11",
             check: "a11y",

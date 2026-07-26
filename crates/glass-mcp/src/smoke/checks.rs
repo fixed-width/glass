@@ -56,10 +56,9 @@ pub fn check_health(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
 /// "not fail".
 const DOCTOR_VERDICTS: [&str; 3] = ["ok", "warn", "fail"];
 
-/// `check_health`'s body. `glass_doctor`'s `overall` already applies its severity rule (a
-/// non-default backend's failing check is only a warning there), so this reads `overall`
-/// as the verdict rather than re-deriving one from individual check statuses — walking
-/// `sections[].checks[]` is only for naming which check(s) failed.
+/// `check_health`'s body. `glass_doctor`'s `overall` already applies its severity rule — a
+/// non-default backend's failing check is only a warning there — so this reads `overall` as
+/// the verdict; walking `sections[].checks[]` is only for naming which check(s) failed.
 ///
 /// That severity rule is also why this first pins down *which* backend the server is
 /// grading: a verdict about some other backend is not evidence about the one under test.
@@ -67,10 +66,8 @@ fn health(t: &mut dyn McpTransport, p: &Profile) -> Result<String, String> {
     let caps = t.call("glass_capabilities", json!({}))?;
     let caps = check_envelope("glass_capabilities", &caps)?;
     // Deliberately no `backend` argument: this asks which backend the server resolved as
-    // ACTIVE. `glass_doctor` takes no backend argument at all — its `overall` grades whatever
-    // that same resolution produced — so the active backend is the only thing that makes the
-    // verdict below mean anything. Naming a backend here would echo the name straight back
-    // and prove nothing about what `glass_doctor` is about to grade.
+    // ACTIVE, which is what `glass_doctor`'s verdict below grades. Naming a backend here
+    // would echo the name straight back and prove nothing.
     let active = caps["backend"].as_str().ok_or_else(|| {
         format!(
             "glass_capabilities reported no `backend` string (got {}), so which backend \
@@ -158,20 +155,18 @@ pub fn check_a11y(t: &mut dyn McpTransport) -> (CheckOutcome, Option<Vec<Outline
     (outcome(4, "a11y snapshot", r), nodes)
 }
 
-/// The text the interaction check writes: a fresh nonce per run. A fixed string could
-/// collide with text the target app itself displays — `value_contains` would then match
-/// something the check never wrote, and the interaction would look verified when nothing
-/// happened. The nonce makes a match proof that this run's write landed.
+/// The text the interaction check writes: a fresh nonce per run. A fixed string could collide
+/// with text the target app itself displays, and `value_contains` would then match something
+/// the check never wrote — a verified-looking interaction where nothing happened.
 fn probe_text() -> String {
     format!("glass-smoke-{:08x}", rand::rng().random::<u32>())
 }
 
-/// Both interaction paths. The element path is verified through
-/// `glass_wait_for_element`'s `value_contains` — the signal glass actually exposes for a
-/// written value. A written text field's content lands in the a11y `value` property, not
-/// `name`, and the outline text glass renders for an agent carries only `name` — so
-/// "the tool returned ok" is not evidence the app changed, and neither is a re-read of the
-/// outline.
+/// Both interaction paths. The element path is verified through `glass_wait_for_element`'s
+/// `value_contains` — the signal glass actually exposes for a written value. A written text
+/// field's content lands in the a11y `value` property, not `name`, and the outline glass
+/// renders carries only `name`, so neither "the tool returned ok" nor a re-read of the
+/// outline is evidence the app changed.
 ///
 /// `nodes` is `None` when check 4 never produced a tree; that is reported as its own skip
 /// reason rather than blamed on the app.
@@ -191,11 +186,10 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
         );
     };
     let id = target.id;
-    // An unmapped role renders as `Other(<native token>)` in the outline (see
-    // `glass_core::outline::write_line`), which `AxRole::from_name` — the oracle for which
-    // role names glass can address — cannot parse back, so `glass_wait_for_element`'s `role`
-    // selector cannot target it. A skip that says why beats a fail that blames the app for a
-    // role glass itself cannot address.
+    // An unmapped role renders as `Other(<native token>)` in the outline, which
+    // `AxRole::from_name` cannot parse back, so `glass_wait_for_element`'s `role` selector
+    // cannot target it. A skip beats a fail that blames the app for a role glass itself
+    // cannot address.
     if glass_core::AxRole::from_name(&target.role).is_none() {
         return CheckOutcome::skip(
             5,
@@ -226,10 +220,9 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
                         .to_string(),
                 );
             }
-            // The matched element rides in an untrusted sibling (see
-            // `crate::tools::wait::element_sibling`); a missing/unparseable sibling or a
-            // sibling with no `id` means the id cannot be confirmed, not that it mismatches —
-            // only a definite mismatch fails the check.
+            // The matched element rides in an untrusted sibling; a missing, unparseable or
+            // id-less sibling means the id cannot be confirmed, not that it mismatches — only
+            // a definite mismatch fails the check.
             if let Some(matched_id) = matched_element_id(&wait)
                 && matched_id != u64::from(id)
             {
@@ -253,8 +246,8 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
             check_envelope("glass_key", &key)?;
 
             // ...and prove the app really did survive the pixel path, rather than trusting the
-            // choice of chord. Without this, the three checks after it would report on a
-            // corpse and still pass.
+            // choice of chord. Without this, the checks after it would report on a corpse and
+            // still pass.
             let live = t.call("glass_list_windows", json!({}))?;
             let live = check_envelope("glass_list_windows", &live)?;
             if live["count"].as_u64().unwrap_or(0) == 0 {
@@ -269,12 +262,11 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
     )
 }
 
-/// The JSON object carried inside an untrusted-wrapped sibling (the wrapper is a note line,
-/// `⟦untrusted:<nonce>⟧`, the body, then the close marker — not bare JSON, so the object is
-/// located by its outermost braces rather than parsed whole). `None` when there is no
-/// sibling, no `{...}` span, or the span doesn't parse. `get` rather than indexing: a `}`
-/// before a `{` would panic on a slice, and a panic in a release gate aborts the run with no
-/// report at all.
+/// The JSON object carried inside an untrusted-wrapped sibling. The wrapper is a note line,
+/// the markers and the body — not bare JSON — so the object is located by its outermost
+/// braces. `None` when there is no sibling, no `{...}` span, or the span doesn't parse. `get`
+/// rather than indexing: a `}` before a `{` would panic on a slice, and a panic here aborts
+/// the run with no report at all.
 fn untrusted_json(r: &CallResult) -> Option<Value> {
     let sibling = untrusted_sibling(r).ok()?;
     let start = sibling.find('{')?;
@@ -294,10 +286,9 @@ pub fn check_logs(t: &mut dyn McpTransport) -> CheckOutcome {
         t.call("glass_logs", json!({})).and_then(|r| {
             check_envelope("glass_logs", &r)?;
             // `glass_logs` wraps its `{"lines":[…]}` body unconditionally — an app that
-            // logged nothing still gets the wrapper around an empty array (see
-            // `crate::tools::capture::logs`). So a missing sibling is not "no output", it is
-            // the untrusted wrapper having stopped being emitted: the exact freeze violation
-            // this check exists to catch.
+            // logged nothing still gets the wrapper around an empty array. So a missing
+            // sibling is not "no output", it is the untrusted wrapper having stopped being
+            // emitted: the freeze violation this check exists to catch.
             let sibling = untrusted_sibling(&r)?;
             let lines = untrusted_json(&r)
                 .as_ref()
@@ -336,10 +327,10 @@ pub fn check_error_honesty(t: &mut dyn McpTransport) -> CheckOutcome {
         );
     }
     let msg = r.siblings.join(" ");
-    // The error must be about the stale id this check provoked. A run with no session, or
-    // one that never took a snapshot, answers with `NoActiveSession` / `NoAxSnapshot`
-    // instead — both perfectly actionable, so grading their wording would hand this check a
-    // green precisely in the runs already broken further up.
+    // The error must be about the stale id this check provoked. A run with no session, or one
+    // that never took a snapshot, answers with `NoActiveSession` / `NoAxSnapshot` instead —
+    // both actionable, so grading their wording would hand this check a green precisely in
+    // the runs already broken further up.
     if !msg.contains(&STALE_ELEMENT_ID.to_string()) {
         return CheckOutcome::skip(
             STEP,
@@ -488,8 +479,7 @@ mod tests {
     }
 
     /// A `glass_doctor` result mirroring the server's real payload shape
-    /// (`{report, sections, overall}`), not the `{checks}` shape a stale mock once
-    /// fabricated and hid this bug behind.
+    /// (`{report, sections, overall}`), not the `{checks}` shape a stale mock once fabricated.
     fn doctor_result(overall: &str, sections: Value) -> Value {
         json!({ "report": "glass doctor\n...", "overall": overall, "sections": sections })
     }
@@ -554,7 +544,7 @@ mod tests {
     fn health_fails_when_the_server_is_on_a_different_backend_than_the_one_under_test() {
         // The reproduced defect: with the server resolving another backend, `overall` applies
         // its severity rule to THAT backend — a broken x11 there is only a warning — so this
-        // check would report Pass while saying nothing about x11.
+        // check reported Pass while saying nothing about x11.
         let mut t = ScriptedTransport::new(vec![
             ("glass_capabilities", Ok(caps("wayland"))),
             ("glass_doctor", Ok(doctor("warn", x11_sections("fail")))),
@@ -633,9 +623,8 @@ mod tests {
     }
 
     /// A `glass_wait_for_element` match, wrapped exactly as the real tool wraps it: a note
-    /// line, the nonce-delimited markers, then the element JSON — not bare JSON. Building it
-    /// through the real wrapper (rather than a hand-rolled marker string) is what makes the
-    /// extraction in `matched_element_id` actually exercised by these tests.
+    /// line, the nonce-delimited markers, then the element JSON — not bare JSON. Going through
+    /// the real wrapper is what actually exercises `matched_element_id`'s extraction.
     fn matched_element(id: u32) -> String {
         let body = json!({
             "id": id,
@@ -719,8 +708,8 @@ mod tests {
 
     #[test]
     fn interaction_fails_when_the_app_is_gone_after_the_pixel_path() {
-        // The failure mode the liveness re-read exists for: the key dismissed the app. Checks
-        // 8-10 would all still pass against the dead session, so this check has to say so.
+        // The failure mode the liveness re-read exists for: the key dismissed the app. The
+        // checks after it would all still pass against the dead session.
         let mut t = ScriptedTransport::new(interaction_script(
             json!({ "matched": true, "elapsed_ms": 5 }),
             &[],
@@ -832,8 +821,8 @@ mod tests {
     }
 
     /// Reproduced live: check 4 failed, and this check then went green on `NoAxSnapshot`'s
-    /// remedy ("call glass_a11y_snapshot first") — an error about a missing snapshot, not
-    /// about the stale id it set out to provoke. Green precisely in a run already broken.
+    /// remedy — an error about a missing snapshot, not about the stale id it set out to
+    /// provoke. Green precisely in a run already broken.
     #[test]
     fn error_honesty_skips_when_the_error_is_not_about_the_stale_id() {
         let msg = glass_core::GlassError::NoAxSnapshot.to_string();
@@ -952,7 +941,7 @@ mod tests {
     #[test]
     fn a_closing_brace_before_an_opening_one_does_not_panic() {
         // `matched_element_id` locates the body by its outermost braces; a sibling shaped
-        // like this would panic on a slice. A panic in a release gate loses the report.
+        // like this would panic on a slice, and a panic loses the report.
         let r = CallResult {
             is_error: false,
             envelope: None,

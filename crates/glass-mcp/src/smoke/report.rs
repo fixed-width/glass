@@ -7,12 +7,9 @@ use serde::Serialize;
 /// `XPass` is a known limitation that has started passing — reported so the support
 /// matrix does not quietly rot, but never a failure.
 ///
-/// One report carries both renderings — the text report and the JSON — so [`Display`]
-/// and the serde representation must spell each status identically, or the docs telling a
-/// reader to grep the JSON for what they saw on screen would be wrong. The text report
-/// prints this spelling on every row, which is also what keeps the five statuses apart
-/// where two of them share a glyph — see [`CheckStatus::severity`].
-/// `display_matches_the_serialized_spelling` holds them together.
+/// One report carries both renderings, so [`Display`] and the serde representation must
+/// spell each status identically: the docs tell a reader to grep the JSON for what they saw
+/// on screen. `display_matches_the_serialized_spelling` holds them together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -25,9 +22,8 @@ pub enum CheckStatus {
 
 impl std::fmt::Display for CheckStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `pad`, not `write_str`: the text report asks for `{:<5}` so the four- and
-        // five-letter statuses put the step number in the same column, and `write_str`
-        // silently drops the formatter's width.
+        // `pad`, not `write_str`: the report asks for `{:<5}` so the four- and five-letter
+        // statuses put the step number in the same column, and `write_str` drops the width.
         f.pad(match self {
             CheckStatus::Pass => "pass",
             CheckStatus::Fail => "fail",
@@ -39,14 +35,11 @@ impl std::fmt::Display for CheckStatus {
 }
 
 impl CheckStatus {
-    /// This status as one of `doctor`'s, which is what supplies the glyph and the summary
-    /// bucket. Mapping onto that vocabulary rather than inventing a second one is what keeps
-    /// the two reports readable side by side; deriving both the glyph and the count from it
-    /// is what stops a row's glyph and the summary line disagreeing.
+    /// This status as one of `doctor`'s, which supplies the glyph and the summary bucket.
+    /// Deriving both from it is what stops a row's glyph and the summary line disagreeing.
     ///
-    /// `XFail` and `XPass` both land on `Warn`: neither fails a run, and both are the same
-    /// kind of thing to look at — a recorded limitation. They are told apart by the status
-    /// word printed beside the glyph, not by the glyph.
+    /// `XFail` and `XPass` both land on `Warn` — neither fails a run, both are a recorded
+    /// limitation — so they are told apart by the status word beside the glyph, not the glyph.
     fn severity(self) -> DoctorStatus {
         match self {
             CheckStatus::Pass => DoctorStatus::Ok,
@@ -91,8 +84,7 @@ impl CheckOutcome {
 }
 
 /// Whether the run drove anything. A `--dry-run` exercises nothing — every check is a `skip`,
-/// so the run *cannot* fail — and a bare `PASS` over that would read as "this build works" to
-/// the three channels (heading, exit code, statuses) a reader or script actually consults.
+/// so the run *cannot* fail — and a bare `PASS` over that would read as "this build works".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -102,23 +94,22 @@ pub enum RunMode {
     DryRun,
 }
 
-/// The app the run drove, or why it had none. Modelled as one value with two states rather
-/// than a `String` carrying either, so a JSON consumer reads a discriminant instead of
-/// sniffing a label for substrings that would tell it a remedy sentence from an app name.
+/// The app the run drove, or why it had none. Two states rather than a `String` carrying
+/// either, so a JSON consumer reads a discriminant instead of sniffing a label for the
+/// difference between a remedy sentence and an app name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum TargetApp {
-    /// The candidate selected, by label. Reports from different hosts are only comparable
-    /// if this is visible.
+    /// The candidate selected, by label.
     Selected(String),
     /// No app was available; the value says why and what to do. Only a `--dry-run` report can
-    /// carry this — a real run needs an app and stops before it has a report to put it in.
+    /// carry this: a real run needs an app and stops before it has a report to put it in.
     Unavailable(String),
 }
 
 impl TargetApp {
-    /// The remedy note, when there is no app. The place to *read* it is the `start` check's
-    /// `detail`, where the docs already send a reader; this is where that row gets it from.
+    /// The remedy note, when there is no app. It is rendered in the `start` check's `detail`,
+    /// where the docs send a reader.
     pub fn note(&self) -> Option<&str> {
         match self {
             Self::Selected(_) => None,
@@ -127,9 +118,8 @@ impl TargetApp {
     }
 }
 
-/// The one-word label for the report's header line. Deliberately short in both states: the
-/// header is a subtitle slot, and a sentence in it is what made an unusable host read as
-/// healthy. The sentence lives in the `start` row instead.
+/// The one-word label for the report's header line. Short in both states: a sentence in that
+/// subtitle slot is what made an unusable host read as healthy; it lives in the `start` row.
 impl std::fmt::Display for TargetApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -143,10 +133,8 @@ impl std::fmt::Display for TargetApp {
 pub struct SmokeReport {
     pub backend: String,
     /// The version the server reported at `initialize`, or `None` when it reported none.
-    /// Nothing asserts on it — it is here so a report attached to an issue says which build
-    /// produced it — so a server that omits it is recorded as `null` rather than ending the
-    /// run. `null` is a discriminant a JSON consumer reads directly, unlike a placeholder
-    /// string it would have to recognise.
+    /// Nothing asserts on it, so a server that omits it is recorded as `null` — a discriminant
+    /// a JSON consumer reads directly — rather than ending the run.
     pub version: Option<String>,
     pub mode: RunMode,
     pub app: TargetApp,
@@ -182,18 +170,14 @@ impl SmokeReport {
 
     /// The human report, in the shape `glass-mcp doctor` uses
     /// ([`glass_core::Diagnosis::render_text`]): a heading, one glyph-prefixed line per check,
-    /// and a trailing `Summary:` line ending in the verdict. `--report` writes the JSON;
-    /// this is the channel a person reads.
+    /// and a trailing `Summary:` line ending in the verdict.
     pub fn to_text(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
         let verdict = self.verdict();
         // Every interpolated value goes through `one_line`, not only the ones that need it
-        // today. `version` is the one that can actually carry a newline — it is `git describe`
-        // output on a real run — and `detail` carries arbitrary text. `backend` is a canonical
-        // literal and `app`'s `Display` yields a label or a fixed string, so neither needs it
-        // now; both go through it anyway, because the reason the app field fell outside this
-        // hardening once was that it started safe and *became* error-derived later.
+        // today: the app field fell outside this hardening once because it started safe and
+        // *became* error-derived later.
         let _ = writeln!(
             out,
             "glass smoke — {} — {verdict}\nglass-mcp {} · app: {}\n",
@@ -210,9 +194,8 @@ impl SmokeReport {
                 DoctorStatus::Fail => fail += 1,
                 DoctorStatus::Skip => skipped += 1,
             }
-            // The status word is printed as well as the glyph: `xfail` and `xpass` share
-            // `⚠`, and it is also the spelling the JSON uses, so what a reader sees here is
-            // what they can grep the report file for.
+            // The status word as well as the glyph: `xfail` and `xpass` share `⚠`, and this
+            // is the spelling the JSON uses, so a reader can grep for what they saw.
             let _ = writeln!(
                 out,
                 "  {} {:<5} {} {}: {}",
@@ -223,9 +206,8 @@ impl SmokeReport {
                 one_line(&c.detail)
             );
             if c.status == CheckStatus::XPass {
-                // Doctor's continuation-line convention, carrying the "reported" an `xpass`
-                // promises: a limitation that has quietly been fixed must not rot the support
-                // matrix.
+                // Doctor's continuation-line convention: a limitation that has quietly been
+                // fixed must not rot the support matrix.
                 let _ = writeln!(
                     out,
                     "      → stale limitation: recorded as a known limitation but passed — \
@@ -242,14 +224,11 @@ impl SmokeReport {
     }
 }
 
-/// Collapse one value onto a single line so it cannot break the report's layout. Every line
-/// of the report means something positionally — a check row, a continuation, the summary — so
-/// a value spilling onto its own line would read as one of those, and a detail long on
-/// newlines could push the summary off a reader's screen entirely. Arbitrary text reaches
-/// `detail`: `check_error_honesty` formats raw tool error text into it, and
-/// `GlassError::AccessibilityUnavailable` forwards backend stdout verbatim, so a newline
-/// cannot be assumed absent. Nothing else needs escaping — the format has no delimiter a
-/// value could impersonate.
+/// Collapse one value onto a single line so it cannot break the report's layout: every line
+/// means something positionally, so a value spilling onto its own line reads as a row of its
+/// own. Arbitrary text reaches `detail` — `GlassError::AccessibilityUnavailable` forwards
+/// backend stdout verbatim — so a newline cannot be assumed absent. Nothing else needs
+/// escaping: the format has no delimiter a value could impersonate.
 fn one_line(s: &str) -> String {
     s.replace("\r\n", "\n").replace(['\n', '\r'], " ")
 }
@@ -291,8 +270,6 @@ mod tests {
 
     #[test]
     fn display_matches_the_serialized_spelling() {
-        // One report renders both; the docs tell readers to grep the JSON for the status they
-        // saw on screen, which only works while these two agree.
         for status in [
             CheckStatus::Pass,
             CheckStatus::Fail,
@@ -309,9 +286,9 @@ mod tests {
         }
     }
 
-    /// Two statuses share `⚠`, so the glyph alone cannot carry all five. Every row therefore
-    /// prints the status word too, and it is the pair that must be unique — otherwise `xfail`
-    /// and `xpass`, which mean opposite things about a limitation, would read identically.
+    /// Two statuses share `⚠`, so the glyph alone cannot carry all five: every row prints the
+    /// status word too, and it is the pair that must be unique. Otherwise `xfail` and `xpass`,
+    /// which mean opposite things about a limitation, would read identically.
     #[test]
     fn every_status_renders_a_distinguishable_row() {
         let mut rendered = std::collections::HashSet::new();
@@ -376,8 +353,7 @@ mod tests {
     }
 
     /// The glyphs are doctor's, so a reader moving between the two reports reads the same
-    /// vocabulary. This pins the mapping itself — the summary buckets are derived from it, so
-    /// a change here moves both together.
+    /// vocabulary. Pinning the mapping pins the summary buckets too: they derive from it.
     #[test]
     fn the_glyphs_are_doctors() {
         assert_eq!(CheckStatus::Pass.severity(), DoctorStatus::Ok);
@@ -423,8 +399,7 @@ mod tests {
     }
 
     /// A `|` used to be escaped, because it would have shifted a markdown table's columns.
-    /// The text report has no such delimiter, so it must now survive verbatim — and still on
-    /// one line.
+    /// The text report has no such delimiter, so it must now survive verbatim, and on one line.
     #[test]
     fn a_pipe_in_a_detail_is_rendered_verbatim_on_one_line() {
         let text = report(vec![CheckOutcome::fail(
@@ -450,11 +425,9 @@ mod tests {
                 CheckOutcome::fail(8, "stop", "the row that must not vanish"),
             ]
         };
-        // Compared against a baseline whose detail carries the same text with no newline in
-        // it, the way the header's sibling test does. Counting lines that merely *look* like
-        // rows would not fail if the collapsing were removed: a spilled fragment starts at
-        // column 0, so an indent-prefix filter would not count it and the total would still
-        // come out right.
+        // Compared against a baseline carrying the same text with no newline in it. Counting
+        // lines that merely *look* like rows would not fail if the collapsing were removed: a
+        // spilled fragment starts at column 0, so an indent-prefix filter would miss it.
         let clean = report(rows("line one line two")).to_text();
         let text = report(rows("line one\nline two")).to_text();
         assert_eq!(
@@ -500,8 +473,7 @@ mod tests {
     }
 
     /// A server that answered `initialize` without a version no longer ends the run, so the
-    /// heading has to say the version is missing rather than leave an empty slot that reads
-    /// like a rendering bug.
+    /// heading says the version is missing rather than leaving an empty slot.
     #[test]
     fn an_unreported_version_says_so_in_the_heading() {
         let mut r = report(vec![]);
@@ -527,15 +499,14 @@ mod tests {
         );
     }
 
-    /// The header must survive the same text the `detail`s are hardened against. `version` is
-    /// the value that can genuinely carry a newline — it is `git describe` output on a real
-    /// run — and `app` is the one that became error-derived after the details were hardened.
+    /// The header must survive the same text the `detail`s are hardened against: `version`
+    /// can genuinely carry a newline (it is `git describe` output on a real run), and `app`
+    /// became error-derived after the details were hardened.
     #[test]
     fn a_newline_in_a_header_value_cannot_break_the_report() {
         const HOSTILE: &str = "we\nird | value";
         let row = || vec![CheckOutcome::pass(1, "start", "800x600")];
-        // What the report looks like with nothing hostile in it. Deriving the expected line
-        // count beats writing one down: it stays right as the header gains or loses lines.
+        // Derived, not written down, so it stays right as the header gains or loses lines.
         let clean = report(row()).to_text().lines().count();
 
         let mut with_app = report(row());

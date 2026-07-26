@@ -30,9 +30,8 @@ fn read_report(path: &std::path::Path) -> serde_json::Value {
 }
 
 /// The checks the CI fixture controls end to end: the runner installs the target app and the
-/// accessibility bus, so each of these must actually be `pass`. `Skip` exits 0, so without
-/// this a check that degraded to a skip — `interaction` when the app stops exposing an
-/// editable element, say — would keep CI green forever while proving nothing.
+/// accessibility bus, so each of these must actually be `pass`. `Skip` exits 0, so a check
+/// that degraded to a skip would otherwise keep CI green while proving nothing.
 ///
 /// `capabilities+doctor` grades the host environment rather than the fixture, so it is not
 /// pinned to `pass` here.
@@ -82,8 +81,8 @@ fn smoke_x11_passes_against_a_real_app() {
     );
 
     // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's
-    // rows. Sourcing the expectation from the same binary's own plan — rather than a list
-    // copied into this file — is what keeps the two from drifting apart unnoticed.
+    // rows. Sourcing the expectation from the same binary's own plan, rather than a list
+    // copied into this file, is what keeps the two from drifting apart unnoticed.
     let plan_path = dir.path().join("plan.json");
     let plan = Command::new(SERVER)
         .args(["smoke", "--backend", "x11", "--dry-run", "--report"])

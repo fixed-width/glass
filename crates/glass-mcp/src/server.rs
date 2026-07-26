@@ -62,7 +62,7 @@ fn map_tool_result(result: ToolResult) -> CallToolResult {
 /// consumers read, plus the same data structured — `sections` and the `overall`
 /// verdict — so an agent can branch on status without parsing prose. Kept pure
 /// (no async / no probing) so the shape is unit-testable against a hand-built
-/// `Diagnosis`, independent of what this host's real checks report.
+/// `Diagnosis`.
 fn doctor_result(diag: &glass_core::Diagnosis, backend: &str) -> serde_json::Value {
     serde_json::json!({
         "report": diag.render_text(backend),
@@ -752,8 +752,8 @@ mod tests {
         let v = doctor_result(&diag, "x11");
 
         // The single field a consumer should branch on: x11 is the queried backend, so its
-        // Fail is critical and the run-wide verdict is "fail" — a lowercase string, not the
-        // Rust-side `CheckStatus::Fail` debug spelling.
+        // Fail is critical and the verdict is "fail" — lowercase, not the Rust-side
+        // `CheckStatus::Fail` debug spelling.
         assert_eq!(v["overall"], "fail");
         assert_eq!(
             v["sections"][0]["checks"][0]["status"], "fail",

@@ -106,9 +106,8 @@ fn bin_list(candidates: &[Candidate]) -> String {
 }
 
 /// Pick the first candidate runnable on `path` — the value of `PATH`, or `None` when the
-/// variable is unset. Taking the search path rather than reading the environment is what lets
-/// the probe below be tested against a directory the test controls, instead of whichever apps
-/// the machine running the suite happens to have.
+/// variable is unset. Taking the search path as a parameter is what lets the probe be tested
+/// against a directory the test controls rather than the host's real environment.
 pub fn resolve_app(
     candidates: &'static [Candidate],
     path: Option<&OsStr>,
@@ -121,24 +120,22 @@ pub fn resolve_app(
 }
 
 /// Is this specific candidate runnable, without regard to probe order? What `--app` needs:
-/// the caller has already chosen which candidate, and only wants to know whether the plan it
-/// is about to print could actually be carried out.
+/// the caller has already chosen the candidate and only asks whether it could run.
 pub fn runnable(candidate: &Candidate, path: Option<&OsStr>) -> bool {
     path.is_some_and(|p| on_path_in(candidate.bin, p))
 }
 
 /// Is `bin` runnable as a bare command name on `path`? Delegates to the workspace's one
 /// `execvp`-semantics resolver — a regular file carrying an execute bit, first `$PATH` entry
-/// wins — rather than testing `is_file()`, which would accept a mode-644 file named `xed` and
-/// hand the run an "app" that cannot launch.
+/// wins — rather than `is_file()`, which would accept a mode-644 file named `xed` and hand
+/// the run an "app" that cannot launch.
 fn on_path_in(bin: &str, path: &OsStr) -> bool {
     glass_sandbox_core::resolve_on_path_in(OsStr::new(bin), path).is_some()
 }
 
 /// Test-only: a directory of real files to search — `bins` executable, `data` left mode-644 —
 /// paired with the `$PATH` value naming it. Tests probe this rather than a stand-in predicate,
-/// so what they exercise is the resolution a run actually performs; and they never read the
-/// host's own `PATH`, so no test depends on which apps the machine happens to have.
+/// so what they exercise is the resolution a run actually performs.
 #[cfg(test)]
 pub(crate) fn path_fixture(
     bins: &[&str],
@@ -176,14 +173,12 @@ pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
         };
         let rest = rest.trim_start();
 
-        // Extract role (first word)
         let role = rest
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_string();
 
-        // Find what comes after the role
         let after_role = rest
             .split_whitespace()
             .nth(1)
@@ -193,7 +188,6 @@ pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
             })
             .unwrap_or("");
 
-        // Parse name if present (starts with ")
         let (name, after_name) = if let Some(quoted) = after_role.strip_prefix('"') {
             match parse_escape_quoted_string(quoted) {
                 Some((name_str, remainder)) => (Some(name_str), remainder.trim_start()),
@@ -203,7 +197,6 @@ pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
             (None, after_role)
         };
 
-        // Parse states (last [...] group in after_name)
         let states = parse_states(after_name);
 
         nodes.push(OutlineNode {
@@ -229,11 +222,9 @@ fn parse_escape_quoted_string(s: &str) -> Option<(String, &str)> {
 
         match ch {
             '"' => {
-                // Found closing quote
                 return Some((result, &s[consumed_len..]));
             }
             '\\' => {
-                // Escape sequence
                 let next_ch = chars.next()?;
                 consumed_len += next_ch.len_utf8();
                 match next_ch {
@@ -253,7 +244,6 @@ fn parse_escape_quoted_string(s: &str) -> Option<(String, &str)> {
         }
     }
 
-    // No closing quote found
     None
 }
 
@@ -304,8 +294,7 @@ mod tests {
     }
 
     /// The bug this pins: `xed` present but not executable is not an app. Reading it as one
-    /// selects a candidate that cannot launch, so the run fails at check 1 with a launch error
-    /// instead of falling through to a candidate that would have worked.
+    /// selects a candidate that cannot launch, instead of falling through to one that works.
     #[cfg(unix)]
     #[test]
     fn a_non_executable_file_is_not_a_candidate() {
@@ -349,9 +338,8 @@ mod tests {
         }
     }
 
-    /// A dry run drives nothing, so its wording must not claim an app is required *now* — the
-    /// real-run sentence ("the smoke run drives a real app") is false in the mode that prints
-    /// the plan.
+    /// A dry run drives nothing, so the real-run sentence ("the smoke run drives a real app")
+    /// is false in the mode that prints the plan.
     #[test]
     fn the_plan_note_does_not_repeat_the_real_runs_claim() {
         let note = NoTargetApp::NoneInstalled.plan_note(&X11_CANDIDATES);

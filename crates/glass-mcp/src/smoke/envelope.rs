@@ -9,13 +9,10 @@ const UNTRUSTED_MARKER: &str = "⟦untrusted:";
 
 /// Assert the frozen `{ok,tool,result}` envelope and return the inner `result`.
 pub fn check_envelope(tool: &str, r: &CallResult) -> Result<Value, String> {
-    // An error result is reported as what it is, before anything looks for an envelope.
-    // `CallResult::from_mcp` deliberately leaves `envelope: None` on `isError` — the message
-    // is not an envelope and must never be parsed as one — so without this arm every ordinary
-    // tool failure fell through to "no envelope in the first content block" and told the
-    // operator the frozen protocol surface had broken, while the server's actual explanation
-    // sat unread in `siblings`. Whatever the server said is what the caller needs to triage,
-    // so it is forwarded whole rather than excerpted.
+    // `CallResult::from_mcp` leaves `envelope: None` on `isError` — the message is not an
+    // envelope and must never be parsed as one — so without this arm an ordinary tool failure
+    // fell through to "no envelope in the first content block", reporting the frozen protocol
+    // surface as broken while the server's own explanation sat unread in `siblings`.
     if r.is_error {
         let msg = r.siblings.join(" ");
         return Err(if msg.trim().is_empty() {
@@ -67,23 +64,17 @@ pub fn untrusted_sibling(r: &CallResult) -> Result<&str, String> {
 /// a value to pass, an action to take). A message that states only a cause
 /// ("no clickable on-screen geometry") fails, which is the regression this guards.
 ///
-/// Beyond generic English pointer verbs, `"re-snapshot"` is also recognized: it's the
-/// codebase-wide idiom for "take a fresh accessibility snapshot before retrying" (used
-/// identically by `GlassError::AxElementNotFound` and `AxElementChanged`) — added after the
-/// first real run against `glass-core`'s actual error text (this file's earlier test cases
-/// were all hand-written, never checked against it).
+/// Beyond generic English pointer verbs, `"re-snapshot"` is recognized too: it is the
+/// codebase-wide idiom for "take a fresh accessibility snapshot before retrying", used by
+/// `GlassError::AxElementNotFound` and `AxElementChanged`.
 ///
-/// A message that names one of glass's own registered tools is also inherently a pointer,
-/// however the sentence is phrased (`AxElementNotEditable` names three: "focus it with
-/// glass_click, then enter text with glass_type / glass_key instead" — no generic pointer
-/// verb, but plainly actionable). That check matches against [`crate::server::registered_tools`]
-/// — the live `#[tool]` registry — rather than a bare `"glass_"` substring, deliberately:
-/// app-controlled or backend-controlled text can contain that prefix in a path or filename
-/// with no tool in sight (e.g. the Android reader forwarding raw `uiautomator` stdout that
-/// happens to mention its own dump path, `/sdcard/glass_dump.xml`, or the Windows clipboard
-/// shim's `glass_clip_hook.dll`) — see the regression tests below. Matching the exact
-/// registered names avoids that false positive and stays correct as tools are added or
-/// renamed, so resist simplifying this back to `contains("glass_")`.
+/// A message that names one of glass's own registered tools is also a pointer, however the
+/// sentence is phrased (`AxElementNotEditable` names three, with no generic pointer verb).
+/// That check matches against [`crate::server::registered_tools`] — the live `#[tool]`
+/// registry — rather than a bare `"glass_"` substring: app- or backend-controlled text can
+/// carry that prefix in a path or filename with no tool in sight (the Android reader's
+/// `/sdcard/glass_dump.xml`, the Windows clipboard shim's `glass_clip_hook.dll` — see the
+/// regression tests below), so resist simplifying this back to `contains("glass_")`.
 /// Every pointer is matched as a run of WHOLE words, never as a raw substring: `"use"` sits
 /// inside `because`, `"try"` inside `geometry` and `registry`, `"set"` inside `offset`, so a
 /// substring match scored a cause-only message like "at-spi registry not running" actionable.
@@ -110,9 +101,8 @@ pub fn names_a_remedy(msg: &str) -> bool {
 
 /// Alphanumeric word runs: `-` and `_` separate, so `re-snapshot` and `glass_click_element`
 /// each tokenize into their parts and are matched as consecutive words by
-/// [`contains_phrase`]. Same tokenizer, and same reason, as the doc-lint in `server.rs`
-/// (`names_windows_backend`), which was written to stop `windows` matching inside
-/// `reposition windows`.
+/// [`contains_phrase`]. Same tokenizer as the doc-lint in `server.rs`
+/// (`names_windows_backend`).
 fn words(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -148,9 +138,8 @@ mod tests {
         assert_eq!(result["width"], json!(800));
     }
 
-    /// A missing envelope on a *successful* result is a genuine freeze violation and must
-    /// keep failing with exactly this message. The `is_error` arm above sits in front of it,
-    /// so this pins that the arm did not swallow the case it was added beside.
+    /// A missing envelope on a *successful* result is a genuine freeze violation: this pins
+    /// that the `is_error` arm in front of it did not swallow the case it was added beside.
     #[test]
     fn a_missing_envelope_on_a_successful_result_is_still_rejected() {
         let c = CallResult {
@@ -167,9 +156,8 @@ mod tests {
     }
 
     /// The defect this arm exists for: an ordinary tool failure reported the frozen protocol
-    /// surface as broken — "no `{ok,tool,result}` envelope in the first content block" — while
-    /// the server's own explanation sat unread in `siblings`. Built from the live `GlassError`
-    /// rather than a literal, so it tracks glass-core's actual wording.
+    /// surface as broken while the server's own explanation sat unread in `siblings`. Built
+    /// from the live `GlassError`, so it tracks glass-core's actual wording.
     #[test]
     fn a_tool_error_carries_the_servers_own_message() {
         let msg =
@@ -271,8 +259,7 @@ mod tests {
 
     /// `"try "` sits inside `geometry` and `registry`, `"use "` inside `because`, `"set "`
     /// inside `offset` — every one of these is a cause-only message that a substring match
-    /// scored actionable. The canonical `no clickable on-screen geometry` case above only
-    /// still failed because nothing happened to follow the word.
+    /// scored actionable, and that the canonical case above happened not to catch.
     #[test]
     fn a_pointer_verb_hiding_inside_a_longer_word_is_not_a_remedy() {
         for msg in [
@@ -298,11 +285,9 @@ mod tests {
     }
 
     /// Regression for the x11 end-to-end run (`tests/smoke_x11.rs`): `glass_click_element`
-    /// on a stale id returned this exact message, and the pre-existing `POINTERS` list
-    /// didn't recognize its "re-snapshot" remedy clause — a false negative caught only
-    /// once the harness ran against real glass, not a scripted transport. Constructed from
-    /// the live enum (not a copied string) so this tracks `glass-core`'s actual wording
-    /// rather than a frozen snapshot of it.
+    /// on a stale id returned this message, and `POINTERS` didn't recognize its "re-snapshot"
+    /// remedy clause — a false negative only a run against real glass could surface.
+    /// Constructed from the live enum, so it tracks `glass-core`'s actual wording.
     #[test]
     fn recognizes_ax_element_not_found_re_snapshot_wording() {
         let msg = glass_core::GlassError::AxElementNotFound(999_999).to_string();
@@ -316,8 +301,7 @@ mod tests {
         assert!(names_a_remedy(&msg), "should recognize re-snapshot: {msg}");
     }
 
-    /// This variant names three tools ("focus it with glass_click, then enter text with
-    /// glass_type / glass_key instead") without using any generic pointer verb, so it only
+    /// This variant names three tools without using any generic pointer verb, so it only
     /// passes via the registered-tool-name signal, not `POINTERS`.
     #[test]
     fn recognizes_ax_element_not_editable_named_tools() {
@@ -328,13 +312,11 @@ mod tests {
         );
     }
 
-    /// Regression for the false positive a bare `contains("glass_")` check would produce:
-    /// the Android a11y reader forwards raw `uiautomator` stdout verbatim into
-    /// `GlassError::AccessibilityUnavailable` (`glass-android/src/axmap.rs`'s
-    /// `check_dump_status`), and the dump file it polls is `/sdcard/glass_dump.xml`
-    /// (`glass-android/src/a11y.rs`'s `DUMP_PATH`) — so a real device failure can read
-    /// "uiautomator dump failed: /sdcard/glass_dump.xml: Permission denied", stating only a
-    /// cause, naming no tool at all.
+    /// The false positive a bare `contains("glass_")` check would produce: the Android a11y
+    /// reader forwards raw `uiautomator` stdout verbatim into
+    /// `GlassError::AccessibilityUnavailable`, and the dump file it polls is
+    /// `/sdcard/glass_dump.xml` — so a real device failure can name that path while stating
+    /// only a cause.
     #[test]
     fn android_dump_path_is_not_mistaken_for_a_tool_name() {
         let msg = "uiautomator dump failed: /sdcard/glass_dump.xml: Permission denied";
@@ -342,8 +324,8 @@ mod tests {
     }
 
     /// Same false-positive shape on Windows: the injected clipboard-shim DLL is
-    /// `glass_clip_hook.dll` (`glass-windows/src/containment/config.rs`'s `hook_dll_path`),
-    /// so a load failure naming that file, and nothing else, must still read as cause-only.
+    /// `glass_clip_hook.dll`, so a load failure naming that file must still read as
+    /// cause-only.
     #[test]
     fn windows_clip_hook_dll_path_is_not_mistaken_for_a_tool_name() {
         let msg = "failed to load glass_clip_hook.dll: The specified module could not be found.";
