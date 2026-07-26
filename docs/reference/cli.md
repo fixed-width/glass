@@ -64,16 +64,19 @@ not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#
 ## `smoke`
 
 **Experimental** — see [Stability and versioning](stability.md#experimental-subcommands). Drive
-glass's own MCP tools against a real app and report whether this build works end to end. See
-[how-to/verify-your-install.md](../how-to/verify-your-install.md) for what each check means and how
-to read the report.
+glass's own MCP tools against a real app and report whether this build works end to end. The checks,
+the statuses, and the report's fields are described in
+[smoke checks and report](smoke.md); [how-to/verify-your-install.md](../how-to/verify-your-install.md)
+covers running it and acting on a red result.
 
 - `--backend <name>` — backend to exercise (default `x11`; the only one today). Also sets
   `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so the session and
   `glass_doctor`'s verdict always agree on which backend is under test.
 - `--report <path>` — also write the JSON report to `path` (the markdown table always goes to
   stdout).
-- `--app <name>` — force a specific candidate app instead of probing for the first one present.
+- `--app <name>` — force a specific candidate app instead of probing for the first one present. The
+  name must be one of the backend's candidates; the binary is not checked for presence, so naming an
+  app that is not installed fails at the `start` check.
 - `--expect-version <tag>` — version the binary must report (check 1); omit to skip that check.
 - `--dry-run` — print the plan and exit without touching anything.
 - `--self-check` — prove the checks can still fail: run them against deliberately wrong responses
