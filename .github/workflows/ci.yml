@@ -131,7 +131,7 @@ jobs:
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
       - name: smoke (wayland)
-        run: cargo test -p glass-mcp --test smoke_wayland -- --ignored
+        run: cargo test -p glass-mcp --test smoke_wayland -- --ignored --nocapture
 
   macos:
     name: macOS (build · clippy · test)
