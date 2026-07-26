@@ -3,9 +3,10 @@
 `glass-mcp smoke` drives glass's own MCP tools against a real app on your machine and reports
 whether **this build** actually works end to end — not just that the binary runs, but that it can
 launch an app, capture a screenshot, read the accessibility tree, write to a field and see the value
-land, and shut down cleanly. Run it after building from source, after moving to a new host, or
-whenever you want a second opinion beyond what [`glass-mcp doctor`](../reference/cli.md#doctor)'s
-environment checks can tell you.
+land, and shut down cleanly. It drives [the binary you invoke it from](../reference/smoke.md#what-it-runs),
+so "this build" means the one in your hand, not whichever `glass-mcp` is on `PATH`. Run it after
+building from source, after moving to a new host, or whenever you want a second opinion beyond what
+[`glass-mcp doctor`](../reference/cli.md#doctor)'s environment checks can tell you.
 
 > **Experimental.** `smoke` is not covered by the
 > [1.x compatibility promise](../reference/stability.md#experimental-subcommands) — its flags and
@@ -29,14 +30,17 @@ fails at check 2 or 3 and repeats what `doctor` would have told you directly, wi
 
 ## Run it
 
-See the plan without touching anything — which app would be picked, which checks would run. This
+See the plan without driving anything — which app would be picked, which checks would run. This
 works even before you've installed a target app: if none of the candidates is on `PATH` yet, the
-app column says so instead of the command failing, so it's safe as the very first thing you run
-after building:
+plan's `start` row says what to install instead of the command failing, so it's safe as the very
+first thing you run after building:
 
 ```bash
 glass-mcp smoke --dry-run
 ```
+
+A plan heads its report `PASS (plan only)`, not `PASS`. Nothing was exercised, so it is not evidence
+that anything works — only that the run would be well-formed.
 
 Then the real thing, which does need a target app installed:
 
@@ -47,17 +51,19 @@ glass-mcp smoke --backend x11
 Three flags matter while you're working; [CLI](../reference/cli.md#smoke) lists them all.
 
 - `--app <name>` — drive a specific candidate instead of the first one probing finds. It selects
-  among the candidates above; it does not make an app appear, and it does not check the binary is
-  installed, so naming one you don't have just fails at check 2.
+  among the candidates above; it does not make an app appear. A real run naming one you don't have
+  fails at check 2; add `--dry-run` and the plan tells you up front instead.
 - `--report <path>` — also write the run as JSON, which is what to attach when filing an issue.
 - `--expect-version <tag>` — require the binary to report exactly this release tag, catching a stale
-  or mismatched artifact before anything else runs.
+  or mismatched artifact before anything else runs. A `--dry-run` compares nothing.
 
 ## Read the result
 
-The heading above the table is `PASS` or `FAIL` and matches the exit code, so scripting on the exit
-code is enough for a yes/no answer. When you need to know *what* happened, read the `detail` column
-of the check you care about — it states what that check observed.
+The heading above the table is `PASS`, `PASS (plan only)` or `FAIL`, and the exit code is 0 for the
+first two and 1 for the last. Read the exit code as *no check failed* rather than as *everything
+works*: a run in which every check skipped — any `--dry-run`, including one on a machine with no
+target app — also exits 0. When you need to know *what* happened, read the `detail` column of the
+check you care about; it states what that check observed, or what it would have done.
 
 Two things are worth knowing before you treat a green run as evidence: only `fail` fails a run, and
 a `skip` is not a `pass`. If a check you expected to exercise reports `skip`, read its `detail`
@@ -73,6 +79,10 @@ what each check asserts and what each status means.
    whether it's reachable and how to start it. See [Before you run it](#before-you-run-it).
 4. If check 2 (`start`) or later failed, try `--app` with a different candidate you have installed,
    to see whether the failure is specific to the app that got picked rather than to glass itself.
+   `glass-mcp smoke --dry-run --app <name>` confirms the one you chose is actually runnable before
+   you spend a full run on it.
 5. Re-run with `--report <path>` and attach the JSON when
    [filing an issue](https://github.com/fixed-width/glass/issues) — it carries every check's status
-   and detail, alongside the backend, version and app the run used.
+   and detail, alongside the backend, version and app the run used. If the run never reached a
+   check — no target app, say — it explains itself on stderr and writes no file; paste that message
+   instead.

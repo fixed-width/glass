@@ -71,8 +71,9 @@ All tools in the current release are **stable**; none is experimental.
 
 ## Experimental subcommands
 
-The same experimental treatment applies to `glass-mcp smoke` (see
-[how-to/verify-your-install.md](../how-to/verify-your-install.md)): a diagnostic subcommand that
-drives glass's own tools against a real app and reports whether the build works. It is **not**
-covered by the compatibility promise above — its flags, checks, and report shape (markdown and
-JSON alike) may change in any minor release.
+The same experimental treatment applies to `glass-mcp smoke`: a diagnostic subcommand that drives
+glass's own tools against a real app and reports whether the build works. It is **not** covered by
+the compatibility promise above — its flags, checks, and report shape (markdown and JSON alike) may
+change in any minor release. The surface it constrains is described in
+[smoke checks and report](smoke.md); [how-to/verify-your-install.md](../how-to/verify-your-install.md)
+covers running it.
