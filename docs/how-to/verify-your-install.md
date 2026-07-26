@@ -17,7 +17,7 @@ building from source, after moving to a new host, or whenever you want a second 
 `doctor` checks the environment; `smoke` (without `--dry-run`) goes further and actually drives an
 app, so it needs two things beyond what `doctor` requires:
 
-- **A target app.** On the X11 backend (the only one today) it probes for the first of `xed`,
+- **A target app.** On the X11 backend — the only one this build supports — it probes for the first of `xed`,
   `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
 - **A running accessibility bus.** Checks 4 and 5 read and drive the accessibility tree, which on
   Linux means AT-SPI must be running (the `at-spi2-core` package on Debian/Ubuntu). Without it

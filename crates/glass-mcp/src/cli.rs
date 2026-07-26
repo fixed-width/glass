@@ -101,7 +101,7 @@ pub enum Command {
     /// Drive glass's own MCP tools against a real app and report whether this build
     /// works. Experimental: not part of the stable tool surface.
     Smoke {
-        /// Backend to exercise. Today: `x11`.
+        /// Backend to exercise. This build supports only `x11`.
         #[arg(long, default_value = "x11")]
         backend: String,
         /// Write the JSON report to PATH (the text report always goes to stdout).
