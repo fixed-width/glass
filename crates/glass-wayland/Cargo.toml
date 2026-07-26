@@ -28,6 +28,9 @@ wayland-protocols-misc.workspace = true
 smithay-client-toolkit.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# The compositor's own Xwayland server: glass talks X11 to it to recover a toplevel that
+# reached the X server but never reached the compositor (see src/xwayland.rs).
+x11rb.workspace = true
 tempfile.workspace = true
 rustix.workspace = true
 

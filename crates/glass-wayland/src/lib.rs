@@ -12,6 +12,7 @@ pub mod keyboard;
 pub mod pixels;
 pub mod platform;
 pub mod swayipc;
+pub mod xwayland;
 
 pub use platform::WaylandPlatform;
 

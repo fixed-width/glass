@@ -184,15 +184,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Xvfb (the color palette is 3 entries, so that is the intended ceiling).
     let mut extras: Vec<(Window, u32)> = Vec::new();
     for i in 1..window_count {
-        // Let the previous toplevel fully establish before creating the next one.
-        // Creating multiple X11 toplevels back-to-back (no event-loop processing in
-        // between, which a real GUI toolkit never does) races Xwayland's per-surface
-        // setup under headless sway: the second window's wl_surface intermittently
-        // never maps, so it goes missing from sway's tree (and thus list_windows).
-        // A round-trip plus a short settle serializes creation and makes multi-window
-        // enumeration deterministic. Only runs for `--windows N>1`.
-        conn.get_input_focus()?.reply()?;
-        std::thread::sleep(std::time::Duration::from_millis(250));
         let ewin = conn.generate_id()?;
         let ex = (i as i16) * (WIDTH as i16 + 20);
         conn.create_window(
