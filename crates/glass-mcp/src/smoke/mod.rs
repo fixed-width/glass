@@ -14,10 +14,14 @@ use report::{CheckOutcome, SmokeReport};
 use transport::McpTransport;
 
 pub struct SmokeOptions {
+    /// Backend to exercise (see [`candidates_for`] for the supported set).
     pub backend: String,
+    /// Force a specific candidate app instead of probing for the first one present on the host.
     pub app: Option<String>,
-    /// Version the binary must report (the release tag). `None` skips the check.
+    /// Version the binary must report (the release tag). `None` skips check 1, recording why
+    /// rather than omitting it — see [`version_check`].
     pub expect_version: Option<String>,
+    /// Print the plan and exit without calling anything.
     pub dry_run: bool,
 }
 
@@ -44,6 +48,17 @@ const CHECK_NAMES: [(u8, &str); 8] = [
     (8, "logs"),
     (9, "error honesty"),
 ];
+
+/// Check 1. Runs [`checks::check_version`] when `--expect-version` was given; otherwise records
+/// a `Skip` rather than omitting the check, so a real run's rows match `--dry-run`'s preview
+/// (which always previews all nine, `version` included) instead of the row count depending on
+/// whether the flag was passed.
+fn version_check(t: &mut dyn McpTransport, expect_version: Option<&str>) -> CheckOutcome {
+    match expect_version {
+        Some(expected) => checks::check_version(t, expected),
+        None => CheckOutcome::skip(1, "version", "no --expect-version given"),
+    }
+}
 
 pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
     let candidates = candidates_for(&opts.backend)?;
@@ -80,14 +95,12 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
     let mut t = client::StdioClient::spawn(&exe, &[])?;
     let version = t.server_version()?;
-    let mut out = Vec::new();
-
-    if let Some(expected) = &opts.expect_version {
-        out.push(checks::check_version(&mut t, expected));
-    }
-    out.push(checks::check_start(&mut t, &p));
-    out.push(checks::check_health(&mut t));
-    out.push(checks::check_screenshot(&mut t));
+    let mut out = vec![
+        version_check(&mut t, opts.expect_version.as_deref()),
+        checks::check_start(&mut t, &p),
+        checks::check_health(&mut t),
+        checks::check_screenshot(&mut t),
+    ];
     let (a11y, nodes) = checks::check_a11y(&mut t);
     out.push(a11y);
     out.push(checks::check_interaction(&mut t, &nodes));
@@ -110,6 +123,33 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke::report::CheckStatus;
+    use crate::smoke::transport::ScriptedTransport;
+
+    #[test]
+    fn expect_version_none_is_a_skip_not_an_omission() {
+        // A real run's row count must match `--dry-run`'s preview regardless of whether
+        // `--expect-version` was given, so a missing flag records why check 1 didn't run
+        // rather than dropping it from the report.
+        let mut t = ScriptedTransport::new(vec![]);
+        let out = version_check(&mut t, None);
+        assert_eq!(out.step, 1);
+        assert_eq!(out.name, "version");
+        assert_eq!(out.status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn expect_version_some_reaches_check_version_pass_and_fail() {
+        // ScriptedTransport::server_version() always reports "0.0.0-scripted" — see transport.rs.
+        let mut t = ScriptedTransport::new(vec![]);
+        let pass = version_check(&mut t, Some("0.0.0-scripted"));
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        let mut t = ScriptedTransport::new(vec![]);
+        let fail = version_check(&mut t, Some("1.1.0"));
+        assert_eq!(fail.status, CheckStatus::Fail);
+        assert!(fail.detail.contains("1.1.0"), "got: {}", fail.detail);
+    }
 
     #[test]
     fn dry_run_reports_the_plan_without_calling_anything() {

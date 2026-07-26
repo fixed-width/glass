@@ -72,5 +72,6 @@ to read the report.
 - `--report <path>` — also write the JSON report to `path` (the markdown table always goes to
   stdout).
 - `--app <name>` — force a specific candidate app instead of probing for the first one present.
+- `--expect-version <tag>` — version the binary must report (check 1); omit to skip that check.
 - `--dry-run` — print the plan and exit without touching anything.
 - `--self-check` — reserved for a future fault-injection mode; has no effect yet.

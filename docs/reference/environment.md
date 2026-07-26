@@ -144,11 +144,3 @@ Binding a non-loopback address without a token is refused (fail-closed). See
 | `GLASS_AUDIT_PREFIX_LEN` | Length of the plaintext content prefix (`0` disables it) | `8` | all |
 
 The record schema and redaction model are in [reference/audit-log.md](audit-log.md).
-
-## Diagnostics
-
-| Variable | Purpose | Default | Scope |
-|---|---|---|---|
-| `GLASS_SMOKE_EXPECT_VERSION` | Version `glass-mcp smoke` must match at check 1 (the release tag); unset skips that check | unset (check 1 skipped) | all |
-
-See [how-to/verify-your-install.md](../how-to/verify-your-install.md).

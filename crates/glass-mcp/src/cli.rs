@@ -6,6 +6,7 @@
 //! `glass-mcp` serves MCP over stdio (the default).
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,10 +106,13 @@ pub enum Command {
         backend: String,
         /// Write the JSON report to PATH (markdown always goes to stdout).
         #[arg(long, value_name = "PATH")]
-        report: Option<String>,
+        report: Option<PathBuf>,
         /// Force a target app instead of probing for the first available one.
         #[arg(long)]
         app: Option<String>,
+        /// Version the binary must report (the release tag). Omit to skip that check.
+        #[arg(long, value_name = "TAG")]
+        expect_version: Option<String>,
         /// Prove the checks can fail: run them against injected faults.
         #[arg(long)]
         self_check: bool,

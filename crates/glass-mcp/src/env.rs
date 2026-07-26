@@ -320,13 +320,6 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
         default: "8",
         secret: false,
     },
-    EnvVarDoc {
-        name: "GLASS_SMOKE_EXPECT_VERSION",
-        scope: EnvScope::All,
-        purpose: "Version `glass-mcp smoke` must match at check 1 (the release tag); unset skips that check",
-        default: "(unset — check 1 is skipped)",
-        secret: false,
-    },
 ];
 
 /// `GLASS_*`-prefixed names read (or, for `GLASS_CLIP`, merely spelled) somewhere in the
@@ -549,7 +542,6 @@ mod tests {
             "GLASS_AUDIT_LOG",
             "GLASS_AUDIT_CONTENT",
             "GLASS_AUDIT_PREFIX_LEN",
-            "GLASS_SMOKE_EXPECT_VERSION",
         ];
         for name in expected {
             let n = GLASS_ENV.iter().filter(|d| d.name == name).count();

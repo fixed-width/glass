@@ -44,16 +44,14 @@ Useful flags:
   one of the backend's candidates; a `--dry-run` without `--app` shows which one probing would pick.
 - `--report <path>` — also write the full report as JSON to `path` (the markdown table always goes
   to stdout regardless).
-
-Set `GLASS_SMOKE_EXPECT_VERSION` to a release tag to also check the running binary reports that
-exact version — catches a stale or mismatched artifact before anything else runs. It's skipped when
-unset. See [reference/environment.md](../reference/environment.md#diagnostics).
+- `--expect-version <tag>` — also check the running binary reports exactly this version (a release
+  tag) — catches a stale or mismatched artifact before anything else runs. Omit to skip that check.
 
 ## What each check means
 
 | # | check | what it proves |
 |---|---|---|
-| 1 | version | The binary reports the version `GLASS_SMOKE_EXPECT_VERSION` names. Only runs when that variable is set. |
+| 1 | version | The binary reports the version `--expect-version` named. Skipped (not omitted) when the flag isn't given. |
 | 2 | start | `glass_start` launches the target app and returns real window geometry. |
 | 3 | capabilities+doctor | `glass_capabilities` and `glass_doctor` both respond, and `doctor`'s overall verdict isn't `fail`. |
 | 4 | screenshot | `glass_screenshot` returns an image with dimensions. |

@@ -135,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
             backend,
             report,
             app,
+            expect_version,
             self_check,
             dry_run,
         }) => {
@@ -142,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
             let r = glass_mcp::smoke::run(glass_mcp::smoke::SmokeOptions {
                 backend,
                 app,
-                expect_version: std::env::var("GLASS_SMOKE_EXPECT_VERSION").ok(),
+                expect_version,
                 dry_run,
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
