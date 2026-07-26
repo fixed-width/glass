@@ -32,13 +32,7 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
     let mut args = json!({ "run": run, "backend": p.backend, "a11y": true });
     if !p.app.env.is_empty() {
-        let env: serde_json::Map<String, Value> = p
-            .app
-            .env
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
-            .collect();
-        args["env"] = Value::Object(env);
+        args["env"] = p.app.env.iter().copied().collect();
     }
     outcome(
         1,
@@ -231,15 +225,18 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
             }
             // The matched element rides in an untrusted sibling; a missing, unparseable or
             // id-less sibling means the id cannot be confirmed, not that it mismatches — only
-            // a definite mismatch fails the check.
-            if let Some(matched_id) = matched_element_id(&wait)
-                && matched_id != u64::from(id)
-            {
-                return Err(format!(
-                    "glass_set_value wrote to #{id} but element #{matched_id} \
-                     reported the value instead — the write landed somewhere unintended"
-                ));
-            }
+            // a definite mismatch fails the check, and the detail has to say which of the two
+            // happened or a guard that stopped guarding reads exactly like one that held.
+            let confirmation = match matched_element_id(&wait) {
+                Some(matched_id) if matched_id != u64::from(id) => {
+                    return Err(format!(
+                        "glass_set_value wrote to #{id} but element #{matched_id} \
+                         reported the value instead — the write landed somewhere unintended"
+                    ));
+                }
+                Some(_) => "",
+                None => " (id unconfirmed: the reply carried no element id)",
+            };
 
             // Pixel path: a click inside the window, then a key. These assert the tools
             // accept and report; the element path above is what proves an effect.
@@ -266,7 +263,9 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
                         .to_string(),
                 );
             }
-            Ok(format!("element #{id} took the value; pixel path ok"))
+            Ok(format!(
+                "element #{id} took the value{confirmation}; pixel path ok"
+            ))
         })(),
     )
 }
@@ -728,9 +727,12 @@ mod tests {
             &[sibling.as_str()],
             pixel_path_script(1),
         ));
-        assert_eq!(
-            check_interaction(&mut t, Some(&nodes_with_editable())).status,
-            CheckStatus::Pass
+        let out = check_interaction(&mut t, Some(&nodes_with_editable()));
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            !out.detail.contains("unconfirmed"),
+            "a confirmed id must not be reported as unconfirmed: {}",
+            out.detail
         );
     }
 
@@ -743,9 +745,12 @@ mod tests {
             &[],
             pixel_path_script(1),
         ));
-        assert_eq!(
-            check_interaction(&mut t, Some(&nodes_with_editable())).status,
-            CheckStatus::Pass
+        let out = check_interaction(&mut t, Some(&nodes_with_editable()));
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            out.detail.contains("unconfirmed"),
+            "must say the id was not confirmed: {}",
+            out.detail
         );
     }
 

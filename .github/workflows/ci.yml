@@ -116,8 +116,8 @@ jobs:
         # the GLVND loaders + Mesa software EGL/DRI (not just libgl1-mesa-dri). Plus Xwayland
         # for the app, and bubblewrap for sandbox_* — whose unprivileged user namespaces
         # Ubuntu 24.04 restricts via AppArmor, so re-enable them (no-op if the knob is absent).
-        # zenity + at-spi2-core: the smoke (wayland) step below needs a target app plus a
-        # running AT-SPI bus for its accessibility checks; the runner ships neither.
+        # zenity + at-spi2-core: the smoke (wayland) step below needs a target app on PATH plus
+        # a running AT-SPI bus for its accessibility checks; the runner ships neither by default.
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri bubblewrap \

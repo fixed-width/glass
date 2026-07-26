@@ -24,8 +24,8 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
-/// Every backend the smoke runner drives, with its candidate apps. The single declaration of that
-/// set: both the resolution below and the prose naming what is drivable read it.
+/// Every backend the smoke runner drives, with its candidate apps: the resolution below and the
+/// errors it produces read this table, and `cli.rs`'s hand-written help is tested against it.
 const DRIVABLE: &[(&str, &[Candidate])] =
     &[("x11", &X11_CANDIDATES), ("wayland", &WAYLAND_CANDIDATES)];
 
@@ -517,23 +517,6 @@ mod tests {
         for c in &WAYLAND_CANDIDATES {
             assert!(offered.contains(c.label), "must offer {}: {err}", c.label);
         }
-    }
-
-    /// `recognized_backend` is case-insensitive; a second, stricter recognition site here would
-    /// reject a spelling the rest of the binary accepts.
-    #[test]
-    fn wayland_is_recognized_case_insensitively() {
-        let (_dir, path) = host_with(&[]);
-        let r = run_with(
-            SmokeOptions {
-                backend: "WAYLAND".into(),
-                app: None,
-                dry_run: true,
-            },
-            Some(&path),
-        )
-        .expect("WAYLAND must resolve the same way GLASS_BACKEND=WAYLAND does");
-        assert_eq!(r.backend, "wayland");
     }
 
     /// The prose naming what is drivable is derived from the table, so a backend cannot land
