@@ -75,5 +75,5 @@ The same experimental treatment applies to `glass-mcp smoke`: a diagnostic subco
 glass's own tools against a real app and reports whether the build works. It is **not** covered by
 the compatibility promise above — its flags, checks, and report shape (text and JSON alike) may
 change in any minor release. The surface it constrains is described in
-[smoke checks and report](smoke.md); [how-to/exercise-a-build.md](../how-to/exercise-a-build.md)
+[smoke checks and report](smoke.md); [how-to/check-a-build.md](../how-to/check-a-build.md)
 covers running it.

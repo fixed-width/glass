@@ -28,7 +28,7 @@ On Linux and Windows the built binary is all you need — return to the [Linux](
 the signing + LaunchAgent steps below.
 
 To confirm the build works — not just that it compiled, but that it launches an app and drives it
-end to end — see [Exercise a build with `smoke`](exercise-a-build.md). (For whether the *environment*
+end to end — see [Check a build works end to end](check-a-build.md). (For whether the *environment*
 is set up correctly, that's [`glass-mcp doctor`](../reference/cli.md#doctor).)
 
 ## macOS: sign the app and run it as a LaunchAgent

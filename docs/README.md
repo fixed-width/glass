@@ -36,8 +36,8 @@ Set up, then check the environment with `glass-mcp doctor` — see
 **Contribute**
 
 - [Build from source](how-to/build-from-source.md) — all platforms; macOS signing + LaunchAgent
-- [Exercise a build with `smoke`](how-to/exercise-a-build.md) — drive glass's own MCP tools against
-  a real app and confirm the build you just compiled works end to end
+- [Check a build works end to end](how-to/check-a-build.md) — `glass-mcp smoke` drives glass's own
+  MCP tools against a real app, so you know the build you just compiled works
 - [Benchmark and profile](how-to/benchmarking.md)
 - [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
   screenshot-every-step, round-trips and tokens

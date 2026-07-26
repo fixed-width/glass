@@ -1,4 +1,4 @@
-# Exercise a build with `smoke`
+# Check a build works end to end
 
 `glass-mcp smoke` answers one question: does **this build** drive a real app end to end? It
 launches a stock app, captures a screenshot, reads the accessibility tree, writes to a field and

@@ -66,7 +66,7 @@ not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#
 **Experimental** — see [Stability and versioning](stability.md#experimental-subcommands). Drive
 glass's own MCP tools against a real app and report whether this build works end to end. The checks,
 the statuses, and the report's fields are described in
-[smoke checks and report](smoke.md); [how-to/exercise-a-build.md](../how-to/exercise-a-build.md)
+[smoke checks and report](smoke.md); [how-to/check-a-build.md](../how-to/check-a-build.md)
 covers running it and acting on a red result.
 
 - `--backend <name>` — backend to exercise. The smoke runner drives only `x11`, which is the
