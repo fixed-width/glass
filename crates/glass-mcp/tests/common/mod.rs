@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 
 pub struct Xvfb {
     child: Child,
@@ -99,6 +99,73 @@ pub const MUST_PASS: [&str; 8] = [
 /// Checks deliberately exempt from [`MUST_PASS`]. Empty today; a check the fixture cannot control
 /// belongs here with its reason, which is the decision the test below refuses to let anyone skip.
 pub const MAY_NOT_PASS: [&str; 0] = [];
+
+/// Everything both gates assert about a real run: it succeeded, the report describes the backend
+/// asked for, and its rows are exactly what the same binary's `--dry-run` previews. `extra_env` is
+/// the harness's own isolation — the x11 gate's private display — applied to both invocations.
+pub fn assert_smoke_gate(server: &str, backend: &str, extra_env: &[(&str, &str)]) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let report = dir.path().join("smoke.json");
+    let out = run_smoke(server, backend, &report, extra_env, &[]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // A setup failure (no target app, no accessibility bus) writes no report and explains itself
+    // on stderr, so a stdout-only message would leave nothing to triage from.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "smoke failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+
+    let json = read_report(&report);
+    assert_eq!(json["backend"], backend);
+    assert_eq!(json["mode"], "full", "a real run is not a plan: {json}");
+    assert_eq!(
+        json["app"]["state"], "selected",
+        "a real run drove an app, so the report must say which: {json}"
+    );
+    assert!(
+        json["app"]["value"].as_str().is_some_and(|a| !a.is_empty()),
+        "the selected app must be named: {json}"
+    );
+
+    // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's rows.
+    // Sourcing the expectation from the same binary's own plan, rather than a list copied into a
+    // test, is what keeps the two from drifting apart unnoticed.
+    let plan_path = dir.path().join("plan.json");
+    let plan = run_smoke(server, backend, &plan_path, extra_env, &["--dry-run"]);
+    assert!(
+        plan.status.success(),
+        "smoke --dry-run failed: {}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan = read_report(&plan_path);
+    assert_eq!(plan["mode"], "dry_run", "a plan must say so: {plan}");
+    assert_eq!(
+        rows(&json),
+        rows(&plan),
+        "a real run must carry exactly the checks --dry-run previews: {stdout}"
+    );
+
+    assert_fixture_checks_pass(&json, &stdout);
+}
+
+fn run_smoke(
+    server: &str,
+    backend: &str,
+    report: &Path,
+    extra_env: &[(&str, &str)],
+    extra_args: &[&str],
+) -> Output {
+    let mut cmd = Command::new(server);
+    cmd.args(["smoke", "--backend", backend, "--report"])
+        .arg(report)
+        .args(extra_args);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run smoke")
+}
 
 pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
     let checks = json["checks"].as_array().expect("checks array");
