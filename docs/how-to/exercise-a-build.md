@@ -11,8 +11,7 @@ launches a stock app, captures a screenshot, reads the accessibility tree, write
 confirms the value landed, then shuts the session down — through glass's own MCP tools, over a real
 MCP connection.
 
-It exists to gate releases: the release process runs it on every backend before shipping. Two other
-moments make it worth running by hand — after building glass from source, and while changing glass
+Two moments make it worth running — after building glass from source, and while changing glass
 itself, when you want one command that exercises the whole loop rather than a suite that stubs it.
 It drives [the binary you invoke it from](../reference/smoke.md#what-it-runs), so "this build" means
 the one in your hand, not whichever `glass-mcp` is on `PATH`.
