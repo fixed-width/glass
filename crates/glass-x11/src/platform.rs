@@ -23,9 +23,16 @@ use x11rb::rust_connection::RustConnection;
 // private Xvfb — still reaps at `REAP_GRACE` each, so a helper that ignores SIGTERM can take the
 // whole teardown past the budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
-    "the close request + signal ladder must finish inside glass_core::TEARDOWN_BUDGET"
+    ASK_BUDGET.as_millis() + CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis()
+        < TEARDOWN_BUDGET.as_millis(),
+    "sending the close request, waiting it out and the signal ladder must all finish inside \
+     glass_core::TEARDOWN_BUDGET"
 );
+
+/// How long the close request itself may take before glass gives up on the display and goes
+/// straight to signalling. Sending it is a handful of X round trips — sub-millisecond on a
+/// healthy server — so this is a liveness bound, not a budget the ask is expected to use.
+const ASK_BUDGET: Duration = Duration::from_millis(400);
 
 const XT_MOTION: u8 = 6; // MotionNotify
 const XT_BTN_PRESS: u8 = 4; // ButtonPress
@@ -406,15 +413,51 @@ impl X11Platform {
     /// toolkit app runs no shutdown path at all, so anything it would have flushed on exit is
     /// lost and it can come back reporting a crash. The signal ladder stays as the fallback —
     /// it is what actually guarantees the process tree is gone.
+    /// [`Self::request_close`] under a deadline, so a display that has stopped answering cannot
+    /// hold teardown open.
+    ///
+    /// Every step of the ask is a blocking X round trip and x11rb has no per-request timeout, so
+    /// the bound has to come from outside the connection: the ask runs on its own thread with its
+    /// own connection to the same display, and the caller stops waiting after [`ASK_BUDGET`]. The
+    /// second connection is what makes abandoning it safe — the thread cannot leave this backend's
+    /// connection stopped mid-request — and any client may send a close request, so the ask is no
+    /// less valid from there. A socket timeout would not work in its place: a spurious trip
+    /// desynchronizes the X protocol stream, which has no message boundary to resynchronize to.
+    ///
+    /// An abandoned thread stays blocked until the display answers or glass exits. That is the
+    /// cost of x11rb having no cancellation, and it buys the guarantee that matters here — the
+    /// signal ladder still runs, so the app does not outlive the glass process that gave up on it.
+    fn request_close_bounded(&self, root_pid: u32) -> Asked {
+        let (display, active) = (self.display.clone(), self.window);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let asked = match X11Platform::connect(Some(&display)) {
+                Ok(mut asker) => {
+                    // Carry the active window over so the ask sees what this backend is driving:
+                    // `request_close` reports a launch that was found only by window hint.
+                    asker.window = active;
+                    asker.request_close(root_pid)
+                }
+                Err(e) => Asked::blocked(format!("glass could not reach the X server: {e}")),
+            };
+            let _ = tx.send(asked);
+        });
+        rx.recv_timeout(ASK_BUDGET).unwrap_or_else(|_| {
+            Asked::blocked(format!(
+                "the X server did not answer within {ASK_BUDGET:?}, so the app could not be asked \
+                 to close"
+            ))
+        })
+    }
+
     fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // Snapshot the launch's process tree before any of it exits. `await_exit` reaps the
-            // child, which reparents its descendants to init and takes them out of the subtree —
-            // after that there is no way to enumerate them again.
+            // Snapshot the launch's process tree before any of it exits. Waiting on the child
+            // reaps it, which reparents its descendants to init and takes them out of the
+            // subtree — after that there is no way to enumerate them again.
             let tree = proc_tree_pids(child.id());
-            let asked = self.request_close(child.id());
-            let closed_itself =
-                asked.await_close(CLOSE_GRACE, || matches!(child.try_wait(), Ok(Some(_))));
+            let asked = self.request_close_bounded(child.id());
+            let closed_itself = asked.await_child_exit(&mut child, CLOSE_GRACE);
             // The sweep runs either way: an app that closed itself can still have forked children
             // it never cleaned up, and on the graceful path the signals land on processes that
             // are already gone and cost nothing.

@@ -49,6 +49,13 @@ impl Xvfb {
         let xvfb = glass_core::tool_path("GLASS_XVFB", "Xvfb");
         start_binary(&xvfb, screen, READY_TIMEOUT)
     }
+
+    /// The server process's pid. Exposed so a test can put the display itself into a state glass
+    /// has to survive — an X server that is running but not answering, which is otherwise
+    /// impossible to produce from the client side.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 /// One spawn attempt's failure, carrying whatever the server wrote to stderr —
