@@ -20,8 +20,9 @@ the repo root.
 
 A real run drives an app, so it needs:
 
-- **A target app.** The smoke runner drives x11, where it probes for the first of `xed`,
-  `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
+- **A target app.** A real run drives a stock app installed on the host — install one of the
+  candidates for the backend you are checking. `glass-mcp smoke --backend <backend> --dry-run` names
+  them without running anything.
 - **A running accessibility bus.** Checks 4 and 5 read and drive the accessibility tree, which on
   Linux means AT-SPI must be running (the `at-spi2-core` package on Debian/Ubuntu). Without it
   check 4 goes red however healthy the rest of the install is.

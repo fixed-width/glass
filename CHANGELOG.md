@@ -49,6 +49,9 @@ internal refactors, CI, or test-only changes.
   rather than failing. Experimental; see
   `docs/how-to/check-a-build.md` to run it and `docs/reference/smoke.md` for the checks and
   the report shape.
+- `glass-mcp smoke` drives the `wayland` backend: `smoke --backend wayland` launches a stock GTK app
+  under the backend's headless sway and runs the same eight checks as `x11`. The target is launched
+  with `GDK_BACKEND=wayland`, so the run exercises the native Wayland path.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.

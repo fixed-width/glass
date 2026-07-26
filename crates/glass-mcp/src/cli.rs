@@ -101,7 +101,7 @@ pub enum Command {
     /// Drive glass's own MCP tools against a real app and report whether this build
     /// works. Experimental: not part of the stable tool surface.
     Smoke {
-        /// Backend to exercise. The smoke runner drives only x11.
+        /// Backend to exercise. The smoke runner drives x11 and wayland.
         #[arg(long, default_value = "x11")]
         backend: String,
         /// Write the JSON report to PATH (the text report always goes to stdout).
@@ -345,5 +345,19 @@ mod tests {
             !crate::VERSION.is_empty(),
             "GLASS_VERSION must be populated by build.rs"
         );
+    }
+
+    #[test]
+    fn the_backend_help_names_every_drivable_backend() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let mut smoke = cmd
+            .find_subcommand_mut("smoke")
+            .expect("smoke subcommand")
+            .clone();
+        let help = smoke.render_long_help().to_string();
+        for b in crate::smoke::drivable_backends() {
+            assert!(help.contains(b), "--backend help must name {b:?}:\n{help}");
+        }
     }
 }

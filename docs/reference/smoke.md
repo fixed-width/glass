@@ -15,6 +15,21 @@ release.
 have in hand — never a different `glass-mcp` that happens to be earlier on `PATH`. The spawned
 server is given `GLASS_BACKEND` set to the backend under test, overriding any ambient value.
 
+## Target apps
+
+A real run drives a stock app installed on the host. Each backend has a candidate list; the run
+probes it in order and takes the first one runnable on `PATH`, recording the choice in the report's
+`app` field. `--app <name>` selects a specific candidate instead.
+
+| Backend | Candidates, in probe order |
+|---|---|
+| `x11` | `xed`, `gnome-text-editor`, `zenity`, `xterm` |
+| `wayland` | `xed`, `gnome-text-editor`, `zenity` |
+
+A wayland run launches its target with `GDK_BACKEND=wayland`, so the app runs as a native Wayland
+client and the run's verdict describes the native path. `xterm` is an X11-only client, which under
+the Wayland backend would reach the screen through Xwayland, so it is not a wayland candidate.
+
 ## Checks
 
 | # | Name | What it asserts |
