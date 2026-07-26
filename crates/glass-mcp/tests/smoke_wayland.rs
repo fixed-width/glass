@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{SwayProbe, assert_fixture_checks_pass, read_report, rows, sway_probe};
+use common::{assert_fixture_checks_pass, read_report, rows, sway_probe};
 use std::process::Command;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
@@ -14,13 +14,8 @@ const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
 fn smoke_wayland_passes_against_a_real_app() {
     // The backend spawns its own compositor, so there is nothing to start here — but a host
     // without sway must skip rather than report a failure it cannot act on.
-    match sway_probe(SERVER) {
-        SwayProbe::Broken(why) => panic!("cannot tell whether this host has sway: {why}"),
-        SwayProbe::Absent => {
-            eprintln!("no glass-discoverable sway >=1.12; skipping");
-            return;
-        }
-        SwayProbe::Available => {}
+    if !sway_probe(SERVER).can_run() {
+        return;
     }
 
     let dir = tempfile::tempdir().expect("tempdir");

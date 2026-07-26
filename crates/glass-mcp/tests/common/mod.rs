@@ -105,10 +105,37 @@ pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
 /// Whether this host has a sway the Wayland backend can spawn, or why the question could not be
 /// answered. A probe that cannot answer is not a host without sway: the first must fail the
 /// test, the second must skip it.
+#[derive(Debug)]
+#[must_use]
 pub enum SwayProbe {
     Available,
     Absent,
     Broken(String),
+}
+
+/// Set in the environment to make a missing sway a failure rather than a skip: CI sets it so a
+/// green wayland gate always means the gate ran, and a developer laptop leaves it unset and skips.
+pub const REQUIRE_WAYLAND: &str = "GLASS_SMOKE_REQUIRE_WAYLAND";
+
+impl SwayProbe {
+    /// Whether the gate can run, panicking rather than returning `false` for every answer a skip
+    /// would misreport as a pass: a probe that could not answer, and — where [`REQUIRE_WAYLAND`]
+    /// demands a real run — a host with no sway at all.
+    #[must_use]
+    pub fn can_run(self) -> bool {
+        match self {
+            Self::Available => true,
+            Self::Absent if std::env::var_os(REQUIRE_WAYLAND).is_some() => panic!(
+                "{REQUIRE_WAYLAND} is set, so this gate must run, but no glass-discoverable \
+                 sway >=1.12 was found for the Wayland backend to spawn"
+            ),
+            Self::Absent => {
+                eprintln!("no glass-discoverable sway >=1.12; skipping");
+                false
+            }
+            Self::Broken(why) => panic!("cannot tell whether this host has sway: {why}"),
+        }
+    }
 }
 
 /// Does this host have a sway the Wayland backend can spawn? Asks the shipped binary's own probe

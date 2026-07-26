@@ -131,6 +131,10 @@ jobs:
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
       - name: smoke (wayland)
+        # The runner fetched sway above, so a skip here means a broken fetch or broken discovery
+        # reporting a step outcome byte-identical to a real pass.
+        env:
+          GLASS_SMOKE_REQUIRE_WAYLAND: "1"
         run: cargo test -p glass-mcp --test smoke_wayland -- --ignored --nocapture
 
   macos:
