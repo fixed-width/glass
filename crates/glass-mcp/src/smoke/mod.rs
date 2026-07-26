@@ -3,6 +3,7 @@
 
 pub mod checks;
 pub mod envelope;
+pub mod ledger;
 pub mod profile;
 pub mod report;
 pub mod transport;
