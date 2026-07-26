@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{assert_fixture_checks_pass, read_report, rows, sway_available};
+use common::{SwayProbe, assert_fixture_checks_pass, read_report, rows, sway_probe};
 use std::process::Command;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
@@ -14,9 +14,13 @@ const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
 fn smoke_wayland_passes_against_a_real_app() {
     // The backend spawns its own compositor, so there is nothing to start here — but a host
     // without sway must skip rather than report a failure it cannot act on.
-    if !sway_available(SERVER) {
-        eprintln!("no glass-discoverable sway >=1.12; skipping");
-        return;
+    match sway_probe(SERVER) {
+        SwayProbe::Broken(why) => panic!("cannot tell whether this host has sway: {why}"),
+        SwayProbe::Absent => {
+            eprintln!("no glass-discoverable sway >=1.12; skipping");
+            return;
+        }
+        SwayProbe::Available => {}
     }
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -43,6 +47,10 @@ fn smoke_wayland_passes_against_a_real_app() {
     assert_eq!(
         json["app"]["state"], "selected",
         "a real run drove an app, so the report must say which: {json}"
+    );
+    assert!(
+        json["app"]["value"].as_str().is_some_and(|a| !a.is_empty()),
+        "the selected app must be named: {json}"
     );
 
     // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's rows.

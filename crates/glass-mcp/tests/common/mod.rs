@@ -102,22 +102,50 @@ pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
     }
 }
 
+/// Whether this host has a sway the Wayland backend can spawn, or why the question could not be
+/// answered. A probe that cannot answer is not a host without sway: the first must fail the
+/// test, the second must skip it.
+pub enum SwayProbe {
+    Available,
+    Absent,
+    Broken(String),
+}
+
 /// Does this host have a sway the Wayland backend can spawn? Asks the shipped binary's own probe
 /// rather than re-implementing discovery, so the guard and the backend cannot disagree.
-pub fn sway_available(server: &str) -> bool {
-    let Ok(out) = Command::new(server).args(["doctor", "--json"]).output() else {
-        return false;
+pub fn sway_probe(server: &str) -> SwayProbe {
+    let out = match Command::new(server).args(["doctor", "--json"]).output() {
+        Ok(out) => out,
+        Err(e) => return SwayProbe::Broken(format!("could not run {server} doctor --json: {e}")),
     };
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return false;
+    let json: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(json) => json,
+        Err(e) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return SwayProbe::Broken(format!(
+                "doctor --json printed non-JSON stdout ({e}): {stdout}"
+            ));
+        }
     };
-    json["sections"]
+    let Some(sections) = json["sections"].as_array() else {
+        return SwayProbe::Broken(format!("doctor --json had no \"sections\" array: {json}"));
+    };
+    let Some(wayland) = sections.iter().find(|s| s["title"] == "wayland") else {
+        return SwayProbe::Broken(format!("doctor --json had no \"wayland\" section: {json}"));
+    };
+    let Some(check) = wayland["checks"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|s| s["title"] == "wayland")
-        .and_then(|s| s["checks"].as_array())
-        .into_iter()
-        .flatten()
-        .any(|c| c["name"] == "sway >=1.12" && c["status"] == "ok")
+        .find(|c| c["name"] == "sway >=1.12")
+    else {
+        return SwayProbe::Broken(format!(
+            "wayland section had no \"sway >=1.12\" check: {wayland}"
+        ));
+    };
+    if check["status"] == "ok" {
+        SwayProbe::Available
+    } else {
+        SwayProbe::Absent
+    }
 }
