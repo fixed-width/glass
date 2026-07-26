@@ -15,14 +15,21 @@
 
 use crate::smoke::transport::{CallResult, McpTransport};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// A server that has not answered in this long is treated as hung.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How many of the server's last stderr lines to keep for a failure detail. Enough to carry
+/// a panic message or a degrade warning; bounded so a chatty server cannot grow this without
+/// limit over a long run.
+const STDERR_TAIL_LINES: usize = 20;
 
 #[derive(Debug)]
 pub struct StdioClient {
@@ -32,8 +39,17 @@ pub struct StdioClient {
     rx: Receiver<String>,
     /// Joined on drop so no thread outlives the client; `None` once joined.
     reader: Option<JoinHandle<()>>,
+    /// The server's last stderr lines. Without these a degrade warning or a panic leaves
+    /// only "server closed stdout" or a silent timeout, with nothing saying why.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Joined before the tail is read, so the tail includes the last thing the server said.
+    stderr_reader: Option<JoinHandle<()>>,
     next_id: i64,
-    version: String,
+    /// What the server reported in `initialize`'s `serverInfo.version`. Never seeded from
+    /// this binary's own `crate::VERSION`: client and server are the same executable here, so
+    /// a seeded value would match `--expect-version` even from a server that stopped
+    /// reporting a version at all — check 1 would pass without the server ever answering.
+    version: Option<String>,
     /// Per-request deadline. Fixed at `CALL_TIMEOUT` in production
     /// (`spawn`); overridable so tests can exercise the timeout path without
     /// a multi-minute wait.
@@ -54,7 +70,7 @@ impl StdioClient {
         let mut cmd = Command::new(exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -68,15 +84,23 @@ impl StdioClient {
                 .take()
                 .ok_or("no stdout on the spawned server")?,
         );
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("no stderr on the spawned server")?;
         let (tx, rx) = mpsc::channel();
         let reader = Some(spawn_stdout_reader(stdout, tx)?);
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr_reader = Some(spawn_stderr_reader(stderr, stderr_tail.clone())?);
         let mut c = Self {
             child,
             stdin,
             rx,
             reader,
+            stderr_tail,
+            stderr_reader,
             next_id: 0,
-            version: crate::VERSION.to_string(),
+            version: None,
             timeout,
         };
         c.initialize()?;
@@ -95,9 +119,16 @@ impl StdioClient {
         if init.get("result").is_none() {
             return Err(format!("initialize failed: {init}"));
         }
-        if let Some(v) = init["result"]["serverInfo"]["version"].as_str() {
-            self.version = v.to_string();
-        }
+        let version = init["result"]["serverInfo"]["version"]
+            .as_str()
+            .ok_or_else(|| {
+                format!(
+                    "initialize returned no `serverInfo.version` string (got {}); the version \
+                 check has nothing to compare against",
+                    init["result"]["serverInfo"]["version"]
+                )
+            })?;
+        self.version = Some(version.to_string());
         self.notify("notifications/initialized", serde_json::json!({}))
     }
 
@@ -129,9 +160,31 @@ impl StdioClient {
             Ok(v) => Ok(v),
             Err(e) => {
                 self.kill_and_reap();
-                Err(format!("{method}: {e}"))
+                let note = self.stderr_note();
+                Err(format!("{method}: {e}{note}"))
             }
         }
+    }
+
+    /// The tail of the server's stderr, as a suffix for a failure detail — empty when it
+    /// said nothing there. Call only after [`Self::kill_and_reap`]: with the child reaped its
+    /// stderr write end is closed, so joining the reader here is prompt and guarantees the
+    /// tail includes the last thing the server managed to say (typically the panic that
+    /// killed it, which is precisely what "server closed stdout" alone fails to explain).
+    fn stderr_note(&mut self) -> String {
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let Ok(tail) = self.stderr_tail.lock() else {
+            return String::new();
+        };
+        if tail.is_empty() {
+            return String::new();
+        }
+        format!(
+            " — server stderr: {}",
+            tail.iter().cloned().collect::<Vec<_>>().join(" ; ")
+        )
     }
 
     /// Kill and reap the child. Safe to call more than once: `std::process::
@@ -174,6 +227,29 @@ fn spawn_stdout_reader(
             }
         })
         .map_err(|e| format!("could not spawn the stdout-reader thread: {e}"))
+}
+
+/// Keeps the last [`STDERR_TAIL_LINES`] lines the server wrote to stderr. Draining the pipe
+/// on its own thread also stops a server that logs heavily from blocking on a full stderr
+/// pipe while the client waits for a response that can then never come.
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) -> Result<JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("smoke-stderr".into())
+        .spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let Ok(mut tail) = tail.lock() else {
+                    return; // a poisoned lock means the client is already unwinding
+                };
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        })
+        .map_err(|e| format!("could not spawn the stderr-reader thread: {e}"))
 }
 
 /// Waits on `rx` for a JSON-RPC message whose `id` matches, skipping
@@ -221,7 +297,9 @@ impl McpTransport for StdioClient {
     }
 
     fn server_version(&mut self) -> Result<String, String> {
-        Ok(self.version.clone())
+        self.version
+            .clone()
+            .ok_or_else(|| "the server reported no version at initialize".to_string())
     }
 }
 
@@ -235,6 +313,10 @@ impl Drop for StdioClient {
         // guarantees (the kernel closes it as part of process teardown), so
         // joining here should be near-instant rather than a real wait.
         if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        // Same reasoning for the stderr reader; `stderr_note` may already have taken it.
+        if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
         }
     }
@@ -316,6 +398,26 @@ mod tests {
             start.elapsed() < Duration::from_millis(600),
             "the deadline must span the whole call, not reset per line: took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// `#[cfg(unix)]`: a server that talks only on stderr and never answers on stdout —
+    /// the shape of one that panics or degrades at startup. `sh` with no arguments reads
+    /// commands from stdin, so it rejects each JSON-RPC line on stderr ("not found") and
+    /// never writes a response. Without the stderr capture the whole failure would read
+    /// "no response within Ns", with nothing at all saying why.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_carries_the_servers_stderr_into_the_message() {
+        let err = StdioClient::spawn_with_timeout(
+            std::path::Path::new("sh"),
+            &[],
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("server stderr"),
+            "the failure must carry what the server said on stderr: {err}"
         );
     }
 
