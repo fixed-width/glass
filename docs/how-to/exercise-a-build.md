@@ -1,21 +1,30 @@
-# Verify your install
+# Exercise a build with `smoke`
 
-`glass-mcp smoke` drives glass's own MCP tools against a real app on your machine and reports
-whether **this build** actually works end to end — not just that the binary runs, but that it can
-launch an app, capture a screenshot, read the accessibility tree, write to a field and see the value
-land, and shut down cleanly. It drives [the binary you invoke it from](../reference/smoke.md#what-it-runs),
-so "this build" means the one in your hand, not whichever `glass-mcp` is on `PATH`. Run it after
-building from source, after moving to a new host, or whenever you want a second opinion beyond what
-[`glass-mcp doctor`](../reference/cli.md#doctor)'s environment checks can tell you.
+> **Setting glass up, or something isn't working?** Run
+> [`glass-mcp doctor`](../reference/cli.md#doctor). It checks the environment glass needs — display
+> server, containment runtime, tool paths — and prints how to fix whatever is missing. That is the
+> command for "is my install healthy?", and unlike this one it is stable and needs nothing installed
+> to answer.
+
+`glass-mcp smoke` answers a narrower question: does **this build** drive a real app end to end? It
+launches a stock app, captures a screenshot, reads the accessibility tree, writes to a field and
+confirms the value landed, then shuts the session down — through glass's own MCP tools, over a real
+MCP connection.
+
+It exists to gate releases: the release process runs it on every backend before shipping. Two other
+moments make it worth running by hand — after building glass from source, and while changing glass
+itself, when you want one command that exercises the whole loop rather than a suite that stubs it.
+It drives [the binary you invoke it from](../reference/smoke.md#what-it-runs), so "this build" means
+the one in your hand, not whichever `glass-mcp` is on `PATH`.
 
 > **Experimental.** `smoke` is not covered by the
 > [1.x compatibility promise](../reference/stability.md#experimental-subcommands) — its flags and
 > report shape may change in a minor release.
 
-## Before you run it
+## What it needs
 
-`doctor` checks the environment; `smoke` (without `--dry-run`) goes further and actually drives an
-app, so it needs two things beyond what `doctor` requires:
+`doctor` inspects the host; `smoke` drives an app on it, so a real run needs two things `doctor`
+does not:
 
 - **A target app.** On the X11 backend — the only one this build supports — it probes for the first of `xed`,
   `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
@@ -25,8 +34,8 @@ app, so it needs two things beyond what `doctor` requires:
 
 Neither is needed for `--dry-run` — see below.
 
-If you haven't run `glass-mcp doctor` yet, run it first. A `smoke` run against a broken environment
-fails at check 1 or 2 and repeats what `doctor` would have told you directly, with less detail.
+Run `doctor` first if you haven't. Against a broken environment `smoke` just fails at check 1 or 2
+and repeats, with less detail, what `doctor` would have told you outright.
 
 ## Run it
 
@@ -87,7 +96,7 @@ of what each check asserts and what each status means.
 2. If check 2 (`capabilities+doctor`) failed, run `glass-mcp doctor` directly. It gives fuller
    per-check remedy guidance than `smoke`'s one-line summary.
 3. If check 4 (`a11y snapshot`) failed, the accessibility bus is the usual cause — `doctor` reports
-   whether it's reachable and how to start it. See [Before you run it](#before-you-run-it).
+   whether it's reachable and how to start it. See [What it needs](#what-it-needs).
 4. If neither of those applies, try `--app` with a different candidate you have installed, to see
    whether the failure is specific to the app that got picked rather than to glass itself.
    `glass-mcp smoke --dry-run --app <name>` confirms the one you chose is actually runnable before

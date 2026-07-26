@@ -47,7 +47,7 @@ internal refactors, CI, or test-only changes.
   status word per check, and a `Summary:` line carrying the verdict. `--dry-run` prints the plan
   without driving anything, on any host: with no target app installed it says what to install
   rather than failing. Experimental; see
-  `docs/how-to/verify-your-install.md` to run it and `docs/reference/smoke.md` for the checks and
+  `docs/how-to/exercise-a-build.md` to run it and `docs/reference/smoke.md` for the checks and
   the report shape.
 
 ### Changed

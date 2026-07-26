@@ -2,7 +2,7 @@
 
 What `glass-mcp smoke` asserts, and the shape of what it emits. For the flags, see
 [CLI](cli.md#smoke); to run it and act on a red result, see
-[how-to/verify-your-install.md](../how-to/verify-your-install.md).
+[how-to/exercise-a-build.md](../how-to/exercise-a-build.md).
 
 **Experimental** — the checks, their numbering, and the report shape are not covered by the
 [1.x compatibility promise](stability.md#experimental-subcommands) and may change in any minor
