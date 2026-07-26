@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod ledger;
 pub mod profile;
 pub mod report;
+pub mod selfcheck;
 pub mod transport;
 
 use profile::{Candidate, Profile, X11_CANDIDATES};

@@ -139,7 +139,15 @@ async fn main() -> anyhow::Result<()> {
             self_check,
             dry_run,
         }) => {
-            let _ = self_check; // wired in the next task
+            if self_check {
+                match glass_mcp::smoke::selfcheck::run_self_check() {
+                    Ok(summary) => {
+                        println!("self-check ok: {summary}");
+                        return Ok(());
+                    }
+                    Err(e) => anyhow::bail!("self-check FAILED: {e}"),
+                }
+            }
             let r = glass_mcp::smoke::run(glass_mcp::smoke::SmokeOptions {
                 backend,
                 app,
