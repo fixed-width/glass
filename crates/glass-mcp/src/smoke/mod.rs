@@ -38,6 +38,17 @@ pub fn drivable_backends() -> Vec<&'static str> {
 /// error telling a caller what to pass cannot name different backends.
 pub const DEFAULT_BACKEND: &str = DRIVABLE[0].0;
 
+/// The reference doc's target-app table, rendered from [`DRIVABLE`]. A doc-sync test compares it
+/// against the checked-in markdown, so a candidate can't land in the code and not in the docs.
+pub fn render_candidate_table() -> String {
+    let mut out = String::from("| Backend | Candidates, in probe order |\n|---|---|\n");
+    for (backend, candidates) in DRIVABLE {
+        let bins: Vec<String> = candidates.iter().map(|c| format!("`{}`", c.bin)).collect();
+        out.push_str(&format!("| `{backend}` | {} |\n", bins.join(", ")));
+    }
+    out
+}
+
 /// The clause both resolution errors carry, spelled once so a test can scope its assertion to
 /// the span derived from [`DRIVABLE`] rather than to surrounding prose that also names backends.
 const DRIVES_CLAUSE: &str = "the smoke runner drives: ";
@@ -219,7 +230,7 @@ mod tests {
 
     /// Every row a report must carry, in order, written out rather than derived from
     /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
-    /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d X11 gate.
+    /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d x11/wayland gates.
     const CANONICAL_ROWS: [(u8, &str); 8] = [
         (1, "start"),
         (2, "capabilities+doctor"),

@@ -70,7 +70,8 @@ the statuses, and the report's fields are described in
 covers running it and acting on a red result.
 
 - `--backend <name>` — backend to exercise. The smoke runner drives `x11`, which is the default, and
-  `wayland`; the candidates each one probes are listed in [smoke checks and report](smoke.md#target-apps).
+  `wayland`; the candidates each one probes are listed in [smoke checks and report](smoke.md#target-apps),
+  and a `wayland` run additionally needs a discoverable sway ≥ 1.12 to launch the app into.
   Also sets `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so
   the session and `glass_doctor`'s verdict always agree on which backend is under test.
 - `--report <path>` — also write the JSON report to `path` (the text report always goes to stdout).
