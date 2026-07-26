@@ -50,12 +50,29 @@ pub fn untrusted_sibling(r: &CallResult) -> Result<&str, String> {
 /// It cannot judge prose — it checks for an imperative pointer (a tool name to call,
 /// a value to pass, an action to take). A message that states only a cause
 /// ("no clickable on-screen geometry") fails, which is the regression this guards.
+///
+/// Two extra signals beyond generic English pointer verbs, added after the first real
+/// run against `glass-core`'s actual `GlassError` text (this file's earlier test cases
+/// were all hand-written, never checked against it): `"re-snapshot"` is the codebase-wide
+/// idiom for "take a fresh accessibility snapshot before retrying" (used identically by
+/// `AxElementNotFound` and `AxElementChanged`); and naming one of glass's own `glass_`-
+/// prefixed tools is inherently a pointer, however the surrounding sentence is phrased
+/// (`AxElementNotEditable` names three: "focus it with glass_click, then enter text with
+/// glass_type / glass_key instead" — no generic pointer verb, but plainly actionable).
 pub fn names_a_remedy(msg: &str) -> bool {
-    const POINTERS: [&str; 8] = [
-        "call ", "pass ", "use ", "re-run", "relaunch", "retry", "set ", "try ",
+    const POINTERS: [&str; 9] = [
+        "call ",
+        "pass ",
+        "use ",
+        "re-run",
+        "relaunch",
+        "retry",
+        "set ",
+        "try ",
+        "re-snapshot",
     ];
     let lower = msg.to_lowercase();
-    POINTERS.iter().any(|p| lower.contains(p))
+    POINTERS.iter().any(|p| lower.contains(p)) || lower.contains("glass_")
 }
 
 #[cfg(test)]
@@ -153,5 +170,30 @@ mod tests {
         assert!(!names_a_remedy("no clickable on-screen geometry"));
         assert!(names_a_remedy("no active session — call glass_start first"));
         assert!(names_a_remedy("not a boolean; pass \"true\" or \"false\""));
+    }
+
+    /// Regression for the x11 end-to-end run (`tests/smoke_x11.rs`): `glass_click_element`
+    /// on a stale id returned `GlassError::AxElementNotFound`'s real message, and the
+    /// pre-existing `POINTERS` list didn't recognize its "re-snapshot" remedy clause —
+    /// a false negative caught only once the harness ran against real glass, not a
+    /// scripted transport. Constructed from the live enum (not a copied string) so this
+    /// tracks `glass-core`'s actual wording rather than a frozen snapshot of it.
+    #[test]
+    fn recognizes_glass_cores_actual_remedy_wording() {
+        let not_found = glass_core::GlassError::AxElementNotFound(999_999).to_string();
+        assert!(
+            names_a_remedy(&not_found),
+            "should recognize re-snapshot: {not_found}"
+        );
+        let changed = glass_core::GlassError::AxElementChanged(2).to_string();
+        assert!(
+            names_a_remedy(&changed),
+            "should recognize re-snapshot: {changed}"
+        );
+        let not_editable = glass_core::GlassError::AxElementNotEditable(0).to_string();
+        assert!(
+            names_a_remedy(&not_editable),
+            "should recognize the named glass_ tools: {not_editable}"
+        );
     }
 }
