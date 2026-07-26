@@ -302,8 +302,11 @@ impl GlassServer {
                        Optional `deep`: also spin up and tear down the default backend's \
                        headless display to verify it starts. Returns `report` (the rendered \
                        text above) plus structured data: `sections` (each a `{title, backend, \
-                       checks: [{name, status, detail, remedy?, remedy_action?}]}`, `status` one \
-                       of `\"ok\"`/`\"warn\"`/`\"fail\"`/`\"skip\"`) and `overall` — the single \
+                       checks: [{name, status, detail, remedy?, remedy_action?}]}`, where \
+                       `backend` is null for general checks that apply to every backend, and \
+                       `status` is one of `\"ok\"`/`\"warn\"`/`\"fail\"`/`\"skip\"`; `remedy` and \
+                       `remedy_action` are each omitted when absent, so a failing check may \
+                       carry neither) and `overall` — the single \
                        verdict to branch on, since it already downgrades a non-default backend's \
                        failing check to a warning the way the rendered summary does."
     )]

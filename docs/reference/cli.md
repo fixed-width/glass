@@ -74,4 +74,8 @@ to read the report.
 - `--app <name>` — force a specific candidate app instead of probing for the first one present.
 - `--expect-version <tag>` — version the binary must report (check 1); omit to skip that check.
 - `--dry-run` — print the plan and exit without touching anything.
-- `--self-check` — reserved for a future fault-injection mode; has no effect yet.
+- `--self-check` — prove the checks can still fail: run them against deliberately wrong responses
+  and confirm each one catches its fault, for the reason it names. Drives nothing real — no app, no
+  display — and exits when done, so it cannot be combined with the flags above; passing one is a
+  usage error rather than a silently ignored argument. Exit code 0 when every injected fault was
+  caught.
