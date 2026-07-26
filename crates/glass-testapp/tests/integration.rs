@@ -1042,6 +1042,10 @@ fn clipboard_owner_answers_targets_and_refuses_unknown_target() {
 /// found by `_NET_WM_PID` against the launched process tree, and under containment the process
 /// glass spawned is `bwrap`, not the app — so the window belongs to a descendant pid. If that
 /// walk failed, teardown would silently fall back to signalling every sandboxed app.
+///
+/// The walk works only because the sandbox deliberately does not unshare the PID namespace: in
+/// one, the app would publish a namespace-relative `_NET_WM_PID` that matches nothing glass can
+/// see. Revisiting that decision breaks this test, which is the intent.
 #[test]
 #[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
 fn sandbox_default_app_is_still_asked_to_close() {
