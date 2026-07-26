@@ -113,6 +113,18 @@ mod tests {
     }
 
     #[test]
+    fn an_envelope_without_a_result_is_rejected() {
+        let c = CallResult {
+            is_error: false,
+            envelope: Some(json!({ "ok": true, "tool": "glass_start" })),
+            siblings: vec![],
+            images: 0,
+        };
+        let err = check_envelope("glass_start", &c).unwrap_err();
+        assert!(err.contains("result"), "got: {err}");
+    }
+
+    #[test]
     fn untrusted_app_text_inside_result_is_rejected() {
         // The A1 rule: app-controlled text is a sibling block, never inside `result`.
         let c = ok_call(
