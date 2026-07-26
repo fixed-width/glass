@@ -12,7 +12,7 @@ pub mod transport;
 
 use std::ffi::OsStr;
 
-use profile::{Candidate, Profile, X11_CANDIDATES};
+use profile::{Candidate, Profile, WAYLAND_CANDIDATES, X11_CANDIDATES};
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
 
 pub struct SmokeOptions {
@@ -24,24 +24,57 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
+/// Every backend the smoke runner drives, with its candidate apps: the resolution below and the
+/// errors it produces read this table, and `cli.rs`'s hand-written help is tested against it.
+const DRIVABLE: &[(&str, &[Candidate])] =
+    &[("x11", &X11_CANDIDATES), ("wayland", &WAYLAND_CANDIDATES)];
+
+/// The drivable backend names, in table order, for a message that tells the caller what to pass.
+pub fn drivable_backends() -> Vec<&'static str> {
+    DRIVABLE.iter().map(|(name, _)| *name).collect()
+}
+
+/// What a bare `smoke` drives. Derived from the table so `--backend`'s clap default and the
+/// error telling a caller what to pass cannot name different backends.
+pub const DEFAULT_BACKEND: &str = DRIVABLE[0].0;
+
+/// The reference doc's target-app table, rendered from [`DRIVABLE`]. A doc-sync test compares it
+/// against the checked-in markdown, so a candidate can't land in the code and not in the docs.
+pub fn render_candidate_table() -> String {
+    let mut out = String::from("| Backend | Candidates, in probe order |\n|---|---|\n");
+    for (backend, candidates) in DRIVABLE {
+        let bins: Vec<String> = candidates.iter().map(|c| format!("`{}`", c.bin)).collect();
+        out.push_str(&format!("| `{backend}` | {} |\n", bins.join(", ")));
+    }
+    out
+}
+
+/// The clause both resolution errors carry, spelled once so a test can scope its assertion to
+/// the span derived from [`DRIVABLE`] rather than to surrounding prose that also names backends.
+const DRIVES_CLAUSE: &str = "the smoke runner drives: ";
+
 /// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
 /// backend-recognition predicate — and return the canonical name alongside its candidate apps.
 /// Keying the table off what that returns is what stops `smoke --backend X11` being rejected
 /// while `GLASS_BACKEND=X11` is honoured everywhere else in the binary.
 fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]), String> {
+    let drivable = drivable_backends().join(", ");
     let Some(name) = crate::recognized_backend(backend) else {
         return Err(format!(
-            "unknown backend {backend:?} — glass knows: {}. The smoke runner drives: x11.",
+            "unknown backend {backend:?} — glass knows: {}; {DRIVES_CLAUSE}{drivable}.",
             crate::BACKENDS.join(", ")
         ));
     };
-    match name {
-        "x11" => Ok((name, &X11_CANDIDATES)),
-        other => Err(format!(
-            "no smoke candidates for backend {other:?} yet — the smoke runner drives: x11. \
-             Pass --backend x11."
-        )),
-    }
+    DRIVABLE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, c)| (*n, *c))
+        .ok_or_else(|| {
+            format!(
+                "no smoke candidates for backend {name:?} yet — {DRIVES_CLAUSE}{drivable}. \
+                 Pass --backend {DEFAULT_BACKEND}."
+            )
+        })
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -74,8 +107,7 @@ fn planned_rows() -> Vec<(u8, &'static str)> {
 /// Every check name a report can carry. The known-limits ledger is validated against this,
 /// so an entry naming a check that does not exist fails a test rather than silently never
 /// matching and hard-failing a release over an accepted limitation.
-#[cfg(test)]
-pub(crate) fn all_check_names() -> Vec<&'static str> {
+pub fn all_check_names() -> Vec<&'static str> {
     planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
@@ -198,7 +230,7 @@ mod tests {
 
     /// Every row a report must carry, in order, written out rather than derived from
     /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
-    /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d X11 gate.
+    /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d x11/wayland gates.
     const CANONICAL_ROWS: [(u8, &str); 8] = [
         (1, "start"),
         (2, "capabilities+doctor"),
@@ -231,6 +263,18 @@ mod tests {
 
     fn rows(r: &SmokeReport) -> Vec<(u8, &str)> {
         r.checks.iter().map(|c| (c.step, c.name.as_str())).collect()
+    }
+
+    /// The span of a resolution error interpolated from [`DRIVABLE`], up to the period that ends
+    /// the clause. Both surrounding sentences also name backends — `crate::BACKENDS` before it,
+    /// `Pass --backend x11.` after — so an assertion over the whole message holds vacuously.
+    fn drives_clause(err: &str) -> &str {
+        let (_, rest) = err
+            .split_once(DRIVES_CLAUSE)
+            .unwrap_or_else(|| panic!("must have a drives clause: {err}"));
+        rest.split_once('.')
+            .unwrap_or_else(|| panic!("the drives clause must end in a period: {err}"))
+            .0
     }
 
     fn detail_of<'a>(r: &'a SmokeReport, name: &str) -> &'a str {
@@ -344,7 +388,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("beos") && err.contains("x11"), "got: {err}");
+        assert!(err.contains("beos"), "got: {err}");
     }
 
     #[test]
@@ -371,7 +415,7 @@ mod tests {
     fn a_backend_glass_knows_but_smoke_cannot_drive_yet_says_so() {
         let err = run_with(
             SmokeOptions {
-                backend: "wayland".into(),
+                backend: "android".into(),
                 app: None,
                 dry_run: true,
             },
@@ -379,9 +423,122 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("wayland") && err.contains("x11"),
-            "must name the backend asked for and what is drivable: {err}"
+            err.contains("android"),
+            "must name the backend asked for: {err}"
         );
+        let drives = drives_clause(&err);
+        for b in drivable_backends() {
+            assert!(
+                drives.contains(b),
+                "the drives clause must name {b:?}: {err}"
+            );
+        }
+    }
+
+    /// Nothing else requires a [`DRIVABLE`] name to be the canonical spelling `recognized_backend`
+    /// returns. `("Wayland", …)` compiles, never matches the lookup below it, and conceals itself:
+    /// the error prose and the CLI help test both read this table, so both go on calling a dead
+    /// row drivable while `--backend Wayland` errors.
+    #[test]
+    fn every_drivable_row_can_actually_be_resolved() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, candidates) in DRIVABLE {
+            assert_eq!(
+                crate::recognized_backend(name),
+                Some(*name),
+                "{name:?} is not the canonical spelling glass resolves to"
+            );
+            assert!(!candidates.is_empty(), "{name:?} has no candidate apps");
+            assert!(seen.insert(*name), "{name:?} appears twice");
+        }
+    }
+
+    /// `xed` heads both tables, so naming one candidate would not tell the two apart.
+    #[test]
+    fn wayland_resolves_the_wayland_table() {
+        let (name, candidates) = candidates_for("wayland").expect("wayland must be drivable");
+        assert_eq!(name, "wayland");
+        let resolved: Vec<&str> = candidates.iter().map(|c| c.bin).collect();
+        let wayland: Vec<&str> = WAYLAND_CANDIDATES.iter().map(|c| c.bin).collect();
+        assert_eq!(resolved, wayland);
+    }
+
+    /// What a Wayland user with nothing installed is told. A `start` row built from the x11 table
+    /// would send them to install `xterm`, which cannot drive a Wayland session.
+    #[test]
+    fn a_wayland_plan_previews_the_same_rows_and_names_the_wayland_candidates() {
+        let (_dir, path) = host_with(&[]);
+        let r = run_with(
+            SmokeOptions {
+                backend: "wayland".into(),
+                app: None,
+                dry_run: true,
+            },
+            Some(&path),
+        )
+        .expect("wayland must be drivable");
+        assert_eq!(rows(&r), CANONICAL_ROWS.to_vec());
+        assert_eq!(r.backend, "wayland");
+        let start = detail_of(&r, "start");
+        assert!(
+            start.contains("install") && start.contains("zenity"),
+            "the start row must name what to install: {start}"
+        );
+        assert!(
+            !start.contains("xterm"),
+            "an X11-only client is not something to install for wayland: {start}"
+        );
+    }
+
+    /// `--app` resolves against the backend under test, not x11's table: `xterm` is a valid x11
+    /// candidate, so resolving it there would readmit through `--app` the client the wayland
+    /// table exists to exclude.
+    #[test]
+    fn an_explicit_app_override_resolves_against_the_backend_under_test() {
+        let (_dir, path) = host_with(&[]);
+        let err = run_with(
+            SmokeOptions {
+                backend: "wayland".into(),
+                app: Some("xterm".into()),
+                dry_run: true,
+            },
+            Some(&path),
+        )
+        .unwrap_err();
+        assert!(err.contains("xterm"), "must name the app asked for: {err}");
+        // Scoped to the offer, because the rejected name is `xterm` too.
+        let (_, offered) = err
+            .split_once("use one of: ")
+            .unwrap_or_else(|| panic!("must offer the backend's candidates: {err}"));
+        assert!(
+            !offered.contains("xterm"),
+            "the wayland offer must not include an X11-only client: {err}"
+        );
+        for c in &WAYLAND_CANDIDATES {
+            assert!(offered.contains(c.label), "must offer {}: {err}", c.label);
+        }
+    }
+
+    /// The prose naming what is drivable is derived from the table, so a backend cannot land
+    /// while a message still says otherwise.
+    #[test]
+    fn an_unknown_backend_names_every_drivable_backend() {
+        let err = run_with(
+            SmokeOptions {
+                backend: "beos".into(),
+                app: None,
+                dry_run: true,
+            },
+            None,
+        )
+        .unwrap_err();
+        let drives = drives_clause(&err);
+        for b in drivable_backends() {
+            assert!(
+                drives.contains(b),
+                "the drives clause must name {b:?}: {err}"
+            );
+        }
     }
 
     /// A name that is not in the candidate table at all is a typo in the caller's input, not

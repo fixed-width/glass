@@ -1,8 +1,7 @@
 # `smoke` checks and report
 
 What `glass-mcp smoke` asserts, and the shape of what it emits. For the flags, see
-[CLI](cli.md#smoke); to run it and act on a red result, see
-[how-to/check-a-build.md](../how-to/check-a-build.md).
+[CLI](cli.md#smoke).
 
 **Experimental** — the checks, their numbering, and the report shape are not covered by the
 [1.x compatibility promise](stability.md#experimental-subcommands) and may change in any minor
@@ -14,6 +13,28 @@ release.
 (`std::env::current_exe()`), and drives it over stdio. It therefore always tests the build you
 have in hand — never a different `glass-mcp` that happens to be earlier on `PATH`. The spawned
 server is given `GLASS_BACKEND` set to the backend under test, overriding any ambient value.
+
+## Target apps
+
+A real run drives a stock app installed on the host. Each backend has a candidate list; the run
+probes it in order and takes the first one runnable on `PATH`, recording the choice in the report's
+`app` field. `--app <name>` selects a specific candidate instead.
+
+<!-- BEGIN GENERATED: smoke-candidates -->
+| Backend | Candidates, in probe order |
+|---|---|
+| `x11` | `xed`, `gnome-text-editor`, `zenity`, `xterm` |
+| `wayland` | `xed`, `gnome-text-editor`, `zenity` |
+<!-- END GENERATED: smoke-candidates -->
+
+A wayland run launches its target with `GDK_BACKEND=wayland`, so a toolkit that cannot use the
+Wayland backend fails the launch rather than falling back to Xwayland. `xterm` is an X11-only
+client, which under the Wayland backend would reach the screen through Xwayland, so it is not a
+wayland candidate.
+
+A `--backend wayland` run also needs a discoverable sway ≥ 1.12 — the backend spawns a private
+headless one per session, and [Set up Linux](../how-to/setup-linux.md#wayland-sway) covers where it
+looks. Without one, check 1 (`start`) fails: there is no compositor to launch the app into.
 
 ## Checks
 

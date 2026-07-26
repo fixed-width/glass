@@ -11,8 +11,7 @@ pub struct LedgerEntry {
     pub reason: &'static str,
 }
 
-/// X11 has no accepted limitations today. Entries for other backends land with
-/// their own increments.
+/// No backend the runner drives has an accepted limitation today.
 pub const KNOWN_LIMITS: &[LedgerEntry] = &[];
 
 /// Reclassify an outcome against the shipped ledger.

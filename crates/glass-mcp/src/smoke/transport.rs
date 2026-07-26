@@ -71,9 +71,11 @@ impl CallResult {
     }
 }
 
-/// Replays a fixed script. Used by the unit tests and by `--self-check`.
+/// Replays a fixed script and records what it was called with. Used by the unit tests and by
+/// `--self-check`.
 pub struct ScriptedTransport {
     queue: std::collections::VecDeque<(String, Result<CallResult, String>)>,
+    calls: Vec<(String, Value)>,
 }
 
 impl ScriptedTransport {
@@ -83,12 +85,33 @@ impl ScriptedTransport {
                 .into_iter()
                 .map(|(t, r)| (t.to_string(), r))
                 .collect(),
+            calls: Vec::new(),
         }
+    }
+
+    /// Every `(tool, args)` this double was called with, in order, including calls the script
+    /// rejected.
+    pub fn calls(&self) -> &[(String, Value)] {
+        &self.calls
+    }
+
+    /// The arguments of the one call to `tool`, or `None` if it was never called. Panics when it
+    /// was called more than once: answering about the first would hand a before/after assertion a
+    /// green result about the wrong call.
+    pub fn args_for(&self, tool: &str) -> Option<&Value> {
+        let mut matching = self.calls.iter().filter(|(t, _)| t == tool);
+        let (_, args) = matching.next()?;
+        assert!(
+            matching.next().is_none(),
+            "{tool} was called more than once; use calls() to pick the call you mean"
+        );
+        Some(args)
     }
 }
 
 impl McpTransport for ScriptedTransport {
-    fn call(&mut self, tool: &str, _args: Value) -> Result<CallResult, String> {
+    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        self.calls.push((tool.to_string(), args));
         match self.queue.pop_front() {
             None => Err(format!("script exhausted; unexpected call to {tool}")),
             Some((expected, r)) if expected == tool => r,
@@ -169,5 +192,49 @@ mod tests {
         );
         assert_eq!(r.siblings, vec!["sibling text".to_string()]);
         assert_eq!(r.images, 1);
+    }
+
+    #[test]
+    fn scripted_transport_records_the_arguments_of_every_call() {
+        let mut t = ScriptedTransport::new(vec![
+            ("glass_start", Ok(CallResult::default())),
+            ("glass_stop", Ok(CallResult::default())),
+        ]);
+        let _ = t.call(
+            "glass_start",
+            json!({ "run": ["xed"], "env": { "GDK_BACKEND": "wayland" } }),
+        );
+        let _ = t.call("glass_stop", json!({}));
+        let names: Vec<&str> = t.calls().iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["glass_start", "glass_stop"],
+            "calls() promises the order the code made them in"
+        );
+        assert_eq!(t.calls()[0].1["env"]["GDK_BACKEND"], json!("wayland"));
+    }
+
+    /// Silently answering about the first call would let an assertion meant for a later one pass
+    /// against an earlier one.
+    #[test]
+    #[should_panic(expected = "called more than once")]
+    fn args_for_refuses_a_tool_that_was_called_more_than_once() {
+        let mut t = ScriptedTransport::new(vec![
+            ("glass_key", Ok(CallResult::default())),
+            ("glass_key", Ok(CallResult::default())),
+        ]);
+        let _ = t.call("glass_key", json!({ "chord": "Home" }));
+        let _ = t.call("glass_key", json!({ "chord": "End" }));
+        let _ = t.args_for("glass_key");
+    }
+
+    /// A call the script rejects is still a call the code made: recording only accepted calls
+    /// would leave a test unable to tell a wrong payload from no payload at all.
+    #[test]
+    fn a_rejected_call_is_still_recorded() {
+        let mut t = ScriptedTransport::new(vec![("glass_stop", Ok(CallResult::default()))]);
+        let _ = t.call("glass_screenshot", json!({ "scale": 1 }));
+        assert_eq!(t.calls().len(), 1);
+        assert_eq!(t.calls()[0].0, "glass_screenshot");
     }
 }

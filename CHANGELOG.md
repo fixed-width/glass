@@ -46,9 +46,12 @@ internal refactors, CI, or test-only changes.
   reports whether this build works, in the same report style as `glass-mcp doctor`: a glyph and a
   status word per check, and a `Summary:` line carrying the verdict. `--dry-run` prints the plan
   without driving anything, on any host: with no target app installed it says what to install
-  rather than failing. Experimental; see
-  `docs/how-to/check-a-build.md` to run it and `docs/reference/smoke.md` for the checks and
-  the report shape.
+  rather than failing. Experimental; see `docs/reference/smoke.md` for the checks and the
+  report shape.
+- `glass-mcp smoke` drives the `wayland` backend: `smoke --backend wayland` launches a stock GTK app
+  under the backend's headless sway and runs the same eight checks as `x11`. The target is launched
+  with `GDK_BACKEND=wayland`, so a toolkit that cannot use the Wayland backend fails the launch
+  rather than falling back to Xwayland.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.

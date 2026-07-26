@@ -8,8 +8,14 @@ pub struct Candidate {
     pub bin: &'static str,
     /// Its arguments. Must open a non-destructive, unsaved surface.
     pub args: &'static [&'static str],
+    /// Environment for the launched app. Empty for candidates that need none.
+    pub env: &'static [(&'static str, &'static str)],
     pub label: &'static str,
 }
+
+/// The prompt text must not look like anything the interaction check writes: a label the runner
+/// could also have typed makes `value_contains` ambiguous evidence.
+const ZENITY_ARGS: &[&str] = &["--entry", "--text=type in this box"];
 
 /// Linux is the only platform with no guaranteed stock app, so the runner probes in
 /// order and records which one it selected.
@@ -17,24 +23,52 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
     Candidate {
         bin: "xed",
         args: &[],
+        env: &[],
         label: "xed",
     },
     Candidate {
         bin: "gnome-text-editor",
         args: &[],
+        env: &[],
         label: "gnome-text-editor",
     },
     Candidate {
-        // The prompt text must not look like anything the interaction check writes: a label
-        // the runner could also have typed makes `value_contains` ambiguous evidence.
         bin: "zenity",
-        args: &["--entry", "--text=type in this box"],
+        args: ZENITY_ARGS,
+        env: &[],
         label: "zenity",
     },
     Candidate {
         bin: "xterm",
         args: &[],
+        env: &[],
         label: "xterm",
+    },
+];
+
+/// GTK refuses to start when the named backend is unavailable, so naming it turns a would-be
+/// silent Xwayland fallback into a launch failure the run reports.
+const NATIVE_WAYLAND: &[(&str, &str)] = &[("GDK_BACKEND", "wayland")];
+
+/// The X11 table without its X11-only entry, in the same probe order.
+pub const WAYLAND_CANDIDATES: [Candidate; 3] = [
+    Candidate {
+        bin: "xed",
+        args: &[],
+        env: NATIVE_WAYLAND,
+        label: "xed",
+    },
+    Candidate {
+        bin: "gnome-text-editor",
+        args: &[],
+        env: NATIVE_WAYLAND,
+        label: "gnome-text-editor",
+    },
+    Candidate {
+        bin: "zenity",
+        args: ZENITY_ARGS,
+        env: NATIVE_WAYLAND,
+        label: "zenity",
     },
 ];
 
@@ -448,5 +482,69 @@ mod tests {
             states: vec![],
         }];
         assert_eq!(first_editable(&nodes).unwrap().id, 10);
+    }
+
+    /// GDK tries wayland before x11, so GTK already picks wayland where `WAYLAND_DISPLAY` is set:
+    /// what naming the backend buys is a launch failure where GTK would otherwise fall back to the
+    /// `DISPLAY` a headless sway also exports for Xwayland.
+    #[test]
+    fn every_wayland_candidate_names_the_wayland_gdk_backend() {
+        for c in &WAYLAND_CANDIDATES {
+            assert_eq!(
+                c.env,
+                [("GDK_BACKEND", "wayland")],
+                "{} must name the Wayland GDK backend and nothing else",
+                c.label
+            );
+        }
+    }
+
+    /// A duplicate key compiles and reads as harmless here, but `check_start` collects `env` into
+    /// a `serde_json::Map`, where the later value wins on the wire without anything saying so.
+    #[test]
+    fn every_candidates_env_is_a_well_formed_map() {
+        for (backend, candidates) in crate::smoke::DRIVABLE {
+            for c in *candidates {
+                let mut seen = std::collections::BTreeSet::new();
+                for (k, v) in c.env {
+                    assert!(!k.is_empty(), "{backend}/{}: empty env key", c.label);
+                    assert!(
+                        !v.is_empty(),
+                        "{backend}/{}: empty value for {k:?}",
+                        c.label
+                    );
+                    assert!(seen.insert(k), "{backend}/{}: {k:?} set twice", c.label);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_x11_candidate_changes_the_apps_environment() {
+        for c in &X11_CANDIDATES {
+            assert!(c.env.is_empty(), "{} must carry no env", c.label);
+        }
+    }
+
+    /// The relationship [`WAYLAND_CANDIDATES`]' doc comment states, which nothing else pins: a
+    /// candidate added to one table only would leave it false. `xterm` is the excluded entry
+    /// because it reaches a Wayland session only through Xwayland, so a run that selected it
+    /// would report a verdict about a code path it never exercised.
+    #[test]
+    fn the_wayland_table_is_the_x11_table_without_its_x11_only_entry() {
+        let x11: Vec<&str> = X11_CANDIDATES
+            .iter()
+            .map(|c| c.bin)
+            .filter(|b| *b != "xterm")
+            .collect();
+        let wayland: Vec<&str> = WAYLAND_CANDIDATES.iter().map(|c| c.bin).collect();
+        assert_eq!(wayland, x11);
+    }
+
+    #[test]
+    fn resolve_picks_the_first_present_wayland_candidate() {
+        let (_dir, path) = path_fixture(&["zenity", "gnome-text-editor"], &[]);
+        let c = resolve_app(&WAYLAND_CANDIDATES, Some(&path)).unwrap();
+        assert_eq!(c.label, "gnome-text-editor");
     }
 }

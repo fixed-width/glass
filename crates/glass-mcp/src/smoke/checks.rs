@@ -30,7 +30,10 @@ fn excerpt(s: &str) -> String {
 pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     let mut run = vec![Value::String(p.app.bin.to_string())];
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
-    let args = json!({ "run": run, "backend": p.backend, "a11y": true });
+    let mut args = json!({ "run": run, "backend": p.backend, "a11y": true });
+    if !p.app.env.is_empty() {
+        args["env"] = p.app.env.iter().copied().collect();
+    }
     outcome(
         1,
         "start",
@@ -222,15 +225,18 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
             }
             // The matched element rides in an untrusted sibling; a missing, unparseable or
             // id-less sibling means the id cannot be confirmed, not that it mismatches — only
-            // a definite mismatch fails the check.
-            if let Some(matched_id) = matched_element_id(&wait)
-                && matched_id != u64::from(id)
-            {
-                return Err(format!(
-                    "glass_set_value wrote to #{id} but element #{matched_id} \
-                     reported the value instead — the write landed somewhere unintended"
-                ));
-            }
+            // a definite mismatch fails the check, and the detail has to say which of the two
+            // happened or a guard that stopped guarding reads exactly like one that held.
+            let confirmation = match matched_element_id(&wait) {
+                Some(matched_id) if matched_id != u64::from(id) => {
+                    return Err(format!(
+                        "glass_set_value wrote to #{id} but element #{matched_id} \
+                         reported the value instead — the write landed somewhere unintended"
+                    ));
+                }
+                Some(_) => "",
+                None => " (id unconfirmed: the reply carried no element id)",
+            };
 
             // Pixel path: a click inside the window, then a key. These assert the tools
             // accept and report; the element path above is what proves an effect.
@@ -257,7 +263,9 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: Option<&[OutlineNode]>
                         .to_string(),
                 );
             }
-            Ok(format!("element #{id} took the value; pixel path ok"))
+            Ok(format!(
+                "element #{id} took the value{confirmation}; pixel path ok"
+            ))
         })(),
     )
 }
@@ -367,7 +375,7 @@ pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::profile::X11_CANDIDATES;
+    use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::{CallResult, ScriptedTransport};
 
@@ -389,6 +397,22 @@ mod tests {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
         }
+    }
+
+    fn wayland_profile() -> Profile {
+        Profile {
+            backend: "wayland".into(),
+            app: &WAYLAND_CANDIDATES[0],
+        }
+    }
+
+    fn started() -> CallResult {
+        ok(
+            "glass_start",
+            json!({ "x": 0, "y": 0, "width": 800, "height": 600 }),
+            &[],
+            0,
+        )
     }
 
     #[test]
@@ -415,6 +439,24 @@ mod tests {
             "must say what was missing: {}",
             out.detail
         );
+    }
+
+    #[test]
+    fn start_sends_the_candidates_env_on_the_wire() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Ok(started()))]);
+        let _ = check_start(&mut t, &wayland_profile());
+        let args = t.args_for("glass_start").expect("glass_start was called");
+        assert_eq!(args["env"]["GDK_BACKEND"], json!("wayland"));
+    }
+
+    /// An empty `env` object is a different payload from no `env` key, and the server is free to
+    /// treat them differently — so a candidate that declares none must send none.
+    #[test]
+    fn start_sends_no_env_key_for_a_candidate_that_needs_none() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Ok(started()))]);
+        let _ = check_start(&mut t, &profile());
+        let args = t.args_for("glass_start").expect("glass_start was called");
+        assert!(args.get("env").is_none(), "got: {args}");
     }
 
     #[test]
@@ -685,9 +727,12 @@ mod tests {
             &[sibling.as_str()],
             pixel_path_script(1),
         ));
-        assert_eq!(
-            check_interaction(&mut t, Some(&nodes_with_editable())).status,
-            CheckStatus::Pass
+        let out = check_interaction(&mut t, Some(&nodes_with_editable()));
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            !out.detail.contains("unconfirmed"),
+            "a confirmed id must not be reported as unconfirmed: {}",
+            out.detail
         );
     }
 
@@ -700,9 +745,12 @@ mod tests {
             &[],
             pixel_path_script(1),
         ));
-        assert_eq!(
-            check_interaction(&mut t, Some(&nodes_with_editable())).status,
-            CheckStatus::Pass
+        let out = check_interaction(&mut t, Some(&nodes_with_editable()));
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            out.detail.contains("unconfirmed"),
+            "must say the id was not confirmed: {}",
+            out.detail
         );
     }
 
