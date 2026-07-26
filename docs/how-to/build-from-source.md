@@ -27,6 +27,10 @@ On Linux and Windows the built binary is all you need — return to the [Linux](
 [Windows](setup-windows.md) setup guide to install the runtime deps and connect an agent. macOS needs
 the signing + LaunchAgent steps below.
 
+To confirm the build works — not just that it compiled, but that it launches an app and drives it
+end to end — see [Exercise a build with `smoke`](exercise-a-build.md). (For whether the *environment*
+is set up correctly, that's [`glass-mcp doctor`](../reference/cli.md#doctor).)
+
 ## macOS: sign the app and run it as a LaunchAgent
 
 Building from source, you reproduce by hand what the `.dmg` double-click does for you: establish a
