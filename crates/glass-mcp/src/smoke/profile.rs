@@ -8,6 +8,8 @@ pub struct Candidate {
     pub bin: &'static str,
     /// Its arguments. Must open a non-destructive, unsaved surface.
     pub args: &'static [&'static str],
+    /// Environment for the launched app. Empty for candidates that need none.
+    pub env: &'static [(&'static str, &'static str)],
     pub label: &'static str,
 }
 
@@ -17,11 +19,13 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
     Candidate {
         bin: "xed",
         args: &[],
+        env: &[],
         label: "xed",
     },
     Candidate {
         bin: "gnome-text-editor",
         args: &[],
+        env: &[],
         label: "gnome-text-editor",
     },
     Candidate {
@@ -29,12 +33,42 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
         // the runner could also have typed makes `value_contains` ambiguous evidence.
         bin: "zenity",
         args: &["--entry", "--text=type in this box"],
+        env: &[],
         label: "zenity",
     },
     Candidate {
         bin: "xterm",
         args: &[],
+        env: &[],
         label: "xterm",
+    },
+];
+
+/// GTK refuses to start when the named backend is unavailable, so a wayland run drives a native
+/// Wayland client rather than silently falling back to Xwayland.
+const NATIVE_WAYLAND: &[(&str, &str)] = &[("GDK_BACKEND", "wayland")];
+
+/// The X11 table without its X11-only entry, in the same probe order.
+pub const WAYLAND_CANDIDATES: [Candidate; 3] = [
+    Candidate {
+        bin: "xed",
+        args: &[],
+        env: NATIVE_WAYLAND,
+        label: "xed",
+    },
+    Candidate {
+        bin: "gnome-text-editor",
+        args: &[],
+        env: NATIVE_WAYLAND,
+        label: "gnome-text-editor",
+    },
+    Candidate {
+        // The prompt text must not look like anything the interaction check writes: a label
+        // the runner could also have typed makes `value_contains` ambiguous evidence.
+        bin: "zenity",
+        args: &["--entry", "--text=type in this box"],
+        env: NATIVE_WAYLAND,
+        label: "zenity",
     },
 ];
 
@@ -448,5 +482,42 @@ mod tests {
             states: vec![],
         }];
         assert_eq!(first_editable(&nodes).unwrap().id, 10);
+    }
+
+    /// A headless sway session also exports `DISPLAY` for Xwayland, so GTK is free to pick the
+    /// X11 backend unless told otherwise — and a run that let it would grade Xwayland.
+    #[test]
+    fn every_wayland_candidate_forces_the_native_backend() {
+        for c in &WAYLAND_CANDIDATES {
+            assert!(
+                c.env.contains(&("GDK_BACKEND", "wayland")),
+                "{} must force the native Wayland backend",
+                c.label
+            );
+        }
+    }
+
+    #[test]
+    fn no_x11_candidate_changes_the_apps_environment() {
+        for c in &X11_CANDIDATES {
+            assert!(c.env.is_empty(), "{} must carry no env", c.label);
+        }
+    }
+
+    /// `xterm` reaches a Wayland session only through Xwayland, so selecting it would report a
+    /// verdict about a code path the run never exercised.
+    #[test]
+    fn the_wayland_table_holds_no_x11_only_client() {
+        assert!(
+            !WAYLAND_CANDIDATES.iter().any(|c| c.bin == "xterm"),
+            "xterm is not a wayland candidate"
+        );
+    }
+
+    #[test]
+    fn resolve_picks_the_first_present_wayland_candidate() {
+        let (_dir, path) = path_fixture(&["zenity", "gnome-text-editor"], &[]);
+        let c = resolve_app(&WAYLAND_CANDIDATES, Some(&path)).unwrap();
+        assert_eq!(c.label, "gnome-text-editor");
     }
 }
