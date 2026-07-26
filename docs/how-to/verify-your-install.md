@@ -57,20 +57,33 @@ Two flags matter while you're working; [CLI](../reference/cli.md#smoke) lists th
 
 ## Read the result
 
-The heading above the table is `PASS`, `PASS (plan only)` or `FAIL`, and the exit code is 0 for the
-first two and 1 for the last. Read the exit code as *no check failed* rather than as *everything
-works*: a run in which every check skipped — any `--dry-run`, including one on a machine with no
-target app — also exits 0. When you need to know *what* happened, read the `detail` column of the
-check you care about; it states what that check observed, or what it would have done.
+The report reads like `glass-mcp doctor`'s: a heading, one line per check, and a `Summary:` line.
+Both the heading and the summary end in `PASS`, `PASS (plan only)` or `FAIL`, and the exit code is 0
+for the first two and 1 for the last.
+
+```
+glass smoke — x11 — PASS
+glass-mcp 1.1.0 · app: zenity
+
+  ✓ pass  1 start: 432x142
+  …
+
+Summary: 8 ok, 0 warning(s), 0 failure(s), 0 skipped — PASS
+```
+
+Read the exit code as *no check failed* rather than as *everything works*: a run in which every
+check skipped — any `--dry-run`, including one on a machine with no target app — also exits 0. Scan
+for a `✗` when you want the short answer, and read the text after the colon on any line you care
+about; it states what that check observed, or what it would have done.
 
 Two things are worth knowing before you treat a green run as evidence: only `fail` fails a run, and
-a `skip` is not a `pass`. If a check you expected to exercise reports `skip`, read its `detail`
-before concluding anything. [smoke checks and report](../reference/smoke.md) has the full table of
-what each check asserts and what each status means.
+a `skip` is not a `pass`. If a check you expected to exercise reports `skip`, read the rest of its
+line before concluding anything. [smoke checks and report](../reference/smoke.md) has the full table
+of what each check asserts and what each status means.
 
 ## When it's red
 
-1. Read the `detail` for the failing check first — it names what broke, not just that something did.
+1. Read the failing check's line first — it names what broke, not just that something did.
 2. If check 2 (`capabilities+doctor`) failed, run `glass-mcp doctor` directly. It gives fuller
    per-check remedy guidance than `smoke`'s one-line summary.
 3. If check 4 (`a11y snapshot`) failed, the accessibility bus is the usual cause — `doctor` reports

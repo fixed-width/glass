@@ -291,13 +291,13 @@ mod tests {
         );
     }
 
-    /// A heading, an exit code and nine uniform skips all said "healthy" on a machine that
+    /// A heading, an exit code and eight uniform skips all said "healthy" on a machine that
     /// could not run a single check. The heading is the channel that has to give.
     #[test]
     fn a_plan_does_not_head_its_report_pass() {
         let (_dir, path) = host_with(&[]);
-        let md = dry_run(None, Some(&path)).to_markdown();
-        let heading = md.lines().next().unwrap_or_default();
+        let text = dry_run(None, Some(&path)).to_text();
+        let heading = text.lines().next().unwrap_or_default();
         assert!(heading.contains("plan only"), "got: {heading}");
     }
 

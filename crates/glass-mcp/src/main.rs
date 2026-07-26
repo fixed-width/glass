@@ -161,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
                      reached a check."
                 )
             })?;
-            print!("{}", r.to_markdown());
+            print!("{}", r.to_text());
             if let Some(path) = report {
                 std::fs::write(&path, serde_json::to_string_pretty(&r)?)?;
             }

@@ -72,8 +72,7 @@ covers running it and acting on a red result.
 - `--backend <name>` — backend to exercise (default `x11`; the only one today). Also sets
   `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so the session and
   `glass_doctor`'s verdict always agree on which backend is under test.
-- `--report <path>` — also write the JSON report to `path` (the markdown table always goes to
-  stdout).
+- `--report <path>` — also write the JSON report to `path` (the text report always goes to stdout).
 - `--app <name>` — force a specific candidate app instead of probing for the first one present. The
   name must be one of the backend's candidates; a name that is not is a usage error. A real run does
   not check the named binary for presence, so naming an app that is not installed fails at the

@@ -37,38 +37,51 @@ have done. `start`'s `detail` is where a missing target app is reported.
 
 ## Statuses
 
-The markdown table and the JSON report spell each status identically.
+Every check reports one of five statuses. The text report and the JSON spell each one identically.
 
-| Status | Meaning | Effect on the run |
-|---|---|---|
-| `pass` | The check succeeded. | None. |
-| `fail` | The check found a real problem. | Any `fail` makes the run `FAIL`, exit code 1. |
-| `xfail` | A known limitation failed as expected. | None; the run still exits 0. |
-| `xpass` | A check recorded as a known limitation passed. | None; reported so a limitation that has been fixed does not go unnoticed in the support matrix. |
-| `skip` | The check was deliberately not run. `detail` says why. | None. |
+| Status | Glyph | Meaning | Effect on the run |
+|---|---|---|---|
+| `pass` | `✓` | The check succeeded. | None. |
+| `fail` | `✗` | The check found a real problem. | Any `fail` makes the run `FAIL`, exit code 1. |
+| `xfail` | `⚠` | A known limitation failed as expected. | None; the run still exits 0. |
+| `xpass` | `⚠` | A check recorded as a known limitation passed. | None; reported so a limitation that has been fixed does not go unnoticed in the support matrix. |
+| `skip` | `–` | The check was deliberately not run. `detail` says why. | None. |
+
+The glyphs are [`glass-mcp doctor`](cli.md#doctor)'s. `xfail` and `xpass` share `⚠` — neither fails a
+run, and both are a recorded limitation to look at — so the text report prints the status word
+beside the glyph as well.
 
 Only `fail` fails a run. A `skip` is not a `pass`: a check that skipped produced no evidence about
 what it would have asserted.
 
 ## Report
 
-Every run prints the markdown report to stdout; `--report <path>` additionally writes the same run
-as JSON. The JSON is written only once the run reaches its checks — a setup failure of a real
+Every run prints a text report to stdout, in the same shape as `glass-mcp doctor`'s. `--report
+<path>` additionally writes the same run as JSON; the two carry the same facts, and neither is
+derived from the other.
+
+The JSON is written only once the run reaches its checks — a setup failure of a real
 (non-`--dry-run`) run, such as no target app on `PATH`, reports on stderr and writes no file. A
 `--dry-run` always reaches its (all-`skip`) checks, so it writes a report on any host, including one
 with no candidate app installed.
 
-### Markdown
+### Text
 
 ```
-# glass smoke — <backend> — <verdict>
+glass smoke — <backend> — <verdict>
+glass-mcp <version> · app: <app>
 
-glass-mcp <version> · app: `<app>`
+  <glyph> <status> <#> <check>: <detail>
+  …
 
-| # | check | status | detail |
+Summary: <n> ok, <n> warning(s), <n> failure(s), <n> skipped — <verdict>
 ```
 
-The heading's `<verdict>` is one of:
+One line per check, in the order the [Checks](#checks) table lists them, carrying the check's number,
+its name and its `detail`. Newlines in any interpolated value are collapsed to spaces, so a check's
+`detail` is always exactly one line and the summary can never be pushed out of view.
+
+`<verdict>` appears twice — heading and summary — and is one of:
 
 | Verdict | Meaning | Exit code |
 |---|---|---|
@@ -76,12 +89,15 @@ The heading's `<verdict>` is one of:
 | `PASS (plan only)` | `--dry-run`: nothing was spawned, launched or called, so nothing could fail. | 0 |
 | `FAIL` | At least one check reported `fail`. | 1 |
 
-`<app>` is the label of the app the run selected, or `none available` when it had none — the reason and
-the remedy are in the `start` row's `detail`, not in this line. A `|` in any of these values is
-escaped and newlines are collapsed, so no value can break the table.
+The summary's counts follow the glyph mapping in [Statuses](#statuses): `pass` counts as ok, `xfail`
+and `xpass` as warnings, `fail` as failures, and `skip` as skipped.
 
-When any check is `xpass`, a `## Stale limitations` section follows the table, naming each such check
-— the "reported" the `xpass` status promises.
+`<version>` is the version the server reported, or `(version not reported)` when it reported none.
+`<app>` is the label of the app the run selected, or `none available` when it had none — the reason
+and the remedy are in the `start` row's `detail`, not in this line.
+
+An `xpass` row is followed by a continuation line, in doctor's `→` style, saying the check is
+recorded as a known limitation but passed — the "reported" the `xpass` status promises.
 
 ### JSON
 
