@@ -124,8 +124,14 @@ result, along with what to do about it where anything can be — the result stay
 
 Two exceptions: a Windows app launched under Sandboxie containment (`sandbox` of `default` or
 `strict`) is terminated without being asked, because a close request from outside the box never
-reaches it; and an app with no window has nothing to ask, so it is terminated immediately as
-before.
+reaches it; and an app with no window to ask is terminated immediately — one that opened none, or
+(on X11) a client that never opted into the `WM_DELETE_WINDOW` protocol, which has no handler for
+the request and will not act on it. Toolkit apps opt in; a bare-Xlib one may not.
+
+One reporting limit: on Wayland the compositor performs the ask, and it disconnects a client that
+has no close protocol instead of asking it. glass sees the same thing either way — the window is
+gone — so that case is reported as a clean close rather than as a termination. The X11 backend
+reads the protocol list itself and does distinguish them.
 
 ## Capture & visual comparison
 

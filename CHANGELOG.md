@@ -109,16 +109,25 @@ internal refactors, CI, or test-only changes.
   attempting the spawn. Your own app is unaffected: only Apple-signed system code takes the new
   path, and only when `sandbox` is `off` (a contained launch cannot be handed off at all, so it
   still tries — Terminal and Disk Utility, for instance, do run contained).
-- Windows and macOS: `glass_stop` now asks the app to close before killing it, so the app runs
-  its own shutdown path. Both backends previously went straight to terminating the process —
-  Windows by closing the job object, macOS by signalling — which an app that records whether it
-  exited cleanly reports as a crash the *next* time it starts. A Chromium-based browser opened
-  with a "Restore pages?" prompt instead of its normal first screen, so an agent driving it saw
-  a different first screen on every run. An app that ignores or refuses the request is still
-  terminated, and glass now says so on stderr rather than reporting an unqualified success.
-  Windows launches under Sandboxie containment are the exception and still get the old
-  teardown: a close request sent from outside the box is accepted by the OS but never reaches
-  the app, so landing one needs a helper running inside the box.
+- `glass_stop` now asks the app to close before killing it on every desktop backend, so the app
+  runs its own shutdown path. All four previously went straight to terminating the process —
+  Windows by closing the job object, macOS by signalling, X11 and Wayland by signalling the
+  process group — which an app that records whether it exited cleanly reports as a crash the
+  *next* time it starts. A Chromium-based browser opened with a "Restore pages?" prompt instead
+  of its normal first screen, so an agent driving it saw a different first screen on every run.
+  The ask is each platform's own: `WM_CLOSE` on Windows, a quit request on macOS, a
+  `WM_DELETE_WINDOW` client message on X11, and a close request through the compositor on
+  Wayland. On the two Linux backends that was measured directly: a GTK app ran its shutdown
+  handlers when asked and none of them when signalled, because the toolkit installs no `SIGTERM`
+  handler. An app that installs one of its own is the exception.
+  An app that ignores or refuses the request is still terminated, and glass now says so on
+  stderr rather than reporting an unqualified success. Two exceptions keep the old teardown: a
+  Windows launch under Sandboxie containment (a close request sent from outside the box is
+  accepted by the OS but never reaches the app, so landing one needs a helper running inside the
+  box), and an X11 client that never opted into the `WM_DELETE_WINDOW` protocol, which has no
+  handler for the request and will not act on it. Under Wayland the compositor performs the ask,
+  and it disconnects a client that has no close protocol rather than asking it — glass cannot
+  tell that apart from a clean close there, so that case is reported as one.
 - iOS: `glass_start` no longer reports a window for an app that died on launch. `simctl launch`
   exits successfully once the process is spawned, so an app that rejects a launch argument or
   trips an assertion at startup was reported as running, and the screenshot behind that geometry

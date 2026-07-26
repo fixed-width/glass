@@ -4,15 +4,28 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    TEARDOWN_BUDGET, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
-use glass_proc_linux::{proc_tree_pids, spawn_reader};
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, proc_tree_pids, spawn_reader};
+use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+
+// glass-mcp gives the whole of teardown `glass_core::TEARDOWN_BUDGET` and then exits regardless, on a
+// `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
+// budget would never get to the signal, and the app would outlive glass.
+//
+// This binds the ladder only. What follows it in the same budget — the private a11y bus, then a
+// private Xvfb — still reaps at `REAP_GRACE` each, so a helper that ignores SIGTERM can take the
+// whole teardown past the budget; that is pre-existing and not what this assertion is about.
+const _: () = assert!(
+    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    "the close request + signal ladder must finish inside glass_core::TEARDOWN_BUDGET"
+);
 
 const XT_MOTION: u8 = 6; // MotionNotify
 const XT_BTN_PRESS: u8 = 4; // ButtonPress
@@ -278,12 +291,129 @@ impl X11Platform {
         Ok(())
     }
 
+    /// Ask every mapped top-level window of the app rooted at `root_pid` to close.
+    ///
+    /// The ask is a `WM_DELETE_WINDOW` client message — the same one a window manager sends
+    /// when the user clicks the close button, and the only way a toolkit app gets to run its
+    /// shutdown path (see `glass_proc_linux::CLOSE_GRACE` for what a signal does instead).
+    /// Nothing restricts who sends it, whether or not a window manager is running: `wmctrl -c`
+    /// does the same thing.
+    ///
+    /// Only windows that advertise `WM_DELETE_WINDOW` in `WM_PROTOCOLS` are asked. A window
+    /// that does not has no handler for the message and will not act on it, so counting it
+    /// would make teardown wait out the whole grace for a shutdown nobody was asked to perform.
+    ///
+    /// The set is the launched process tree's, never the window-hint's. A hint can match a
+    /// window belonging to some *other* process — that is the point of the fallback, and it is
+    /// safe for discovery, which only reads — but closing one would destroy the state of an app
+    /// glass did not launch, which teardown of a spawned child has never done. A launch found
+    /// only by hint is therefore signalled, and says so rather than passing for an app with no
+    /// window.
+    fn request_close(&self, root_pid: u32) -> Asked {
+        let (protocols, delete) = match (
+            self.intern(b"WM_PROTOCOLS"),
+            self.intern(b"WM_DELETE_WINDOW"),
+        ) {
+            (Ok(p), Ok(d)) => (p, d),
+            (Err(e), _) | (_, Err(e)) => {
+                return Asked::blocked(format!("glass could not reach the X server: {e}"));
+            }
+        };
+        // `scan_all_windows` is the same enumeration `list_windows` uses, so the set asked to
+        // close is exactly the set glass reports as the app's windows — mapped top-levels whose
+        // `_NET_WM_PID` is in the launched process tree.
+        let wins = match self.scan_all_windows(&proc_tree_pids(root_pid)) {
+            Ok(wins) => wins,
+            Err(e) => return Asked::blocked(format!("glass could not enumerate its windows: {e}")),
+        };
+        if wins.is_empty() {
+            // No window in the launched process tree. If glass is nonetheless driving one, it
+            // was matched by the window hint and belongs to a process outside that tree, which
+            // teardown deliberately leaves alone (see above) — worth saying, because the app on
+            // screen is about to be signalled rather than asked.
+            return match self.window {
+                Some(_) => Asked::blocked(
+                    "the app's window was matched by the window hint, not by process id, so it \
+                     belongs to a process glass did not launch and is not sent a close request",
+                ),
+                None => Asked::none(),
+            };
+        }
+        let total = wins.len();
+        let asked = wins
+            .into_iter()
+            .filter(|&win| self.accepts_delete(win, protocols, delete))
+            .filter(|&win| self.send_delete(win, protocols, delete).is_ok())
+            .count();
+        // x11rb buffers requests: they go out on `flush`, on a call that awaits a reply, or when
+        // the write buffer fills. The wait that follows makes no X calls at all, so without this
+        // flush the app might never receive the request inside the grace. A failed flush means
+        // nothing was delivered, whatever the count above says.
+        if let Err(e) = self.conn.flush() {
+            return Asked::blocked(format!("glass could not deliver the close request: {e}"));
+        }
+        Asked::counted(total, asked, |unaskable| {
+            format!(
+                "{unaskable} of its {total} window(s) do not advertise the WM_DELETE_WINDOW \
+                 protocol, so there is nothing to send them"
+            )
+        })
+    }
+
+    /// Whether `win` advertises `WM_DELETE_WINDOW` in its `WM_PROTOCOLS` property. A read
+    /// failure reads as "no": an unasked window costs a graceful shutdown, a wrongly-asked one
+    /// costs a grace period waiting for a message the app is entitled to ignore.
+    fn accepts_delete(&self, win: Window, protocols: Atom, delete: Atom) -> bool {
+        self.conn
+            .get_property(false, win, protocols, AtomEnum::ATOM, 0, 32)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|reply| {
+                reply
+                    .value32()
+                    .is_some_and(|mut a| a.any(|at| at == delete))
+            })
+    }
+
+    /// Send one `WM_DELETE_WINDOW` client message to `win`, in the shape ICCCM 4.2.8 specifies:
+    /// 32-bit format, the protocol atom first, a timestamp second, delivered with an empty event
+    /// mask. The timestamp is `CURRENT_TIME` because there is no triggering event to take one
+    /// from — glass is not reacting to a user action the way a window manager is.
+    ///
+    /// A window destroyed between the scan and this call is NOT reported here: `send_event`
+    /// returns a `VoidCookie`, so the `BadWindow` comes back asynchronously and is dropped. Only
+    /// a connection-level write failure surfaces. That costs at most a wait for a window that
+    /// was already gone, which `await_close` short-circuits.
+    fn send_delete(&self, win: Window, protocols: Atom, delete: Atom) -> Result<()> {
+        let event = ClientMessageEvent::new(32, win, protocols, [delete, CURRENT_TIME, 0, 0, 0]);
+        self.conn
+            .send_event(false, win, EventMask::NO_EVENT, event)
+            .map_err(|e| GlassError::Backend(format!("send WM_DELETE_WINDOW: {e}")))?;
+        Ok(())
+    }
+
     /// Kill and reap the launched child (if any) and forget its window. Used by
     /// `stop_app` and by `start_app`'s failure path so a launch that never finds
     /// a window does not orphan the process.
+    ///
+    /// The app is asked to close first and only signalled if it does not go: a signalled
+    /// toolkit app runs no shutdown path at all, so anything it would have flushed on exit is
+    /// lost and it can come back reporting a crash. The signal ladder stays as the fallback —
+    /// it is what actually guarantees the process tree is gone.
     fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
-            glass_proc_linux::reap_group(&mut child, glass_proc_linux::REAP_GRACE);
+            // Snapshot the launch's process tree before any of it exits. `await_exit` reaps the
+            // child, which reparents its descendants to init and takes them out of the subtree —
+            // after that there is no way to enumerate them again.
+            let tree = proc_tree_pids(child.id());
+            let asked = self.request_close(child.id());
+            let closed_itself =
+                asked.await_close(CLOSE_GRACE, || matches!(child.try_wait(), Ok(Some(_))));
+            // The sweep runs either way: an app that closed itself can still have forked children
+            // it never cleaned up, and on the graceful path the signals land on processes that
+            // are already gone and cost nothing.
+            glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
+            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.window = None;
         // Drop the private a11y bus, reaping its dbus-daemon / at-spi children. Also

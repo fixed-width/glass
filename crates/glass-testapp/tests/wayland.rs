@@ -241,6 +241,166 @@ fn sway_pids() -> std::collections::HashSet<u32> {
         .unwrap_or_default()
 }
 
+/// Wait for the fixture's `EVENT pid=<n>` startup line and return it, so a teardown test can
+/// check the app process itself is gone (the compositor's window list can't answer that).
+fn wait_for_app_pid(p: &mut WaylandPlatform) -> u32 {
+    for _ in 0..READY_TRIES {
+        for (_s, line) in p.drain_logs() {
+            if let Some(pid) = line
+                .strip_prefix("EVENT pid=")
+                .and_then(|r| r.trim().parse().ok())
+            {
+                return pid;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("fixture never reported its pid");
+}
+
+/// Teardown must ask the app to close before signalling it: a signalled toolkit app runs no
+/// shutdown path at all (see `glass_proc_linux::CLOSE_GRACE`), so state it would flush on exit is
+/// lost. Under Wayland the ask goes through sway, which sends the client a close request; the
+/// fixture prints `EVENT closed_gracefully` from the handler that only runs when it was asked.
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_asks_the_app_to_close_before_signalling_it() {
+    let mut p = WaylandPlatform::new().unwrap();
+    start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
+    let pid = wait_for_app_pid(&mut p);
+    p.stop_app().unwrap();
+    // The fixture writes the line just before exiting; give the reader thread a moment to pick
+    // it up off the pipe (it travels via sway's stdout, one hop further than under X11).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        logs.iter().any(|l| l.contains("EVENT closed_gracefully")),
+        "stop_app must ask the app to close so its shutdown path runs; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the app must still be gone after a graceful close (pid {pid})"
+    );
+}
+
+/// Teardown must reap what the app forked, not just what dies with the display.
+///
+/// This is the test that binds the signal actually reaching the launch. sway `setsid`s every app
+/// it `exec`s, so the app is in neither the compositor's process group nor its session; a
+/// teardown that signals only that group still *looks* correct, because a display client dies on
+/// its own when its compositor goes away. A forked child that never talks to the display does
+/// not — it is left running with `ppid 1`.
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_reaps_the_apps_forked_child() {
+    let mut p = WaylandPlatform::new().unwrap();
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--fork-child".to_string()],
+            APP_TIMEOUT_MS,
+        ),
+    );
+    let mut child_pid: Option<u32> = None;
+    for _ in 0..READY_TRIES {
+        for (_s, line) in p.drain_logs() {
+            if let Some(rest) = line.strip_prefix("EVENT child_pid=") {
+                child_pid = rest.trim().parse().ok();
+            }
+        }
+        if child_pid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let child_pid = child_pid.expect("fixture should report its forked child pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "the forked child should be alive while the app runs"
+    );
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !std::path::Path::new(&format!("/proc/{child_pid}")).exists(),
+        "stop_app must reap the app's forked child (pid {child_pid}), not orphan it"
+    );
+}
+
+/// An app that was asked and does not go must be signalled once the grace runs out, and the
+/// whole teardown must still fit the budget glass-mcp allows it.
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_signals_an_app_that_ignores_the_close_request() {
+    let mut p = WaylandPlatform::new().unwrap();
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--ignore-close".to_string()],
+            APP_TIMEOUT_MS,
+        ),
+    );
+    let pid = wait_for_app_pid(&mut p);
+    let t = std::time::Instant::now();
+    p.stop_app().unwrap();
+    let elapsed = t.elapsed();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("EVENT ignoring_close_request")),
+        "the compositor should have passed the close request to the app; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "an app that ignores the request must still be signalled (pid {pid} survived)"
+    );
+    assert!(
+        elapsed >= glass_proc_linux::CLOSE_GRACE,
+        "the app must get the whole close grace before being signalled (took {elapsed:?})"
+    );
+    assert!(
+        elapsed < glass_core::TEARDOWN_BUDGET,
+        "teardown must fit in the budget glass-mcp gives it ({:?}); this took {elapsed:?}",
+        glass_core::TEARDOWN_BUDGET
+    );
+}
+
+/// A client that never opted into `WM_DELETE_WINDOW` cannot be asked, and under Wayland glass
+/// cannot tell: sway acknowledges the `kill` command either way, and wlroots closes the X
+/// connection of a client that has no close protocol. What teardown must still guarantee is
+/// what this pins — the app is gone, its shutdown path did not run, and no compositor is left
+/// behind. (The X11 backend, which reads `WM_PROTOCOLS` itself, does report this case.)
+#[test]
+#[ignore = "requires sway; run via scripts/test-wayland.sh"]
+fn stop_app_leaves_nothing_behind_when_the_app_cannot_be_asked() {
+    let before = sway_pids();
+    let mut p = WaylandPlatform::new().unwrap();
+    start(
+        &mut p,
+        &spec(
+            vec![TESTAPP.to_string(), "--no-wm-delete".to_string()],
+            APP_TIMEOUT_MS,
+        ),
+    );
+    let pid = wait_for_app_pid(&mut p);
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        !logs.iter().any(|l| l.contains("EVENT closed_gracefully")),
+        "an app with no WM_DELETE_WINDOW protocol cannot have closed gracefully; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the app must be gone after teardown (pid {pid})"
+    );
+    let leaked: Vec<_> = sway_pids().difference(&before).copied().collect();
+    assert!(
+        leaked.is_empty(),
+        "teardown leaked sway process(es): {leaked:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires sway; run via scripts/test-wayland.sh"]
 fn start_app_failure_leaves_no_orphan() {

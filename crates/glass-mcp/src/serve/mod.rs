@@ -6,7 +6,6 @@ pub mod session_gate;
 pub mod token;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Context;
 use axum::Router;
@@ -165,7 +164,7 @@ pub async fn run_on(
         .context("serving MCP over HTTP");
 
     // Tear down the active session through the one bounded path, like stdio.
-    crate::shutdown::run_shutdown(sessions, Duration::from_secs(3)).await;
+    crate::shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET).await;
     r
 }
 

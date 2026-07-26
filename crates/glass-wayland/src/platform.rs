@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    WindowGeometry, WindowId, WindowInfo, WindowOp,
+    TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
+use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -36,6 +37,18 @@ use std::collections::HashMap;
 use crate::command::{LogSink, build_sway_command, sway_config};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
+
+// glass-mcp gives the whole of teardown `glass_core::TEARDOWN_BUDGET` and then exits regardless, on a
+// `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
+// budget would never get to the signal, and sway (plus Xwayland and the app) would outlive glass.
+//
+// This binds the ladder only. The a11y bus teardown that follows it in the same budget still
+// reaps at `REAP_GRACE`, so a helper that ignores SIGTERM can take the whole teardown past the
+// budget; that is pre-existing and not what this assertion is about.
+const _: () = assert!(
+    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
+);
 
 struct ActiveSession {
     child: Child,
@@ -79,16 +92,97 @@ impl WaylandPlatform {
         })
     }
 
+    /// Tear the session down: ask the app to close, then reap the whole launch.
+    ///
+    /// The app is asked first because a signal gives a toolkit app no shutdown path at all (see
+    /// `glass_proc_linux::CLOSE_GRACE`), so everything it would have flushed on exit is lost and
+    /// it can come back reporting a crash.
+    ///
+    /// The reap covers the app's own processes as well as sway's group. sway calls `setsid` for
+    /// every app it `exec`s, so the app is in neither sway's process group nor its session —
+    /// signalling that group alone reaches the compositor and nothing else. A display client
+    /// usually dies anyway once its compositor goes away, but anything the app forked that is
+    /// not a display client would be left running.
     fn kill_session(&mut self) {
         // Tear down the clipboard owner thread before the wayland socket disappears.
         if let Some(owner) = self.clipboard_owner.take() {
             owner.stop();
         }
         if let Some(mut s) = self.active.take() {
-            glass_proc_linux::reap_group(&mut s.child, glass_proc_linux::REAP_GRACE);
+            // Snapshot the launch (sway, Xwayland, the app and anything it forked) before any of
+            // it exits: once sway is reaped its descendants are reparented to init and can no
+            // longer be found from its pid.
+            let tree = glass_proc_linux::proc_tree_pids(s.child.id());
+            let app = app_pids(&tree, s.child.id());
+            let asked = request_close(&mut s.ipc);
+            // Wait on the app's processes, not on sway's window list: an empty list only means
+            // the surface is gone, and a toolkit that flushes state after destroying its window
+            // would still be mid-shutdown. With no app pid to watch (nothing but the compositor
+            // in the tree) fall back to the window list, which is all there is.
+            let closed_itself = asked.await_close(CLOSE_GRACE, || {
+                if app.is_empty() {
+                    s.ipc.windows().is_ok_and(|w| w.is_empty())
+                } else {
+                    !glass_proc_linux::any_alive(&app)
+                }
+            });
+            glass_proc_linux::reap_launch(&mut s.child, &tree, glass_proc_linux::APP_REAP_GRACE);
+            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
         }
         self.dbus = None;
     }
+}
+
+/// The launched app's own processes: everything in the session's process tree except the
+/// compositor itself and the Xwayland it starts. Used as the liveness signal during teardown.
+fn app_pids(tree: &[u32], sway_pid: u32) -> Vec<u32> {
+    tree.iter()
+        .copied()
+        .filter(|&pid| pid != sway_pid && !is_xwayland(pid))
+        .collect()
+}
+
+/// Whether `pid` is the compositor's Xwayland, read from `/proc/<pid>/comm`. Xwayland exits with
+/// the compositor and is glass's own plumbing, so waiting on it would mean waiting for sway.
+fn is_xwayland(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "Xwayland")
+}
+
+/// Ask every window in the session to close.
+///
+/// sway's `kill` is the compositor-side close request — `xdg_toplevel.close` to a native Wayland
+/// client, `WM_DELETE_WINDOW` to an Xwayland one that advertises the protocol. Under Wayland the
+/// *compositor* owns that ask, so glass goes through sway rather than talking to the client the
+/// way the X11 backend does.
+///
+/// **What glass cannot tell here:** sway acknowledges the *command*, not the client's handling of
+/// it, and for an Xwayland client that never opted into `WM_DELETE_WINDOW` wlroots closes the X
+/// connection instead of asking. Both look identical from the outside — the window disappears —
+/// so on this backend a client that was disconnected rather than asked is reported as a clean
+/// close. The X11 backend can distinguish the two because it reads `WM_PROTOCOLS` itself.
+///
+/// Each window is asked separately rather than as one batched command: sway returns one outcome
+/// per command, and a batch collapses them into a single first-failure, which would lose the
+/// per-window accounting this returns.
+fn request_close(ipc: &mut Ipc) -> Asked {
+    let windows = match ipc.windows() {
+        Ok(windows) => windows,
+        Err(e) => return Asked::blocked(format!("glass could not reach the compositor: {e}")),
+    };
+    if windows.is_empty() {
+        return Asked::none();
+    }
+    let total = windows.len();
+    let asked = windows
+        .iter()
+        .filter(|w| {
+            ipc.run_command(&format!("[con_id={}] kill", w.con_id))
+                .is_ok()
+        })
+        .count();
+    Asked::counted(total, asked, |unaskable| {
+        format!("the compositor refused the close request for {unaskable} of its {total} window(s)")
+    })
 }
 
 impl Drop for WaylandPlatform {

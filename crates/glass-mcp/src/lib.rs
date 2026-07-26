@@ -30,8 +30,6 @@ pub(crate) mod status;
 mod tools;
 mod untrusted;
 
-use std::time::Duration;
-
 use anyhow::Context;
 use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
 #[cfg(target_os = "linux")]
@@ -409,7 +407,7 @@ pub async fn run_stdio(glass: Glass, report: crate::audit::AuditReport) -> anyho
             true
         }
     };
-    shutdown::run_shutdown(sessions, Duration::from_secs(3)).await;
+    shutdown::run_shutdown(sessions, glass_core::TEARDOWN_BUDGET).await;
     if via_signal {
         std::process::exit(0);
     }
