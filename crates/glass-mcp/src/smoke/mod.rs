@@ -422,15 +422,14 @@ mod tests {
         }
     }
 
+    /// `xed` heads both tables, so naming one candidate would not tell the two apart.
     #[test]
     fn wayland_resolves_the_wayland_table() {
         let (name, candidates) = candidates_for("wayland").expect("wayland must be drivable");
         assert_eq!(name, "wayland");
-        assert!(candidates.iter().any(|c| c.bin == "xed"));
-        assert!(
-            !candidates.iter().any(|c| c.bin == "xterm"),
-            "an X11-only client is not a wayland candidate"
-        );
+        let resolved: Vec<&str> = candidates.iter().map(|c| c.bin).collect();
+        let wayland: Vec<&str> = WAYLAND_CANDIDATES.iter().map(|c| c.bin).collect();
+        assert_eq!(resolved, wayland);
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub struct Candidate {
     pub label: &'static str,
 }
 
+/// The prompt text must not look like anything the interaction check writes: a label the runner
+/// could also have typed makes `value_contains` ambiguous evidence.
+const ZENITY_ARGS: &[&str] = &["--entry", "--text=type in this box"];
+
 /// Linux is the only platform with no guaranteed stock app, so the runner probes in
 /// order and records which one it selected.
 pub const X11_CANDIDATES: [Candidate; 4] = [
@@ -29,10 +33,8 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
         label: "gnome-text-editor",
     },
     Candidate {
-        // The prompt text must not look like anything the interaction check writes: a label
-        // the runner could also have typed makes `value_contains` ambiguous evidence.
         bin: "zenity",
-        args: &["--entry", "--text=type in this box"],
+        args: ZENITY_ARGS,
         env: &[],
         label: "zenity",
     },
@@ -63,10 +65,8 @@ pub const WAYLAND_CANDIDATES: [Candidate; 3] = [
         label: "gnome-text-editor",
     },
     Candidate {
-        // The prompt text must not look like anything the interaction check writes: a label
-        // the runner could also have typed makes `value_contains` ambiguous evidence.
         bin: "zenity",
-        args: &["--entry", "--text=type in this box"],
+        args: ZENITY_ARGS,
         env: NATIVE_WAYLAND,
         label: "zenity",
     },
@@ -490,11 +490,31 @@ mod tests {
     #[test]
     fn every_wayland_candidate_names_the_wayland_gdk_backend() {
         for c in &WAYLAND_CANDIDATES {
-            assert!(
-                c.env.contains(&("GDK_BACKEND", "wayland")),
-                "{} must name the Wayland GDK backend",
+            assert_eq!(
+                c.env, NATIVE_WAYLAND,
+                "{} must name the Wayland GDK backend and nothing else",
                 c.label
             );
+        }
+    }
+
+    /// A duplicate key compiles and reads as harmless here, but `check_start` collects `env` into
+    /// a `serde_json::Map`, where the later value wins on the wire without anything saying so.
+    #[test]
+    fn every_candidates_env_is_a_well_formed_map() {
+        for (backend, candidates) in crate::smoke::DRIVABLE {
+            for c in *candidates {
+                let mut seen = std::collections::BTreeSet::new();
+                for (k, v) in c.env {
+                    assert!(!k.is_empty(), "{backend}/{}: empty env key", c.label);
+                    assert!(
+                        !v.is_empty(),
+                        "{backend}/{}: empty value for {k:?}",
+                        c.label
+                    );
+                    assert!(seen.insert(k), "{backend}/{}: {k:?} set twice", c.label);
+                }
+            }
         }
     }
 
@@ -505,14 +525,19 @@ mod tests {
         }
     }
 
-    /// `xterm` reaches a Wayland session only through Xwayland, so selecting it would report a
-    /// verdict about a code path the run never exercised.
+    /// The relationship [`WAYLAND_CANDIDATES`]' doc comment states, which nothing else pins: a
+    /// candidate added to one table only would leave it false. `xterm` is the excluded entry
+    /// because it reaches a Wayland session only through Xwayland, so a run that selected it
+    /// would report a verdict about a code path it never exercised.
     #[test]
-    fn the_wayland_table_holds_no_x11_only_client() {
-        assert!(
-            !WAYLAND_CANDIDATES.iter().any(|c| c.bin == "xterm"),
-            "xterm is not a wayland candidate"
-        );
+    fn the_wayland_table_is_the_x11_table_without_its_x11_only_entry() {
+        let x11: Vec<&str> = X11_CANDIDATES
+            .iter()
+            .map(|c| c.bin)
+            .filter(|b| *b != "xterm")
+            .collect();
+        let wayland: Vec<&str> = WAYLAND_CANDIDATES.iter().map(|c| c.bin).collect();
+        assert_eq!(wayland, x11);
     }
 
     #[test]
