@@ -28,18 +28,17 @@ impl CallResult {
         let mut envelope = None;
         let mut siblings = Vec::new();
         let mut images = 0;
-        for (i, item) in raw["content"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .enumerate()
-        {
+        let mut seen_text_block = false;
+        for item in raw["content"].as_array().unwrap_or(&Vec::new()).iter() {
             match item["type"].as_str() {
                 Some("text") => {
                     let text = item["text"].as_str().unwrap_or_default().to_string();
                     // An error result carries a message, never an envelope: parsing it as
-                    // one would let a stray JSON-shaped error masquerade as a pass.
-                    if i == 0 && !is_error {
+                    // one would let a stray JSON-shaped error masquerade as a pass. The first
+                    // text block (regardless of preceding non-text items) is the envelope; later
+                    // text blocks are siblings.
+                    if !seen_text_block && !is_error {
+                        seen_text_block = true;
                         envelope = serde_json::from_str::<Value>(&text).ok();
                         if envelope.is_none() {
                             siblings.push(text);
@@ -145,5 +144,25 @@ mod tests {
             err.contains("glass_stop"),
             "must name what it expected: {err}"
         );
+    }
+
+    #[test]
+    fn an_image_before_the_envelope_still_parses_the_envelope() {
+        let raw = json!({
+            "content": [
+                { "type": "image", "data": "iVBOR", "mimeType": "image/png" },
+                { "type": "text", "text": "{\"ok\":true,\"tool\":\"glass_screenshot\",\"result\":{}}" },
+                { "type": "text", "text": "sibling text" }
+            ],
+            "isError": false
+        });
+        let r = CallResult::from_mcp(&raw);
+        assert!(!r.is_error);
+        assert_eq!(
+            r.envelope.as_ref().unwrap()["tool"],
+            json!("glass_screenshot")
+        );
+        assert_eq!(r.siblings, vec!["sibling text".to_string()]);
+        assert_eq!(r.images, 1);
     }
 }
