@@ -354,7 +354,10 @@ mod sway_probe_tests {
     #[test]
     fn a_status_outside_the_known_set_cannot_be_read_as_an_answer() {
         let why = why_broken(&doctor_reporting("green"));
-        assert!(why.contains("green"), "must name what it got: {why}");
+        assert!(
+            why.contains("unrecognized status Some(\"green\")"),
+            "must name what it got: {why}"
+        );
     }
 
     #[test]
@@ -390,7 +393,10 @@ mod sway_probe_tests {
             SwayProbe::Broken(why) => why,
             other => panic!("expected Broken, got {other:?}"),
         };
-        assert!(why.contains('3'), "must name the exit status: {why}");
+        assert!(
+            why.contains("exit status: 3"),
+            "must name the exit status: {why}"
+        );
         assert!(
             why.contains("cannot open display"),
             "must carry the stderr tail: {why}"

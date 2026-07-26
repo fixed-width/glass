@@ -491,7 +491,8 @@ mod tests {
     fn every_wayland_candidate_names_the_wayland_gdk_backend() {
         for c in &WAYLAND_CANDIDATES {
             assert_eq!(
-                c.env, NATIVE_WAYLAND,
+                c.env,
+                [("GDK_BACKEND", "wayland")],
                 "{} must name the Wayland GDK backend and nothing else",
                 c.label
             );
