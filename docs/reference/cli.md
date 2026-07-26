@@ -68,7 +68,9 @@ glass's own MCP tools against a real app and report whether this build works end
 [how-to/verify-your-install.md](../how-to/verify-your-install.md) for what each check means and how
 to read the report.
 
-- `--backend <name>` — backend to exercise (default `x11`; the only one today).
+- `--backend <name>` — backend to exercise (default `x11`; the only one today). Also sets
+  `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so the session and
+  `glass_doctor`'s verdict always agree on which backend is under test.
 - `--report <path>` — also write the JSON report to `path` (the markdown table always goes to
   stdout).
 - `--app <name>` — force a specific candidate app instead of probing for the first one present.
