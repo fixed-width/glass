@@ -23,9 +23,6 @@ way it does? The explanations.
 - [Android](how-to/setup-android.md) — an AVD emulator, from any host
 - [iOS](how-to/setup-ios.md) — the Simulator, macOS host only
 
-Set up, then check the environment with `glass-mcp doctor` — see
-[CLI](reference/cli.md#doctor).
-
 **Connect and drive**
 
 - [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP

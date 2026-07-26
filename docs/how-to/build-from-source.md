@@ -23,13 +23,13 @@ xcode-select --install
 The `objc2-*` crates that bind Cocoa/CoreGraphics/CoreFoundation need the macOS SDK and `clang` the
 CLT provides at their build-time link step; without it, `cargo build` fails there.
 
-On Linux and Windows the built binary is all you need — return to the [Linux](setup-linux.md) or
-[Windows](setup-windows.md) setup guide to install the runtime deps and connect an agent. macOS needs
-the signing + LaunchAgent steps below.
-
 To confirm the build works — not just that it compiled, but that it launches an app and drives it
 end to end — see [Check a build works end to end](check-a-build.md). (For whether the *environment*
 is set up correctly, that's [`glass-mcp doctor`](../reference/cli.md#doctor).)
+
+On Linux and Windows the built binary is all you need — return to the [Linux](setup-linux.md) or
+[Windows](setup-windows.md) setup guide to install the runtime deps and connect an agent. macOS needs
+the signing + LaunchAgent steps below.
 
 ## macOS: sign the app and run it as a LaunchAgent
 
