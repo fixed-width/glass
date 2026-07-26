@@ -76,6 +76,7 @@ pub fn on_path(bin: &str) -> bool {
 }
 
 /// Parse the compact accessibility outline: `#id Role "name" (x,y wxh) [states]`.
+/// Correctly handles names with escaped quotes and brackets in the name.
 pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
     let mut nodes = Vec::new();
     for line in outline.lines() {
@@ -87,19 +88,38 @@ pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
         let Ok(id) = id_str.parse::<u32>() else {
             continue;
         };
+        let rest = rest.trim_start();
+
+        // Extract role (first word)
         let role = rest
             .split_whitespace()
             .next()
             .unwrap_or_default()
             .to_string();
-        let name = rest
-            .split_once('"')
-            .and_then(|(_, after)| after.split_once('"').map(|(n, _)| n.to_string()));
-        let states = rest
-            .rsplit_once('[')
-            .and_then(|(_, s)| s.split_once(']'))
-            .map(|(s, _)| s.split(',').map(|t| t.trim().to_string()).collect())
-            .unwrap_or_default();
+
+        // Find what comes after the role
+        let after_role = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|_| {
+                rest.find(char::is_whitespace)
+                    .map(|pos| rest[pos..].trim_start())
+            })
+            .unwrap_or("");
+
+        // Parse name if present (starts with ")
+        let (name, after_name) = if let Some(quoted) = after_role.strip_prefix('"') {
+            match parse_escape_quoted_string(quoted) {
+                Some((name_str, remainder)) => (Some(name_str), remainder.trim_start()),
+                None => continue,
+            }
+        } else {
+            (None, after_role)
+        };
+
+        // Parse states (last [...] group in after_name)
+        let states = parse_states(after_name);
+
         nodes.push(OutlineNode {
             id,
             role,
@@ -108,6 +128,65 @@ pub fn parse_outline(outline: &str) -> Vec<OutlineNode> {
         });
     }
     nodes
+}
+
+/// Parse an escape-quoted string starting after the opening quote.
+/// Handles escape sequences: `\"` (escaped quote) and `\\` (escaped backslash).
+/// Returns the unescaped content and the remainder after the closing quote.
+fn parse_escape_quoted_string(s: &str) -> Option<(String, &str)> {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    let mut consumed_len = 0;
+
+    while let Some(ch) = chars.next() {
+        consumed_len += ch.len_utf8();
+
+        match ch {
+            '"' => {
+                // Found closing quote
+                return Some((result, &s[consumed_len..]));
+            }
+            '\\' => {
+                // Escape sequence
+                let next_ch = chars.next()?;
+                consumed_len += next_ch.len_utf8();
+                match next_ch {
+                    '"' => result.push('"'),
+                    '\\' => result.push('\\'),
+                    'n' => result.push('\n'),
+                    'r' => result.push('\r'),
+                    't' => result.push('\t'),
+                    '0' => result.push('\0'),
+                    _ => {
+                        result.push('\\');
+                        result.push(next_ch);
+                    }
+                }
+            }
+            ch => result.push(ch),
+        }
+    }
+
+    // No closing quote found
+    None
+}
+
+/// Extract states from the last `[...]` group in the text.
+fn parse_states(s: &str) -> Vec<String> {
+    if let Some(bracket_start) = s.rfind('[') {
+        if let Some(bracket_end) = s[bracket_start..].find(']') {
+            let states_str = &s[bracket_start + 1..bracket_start + bracket_end];
+            states_str
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    }
 }
 
 /// The element the interaction check writes to: an explicitly editable node, else a
@@ -178,5 +257,36 @@ mod tests {
             states: vec![],
         }];
         assert!(first_editable(&neither).is_none());
+    }
+
+    #[test]
+    fn parses_name_with_escaped_quote() {
+        let outline = "#3 Button \"Say \\\"hi\\\"\" (0,0 10x10)\n";
+        let nodes = parse_outline(outline);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 3);
+        assert_eq!(nodes[0].name.as_deref(), Some("Say \"hi\""));
+    }
+
+    #[test]
+    fn parses_bracket_in_name_with_no_states() {
+        let outline = "#5 Label \"Item [1]\" (0,0 10x10)\n";
+        let nodes = parse_outline(outline);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 5);
+        assert_eq!(nodes[0].name.as_deref(), Some("Item [1]"));
+        assert!(nodes[0].states.is_empty());
+    }
+
+    #[test]
+    fn parses_bracket_in_name_with_real_states() {
+        let outline = "#7 TextBox \"Item [1]\" (0,0 10x10) [editable,focusable]\n";
+        let nodes = parse_outline(outline);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 7);
+        assert_eq!(nodes[0].name.as_deref(), Some("Item [1]"));
+        assert!(nodes[0].states.iter().any(|s| s == "editable"));
+        assert!(nodes[0].states.iter().any(|s| s == "focusable"));
+        assert_eq!(nodes[0].states.len(), 2);
     }
 }
