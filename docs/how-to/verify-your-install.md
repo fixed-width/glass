@@ -13,8 +13,8 @@ environment checks can tell you.
 
 ## Before you run it
 
-`doctor` checks the environment; `smoke` goes further and actually drives an app, so it needs two
-things beyond what `doctor` requires:
+`doctor` checks the environment; `smoke` (without `--dry-run`) goes further and actually drives an
+app, so it needs two things beyond what `doctor` requires:
 
 - **A target app.** On the X11 backend (the only one today) it probes for the first of `xed`,
   `gnome-text-editor`, `zenity`, `xterm` present on `PATH` — install any one of them.
@@ -22,18 +22,23 @@ things beyond what `doctor` requires:
   Linux means AT-SPI must be running (the `at-spi2-core` package on Debian/Ubuntu). Without it
   check 5 goes red however healthy the rest of the install is.
 
+Neither is needed for `--dry-run` — see below.
+
 If you haven't run `glass-mcp doctor` yet, run it first. A `smoke` run against a broken environment
 fails at check 2 or 3 and repeats what `doctor` would have told you directly, with less detail.
 
 ## Run it
 
-See the plan without touching anything — which app would be picked, which checks would run:
+See the plan without touching anything — which app would be picked, which checks would run. This
+works even before you've installed a target app: if none of the candidates is on `PATH` yet, the
+app column says so instead of the command failing, so it's safe as the very first thing you run
+after building:
 
 ```bash
 glass-mcp smoke --dry-run
 ```
 
-Then the real thing:
+Then the real thing, which does need a target app installed:
 
 ```bash
 glass-mcp smoke --backend x11

@@ -44,8 +44,10 @@ what it would have asserted.
 ## Report
 
 The markdown table goes to stdout on every run; `--report <path>` additionally writes the JSON. The
-JSON is written only once the run reaches its checks — a setup failure, such as no target app on
-`PATH`, reports on stderr and writes no file.
+JSON is written only once the run reaches its checks — a setup failure of a real (non-`--dry-run`)
+run, such as no target app on `PATH`, reports on stderr and writes no file. `--dry-run` always
+reaches its (all-`skip`) checks, so it writes a report even when no candidate app is present; the
+`app` field then names what to install instead of a candidate label.
 
 | Field | Description |
 |---|---|

@@ -89,35 +89,67 @@ fn version_check(t: &mut dyn McpTransport, expect_version: Option<&str>) -> Chec
 }
 
 pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
+    run_with(opts, &profile::on_path)
+}
+
+/// `run`'s actual logic, taking the presence probe as a parameter rather than always calling
+/// [`profile::on_path`] — the seam that lets tests drive it with a fake instead of the host's
+/// real `PATH`. `run` is the only caller that should ever pass `on_path` itself; every unit
+/// test below should go through this with a fake so none of them depend on which target apps
+/// the machine running the suite happens to have installed.
+fn run_with(opts: SmokeOptions, present: &dyn Fn(&str) -> bool) -> Result<SmokeReport, String> {
     let (backend, candidates) = candidates_for(&opts.backend)?;
-    let app = match &opts.app {
-        Some(name) => candidates.iter().find(|c| c.label == name).ok_or_else(|| {
+
+    // Resolve an explicit `--app` up front, dry run or not: naming a candidate that doesn't
+    // exist in the table is a typo in the caller's input, not an environment gap, so it must
+    // be rejected the same way in both modes rather than only once probing would happen.
+    let forced = match &opts.app {
+        Some(name) => Some(candidates.iter().find(|c| c.label == name).ok_or_else(|| {
             let names: Vec<&str> = candidates.iter().map(|c| c.label).collect();
             format!(
                 "unknown app {name:?} for {backend} — use one of: {}",
                 names.join(", ")
             )
-        })?,
-        None => profile::resolve_app(candidates, &profile::on_path)?,
-    };
-    let p = Profile {
-        backend: backend.to_string(),
-        app,
+        })?),
+        None => None,
     };
 
     if opts.dry_run {
+        // Unlike a real run, dry-run must not fail just because no candidate is present: its
+        // whole purpose is "see the plan without touching anything", and the moment a user
+        // most wants that is while setting up — before any candidate is installed. So a probe
+        // miss here degrades into the app column instead of an error; the wording is the same
+        // "what to install" text `resolve_app` would otherwise have failed with.
+        let app_label = match forced {
+            Some(c) => c.label.to_string(),
+            None => match profile::resolve_app(candidates, present) {
+                Ok(c) => c.label.to_string(),
+                Err(e) => e,
+            },
+        };
         let mut checks: Vec<CheckOutcome> = CHECK_NAMES
             .iter()
             .map(|(step, name)| CheckOutcome::skip(*step, name, "dry run"))
             .collect();
         checks.push(CheckOutcome::skip(STOP_CHECK.0, STOP_CHECK.1, "dry run"));
         return Ok(SmokeReport {
-            backend: p.backend,
+            backend: backend.to_string(),
             version: crate::VERSION.to_string(),
-            app: app.label.to_string(),
+            app: app_label,
             checks,
         });
     }
+
+    // A real run does need an app to drive — unlike dry-run's preview, there is nothing to
+    // fall back to here.
+    let app = match forced {
+        Some(c) => c,
+        None => profile::resolve_app(candidates, present)?,
+    };
+    let p = Profile {
+        backend: backend.to_string(),
+        app,
+    };
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
     // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
@@ -156,6 +188,13 @@ mod tests {
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::ScriptedTransport;
 
+    /// A `present` predicate for tests that must not depend on which target apps the host
+    /// running the suite happens to have installed — simulates a machine with none of the
+    /// X11 candidates on `PATH`, the shape of a bare CI runner.
+    fn nothing_present(_bin: &str) -> bool {
+        false
+    }
+
     #[test]
     fn expect_version_none_is_a_skip_not_an_omission() {
         // A real run's row count must match `--dry-run`'s preview regardless of whether
@@ -182,12 +221,17 @@ mod tests {
 
     #[test]
     fn dry_run_reports_the_plan_without_calling_anything() {
-        let r = run(SmokeOptions {
-            backend: "x11".into(),
-            app: None,
-            expect_version: None,
-            dry_run: true,
-        })
+        // Driven by `nothing_present`, not the host's real `PATH`: this must hold whether or
+        // not the machine running the suite has any X11 candidate installed.
+        let r = run_with(
+            SmokeOptions {
+                backend: "x11".into(),
+                app: None,
+                expect_version: None,
+                dry_run: true,
+            },
+            &nothing_present,
+        )
         .unwrap();
         assert!(
             r.checks
@@ -195,6 +239,31 @@ mod tests {
                 .all(|c| c.status == report::CheckStatus::Skip)
         );
         assert_eq!(r.exit_code(), 0);
+        // Dry-run's whole purpose is a preview before the environment is necessarily ready,
+        // so no candidate present must degrade into the app column rather than fail the run —
+        // and it must still say what to install, the same remedy `resolve_app` names.
+        assert!(
+            r.app.contains("install"),
+            "must say what to install when nothing was found: {}",
+            r.app
+        );
+    }
+
+    #[test]
+    fn dry_run_names_the_candidate_it_would_pick_when_one_is_present() {
+        // The other half of the degrade: when a candidate genuinely is on `PATH`, the preview
+        // must still name it, not the "nothing found" text.
+        let r = run_with(
+            SmokeOptions {
+                backend: "x11".into(),
+                app: None,
+                expect_version: None,
+                dry_run: true,
+            },
+            &|bin: &str| bin == "zenity",
+        )
+        .unwrap();
+        assert_eq!(r.app, "zenity");
     }
 
     #[test]
@@ -213,13 +282,17 @@ mod tests {
     fn a_backend_name_is_recognized_the_same_way_the_rest_of_the_binary_recognizes_it() {
         // `recognized_backend` is case-insensitive, so `GLASS_BACKEND=X11` is honoured
         // everywhere else; a second, stricter recognition site here would reject the same
-        // spelling the binary otherwise accepts.
-        let r = run(SmokeOptions {
-            backend: "X11".into(),
-            app: None,
-            expect_version: None,
-            dry_run: true,
-        })
+        // spelling the binary otherwise accepts. Driven by `nothing_present`, not the host's
+        // real `PATH` — backend recognition must not depend on which apps are installed.
+        let r = run_with(
+            SmokeOptions {
+                backend: "X11".into(),
+                app: None,
+                expect_version: None,
+                dry_run: true,
+            },
+            &nothing_present,
+        )
         .expect("X11 must resolve the same way GLASS_BACKEND=X11 does");
         assert_eq!(
             r.backend, "x11",

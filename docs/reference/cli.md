@@ -78,7 +78,9 @@ covers running it and acting on a red result.
   name must be one of the backend's candidates; the binary is not checked for presence, so naming an
   app that is not installed fails at the `start` check.
 - `--expect-version <tag>` — version the binary must report (check 1); omit to skip that check.
-- `--dry-run` — print the plan and exit without touching anything.
+- `--dry-run` — print the plan and exit without touching anything. Unlike a real run, this does not
+  require a target app to be installed: if none of the candidates is present, the app column says so
+  instead of the command failing.
 - `--self-check` — prove the checks can still fail: run them against deliberately wrong responses
   and confirm each one catches its fault, for the reason it names. Drives nothing real — no app, no
   display — and exits when done, so it cannot be combined with the flags above; passing one is a
