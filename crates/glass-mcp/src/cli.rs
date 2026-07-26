@@ -350,14 +350,18 @@ mod tests {
     #[test]
     fn the_backend_help_names_every_drivable_backend() {
         use clap::CommandFactory;
-        let mut cmd = Cli::command();
-        let mut smoke = cmd
-            .find_subcommand_mut("smoke")
-            .expect("smoke subcommand")
-            .clone();
-        let help = smoke.render_long_help().to_string();
+        let cmd = Cli::command();
+        let smoke = cmd.find_subcommand("smoke").expect("smoke subcommand");
+        let arg = smoke
+            .get_arguments()
+            .find(|a| a.get_id() == "backend")
+            .expect("--backend argument");
+        let help = arg.get_help().expect("--backend help").to_string();
         for b in crate::smoke::drivable_backends() {
-            assert!(help.contains(b), "--backend help must name {b:?}:\n{help}");
+            assert!(
+                help.contains(b),
+                "the --backend description must name {b:?}: {help}"
+            );
         }
     }
 }
