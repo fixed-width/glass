@@ -126,7 +126,7 @@ jobs:
       - name: Fetch prebuilt sway bundle
         run: |
           mkdir -p ~/.local/share/glass/sway
-          curl -fsSL https://github.com/xxx/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
+          curl -fsSL https://github.com/fixed-width/sway-build/releases/download/bundle-latest/sway-bundle-linux-x86_64.tar.gz \
             | tar -C ~/.local/share/glass/sway -xz
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
