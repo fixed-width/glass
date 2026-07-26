@@ -80,12 +80,14 @@ pub fn read_report(path: &Path) -> serde_json::Value {
 }
 
 /// The checks a CI fixture controls end to end: the runner installs the target app and the
-/// accessibility bus, so each must actually be `pass`. `Skip` exits 0, so a check that degraded
-/// to a skip would otherwise keep CI green while proving nothing.
+/// accessibility bus, so each must actually be `pass`. Neither `skip` nor `xfail` fails a run, so
+/// a check that degraded to either would otherwise keep CI green while proving nothing.
 ///
-/// `capabilities+doctor` grades the host environment rather than the fixture, so it is absent.
-pub const MUST_PASS: [&str; 7] = [
+/// `capabilities+doctor` is listed because it is the only check that establishes which backend the
+/// run graded — it passes on a `warn` verdict, so requiring it forbids nothing a healthy run does.
+pub const MUST_PASS: [&str; 8] = [
     "start",
+    "capabilities+doctor",
     "screenshot",
     "a11y snapshot",
     "interaction",
@@ -93,6 +95,10 @@ pub const MUST_PASS: [&str; 7] = [
     "error honesty",
     "stop",
 ];
+
+/// Checks deliberately exempt from [`MUST_PASS`]. Empty today; a check the fixture cannot control
+/// belongs here with its reason, which is the decision the test below refuses to let anyone skip.
+pub const MAY_NOT_PASS: [&str; 0] = [];
 
 pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
     let checks = json["checks"].as_array().expect("checks array");
@@ -202,6 +208,30 @@ fn classify(doctor_json: &serde_json::Value) -> SwayProbe {
         other => SwayProbe::Broken(format!(
             "sway >=1.12 check had unrecognized status {other:?}: {wayland}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod must_pass_tests {
+    use super::*;
+
+    /// [`MUST_PASS`] is hand-maintained, and only renames and removals fail loudly: land a ninth
+    /// check, forget to list it, and CI stays green forever while the new check is free to skip —
+    /// the exact failure `MUST_PASS` exists to prevent.
+    #[test]
+    fn every_check_the_runner_emits_has_a_decided_status() {
+        let mut decided: Vec<&str> = MUST_PASS
+            .iter()
+            .chain(MAY_NOT_PASS.iter())
+            .copied()
+            .collect();
+        decided.sort_unstable();
+        let mut emitted = glass_mcp::smoke::all_check_names();
+        emitted.sort_unstable();
+        assert_eq!(
+            decided, emitted,
+            "every check a report can carry must be listed in MUST_PASS or MAY_NOT_PASS"
+        );
     }
 }
 
