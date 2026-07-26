@@ -52,28 +52,38 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
 }
 
 pub fn check_health(t: &mut dyn McpTransport) -> CheckOutcome {
-    outcome(
-        3,
-        "capabilities+doctor",
-        (|| {
-            let caps = t.call("glass_capabilities", json!({}))?;
-            let caps = check_envelope("glass_capabilities", &caps)?;
-            let doc = t.call("glass_doctor", json!({}))?;
-            let doc = check_envelope("glass_doctor", &doc)?;
-            let failed: Vec<String> = doc["checks"]
-                .as_array()
-                .unwrap_or(&Vec::new())
-                .iter()
-                .filter(|c| c["status"].as_str() == Some("FAIL"))
-                .map(|c| c["name"].as_str().unwrap_or("<unnamed>").to_string())
-                .collect();
-            if failed.is_empty() {
-                Ok(format!("backend {}", caps["backend"]))
-            } else {
-                Err(format!("doctor FAIL: {}", failed.join(", ")))
-            }
-        })(),
-    )
+    outcome(3, "capabilities+doctor", health(t))
+}
+
+/// `check_health`'s body. `glass_doctor`'s `overall` already applies its severity rule (a
+/// non-default backend's failing check is only a warning there), so this reads `overall`
+/// as the verdict rather than re-deriving one from individual check statuses — walking
+/// `sections[].checks[]` is only for naming which check(s) failed.
+fn health(t: &mut dyn McpTransport) -> Result<String, String> {
+    let caps = t.call("glass_capabilities", json!({}))?;
+    let caps = check_envelope("glass_capabilities", &caps)?;
+    let doc = t.call("glass_doctor", json!({}))?;
+    let doc = check_envelope("glass_doctor", &doc)?;
+
+    if doc["overall"].as_str() == Some("fail") {
+        let failed: Vec<&str> = doc["sections"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|s| s["checks"].as_array().into_iter().flatten())
+            .filter(|c| c["status"].as_str() == Some("fail"))
+            .map(|c| c["name"].as_str().unwrap_or("<unnamed>"))
+            .collect();
+        return Err(if failed.is_empty() {
+            // Silence here would be worse than an odd message: the run truly failed.
+            "doctor overall verdict is fail, but no individual check reports fail".to_string()
+        } else {
+            format!("doctor FAIL: {}", failed.join(", "))
+        });
+    }
+
+    let backend = caps["backend"].as_str().unwrap_or("<unknown>");
+    Ok(format!("backend {backend}"))
 }
 
 pub fn check_screenshot(t: &mut dyn McpTransport) -> CheckOutcome {
@@ -223,6 +233,13 @@ mod tests {
         assert_eq!(out.status, CheckStatus::Fail);
     }
 
+    /// A `glass_doctor` result mirroring the server's real payload shape
+    /// (`{report, sections, overall}`), not the `{checks}` shape a stale mock once
+    /// fabricated and hid this bug behind.
+    fn doctor_result(overall: &str, sections: Value) -> Value {
+        json!({ "report": "glass doctor\n...", "overall": overall, "sections": sections })
+    }
+
     #[test]
     fn health_fails_when_doctor_reports_fail() {
         let mut t = ScriptedTransport::new(vec![
@@ -239,7 +256,14 @@ mod tests {
                 "glass_doctor",
                 Ok(ok(
                     "glass_doctor",
-                    json!({ "checks": [{ "name": "display", "status": "FAIL" }] }),
+                    doctor_result(
+                        "fail",
+                        json!([{
+                            "title": "x11",
+                            "backend": "x11",
+                            "checks": [{ "name": "display", "status": "fail", "detail": "not found" }],
+                        }]),
+                    ),
                     vec![],
                     0,
                 )),
@@ -250,6 +274,74 @@ mod tests {
         assert!(
             out.detail.contains("display"),
             "must name the failing check: {}",
+            out.detail
+        );
+    }
+
+    #[test]
+    fn health_fails_on_overall_fail_even_with_no_check_individually_reporting_it() {
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_capabilities",
+                Ok(ok(
+                    "glass_capabilities",
+                    json!({ "backend": "x11" }),
+                    vec![],
+                    0,
+                )),
+            ),
+            (
+                "glass_doctor",
+                Ok(ok(
+                    "glass_doctor",
+                    doctor_result("fail", json!([])),
+                    vec![],
+                    0,
+                )),
+            ),
+        ]);
+        let out = check_health(&mut t);
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(
+            !out.detail.is_empty(),
+            "an unattributed overall fail must still say something, not go silent"
+        );
+    }
+
+    #[test]
+    fn health_passes_when_doctor_reports_ok() {
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_capabilities",
+                Ok(ok(
+                    "glass_capabilities",
+                    json!({ "backend": "x11" }),
+                    vec![],
+                    0,
+                )),
+            ),
+            (
+                "glass_doctor",
+                Ok(ok(
+                    "glass_doctor",
+                    doctor_result(
+                        "ok",
+                        json!([{
+                            "title": "x11",
+                            "backend": "x11",
+                            "checks": [{ "name": "display", "status": "ok", "detail": "found" }],
+                        }]),
+                    ),
+                    vec![],
+                    0,
+                )),
+            ),
+        ]);
+        let out = check_health(&mut t);
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert_eq!(
+            out.detail, "backend x11",
+            "must render the plain backend string, not a JSON-quoted one: {}",
             out.detail
         );
     }
