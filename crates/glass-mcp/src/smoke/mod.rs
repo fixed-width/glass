@@ -10,8 +10,10 @@ pub mod report;
 pub mod selfcheck;
 pub mod transport;
 
+use std::ffi::OsStr;
+
 use profile::{Candidate, Profile, X11_CANDIDATES};
-use report::{CheckOutcome, SmokeReport};
+use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
 use transport::McpTransport;
 
 pub struct SmokeOptions {
@@ -65,16 +67,23 @@ const CHECK_NAMES: [(u8, &str); 8] = [
 /// The last check, run after every other one whatever they reported.
 const STOP_CHECK: (u8, &str) = (10, "stop");
 
+/// Every `(step, name)` a report carries, in order. A `--dry-run` preview is built from this
+/// directly and a real run's rows must match it — which is why the end-to-end gate compares a
+/// real run against a `--dry-run` of the same binary rather than against a hand-copied list.
+fn planned_rows() -> Vec<(u8, &'static str)> {
+    CHECK_NAMES
+        .iter()
+        .copied()
+        .chain(std::iter::once(STOP_CHECK))
+        .collect()
+}
+
 /// Every check name a report can carry. The known-limits ledger is validated against this,
 /// so an entry naming a check that does not exist fails a test rather than silently never
 /// matching and hard-failing a release over an accepted limitation.
 #[cfg(test)]
 pub(crate) fn all_check_names() -> Vec<&'static str> {
-    CHECK_NAMES
-        .iter()
-        .map(|(_, name)| *name)
-        .chain(std::iter::once(STOP_CHECK.1))
-        .collect()
+    planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
 /// Check 1. Runs [`checks::check_version`] when `--expect-version` was given; otherwise records
@@ -88,16 +97,42 @@ fn version_check(t: &mut dyn McpTransport, expect_version: Option<&str>) -> Chec
     }
 }
 
-pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
-    run_with(opts, &profile::on_path)
+/// The step whose `detail` carries an unavailable app: `start` is the check that would hit
+/// the gap, and the one the how-to already sends a reader to when a run goes wrong.
+const START_STEP: u8 = 2;
+
+/// `--dry-run`'s rows: every check a real run would produce, each a `skip` saying what it
+/// would have done. Two of them say more than "dry run", because two of the run's inputs are
+/// only visible here — the missing target app, and an `--expect-version` that a dry run does
+/// not compare against anything.
+fn plan_checks(app: &TargetApp, expect_version: Option<&str>) -> Vec<CheckOutcome> {
+    planned_rows()
+        .into_iter()
+        .map(|(step, name)| {
+            let detail = match (step, app.note()) {
+                (START_STEP, Some(note)) => note.to_string(),
+                (1, _) => match expect_version {
+                    Some(tag) => format!("dry run — would compare the server's version to {tag:?}"),
+                    None => "dry run — no --expect-version given".to_string(),
+                },
+                _ => "dry run".to_string(),
+            };
+            CheckOutcome::skip(step, name, detail)
+        })
+        .collect()
 }
 
-/// `run`'s actual logic, taking the presence probe as a parameter rather than always calling
-/// [`profile::on_path`] — the seam that lets tests drive it with a fake instead of the host's
-/// real `PATH`. `run` is the only caller that should ever pass `on_path` itself; every unit
-/// test below should go through this with a fake so none of them depend on which target apps
-/// the machine running the suite happens to have installed.
-fn run_with(opts: SmokeOptions, present: &dyn Fn(&str) -> bool) -> Result<SmokeReport, String> {
+pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
+    let path = std::env::var_os("PATH");
+    run_with(opts, path.as_deref())
+}
+
+/// `run`'s actual logic, taking the search path to probe as a parameter rather than reading
+/// `PATH` itself — the seam that lets tests drive it against a directory they control instead
+/// of the host's real environment. `run` is the only caller that should ever pass the host's
+/// `PATH`; every unit test below goes through this with an explicit path, so none of them
+/// depends on which target apps the machine running the suite happens to have installed.
+fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, String> {
     let (backend, candidates) = candidates_for(&opts.backend)?;
 
     // Resolve an explicit `--app` up front, dry run or not: naming a candidate that doesn't
@@ -116,27 +151,28 @@ fn run_with(opts: SmokeOptions, present: &dyn Fn(&str) -> bool) -> Result<SmokeR
 
     if opts.dry_run {
         // Unlike a real run, dry-run must not fail just because no candidate is present: its
-        // whole purpose is "see the plan without touching anything", and the moment a user
-        // most wants that is while setting up — before any candidate is installed. So a probe
-        // miss here degrades into the app column instead of an error; the wording is the same
-        // "what to install" text `resolve_app` would otherwise have failed with.
-        let app_label = match forced {
-            Some(c) => c.label.to_string(),
-            None => match profile::resolve_app(candidates, present) {
-                Ok(c) => c.label.to_string(),
-                Err(e) => e,
+        // whole purpose is "see the plan before driving anything", and the moment a user most
+        // wants that is while setting up — before any candidate is installed. So the plan
+        // records the gap instead of erroring. A forced `--app` is probed too: a plan naming an
+        // app the host does not have is indistinguishable from one it does, and the how-to
+        // sends a stuck reader to `--app` precisely when something is already wrong.
+        let app = match forced {
+            Some(c) if !profile::runnable(c, path) => TargetApp::Unavailable(format!(
+                "would fail: --app {} was given, but {} is not runnable on PATH",
+                c.label, c.bin
+            )),
+            Some(c) => TargetApp::Selected(c.label.to_string()),
+            None => match profile::resolve_app(candidates, path) {
+                Ok(c) => TargetApp::Selected(c.label.to_string()),
+                Err(e) => TargetApp::Unavailable(e.plan_note(candidates)),
             },
         };
-        let mut checks: Vec<CheckOutcome> = CHECK_NAMES
-            .iter()
-            .map(|(step, name)| CheckOutcome::skip(*step, name, "dry run"))
-            .collect();
-        checks.push(CheckOutcome::skip(STOP_CHECK.0, STOP_CHECK.1, "dry run"));
         return Ok(SmokeReport {
             backend: backend.to_string(),
             version: crate::VERSION.to_string(),
-            app: app_label,
-            checks,
+            mode: RunMode::DryRun,
+            checks: plan_checks(&app, opts.expect_version.as_deref()),
+            app,
         });
     }
 
@@ -144,7 +180,7 @@ fn run_with(opts: SmokeOptions, present: &dyn Fn(&str) -> bool) -> Result<SmokeR
     // fall back to here.
     let app = match forced {
         Some(c) => c,
-        None => profile::resolve_app(candidates, present)?,
+        None => profile::resolve_app(candidates, path).map_err(|e| e.blocking_error(candidates))?,
     };
     let p = Profile {
         backend: backend.to_string(),
@@ -177,7 +213,8 @@ fn run_with(opts: SmokeOptions, present: &dyn Fn(&str) -> bool) -> Result<SmokeR
     Ok(SmokeReport {
         backend: p.backend,
         version,
-        app: app.label.to_string(),
+        mode: RunMode::Full,
+        app: TargetApp::Selected(app.label.to_string()),
         checks,
     })
 }
@@ -188,11 +225,51 @@ mod tests {
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::ScriptedTransport;
 
-    /// A `present` predicate for tests that must not depend on which target apps the host
-    /// running the suite happens to have installed — simulates a machine with none of the
-    /// X11 candidates on `PATH`, the shape of a bare CI runner.
-    fn nothing_present(_bin: &str) -> bool {
-        false
+    /// Every row a report must carry, in order, written out rather than derived from
+    /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
+    /// fail here, in the default `cargo test` suite, not only in the `#[ignore]`d X11 gate.
+    const CANONICAL_ROWS: [(u8, &str); 9] = [
+        (1, "version"),
+        (2, "start"),
+        (3, "capabilities+doctor"),
+        (4, "screenshot"),
+        (5, "a11y snapshot"),
+        (6, "interaction"),
+        (8, "logs"),
+        (9, "error honesty"),
+        (10, "stop"),
+    ];
+
+    /// A search path holding real executables named `bins` — empty for the shape of a bare CI
+    /// runner with none of the candidates installed. The `TempDir` must stay bound for as long
+    /// as the path is used: dropping it deletes the directory.
+    fn host_with(bins: &[&str]) -> (tempfile::TempDir, std::ffi::OsString) {
+        profile::path_fixture(bins, &[])
+    }
+
+    fn dry_run(app: Option<&str>, path: Option<&OsStr>) -> SmokeReport {
+        run_with(
+            SmokeOptions {
+                backend: "x11".into(),
+                app: app.map(str::to_string),
+                expect_version: None,
+                dry_run: true,
+            },
+            path,
+        )
+        .expect("a dry run on a known backend must produce a plan")
+    }
+
+    fn rows(r: &SmokeReport) -> Vec<(u8, &str)> {
+        r.checks.iter().map(|c| (c.step, c.name.as_str())).collect()
+    }
+
+    fn detail_of<'a>(r: &'a SmokeReport, name: &str) -> &'a str {
+        &r.checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no {name:?} row in {:?}", rows(r)))
+            .detail
     }
 
     #[test]
@@ -219,61 +296,134 @@ mod tests {
         assert!(fail.detail.contains("1.1.0"), "got: {}", fail.detail);
     }
 
+    /// The invariant `run_with` is built on: the preview and a real run carry the same rows.
+    /// Pinned against a written-out list, so deleting a [`CHECK_NAMES`] entry fails a test
+    /// instead of silently shortening every report.
     #[test]
-    fn dry_run_reports_the_plan_without_calling_anything() {
-        // Driven by `nothing_present`, not the host's real `PATH`: this must hold whether or
-        // not the machine running the suite has any X11 candidate installed.
-        let r = run_with(
-            SmokeOptions {
-                backend: "x11".into(),
-                app: None,
-                expect_version: None,
-                dry_run: true,
-            },
-            &nothing_present,
-        )
-        .unwrap();
+    fn a_plan_previews_every_check_in_order() {
+        let (_dir, path) = host_with(&[]);
+        let r = dry_run(None, Some(&path));
+        assert_eq!(rows(&r), CANONICAL_ROWS.to_vec());
+    }
+
+    #[test]
+    fn a_plan_runs_nothing_and_so_cannot_fail() {
+        let (_dir, path) = host_with(&[]);
+        let r = dry_run(None, Some(&path));
+        assert!(!r.checks.is_empty(), "an empty plan would vacuously pass");
         assert!(
             r.checks
                 .iter()
                 .all(|c| c.status == report::CheckStatus::Skip)
         );
         assert_eq!(r.exit_code(), 0);
-        // Dry-run's whole purpose is a preview before the environment is necessarily ready,
-        // so no candidate present must degrade into the app column rather than fail the run —
-        // and it must still say what to install, the same remedy `resolve_app` names.
+    }
+
+    /// The degrade this branch added: previewing before any candidate is installed must not
+    /// fail. What changed is where the gap is *reported* — the `start` row, the check that
+    /// would hit it, rather than the slot that names the selected app.
+    #[test]
+    fn a_plan_with_no_candidate_says_so_on_the_check_that_would_fail() {
+        let (_dir, path) = host_with(&[]);
+        let r = dry_run(None, Some(&path));
+        let start = detail_of(&r, "start");
         assert!(
-            r.app.contains("install"),
-            "must say what to install when nothing was found: {}",
+            start.contains("install") && start.contains("zenity"),
+            "the start row must name what to install: {start}"
+        );
+        assert_eq!(
+            r.app,
+            TargetApp::Unavailable(start.to_string()),
+            "the app field must model the gap, not carry it as a label"
+        );
+    }
+
+    /// A heading, an exit code and nine uniform skips all said "healthy" on a machine that
+    /// could not run a single check. The heading is the channel that has to give.
+    #[test]
+    fn a_plan_does_not_head_its_report_pass() {
+        let (_dir, path) = host_with(&[]);
+        let md = dry_run(None, Some(&path)).to_markdown();
+        let heading = md.lines().next().unwrap_or_default();
+        assert!(heading.contains("plan only"), "got: {heading}");
+    }
+
+    #[test]
+    fn a_plan_names_the_candidate_it_would_pick_when_one_is_present() {
+        let (_dir, path) = host_with(&["zenity"]);
+        let r = dry_run(None, Some(&path));
+        assert_eq!(r.app, TargetApp::Selected("zenity".into()));
+        assert_eq!(detail_of(&r, "start"), "dry run");
+    }
+
+    /// `--app` selects among the candidates; it does not conjure one. A plan naming an app the
+    /// host does not have looked exactly like a plan that could run — and the how-to sends a
+    /// stuck reader to `--app` precisely when something is already wrong.
+    #[test]
+    fn a_plan_marks_a_forced_app_that_is_not_installed() {
+        let (_dir, path) = host_with(&["zenity"]);
+        let r = dry_run(Some("xterm"), Some(&path));
+        let start = detail_of(&r, "start");
+        assert!(start.contains("xterm"), "must name the forced app: {start}");
+        assert!(
+            matches!(r.app, TargetApp::Unavailable(_)),
+            "got: {:?}",
             r.app
         );
     }
 
     #[test]
-    fn dry_run_names_the_candidate_it_would_pick_when_one_is_present() {
-        // The other half of the degrade: when a candidate genuinely is on `PATH`, the preview
-        // must still name it, not the "nothing found" text.
+    fn a_plan_accepts_a_forced_app_that_is_installed() {
+        let (_dir, path) = host_with(&["xterm"]);
+        let r = dry_run(Some("xterm"), Some(&path));
+        assert_eq!(r.app, TargetApp::Selected("xterm".into()));
+    }
+
+    /// An unset `PATH` is not "nothing installed": installing another candidate cannot fix it,
+    /// so the plan must not send the reader off to do that.
+    #[test]
+    fn a_plan_with_no_search_path_says_to_set_path() {
+        let r = dry_run(None, None);
+        let start = detail_of(&r, "start");
+        assert!(
+            start.contains("PATH is unset"),
+            "must name the real cause: {start}"
+        );
+    }
+
+    /// A dry run compares no versions, so a plan that took `--expect-version` and said only
+    /// "dry run" hid an ignored argument — the thing `--self-check` rejects flags to avoid.
+    #[test]
+    fn a_plan_says_the_expected_version_was_not_compared() {
+        let (_dir, path) = host_with(&["zenity"]);
         let r = run_with(
             SmokeOptions {
                 backend: "x11".into(),
                 app: None,
-                expect_version: None,
+                expect_version: Some("1.2.3".into()),
                 dry_run: true,
             },
-            &|bin: &str| bin == "zenity",
+            Some(&path),
         )
-        .unwrap();
-        assert_eq!(r.app, "zenity");
+        .expect("a plan");
+        let version = detail_of(&r, "version");
+        assert!(
+            version.contains("would compare") && version.contains("1.2.3"),
+            "got: {version}"
+        );
     }
 
     #[test]
     fn an_unknown_backend_is_rejected_by_name() {
-        let err = run(SmokeOptions {
-            backend: "beos".into(),
-            app: None,
-            expect_version: None,
-            dry_run: true,
-        })
+        let err = run_with(
+            SmokeOptions {
+                backend: "beos".into(),
+                app: None,
+                expect_version: None,
+                dry_run: true,
+            },
+            None,
+        )
         .unwrap_err();
         assert!(err.contains("beos") && err.contains("x11"), "got: {err}");
     }
@@ -282,8 +432,8 @@ mod tests {
     fn a_backend_name_is_recognized_the_same_way_the_rest_of_the_binary_recognizes_it() {
         // `recognized_backend` is case-insensitive, so `GLASS_BACKEND=X11` is honoured
         // everywhere else; a second, stricter recognition site here would reject the same
-        // spelling the binary otherwise accepts. Driven by `nothing_present`, not the host's
-        // real `PATH` — backend recognition must not depend on which apps are installed.
+        // spelling the binary otherwise accepts.
+        let (_dir, path) = host_with(&[]);
         let r = run_with(
             SmokeOptions {
                 backend: "X11".into(),
@@ -291,7 +441,7 @@ mod tests {
                 expect_version: None,
                 dry_run: true,
             },
-            &nothing_present,
+            Some(&path),
         )
         .expect("X11 must resolve the same way GLASS_BACKEND=X11 does");
         assert_eq!(
@@ -302,12 +452,15 @@ mod tests {
 
     #[test]
     fn a_backend_glass_knows_but_smoke_cannot_drive_yet_says_so() {
-        let err = run(SmokeOptions {
-            backend: "wayland".into(),
-            app: None,
-            expect_version: None,
-            dry_run: true,
-        })
+        let err = run_with(
+            SmokeOptions {
+                backend: "wayland".into(),
+                app: None,
+                expect_version: None,
+                dry_run: true,
+            },
+            None,
+        )
         .unwrap_err();
         assert!(
             err.contains("wayland") && err.contains("x11"),
@@ -315,14 +468,21 @@ mod tests {
         );
     }
 
+    /// A name that is not in the candidate table at all is a typo in the caller's input, not
+    /// an environment gap — so it stays a hard error in both modes, unlike a candidate that
+    /// is simply not installed.
     #[test]
     fn an_explicit_app_override_must_exist_in_the_candidate_list() {
-        let err = run(SmokeOptions {
-            backend: "x11".into(),
-            app: Some("emacs".into()),
-            expect_version: None,
-            dry_run: true,
-        })
+        let (_dir, path) = host_with(&[]);
+        let err = run_with(
+            SmokeOptions {
+                backend: "x11".into(),
+                app: Some("emacs".into()),
+                expect_version: None,
+                dry_run: true,
+            },
+            Some(&path),
+        )
         .unwrap_err();
         assert!(err.contains("emacs"), "got: {err}");
     }

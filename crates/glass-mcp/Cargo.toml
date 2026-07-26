@@ -19,6 +19,10 @@ network = [
 [dependencies]
 glass-android.workspace = true
 glass-core.workspace = true
+# `smoke`'s target-app probe: the workspace's one `execvp`-semantics `$PATH` resolver
+# (executable regular file, first entry wins). Pure std, no dependencies of its own, and it
+# builds on every target — so this stays out of the per-OS dependency blocks below.
+glass-sandbox-core.workspace = true
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

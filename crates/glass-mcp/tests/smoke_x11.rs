@@ -9,19 +9,25 @@ use std::process::Command;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
 
-/// Every row a real run must produce, in order. Asserting the whole set — not just that a
-/// few names appear somewhere — is what makes a check that quietly stopped running visible.
-const EXPECTED_ROWS: [(u64, &str); 9] = [
-    (1, "version"),
-    (2, "start"),
-    (3, "capabilities+doctor"),
-    (4, "screenshot"),
-    (5, "a11y snapshot"),
-    (6, "interaction"),
-    (8, "logs"),
-    (9, "error honesty"),
-    (10, "stop"),
-];
+/// The `(step, name)` pairs a report carries, in order.
+fn rows(json: &serde_json::Value) -> Vec<(u64, String)> {
+    json["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .map(|c| {
+            (
+                c["step"].as_u64().unwrap_or_default(),
+                c["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn read_report(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("report written"))
+        .expect("report is JSON")
+}
 
 /// The checks the CI fixture controls end to end: the runner installs the target app and the
 /// accessibility bus, so each of these must actually be `pass`. `Skip` exits 0, so without
@@ -63,31 +69,42 @@ fn smoke_x11_passes_against_a_real_app() {
         "smoke failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&report).expect("report written"))
-            .expect("report is JSON");
+    let json = read_report(&report);
     assert_eq!(json["backend"], "x11");
+    assert_eq!(json["mode"], "full", "a real run is not a plan: {json}");
+    assert_eq!(
+        json["app"]["state"], "selected",
+        "a real run drove an app, so the report must say which: {json}"
+    );
     assert!(
-        json["app"].as_str().is_some_and(|a| !a.is_empty()),
-        "the selected app must be recorded: {json}"
+        json["app"]["value"].as_str().is_some_and(|a| !a.is_empty()),
+        "the selected app must be named: {json}"
+    );
+
+    // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's
+    // rows. Sourcing the expectation from the same binary's own plan — rather than a list
+    // copied into this file — is what keeps the two from drifting apart unnoticed.
+    let plan_path = dir.path().join("plan.json");
+    let plan = Command::new(SERVER)
+        .args(["smoke", "--backend", "x11", "--dry-run", "--report"])
+        .arg(&plan_path)
+        .env("DISPLAY", &xvfb.display)
+        .output()
+        .expect("run smoke --dry-run");
+    assert!(
+        plan.status.success(),
+        "smoke --dry-run failed: {}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan = read_report(&plan_path);
+    assert_eq!(plan["mode"], "dry_run", "a plan must say so: {plan}");
+    assert_eq!(
+        rows(&json),
+        rows(&plan),
+        "a real run must carry exactly the checks --dry-run previews: {stdout}"
     );
 
     let checks = json["checks"].as_array().expect("checks array");
-    let rows: Vec<(u64, &str)> = checks
-        .iter()
-        .map(|c| {
-            (
-                c["step"].as_u64().unwrap_or_default(),
-                c["name"].as_str().unwrap_or_default(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        rows,
-        EXPECTED_ROWS.to_vec(),
-        "the report must carry every check, in order: {stdout}"
-    );
-
     for name in MUST_PASS {
         let status = checks
             .iter()

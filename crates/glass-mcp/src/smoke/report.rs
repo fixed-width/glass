@@ -65,13 +65,61 @@ impl CheckOutcome {
     }
 }
 
+/// Whether the run drove anything. A `--dry-run` exercises nothing — every check is a `skip`,
+/// so the run *cannot* fail — and a bare `PASS` over that would read as "this build works" to
+/// the three channels (heading, exit code, statuses) a reader or script actually consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// The checks ran against a spawned server and a launched app.
+    Full,
+    /// `--dry-run`: the plan only. Nothing was spawned, launched or called.
+    DryRun,
+}
+
+/// The app the run drove, or why it had none. Modelled as one value with two states rather
+/// than a `String` carrying either, so a JSON consumer reads a discriminant instead of
+/// sniffing a label for substrings that would tell it a remedy sentence from an app name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum TargetApp {
+    /// The candidate selected, by label. Reports from different hosts are only comparable
+    /// if this is visible.
+    Selected(String),
+    /// No app was available; the value says why and what to do. Only a `--dry-run` report can
+    /// carry this — a real run needs an app and stops before it has a report to put it in.
+    Unavailable(String),
+}
+
+impl TargetApp {
+    /// The remedy note, when there is no app. The place to *read* it is the `start` check's
+    /// `detail`, where the docs already send a reader; this is where that row gets it from.
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Selected(_) => None,
+            Self::Unavailable(note) => Some(note),
+        }
+    }
+}
+
+/// The one-word label for the report's header line. Deliberately short in both states: the
+/// header is a subtitle slot, and a sentence in it is what made an unusable host read as
+/// healthy. The sentence lives in the `start` row instead.
+impl std::fmt::Display for TargetApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Selected(label) => f.write_str(label),
+            Self::Unavailable(_) => f.write_str("none available"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SmokeReport {
     pub backend: String,
     pub version: String,
-    /// The candidate app actually selected. Reports from different hosts are only
-    /// comparable if this is visible.
-    pub app: String,
+    pub mode: RunMode,
+    pub app: TargetApp,
     pub checks: Vec<CheckOutcome>,
 }
 
@@ -86,14 +134,30 @@ impl SmokeReport {
         i32::from(self.failed())
     }
 
+    /// The heading's verdict. `PASS` alone claims the build was exercised and held up; a
+    /// `--dry-run` exercised nothing, so it says which kind of pass it is. Both still exit 0 —
+    /// nothing failed.
+    fn verdict(&self) -> &'static str {
+        match (self.failed(), self.mode) {
+            (true, _) => "FAIL",
+            (false, RunMode::Full) => "PASS",
+            (false, RunMode::DryRun) => "PASS (plan only)",
+        }
+    }
+
     pub fn to_markdown(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        let verdict = if self.failed() { "FAIL" } else { "PASS" };
+        let verdict = self.verdict();
         let _ = writeln!(
             out,
             "# glass smoke — {} — {verdict}\n\nglass-mcp {} · app: `{}`\n",
-            self.backend, self.version, self.app
+            self.backend,
+            self.version,
+            // `Display` yields a candidate label or a fixed literal, so this cannot currently
+            // break the table — routed through `cell` anyway, because the reason the app field
+            // fell outside this hardening once was that it *became* error-derived later.
+            cell(&self.app.to_string())
         );
         let _ = writeln!(out, "| # | check | status | detail |");
         let _ = writeln!(out, "|---|---|---|---|");
@@ -146,7 +210,8 @@ mod tests {
         SmokeReport {
             backend: "x11".into(),
             version: "1.1.0".into(),
-            app: "xterm".into(),
+            mode: RunMode::Full,
+            app: TargetApp::Selected("xterm".into()),
             checks,
         }
     }
@@ -226,6 +291,59 @@ mod tests {
         );
         let rows = md.lines().filter(|l| l.starts_with("| ")).count();
         assert_eq!(rows, 3, "header row plus two check rows: {md}");
+    }
+
+    /// The failure this pins: a plan-only run on a machine that cannot run the checks at all
+    /// used to head its report `PASS`, agreeing with exit 0 and nine uniform `skip` rows.
+    #[test]
+    fn a_dry_run_heading_says_it_exercised_nothing() {
+        let mut r = report(vec![CheckOutcome::skip(1, "version", "dry run")]);
+        r.mode = RunMode::DryRun;
+        let md = r.to_markdown();
+        assert!(
+            md.lines()
+                .next()
+                .is_some_and(|h| h.contains("PASS (plan only)")),
+            "a dry run must not head its report with a bare PASS: {md}"
+        );
+        assert_eq!(r.exit_code(), 0, "nothing failed, so the exit code stays 0");
+    }
+
+    /// A dry run that *did* find nothing still reports the remedy — in the `start` row, not
+    /// the header, whose slot takes a label.
+    #[test]
+    fn an_unavailable_app_renders_as_a_label_not_a_sentence() {
+        let mut r = report(vec![]);
+        r.app = TargetApp::Unavailable("would fail: no target app on PATH — install one".into());
+        let header = r.to_markdown();
+        assert!(header.contains("app: `none available`"), "got: {header}");
+        assert!(
+            !header.contains("install one"),
+            "the remedy belongs in the start row, not the header: {header}"
+        );
+    }
+
+    /// The header must survive the same text the `detail` cells are hardened against: this
+    /// field is error-derived now, which is exactly how it slipped outside that hardening.
+    #[test]
+    fn a_newline_in_the_app_note_cannot_reach_the_header() {
+        let mut r = report(vec![CheckOutcome::pass(1, "version", "1.1.0")]);
+        r.app = TargetApp::Selected("we\nird | app".into());
+        let md = r.to_markdown();
+        let header = md.lines().nth(2).expect("the subtitle line");
+        assert!(header.contains("we ird \\| app"), "got: {header}");
+    }
+
+    /// A consumer must be able to tell a selected app from a remedy without reading the text.
+    #[test]
+    fn the_json_app_field_carries_a_discriminant() {
+        let selected = serde_json::to_value(TargetApp::Selected("zenity".into())).unwrap();
+        assert_eq!(selected["state"], "selected");
+        assert_eq!(selected["value"], "zenity");
+
+        let none =
+            serde_json::to_value(TargetApp::Unavailable("install one of: …".into())).unwrap();
+        assert_eq!(none["state"], "unavailable");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! What to launch on a backend, and how to read the accessibility outline it produces.
 
+use std::ffi::OsStr;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate {
     /// Executable to look for on PATH.
@@ -50,31 +52,113 @@ pub struct OutlineNode {
     pub states: Vec<String>,
 }
 
-/// Pick the first candidate present on the host.
-pub fn resolve_app(
-    candidates: &'static [Candidate],
-    present: &dyn Fn(&str) -> bool,
-) -> Result<&'static Candidate, String> {
-    candidates.iter().find(|c| present(c.bin)).ok_or_else(|| {
-        let names: Vec<&str> = candidates.iter().map(|c| c.bin).collect();
-        format!(
-            "no target app found — install one of: {}. The smoke run drives a real app, \
-             so at least one must be on PATH.",
-            names.join(", ")
-        )
-    })
+/// Why a run has no target app to drive. The two cases are kept apart because their remedies
+/// differ: installing another candidate will never fix an unset `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoTargetApp {
+    /// `PATH` is unset, so no bare command name resolves at all — nothing was even searched.
+    NoSearchPath,
+    /// `PATH` was searched and held none of the candidates.
+    NoneInstalled,
 }
 
-/// Is `bin` on PATH? The default probe for [`resolve_app`].
-pub fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let p = dir.join(bin);
-                p.is_file()
-            })
-        })
-        .unwrap_or(false)
+impl NoTargetApp {
+    /// Why a real run cannot proceed. A real run drives an app, so this is terminal.
+    pub fn blocking_error(self, candidates: &[Candidate]) -> String {
+        match self {
+            Self::NoSearchPath => format!(
+                "PATH is unset, so no command name can be resolved — set PATH to a directory \
+                 holding one of: {}. The smoke run drives a real app, so one must be runnable.",
+                bin_list(candidates)
+            ),
+            Self::NoneInstalled => format!(
+                "no target app found — install one of: {}. The smoke run drives a real app, \
+                 so at least one must be on PATH.",
+                bin_list(candidates)
+            ),
+        }
+    }
+
+    /// What a `--dry-run` plan records instead. A dry run drives nothing, so the missing app
+    /// does not stop it — it is stated as what a real run would hit, not as a present failure.
+    pub fn plan_note(self, candidates: &[Candidate]) -> String {
+        match self {
+            Self::NoSearchPath => format!(
+                "would fail: PATH is unset, so no target app can be resolved — set PATH to a \
+                 directory holding one of: {}",
+                bin_list(candidates)
+            ),
+            Self::NoneInstalled => format!(
+                "would fail: no target app on PATH — install one of: {}",
+                bin_list(candidates)
+            ),
+        }
+    }
+}
+
+/// The candidates' executable names, in probe order, for a message that names what to install.
+fn bin_list(candidates: &[Candidate]) -> String {
+    candidates
+        .iter()
+        .map(|c| c.bin)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Pick the first candidate runnable on `path` — the value of `PATH`, or `None` when the
+/// variable is unset. Taking the search path rather than reading the environment is what lets
+/// the probe below be tested against a directory the test controls, instead of whichever apps
+/// the machine running the suite happens to have.
+pub fn resolve_app(
+    candidates: &'static [Candidate],
+    path: Option<&OsStr>,
+) -> Result<&'static Candidate, NoTargetApp> {
+    let path = path.ok_or(NoTargetApp::NoSearchPath)?;
+    candidates
+        .iter()
+        .find(|c| on_path_in(c.bin, path))
+        .ok_or(NoTargetApp::NoneInstalled)
+}
+
+/// Is this specific candidate runnable, without regard to probe order? What `--app` needs:
+/// the caller has already chosen which candidate, and only wants to know whether the plan it
+/// is about to print could actually be carried out.
+pub fn runnable(candidate: &Candidate, path: Option<&OsStr>) -> bool {
+    path.is_some_and(|p| on_path_in(candidate.bin, p))
+}
+
+/// Is `bin` runnable as a bare command name on `path`? Delegates to the workspace's one
+/// `execvp`-semantics resolver — a regular file carrying an execute bit, first `$PATH` entry
+/// wins — rather than testing `is_file()`, which would accept a mode-644 file named `xed` and
+/// hand the run an "app" that cannot launch.
+fn on_path_in(bin: &str, path: &OsStr) -> bool {
+    glass_sandbox_core::resolve_on_path_in(OsStr::new(bin), path).is_some()
+}
+
+/// Test-only: a directory of real files to search — `bins` executable, `data` left mode-644 —
+/// paired with the `$PATH` value naming it. Tests probe this rather than a stand-in predicate,
+/// so what they exercise is the resolution a run actually performs; and they never read the
+/// host's own `PATH`, so no test depends on which apps the machine happens to have.
+#[cfg(test)]
+pub(crate) fn path_fixture(
+    bins: &[&str],
+    data: &[&str],
+) -> (tempfile::TempDir, std::ffi::OsString) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for name in bins {
+        let p = dir.path().join(name);
+        std::fs::write(&p, b"#!/bin/sh\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+    for name in data {
+        std::fs::write(dir.path().join(name), b"not a program\n").expect("write");
+    }
+    let path = std::env::join_paths([dir.path()]).expect("join_paths");
+    (dir, path)
 }
 
 /// Parse the compact accessibility outline: `#id Role "name" (x,y wxh) [states]`.
@@ -207,18 +291,85 @@ mod tests {
 
     #[test]
     fn resolve_picks_the_first_present_candidate() {
-        let present = |b: &str| b == "zenity" || b == "xterm";
-        let c = resolve_app(&X11_CANDIDATES, &present).unwrap();
+        let (_dir, path) = path_fixture(&["zenity", "xterm"], &[]);
+        let c = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap();
         assert_eq!(c.label, "zenity");
     }
 
     #[test]
-    fn resolve_names_what_to_install_when_nothing_is_present() {
-        let err = resolve_app(&X11_CANDIDATES, &|_| false).unwrap_err();
-        for expected in ["xed", "gnome-text-editor", "zenity", "xterm"] {
-            assert!(err.contains(expected), "must name every candidate: {err}");
+    fn resolve_reports_none_installed_when_the_path_holds_no_candidate() {
+        let (_dir, path) = path_fixture(&[], &[]);
+        let err = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap_err();
+        assert_eq!(err, NoTargetApp::NoneInstalled);
+    }
+
+    /// The bug this pins: `xed` present but not executable is not an app. Reading it as one
+    /// selects a candidate that cannot launch, so the run fails at check 2 with a launch error
+    /// instead of falling through to a candidate that would have worked.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_not_a_candidate() {
+        let (_dir, path) = path_fixture(&["xterm"], &["xed"]);
+        let c = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap();
+        assert_eq!(
+            c.label, "xterm",
+            "a mode-644 file named xed must be skipped, not selected"
+        );
+    }
+
+    /// `--app`'s probe: it asks about one chosen candidate, not the first that resolves.
+    #[test]
+    fn runnable_answers_about_the_named_candidate_only() {
+        let (_dir, path) = path_fixture(&["zenity"], &[]);
+        let zenity = X11_CANDIDATES.iter().find(|c| c.bin == "zenity").unwrap();
+        let xterm = X11_CANDIDATES.iter().find(|c| c.bin == "xterm").unwrap();
+        assert!(runnable(zenity, Some(&path)));
+        assert!(!runnable(xterm, Some(&path)));
+        assert!(!runnable(zenity, None), "an unset PATH resolves nothing");
+    }
+
+    /// An unset `PATH` is its own case: no amount of installing fixes it, so it must not be
+    /// reported as "nothing installed".
+    #[test]
+    fn an_unset_path_is_not_reported_as_nothing_installed() {
+        let err = resolve_app(&X11_CANDIDATES, None).unwrap_err();
+        assert_eq!(err, NoTargetApp::NoSearchPath);
+    }
+
+    #[test]
+    fn nothing_installed_names_every_candidate_and_what_to_do() {
+        for msg in [
+            NoTargetApp::NoneInstalled.blocking_error(&X11_CANDIDATES),
+            NoTargetApp::NoneInstalled.plan_note(&X11_CANDIDATES),
+        ] {
+            for expected in ["xed", "gnome-text-editor", "zenity", "xterm"] {
+                assert!(msg.contains(expected), "must name every candidate: {msg}");
+            }
+            assert!(msg.contains("install"), "must say what to do: {msg}");
         }
-        assert!(err.contains("install"), "must say what to do: {err}");
+    }
+
+    /// A dry run drives nothing, so its wording must not claim an app is required *now* — the
+    /// real-run sentence ("the smoke run drives a real app") is false in the mode that prints
+    /// the plan.
+    #[test]
+    fn the_plan_note_does_not_repeat_the_real_runs_claim() {
+        let note = NoTargetApp::NoneInstalled.plan_note(&X11_CANDIDATES);
+        assert!(
+            note.starts_with("would fail"),
+            "a plan states what a real run would hit: {note}"
+        );
+        assert!(
+            !note.contains("drives a real app"),
+            "the real-run claim is false under --dry-run: {note}"
+        );
+    }
+
+    #[test]
+    fn an_unset_path_says_to_set_it_rather_than_to_install_more() {
+        let msg = NoTargetApp::NoSearchPath.blocking_error(&X11_CANDIDATES);
+        assert!(msg.contains("PATH is unset"), "must name the cause: {msg}");
+        assert!(msg.contains("set PATH"), "must name the remedy: {msg}");
     }
 
     #[test]

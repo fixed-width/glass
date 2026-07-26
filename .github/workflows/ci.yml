@@ -46,6 +46,11 @@ jobs:
       - run: cargo test --workspace --locked
       - name: smoke self-check
         run: cargo run -p glass-mcp -- smoke --self-check
+      # This runner has none of the X11 target apps installed, so it is exactly the host that
+      # must degrade rather than hard-fail: a plan is printed, the `start` row names what to
+      # install, and the run exits 0. Nothing else exercises that path end to end.
+      - name: smoke plan on a host with no target app
+        run: cargo run -p glass-mcp -- smoke --dry-run
 
   miri:
     name: Miri (UB check · pure crates)
