@@ -26,6 +26,7 @@ pub mod serve;
 pub(crate) mod server;
 pub mod setup;
 pub(crate) mod shutdown;
+pub mod smoke;
 pub(crate) mod status;
 mod tools;
 mod untrusted;
