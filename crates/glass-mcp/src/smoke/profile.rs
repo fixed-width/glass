@@ -44,8 +44,8 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
     },
 ];
 
-/// GTK refuses to start when the named backend is unavailable, so a wayland run drives a native
-/// Wayland client rather than silently falling back to Xwayland.
+/// GTK refuses to start when the named backend is unavailable, so naming it turns a would-be
+/// silent Xwayland fallback into a launch failure the run reports.
 const NATIVE_WAYLAND: &[(&str, &str)] = &[("GDK_BACKEND", "wayland")];
 
 /// The X11 table without its X11-only entry, in the same probe order.
@@ -484,14 +484,15 @@ mod tests {
         assert_eq!(first_editable(&nodes).unwrap().id, 10);
     }
 
-    /// A headless sway session also exports `DISPLAY` for Xwayland, so GTK is free to pick the
-    /// X11 backend unless told otherwise — and a run that let it would grade Xwayland.
+    /// GDK tries wayland before x11, so GTK already picks wayland where `WAYLAND_DISPLAY` is set:
+    /// what naming the backend buys is a launch failure where GTK would otherwise fall back to the
+    /// `DISPLAY` a headless sway also exports for Xwayland.
     #[test]
-    fn every_wayland_candidate_forces_the_native_backend() {
+    fn every_wayland_candidate_names_the_wayland_gdk_backend() {
         for c in &WAYLAND_CANDIDATES {
             assert!(
                 c.env.contains(&("GDK_BACKEND", "wayland")),
-                "{} must force the native Wayland backend",
+                "{} must name the Wayland GDK backend",
                 c.label
             );
         }

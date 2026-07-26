@@ -501,6 +501,9 @@ pub(crate) mod testutil {
         /// Count of `capture_frame` calls — lets a test assert a settle actually captured
         /// frames (e.g. `return:"snapshot"` settling before it folds the tree).
         pub captures: Arc<Mutex<usize>>,
+        /// Specs `start_app` was handed, in order — the only observer of what the tool layer
+        /// built from `glass_start`'s arguments.
+        pub specs: Arc<Mutex<Vec<AppSpec>>>,
     }
 
     impl FakePlatform {
@@ -531,6 +534,10 @@ pub(crate) mod testutil {
             self.captures = log;
             self
         }
+        pub fn with_spec_log(mut self, log: Arc<Mutex<Vec<AppSpec>>>) -> Self {
+            self.specs = log;
+            self
+        }
     }
 
     /// A 4x4 opaque frame, constant everywhere except pixel (3,3), set to `corner` —
@@ -547,7 +554,8 @@ pub(crate) mod testutil {
     }
 
     impl Platform for FakePlatform {
-        fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+        fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+            self.specs.lock().unwrap().push(spec.clone());
             self.started = true;
             Ok(self.geometry.clone())
         }
@@ -965,6 +973,23 @@ mod tests {
         let v = assert_envelope(&out, "glass_start");
         assert_eq!(v["width"], json!(80));
         assert_eq!(v["height"], json!(60));
+    }
+
+    /// The link the smoke runner's wayland profile rests on: `glass_start`'s `env` argument
+    /// reaching the backend as `AppSpec.env`. Every smoke check passes with that env removed, so
+    /// no run observes it.
+    #[test]
+    fn start_hands_the_requested_env_to_the_backend() {
+        use std::sync::{Arc, Mutex};
+        let specs: Arc<Mutex<Vec<AppSpec>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with(FakePlatform::new(10, 10).with_spec_log(specs.clone()));
+        let mut a = start_args();
+        a.env.insert("GDK_BACKEND".into(), "wayland".into());
+        start(&mut g, &a).unwrap();
+        assert_eq!(
+            specs.lock().unwrap()[0].env,
+            vec![("GDK_BACKEND".to_string(), "wayland".to_string())]
+        );
     }
 
     #[test]

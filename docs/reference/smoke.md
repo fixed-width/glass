@@ -26,9 +26,10 @@ probes it in order and takes the first one runnable on `PATH`, recording the cho
 | `x11` | `xed`, `gnome-text-editor`, `zenity`, `xterm` |
 | `wayland` | `xed`, `gnome-text-editor`, `zenity` |
 
-A wayland run launches its target with `GDK_BACKEND=wayland`, so the app runs as a native Wayland
-client and the run's verdict describes the native path. `xterm` is an X11-only client, which under
-the Wayland backend would reach the screen through Xwayland, so it is not a wayland candidate.
+A wayland run launches its target with `GDK_BACKEND=wayland`, so a toolkit that cannot use the
+Wayland backend fails the launch rather than falling back to Xwayland. `xterm` is an X11-only
+client, which under the Wayland backend would reach the screen through Xwayland, so it is not a
+wayland candidate.
 
 ## Checks
 
