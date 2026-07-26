@@ -149,14 +149,18 @@ impl SmokeReport {
         use std::fmt::Write;
         let mut out = String::new();
         let verdict = self.verdict();
+        // Every interpolated value goes through `cell`, not only the ones that need it today.
+        // `version` is the one that can actually carry a `|` — it is `git describe` output on a
+        // real run, and a tag holding a pipe would shift the header while a newline would end
+        // the document. `backend` is a canonical literal and `app`'s `Display` yields a label
+        // or a fixed string, so neither needs it now; both are escaped anyway, because the
+        // reason the app field fell outside this hardening once was that it started safe and
+        // *became* error-derived later.
         let _ = writeln!(
             out,
             "# glass smoke — {} — {verdict}\n\nglass-mcp {} · app: `{}`\n",
-            self.backend,
-            self.version,
-            // `Display` yields a candidate label or a fixed literal, so this cannot currently
-            // break the table — routed through `cell` anyway, because the reason the app field
-            // fell outside this hardening once was that it *became* error-derived later.
+            cell(&self.backend),
+            cell(&self.version),
             cell(&self.app.to_string())
         );
         let _ = writeln!(out, "| # | check | status | detail |");
@@ -323,15 +327,36 @@ mod tests {
         );
     }
 
-    /// The header must survive the same text the `detail` cells are hardened against: this
-    /// field is error-derived now, which is exactly how it slipped outside that hardening.
+    /// The header must survive the same text the `detail` cells are hardened against. `version`
+    /// is the value that can genuinely carry a `|` — it is `git describe` output on a real run —
+    /// and `app` is the one that became error-derived after the cells were hardened.
     #[test]
-    fn a_newline_in_the_app_note_cannot_reach_the_header() {
-        let mut r = report(vec![CheckOutcome::pass(1, "version", "1.1.0")]);
-        r.app = TargetApp::Selected("we\nird | app".into());
-        let md = r.to_markdown();
-        let header = md.lines().nth(2).expect("the subtitle line");
-        assert!(header.contains("we ird \\| app"), "got: {header}");
+    fn a_pipe_or_newline_in_a_header_value_cannot_break_the_report() {
+        const HOSTILE: &str = "we\nird | value";
+        let row = || vec![CheckOutcome::pass(1, "version", "1.1.0")];
+        // What the report looks like with nothing hostile in it. Deriving the expected line
+        // count beats writing one down: it stays right as the header gains or loses lines.
+        let clean = report(row()).to_markdown().lines().count();
+
+        let mut with_app = report(row());
+        with_app.app = TargetApp::Selected(HOSTILE.into());
+        let mut with_version = report(row());
+        with_version.version = HOSTILE.into();
+        let mut with_backend = report(row());
+        with_backend.backend = HOSTILE.into();
+
+        for r in [with_app, with_version, with_backend] {
+            let md = r.to_markdown();
+            assert_eq!(
+                md.lines().count(),
+                clean,
+                "an unescaped newline added a line to the report: {md}"
+            );
+            assert!(
+                md.contains("we ird \\| value"),
+                "the value must be escaped in place: {md}"
+            );
+        }
     }
 
     /// A consumer must be able to tell a selected app from a remedy without reading the text.

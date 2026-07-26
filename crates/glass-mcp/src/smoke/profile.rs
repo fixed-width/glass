@@ -367,9 +367,17 @@ mod tests {
 
     #[test]
     fn an_unset_path_says_to_set_it_rather_than_to_install_more() {
-        let msg = NoTargetApp::NoSearchPath.blocking_error(&X11_CANDIDATES);
-        assert!(msg.contains("PATH is unset"), "must name the cause: {msg}");
-        assert!(msg.contains("set PATH"), "must name the remedy: {msg}");
+        for msg in [
+            NoTargetApp::NoSearchPath.blocking_error(&X11_CANDIDATES),
+            NoTargetApp::NoSearchPath.plan_note(&X11_CANDIDATES),
+        ] {
+            assert!(msg.contains("PATH is unset"), "must name the cause: {msg}");
+            assert!(msg.contains("set PATH"), "must name the remedy: {msg}");
+            assert!(
+                !msg.contains("install"),
+                "installing an app cannot fix an unset PATH, so it must not be the advice: {msg}"
+            );
+        }
     }
 
     #[test]
