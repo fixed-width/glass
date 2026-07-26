@@ -26,11 +26,23 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
-fn candidates_for(backend: &str) -> Result<&'static [Candidate], String> {
-    match backend {
-        "x11" => Ok(&X11_CANDIDATES),
+/// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
+/// backend-recognition predicate — and return the canonical name alongside its candidate
+/// apps. Keying the table off what that returns, rather than matching a literal here, is
+/// what stops `smoke --backend X11` being rejected while `GLASS_BACKEND=X11` is honoured
+/// everywhere else in the binary.
+fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]), String> {
+    let Some(name) = crate::recognized_backend(backend) else {
+        return Err(format!(
+            "unknown backend {backend:?} — glass knows: {}. The smoke runner drives: x11.",
+            crate::BACKENDS.join(", ")
+        ));
+    };
+    match name {
+        "x11" => Ok((name, &X11_CANDIDATES)),
         other => Err(format!(
-            "unknown backend {other:?} — this build supports: x11. Pass --backend x11."
+            "no smoke candidates for backend {other:?} yet — this build drives: x11. \
+             Pass --backend x11."
         )),
     }
 }
@@ -50,6 +62,21 @@ const CHECK_NAMES: [(u8, &str); 8] = [
     (9, "error honesty"),
 ];
 
+/// The last check, run after every other one whatever they reported.
+const STOP_CHECK: (u8, &str) = (10, "stop");
+
+/// Every check name a report can carry. The known-limits ledger is validated against this,
+/// so an entry naming a check that does not exist fails a test rather than silently never
+/// matching and hard-failing a release over an accepted limitation.
+#[cfg(test)]
+pub(crate) fn all_check_names() -> Vec<&'static str> {
+    CHECK_NAMES
+        .iter()
+        .map(|(_, name)| *name)
+        .chain(std::iter::once(STOP_CHECK.1))
+        .collect()
+}
+
 /// Check 1. Runs [`checks::check_version`] when `--expect-version` was given; otherwise records
 /// a `Skip` rather than omitting the check, so a real run's rows match `--dry-run`'s preview
 /// (which always previews all nine, `version` included) instead of the row count depending on
@@ -62,20 +89,19 @@ fn version_check(t: &mut dyn McpTransport, expect_version: Option<&str>) -> Chec
 }
 
 pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
-    let candidates = candidates_for(&opts.backend)?;
+    let (backend, candidates) = candidates_for(&opts.backend)?;
     let app = match &opts.app {
         Some(name) => candidates.iter().find(|c| c.label == name).ok_or_else(|| {
             let names: Vec<&str> = candidates.iter().map(|c| c.label).collect();
             format!(
-                "unknown app {name:?} for {} — use one of: {}",
-                opts.backend,
+                "unknown app {name:?} for {backend} — use one of: {}",
                 names.join(", ")
             )
         })?,
         None => profile::resolve_app(candidates, &profile::on_path)?,
     };
     let p = Profile {
-        backend: opts.backend.clone(),
+        backend: backend.to_string(),
         app,
     };
 
@@ -84,9 +110,9 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
             .iter()
             .map(|(step, name)| CheckOutcome::skip(*step, name, "dry run"))
             .collect();
-        checks.push(CheckOutcome::skip(10, "stop", "dry run"));
+        checks.push(CheckOutcome::skip(STOP_CHECK.0, STOP_CHECK.1, "dry run"));
         return Ok(SmokeReport {
-            backend: opts.backend,
+            backend: p.backend,
             version: crate::VERSION.to_string(),
             app: app.label.to_string(),
             checks,
@@ -94,27 +120,30 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
     }
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
-    let mut t = client::StdioClient::spawn(&exe, &[])?;
+    // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
+    // takes no backend argument — its verdict grades whatever that resolution produced. So
+    // hand it the backend under test rather than inheriting whatever the caller's shell has
+    // set, or check 3 would grade a backend this run is not exercising. `check_health`
+    // re-reads the server's active backend and fails on a mismatch, so this plumbing breaking
+    // is a visible failure rather than a silently misdirected verdict.
+    let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", backend)])?;
     let version = t.server_version()?;
     let mut out = vec![
         version_check(&mut t, opts.expect_version.as_deref()),
         checks::check_start(&mut t, &p),
-        checks::check_health(&mut t),
+        checks::check_health(&mut t, &p),
         checks::check_screenshot(&mut t),
     ];
     let (a11y, nodes) = checks::check_a11y(&mut t);
     out.push(a11y);
-    out.push(checks::check_interaction(&mut t, &nodes));
+    out.push(checks::check_interaction(&mut t, nodes.as_deref()));
     out.push(checks::check_logs(&mut t));
     out.push(checks::check_error_honesty(&mut t));
     out.push(checks::check_stop(&mut t));
 
-    let checks = out
-        .into_iter()
-        .map(|c| ledger::apply(&opts.backend, c))
-        .collect();
+    let checks = out.into_iter().map(|c| ledger::apply(backend, c)).collect();
     Ok(SmokeReport {
-        backend: opts.backend,
+        backend: p.backend,
         version,
         app: app.label.to_string(),
         checks,
@@ -141,12 +170,11 @@ mod tests {
 
     #[test]
     fn expect_version_some_reaches_check_version_pass_and_fail() {
-        // ScriptedTransport::server_version() always reports "0.0.0-scripted" — see transport.rs.
-        let mut t = ScriptedTransport::new(vec![]);
-        let pass = version_check(&mut t, Some("0.0.0-scripted"));
+        let mut t = ScriptedTransport::new(vec![]).with_version("1.1.0");
+        let pass = version_check(&mut t, Some("1.1.0"));
         assert_eq!(pass.status, CheckStatus::Pass);
 
-        let mut t = ScriptedTransport::new(vec![]);
+        let mut t = ScriptedTransport::new(vec![]).with_version("1.0.0");
         let fail = version_check(&mut t, Some("1.1.0"));
         assert_eq!(fail.status, CheckStatus::Fail);
         assert!(fail.detail.contains("1.1.0"), "got: {}", fail.detail);
@@ -179,6 +207,39 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("beos") && err.contains("x11"), "got: {err}");
+    }
+
+    #[test]
+    fn a_backend_name_is_recognized_the_same_way_the_rest_of_the_binary_recognizes_it() {
+        // `recognized_backend` is case-insensitive, so `GLASS_BACKEND=X11` is honoured
+        // everywhere else; a second, stricter recognition site here would reject the same
+        // spelling the binary otherwise accepts.
+        let r = run(SmokeOptions {
+            backend: "X11".into(),
+            app: None,
+            expect_version: None,
+            dry_run: true,
+        })
+        .expect("X11 must resolve the same way GLASS_BACKEND=X11 does");
+        assert_eq!(
+            r.backend, "x11",
+            "the report must record the canonical name, not the spelling passed in"
+        );
+    }
+
+    #[test]
+    fn a_backend_glass_knows_but_smoke_cannot_drive_yet_says_so() {
+        let err = run(SmokeOptions {
+            backend: "wayland".into(),
+            app: None,
+            expect_version: None,
+            dry_run: true,
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("wayland") && err.contains("x11"),
+            "must name the backend asked for and what is drivable: {err}"
+        );
     }
 
     #[test]

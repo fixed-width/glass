@@ -22,6 +22,19 @@ pub trait McpTransport {
 }
 
 impl CallResult {
+    /// A successful call carrying glass's `{ok,tool,result}` envelope. The one place that
+    /// shape is built for a double — the checks' tests, `--self-check`'s fault injection and
+    /// the envelope tests all go through here, so a change to the frozen envelope shape can't
+    /// be honoured by one caller and missed by another.
+    pub fn ok(tool: &str, result: Value, siblings: &[&str], images: usize) -> Self {
+        Self {
+            is_error: false,
+            envelope: Some(serde_json::json!({ "ok": true, "tool": tool, "result": result })),
+            siblings: siblings.iter().copied().map(String::from).collect(),
+            images,
+        }
+    }
+
     /// Parse the `result` object of a `tools/call` response.
     pub fn from_mcp(raw: &Value) -> Self {
         let is_error = raw["isError"].as_bool().unwrap_or(false);
@@ -73,10 +86,23 @@ impl ScriptedTransport {
                 .into_iter()
                 .map(|(t, r)| (t.to_string(), r))
                 .collect(),
-            version: "0.0.0-scripted".into(),
+            version: DEFAULT_SCRIPTED_VERSION.into(),
         }
     }
+
+    /// Report `version` from [`McpTransport::server_version`] instead of the default, so a
+    /// test that cares about the version says which one it means rather than restating
+    /// this module's placeholder.
+    #[must_use]
+    pub fn with_version(mut self, version: &str) -> Self {
+        self.version = version.to_string();
+        self
+    }
 }
+
+/// What [`ScriptedTransport`] reports as the server version unless
+/// [`ScriptedTransport::with_version`] says otherwise.
+pub const DEFAULT_SCRIPTED_VERSION: &str = "0.0.0-scripted";
 
 impl McpTransport for ScriptedTransport {
     fn call(&mut self, tool: &str, _args: Value) -> Result<CallResult, String> {

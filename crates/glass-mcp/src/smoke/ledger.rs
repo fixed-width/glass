@@ -59,6 +59,60 @@ mod tests {
         reason: "single contact only",
     }];
 
+    /// An entry only ever does anything if both its names match exactly what the run
+    /// produces — [`apply_with`] compares them with `==`. A typo therefore does not fail
+    /// loudly, it just never matches: the limitation everyone believes is accepted hard-fails
+    /// the release instead.
+    fn validate(ledger: &[LedgerEntry]) -> Result<(), String> {
+        let names = crate::smoke::all_check_names();
+        for e in ledger {
+            if crate::recognized_backend(e.backend).is_none() {
+                return Err(format!("{:?} is not a backend glass knows", e.backend));
+            }
+            if !names.contains(&e.check) {
+                return Err(format!(
+                    "{:?} is not a check name — the checks are: {}",
+                    e.check,
+                    names.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_shipped_limit_names_a_real_backend_and_a_real_check() {
+        validate(KNOWN_LIMITS).expect("the shipped ledger must be reachable");
+    }
+
+    #[test]
+    fn a_limit_naming_a_check_that_does_not_exist_is_rejected() {
+        // The shipped ledger is empty today, so the test above passes vacuously; this one
+        // proves the validation would actually catch the plausible typo — `"a11y"` for the
+        // real `"a11y snapshot"` — rather than pass on anything.
+        let err = validate(&[LedgerEntry {
+            backend: "x11",
+            check: "a11y",
+            reason: "…",
+        }])
+        .unwrap_err();
+        assert!(
+            err.contains("a11y snapshot"),
+            "must name the real ones: {err}"
+        );
+    }
+
+    #[test]
+    fn a_limit_naming_a_backend_glass_does_not_know_is_rejected() {
+        let err = validate(&[LedgerEntry {
+            backend: "beos",
+            check: "stop",
+            reason: "…",
+        }])
+        .unwrap_err();
+        assert!(err.contains("beos"), "got: {err}");
+    }
+
     #[test]
     fn a_listed_failure_becomes_xfail_and_keeps_the_reason() {
         let out = apply_with(

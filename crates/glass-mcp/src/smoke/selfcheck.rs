@@ -10,7 +10,7 @@ use crate::smoke::checks;
 use crate::smoke::profile::OutlineNode;
 use crate::smoke::report::{CheckOutcome, CheckStatus};
 use crate::smoke::transport::{CallResult, ScriptedTransport};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// One fault-injection scenario: the outcome a check produced against a deliberately wrong
 /// response, and a `detail` substring unique to the assertion it targets. `status` alone
@@ -28,6 +28,19 @@ impl Scenario {
     fn caught(&self) -> bool {
         self.outcome.status == CheckStatus::Fail && self.outcome.detail.contains(self.expect_detail)
     }
+
+    /// `contains("")` is always true, so an empty `expect_detail` would silently revert a
+    /// scenario to the status-only check this module exists to argue against — and it would
+    /// still report as caught.
+    fn names_an_assertion(&self) -> Result<(), String> {
+        if self.expect_detail.is_empty() {
+            return Err(format!(
+                "scenario {:?} has an empty expect_detail, which matches any failure",
+                self.name
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Faults, and the check that must catch each one — for the reason each is named after.
@@ -39,6 +52,9 @@ pub fn run_self_check() -> Result<String, String> {
         remedyless_error_scenario(),
     ];
 
+    for s in &scenarios {
+        s.names_an_assertion()?;
+    }
     let escaped: Vec<&str> = scenarios
         .iter()
         .filter(|s| !s.caught())
@@ -48,15 +64,6 @@ pub fn run_self_check() -> Result<String, String> {
         Ok(format!("{} injected faults, all caught", scenarios.len()))
     } else {
         Err(format!("faults not caught: {}", escaped.join("; ")))
-    }
-}
-
-fn ok_call(tool: &str, result: Value, siblings: Vec<&str>, images: usize) -> CallResult {
-    CallResult {
-        is_error: false,
-        envelope: Some(json!({ "ok": true, "tool": tool, "result": result })),
-        siblings: siblings.into_iter().map(String::from).collect(),
-        images,
     }
 }
 
@@ -87,7 +94,7 @@ fn mutated_envelope_scenario() -> Scenario {
 
 /// Scenario 2, app text inside `result`, *alongside* a genuinely valid untrusted sibling with
 /// parseable outline content. The sibling must be real: if it were empty, deleting
-/// `check_envelope`'s A1 rule (untrusted markers must never appear inside `result`) would
+/// `check_envelope`'s rule that untrusted markers must never appear inside `result` would
 /// still leave `check_a11y` failing — via `untrusted_sibling`'s missing-marker error — for
 /// an unrelated reason, so removing the assertion under test would go undetected. With a
 /// valid sibling present, deleting that rule lets `check_a11y` fall through to it, parse a
@@ -116,11 +123,12 @@ fn untrusted_text_in_result_scenario() -> Scenario {
 
 /// Scenario 3: `glass_set_value` reports ok, but `glass_wait_for_element` — the consumer-layer
 /// signal `check_interaction` actually verifies against — never confirms the write
-/// (`matched: false`). The pixel-path calls (`glass_click`, `glass_key`) are scripted too,
-/// and the `wait_for_element` response carries no sibling (so `matched_element_id` reads
-/// `None`, not a mismatch): if `check_interaction`'s `matched` guard were deleted, execution
-/// would fall through those two scripted calls to a genuine `Pass`, rather than hitting
-/// `ScriptedTransport`'s exhausted-queue error and going red for an unrelated reason.
+/// (`matched: false`). The calls after it (the pixel path, then the liveness re-read) are
+/// scripted too, and the `wait_for_element` response carries no sibling (so
+/// `matched_element_id` reads `None`, not a mismatch): if `check_interaction`'s `matched`
+/// guard were deleted, execution would fall through those scripted calls to a genuine `Pass`,
+/// rather than hitting `ScriptedTransport`'s exhausted-queue error and going red for an
+/// unrelated reason.
 fn noop_interaction_scenario() -> Scenario {
     let nodes = [OutlineNode {
         id: 12,
@@ -131,26 +139,43 @@ fn noop_interaction_scenario() -> Scenario {
     let mut t = ScriptedTransport::new(vec![
         (
             "glass_set_value",
-            Ok(ok_call("glass_set_value", json!({ "id": 12 }), vec![], 0)),
+            Ok(CallResult::ok(
+                "glass_set_value",
+                json!({ "id": 12 }),
+                &[],
+                0,
+            )),
         ),
         (
             "glass_wait_for_element",
-            Ok(ok_call(
+            Ok(CallResult::ok(
                 "glass_wait_for_element",
                 json!({ "matched": false, "elapsed_ms": 5000 }),
-                vec![],
+                &[],
                 0,
             )),
         ),
         (
             "glass_click",
-            Ok(ok_call("glass_click", json!({}), vec![], 0)),
+            Ok(CallResult::ok("glass_click", json!({}), &[], 0)),
         ),
-        ("glass_key", Ok(ok_call("glass_key", json!({}), vec![], 0))),
+        (
+            "glass_key",
+            Ok(CallResult::ok("glass_key", json!({}), &[], 0)),
+        ),
+        (
+            "glass_list_windows",
+            Ok(CallResult::ok(
+                "glass_list_windows",
+                json!({ "count": 1 }),
+                &[],
+                0,
+            )),
+        ),
     ]);
     Scenario {
         name: "no-op interaction reported ok",
-        outcome: checks::check_interaction(&mut t, &nodes),
+        outcome: checks::check_interaction(&mut t, Some(&nodes)),
         expect_detail: "no element reported the written value",
     }
 }
@@ -183,5 +208,20 @@ mod tests {
     #[test]
     fn every_injected_fault_is_caught() {
         run_self_check().expect("a fault slipped through");
+    }
+
+    #[test]
+    fn an_empty_expect_detail_is_rejected_rather_than_matching_anything() {
+        let s = Scenario {
+            name: "unnamed assertion",
+            outcome: CheckOutcome::fail(1, "version", "any failure at all"),
+            expect_detail: "",
+        };
+        assert!(
+            s.caught(),
+            "an empty substring matches anything — which is exactly why it must be rejected"
+        );
+        let err = s.names_an_assertion().unwrap_err();
+        assert!(err.contains("unnamed assertion"), "got: {err}");
     }
 }

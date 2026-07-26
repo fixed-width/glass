@@ -23,8 +23,10 @@ pub const X11_CANDIDATES: [Candidate; 4] = [
         label: "gnome-text-editor",
     },
     Candidate {
+        // The prompt text must not look like anything the interaction check writes: a label
+        // the runner could also have typed makes `value_contains` ambiguous evidence.
         bin: "zenity",
-        args: &["--entry", "--text=glass smoke"],
+        args: &["--entry", "--text=type in this box"],
         label: "zenity",
     },
     Candidate {

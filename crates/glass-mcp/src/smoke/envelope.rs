@@ -68,25 +68,52 @@ pub fn untrusted_sibling(r: &CallResult) -> Result<&str, String> {
 /// shim's `glass_clip_hook.dll`) — see the regression tests below. Matching the exact
 /// registered names avoids that false positive and stays correct as tools are added or
 /// renamed, so resist simplifying this back to `contains("glass_")`.
+/// Every pointer is matched as a run of WHOLE words, never as a raw substring: `"use"` sits
+/// inside `because`, `"try"` inside `geometry` and `registry`, `"set"` inside `offset`, so a
+/// substring match scored a cause-only message like "at-spi registry not running" actionable.
 pub fn names_a_remedy(msg: &str) -> bool {
     const POINTERS: [&str; 9] = [
-        "call ",
-        "pass ",
-        "use ",
+        "call",
+        "pass",
+        "use",
         "re-run",
         "relaunch",
         "retry",
-        "set ",
-        "try ",
+        "set",
+        "try",
         "re-snapshot",
     ];
-    let lower = msg.to_lowercase();
+    let words = words(msg);
     let tools = crate::server::registered_tools();
     POINTERS
         .iter()
         .copied()
         .chain(tools.iter().map(String::as_str))
-        .any(|pointer| lower.contains(pointer))
+        .any(|pointer| contains_phrase(&words, pointer))
+}
+
+/// Alphanumeric word runs: `-` and `_` separate, so `re-snapshot` and `glass_click_element`
+/// each tokenize into their parts and are matched as consecutive words by
+/// [`contains_phrase`]. Same tokenizer, and same reason, as the doc-lint in `server.rs`
+/// (`names_windows_backend`), which was written to stop `windows` matching inside
+/// `reposition windows`.
+fn words(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Do `phrase`'s words appear as a consecutive run in `words`, case-insensitively?
+fn contains_phrase(words: &[&str], phrase: &str) -> bool {
+    let needle: Vec<&str> = self::words(phrase);
+    if needle.is_empty() {
+        return false;
+    }
+    words.windows(needle.len()).any(|run| {
+        run.iter()
+            .zip(&needle)
+            .all(|(w, n)| w.eq_ignore_ascii_case(n))
+    })
 }
 
 #[cfg(test)]
@@ -94,18 +121,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn ok_call(tool: &str, result: Value, siblings: Vec<&str>) -> CallResult {
-        CallResult {
-            is_error: false,
-            envelope: Some(json!({ "ok": true, "tool": tool, "result": result })),
-            siblings: siblings.into_iter().map(String::from).collect(),
-            images: 0,
-        }
+    fn ok_call(tool: &str, result: Value, siblings: &[&str]) -> CallResult {
+        CallResult::ok(tool, result, siblings, 0)
     }
 
     #[test]
     fn a_well_formed_envelope_yields_its_result() {
-        let c = ok_call("glass_start", json!({ "width": 800 }), vec![]);
+        let c = ok_call("glass_start", json!({ "width": 800 }), &[]);
         let result = check_envelope("glass_start", &c).unwrap();
         assert_eq!(result["width"], json!(800));
     }
@@ -124,7 +146,7 @@ mod tests {
 
     #[test]
     fn a_mismatched_tool_name_is_rejected() {
-        let c = ok_call("glass_stop", json!({}), vec![]);
+        let c = ok_call("glass_stop", json!({}), &[]);
         let err = check_envelope("glass_start", &c).unwrap_err();
         assert!(
             err.contains("glass_start") && err.contains("glass_stop"),
@@ -157,11 +179,11 @@ mod tests {
 
     #[test]
     fn untrusted_app_text_inside_result_is_rejected() {
-        // The A1 rule: app-controlled text is a sibling block, never inside `result`.
+        // App-controlled text is a sibling block, never inside `result`.
         let c = ok_call(
             "glass_a11y_snapshot",
             json!({ "outline": "⟦untrusted:abc⟧ #1 Button ⟦/untrusted:abc⟧" }),
-            vec![],
+            &[],
         );
         let err = check_envelope("glass_a11y_snapshot", &c).unwrap_err();
         assert!(err.contains("result"), "must say where it found it: {err}");
@@ -172,10 +194,10 @@ mod tests {
         let with = ok_call(
             "glass_a11y_snapshot",
             json!({}),
-            vec!["⟦untrusted:abc⟧ body ⟦/untrusted:abc⟧"],
+            &["⟦untrusted:abc⟧ body ⟦/untrusted:abc⟧"],
         );
         assert!(untrusted_sibling(&with).is_ok());
-        let without = ok_call("glass_a11y_snapshot", json!({}), vec!["plain text"]);
+        let without = ok_call("glass_a11y_snapshot", json!({}), &["plain text"]);
         assert!(untrusted_sibling(&without).is_err());
     }
 
@@ -184,6 +206,34 @@ mod tests {
         assert!(!names_a_remedy("no clickable on-screen geometry"));
         assert!(names_a_remedy("no active session — call glass_start first"));
         assert!(names_a_remedy("not a boolean; pass \"true\" or \"false\""));
+    }
+
+    /// `"try "` sits inside `geometry` and `registry`, `"use "` inside `because`, `"set "`
+    /// inside `offset` — every one of these is a cause-only message that a substring match
+    /// scored actionable. The canonical `no clickable on-screen geometry` case above only
+    /// still failed because nothing happened to follow the word.
+    #[test]
+    fn a_pointer_verb_hiding_inside_a_longer_word_is_not_a_remedy() {
+        for msg in [
+            "at-spi registry not running",
+            "the element has no on-screen geometry to click",
+            "the snapshot is stale because the window changed",
+            "the frame arrived at a negative offset",
+            "the entry is not focusable",
+        ] {
+            assert!(!names_a_remedy(msg), "should not be actionable: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_pointer_verb_as_a_whole_word_is_still_a_remedy() {
+        for msg in [
+            "unknown mode; use \"exact\" or \"perceptual\"",
+            "Try a shorter timeout",
+            "set GLASS_BACKEND to a supported backend",
+        ] {
+            assert!(names_a_remedy(msg), "should be actionable: {msg}");
+        }
     }
 
     /// Regression for the x11 end-to-end run (`tests/smoke_x11.rs`): `glass_click_element`
