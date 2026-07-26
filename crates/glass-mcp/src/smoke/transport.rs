@@ -71,9 +71,11 @@ impl CallResult {
     }
 }
 
-/// Replays a fixed script. Used by the unit tests and by `--self-check`.
+/// Replays a fixed script and records what it was called with. Used by the unit tests and by
+/// `--self-check`.
 pub struct ScriptedTransport {
     queue: std::collections::VecDeque<(String, Result<CallResult, String>)>,
+    calls: Vec<(String, Value)>,
 }
 
 impl ScriptedTransport {
@@ -83,12 +85,25 @@ impl ScriptedTransport {
                 .into_iter()
                 .map(|(t, r)| (t.to_string(), r))
                 .collect(),
+            calls: Vec::new(),
         }
+    }
+
+    /// Every `(tool, args)` this double was called with, in order, including calls the script
+    /// rejected.
+    pub fn calls(&self) -> &[(String, Value)] {
+        &self.calls
+    }
+
+    /// The arguments of the first call to `tool`.
+    pub fn args_for(&self, tool: &str) -> Option<&Value> {
+        self.calls.iter().find(|(t, _)| t == tool).map(|(_, a)| a)
     }
 }
 
 impl McpTransport for ScriptedTransport {
-    fn call(&mut self, tool: &str, _args: Value) -> Result<CallResult, String> {
+    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        self.calls.push((tool.to_string(), args));
         match self.queue.pop_front() {
             None => Err(format!("script exhausted; unexpected call to {tool}")),
             Some((expected, r)) if expected == tool => r,
@@ -169,5 +184,26 @@ mod tests {
         );
         assert_eq!(r.siblings, vec!["sibling text".to_string()]);
         assert_eq!(r.images, 1);
+    }
+
+    #[test]
+    fn scripted_transport_records_the_arguments_of_every_call() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Ok(CallResult::default()))]);
+        let _ = t.call(
+            "glass_start",
+            json!({ "run": ["xed"], "env": { "GDK_BACKEND": "wayland" } }),
+        );
+        let args = t.args_for("glass_start").expect("glass_start was called");
+        assert_eq!(args["env"]["GDK_BACKEND"], json!("wayland"));
+    }
+
+    /// A call the script rejects is still a call the code made: recording only accepted calls
+    /// would leave a test unable to tell a wrong payload from no payload at all.
+    #[test]
+    fn a_rejected_call_is_still_recorded() {
+        let mut t = ScriptedTransport::new(vec![("glass_stop", Ok(CallResult::default()))]);
+        let _ = t.call("glass_screenshot", json!({ "scale": 1 }));
+        assert_eq!(t.calls().len(), 1);
+        assert_eq!(t.calls()[0].0, "glass_screenshot");
     }
 }
