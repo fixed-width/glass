@@ -452,8 +452,10 @@ mod tests {
         assert_eq!(resolved, wayland);
     }
 
+    /// What a Wayland user with nothing installed is told. A `start` row built from the x11 table
+    /// would send them to install `xterm`, which cannot drive a Wayland session.
     #[test]
-    fn a_wayland_plan_previews_the_same_rows_as_x11() {
+    fn a_wayland_plan_previews_the_same_rows_and_names_the_wayland_candidates() {
         let (_dir, path) = host_with(&[]);
         let r = run_with(
             SmokeOptions {
@@ -466,6 +468,44 @@ mod tests {
         .expect("wayland must be drivable");
         assert_eq!(rows(&r), CANONICAL_ROWS.to_vec());
         assert_eq!(r.backend, "wayland");
+        let start = detail_of(&r, "start");
+        assert!(
+            start.contains("install") && start.contains("zenity"),
+            "the start row must name what to install: {start}"
+        );
+        assert!(
+            !start.contains("xterm"),
+            "an X11-only client is not something to install for wayland: {start}"
+        );
+    }
+
+    /// `--app` resolves against the backend under test, not x11's table: `xterm` is a valid x11
+    /// candidate, so resolving it there would readmit through `--app` the client the wayland
+    /// table exists to exclude.
+    #[test]
+    fn an_explicit_app_override_resolves_against_the_backend_under_test() {
+        let (_dir, path) = host_with(&[]);
+        let err = run_with(
+            SmokeOptions {
+                backend: "wayland".into(),
+                app: Some("xterm".into()),
+                dry_run: true,
+            },
+            Some(&path),
+        )
+        .unwrap_err();
+        assert!(err.contains("xterm"), "must name the app asked for: {err}");
+        // Scoped to the offer, because the rejected name is `xterm` too.
+        let (_, offered) = err
+            .split_once("use one of: ")
+            .unwrap_or_else(|| panic!("must offer the backend's candidates: {err}"));
+        assert!(
+            !offered.contains("xterm"),
+            "the wayland offer must not include an X11-only client: {err}"
+        );
+        for c in &WAYLAND_CANDIDATES {
+            assert!(offered.contains(c.label), "must offer {}: {err}", c.label);
+        }
     }
 
     /// `recognized_backend` is case-insensitive; a second, stricter recognition site here would
