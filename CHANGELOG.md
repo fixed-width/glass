@@ -109,6 +109,11 @@ internal refactors, CI, or test-only changes.
   attempting the spawn. Your own app is unaffected: only Apple-signed system code takes the new
   path, and only when `sandbox` is `off` (a contained launch cannot be handed off at all, so it
   still tries — Terminal and Disk Utility, for instance, do run contained).
+- A Wayland session whose compositor stops responding no longer hangs glass. Every sway IPC
+  request is bounded, and a connection that has timed out is not reused — a late reply arriving
+  on it could otherwise be read as the *next* request's, reporting a close request as delivered
+  when it never was. `glass_stop` reports the compositor as unreachable and falls back to
+  signalling the app.
 - `glass_stop` now asks the app to close before killing it on every desktop backend, so the app
   runs its own shutdown path. All four previously went straight to terminating the process —
   Windows by closing the job object, macOS by signalling, X11 and Wayland by signalling the

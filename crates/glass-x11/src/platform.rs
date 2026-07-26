@@ -303,6 +303,12 @@ impl X11Platform {
     /// that does not has no handler for the message and will not act on it, so counting it
     /// would make teardown wait out the whole grace for a shutdown nobody was asked to perform.
     ///
+    /// Every step here is a blocking X round trip, and x11rb has no per-request timeout: an X
+    /// server that is alive but not answering stalls teardown for as long as it stays that way.
+    /// That is true of every X call glass makes (capture and input included), not something this
+    /// path introduces a way around — bounding it needs a cancellable X path, not a socket
+    /// timeout, which would desynchronize the protocol stream on a spurious trip.
+    ///
     /// The set is the launched process tree's, never the window-hint's. A hint can match a
     /// window belonging to some *other* process — that is the point of the fallback, and it is
     /// safe for discovery, which only reads — but closing one would destroy the state of an app
