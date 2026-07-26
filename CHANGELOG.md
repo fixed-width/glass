@@ -38,6 +38,10 @@ internal refactors, CI, or test-only changes.
   hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
   Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
+- `glass_doctor` now returns structured data alongside its rendered `report` text: `sections`
+  (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
+  diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
+  of parsing prose. Purely additive: `report` is unchanged.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.

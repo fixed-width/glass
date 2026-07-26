@@ -597,7 +597,15 @@ it to self-diagnose a `glass_start` failure.
 **Platform notes:** on Linux the checks cover the headless display servers (Xvfb for x11, sway for
 wayland) and software GL; the report names exactly the checks it ran for the selected backend.
 
-Returns `{report}` — the human-readable diagnostic text above, as a single string.
+Returns `{report, sections, overall}`. `report` is the human-readable diagnostic text above, as a
+single string. `sections` is the same checks, structured: each is `{title, backend, checks}`, where
+`backend` names the backend the section diagnoses (`"x11"`, `"wayland"`, …) or is absent for general
+checks, and each entry in `checks` is `{name, status, detail, remedy?, remedy_action?}` — `status`
+one of `"ok"`/`"warn"`/`"fail"`/`"skip"`, with `remedy` (human text) and `remedy_action` (a
+command/URL a tool can run) present only on a check that isn't `"ok"`. `overall` is the single
+verdict to branch on — one of `"ok"`/`"warn"`/`"fail"` — and already applies the same severity rule
+as the rendered summary, so a failing check in a section for a backend other than the one in use
+counts only as a warning: a non-default backend's problem never reads as `overall: "fail"`.
 
 Mirrors the `glass-mcp doctor` CLI — see [reference/cli.md](cli.md).
 

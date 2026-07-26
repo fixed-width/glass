@@ -58,6 +58,19 @@ fn map_tool_result(result: ToolResult) -> CallToolResult {
     }
 }
 
+/// The `glass_doctor` result payload: the rendered report humans and existing
+/// consumers read, plus the same data structured — `sections` and the `overall`
+/// verdict — so an agent can branch on status without parsing prose. Kept pure
+/// (no async / no probing) so the shape is unit-testable against a hand-built
+/// `Diagnosis`, independent of what this host's real checks report.
+fn doctor_result(diag: &glass_core::Diagnosis, backend: &str) -> serde_json::Value {
+    serde_json::json!({
+        "report": diag.render_text(backend),
+        "sections": diag.sections,
+        "overall": diag.overall(backend),
+    })
+}
+
 #[tool_router]
 impl GlassServer {
     pub fn new(glass: Glass, report: AuditReport) -> Self {
@@ -287,7 +300,12 @@ impl GlassServer {
         description = "Diagnose the glass environment and report per-check status + how to \
                        fix anything missing. Use this to self-diagnose a glass_start failure. \
                        Optional `deep`: also spin up and tear down the default backend's \
-                       headless display to verify it starts."
+                       headless display to verify it starts. Returns `report` (the rendered \
+                       text above) plus structured data: `sections` (each a `{title, backend, \
+                       checks: [{name, status, detail, remedy?, remedy_action?}]}`, `status` one \
+                       of `\"ok\"`/`\"warn\"`/`\"fail\"`/`\"skip\"`) and `overall` — the single \
+                       verdict to branch on, since it already downgrades a non-default backend's \
+                       failing check to a warning the way the rendered summary does."
     )]
     async fn glass_doctor(
         &self,
@@ -304,7 +322,7 @@ impl GlassServer {
                 .expect("doctor task panicked");
         Ok(to_call_result(ToolOutput::result(
             "glass_doctor",
-            serde_json::json!({ "report": diag.render_text(backend) }),
+            doctor_result(&diag, backend),
         )))
     }
 
@@ -711,6 +729,37 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| !s.is_empty()),
             "expected a non-empty result.report string, got {v}"
+        );
+    }
+
+    #[test]
+    fn doctor_result_carries_overall_and_the_section_check_structure() {
+        use glass_core::{Check, CheckStatus, Diagnosis, Section};
+
+        let diag = Diagnosis::new(vec![Section::new(
+            "x11",
+            Some("x11".into()),
+            vec![
+                Check::new("Xvfb", CheckStatus::Fail, "not found").with_remedy("install it"),
+                Check::new("software GL", CheckStatus::Ok, "present"),
+            ],
+        )]);
+
+        let v = doctor_result(&diag, "x11");
+
+        // The single field a consumer should branch on: x11 is the queried backend, so its
+        // Fail is critical and the run-wide verdict is "fail" — a lowercase string, not the
+        // Rust-side `CheckStatus::Fail` debug spelling.
+        assert_eq!(v["overall"], "fail");
+        assert_eq!(
+            v["sections"][0]["checks"][0]["status"], "fail",
+            "a Fail check must survive serialization as the lowercase string: {v}"
+        );
+        assert_eq!(v["sections"][0]["checks"][0]["name"], "Xvfb");
+        assert_eq!(v["sections"][0]["checks"][1]["status"], "ok");
+        assert!(
+            v["report"].as_str().is_some_and(|s| s.contains("Xvfb")),
+            "report must still carry the rendered text: {v}"
         );
     }
 
