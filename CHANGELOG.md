@@ -100,6 +100,13 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- Linux (`backend: "x11"`): `glass_stop` no longer signals an app that should have been asked to
+  close. The close request went out on a short-lived X connection that was closed immediately
+  afterwards, and a request the server had not processed yet was discarded with it — so the app
+  never saw it, sat out the whole close grace, and was signalled, losing whatever it would have
+  flushed on exit. On a loaded machine 4 of 10 teardowns went that way, with the app's event loop
+  running the whole time. glass now waits for the server to confirm the request before the
+  connection can go away.
 - macOS: launching a stock Apple app no longer leaves a crash report and a "quit unexpectedly"
   dialog behind. glass direct-spawns a bundle's inner executable to get piped logs and
   containment, but macOS gives a system app a launch constraint requiring it to be started by

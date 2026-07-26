@@ -14,6 +14,7 @@ use x11rb::protocol::ErrorKind;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 // glass-mcp gives the whole of teardown `glass_core::TEARDOWN_BUDGET` and then exits regardless, on a
 // `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
@@ -358,11 +359,15 @@ impl X11Platform {
             .filter(|&win| self.accepts_delete(win, protocols, delete))
             .filter(|&win| self.send_delete(win, protocols, delete).is_ok())
             .count();
-        // x11rb buffers requests: they go out on `flush`, on a call that awaits a reply, or when
-        // the write buffer fills. The wait that follows makes no X calls at all, so without this
-        // flush the app might never receive the request inside the grace. A failed flush means
-        // nothing was delivered, whatever the count above says.
-        if let Err(e) = self.conn.flush() {
+        // Writing the request out is not enough: the ask runs on its own connection, which is
+        // dropped the moment this returns, and a request still unprocessed when its sender
+        // disconnects can be discarded — the app then waits out the whole grace for a message
+        // nobody will deliver, and is signalled instead of asked. Measured on a loaded machine:
+        // 4 of 10 teardowns lost the request that way, with the app's event loop demonstrably
+        // running throughout. `sync` sends everything buffered and waits for the server to
+        // answer a request queued behind it, so the close request has provably been processed
+        // before the connection can go away.
+        if let Err(e) = self.conn.sync() {
             return Asked::blocked(format!("glass could not deliver the close request: {e}"));
         }
         Asked::counted(total, asked, |unaskable| {
