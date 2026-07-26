@@ -4,7 +4,7 @@
 use crate::smoke::envelope::{check_envelope, untrusted_sibling};
 use crate::smoke::profile::{OutlineNode, Profile, parse_outline};
 use crate::smoke::report::CheckOutcome;
-use crate::smoke::transport::McpTransport;
+use crate::smoke::transport::{CallResult, McpTransport};
 use serde_json::{Value, json};
 
 /// Fold a `Result` into an outcome so a transport error is a reported failure,
@@ -122,13 +122,32 @@ pub fn check_a11y(t: &mut dyn McpTransport) -> (CheckOutcome, Vec<OutlineNode>) 
 /// The text the interaction check writes. Distinctive so a stale tree cannot pass.
 const PROBE_TEXT: &str = "glass smoke";
 
-/// Both interaction paths. The element path is verified by re-reading the value from
-/// the tree — "the tool returned ok" is not evidence the app changed.
+/// Both interaction paths. The element path is verified through
+/// `glass_wait_for_element`'s `value_contains` — the signal glass actually exposes for a
+/// written value. A written text field's content lands in the a11y `value` property, not
+/// `name`, and the outline text glass renders for an agent carries only `name` — so
+/// "the tool returned ok" is not evidence the app changed, and neither is a re-read of the
+/// outline.
 pub fn check_interaction(t: &mut dyn McpTransport, nodes: &[OutlineNode]) -> CheckOutcome {
     let Some(target) = crate::smoke::profile::first_editable(nodes) else {
         return CheckOutcome::skip(6, "interaction", "no editable element in the tree");
     };
     let id = target.id;
+    // An unmapped role renders as `Other(<native token>)` in the outline (see
+    // `glass_core::outline::write_line`), which `AxRole::from_name` cannot parse back — so
+    // `glass_wait_for_element`'s `role` selector cannot target it. A skip that says why beats
+    // a fail that blames the app for a role glass itself cannot address.
+    if target.role.contains('(') {
+        return CheckOutcome::skip(
+            6,
+            "interaction",
+            format!(
+                "target element #{id} has no addressable role ({}) to verify against",
+                target.role
+            ),
+        );
+    }
+    let role = target.role.as_str();
     outcome(
         6,
         "interaction",
@@ -136,15 +155,27 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: &[OutlineNode]) -> Che
             let set = t.call("glass_set_value", json!({ "id": id, "text": PROBE_TEXT }))?;
             check_envelope("glass_set_value", &set)?;
 
-            let after = t.call("glass_a11y_snapshot", json!({}))?;
-            check_envelope("glass_a11y_snapshot", &after)?;
-            let body = untrusted_sibling(&after)?;
-            let landed = crate::smoke::profile::parse_outline(body)
-                .iter()
-                .any(|n| n.id == id && n.name.as_deref() == Some(PROBE_TEXT));
-            if !landed {
+            let wait = t.call(
+                "glass_wait_for_element",
+                json!({ "role": role, "value_contains": PROBE_TEXT, "timeout_ms": 5000 }),
+            )?;
+            let result = check_envelope("glass_wait_for_element", &wait)?;
+            if result["matched"].as_bool() != Some(true) {
+                return Err(
+                    "glass_set_value returned ok but no element reported the written value"
+                        .to_string(),
+                );
+            }
+            // The matched element rides in an untrusted sibling (see
+            // `crate::tools::wait::element_sibling`); a missing/unparseable sibling or a
+            // sibling with no `id` means the id cannot be confirmed, not that it mismatches —
+            // only a definite mismatch fails the check.
+            if let Some(matched_id) = matched_element_id(&wait)
+                && matched_id != u64::from(id)
+            {
                 return Err(format!(
-                    "glass_set_value returned ok but element #{id} did not take the value"
+                    "glass_set_value wrote to #{id} but element #{matched_id} \
+                     reported the value instead — the write landed somewhere unintended"
                 ));
             }
 
@@ -157,6 +188,21 @@ pub fn check_interaction(t: &mut dyn McpTransport, nodes: &[OutlineNode]) -> Che
             Ok(format!("element #{id} took the value; pixel path ok"))
         })(),
     )
+}
+
+/// The matched element's `id`, extracted from an untrusted-wrapped sibling's JSON body (the
+/// wrapper is a note line, `⟦untrusted:<nonce>⟧`, the body, then the close marker — not bare
+/// JSON, so the object is located by its outermost braces rather than parsed whole). `None`
+/// when there is no sibling, no `{...}` span in it, the span doesn't parse, or it carries no
+/// `id` — every one of those means "cannot confirm", not a mismatch.
+fn matched_element_id(r: &CallResult) -> Option<u64> {
+    let sibling = untrusted_sibling(r).ok()?;
+    let start = sibling.find('{')?;
+    let end = sibling.rfind('}')?;
+    serde_json::from_str::<Value>(&sibling[start..=end])
+        .ok()?
+        .get("id")?
+        .as_u64()
 }
 
 pub fn check_logs(t: &mut dyn McpTransport) -> CheckOutcome {
@@ -451,18 +497,41 @@ mod tests {
         }]
     }
 
+    /// A `glass_wait_for_element` match, wrapped exactly as the real tool wraps it: a note
+    /// line, the nonce-delimited markers, then the element JSON — not bare JSON. Building it
+    /// through the real wrapper (rather than a hand-rolled marker string) is what makes the
+    /// extraction in `matched_element_id` actually exercised by these tests.
+    fn matched_element(id: u32) -> String {
+        let body = json!({
+            "id": id,
+            "role": "TextField",
+            "name": Value::Null,
+            "value": PROBE_TEXT,
+            "bounds": Value::Null,
+            "states": ["editable"],
+        })
+        .to_string();
+        crate::untrusted::wrap_untrusted(&body)
+    }
+
     #[test]
     fn interaction_verifies_at_the_consumer_layer_not_by_ok() {
-        // set_value ok, then the re-read shows the text landed.
-        let after = "⟦untrusted:z⟧\n#12 TextBox \"glass smoke\" [editable]\n⟦/untrusted:z⟧";
+        // set_value ok, then glass_wait_for_element — the signal glass actually exposes for a
+        // written value — confirms it landed on the same element.
+        let sibling = matched_element(12);
         let mut t = ScriptedTransport::new(vec![
             (
                 "glass_set_value",
                 Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
             ),
             (
-                "glass_a11y_snapshot",
-                Ok(ok("glass_a11y_snapshot", json!({}), vec![after], 0)),
+                "glass_wait_for_element",
+                Ok(ok(
+                    "glass_wait_for_element",
+                    json!({ "matched": true, "elapsed_ms": 5 }),
+                    vec![sibling.as_str()],
+                    0,
+                )),
             ),
             ("glass_click", Ok(ok("glass_click", json!({}), vec![], 0))),
             ("glass_key", Ok(ok("glass_key", json!({}), vec![], 0))),
@@ -474,21 +543,81 @@ mod tests {
     }
 
     #[test]
-    fn interaction_fails_when_the_value_did_not_change_despite_ok() {
-        let unchanged = "⟦untrusted:z⟧\n#12 TextBox \"\" [editable]\n⟦/untrusted:z⟧";
+    fn interaction_passes_when_matched_but_the_id_cannot_be_confirmed() {
+        // matched:true with no untrusted sibling to read an id from: "cannot confirm" is not
+        // a failure — only a definite id mismatch is.
         let mut t = ScriptedTransport::new(vec![
             (
                 "glass_set_value",
                 Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
             ),
             (
-                "glass_a11y_snapshot",
-                Ok(ok("glass_a11y_snapshot", json!({}), vec![unchanged], 0)),
+                "glass_wait_for_element",
+                Ok(ok(
+                    "glass_wait_for_element",
+                    json!({ "matched": true, "elapsed_ms": 5 }),
+                    vec![],
+                    0,
+                )),
+            ),
+            ("glass_click", Ok(ok("glass_click", json!({}), vec![], 0))),
+            ("glass_key", Ok(ok("glass_key", json!({}), vec![], 0))),
+        ]);
+        assert_eq!(
+            check_interaction(&mut t, &nodes_with_editable()).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn interaction_fails_when_no_element_reports_the_written_value() {
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_set_value",
+                Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
+            ),
+            (
+                "glass_wait_for_element",
+                Ok(ok(
+                    "glass_wait_for_element",
+                    json!({ "matched": false, "elapsed_ms": 5000 }),
+                    vec![],
+                    0,
+                )),
             ),
         ]);
         let out = check_interaction(&mut t, &nodes_with_editable());
         assert_eq!(out.status, CheckStatus::Fail);
-        assert!(out.detail.contains("did not"), "got: {}", out.detail);
+        assert!(out.detail.contains("no element"), "got: {}", out.detail);
+    }
+
+    #[test]
+    fn interaction_fails_when_a_different_element_reports_the_value() {
+        // The probe text shows up, but on #99, not the #12 we wrote to: the write landed
+        // somewhere unintended, which is a real defect this check must catch.
+        let sibling = matched_element(99);
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_set_value",
+                Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
+            ),
+            (
+                "glass_wait_for_element",
+                Ok(ok(
+                    "glass_wait_for_element",
+                    json!({ "matched": true, "elapsed_ms": 5 }),
+                    vec![sibling.as_str()],
+                    0,
+                )),
+            ),
+        ]);
+        let out = check_interaction(&mut t, &nodes_with_editable());
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(
+            out.detail.contains("12") && out.detail.contains("99"),
+            "must name both ids: {}",
+            out.detail
+        );
     }
 
     #[test]
@@ -501,6 +630,23 @@ mod tests {
             states: vec![],
         }];
         assert_eq!(check_interaction(&mut t, &nodes).status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn interaction_skips_when_the_target_has_no_addressable_role() {
+        // `Other(...)` is what an unmapped role renders as in the outline; `AxRole::from_name`
+        // cannot parse it back, so `glass_wait_for_element`'s `role` selector cannot target
+        // it. This must skip with a reason, not fail and blame the app.
+        let mut t = ScriptedTransport::new(vec![]);
+        let nodes = vec![OutlineNode {
+            id: 7,
+            role: "Other(AXDisclosureTriangle)".into(),
+            name: None,
+            states: vec!["editable".into()],
+        }];
+        let out = check_interaction(&mut t, &nodes);
+        assert_eq!(out.status, CheckStatus::Skip);
+        assert!(out.detail.contains("role"), "got: {}", out.detail);
     }
 
     #[test]
