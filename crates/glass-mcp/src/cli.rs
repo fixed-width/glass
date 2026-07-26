@@ -6,6 +6,7 @@
 //! `glass-mcp` serves MCP over stdio (the default).
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,6 +98,26 @@ pub enum Command {
     /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
     #[command(hide = true)]
     DebugChecklist,
+    /// Drive glass's own MCP tools against a real app and report whether this build
+    /// works. Experimental: not part of the stable tool surface.
+    Smoke {
+        /// Backend to exercise. The smoke runner drives only x11.
+        #[arg(long, default_value = "x11")]
+        backend: String,
+        /// Write the JSON report to PATH (the text report always goes to stdout).
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+        /// Force a target app instead of probing for the first available one.
+        #[arg(long)]
+        app: Option<String>,
+        /// Prove the checks can fail: run them against injected faults, then exit. Runs
+        /// nothing else, so it cannot be combined with the flags that configure a real run.
+        #[arg(long, conflicts_with_all = ["backend", "report", "app", "dry_run"])]
+        self_check: bool,
+        /// Print what would run and exit, touching nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
@@ -270,6 +291,37 @@ mod tests {
     fn uninstall_subcommand_parses() {
         let cli = Cli::try_parse_from(["glass-mcp", "uninstall"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Uninstall)));
+    }
+
+    #[test]
+    fn smoke_self_check_parses_on_its_own() {
+        let cli = Cli::try_parse_from(["glass-mcp", "smoke", "--self-check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Smoke {
+                self_check: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn smoke_self_check_conflicts_with_the_flags_it_would_ignore() {
+        // `--self-check` runs the fault injection and exits; silently ignoring a real run's
+        // flags would let `smoke --self-check --app xterm` look like it drove that app.
+        for other in [
+            vec!["--dry-run"],
+            vec!["--backend", "x11"],
+            vec!["--app", "xterm"],
+            vec!["--report", "/tmp/r.json"],
+        ] {
+            let mut argv = vec!["glass-mcp", "smoke", "--self-check"];
+            argv.extend(other.iter().copied());
+            let Err(err) = Cli::try_parse_from(&argv) else {
+                panic!("{argv:?} must be rejected, not silently ignored");
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

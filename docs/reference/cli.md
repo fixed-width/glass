@@ -60,3 +60,30 @@ macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+
+## `smoke`
+
+**Experimental** — see [Stability and versioning](stability.md#experimental-subcommands). Drive
+glass's own MCP tools against a real app and report whether this build works end to end. The checks,
+the statuses, and the report's fields are described in
+[smoke checks and report](smoke.md); [how-to/check-a-build.md](../how-to/check-a-build.md)
+covers running it and acting on a red result.
+
+- `--backend <name>` — backend to exercise. The smoke runner drives only `x11`, which is the
+  default. Also sets `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so
+  the session and `glass_doctor`'s verdict always agree on which backend is under test.
+- `--report <path>` — also write the JSON report to `path` (the text report always goes to stdout).
+- `--app <name>` — force a specific candidate app instead of probing for the first one present. The
+  name must be one of the backend's candidates; a name that is not is a usage error. A real run does
+  not check the named binary for presence, so naming an app that is not installed fails at the
+  `start` check; a `--dry-run` does check, and marks the plan unavailable.
+- `--dry-run` — print the plan and exit without spawning a server, launching an app, or calling a
+  tool. Every check is a `skip`, the heading reads `PASS (plan only)`, and the exit code is 0. With
+  `--report`, the plan is written as JSON like any other run. Unlike a real run, this does not
+  require a target app to be installed: if none of the candidates is present, the `start` row says
+  what to install instead of the command failing.
+- `--self-check` — prove the checks can still fail: run them against deliberately wrong responses
+  and confirm each one catches its fault, for the reason it names. Drives nothing real — no app, no
+  display — and exits when done, so it cannot be combined with the flags above; passing one is a
+  usage error rather than a silently ignored argument. Exit code 0 when every injected fault was
+  caught.

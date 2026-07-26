@@ -33,6 +33,8 @@ way it does? The explanations.
 **Contribute**
 
 - [Build from source](how-to/build-from-source.md) — all platforms; macOS signing + LaunchAgent
+- [Check a build works end to end](how-to/check-a-build.md) — `glass-mcp smoke` drives glass's own
+  MCP tools against a real app, so you know the build you just compiled works
 - [Benchmark and profile](how-to/benchmarking.md)
 - [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
   screenshot-every-step, round-trips and tokens
@@ -44,6 +46,8 @@ way it does? The explanations.
 - [Stability and versioning](reference/stability.md) — the semver promise: what's covered from 1.0
 - [Environment variables](reference/environment.md) — every `GLASS_*` variable
 - [CLI](reference/cli.md) — `glass-mcp` subcommands
+- [smoke checks and report](reference/smoke.md) — what each `smoke` check asserts, and what each
+  status means
 - [Platform support](reference/platforms.md) — the capability matrix and system requirements
 - [Accessibility roles by platform](reference/a11y-roles.md) — which roles each backend can produce
 - [Audit log](reference/audit-log.md) — the JSONL record schema and redaction

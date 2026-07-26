@@ -44,6 +44,13 @@ jobs:
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: smoke self-check
+        run: cargo run -p glass-mcp -- smoke --self-check
+      # This runner has none of the X11 target apps installed, so it is exactly the host that
+      # must degrade rather than hard-fail: a plan is printed, the `start` row names what to
+      # install, and the run exits 0. Nothing else exercises that path end to end.
+      - name: smoke plan on a host with no target app
+        run: cargo run -p glass-mcp -- smoke --dry-run
 
   miri:
     name: Miri (UB check · pure crates)
@@ -81,10 +88,14 @@ jobs:
         # Ubuntu 24.04 runners restrict them via AppArmor (bwrap then fails "setting up
         # uid map: Permission denied"), so re-enable them (no-op on images without the knob).
         # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
+        # zenity + at-spi2-core: the smoke (x11) step below needs a target app on PATH plus
+        # a running AT-SPI bus for its accessibility checks; the runner ships neither by default.
         run: |
-          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 zenity at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: ./scripts/test-x11.sh
+      - name: smoke (x11)
+        run: cargo test -p glass-mcp --test smoke_x11 -- --ignored
 
   wayland:
     name: Wayland integration (sway)

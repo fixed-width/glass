@@ -38,6 +38,17 @@ internal refactors, CI, or test-only changes.
   hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
   Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
   as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
+- `glass_doctor` now returns structured data alongside its rendered `report` text: `sections`
+  (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
+  diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
+  of parsing prose. Purely additive: `report` is unchanged.
+- `glass-mcp smoke --backend x11` — drives glass's own MCP tools against a real app and
+  reports whether this build works, in the same report style as `glass-mcp doctor`: a glyph and a
+  status word per check, and a `Summary:` line carrying the verdict. `--dry-run` prints the plan
+  without driving anything, on any host: with no target app installed it says what to install
+  rather than failing. Experimental; see
+  `docs/how-to/check-a-build.md` to run it and `docs/reference/smoke.md` for the checks and
+  the report shape.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.

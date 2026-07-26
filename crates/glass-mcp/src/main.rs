@@ -131,5 +131,41 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::DebugGrants) => run_debug_grants(),
         Some(Command::DebugChecklist) => run_debug_checklist(),
+        Some(Command::Smoke {
+            backend,
+            report,
+            app,
+            self_check,
+            dry_run,
+        }) => {
+            if self_check {
+                match glass_mcp::smoke::selfcheck::run_self_check() {
+                    Ok(summary) => {
+                        println!("self-check ok: {summary}");
+                        return Ok(());
+                    }
+                    Err(e) => anyhow::bail!("self-check FAILED: {e}"),
+                }
+            }
+            let r = glass_mcp::smoke::run(glass_mcp::smoke::SmokeOptions {
+                backend,
+                app,
+                dry_run,
+            })
+            // Setup failed before any check ran, so there is no report to write — say so,
+            // rather than leaving the caller looking for a `--report` file that was never
+            // created.
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "smoke could not start: {e}\nNo report was written: the run never \
+                     reached a check."
+                )
+            })?;
+            print!("{}", r.to_text());
+            if let Some(path) = report {
+                std::fs::write(&path, serde_json::to_string_pretty(&r)?)?;
+            }
+            std::process::exit(r.exit_code());
+        }
     }
 }
