@@ -12,7 +12,7 @@ pub mod transport;
 
 use std::ffi::OsStr;
 
-use profile::{Candidate, Profile, X11_CANDIDATES};
+use profile::{Candidate, Profile, WAYLAND_CANDIDATES, X11_CANDIDATES};
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
 
 pub struct SmokeOptions {
@@ -24,24 +24,39 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
+/// Every backend the smoke runner drives, with its candidate apps. The single declaration of that
+/// set: both the resolution below and the prose naming what is drivable read it.
+const DRIVABLE: &[(&str, &[Candidate])] =
+    &[("x11", &X11_CANDIDATES), ("wayland", &WAYLAND_CANDIDATES)];
+
+/// The drivable backend names, in table order, for a message that tells the caller what to pass.
+pub fn drivable_backends() -> Vec<&'static str> {
+    DRIVABLE.iter().map(|(name, _)| *name).collect()
+}
+
 /// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
 /// backend-recognition predicate — and return the canonical name alongside its candidate apps.
 /// Keying the table off what that returns is what stops `smoke --backend X11` being rejected
 /// while `GLASS_BACKEND=X11` is honoured everywhere else in the binary.
 fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]), String> {
+    let drivable = drivable_backends().join(", ");
     let Some(name) = crate::recognized_backend(backend) else {
         return Err(format!(
-            "unknown backend {backend:?} — glass knows: {}. The smoke runner drives: x11.",
+            "unknown backend {backend:?} — glass knows: {}. The smoke runner drives: {drivable}.",
             crate::BACKENDS.join(", ")
         ));
     };
-    match name {
-        "x11" => Ok((name, &X11_CANDIDATES)),
-        other => Err(format!(
-            "no smoke candidates for backend {other:?} yet — the smoke runner drives: x11. \
-             Pass --backend x11."
-        )),
-    }
+    DRIVABLE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, c)| (*n, *c))
+        .ok_or_else(|| {
+            format!(
+                "no smoke candidates for backend {name:?} yet — the smoke runner drives: \
+                 {drivable}. Pass --backend {}.",
+                drivable_backends()[0]
+            )
+        })
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -344,7 +359,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("beos") && err.contains("x11"), "got: {err}");
+        assert!(err.contains("beos"), "got: {err}");
     }
 
     #[test]
@@ -371,7 +386,7 @@ mod tests {
     fn a_backend_glass_knows_but_smoke_cannot_drive_yet_says_so() {
         let err = run_with(
             SmokeOptions {
-                backend: "wayland".into(),
+                backend: "android".into(),
                 app: None,
                 dry_run: true,
             },
@@ -379,9 +394,74 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("wayland") && err.contains("x11"),
-            "must name the backend asked for and what is drivable: {err}"
+            err.contains("android"),
+            "must name the backend asked for: {err}"
         );
+        for b in drivable_backends() {
+            assert!(err.contains(b), "must name {b:?} as drivable: {err}");
+        }
+    }
+
+    #[test]
+    fn wayland_resolves_the_wayland_table() {
+        let (name, candidates) = candidates_for("wayland").expect("wayland must be drivable");
+        assert_eq!(name, "wayland");
+        assert!(candidates.iter().any(|c| c.bin == "xed"));
+        assert!(
+            !candidates.iter().any(|c| c.bin == "xterm"),
+            "an X11-only client is not a wayland candidate"
+        );
+    }
+
+    #[test]
+    fn a_wayland_plan_previews_the_same_rows_as_x11() {
+        let (_dir, path) = host_with(&[]);
+        let r = run_with(
+            SmokeOptions {
+                backend: "wayland".into(),
+                app: None,
+                dry_run: true,
+            },
+            Some(&path),
+        )
+        .expect("wayland must be drivable");
+        assert_eq!(rows(&r), CANONICAL_ROWS.to_vec());
+        assert_eq!(r.backend, "wayland");
+    }
+
+    /// `recognized_backend` is case-insensitive; a second, stricter recognition site here would
+    /// reject a spelling the rest of the binary accepts.
+    #[test]
+    fn wayland_is_recognized_case_insensitively() {
+        let (_dir, path) = host_with(&[]);
+        let r = run_with(
+            SmokeOptions {
+                backend: "WAYLAND".into(),
+                app: None,
+                dry_run: true,
+            },
+            Some(&path),
+        )
+        .expect("WAYLAND must resolve the same way GLASS_BACKEND=WAYLAND does");
+        assert_eq!(r.backend, "wayland");
+    }
+
+    /// The prose naming what is drivable is derived from the table, so a backend cannot land
+    /// while a message still says otherwise.
+    #[test]
+    fn an_unknown_backend_names_every_drivable_backend() {
+        let err = run_with(
+            SmokeOptions {
+                backend: "beos".into(),
+                app: None,
+                dry_run: true,
+            },
+            None,
+        )
+        .unwrap_err();
+        for b in drivable_backends() {
+            assert!(err.contains(b), "must name {b:?}: {err}");
+        }
     }
 
     /// A name that is not in the candidate table at all is a typo in the caller's input, not
