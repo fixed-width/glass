@@ -447,7 +447,8 @@ mod tests {
     }
 
     /// The prose naming what is drivable is derived from the table, so a backend cannot land
-    /// while a message still says otherwise.
+    /// while a message still says otherwise: checked on the "drives" clause alone, because
+    /// `crate::BACKENDS` names every backend in an earlier clause too and would mask a broken one.
     #[test]
     fn an_unknown_backend_names_every_drivable_backend() {
         let err = run_with(
@@ -459,8 +460,14 @@ mod tests {
             None,
         )
         .unwrap_err();
+        let (_, drives) = err
+            .split_once("The smoke runner drives: ")
+            .expect("must have a drives clause");
         for b in drivable_backends() {
-            assert!(err.contains(b), "must name {b:?}: {err}");
+            assert!(
+                drives.contains(b),
+                "the drives clause must name {b:?}: {err}"
+            );
         }
     }
 
