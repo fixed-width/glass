@@ -1036,3 +1036,26 @@ fn set_value_resolves_an_id_past_the_default_cap_from_an_unbounded_snapshot() {
         "the id past the old cap resolved (lockstep held); got: {msg}"
     );
 }
+
+/// Teardown of an a11y-enabled launch has to fit in the budget glass-mcp gives it. The backends
+/// bind their close-request + signal ladder to `TEARDOWN_BUDGET` at compile time, but the private
+/// a11y bus is torn down inside the same budget and is not covered by that assertion — its two
+/// helpers (the AT-SPI registry and the session bus) each get their own reap grace. Past the
+/// budget glass-mcp stops waiting and exits, orphaning whatever is left.
+///
+/// This lives here rather than with the X11 teardown tests because it is the only suite whose
+/// host is guaranteed an AT-SPI launcher.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn stopping_an_a11y_launch_finishes_inside_the_teardown_budget() {
+    let mut glass = launch_fixture();
+    let t = std::time::Instant::now();
+    glass.stop().expect("stop");
+    let elapsed = t.elapsed();
+    assert!(
+        elapsed < glass_core::TEARDOWN_BUDGET,
+        "tearing down an a11y launch (ask + signal ladder + private bus) must fit in the {:?} \
+         glass-mcp allows teardown; this took {elapsed:?}",
+        glass_core::TEARDOWN_BUDGET
+    );
+}

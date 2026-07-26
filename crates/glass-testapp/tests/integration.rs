@@ -1452,10 +1452,9 @@ fn stop_app_waits_for_an_app_that_takes_time_to_shut_down() {
 }
 
 /// An app that was asked and does not go — a modal "save changes?" prompt, or a hang — must be
-/// signalled once the grace runs out, and the whole teardown must still fit in the budget
-/// glass-mcp allows it. Runs with `a11y: true` so the private bus teardown that follows the
-/// ladder is inside the measurement, which is the configuration the backend's compile-time
-/// budget assertion is silent about.
+/// signalled once the grace runs out, and the ladder must still fit in the budget glass-mcp
+/// allows teardown. (The same measurement with the a11y bus in the picture lives in the a11y
+/// suite, which is the only suite whose host is guaranteed an AT-SPI launcher.)
 #[test]
 #[ignore = "requires an X server; run via scripts/test-x11.sh"]
 fn stop_app_signals_an_app_that_ignores_the_close_request() {
@@ -1463,7 +1462,6 @@ fn stop_app_signals_an_app_that_ignores_the_close_request() {
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
         run: vec![TESTAPP.to_string(), "--ignore-close".to_string()],
-        a11y: true,
         ..app_spec()
     };
     p.start_app(&spec).unwrap();
@@ -1488,8 +1486,8 @@ fn stop_app_signals_an_app_that_ignores_the_close_request() {
     );
     assert!(
         elapsed < glass_core::TEARDOWN_BUDGET,
-        "the ask, the signal ladder and the a11y-bus teardown must fit in the budget glass-mcp \
-         gives teardown ({:?}); this took {elapsed:?}",
+        "the ask and the signal ladder must fit in the budget glass-mcp gives teardown ({:?}); \
+         this took {elapsed:?}",
         glass_core::TEARDOWN_BUDGET
     );
 }
