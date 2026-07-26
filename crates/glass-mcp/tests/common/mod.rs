@@ -1,5 +1,6 @@
-//! Xvfb harness (same approach as glass-testapp): the MCP server connects to an
-//! X display at startup, so the smoke test gives it a private Xvfb.
+//! What the two `#[ignore]`d smoke gates share: the private Xvfb the x11 run needs (the MCP
+//! server connects to an X display at startup), the sway probe the wayland run needs, and the
+//! report readers and assertions both apply to whichever backend they drove.
 
 #![allow(dead_code)]
 
@@ -59,9 +60,15 @@ pub fn rows(json: &serde_json::Value) -> Vec<(u64, String)> {
         .expect("checks array")
         .iter()
         .map(|c| {
+            // Not `unwrap_or_default`: this helper renders both operands of the real-vs-plan
+            // comparison, so an unreadable field degrades both sides identically and the
+            // assertion goes on passing over rows that no longer carry a step or a name.
             (
-                c["step"].as_u64().unwrap_or_default(),
-                c["name"].as_str().unwrap_or_default().to_string(),
+                c["step"].as_u64().expect("every row carries a step"),
+                c["name"]
+                    .as_str()
+                    .expect("every row carries a name")
+                    .to_string(),
             )
         })
         .collect()
@@ -145,20 +152,39 @@ pub fn sway_probe(server: &str) -> SwayProbe {
         Ok(out) => out,
         Err(e) => return SwayProbe::Broken(format!("could not run {server} doctor --json: {e}")),
     };
-    let json: serde_json::Value = match serde_json::from_slice(&out.stdout) {
-        Ok(json) => json,
-        Err(e) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return SwayProbe::Broken(format!(
-                "doctor --json printed non-JSON stdout ({e}): {stdout}"
-            ));
-        }
-    };
-    let Some(sections) = json["sections"].as_array() else {
-        return SwayProbe::Broken(format!("doctor --json had no \"sections\" array: {json}"));
+    match serde_json::from_slice(&out.stdout) {
+        Ok(json) => classify(&json),
+        // A doctor that died before printing leaves an empty stdout, so its status and stderr
+        // are the only cause there is to report.
+        Err(e) => SwayProbe::Broken(format!(
+            "{server} doctor --json printed no readable JSON ({e}); {}, stdout: {:?}, \
+             stderr tail: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            tail(&out.stderr),
+        )),
+    }
+}
+
+/// The last few lines of a captured stream, joined onto one line for a panic message.
+fn tail(stream: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stream);
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(5)..].join(" | ")
+}
+
+/// Read a `doctor --json` document's verdict on sway. Split from running the binary because the
+/// six ways the document can be unreadable are what needs testing, and none of them need a host.
+fn classify(doctor_json: &serde_json::Value) -> SwayProbe {
+    let Some(sections) = doctor_json["sections"].as_array() else {
+        return SwayProbe::Broken(format!(
+            "doctor --json had no \"sections\" array: {doctor_json}"
+        ));
     };
     let Some(wayland) = sections.iter().find(|s| s["title"] == "wayland") else {
-        return SwayProbe::Broken(format!("doctor --json had no \"wayland\" section: {json}"));
+        return SwayProbe::Broken(format!(
+            "doctor --json had no \"wayland\" section: {doctor_json}"
+        ));
     };
     let Some(check) = wayland["checks"]
         .as_array()
@@ -176,5 +202,112 @@ pub fn sway_probe(server: &str) -> SwayProbe {
         other => SwayProbe::Broken(format!(
             "sway >=1.12 check had unrecognized status {other:?}: {wayland}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod sway_probe_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A `doctor --json` document shaped like the real one, with the sway check reporting
+    /// `status`. A shape that drifted from doctor's own would make every host `Broken`, which
+    /// panics — so this fixture cannot rot quietly.
+    fn doctor_reporting(status: &str) -> serde_json::Value {
+        json!({
+            "sections": [{
+                "title": "wayland",
+                "backend": "wayland",
+                "checks": [
+                    { "name": "sway >=1.12", "status": status, "detail": "sway version 1.12 at …" },
+                    { "name": "software GL (Mesa)", "status": "ok", "detail": "…" },
+                ],
+            }],
+        })
+    }
+
+    fn why_broken(json: &serde_json::Value) -> String {
+        match classify(json) {
+            SwayProbe::Broken(why) => why,
+            other => panic!("expected Broken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ok_sway_check_means_the_gate_can_run() {
+        assert!(matches!(
+            classify(&doctor_reporting("ok")),
+            SwayProbe::Available
+        ));
+    }
+
+    /// Every verdict doctor can reach without sway. Reading one of these as `Broken` would fail
+    /// a developer laptop that simply has no sway; reading it as `Available` would run the gate
+    /// against a compositor that is not there.
+    #[test]
+    fn every_non_ok_sway_verdict_means_the_host_has_no_sway() {
+        for status in ["warn", "fail", "skip"] {
+            assert!(
+                matches!(classify(&doctor_reporting(status)), SwayProbe::Absent),
+                "status {status:?} must read as a host without sway"
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_outside_the_known_set_cannot_be_read_as_an_answer() {
+        let why = why_broken(&doctor_reporting("green"));
+        assert!(why.contains("green"), "must name what it got: {why}");
+    }
+
+    #[test]
+    fn a_document_with_no_sections_cannot_be_read_as_an_answer() {
+        let why = why_broken(&json!({}));
+        assert!(
+            why.contains("sections"),
+            "must name what was missing: {why}"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_wayland_section_cannot_be_read_as_an_answer() {
+        let why = why_broken(&json!({ "sections": [{ "title": "x11", "checks": [] }] }));
+        assert!(why.contains("wayland"), "must name what was missing: {why}");
+    }
+
+    /// A doctor that dies before printing leaves an empty stdout, so its exit status and stderr
+    /// are the only cause the resulting panic can name.
+    #[cfg(unix)]
+    #[test]
+    fn a_doctor_that_prints_no_json_reports_its_status_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("glass-mcp");
+        std::fs::write(
+            &fake,
+            b"#!/bin/sh\necho 'cannot open display' >&2\nexit 3\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let why = match sway_probe(fake.to_str().expect("utf-8 path")) {
+            SwayProbe::Broken(why) => why,
+            other => panic!("expected Broken, got {other:?}"),
+        };
+        assert!(why.contains('3'), "must name the exit status: {why}");
+        assert!(
+            why.contains("cannot open display"),
+            "must carry the stderr tail: {why}"
+        );
+    }
+
+    #[test]
+    fn a_wayland_section_with_no_sway_check_cannot_be_read_as_an_answer() {
+        let why = why_broken(&json!({
+            "sections": [{
+                "title": "wayland",
+                "checks": [{ "name": "software GL (Mesa)", "status": "ok" }],
+            }],
+        }));
+        assert!(why.contains("sway >=1.12"), "must name the check: {why}");
     }
 }
