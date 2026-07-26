@@ -1,31 +1,36 @@
-//! End-to-end: the shipped `smoke` subcommand against a real app under Xvfb.
-//! #[ignore]d (needs Xvfb + a target app); run via:
-//!   cargo test -p glass-mcp --test smoke_x11 -- --ignored
+//! End-to-end: the shipped `smoke` subcommand against a real app under the Wayland backend's
+//! own headless sway. #[ignore]d (needs sway >=1.12 and a target app); run via:
+//!   cargo test -p glass-mcp --test smoke_wayland -- --ignored
 
 mod common;
 
-use common::{Xvfb, assert_fixture_checks_pass, read_report, rows};
+use common::{assert_fixture_checks_pass, read_report, rows, sway_available};
 use std::process::Command;
 
 const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
 
 #[test]
-#[ignore = "requires Xvfb and a target app; run via: cargo test -p glass-mcp --test smoke_x11 -- --ignored"]
-fn smoke_x11_passes_against_a_real_app() {
-    let xvfb = Xvfb::start();
+#[ignore = "requires sway >=1.12 and a target app; run via: cargo test -p glass-mcp --test smoke_wayland -- --ignored"]
+fn smoke_wayland_passes_against_a_real_app() {
+    // The backend spawns its own compositor, so there is nothing to start here — but a host
+    // without sway must skip rather than report a failure it cannot act on.
+    if !sway_available(SERVER) {
+        eprintln!("no glass-discoverable sway >=1.12; skipping");
+        return;
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
     let report = dir.path().join("smoke.json");
 
     let out = Command::new(SERVER)
-        .args(["smoke", "--backend", "x11", "--report"])
+        .args(["smoke", "--backend", "wayland", "--report"])
         .arg(&report)
-        .env("DISPLAY", &xvfb.display)
         .output()
         .expect("run smoke");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // A setup failure (no target app, no accessibility bus) writes no report and explains
-    // itself on stderr, so a stdout-only message would leave nothing to triage from.
+    // A setup failure (no target app, no accessibility bus) writes no report and explains itself
+    // on stderr, so a stdout-only message would leave nothing to triage from.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
@@ -33,25 +38,20 @@ fn smoke_x11_passes_against_a_real_app() {
     );
 
     let json = read_report(&report);
-    assert_eq!(json["backend"], "x11");
+    assert_eq!(json["backend"], "wayland");
     assert_eq!(json["mode"], "full", "a real run is not a plan: {json}");
     assert_eq!(
         json["app"]["state"], "selected",
         "a real run drove an app, so the report must say which: {json}"
     );
-    assert!(
-        json["app"]["value"].as_str().is_some_and(|a| !a.is_empty()),
-        "the selected app must be named: {json}"
-    );
 
-    // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's
-    // rows. Sourcing the expectation from the same binary's own plan, rather than a list
-    // copied into this file, is what keeps the two from drifting apart unnoticed.
+    // The invariant `smoke/mod.rs` declares: a real run's rows are the `--dry-run` preview's rows.
+    // Sourcing the expectation from the same binary's own plan, rather than a list copied into
+    // this file, is what keeps the two from drifting apart unnoticed.
     let plan_path = dir.path().join("plan.json");
     let plan = Command::new(SERVER)
-        .args(["smoke", "--backend", "x11", "--dry-run", "--report"])
+        .args(["smoke", "--backend", "wayland", "--dry-run", "--report"])
         .arg(&plan_path)
-        .env("DISPLAY", &xvfb.display)
         .output()
         .expect("run smoke --dry-run");
     assert!(

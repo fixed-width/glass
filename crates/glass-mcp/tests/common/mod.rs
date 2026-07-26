@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 pub struct Xvfb {
@@ -49,4 +50,74 @@ impl Drop for Xvfb {
             let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{num}"));
         }
     }
+}
+
+/// The `(step, name)` pairs a report carries, in order.
+pub fn rows(json: &serde_json::Value) -> Vec<(u64, String)> {
+    json["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .map(|c| {
+            (
+                c["step"].as_u64().unwrap_or_default(),
+                c["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+pub fn read_report(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("report written"))
+        .expect("report is JSON")
+}
+
+/// The checks a CI fixture controls end to end: the runner installs the target app and the
+/// accessibility bus, so each must actually be `pass`. `Skip` exits 0, so a check that degraded
+/// to a skip would otherwise keep CI green while proving nothing.
+///
+/// `capabilities+doctor` grades the host environment rather than the fixture, so it is absent.
+pub const MUST_PASS: [&str; 7] = [
+    "start",
+    "screenshot",
+    "a11y snapshot",
+    "interaction",
+    "logs",
+    "error honesty",
+    "stop",
+];
+
+pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
+    let checks = json["checks"].as_array().expect("checks array");
+    for name in MUST_PASS {
+        let status = checks
+            .iter()
+            .find(|c| c["name"].as_str() == Some(name))
+            .and_then(|c| c["status"].as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            status, "pass",
+            "check {name:?} is fixture-controlled and must pass, not degrade to {status:?}:\n{stdout}"
+        );
+    }
+}
+
+/// Does this host have a sway the Wayland backend can spawn? Asks the shipped binary's own probe
+/// rather than re-implementing discovery, so the guard and the backend cannot disagree.
+pub fn sway_available(server: &str) -> bool {
+    let Ok(out) = Command::new(server).args(["doctor", "--json"]).output() else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return false;
+    };
+    json["sections"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["title"] == "wayland")
+        .and_then(|s| s["checks"].as_array())
+        .into_iter()
+        .flatten()
+        .any(|c| c["name"] == "sway >=1.12" && c["status"] == "ok")
 }
