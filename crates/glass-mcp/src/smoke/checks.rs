@@ -119,6 +119,94 @@ pub fn check_a11y(t: &mut dyn McpTransport) -> (CheckOutcome, Vec<OutlineNode>) 
     (outcome(5, "a11y snapshot", r), nodes)
 }
 
+/// The text the interaction check writes. Distinctive so a stale tree cannot pass.
+const PROBE_TEXT: &str = "glass smoke";
+
+/// Both interaction paths. The element path is verified by re-reading the value from
+/// the tree — "the tool returned ok" is not evidence the app changed.
+pub fn check_interaction(t: &mut dyn McpTransport, nodes: &[OutlineNode]) -> CheckOutcome {
+    let Some(target) = crate::smoke::profile::first_editable(nodes) else {
+        return CheckOutcome::skip(6, "interaction", "no editable element in the tree");
+    };
+    let id = target.id;
+    outcome(
+        6,
+        "interaction",
+        (|| {
+            let set = t.call("glass_set_value", json!({ "id": id, "text": PROBE_TEXT }))?;
+            check_envelope("glass_set_value", &set)?;
+
+            let after = t.call("glass_a11y_snapshot", json!({}))?;
+            check_envelope("glass_a11y_snapshot", &after)?;
+            let body = untrusted_sibling(&after)?;
+            let landed = crate::smoke::profile::parse_outline(body)
+                .iter()
+                .any(|n| n.id == id && n.name.as_deref() == Some(PROBE_TEXT));
+            if !landed {
+                return Err(format!(
+                    "glass_set_value returned ok but element #{id} did not take the value"
+                ));
+            }
+
+            // Pixel path: a click inside the window, then a key. These assert the tools
+            // accept and report; the element path above is what proves an effect.
+            let click = t.call("glass_click", json!({ "x": 5, "y": 5 }))?;
+            check_envelope("glass_click", &click)?;
+            let key = t.call("glass_key", json!({ "chord": "Escape" }))?;
+            check_envelope("glass_key", &key)?;
+            Ok(format!("element #{id} took the value; pixel path ok"))
+        })(),
+    )
+}
+
+pub fn check_logs(t: &mut dyn McpTransport) -> CheckOutcome {
+    outcome(
+        8,
+        "logs",
+        t.call("glass_logs", json!({})).and_then(|r| {
+            check_envelope("glass_logs", &r)?;
+            // An app that logged nothing is normal; app text that is NOT untrusted-wrapped
+            // is a freeze violation, so only check the wrapping when there is text.
+            if r.siblings.is_empty() {
+                return Ok("no output".into());
+            }
+            untrusted_sibling(&r)?;
+            Ok(format!("{} block(s), untrusted-wrapped", r.siblings.len()))
+        }),
+    )
+}
+
+/// Deliberate misuse must return an error that names a remedy, not only a cause.
+pub fn check_error_honesty(t: &mut dyn McpTransport) -> CheckOutcome {
+    outcome(
+        9,
+        "error honesty",
+        t.call("glass_click_element", json!({ "id": 999_999 }))
+            .and_then(|r| {
+                if !r.is_error {
+                    return Err("glass_click_element on a nonexistent id succeeded".into());
+                }
+                let msg = r.siblings.join(" ");
+                if crate::smoke::envelope::names_a_remedy(&msg) {
+                    Ok(format!("actionable: {msg}"))
+                } else {
+                    Err(format!("error names a cause but no remedy: {msg}"))
+                }
+            }),
+    )
+}
+
+pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
+    outcome(
+        10,
+        "stop",
+        t.call("glass_stop", json!({})).and_then(|r| {
+            check_envelope("glass_stop", &r)?;
+            Ok("session ended".into())
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +440,130 @@ mod tests {
         let out = check_start(&mut t, &profile());
         assert_eq!(out.status, CheckStatus::Fail);
         assert!(out.detail.contains("broken pipe"));
+    }
+
+    fn nodes_with_editable() -> Vec<OutlineNode> {
+        vec![OutlineNode {
+            id: 12,
+            role: "TextBox".into(),
+            name: None,
+            states: vec!["editable".into()],
+        }]
+    }
+
+    #[test]
+    fn interaction_verifies_at_the_consumer_layer_not_by_ok() {
+        // set_value ok, then the re-read shows the text landed.
+        let after = "⟦untrusted:z⟧\n#12 TextBox \"glass smoke\" [editable]\n⟦/untrusted:z⟧";
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_set_value",
+                Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
+            ),
+            (
+                "glass_a11y_snapshot",
+                Ok(ok("glass_a11y_snapshot", json!({}), vec![after], 0)),
+            ),
+            ("glass_click", Ok(ok("glass_click", json!({}), vec![], 0))),
+            ("glass_key", Ok(ok("glass_key", json!({}), vec![], 0))),
+        ]);
+        assert_eq!(
+            check_interaction(&mut t, &nodes_with_editable()).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn interaction_fails_when_the_value_did_not_change_despite_ok() {
+        let unchanged = "⟦untrusted:z⟧\n#12 TextBox \"\" [editable]\n⟦/untrusted:z⟧";
+        let mut t = ScriptedTransport::new(vec![
+            (
+                "glass_set_value",
+                Ok(ok("glass_set_value", json!({ "id": 12 }), vec![], 0)),
+            ),
+            (
+                "glass_a11y_snapshot",
+                Ok(ok("glass_a11y_snapshot", json!({}), vec![unchanged], 0)),
+            ),
+        ]);
+        let out = check_interaction(&mut t, &nodes_with_editable());
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(out.detail.contains("did not"), "got: {}", out.detail);
+    }
+
+    #[test]
+    fn interaction_skips_when_no_editable_element_exists() {
+        let mut t = ScriptedTransport::new(vec![]);
+        let nodes = vec![OutlineNode {
+            id: 1,
+            role: "Button".into(),
+            name: None,
+            states: vec![],
+        }];
+        assert_eq!(check_interaction(&mut t, &nodes).status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn error_honesty_requires_an_actionable_message() {
+        let remedyless = CallResult {
+            is_error: true,
+            envelope: None,
+            siblings: vec!["unknown element id 999999".into()],
+            images: 0,
+        };
+        let mut t = ScriptedTransport::new(vec![("glass_click_element", Ok(remedyless))]);
+        let out = check_error_honesty(&mut t);
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(out.detail.contains("remedy"), "got: {}", out.detail);
+
+        let actionable = CallResult {
+            is_error: true,
+            envelope: None,
+            siblings: vec![
+                "unknown element id 999999 — call glass_a11y_snapshot to re-read ids".into(),
+            ],
+            images: 0,
+        };
+        let mut t = ScriptedTransport::new(vec![("glass_click_element", Ok(actionable))]);
+        assert_eq!(check_error_honesty(&mut t).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn error_honesty_fails_when_a_bad_call_succeeds() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_click_element",
+            Ok(ok(
+                "glass_click_element",
+                json!({ "id": 999999 }),
+                vec![],
+                0,
+            )),
+        )]);
+        let out = check_error_honesty(&mut t);
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(out.detail.contains("succeeded"), "got: {}", out.detail);
+    }
+
+    #[test]
+    fn logs_must_arrive_untrusted_wrapped() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_logs",
+            Ok(ok(
+                "glass_logs",
+                json!({ "count": 1 }),
+                vec!["⟦untrusted:q⟧\nstarted\n⟦/untrusted:q⟧"],
+                0,
+            )),
+        )]);
+        assert_eq!(check_logs(&mut t).status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn stop_must_return_a_clean_envelope() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_stop",
+            Ok(ok("glass_stop", json!({}), vec![], 0)),
+        )]);
+        assert_eq!(check_stop(&mut t).status, CheckStatus::Pass);
     }
 }
