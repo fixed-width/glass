@@ -192,7 +192,7 @@ fn parse_states(s: &str) -> Vec<String> {
 /// The element the interaction check writes to: an explicitly editable node, else a
 /// node whose normalized role is a text surface.
 pub fn first_editable(nodes: &[OutlineNode]) -> Option<&OutlineNode> {
-    const TEXT_ROLES: [&str; 3] = ["TextBox", "TextArea", "SearchBox"];
+    const TEXT_ROLES: [&str; 3] = ["TextField", "TextArea", "ComboBox"];
     nodes
         .iter()
         .find(|n| n.states.iter().any(|s| s == "editable"))
@@ -221,11 +221,11 @@ mod tests {
 
     #[test]
     fn parses_id_role_name_and_states() {
-        let outline = "#1 Window \"Untitled\" (0,0 800x600)\n  #12 TextBox \"Body\" (0,24 800x576) [editable,focusable]\n  #13 Button \"Save\" (700,0 80x24)\n";
+        let outline = "#1 Window \"Untitled\" (0,0 800x600)\n  #12 TextField \"Body\" (0,24 800x576) [editable,focusable]\n  #13 Button \"Save\" (700,0 80x24)\n";
         let nodes = parse_outline(outline);
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[1].id, 12);
-        assert_eq!(nodes[1].role, "TextBox");
+        assert_eq!(nodes[1].role, "TextField");
         assert_eq!(nodes[1].name.as_deref(), Some("Body"));
         assert!(nodes[1].states.iter().any(|s| s == "editable"));
         assert_eq!(nodes[2].name.as_deref(), Some("Save"));
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn parses_bracket_in_name_with_real_states() {
-        let outline = "#7 TextBox \"Item [1]\" (0,0 10x10) [editable,focusable]\n";
+        let outline = "#7 TextField \"Item [1]\" (0,0 10x10) [editable,focusable]\n";
         let nodes = parse_outline(outline);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].id, 7);
@@ -288,5 +288,16 @@ mod tests {
         assert!(nodes[0].states.iter().any(|s| s == "editable"));
         assert!(nodes[0].states.iter().any(|s| s == "focusable"));
         assert_eq!(nodes[0].states.len(), 2);
+    }
+
+    #[test]
+    fn first_editable_uses_role_fallback_for_textfield() {
+        let nodes = vec![OutlineNode {
+            id: 10,
+            role: "TextField".into(),
+            name: None,
+            states: vec![],
+        }];
+        assert_eq!(first_editable(&nodes).unwrap().id, 10);
     }
 }

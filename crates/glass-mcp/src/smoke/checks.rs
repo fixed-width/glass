@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn a11y_requires_a_nonempty_tree_in_an_untrusted_sibling() {
-        let outline = "⟦untrusted:abc⟧\n#1 Window \"Untitled\"\n  #2 TextBox \"Body\" [editable]\n⟦/untrusted:abc⟧";
+        let outline = "⟦untrusted:abc⟧\n#1 Window \"Untitled\"\n  #2 TextField \"Body\" [editable]\n⟦/untrusted:abc⟧";
         let mut t = ScriptedTransport::new(vec![(
             "glass_a11y_snapshot",
             Ok(ok("glass_a11y_snapshot", json!({}), vec![outline], 0)),
@@ -491,7 +491,7 @@ mod tests {
     fn nodes_with_editable() -> Vec<OutlineNode> {
         vec![OutlineNode {
             id: 12,
-            role: "TextBox".into(),
+            role: "TextField".into(),
             name: None,
             states: vec!["editable".into()],
         }]
