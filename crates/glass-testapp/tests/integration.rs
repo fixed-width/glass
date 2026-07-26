@@ -28,6 +28,24 @@ fn app_spec() -> AppSpec {
     }
 }
 
+/// Wait for the fixture's `EVENT pid=<n>` line (printed with READY at startup) and return it.
+/// Teardown tests need the pid itself: once the window is destroyed there is no `_NET_WM_PID`
+/// left to read it from.
+fn wait_for_app_pid(p: &mut X11Platform) -> u32 {
+    for _ in 0..40 {
+        for (_s, line) in p.drain_logs() {
+            if let Some(pid) = line
+                .strip_prefix("EVENT pid=")
+                .and_then(|r| r.trim().parse().ok())
+            {
+                return pid;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("fixture never reported its pid");
+}
+
 /// Drain logs repeatedly until `needle` appears or `tries` attempts elapse.
 fn wait_for_log(p: &mut X11Platform, needle: &str, tries: u32) -> bool {
     for _ in 0..tries {
@@ -1020,6 +1038,35 @@ fn clipboard_owner_answers_targets_and_refuses_unknown_target() {
 // Sandbox integration tests (bwrap + Xvfb)
 // ---------------------------------------------------------------------------
 
+/// A contained app must still be *asked* to close. The close request is addressed to a window
+/// found by `_NET_WM_PID` against the launched process tree, and under containment the process
+/// glass spawned is `bwrap`, not the app — so the window belongs to a descendant pid. If that
+/// walk failed, teardown would silently fall back to signalling every sandboxed app.
+#[test]
+#[ignore = "requires an X server + bwrap; run via scripts/test-x11.sh"]
+fn sandbox_default_app_is_still_asked_to_close() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        sandbox: glass_core::SandboxLevel::Default,
+        timeout_ms: 8000,
+        ..app_spec()
+    };
+    p.start_app(&spec)
+        .unwrap_or_else(|e| panic!("sandboxed start_app failed: {e}"));
+    assert!(
+        wait_for_log(&mut p, "READY", 60),
+        "never saw READY on stdout (sandboxed)"
+    );
+    p.stop_app().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        logs.iter().any(|l| l.contains("EVENT closed_gracefully")),
+        "a contained app must be asked to close like any other; got: {logs:?}"
+    );
+}
+
 /// Launch `glass-testapp` under `SandboxLevel::Default` — the app must find the
 /// X display through the `/tmp/.X11-unix` bind and render a non-blank frame.
 #[test]
@@ -1336,6 +1383,65 @@ fn sandbox_off_bypasses_bwrap_check() {
     p.start_app(&spec)
         .unwrap_or_else(|e| panic!("Off sandbox should not require bwrap: {e}"));
     p.stop_app().unwrap();
+}
+
+/// Teardown must ask the app to close (a `WM_DELETE_WINDOW` client message) so the app runs its
+/// own shutdown path. A signalled X11 toolkit app runs none — GTK and Qt install no `SIGTERM`
+/// handler — so anything it would flush on exit is lost and it can report a crash next launch.
+/// The fixture prints `EVENT closed_gracefully` from the handler, which only runs if it was asked.
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn stop_app_asks_the_app_to_close_before_signalling_it() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    p.start_app(&app_spec()).unwrap();
+    let pid = wait_for_app_pid(&mut p);
+    p.stop_app().unwrap();
+    // The fixture's line is written just before it exits, so drain after the reader thread has
+    // had a moment to pick it up off the pipe.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        logs.iter().any(|l| l.contains("EVENT closed_gracefully")),
+        "stop_app must ask the app to close so its shutdown path runs; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the app must still be gone after a graceful close (pid {pid})"
+    );
+}
+
+/// An app that never opted into `WM_DELETE_WINDOW` cannot be asked — it is required to ignore
+/// the message — so teardown must fall back to signalling it rather than waiting out the grace.
+#[test]
+#[ignore = "requires an X server; run via scripts/test-x11.sh"]
+fn stop_app_signals_an_app_that_cannot_be_asked_to_close() {
+    let xvfb = Xvfb::start();
+    let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
+    let spec = AppSpec {
+        run: vec![TESTAPP.to_string(), "--no-wm-delete".to_string()],
+        ..app_spec()
+    };
+    p.start_app(&spec).unwrap();
+    let pid = wait_for_app_pid(&mut p);
+    let t = std::time::Instant::now();
+    p.stop_app().unwrap();
+    let elapsed = t.elapsed();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let logs: Vec<String> = p.drain_logs().into_iter().map(|(_s, l)| l).collect();
+    assert!(
+        !logs.iter().any(|l| l.contains("EVENT closed_gracefully")),
+        "an app with no WM_DELETE_WINDOW protocol cannot have closed gracefully; got: {logs:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the app must be gone after teardown (pid {pid})"
+    );
+    assert!(
+        elapsed < glass_proc_linux::CLOSE_GRACE,
+        "teardown must not wait out the close grace for an app that was never asked \
+         (took {elapsed:?})"
+    );
 }
 
 #[test]

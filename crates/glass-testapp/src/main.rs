@@ -34,6 +34,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // behaves like a real toolkit app that does NOT grab focus in a WM-less
     // session — letting tests verify that glass itself focuses the window.
     let no_wm_pid = std::env::args().any(|a| a == "--no-wm-pid");
+    // `--no-wm-delete` drops WM_DELETE_WINDOW from WM_PROTOCOLS, so the fixture behaves like an
+    // app that cannot be *asked* to close (a raw X11 client that never opted into the protocol)
+    // and glass has to fall back to signalling it. Default (registered) matches every real
+    // toolkit app.
+    let no_wm_delete = std::env::args().any(|a| a == "--no-wm-delete");
     let reparent = std::env::args().any(|a| a == "--reparent");
     let no_self_focus = std::env::args().any(|a| a == "--no-self-focus");
     // `--fork-child` spawns a long-lived child process (a `sleep`) and prints its
@@ -102,6 +107,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         AtomEnum::STRING,
         b"glass-testapp\0glass-testapp\0",
     )?;
+
+    // Opt into WM_DELETE_WINDOW on the main window, like any toolkit app: a close request
+    // arrives as a client message this process handles itself (printing `EVENT
+    // closed_gracefully` before exiting) instead of the app being signalled out from under its
+    // own shutdown path. Only the main window carries it — closing it exits the process, which
+    // takes the `--windows N` extras with it.
+    let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
+    let wm_delete_window = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
+    if !no_wm_delete {
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            wm_protocols,
+            AtomEnum::ATOM,
+            &[wm_delete_window],
+        )?;
+    }
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::new())?;
@@ -213,15 +235,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::mem::forget(kid); // don't reap on drop; glass's group-reap must get it
     }
 
-    // Announce readiness on stdout (one line, flushed) so tests can sync.
+    // Announce readiness on stdout (one line, flushed) so tests can sync. The pid line lets a
+    // teardown test check the process itself is gone, which `_NET_WM_PID` cannot answer once the
+    // window has been destroyed.
+    println!("EVENT pid={}", std::process::id());
     println!("READY w={WIDTH} h={HEIGHT}");
     std::io::stdout().flush()?;
 
     if blink {
-        run_blink_loop(&conn, win, gc, &extras)
+        run_blink_loop(&conn, win, gc, &extras, (wm_protocols, wm_delete_window))
     } else {
-        run_event_loop(&conn, win, gc, &extras)
+        run_event_loop(&conn, win, gc, &extras, (wm_protocols, wm_delete_window))
     }
+}
+
+/// Whether the event loop should keep running after an event.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
 }
 
 /// Handle one X11 event the same way regardless of loop mode: paint on Expose, echo
@@ -231,9 +263,23 @@ fn dispatch_event(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
+    close: (Atom, Atom),
     event: Event,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Flow, Box<dyn std::error::Error>> {
+    let (wm_protocols, wm_delete_window) = close;
     match event {
+        // A close request (what a window manager sends on a close-button click, and what glass
+        // sends when tearing the app down). Announce that the app's own shutdown path ran, then
+        // exit — the whole point of being asked rather than signalled. Both the message type and
+        // its first data word are checked, so an unrelated client message whose payload happens
+        // to carry the atom's value cannot pass for one.
+        Event::ClientMessage(e)
+            if e.type_ == wm_protocols && e.data.as_data32()[0] == wm_delete_window =>
+        {
+            println!("EVENT closed_gracefully");
+            std::io::stdout().flush()?;
+            return Ok(Flow::Quit);
+        }
         Event::Expose(e) => {
             if e.window == win {
                 draw_quadrants(conn, win, gc)?;
@@ -270,7 +316,7 @@ fn dispatch_event(
         }
         _ => {}
     }
-    Ok(())
+    Ok(Flow::Continue)
 }
 
 /// Default loop: block on X11 events. Behavior unchanged from before `--blink` existed.
@@ -279,10 +325,13 @@ fn run_event_loop(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
+    close: (Atom, Atom),
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let event = conn.wait_for_event()?;
-        dispatch_event(conn, win, gc, extras, event)?;
+        if dispatch_event(conn, win, gc, extras, close, event)? == Flow::Quit {
+            return Ok(());
+        }
     }
 }
 
@@ -293,11 +342,14 @@ fn run_blink_loop(
     win: Window,
     gc: Gcontext,
     extras: &[(Window, u32)],
+    close: (Atom, Atom),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     loop {
         while let Some(event) = conn.poll_for_event()? {
-            dispatch_event(conn, win, gc, extras, event)?;
+            if dispatch_event(conn, win, gc, extras, close, event)? == Flow::Quit {
+                return Ok(());
+            }
         }
         let level = ((start.elapsed().as_millis() / BLINK_TICK_MS) % 256) as u8;
         draw_blink(conn, win, gc, level)?;

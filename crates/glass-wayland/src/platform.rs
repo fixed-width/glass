@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     AppSpec, Frame, GlassError, KeyEvent, Platform, PointerEvent, Region, Result, Stream,
-    WindowGeometry, WindowId, WindowInfo, WindowOp,
+    TEARDOWN_BUDGET, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
+use glass_proc_linux::{APP_REAP_GRACE, CLOSE_GRACE};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -36,6 +37,15 @@ use std::collections::HashMap;
 use crate::command::{LogSink, build_sway_command, sway_config};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
+
+// glass-mcp gives the whole of teardown `TEARDOWN_BUDGET` and then exits regardless, on a
+// `spawn_blocking` thread that cannot be cancelled — so an ask-then-signal ladder that fills the
+// budget would never get to the signal, and sway (plus Xwayland and the app) would outlive glass.
+// Bind both graces to it here; the a11y bus teardown that follows shares the remaining headroom.
+const _: () = assert!(
+    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
+);
 
 struct ActiveSession {
     child: Child,
@@ -79,16 +89,60 @@ impl WaylandPlatform {
         })
     }
 
+    /// Tear the session down: ask the app to close, then reap the compositor subtree.
+    ///
+    /// The app is asked first because signalling the compositor's process group gives a toolkit
+    /// app no shutdown path at all — GTK and Qt install no `SIGTERM` handler, so everything the
+    /// app would have flushed on exit is lost and it can come back reporting a crash. The group
+    /// reap still runs either way: it is what guarantees sway, Xwayland and the app are gone.
     fn kill_session(&mut self) {
         // Tear down the clipboard owner thread before the wayland socket disappears.
         if let Some(owner) = self.clipboard_owner.take() {
             owner.stop();
         }
         if let Some(mut s) = self.active.take() {
-            glass_proc_linux::reap_group(&mut s.child, glass_proc_linux::REAP_GRACE);
+            let (asked, unaskable) = request_close(&mut s.ipc);
+            let closed = asked > 0
+                && glass_proc_linux::await_condition(CLOSE_GRACE, || {
+                    // The app is gone from the compositor once it has no windows left. An IPC
+                    // error means sway is unreachable, which is not evidence the app closed, so
+                    // it reads as "still there" and the group reap below takes over.
+                    s.ipc.windows().is_ok_and(|w| w.is_empty())
+                });
+            glass_proc_linux::reap_group(&mut s.child, glass_proc_linux::APP_REAP_GRACE);
+            glass_proc_linux::disclose_teardown(glass_proc_linux::close_outcome(
+                asked, unaskable, closed,
+            ));
         }
         self.dbus = None;
     }
+}
+
+/// Ask every window in the session to close. Reports how many were asked and how many sway
+/// refused to pass the request to, so the caller can tell an app that could not be asked from a
+/// session that had no window to ask.
+///
+/// sway's `kill` is the compositor-side close request — `xdg_toplevel.close` to a native
+/// Wayland client, `WM_DELETE_WINDOW` to an Xwayland one — not a signal to the process. Under
+/// Wayland the *compositor* owns that ask, so glass goes through sway rather than talking to
+/// the client directly the way the X11 backend does.
+///
+/// Each window is asked separately so one failure doesn't drop the rest: a `kill` naming a
+/// container that has already gone is an error from sway, and batching would then abandon the
+/// windows after it in the list.
+fn request_close(ipc: &mut Ipc) -> (usize, usize) {
+    let Ok(windows) = ipc.windows() else {
+        return (0, 0);
+    };
+    let total = windows.len();
+    let asked = windows
+        .iter()
+        .filter(|w| {
+            ipc.run_command(&format!("[con_id={}] kill", w.con_id))
+                .is_ok()
+        })
+        .count();
+    (asked, total - asked)
 }
 
 impl Drop for WaylandPlatform {
