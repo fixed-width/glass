@@ -69,7 +69,7 @@ impl StdioClient {
                 .ok_or("no stdout on the spawned server")?,
         );
         let (tx, rx) = mpsc::channel();
-        let reader = Some(spawn_stdout_reader(stdout, tx));
+        let reader = Some(spawn_stdout_reader(stdout, tx)?);
         let mut c = Self {
             child,
             stdin,
@@ -134,10 +134,14 @@ impl StdioClient {
         }
     }
 
-    /// Kill and reap the child. Safe to call more than once — `std::process::
-    /// Child`'s `kill`/`wait` cache the exit status internally and turn a
-    /// repeat call into a no-op rather than re-signaling a pid that could by
-    /// then have been recycled for an unrelated process.
+    /// Kill and reap the child. Safe to call more than once: `std::process::
+    /// Child` guarantees a repeat `kill`/`wait` is a no-op rather than acting
+    /// on an unrelated process, though the mechanism differs by platform —
+    /// Unix caches the exit status after a successful `wait` and skips
+    /// re-signaling (which would otherwise risk hitting a pid recycled for a
+    /// different process); Windows targets a specific kernel object handle,
+    /// which can never alias to a different process no matter how many times
+    /// it's signaled or waited on.
     fn kill_and_reap(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -150,7 +154,10 @@ impl StdioClient {
 /// on the thread that's waiting for a specific response — is what lets that
 /// caller bound its wait with `recv_timeout` rather than being at the mercy of
 /// a `read_line` call `std` gives no way to time out directly on a pipe.
-fn spawn_stdout_reader(mut stdout: BufReader<ChildStdout>, tx: Sender<String>) -> JoinHandle<()> {
+fn spawn_stdout_reader(
+    mut stdout: BufReader<ChildStdout>,
+    tx: Sender<String>,
+) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("smoke-stdout".into())
         .spawn(move || {
@@ -166,7 +173,7 @@ fn spawn_stdout_reader(mut stdout: BufReader<ChildStdout>, tx: Sender<String>) -
                 }
             }
         })
-        .expect("spawn smoke stdout-reader thread")
+        .map_err(|e| format!("could not spawn the stdout-reader thread: {e}"))
 }
 
 /// Waits on `rx` for a JSON-RPC message whose `id` matches, skipping
@@ -312,17 +319,16 @@ mod tests {
         );
     }
 
-    /// Not run by default: spawns a real, indefinitely-running process with no
-    /// arguments (`yes`) and drives it through `StdioClient::spawn_with_timeout`
-    /// end to end, so it depends on a Unix coreutil that isn't guaranteed on
-    /// every platform this crate builds for. Verifies the actual guarantee —
-    /// that a timed-out request kills the child rather than leaving it
-    /// running — which `wait_for_response`'s unit tests above can't reach
-    /// (they never touch a real `Child`).
+    /// `#[cfg(unix)]` only (not `#[ignore]`): spawns a real, indefinitely-
+    /// running process with no arguments (`yes`, a standard coreutil present
+    /// on every Unix this crate builds for — unlike the genuinely
+    /// environment-dependent `#[ignore]`d tests elsewhere in this crate that
+    /// need Xvfb) and drives it through `StdioClient::spawn_with_timeout` end
+    /// to end. Verifies the actual guarantee — that a timed-out request kills
+    /// the child rather than leaving it running — which `wait_for_response`'s
+    /// unit tests above can't reach (they never touch a real `Child`).
     #[cfg(unix)]
     #[test]
-    #[ignore = "manual: spawns a real never-responding process; \
-                run via: cargo test -p glass-mcp smoke::client -- --ignored"]
     fn a_timed_out_request_kills_the_child() {
         let start = Instant::now();
         let err = StdioClient::spawn_with_timeout(
