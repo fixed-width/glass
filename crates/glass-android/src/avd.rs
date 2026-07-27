@@ -201,6 +201,11 @@ impl EmulatorRegistry {
     }
 }
 
+/// How long a booting emulator may take to reach `sys.boot_completed` when
+/// `GLASS_EMULATOR_BOOT_TIMEOUT_MS` is unset. Public because a client that waits out a boot has to
+/// outlast the budget granted here.
+pub const DEFAULT_BOOT_TIMEOUT_MS: u64 = 120_000;
+
 /// Boot the configured AVD headless and return the serial of the device that came up.
 /// Spawns the emulator detached, waits for a new device + `sys.boot_completed`, and
 /// errors (after killing the half-booted emulator) on timeout or spawn failure.
@@ -221,7 +226,7 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
 
     let timeout_ms: u64 = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(120_000);
+        .unwrap_or(DEFAULT_BOOT_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if let Ok(Some(status)) = child.try_wait() {

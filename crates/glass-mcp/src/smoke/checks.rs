@@ -27,6 +27,18 @@ fn excerpt(s: &str) -> String {
     format!("{}…", s.chars().take(MAX).collect::<String>())
 }
 
+/// The candidates this run did not select, as a line telling the caller how to choose one. Which
+/// candidates those are is decided in `smoke::alternatives`, where the resolution policy and the
+/// search path are known; a backend with nothing to offer appends nothing at all.
+fn other_candidates(p: &Profile) -> Option<String> {
+    (!p.alternatives.is_empty()).then(|| {
+        format!(
+            "other candidates: {} — select with --app",
+            p.alternatives.join(", ")
+        )
+    })
+}
+
 pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     let mut run = vec![Value::String(p.app.bin.to_string())];
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
@@ -34,10 +46,9 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     if !p.app.env.is_empty() {
         args["env"] = p.app.env.iter().copied().collect();
     }
-    outcome(
-        1,
-        "start",
-        t.call("glass_start", args).and_then(|r| {
+    let launched = t
+        .call_with_deadline("glass_start", args, p.start_deadline)
+        .and_then(|r| {
             let result = check_envelope("glass_start", &r)?;
             for field in ["x", "y", "width", "height"] {
                 if !result[field].is_number() {
@@ -45,8 +56,12 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
                 }
             }
             Ok(format!("{}x{}", result["width"], result["height"]))
-        }),
-    )
+        })
+        .map_err(|e| match other_candidates(p) {
+            Some(offer) => format!("{e}; {offer}"),
+            None => e,
+        });
+    outcome(1, "start", launched)
 }
 
 pub fn check_health(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
@@ -377,7 +392,8 @@ mod tests {
     use super::*;
     use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
-    use crate::smoke::transport::{CallResult, ScriptedTransport};
+    use crate::smoke::transport::{CALL_TIMEOUT, CallResult, ScriptedTransport};
+    use std::time::Duration;
 
     fn ok(tool: &str, result: Value, siblings: &[&str], images: usize) -> CallResult {
         CallResult::ok(tool, result, siblings, images)
@@ -392,10 +408,14 @@ mod tests {
         }
     }
 
+    /// Offers nothing: what a run offers is decided by `smoke::alternatives`, so a test that wants
+    /// an offer states it.
     fn profile() -> Profile {
         Profile {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
+            alternatives: vec![],
+            start_deadline: CALL_TIMEOUT,
         }
     }
 
@@ -403,6 +423,8 @@ mod tests {
         Profile {
             backend: "wayland".into(),
             app: &WAYLAND_CANDIDATES[0],
+            alternatives: vec![],
+            start_deadline: CALL_TIMEOUT,
         }
     }
 
@@ -457,6 +479,109 @@ mod tests {
         let _ = check_start(&mut t, &profile());
         let args = t.args_for("glass_start").expect("glass_start was called");
         assert!(args.get("env").is_none(), "got: {args}");
+    }
+
+    /// Check 1 is the only call that may wait out a device boot, and the profile is where that budget
+    /// is decided. A hardcoded deadline here would ignore it silently.
+    #[test]
+    fn start_is_called_with_the_profiles_deadline() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Ok(CallResult::ok(
+                "glass_start",
+                json!({ "x": 0, "y": 0, "width": 8, "height": 6 }),
+                &[],
+                0,
+            )),
+        )]);
+        let mut p = profile();
+        p.start_deadline = Duration::from_secs(321);
+        let _ = check_start(&mut t, &p);
+        assert_eq!(
+            t.deadline_for("glass_start"),
+            Some(Duration::from_secs(321))
+        );
+    }
+
+    /// A failed launch is the only place a run tells the operator what else it could have driven,
+    /// and the launch error it failed with has to survive alongside the offer.
+    #[test]
+    fn a_failed_start_names_the_candidates_it_did_not_try() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Err("Error type 3: Activity class does not exist".to_string()),
+        )]);
+        let mut p = profile();
+        p.app = &X11_CANDIDATES[0];
+        p.alternatives = vec!["gnome-text-editor", "zenity", "xterm"];
+        let out = check_start(&mut t, &p);
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(
+            out.detail.contains("Activity class does not exist"),
+            "the launch error must survive: {}",
+            out.detail
+        );
+        for other in ["gnome-text-editor", "zenity", "xterm"] {
+            assert!(
+                out.detail.contains(other),
+                "must offer {other}: {}",
+                out.detail
+            );
+        }
+        assert!(out.detail.contains("--app"), "must say how: {}", out.detail);
+    }
+
+    /// A run with nothing else to offer must append nothing: a dangling "other candidates:" reads
+    /// as an offer.
+    #[test]
+    fn a_run_with_nothing_to_offer_appends_nothing() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
+        let mut p = profile();
+        p.app = &X11_CANDIDATES[0];
+        p.alternatives = vec![];
+        let out = check_start(&mut t, &p);
+        assert_eq!(out.detail, "boom", "nothing to offer, so nothing appended");
+    }
+
+    /// The offer belongs to failure. A passing launch must report geometry and nothing else — from
+    /// a profile that has something to offer, or the assertion holds however the offer is scoped.
+    #[test]
+    fn a_successful_start_carries_no_offer() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Ok(CallResult::ok(
+                "glass_start",
+                json!({ "x": 0, "y": 0, "width": 8, "height": 6 }),
+                &[],
+                0,
+            )),
+        )]);
+        let mut p = profile();
+        p.alternatives = vec!["gnome-text-editor", "zenity"];
+        let out = check_start(&mut t, &p);
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            !out.detail.contains("--app"),
+            "a pass has no alternatives to offer: {}",
+            out.detail
+        );
+    }
+
+    /// Only the launch gets the derived budget: waiting out a device boot on top of an ordinary
+    /// call is justified where a boot can happen and nowhere else.
+    #[test]
+    fn a_check_that_cannot_boot_a_device_uses_the_default_deadline() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_screenshot",
+            Ok(CallResult::ok(
+                "glass_screenshot",
+                json!({ "width": 8, "height": 6 }),
+                &[],
+                1,
+            )),
+        )]);
+        let _ = check_screenshot(&mut t);
+        assert_eq!(t.deadline_for("glass_screenshot"), Some(CALL_TIMEOUT));
     }
 
     #[test]

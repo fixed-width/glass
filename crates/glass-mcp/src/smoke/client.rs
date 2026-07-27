@@ -15,7 +15,7 @@
 //! reader joins are bounded by [`READER_JOIN_TIMEOUT`], and a failed kill or
 //! reap is reported rather than discarded.
 
-use crate::smoke::transport::{CallResult, McpTransport};
+use crate::smoke::transport::{CALL_TIMEOUT, CallResult, McpTransport};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -25,9 +25,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-/// A server that has not answered in this long is treated as hung.
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long teardown waits for a reader thread to exit before abandoning it: only something
 /// else still holding the child's write end — a grandchild, say — reaches this bound, and an
@@ -86,15 +83,25 @@ impl<W: Write> Session<W> {
         self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
-    /// Send a request and wait for its matching response, bounded by `self.timeout` for the whole
+    /// Send a request and wait for its matching response, bounded by `deadline` for the whole
     /// round trip. Killing the child on failure is the caller's job.
-    pub(super) fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    pub(super) fn request_with_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value, String> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(
             &serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         )?;
-        wait_for_response(&self.rx, id, self.timeout).map_err(|e| format!("{method}: {e}"))
+        wait_for_response(&self.rx, id, deadline).map_err(|e| format!("{method}: {e}"))
+    }
+
+    /// Bounded by `self.timeout`, the per-session default set at construction.
+    pub(super) fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_deadline(method, params, self.timeout)
     }
 
     pub(super) fn initialize(&mut self) -> Result<(), String> {
@@ -117,15 +124,25 @@ impl<W: Write> Session<W> {
         self.notify("notifications/initialized", serde_json::json!({}))
     }
 
-    pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
-        let v = self.request(
+    pub(super) fn call_tool_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String> {
+        let v = self.request_with_deadline(
             "tools/call",
             serde_json::json!({ "name": tool, "arguments": args }),
+            deadline,
         )?;
         if let Some(err) = v.get("error") {
             return Err(format!("{tool}: JSON-RPC error {err}"));
         }
         Ok(CallResult::from_mcp(&v["result"]))
+    }
+
+    pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        self.call_tool_with_deadline(tool, args, self.timeout)
     }
 
     /// Drop the receiving end of the reader thread's channel so its next `send` fails and it
@@ -398,6 +415,22 @@ fn wait_for_response(rx: &Receiver<String>, id: i64, budget: Duration) -> Result
 }
 
 impl McpTransport for StdioClient {
+    fn call_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String> {
+        match self.session.call_tool_with_deadline(tool, args, deadline) {
+            Ok(r) => Ok(r),
+            Err(e) => Err(self.on_failure(e)),
+        }
+    }
+
+    /// Overrides the trait's default rather than inheriting it, so a `Session` constructed with
+    /// its own timeout (the test seam that exercises the hang/timeout path without a real
+    /// multi-minute wait) still governs an un-deadlined call, exactly as it did before
+    /// `call_with_deadline` existed.
     fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
         match self.session.call_tool(tool, args) {
             Ok(r) => Ok(r),
@@ -889,6 +922,76 @@ exec sleep 10
             Some(serde_json::json!({
                 "ok": true, "tool": "glass_stop", "result": { "stopped": true }
             }))
+        );
+    }
+
+    /// `call_with_deadline`'s own contract, distinct from `call`'s: it must reach the server and
+    /// carry back what it answered, not a value built without asking. A body replaced by
+    /// `Ok(Default::default())` returns an envelope-less `Ok` and would pass `call`'s coverage
+    /// (which never touches this method) while going undetected here too if this test only
+    /// checked `is_ok()` — so it pins the actual envelope.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_returns_the_servers_envelope() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"tool\":\"glass_stop\",\"result\":{\"stopped\":true}}"}],"isError":false}}"#;
+        let (_dir, exe) = write_stub(&stub_answering(&format!("    printf '%s\\n' '{reply}'")));
+        let mut client = spawn_stub(&exe);
+        let r = client
+            .call_with_deadline("glass_stop", serde_json::json!({}), Duration::from_secs(5))
+            .expect("the stub answers the call");
+        assert_eq!(
+            r.envelope,
+            Some(serde_json::json!({
+                "ok": true, "tool": "glass_stop", "result": { "stopped": true }
+            }))
+        );
+    }
+
+    /// The deadline `call_with_deadline` is *given* governs, not the session's own configured
+    /// timeout: spawned with a 5s session timeout (`spawn_stub`'s `STUB_TIMEOUT`), a call whose
+    /// explicit deadline is a tenth of a second must time out at that tenth of a second, not wait
+    /// out the full 5s. A body that read `self.timeout` instead of `deadline` would pass this
+    /// slowly (5s) rather than fail it — the elapsed-time bound is what tells the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_times_out_on_its_own_deadline_not_the_sessions() {
+        let (_dir, exe) = write_stub(&stub_answering("    :"));
+        let mut client = spawn_stub(&exe);
+        let start = Instant::now();
+        let e = client
+            .call_with_deadline(
+                "glass_stop",
+                serde_json::json!({}),
+                Duration::from_millis(100),
+            )
+            .expect_err("a stub that never answers must time out");
+        assert!(e.contains("no response within"), "expected a timeout: {e}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a 100ms deadline must not wait out the session's 5s timeout: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The mirror of the previous test, and the one that actually tells "honours its own
+    /// deadline" apart from "honours whichever of the two is shorter": spawned with a 100ms
+    /// session timeout, a call whose explicit deadline is 2s must still succeed against a stub
+    /// that answers after 300ms — past the session's own timeout, but well within the explicit
+    /// deadline. A body that blended or floored the deadline at the session's timeout would time
+    /// this call out; only reading the given deadline on its own lets it succeed.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_is_not_shortened_by_the_sessions_own_timeout() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"tool\":\"glass_stop\",\"result\":{}}"}],"isError":false}}"#;
+        let on_call = format!("    sleep 0.3\n    printf '%s\\n' '{reply}'");
+        let (_dir, exe) = write_stub(&stub_answering(&on_call));
+        let mut client = spawn_stub_with_timeout(&exe, Duration::from_millis(100));
+        let r = client
+            .call_with_deadline("glass_stop", serde_json::json!({}), Duration::from_secs(2))
+            .expect("a 2s deadline must outlast the session's own 100ms timeout");
+        assert_eq!(
+            r.envelope,
+            Some(serde_json::json!({ "ok": true, "tool": "glass_stop", "result": {} }))
         );
     }
 

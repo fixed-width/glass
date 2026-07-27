@@ -4,7 +4,8 @@ use std::ffi::OsStr;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate {
-    /// Executable to look for on PATH.
+    /// What to launch: an executable name resolved on `PATH`, or — on a backend whose targets live
+    /// on a device — the `package/.Activity` component to start there.
     pub bin: &'static str,
     /// Its arguments. Must open a non-destructive, unsaved surface.
     pub args: &'static [&'static str],
@@ -72,10 +73,44 @@ pub const WAYLAND_CANDIDATES: [Candidate; 3] = [
     },
 ];
 
+/// Android targets are `package/.Activity` components rather than executables, so `bin` holds the
+/// component and `args` is empty: `am start` launches an activity, and there is no argument vector
+/// to fill. `env` is empty because on android `AppSpec.env` configures the host-side command, never
+/// the launched app — which is forked from zygote and never sees it.
+///
+/// Nothing probes the device, so this is not a fallback chain: `contacts` is what a run drives
+/// unless `--app` says otherwise.
+pub const ANDROID_CANDIDATES: [Candidate; 2] = [
+    // The only stock component found with a directly editable field on its first screen, which is
+    // what the interaction check needs. It opens an unsaved contact draft: nothing saves it, and
+    // the stop check force-stops the package rather than closing a window.
+    Candidate {
+        bin: "com.google.android.contacts/com.android.contacts.activities.CompactContactEditorActivity",
+        args: &[],
+        env: &[],
+        label: "contacts",
+    },
+    // For system images without the Google apps. It launches everywhere and exposes a tree, but
+    // has no editable field, so the interaction check skips rather than passing.
+    Candidate {
+        bin: "com.android.settings/.Settings",
+        args: &[],
+        env: &[],
+        label: "settings",
+    },
+];
+
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub backend: String,
     pub app: &'static Candidate,
+    /// What a failed launch may offer instead, as the labels `--app` accepts. Resolved where the
+    /// backend's resolution policy and search path are both known, so a backend that probes never
+    /// offers a candidate that probe already found absent.
+    pub alternatives: Vec<&'static str>,
+    /// How long the launch may take. Larger than every other call's budget only where a launch
+    /// may boot a device first.
+    pub start_deadline: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,24 +174,49 @@ fn bin_list(candidates: &[Candidate]) -> String {
         .join(", ")
 }
 
-/// Pick the first candidate runnable on `path` — the value of `PATH`, or `None` when the
-/// variable is unset. Taking the search path as a parameter is what lets the probe be tested
-/// against a directory the test controls rather than the host's real environment.
+/// How a backend's target app is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// Probe `PATH` and take the first candidate that resolves.
+    OnPath,
+    /// Take the first candidate as given. The target ships with the device's system image, and
+    /// nothing this process can run says whether this particular one is there — so the table's
+    /// first row is the default and the rest are reachable only through `--app`.
+    Preinstalled,
+}
+
+/// Pick the candidate this backend's policy selects. Under [`Resolution::OnPath`], the first one
+/// runnable on `path` — the value of `PATH`, or `None` when the variable is unset. Taking the
+/// search path as a parameter is what lets the probe be tested against a directory the test
+/// controls rather than the host's real environment.
 pub fn resolve_app(
     candidates: &'static [Candidate],
     path: Option<&OsStr>,
+    how: Resolution,
 ) -> Result<&'static Candidate, NoTargetApp> {
-    let path = path.ok_or(NoTargetApp::NoSearchPath)?;
-    candidates
-        .iter()
-        .find(|c| on_path_in(c.bin, path))
-        .ok_or(NoTargetApp::NoneInstalled)
+    match how {
+        // `first`, not `[0]`: an empty table is a programming error a test catches, not a reason
+        // to panic inside a release binary's smoke run.
+        Resolution::Preinstalled => candidates.first().ok_or(NoTargetApp::NoneInstalled),
+        Resolution::OnPath => {
+            let path = path.ok_or(NoTargetApp::NoSearchPath)?;
+            candidates
+                .iter()
+                .find(|c| on_path_in(c.bin, path))
+                .ok_or(NoTargetApp::NoneInstalled)
+        }
+    }
 }
 
-/// Is this specific candidate runnable, without regard to probe order? What `--app` needs:
-/// the caller has already chosen the candidate and only asks whether it could run.
-pub fn runnable(candidate: &Candidate, path: Option<&OsStr>) -> bool {
-    path.is_some_and(|p| on_path_in(candidate.bin, p))
+/// Is this specific candidate runnable, without regard to probe order? What `--app` needs: the
+/// caller has already chosen the candidate and only asks whether it could run. Under
+/// [`Resolution::Preinstalled`] that question has no answer this process can obtain, and the
+/// honest response is the one that does not invent a failure.
+pub fn runnable(candidate: &Candidate, path: Option<&OsStr>, how: Resolution) -> bool {
+    match how {
+        Resolution::Preinstalled => true,
+        Resolution::OnPath => path.is_some_and(|p| on_path_in(candidate.bin, p)),
+    }
 }
 
 /// Is `bin` runnable as a bare command name on `path`? Delegates to the workspace's one
@@ -316,14 +376,14 @@ mod tests {
     #[test]
     fn resolve_picks_the_first_present_candidate() {
         let (_dir, path) = path_fixture(&["zenity", "xterm"], &[]);
-        let c = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap();
+        let c = resolve_app(&X11_CANDIDATES, Some(&path), Resolution::OnPath).unwrap();
         assert_eq!(c.label, "zenity");
     }
 
     #[test]
     fn resolve_reports_none_installed_when_the_path_holds_no_candidate() {
         let (_dir, path) = path_fixture(&[], &[]);
-        let err = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap_err();
+        let err = resolve_app(&X11_CANDIDATES, Some(&path), Resolution::OnPath).unwrap_err();
         assert_eq!(err, NoTargetApp::NoneInstalled);
     }
 
@@ -333,7 +393,7 @@ mod tests {
     #[test]
     fn a_non_executable_file_is_not_a_candidate() {
         let (_dir, path) = path_fixture(&["xterm"], &["xed"]);
-        let c = resolve_app(&X11_CANDIDATES, Some(&path)).unwrap();
+        let c = resolve_app(&X11_CANDIDATES, Some(&path), Resolution::OnPath).unwrap();
         assert_eq!(
             c.label, "xterm",
             "a mode-644 file named xed must be skipped, not selected"
@@ -346,17 +406,51 @@ mod tests {
         let (_dir, path) = path_fixture(&["zenity"], &[]);
         let zenity = X11_CANDIDATES.iter().find(|c| c.bin == "zenity").unwrap();
         let xterm = X11_CANDIDATES.iter().find(|c| c.bin == "xterm").unwrap();
-        assert!(runnable(zenity, Some(&path)));
-        assert!(!runnable(xterm, Some(&path)));
-        assert!(!runnable(zenity, None), "an unset PATH resolves nothing");
+        assert!(runnable(zenity, Some(&path), Resolution::OnPath));
+        assert!(!runnable(xterm, Some(&path), Resolution::OnPath));
+        assert!(
+            !runnable(zenity, None, Resolution::OnPath),
+            "an unset PATH resolves nothing"
+        );
     }
 
     /// An unset `PATH` is its own case: no amount of installing fixes it, so it must not be
     /// reported as "nothing installed".
     #[test]
     fn an_unset_path_is_not_reported_as_nothing_installed() {
-        let err = resolve_app(&X11_CANDIDATES, None).unwrap_err();
+        let err = resolve_app(&X11_CANDIDATES, None, Resolution::OnPath).unwrap_err();
         assert_eq!(err, NoTargetApp::NoSearchPath);
+    }
+
+    /// Preinstalled resolution answers without consulting `PATH`: on a device backend there is
+    /// nothing on this host to consult, and probing would report a working host as broken.
+    #[test]
+    fn preinstalled_resolution_takes_the_first_row_without_a_search_path() {
+        let c = resolve_app(&X11_CANDIDATES, None, Resolution::Preinstalled)
+            .expect("a preinstalled target does not depend on this host's PATH");
+        assert_eq!(c.label, X11_CANDIDATES[0].label);
+    }
+
+    /// The policy is what decides, not the arguments: the same unset `PATH` that resolves fine
+    /// above is still terminal for a backend that resolves by probing.
+    #[test]
+    fn on_path_resolution_still_needs_a_search_path() {
+        assert_eq!(
+            resolve_app(&X11_CANDIDATES, None, Resolution::OnPath).unwrap_err(),
+            NoTargetApp::NoSearchPath
+        );
+    }
+
+    /// `--app`'s probe asks "could this candidate run here?", which no code in this process can
+    /// answer about a device. Answering `false` would make `--dry-run` report a working host as
+    /// unable to run the app it is about to drive.
+    #[test]
+    fn runnable_is_true_under_preinstalled_even_when_nothing_is_on_path() {
+        let (_dir, path) = path_fixture(&[], &[]);
+        let c = &X11_CANDIDATES[0];
+        assert!(!runnable(c, Some(&path), Resolution::OnPath));
+        assert!(runnable(c, Some(&path), Resolution::Preinstalled));
+        assert!(runnable(c, None, Resolution::Preinstalled));
     }
 
     #[test]
@@ -559,17 +653,18 @@ mod tests {
     /// a `serde_json::Map`, where the later value wins on the wire without anything saying so.
     #[test]
     fn every_candidates_env_is_a_well_formed_map() {
-        for (backend, candidates) in crate::smoke::DRIVABLE {
-            for c in *candidates {
+        for b in crate::smoke::DRIVABLE {
+            for c in b.candidates {
                 let mut seen = std::collections::BTreeSet::new();
                 for (k, v) in c.env {
-                    assert!(!k.is_empty(), "{backend}/{}: empty env key", c.label);
+                    assert!(!k.is_empty(), "{}/{}: empty env key", b.name, c.label);
                     assert!(
                         !v.is_empty(),
-                        "{backend}/{}: empty value for {k:?}",
+                        "{}/{}: empty value for {k:?}",
+                        b.name,
                         c.label
                     );
-                    assert!(seen.insert(k), "{backend}/{}: {k:?} set twice", c.label);
+                    assert!(seen.insert(k), "{}/{}: {k:?} set twice", b.name, c.label);
                 }
             }
         }
@@ -600,7 +695,7 @@ mod tests {
     #[test]
     fn resolve_picks_the_first_present_wayland_candidate() {
         let (_dir, path) = path_fixture(&["zenity", "gnome-text-editor"], &[]);
-        let c = resolve_app(&WAYLAND_CANDIDATES, Some(&path)).unwrap();
+        let c = resolve_app(&WAYLAND_CANDIDATES, Some(&path), Resolution::OnPath).unwrap();
         assert_eq!(c.label, "gnome-text-editor");
     }
 }
