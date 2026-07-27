@@ -72,6 +72,33 @@ pub const WAYLAND_CANDIDATES: [Candidate; 3] = [
     },
 ];
 
+/// Android targets are `package/.Activity` components rather than executables, so `bin` holds the
+/// component and `args` is empty: `am start` launches an activity, and there is no argument vector
+/// to fill. `env` is empty because on android `AppSpec.env` configures the host-side command, never
+/// the launched app — which is forked from zygote and never sees it.
+///
+/// Nothing probes the device, so this is not a fallback chain: `contacts` is what a run drives
+/// unless `--app` says otherwise.
+pub const ANDROID_CANDIDATES: [Candidate; 2] = [
+    // The only stock component found with a directly editable field on its first screen, which is
+    // what the interaction check needs. It opens an unsaved contact draft: nothing saves it, and
+    // the stop check force-stops the package rather than closing a window.
+    Candidate {
+        bin: "com.google.android.contacts/com.android.contacts.activities.CompactContactEditorActivity",
+        args: &[],
+        env: &[],
+        label: "contacts",
+    },
+    // For system images without the Google apps. It launches everywhere and exposes a tree, but
+    // has no editable field, so the interaction check skips rather than passing.
+    Candidate {
+        bin: "com.android.settings/.Settings",
+        args: &[],
+        env: &[],
+        label: "settings",
+    },
+];
+
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub backend: String,

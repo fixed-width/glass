@@ -101,7 +101,7 @@ pub enum Command {
     /// Drive glass's own MCP tools against a real app and report whether this build
     /// works. Experimental: not part of the stable tool surface.
     Smoke {
-        /// Backend to exercise. The smoke runner drives x11 and wayland.
+        /// Backend to exercise. The smoke runner drives x11, wayland and android.
         #[arg(long, default_value = crate::smoke::DEFAULT_BACKEND)]
         backend: String,
         /// Write the JSON report to PATH (the text report always goes to stdout).

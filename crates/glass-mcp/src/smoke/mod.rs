@@ -12,7 +12,9 @@ pub mod transport;
 
 use std::ffi::OsStr;
 
-use profile::{Candidate, Profile, Resolution, WAYLAND_CANDIDATES, X11_CANDIDATES};
+use profile::{
+    ANDROID_CANDIDATES, Candidate, Profile, Resolution, WAYLAND_CANDIDATES, X11_CANDIDATES,
+};
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
 
 pub struct SmokeOptions {
@@ -49,6 +51,12 @@ const DRIVABLE: &[DrivableBackend] = &[
         resolution: Resolution::OnPath,
         boots_a_device: false,
     },
+    DrivableBackend {
+        name: "android",
+        candidates: &ANDROID_CANDIDATES,
+        resolution: Resolution::Preinstalled,
+        boots_a_device: true,
+    },
 ];
 
 /// The drivable backend names, in table order, for a message that tells the caller what to pass.
@@ -63,16 +71,32 @@ pub const DEFAULT_BACKEND: &str = DRIVABLE[0].name;
 /// The reference doc's target-app table, rendered from [`DRIVABLE`]. A doc-sync test compares it
 /// against the checked-in markdown, so a candidate can't land in the code and not in the docs.
 pub fn render_candidate_table() -> String {
-    let mut out = String::from("| Backend | Candidates, in probe order |\n|---|---|\n");
+    let mut out = String::from("| Backend | Chosen by | Candidates, in order |\n|---|---|---|\n");
     for b in DRIVABLE {
-        let bins: Vec<String> = b
-            .candidates
-            .iter()
-            .map(|c| format!("`{}`", c.bin))
-            .collect();
-        out.push_str(&format!("| `{}` | {} |\n", b.name, bins.join(", ")));
+        let how = match b.resolution {
+            Resolution::OnPath => "first runnable on `PATH`",
+            Resolution::Preinstalled => {
+                "preinstalled; the first row is the default, the rest need `--app`"
+            }
+        };
+        let names: Vec<String> = b.candidates.iter().map(render_candidate).collect();
+        out.push_str(&format!(
+            "| `{}` | {how} | {} |\n",
+            b.name,
+            names.join(", ")
+        ));
     }
     out
+}
+
+/// A candidate as the doc names it: the label alone where it is also the target, and the target
+/// beside it where the two differ — as they do for a component nobody would want to read twice.
+fn render_candidate(c: &Candidate) -> String {
+    if c.label == c.bin {
+        format!("`{}`", c.label)
+    } else {
+        format!("`{}` (`{}`)", c.label, c.bin)
+    }
 }
 
 /// The clause both resolution errors carry, spelled once so a test can scope its assertion to
@@ -445,7 +469,7 @@ mod tests {
     fn a_backend_glass_knows_but_smoke_cannot_drive_yet_says_so() {
         let err = run_with(
             SmokeOptions {
-                backend: "android".into(),
+                backend: "ios".into(),
                 app: None,
                 dry_run: true,
             },
@@ -453,7 +477,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("android"),
+            err.contains("ios"),
             "must name the backend asked for: {err}"
         );
         let drives = drives_clause(&err);
@@ -507,7 +531,7 @@ mod tests {
     /// nothing, and would stay green both if a name changed and if the table were emptied.
     #[test]
     fn drivable_backends_lists_every_row_of_the_table() {
-        assert_eq!(drivable_backends(), ["x11", "wayland"]);
+        assert_eq!(drivable_backends(), ["x11", "wayland", "android"]);
     }
 
     /// `xed` heads both tables, so naming one candidate would not tell the two apart.
@@ -613,5 +637,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("emacs"), "got: {err}");
+    }
+
+    /// The whole point of `Preinstalled`: an android plan resolves with no search path at all,
+    /// because `PATH` says nothing about what is installed on a device.
+    #[test]
+    fn an_android_plan_names_the_default_component_without_a_search_path() {
+        let r = run_with(
+            SmokeOptions {
+                backend: "android".into(),
+                app: None,
+                dry_run: true,
+            },
+            None,
+        )
+        .expect("android must be drivable with no PATH");
+        assert_eq!(r.backend, "android");
+        assert_eq!(r.app, TargetApp::Selected("contacts".into()));
+        assert_eq!(
+            detail_of(&r, "start"),
+            "dry run",
+            "nothing was probed, so there is no gap to report"
+        );
+    }
+
+    /// Without a probe the table is not a fallback chain — every row but the first exists only for
+    /// `--app`, so `--app` has to reach them.
+    #[test]
+    fn an_android_plan_honours_a_forced_candidate() {
+        let r = run_with(
+            SmokeOptions {
+                backend: "android".into(),
+                app: Some("settings".into()),
+                dry_run: true,
+            },
+            None,
+        )
+        .expect("android must be drivable with no PATH");
+        assert_eq!(r.app, TargetApp::Selected("settings".into()));
+    }
+
+    /// `--app` selects among the backend's own candidates. An x11 label must not resolve here, or a
+    /// run would try to launch `xed` as an activity component.
+    #[test]
+    fn an_android_forced_app_resolves_against_the_android_table() {
+        let err = run_with(
+            SmokeOptions {
+                backend: "android".into(),
+                app: Some("xed".into()),
+                dry_run: true,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("xed"), "must name the app asked for: {err}");
+        let (_, offered) = err
+            .split_once("use one of: ")
+            .unwrap_or_else(|| panic!("must offer the backend's candidates: {err}"));
+        for label in ["contacts", "settings"] {
+            assert!(offered.contains(label), "must offer {label:?}: {err}");
+        }
+    }
+
+    /// The rendered doc names the component for a candidate whose label is not its target, and does
+    /// not repeat itself for one whose label is. Written against the two shapes rather than against
+    /// the renderer, which would agree with itself.
+    #[test]
+    fn the_rendered_table_names_a_component_but_does_not_repeat_a_bare_label() {
+        let t = render_candidate_table();
+        assert!(
+            t.contains(
+                "`contacts` (`com.google.android.contacts/com.android.contacts.activities.CompactContactEditorActivity`)"
+            ),
+            "an android row must name the component an operator would pass: {t}"
+        );
+        assert!(
+            !t.contains("`xed` (`xed`)"),
+            "a candidate whose label is its target must be named once: {t}"
+        );
+    }
+
+    /// A reader has to know that android's table is not a fallback chain, and the only place the doc
+    /// can learn it is the renderer.
+    #[test]
+    fn the_rendered_table_says_how_each_backend_chooses() {
+        let t = render_candidate_table();
+        assert!(t.contains("first runnable on `PATH`"), "{t}");
+        assert!(t.contains("the first row is the default"), "{t}");
     }
 }

@@ -16,15 +16,20 @@ server is given `GLASS_BACKEND` set to the backend under test, overriding any am
 
 ## Target apps
 
-A real run drives a stock app installed on the host. Each backend has a candidate list; the run
-probes it in order and takes the first one runnable on `PATH`, recording the choice in the report's
-`app` field. `--app <name>` selects a specific candidate instead.
+A real run drives a stock app, and each backend has a candidate list it chooses from — recording
+the choice in the report's `app` field. How it chooses depends on where the app lives. On `x11`
+and `wayland` the candidates are executables, so the run probes `PATH` and takes the first one
+installed. On `android` the candidate is a `package/.Activity` component on the device, which
+nothing on the host can see, so the run takes the first row as given and never probes: the list is
+a set of choices, not a fallback chain. `--app <name>` selects a different candidate on any
+backend.
 
 <!-- BEGIN GENERATED: smoke-candidates -->
-| Backend | Candidates, in probe order |
-|---|---|
-| `x11` | `xed`, `gnome-text-editor`, `zenity`, `xterm` |
-| `wayland` | `xed`, `gnome-text-editor`, `zenity` |
+| Backend | Chosen by | Candidates, in order |
+|---|---|---|
+| `x11` | first runnable on `PATH` | `xed`, `gnome-text-editor`, `zenity`, `xterm` |
+| `wayland` | first runnable on `PATH` | `xed`, `gnome-text-editor`, `zenity` |
+| `android` | preinstalled; the first row is the default, the rest need `--app` | `contacts` (`com.google.android.contacts/com.android.contacts.activities.CompactContactEditorActivity`), `settings` (`com.android.settings/.Settings`) |
 <!-- END GENERATED: smoke-candidates -->
 
 A wayland run launches its target with `GDK_BACKEND=wayland`, so a toolkit that cannot use the
@@ -35,6 +40,11 @@ wayland candidate.
 A `--backend wayland` run also needs a discoverable sway ≥ 1.12 — the backend spawns a private
 headless one per session, and [Set up Linux](../how-to/setup-linux.md#wayland-sway) covers where it
 looks. Without one, check 1 (`start`) fails: there is no compositor to launch the app into.
+
+An `android` run needs a reachable `adb` and either an online device or an AVD glass can boot —
+`glass-mcp doctor` reports both under `android`. Because nothing probes the device, a component
+that is not installed on the image under test fails check 1 (`start`) with the launch error the
+device reported; the failure names the other candidates and how to select one.
 
 ## Checks
 
