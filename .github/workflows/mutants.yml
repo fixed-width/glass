@@ -1,0 +1,39 @@
+name: Mutation sweep
+
+# The PR gate only mutates lines a PR touches, so a survivor can appear in untouched code when a
+# test changes around it. This sweeps the whole module.
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sweep:
+    name: Mutation sweep (smoke · full module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-mutants
+      - name: Sweep
+        run: |
+          cargo mutants --file 'crates/glass-mcp/src/smoke/*.rs' \
+            -j 2 --package glass-mcp --output "$RUNNER_TEMP/mutants"
+      - name: Upload the outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-sweep
+          path: ${{ runner.temp }}/mutants/mutants.out/

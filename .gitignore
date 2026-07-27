@@ -17,8 +17,8 @@ perf.data.old
 # Coverage output (cargo-llvm-cov)
 *.profraw
 
-# cargo-mutants default output dir
-/mutants.out/
+# cargo-mutants default output dir (root or a crate subdirectory)
+mutants.out/
 
 # Editor / OS cruft
 *.swp
