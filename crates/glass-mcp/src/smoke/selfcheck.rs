@@ -227,7 +227,6 @@ fn dropped_error_message_scenario() -> Scenario {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::report::CheckOutcome;
 
     #[test]
     fn every_injected_fault_is_caught() {

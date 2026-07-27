@@ -478,6 +478,7 @@ mod tests {
     #[test]
     fn parses_every_escape_sequence_it_claims_to_handle() {
         for (escape, decoded) in [
+            ("\\\"", "\""),
             ("\\\\", "\\"),
             ("\\n", "\n"),
             ("\\r", "\r"),

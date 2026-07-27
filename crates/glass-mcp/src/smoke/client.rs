@@ -357,9 +357,8 @@ fn spawn_stderr_reader(
     })
 }
 
-/// Keep the newest [`STDERR_TAIL_LINES`] lines: push, then drop from the front when that puts
-/// the tail over the bound. Outside the reader thread's closure so a test can reach it — a wrong
-/// comparison here silently shrinks the tail that carries a server panic into a failure detail.
+/// Kept outside the reader thread's closure so a test can reach it — a wrong comparison here
+/// silently shrinks the tail that carries a server panic into a failure detail.
 fn push_bounded(tail: &mut VecDeque<String>, line: String) {
     tail.push_back(line);
     if tail.len() > STDERR_TAIL_LINES {
@@ -775,7 +774,7 @@ mod tests {
     #[cfg(unix)]
     const STUB_VERSION: &str = "7.7.7-stub";
 
-    /// A stub MCP server that answers `initialize`, answers one `tools/call` by running
+    /// A stub MCP server that answers `initialize`, answers every `tools/call` by running
     /// `on_call`, and exits when its stdin closes.
     #[cfg(unix)]
     fn stub_answering(on_call: &str) -> String {
