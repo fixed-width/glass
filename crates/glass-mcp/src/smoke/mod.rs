@@ -823,7 +823,12 @@ mod tests {
             row("android").contains("the first row is the default"),
             "{t}"
         );
-        assert!(row("x11").contains("first runnable on `PATH`"), "{t}");
+        for probing in ["x11", "wayland"] {
+            assert!(
+                row(probing).contains("first runnable on `PATH`"),
+                "{probing}: {t}"
+            );
+        }
     }
 
     fn android() -> &'static DrivableBackend {

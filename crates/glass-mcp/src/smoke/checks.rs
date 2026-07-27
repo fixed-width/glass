@@ -543,7 +543,8 @@ mod tests {
         assert_eq!(out.detail, "boom", "nothing to offer, so nothing appended");
     }
 
-    /// The offer belongs to failure. A passing launch must report geometry and nothing else.
+    /// The offer belongs to failure. A passing launch must report geometry and nothing else — from
+    /// a profile that has something to offer, or the assertion holds however the offer is scoped.
     #[test]
     fn a_successful_start_carries_no_offer() {
         let mut t = ScriptedTransport::new(vec![(
@@ -555,7 +556,9 @@ mod tests {
                 0,
             )),
         )]);
-        let out = check_start(&mut t, &profile());
+        let mut p = profile();
+        p.alternatives = vec!["gnome-text-editor", "zenity"];
+        let out = check_start(&mut t, &p);
         assert_eq!(out.status, CheckStatus::Pass);
         assert!(
             !out.detail.contains("--app"),
