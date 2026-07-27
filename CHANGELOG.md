@@ -52,6 +52,10 @@ internal refactors, CI, or test-only changes.
   under the backend's headless sway and runs the same eight checks as `x11`. The target is launched
   with `GDK_BACKEND=wayland`, so a toolkit that cannot use the Wayland backend fails the launch
   rather than falling back to Xwayland.
+- `glass-mcp smoke --backend android` drives a stock app on a connected device or emulator,
+  reporting the same eight checks as the x11 and wayland runners. The target is a
+  `package/.Activity` component chosen from a small table rather than probed for; `--app` selects a
+  different one.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
