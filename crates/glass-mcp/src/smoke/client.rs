@@ -141,9 +141,6 @@ impl<W: Write> Session<W> {
         Ok(CallResult::from_mcp(&v["result"]))
     }
 
-    /// Test-only: `StdioClient` always supplies an explicit deadline via
-    /// `call_tool_with_deadline`, so nothing in production calls this any more.
-    #[cfg(test)]
     pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
         self.call_tool_with_deadline(tool, args, self.timeout)
     }
@@ -425,6 +422,17 @@ impl McpTransport for StdioClient {
         deadline: Duration,
     ) -> Result<CallResult, String> {
         match self.session.call_tool_with_deadline(tool, args, deadline) {
+            Ok(r) => Ok(r),
+            Err(e) => Err(self.on_failure(e)),
+        }
+    }
+
+    /// Overrides the trait's default rather than inheriting it, so a `Session` constructed with
+    /// its own timeout (the test seam that exercises the hang/timeout path without a real
+    /// multi-minute wait) still governs an un-deadlined call, exactly as it did before
+    /// `call_with_deadline` existed.
+    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        match self.session.call_tool(tool, args) {
             Ok(r) => Ok(r),
             Err(e) => Err(self.on_failure(e)),
         }
@@ -946,9 +954,6 @@ exec sleep 10
     /// teardown bounded, a surviving child costs `READER_JOIN_TIMEOUT` and no elapsed-time check
     /// tells it apart. The stub answers nothing and spawns no grandchild, so it is still running
     /// when the deadline fires and its pid is the only one in play.
-    ///
-    /// Calls `call_with_deadline` directly rather than `call`: the trait's default always uses
-    /// the production `CALL_TIMEOUT`, so only an explicit deadline keeps this test fast.
     #[cfg(unix)]
     #[test]
     fn a_timed_out_call_reaps_the_server() {
@@ -958,11 +963,7 @@ exec sleep 10
         assert!(pid_is_alive(pid), "the stub must run before the call");
 
         let e = client
-            .call_with_deadline(
-                "glass_stop",
-                serde_json::json!({}),
-                Duration::from_millis(200),
-            )
+            .call("glass_stop", serde_json::json!({}))
             .expect_err("a stub that never answers must time the call out");
         assert!(e.contains("no response within"), "expected a timeout: {e}");
         assert!(!pid_is_alive(pid), "pid {pid} survived a timed-out call");

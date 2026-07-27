@@ -130,15 +130,15 @@ fn backend_for(backend: &str) -> Result<&'static DrivableBackend, String> {
 /// up while the device is still within the budget glass granted it.
 const BOOT_BUDGET_DEFAULT_MS: u64 = 120_000;
 
-/// Extra budget beyond the device's boot, for the install-and-launch that follows it.
-const START_SLACK: Duration = Duration::from_secs(120);
-
 /// How long `glass_start` may take. Derived rather than chosen: a backend that may boot a device
 /// must outlast the device's own boot budget, or this client gives up before the boot it is
 /// waiting for can finish — and reports it as a launch failure, which is the hardest thing there
-/// is to diagnose from the report. A boot budget already inside `CALL_TIMEOUT` needs no slack
-/// added on top of it: the ordinary deadline already covers it. `get` is injected so the
-/// arithmetic is testable without touching the process environment.
+/// is to diagnose from the report. The addend is `CALL_TIMEOUT`, not a fraction of it: once the
+/// device is up, installing and launching the app is just an ordinary call, so it gets an
+/// ordinary call's worth of time on top of the whole boot budget — at every budget, not only
+/// above some threshold. That also means the result always exceeds `CALL_TIMEOUT`, so nothing
+/// has to clamp it back up for a small budget. `get` is injected so the arithmetic is testable
+/// without touching the process environment.
 fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> Duration {
     if !b.boots_a_device {
         return CALL_TIMEOUT;
@@ -146,11 +146,7 @@ fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> 
     let ms = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(BOOT_BUDGET_DEFAULT_MS);
-    let boot_budget = Duration::from_millis(ms);
-    if boot_budget < CALL_TIMEOUT {
-        return CALL_TIMEOUT;
-    }
-    boot_budget + START_SLACK
+    Duration::from_millis(ms) + CALL_TIMEOUT
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -791,7 +787,7 @@ mod tests {
         );
         assert_eq!(
             d,
-            Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + START_SLACK
+            Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT
         );
     }
 
@@ -802,7 +798,7 @@ mod tests {
         let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "600000".to_string());
         assert_eq!(
             start_deadline(android(), &get),
-            Duration::from_millis(600_000) + START_SLACK
+            Duration::from_millis(600_000) + CALL_TIMEOUT
         );
     }
 
@@ -814,18 +810,22 @@ mod tests {
             let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| v.to_string());
             assert_eq!(
                 start_deadline(android(), &get),
-                Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + START_SLACK,
+                Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT,
                 "{v:?} must not shorten the deadline"
             );
         }
     }
 
-    /// A boot budget below the default must not drag the launch deadline below what every other call
-    /// already gets.
+    /// A boot budget smaller than one ordinary call still leaves a full ordinary call's worth of
+    /// time to install and launch after the boot completes — the addend is unconditional, not a
+    /// clamp that only engages above some threshold.
     #[test]
-    fn a_tiny_boot_budget_does_not_shrink_the_deadline_below_the_default() {
+    fn a_tiny_boot_budget_still_leaves_a_full_call_to_launch() {
         let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "1".to_string());
-        assert_eq!(start_deadline(android(), &get), CALL_TIMEOUT);
+        assert_eq!(
+            start_deadline(android(), &get),
+            Duration::from_millis(1) + CALL_TIMEOUT
+        );
     }
 
     /// The reader is scoped to one variable: reading any name would let an unrelated setting move a
