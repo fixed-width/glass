@@ -31,11 +31,19 @@ shift
 # step with the git pathspec the in-diff caller uses.
 readonly SMOKE_GLOB='crates/glass-mcp/src/smoke/**/*.rs'
 
+# cargo-mutants derives its per-mutant timeout from the unmutated baseline, which never waits:
+# the teardown paths this module tests are only reached when something fails. A mutant that
+# removes the kill makes four tests each wait out `READER_JOIN_TIMEOUT`, measured at 42s where
+# the baseline takes 7s — so the derived timeout is always too tight, and the mutant is scored
+# TIMEOUT rather than caught. Fixed here so the grade does not depend on how fast the host is.
+readonly MUTANT_TIMEOUT=180
+
 status=0
 cargo mutants \
     --package glass-mcp \
     --file "$SMOKE_GLOB" \
     --cargo-arg=--locked \
+    --timeout "$MUTANT_TIMEOUT" \
     -j "${MUTANTS_JOBS:-2}" \
     --output "$out" \
     "$@" || status=$?

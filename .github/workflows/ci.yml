@@ -293,7 +293,7 @@ jobs:
           workspaces: .
       - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants,cargo-nextest
       - name: Diff the smoke module against the merge base
         # A ref name may contain `;`, `` ` ``, `$` and more, so it reaches the shell as data.
         env:
@@ -310,9 +310,11 @@ jobs:
             -- ':(glob)crates/glass-mcp/src/smoke/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
       - name: Mutation gate
+        # nextest runs each test in its own process, so the module's deliberate
+        # multi-second teardown waits overlap instead of summing: 42s to 11s here.
         run: |
           if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "this PR changes no .rs file under crates/glass-mcp/src/smoke/ — nothing to mutate"
             exit 0
           fi
-          scripts/mutants.sh "$RUNNER_TEMP/mutants" --in-diff "$RUNNER_TEMP/pr.diff"
+          scripts/mutants.sh "$RUNNER_TEMP/mutants" --test-tool nextest --in-diff "$RUNNER_TEMP/pr.diff"
