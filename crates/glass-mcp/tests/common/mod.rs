@@ -508,9 +508,12 @@ mod android_probe_tests {
     use super::*;
     use serde_json::json;
 
-    /// A `doctor --json` document shaped like the real one's android section, in doctor's own
-    /// check order. A shape that drifted from doctor's own would make every host `Broken`, which
-    /// panics — so this fixture cannot rot quietly.
+    /// A `doctor --json` document shaped like the real one's android section: all seven checks
+    /// doctor always emits, in its own order. The four this classifier does not read carry what a
+    /// plain (non-`--deep`) run produces — optional companions and unrequested deep probes all
+    /// skip. A shape that drifted from doctor's own would make every host `Broken`, which panics,
+    /// so this fixture cannot rot quietly; holding only the checks read today would instead answer
+    /// a classifier that reaches for a fifth with a document doctor never emits.
     fn doctor_reporting(
         adb: &str,
         emulator: &str,
@@ -525,7 +528,10 @@ mod android_probe_tests {
                     { "name": "adb", "status": adb, "detail": "adb at …" },
                     { "name": "emulator", "status": emulator, "detail": "emulator at …" },
                     { "name": "device", "status": device, "detail": device_detail },
-                    { "name": "screencap", "status": "ok", "detail": "…" },
+                    { "name": "agent", "status": "skip", "detail": "not configured …" },
+                    { "name": "a11y-service", "status": "skip", "detail": "not configured …" },
+                    { "name": "screencap", "status": "skip", "detail": "…" },
+                    { "name": "uiautomator", "status": "skip", "detail": "…" },
                 ],
             }],
         })
