@@ -21,7 +21,7 @@ jobs:
       # Every shard reports: one red shard must not hide a second one.
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
@@ -38,7 +38,7 @@ jobs:
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
-            --shard ${{ matrix.shard }}/4 --sharding round-robin
+            --shard ${{ matrix.shard }}/8 --sharding round-robin
       - name: Upload the outcome
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
