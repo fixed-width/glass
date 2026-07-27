@@ -32,7 +32,7 @@ const STDERR_TAIL_LINES: usize = 20;
 /// child process. Process concerns — killing a hung server, collecting its stderr — belong to
 /// [`StdioClient`], which wraps this.
 #[derive(Debug)]
-pub struct Session<W: Write> {
+pub(super) struct Session<W: Write> {
     sink: W,
     /// Lines the reader thread has pulled off the server's stdout, oldest first.
     rx: Receiver<String>,
@@ -46,7 +46,7 @@ pub struct Session<W: Write> {
 }
 
 impl<W: Write> Session<W> {
-    pub fn new(sink: W, rx: Receiver<String>, timeout: Duration) -> Self {
+    pub(super) fn new(sink: W, rx: Receiver<String>, timeout: Duration) -> Self {
         Self {
             sink,
             rx,
@@ -57,7 +57,7 @@ impl<W: Write> Session<W> {
     }
 
     /// The version the server reported at `initialize`; `None` when it reported none.
-    pub fn server_version(&self) -> Option<String> {
+    pub(super) fn server_version(&self) -> Option<String> {
         self.version.clone()
     }
 
@@ -71,13 +71,13 @@ impl<W: Write> Session<W> {
             .map_err(|e| format!("flush to server: {e}"))
     }
 
-    pub fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+    pub(super) fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
         self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
     /// Send a request and wait for its matching response, bounded by `self.timeout` for the whole
     /// round trip. Killing the child on failure is the caller's job.
-    pub fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    pub(super) fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(
@@ -86,7 +86,7 @@ impl<W: Write> Session<W> {
         wait_for_response(&self.rx, id, self.timeout).map_err(|e| format!("{method}: {e}"))
     }
 
-    pub fn initialize(&mut self) -> Result<(), String> {
+    pub(super) fn initialize(&mut self) -> Result<(), String> {
         let init = self.request(
             "initialize",
             serde_json::json!({
@@ -106,7 +106,7 @@ impl<W: Write> Session<W> {
         self.notify("notifications/initialized", serde_json::json!({}))
     }
 
-    pub fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+    pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
         let v = self.request(
             "tools/call",
             serde_json::json!({ "name": tool, "arguments": args }),
@@ -119,7 +119,7 @@ impl<W: Write> Session<W> {
 
     /// Test-only: recover the sink to assert on what was written.
     #[cfg(test)]
-    pub fn into_sink(self) -> W {
+    fn into_sink(self) -> W {
         self.sink
     }
 }
@@ -191,8 +191,9 @@ impl StdioClient {
         self.session.server_version()
     }
 
-    /// Kill the child and append its stderr on any session failure — a run that gives up on the
-    /// server must not leave it running unattended.
+    /// Kill the child, then append its stderr to `e`. Every session failure lands here — a
+    /// timeout, a closed pipe, or a JSON-RPC error response — so a single rejected call tears the
+    /// server down and the checks that follow will find it gone.
     fn on_failure(&mut self, e: String) -> String {
         self.kill_and_reap();
         let note = self.stderr_note();
@@ -319,7 +320,7 @@ impl McpTransport for StdioClient {
 
 impl Drop for StdioClient {
     fn drop(&mut self) {
-        // Idempotent even if `request` already did this on a timeout — see `kill_and_reap`.
+        // Idempotent even if `on_failure` already did this — see `kill_and_reap`.
         self.kill_and_reap();
         // The reader thread's blocked `read_line` returns only once the child's stdout write
         // end closes, which the kill+wait above guarantees — so this join must stay after it.
@@ -471,7 +472,8 @@ mod tests {
         s.request("first", serde_json::json!({})).expect("first");
         s.request("second", serde_json::json!({})).expect("second");
 
-        let sent = String::from_utf8(s.into_sink()).expect("utf8");
+        let raw = s.into_sink();
+        let sent = String::from_utf8_lossy(&raw);
         let ids: Vec<i64> = sent
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -489,7 +491,8 @@ mod tests {
         s.notify("notifications/initialized", serde_json::json!({}))
             .expect("notify");
 
-        let sent = String::from_utf8(s.into_sink()).expect("utf8");
+        let raw = s.into_sink();
+        let sent = String::from_utf8_lossy(&raw);
         let v: Value = serde_json::from_str(sent.trim()).expect("one json line");
         assert_eq!(v["method"], "notifications/initialized");
         assert!(
@@ -558,9 +561,10 @@ mod tests {
         let e = s
             .call_tool("glass_nope", serde_json::json!({}))
             .unwrap_err();
+        assert!(e.contains("glass_nope"), "must name the tool: {e}");
         assert!(
-            e.contains("glass_nope") && e.contains("no such tool"),
-            "got: {e}"
+            e.contains("no such tool"),
+            "must carry the server's message: {e}"
         );
     }
 }
