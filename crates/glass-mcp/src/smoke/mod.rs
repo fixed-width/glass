@@ -143,8 +143,11 @@ fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> 
     if !b.boots_a_device {
         return CALL_TIMEOUT;
     }
+    // No `.trim()`: `glass-android` reads this same variable with a bare `.parse()`, so a
+    // whitespace-padded value is unreadable to the device too. Trimming here would derive a
+    // deadline from a boot budget the device itself fell back away from.
     let ms = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(BOOT_BUDGET_DEFAULT_MS);
     Duration::from_millis(ms) + CALL_TIMEOUT
 }
@@ -814,6 +817,19 @@ mod tests {
                 "{v:?} must not shorten the deadline"
             );
         }
+    }
+
+    /// `glass-android` parses this same variable with a bare `.parse()` — no `.trim()` — so a
+    /// whitespace-padded value is unreadable to the device too. Trimming it here would derive a
+    /// deadline from a boot budget the device itself fell back away from, the two silently
+    /// disagreeing about how long the boot may take.
+    #[test]
+    fn a_whitespace_padded_boot_budget_falls_back_to_the_default_like_glass_android() {
+        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| " 600000 ".to_string());
+        assert_eq!(
+            start_deadline(android(), &get),
+            Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT
+        );
     }
 
     /// A boot budget smaller than one ordinary call still leaves a full ordinary call's worth of

@@ -925,6 +925,76 @@ exec sleep 10
         );
     }
 
+    /// `call_with_deadline`'s own contract, distinct from `call`'s: it must reach the server and
+    /// carry back what it answered, not a value built without asking. A body replaced by
+    /// `Ok(Default::default())` returns an envelope-less `Ok` and would pass `call`'s coverage
+    /// (which never touches this method) while going undetected here too if this test only
+    /// checked `is_ok()` — so it pins the actual envelope.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_returns_the_servers_envelope() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"tool\":\"glass_stop\",\"result\":{\"stopped\":true}}"}],"isError":false}}"#;
+        let (_dir, exe) = write_stub(&stub_answering(&format!("    printf '%s\\n' '{reply}'")));
+        let mut client = spawn_stub(&exe);
+        let r = client
+            .call_with_deadline("glass_stop", serde_json::json!({}), Duration::from_secs(5))
+            .expect("the stub answers the call");
+        assert_eq!(
+            r.envelope,
+            Some(serde_json::json!({
+                "ok": true, "tool": "glass_stop", "result": { "stopped": true }
+            }))
+        );
+    }
+
+    /// The deadline `call_with_deadline` is *given* governs, not the session's own configured
+    /// timeout: spawned with a 5s session timeout (`spawn_stub`'s `STUB_TIMEOUT`), a call whose
+    /// explicit deadline is a tenth of a second must time out at that tenth of a second, not wait
+    /// out the full 5s. A body that read `self.timeout` instead of `deadline` would pass this
+    /// slowly (5s) rather than fail it — the elapsed-time bound is what tells the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_times_out_on_its_own_deadline_not_the_sessions() {
+        let (_dir, exe) = write_stub(&stub_answering("    :"));
+        let mut client = spawn_stub(&exe);
+        let start = Instant::now();
+        let e = client
+            .call_with_deadline(
+                "glass_stop",
+                serde_json::json!({}),
+                Duration::from_millis(100),
+            )
+            .expect_err("a stub that never answers must time out");
+        assert!(e.contains("no response within"), "expected a timeout: {e}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "a 100ms deadline must not wait out the session's 5s timeout: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The mirror of the previous test, and the one that actually tells "honours its own
+    /// deadline" apart from "honours whichever of the two is shorter": spawned with a 100ms
+    /// session timeout, a call whose explicit deadline is 2s must still succeed against a stub
+    /// that answers after 300ms — past the session's own timeout, but well within the explicit
+    /// deadline. A body that blended or floored the deadline at the session's timeout would time
+    /// this call out; only reading the given deadline on its own lets it succeed.
+    #[cfg(unix)]
+    #[test]
+    fn call_with_deadline_is_not_shortened_by_the_sessions_own_timeout() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"tool\":\"glass_stop\",\"result\":{}}"}],"isError":false}}"#;
+        let on_call = format!("    sleep 0.3\n    printf '%s\\n' '{reply}'");
+        let (_dir, exe) = write_stub(&stub_answering(&on_call));
+        let mut client = spawn_stub_with_timeout(&exe, Duration::from_millis(100));
+        let r = client
+            .call_with_deadline("glass_stop", serde_json::json!({}), Duration::from_secs(2))
+            .expect("a 2s deadline must outlast the session's own 100ms timeout");
+        assert_eq!(
+            r.envelope,
+            Some(serde_json::json!({ "ok": true, "tool": "glass_stop", "result": {} }))
+        );
+    }
+
     /// A JSON-RPC error response reaches `on_failure` like any other session failure, so it
     /// tears the server down too — a contract no glass tool reaches today, and so one that
     /// nothing but this test holds in place.
