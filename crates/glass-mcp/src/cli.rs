@@ -107,7 +107,7 @@ pub enum Command {
         /// Write the JSON report to PATH (the text report always goes to stdout).
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
-        /// Force a target app instead of probing for the first available one.
+        /// Force a target app instead of the one the backend would choose on its own.
         #[arg(long)]
         app: Option<String>,
         /// Prove the checks can fail: run them against injected faults, then exit. Runs
@@ -363,5 +363,24 @@ mod tests {
                 "the --backend description must name {b:?}: {help}"
             );
         }
+    }
+
+    /// This help outlived the probe it described. Not every backend probes — android's table is
+    /// resolved without one — so `--app` overrides a table position there, not a search. The claim
+    /// is what must stay out; the wording around it is free.
+    #[test]
+    fn the_app_help_does_not_claim_every_backend_probes() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let smoke = cmd.find_subcommand("smoke").expect("smoke subcommand");
+        let arg = smoke
+            .get_arguments()
+            .find(|a| a.get_id() == "app")
+            .expect("--app argument");
+        let help = arg.get_help().expect("--app help").to_string();
+        assert!(
+            !help.contains("prob"),
+            "not every backend probes for a target app: {help}"
+        );
     }
 }

@@ -28,7 +28,7 @@ fn excerpt(s: &str) -> String {
 }
 
 /// The candidates this run did not select, as a line telling the caller how to choose one. Which
-/// candidates those are is decided in `smoke::profile_for`, where the resolution policy and the
+/// candidates those are is decided in `smoke::alternatives`, where the resolution policy and the
 /// search path are known; a backend with nothing to offer appends nothing at all.
 fn other_candidates(p: &Profile) -> Option<String> {
     (!p.alternatives.is_empty()).then(|| {
@@ -408,7 +408,7 @@ mod tests {
         }
     }
 
-    /// Offers nothing: what a run offers is `smoke::profile_for`'s decision, so a test that wants
+    /// Offers nothing: what a run offers is decided by `smoke::alternatives`, so a test that wants
     /// an offer states it.
     fn profile() -> Profile {
         Profile {
@@ -567,8 +567,8 @@ mod tests {
         );
     }
 
-    /// Only the launch gets the long budget: a five-minute hang is justified where a boot can happen
-    /// and nowhere else.
+    /// Only the launch gets the derived budget: waiting out a device boot on top of an ordinary
+    /// call is justified where a boot can happen and nowhere else.
     #[test]
     fn a_check_that_cannot_boot_a_device_uses_the_default_deadline() {
         let mut t = ScriptedTransport::new(vec![(

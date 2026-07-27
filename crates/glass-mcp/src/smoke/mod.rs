@@ -29,8 +29,9 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
-/// One backend the smoke runner drives. The resolution below, the errors it produces, the
-/// reference doc's table and `cli.rs`'s hand-written help all read this table.
+/// One backend the smoke runner drives. The resolution below, the errors it produces and the
+/// reference doc's rendered table all read this table; `cli.rs`'s hand-written help is tested
+/// against it.
 pub struct DrivableBackend {
     pub name: &'static str,
     pub candidates: &'static [Candidate],
