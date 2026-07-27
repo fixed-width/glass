@@ -274,3 +274,40 @@ jobs:
           name: coverage-lcov
           path: target/llvm-cov/glass.lcov
           if-no-files-found: warn
+
+  mutants:
+    name: Mutation gate (smoke · in-diff)
+    runs-on: ubuntu-latest
+    # Non-blocking until the module's existing survivors are fixed; Task 9 removes this.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # `--in-diff` needs a merge base to diff against; the default depth-1 checkout has
+          # none, which would yield an empty diff, mutate nothing, and pass green.
+          fetch-depth: 0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-mutants
+      - name: Diff the smoke module against the merge base
+        run: |
+          git rev-parse --verify "origin/${{ github.base_ref }}" >/dev/null 2>&1 || {
+            echo "no merge base for origin/${{ github.base_ref }} — the checkout lacks history,"
+            echo "so --in-diff would mutate nothing and this job would pass having gated nothing."
+            exit 1
+          }
+          git diff "origin/${{ github.base_ref }}...HEAD" -- crates/glass-mcp/src/smoke/ > pr.diff
+          wc -l pr.diff
+      - name: Mutation gate
+        run: |
+          if [ ! -s pr.diff ]; then
+            echo "this PR does not touch crates/glass-mcp/src/smoke/ — nothing to mutate"
+            exit 0
+          fi
+          cargo mutants --in-diff pr.diff --file 'crates/glass-mcp/src/smoke/*.rs' \
+            -j 2 --package glass-mcp --output "$RUNNER_TEMP/mutants"
