@@ -27,12 +27,107 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// panic message or a degrade warning, bounded so a chatty server cannot grow it without limit.
 const STDERR_TAIL_LINES: usize = 20;
 
+/// The JSON-RPC half of the client: ids, framing, the initialize handshake, and tool calls.
+/// Generic over its sink so a test can drive it with an in-memory buffer and a channel, with no
+/// child process. Process concerns — killing a hung server, collecting its stderr — belong to
+/// [`StdioClient`], which wraps this.
+#[derive(Debug)]
+pub struct Session<W: Write> {
+    sink: W,
+    /// Lines the reader thread has pulled off the server's stdout, oldest first.
+    rx: Receiver<String>,
+    next_id: i64,
+    /// Never seeded from this binary's own `crate::VERSION`: client and server are the same
+    /// executable here, so a seeded value would look like something the server answered.
+    version: Option<String>,
+    /// Per-request deadline, fixed at `CALL_TIMEOUT` in production (`StdioClient::spawn`) and
+    /// overridable so tests can exercise the timeout path without a multi-minute wait.
+    timeout: Duration,
+}
+
+impl<W: Write> Session<W> {
+    pub fn new(sink: W, rx: Receiver<String>, timeout: Duration) -> Self {
+        Self {
+            sink,
+            rx,
+            next_id: 0,
+            version: None,
+            timeout,
+        }
+    }
+
+    /// The version the server reported at `initialize`; `None` when it reported none.
+    pub fn server_version(&self) -> Option<String> {
+        self.version.clone()
+    }
+
+    fn send(&mut self, msg: &Value) -> Result<(), String> {
+        let line = format!("{msg}\n");
+        self.sink
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("write to server: {e}"))?;
+        self.sink
+            .flush()
+            .map_err(|e| format!("flush to server: {e}"))
+    }
+
+    pub fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    }
+
+    /// Send a request and wait for its matching response, bounded by `self.timeout` for the whole
+    /// round trip. Killing the child on failure is the caller's job.
+    pub fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        )?;
+        wait_for_response(&self.rx, id, self.timeout).map_err(|e| format!("{method}: {e}"))
+    }
+
+    pub fn initialize(&mut self) -> Result<(), String> {
+        let init = self.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "glass-smoke", "version": crate::VERSION }
+            }),
+        )?;
+        if init.get("result").is_none() {
+            return Err(format!("initialize failed: {init}"));
+        }
+        // A missing `serverInfo.version` is recorded, not fatal: no check asserts on it, so
+        // aborting here would throw away every check's evidence over a missing label.
+        self.version = init["result"]["serverInfo"]["version"]
+            .as_str()
+            .map(str::to_string);
+        self.notify("notifications/initialized", serde_json::json!({}))
+    }
+
+    pub fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        let v = self.request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": args }),
+        )?;
+        if let Some(err) = v.get("error") {
+            return Err(format!("{tool}: JSON-RPC error {err}"));
+        }
+        Ok(CallResult::from_mcp(&v["result"]))
+    }
+
+    /// Test-only: recover the sink to assert on what was written.
+    #[cfg(test)]
+    pub fn into_sink(self) -> W {
+        self.sink
+    }
+}
+
 #[derive(Debug)]
 pub struct StdioClient {
     child: Child,
-    stdin: ChildStdin,
-    /// Lines the reader thread has pulled off the child's stdout, oldest first.
-    rx: Receiver<String>,
+    session: Session<ChildStdin>,
     /// Joined on drop so no thread outlives the client; `None` once joined.
     reader: Option<JoinHandle<()>>,
     /// The server's last stderr lines. Without these a degrade warning or a panic leaves
@@ -40,16 +135,6 @@ pub struct StdioClient {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     /// Joined before the tail is read, so the tail includes the last thing the server said.
     stderr_reader: Option<JoinHandle<()>>,
-    next_id: i64,
-    /// What the server reported in `initialize`'s `serverInfo.version`, or `None` if it
-    /// reported none. Never seeded from this binary's own `crate::VERSION`: client and server
-    /// are the same executable here, so a seeded value would put a version in the report that
-    /// the server never actually answered with.
-    version: Option<String>,
-    /// Per-request deadline. Fixed at `CALL_TIMEOUT` in production
-    /// (`spawn`); overridable so tests can exercise the timeout path without
-    /// a multi-minute wait.
-    timeout: Duration,
 }
 
 impl StdioClient {
@@ -90,76 +175,28 @@ impl StdioClient {
         let stderr_reader = Some(spawn_stderr_reader(stderr, stderr_tail.clone())?);
         let mut c = Self {
             child,
-            stdin,
-            rx,
+            session: Session::new(stdin, rx, timeout),
             reader,
             stderr_tail,
             stderr_reader,
-            next_id: 0,
-            version: None,
-            timeout,
         };
-        c.initialize()?;
-        Ok(c)
-    }
-
-    fn initialize(&mut self) -> Result<(), String> {
-        let init = self.request(
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "glass-smoke", "version": crate::VERSION }
-            }),
-        )?;
-        if init.get("result").is_none() {
-            return Err(format!("initialize failed: {init}"));
+        if let Err(e) = c.session.initialize() {
+            return Err(c.on_failure(e));
         }
-        // A missing `serverInfo.version` is recorded, not fatal: no check asserts on it, so
-        // aborting here would throw away every check's evidence over a missing label.
-        self.version = init["result"]["serverInfo"]["version"]
-            .as_str()
-            .map(str::to_string);
-        self.notify("notifications/initialized", serde_json::json!({}))
+        Ok(c)
     }
 
     /// The version the server reported at `initialize`; `None` when it reported none.
     pub fn server_version(&self) -> Option<String> {
-        self.version.clone()
+        self.session.server_version()
     }
 
-    fn send(&mut self, msg: &Value) -> Result<(), String> {
-        let line = format!("{msg}\n");
-        self.stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| format!("write to server: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("flush to server: {e}"))
-    }
-
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
-        self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-    }
-
-    /// Send a request and wait for its matching response, bounded by
-    /// `self.timeout` for the whole round trip. A timeout or a closed pipe
-    /// both kill the child before returning — a run that gives up on the
+    /// Kill the child and append its stderr on any session failure — a run that gives up on the
     /// server must not leave it running unattended.
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.send(
-            &serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-        )?;
-        match wait_for_response(&self.rx, id, self.timeout) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                self.kill_and_reap();
-                let note = self.stderr_note();
-                Err(format!("{method}: {e}{note}"))
-            }
-        }
+    fn on_failure(&mut self, e: String) -> String {
+        self.kill_and_reap();
+        let note = self.stderr_note();
+        format!("{e}{note}")
     }
 
     /// The tail of the server's stderr, as a suffix for a failure detail — empty when it
@@ -273,14 +310,10 @@ fn wait_for_response(rx: &Receiver<String>, id: i64, budget: Duration) -> Result
 
 impl McpTransport for StdioClient {
     fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
-        let v = self.request(
-            "tools/call",
-            serde_json::json!({ "name": tool, "arguments": args }),
-        )?;
-        if let Some(err) = v.get("error") {
-            return Err(format!("{tool}: JSON-RPC error {err}"));
+        match self.session.call_tool(tool, args) {
+            Ok(r) => Ok(r),
+            Err(e) => Err(self.on_failure(e)),
         }
-        Ok(CallResult::from_mcp(&v["result"]))
     }
 }
 
@@ -422,6 +455,112 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "kill+reap of the child must not hang: {:?}",
             start.elapsed()
+        );
+    }
+
+    /// Ids must advance: a counter that goes backwards or stalls makes `wait_for_response`
+    /// match a stale reply, or never match at all.
+    #[test]
+    fn request_ids_advance_by_one() {
+        let (tx, rx) = mpsc::channel();
+        tx.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n".into())
+            .unwrap();
+        tx.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n".into())
+            .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        s.request("first", serde_json::json!({})).expect("first");
+        s.request("second", serde_json::json!({})).expect("second");
+
+        let sent = String::from_utf8(s.into_sink()).expect("utf8");
+        let ids: Vec<i64> = sent
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| v.get("id").and_then(Value::as_i64))
+            .collect();
+        assert_eq!(ids, vec![1, 2], "sent: {sent}");
+    }
+
+    /// A notification is a message with no id. Returning Ok without writing one means the
+    /// server never hears it.
+    #[test]
+    fn notify_writes_a_message_with_no_id() {
+        let (_tx, rx) = mpsc::channel();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        s.notify("notifications/initialized", serde_json::json!({}))
+            .expect("notify");
+
+        let sent = String::from_utf8(s.into_sink()).expect("utf8");
+        let v: Value = serde_json::from_str(sent.trim()).expect("one json line");
+        assert_eq!(v["method"], "notifications/initialized");
+        assert!(
+            v.get("id").is_none(),
+            "a notification carries no id: {sent}"
+        );
+    }
+
+    /// The version in the report must be what the server answered, not a default or a
+    /// stand-in — client and server are the same executable, so a seeded value would look right.
+    #[test]
+    fn initialize_captures_the_servers_reported_version() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"version\":\"9.9.9-test\"}}}\n"
+                .into(),
+        )
+        .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        s.initialize().expect("initialize");
+        assert_eq!(s.server_version().as_deref(), Some("9.9.9-test"));
+    }
+
+    #[test]
+    fn a_server_reporting_no_version_records_none_rather_than_failing() {
+        let (tx, rx) = mpsc::channel();
+        tx.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n".into())
+            .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        s.initialize()
+            .expect("a missing version is recorded, not fatal");
+        assert_eq!(s.server_version(), None);
+    }
+
+    /// `call_tool` must carry the tool's envelope through, not a default-constructed result —
+    /// every check reads what this returns.
+    #[test]
+    fn call_tool_returns_the_servers_envelope() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true,\\\"tool\\\":\\\"glass_stop\\\",\\\"result\\\":{}}\"}],\"isError\":false}}\n"
+                .into(),
+        )
+        .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        let r = s
+            .call_tool("glass_stop", serde_json::json!({}))
+            .expect("call");
+        assert_eq!(
+            r.envelope.as_ref().expect("envelope")["tool"],
+            serde_json::json!("glass_stop")
+        );
+    }
+
+    /// A JSON-RPC error is not a tool result; reading it as one would let a failed call be
+    /// graded as a pass.
+    #[test]
+    fn call_tool_rejects_a_json_rpc_error() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no such tool\"}}\n"
+                .into(),
+        )
+        .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        let e = s
+            .call_tool("glass_nope", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            e.contains("glass_nope") && e.contains("no such tool"),
+            "got: {e}"
         );
     }
 }
