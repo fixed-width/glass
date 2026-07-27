@@ -295,19 +295,24 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Diff the smoke module against the merge base
+        # A ref name may contain `;`, `` ` ``, `$` and more, so it reaches the shell as data.
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git rev-parse --verify "origin/${{ github.base_ref }}" >/dev/null 2>&1 || {
-            echo "no merge base for origin/${{ github.base_ref }} — the checkout lacks history,"
+          git rev-parse --verify "origin/$BASE_REF" >/dev/null 2>&1 || {
+            echo "no merge base for origin/$BASE_REF — the checkout lacks history,"
             echo "so --in-diff would mutate nothing and this job would pass having gated nothing."
             exit 1
           }
-          git diff "origin/${{ github.base_ref }}...HEAD" -- crates/glass-mcp/src/smoke/ > pr.diff
-          wc -l pr.diff
+          # `:(glob)` so `**` spans directories, matching scripts/mutants.sh's --file; without
+          # it git reads `**` as an ordinary fnmatch pattern and selects nothing at all.
+          git diff "origin/$BASE_REF...HEAD" \
+            -- ':(glob)crates/glass-mcp/src/smoke/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+          wc -l "$RUNNER_TEMP/pr.diff"
       - name: Mutation gate
         run: |
-          if [ ! -s pr.diff ]; then
-            echo "this PR does not touch crates/glass-mcp/src/smoke/ — nothing to mutate"
+          if [ ! -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "this PR changes no .rs file under crates/glass-mcp/src/smoke/ — nothing to mutate"
             exit 0
           fi
-          cargo mutants --in-diff pr.diff --file 'crates/glass-mcp/src/smoke/*.rs' \
-            -j 2 --package glass-mcp --output "$RUNNER_TEMP/mutants"
+          scripts/mutants.sh "$RUNNER_TEMP/mutants" --in-diff "$RUNNER_TEMP/pr.diff"

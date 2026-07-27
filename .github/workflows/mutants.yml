@@ -28,9 +28,7 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Sweep
-        run: |
-          cargo mutants --file 'crates/glass-mcp/src/smoke/*.rs' \
-            -j 2 --package glass-mcp --output "$RUNNER_TEMP/mutants"
+        run: scripts/mutants.sh "$RUNNER_TEMP/mutants"
       - name: Upload the outcome
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
