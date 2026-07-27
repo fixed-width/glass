@@ -718,11 +718,21 @@ mod tests {
     }
 
     /// A reader has to know that android's table is not a fallback chain, and the only place the doc
-    /// can learn it is the renderer.
+    /// can learn it is the renderer. Checked per row rather than by substring anywhere in the table:
+    /// a `contains` over the whole table would still pass with the two `Resolution` arms' bodies
+    /// swapped, since both phrases would still appear somewhere, just on the wrong rows.
     #[test]
     fn the_rendered_table_says_how_each_backend_chooses() {
         let t = render_candidate_table();
-        assert!(t.contains("first runnable on `PATH`"), "{t}");
-        assert!(t.contains("the first row is the default"), "{t}");
+        let row = |name: &str| {
+            t.lines()
+                .find(|l| l.starts_with(&format!("| `{name}` |")))
+                .unwrap_or_else(|| panic!("no {name:?} row in {t}"))
+        };
+        assert!(
+            row("android").contains("the first row is the default"),
+            "{t}"
+        );
+        assert!(row("x11").contains("first runnable on `PATH`"), "{t}");
     }
 }
