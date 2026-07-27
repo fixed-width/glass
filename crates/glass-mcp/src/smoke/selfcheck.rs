@@ -6,9 +6,9 @@
 //! substring distinctive to the assertion it targets.
 
 use crate::smoke::checks;
-use crate::smoke::profile::OutlineNode;
+use crate::smoke::profile::{OutlineNode, Profile, X11_CANDIDATES};
 use crate::smoke::report::{CheckOutcome, CheckStatus};
-use crate::smoke::transport::{CallResult, ScriptedTransport};
+use crate::smoke::transport::{CALL_TIMEOUT, CallResult, ScriptedTransport};
 use serde_json::json;
 
 /// One fault-injection scenario: the outcome a check produced against a deliberately wrong
@@ -44,7 +44,7 @@ impl Scenario {
 /// annotated on it: a scenario dropped without this being changed with it is then a length
 /// mismatch the compiler rejects, rather than a self-check that reports success having injected
 /// one fewer. cargo-mutants does not mutate array literals, so no sweep would report that.
-const INJECTED_FAULTS: usize = 5;
+const INJECTED_FAULTS: usize = 6;
 
 /// Faults, and the check that must catch each one — for the reason each is named after.
 pub fn run_self_check() -> Result<String, String> {
@@ -54,6 +54,7 @@ pub fn run_self_check() -> Result<String, String> {
         noop_interaction_scenario(),
         remedyless_error_scenario(),
         dropped_error_message_scenario(),
+        windowless_start_scenario(),
     ];
 
     for s in &scenarios {
@@ -224,6 +225,39 @@ fn dropped_error_message_scenario() -> Scenario {
     }
 }
 
+/// Scenario 6: `glass_start` reports ok for a window with no `height`. `check_start`'s geometry
+/// guard must catch this; its text names the missing field, which no other failure path in that
+/// check produces — a transport error carries the server's own message instead. Deleting the guard
+/// does not go red another way: the detail is then interpolated straight from the response, so the
+/// check reaches a genuine `Pass` on a launch that established no window.
+///
+/// Driven through `check_start` deliberately: it is the check whose whole job is to notice a
+/// broken launch, and no scenario above reaches it.
+fn windowless_start_scenario() -> Scenario {
+    let mut t = ScriptedTransport::new(vec![(
+        "glass_start",
+        Ok(CallResult::ok(
+            "glass_start",
+            json!({ "x": 0, "y": 0, "width": 800 }),
+            &[],
+            0,
+        )),
+    )]);
+    let p = Profile {
+        backend: "x11".to_string(),
+        app: &X11_CANDIDATES[0],
+        // Nothing to offer: an offer is appended only on the failure path, and a scenario whose
+        // detail carried one would no longer be scoped to the guard under test.
+        alternatives: vec![],
+        start_deadline: CALL_TIMEOUT,
+    };
+    Scenario {
+        name: "start reported a window with no height",
+        outcome: checks::check_start(&mut t, &p),
+        expect_detail: "no `height` in its geometry",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +327,7 @@ mod tests {
     fn the_success_message_names_how_many_faults_were_injected() {
         assert_eq!(
             run_self_check().expect("the shipped scenarios must all be caught"),
-            "5 injected faults, all caught"
+            "6 injected faults, all caught"
         );
     }
 }
