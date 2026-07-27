@@ -1,0 +1,47 @@
+name: Mutation sweep
+
+# The PR gate only mutates lines a PR touches, so a survivor can appear in untouched code when a
+# test changes around it. This sweeps the whole module.
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sweep:
+    name: Mutation sweep shard ${{ matrix.shard }} (smoke)
+    runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports: one red shard must not hide a second one.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: Sweep
+        # nextest runs each test in its own process, so the module's deliberate
+        # multi-second teardown waits overlap instead of summing: 42s to 11s here.
+        run: |
+          scripts/mutants.sh "$RUNNER_TEMP/mutants" \
+            --test-tool nextest \
+            --shard ${{ matrix.shard }}/8 --sharding round-robin
+      - name: Upload the outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-sweep-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutants/mutants.out/

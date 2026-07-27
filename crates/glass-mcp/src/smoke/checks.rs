@@ -486,6 +486,29 @@ mod tests {
         assert!(out.detail.contains("image"), "got: {}", out.detail);
     }
 
+    /// Both dimensions are required. As `&&`, a response missing only one of them passed.
+    #[test]
+    fn screenshot_fails_when_either_dimension_is_missing() {
+        for result in [json!({ "width": 8 }), json!({ "height": 8 }), json!({})] {
+            let mut t = ScriptedTransport::new(vec![(
+                "glass_screenshot",
+                Ok(ok("glass_screenshot", result.clone(), &[], 1)),
+            )]);
+            let out = check_screenshot(&mut t);
+            assert_eq!(
+                out.status,
+                CheckStatus::Fail,
+                "must reject {result}: {}",
+                out.detail
+            );
+            assert!(
+                out.detail.contains("width/height"),
+                "must name the missing geometry: {}",
+                out.detail
+            );
+        }
+    }
+
     #[test]
     fn a11y_requires_a_nonempty_tree_in_an_untrusted_sibling() {
         let outline = "⟦untrusted:abc⟧\n#1 Window \"Untitled\"\n  #2 TextField \"Body\" [editable]\n⟦/untrusted:abc⟧";
@@ -715,6 +738,19 @@ mod tests {
         ];
         script.extend(tail);
         script
+    }
+
+    /// A fixed probe string could collide with text the app already shows, so each run gets a
+    /// distinct one carrying a recognizable prefix.
+    #[test]
+    fn probe_text_is_distinctive_and_fresh_each_call() {
+        let a = probe_text();
+        let b = probe_text();
+        assert!(a.starts_with("glass-smoke-"), "got: {a}");
+        assert_ne!(
+            a, b,
+            "a constant probe cannot distinguish what the run wrote"
+        );
     }
 
     #[test]
@@ -975,6 +1011,27 @@ mod tests {
         let out = check_logs(&mut t);
         assert_eq!(out.status, CheckStatus::Fail);
         assert!(out.detail.contains("lines"), "got: {}", out.detail);
+    }
+
+    #[test]
+    fn excerpt_returns_short_input_unchanged() {
+        assert_eq!(excerpt("short"), "short");
+    }
+
+    /// The boundary the `<=` decides: exactly MAX characters is not too long.
+    #[test]
+    fn excerpt_truncates_only_past_the_limit() {
+        let at_limit: String = "x".repeat(120);
+        assert_eq!(excerpt(&at_limit), at_limit);
+
+        let over = "x".repeat(121);
+        let cut = excerpt(&over);
+        assert!(cut.ends_with('…'), "must mark the truncation: {cut}");
+        assert_eq!(
+            cut.chars().count(),
+            121,
+            "120 kept plus the ellipsis: {cut}"
+        );
     }
 
     #[test]

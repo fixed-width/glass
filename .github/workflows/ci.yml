@@ -274,3 +274,82 @@ jobs:
           name: coverage-lcov
           path: target/llvm-cov/glass.lcov
           if-no-files-found: warn
+
+  mutants:
+    name: Mutation shard ${{ matrix.shard }} (smoke)
+    runs-on: ubuntu-latest
+    # A push carries no base ref to diff against; this gate is a pull-request check.
+    if: github.event_name == 'pull_request'
+    strategy:
+      # Every shard reports: one red shard must not hide a second one.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # `--in-diff` needs a merge base to diff against; the default depth-1 checkout has
+          # none, which would yield an empty diff, mutate nothing, and pass green.
+          fetch-depth: 0
+      - name: Diff the smoke module against the merge base
+        id: diff
+        # A ref name may contain `;`, `` ` ``, `$` and more, so it reaches the shell as data.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git rev-parse --verify "origin/$BASE_REF" >/dev/null 2>&1 || {
+            echo "no merge base for origin/$BASE_REF — the checkout lacks history,"
+            echo "so --in-diff would mutate nothing and this job would pass having gated nothing."
+            exit 1
+          }
+          # `:(glob)` so `**` spans directories, matching scripts/mutants.sh's --file; without
+          # it git reads `**` as an ordinary fnmatch pattern and selects nothing at all.
+          git diff "origin/$BASE_REF...HEAD" \
+            -- ':(glob)crates/glass-mcp/src/smoke/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+          wc -l "$RUNNER_TEMP/pr.diff"
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+            echo "this PR changes no .rs file under crates/glass-mcp/src/smoke/ — nothing to mutate"
+          fi
+      # Installing a toolchain and two cargo tools costs more than the check itself,
+      # so a PR that touches no smoke file skips straight past them.
+      - name: Install pinned toolchain
+        if: steps.diff.outputs.touched == 'true'
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.diff.outputs.touched == 'true'
+        with:
+          workspaces: .
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        if: steps.diff.outputs.touched == 'true'
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: Mutation gate
+        if: steps.diff.outputs.touched == 'true'
+        # nextest runs each test in its own process, so the module's deliberate
+        # multi-second teardown waits overlap instead of summing: 42s to 11s here.
+        run: |
+          scripts/mutants.sh "$RUNNER_TEMP/mutants" \
+            --test-tool nextest \
+            --shard ${{ matrix.shard }}/8 --sharding round-robin \
+            --in-diff "$RUNNER_TEMP/pr.diff"
+
+  # A matrix job's checks are named per shard, so the branch ruleset has nothing stable
+  # to require. This one has a fixed name and fails if any shard did.
+  mutants-gate:
+    name: Mutation gate (smoke)
+    runs-on: ubuntu-latest
+    needs: mutants
+    if: always()
+    steps:
+      - name: Collect the shard results
+        env:
+          RESULT: ${{ needs.mutants.result }}
+        run: |
+          # `skipped` is the push-event path, where the shards deliberately do not run.
+          case "$RESULT" in
+            success|skipped) echo "mutation shards: $RESULT" ;;
+            *) echo "mutation shards: $RESULT — see the per-shard logs"; exit 1 ;;
+          esac

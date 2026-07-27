@@ -473,6 +473,62 @@ mod tests {
         assert_eq!(nodes[0].states.len(), 2);
     }
 
+    /// Each escape the parser claims to decode, decoded. Deleting any one arm sends that
+    /// sequence to the passthrough branch, which emits the backslash literally.
+    #[test]
+    fn parses_every_escape_sequence_it_claims_to_handle() {
+        for (escape, decoded) in [
+            ("\\\"", "\""),
+            ("\\\\", "\\"),
+            ("\\n", "\n"),
+            ("\\r", "\r"),
+            ("\\t", "\t"),
+            ("\\0", "\0"),
+        ] {
+            let outline = format!("#1 Label \"a{escape}b\" (0,0 10x10)\n");
+            let nodes = parse_outline(&outline);
+            assert_eq!(
+                nodes.len(),
+                1,
+                "escape {escape:?} broke parsing: {outline:?}"
+            );
+            assert_eq!(
+                nodes[0].name.as_deref(),
+                Some(format!("a{decoded}b").as_str()),
+                "escape {escape:?} decoded wrongly"
+            );
+        }
+    }
+
+    /// The byte accumulator decides where the name ends, so a wrong one takes the remainder —
+    /// and with it the states — from the wrong offset.
+    #[test]
+    fn an_escaped_name_does_not_consume_the_states_that_follow_it() {
+        let outline = "#7 TextField \"a\\tb\" (0,0 10x10) [editable,focusable]\n";
+        let nodes = parse_outline(outline);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name.as_deref(), Some("a\tb"));
+        assert!(nodes[0].states.iter().any(|s| s == "editable"));
+        assert!(nodes[0].states.iter().any(|s| s == "focusable"));
+        assert_eq!(nodes[0].states.len(), 2);
+    }
+
+    /// `consumed_len`'s line runs for any escaped char, not just the five named ones, so a
+    /// multi-byte char after the backslash exercises it without touching a match arm: a short
+    /// prefix drives `-=` negative, a long one drives `*=` past the states it should measure.
+    #[test]
+    fn a_multibyte_passthrough_escape_leaves_the_byte_accumulator_correct() {
+        let short_prefix = "#9 Label \"\\\u{e9}b\" (0,0 10x10) [editable,focusable]\n";
+        let nodes = parse_outline(short_prefix);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].states, vec!["editable", "focusable"]);
+
+        let long_prefix = "#9 Label \"xxxxxxxxxx\\\u{1f980}b\" (0,0 10x10) [editable,focusable]\n";
+        let nodes = parse_outline(long_prefix);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].states, vec!["editable", "focusable"]);
+    }
+
     #[test]
     fn first_editable_uses_role_fallback_for_textfield() {
         let nodes = vec![OutlineNode {

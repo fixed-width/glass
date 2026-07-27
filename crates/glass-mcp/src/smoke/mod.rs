@@ -111,8 +111,7 @@ pub fn all_check_names() -> Vec<&'static str> {
     planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
-/// The step whose `detail` carries an unavailable app: `start` is the check that would hit
-/// the gap, and the one the how-to already sends a reader to when a run goes wrong.
+/// The step whose `detail` carries an unavailable app: `start` is the check that would hit the gap.
 const START_STEP: u8 = 1;
 
 /// `--dry-run`'s rows: every check a real run would produce, each a `skip` saying what it
@@ -451,6 +450,13 @@ mod tests {
             assert!(!candidates.is_empty(), "{name:?} has no candidate apps");
             assert!(seen.insert(*name), "{name:?} appears twice");
         }
+    }
+
+    /// Written out rather than derived from [`DRIVABLE`] — a list checked against itself pins
+    /// nothing, and would stay green both if a name changed and if the table were emptied.
+    #[test]
+    fn drivable_backends_lists_every_row_of_the_table() {
+        assert_eq!(drivable_backends(), ["x11", "wayland"]);
     }
 
     /// `xed` heads both tables, so naming one candidate would not tell the two apart.

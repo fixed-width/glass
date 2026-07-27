@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Mutation-test the smoke module with cargo-mutants and grade the outcome.
+#
+# Why this wrapper rather than a bare `cargo mutants`: its exit code alone cannot
+# tell a clean run from one that gated nothing.
+#
+#   * It exits 0 whenever it generates no mutants at all — a `--file` glob that
+#     stopped matching after a file moved, or a package that was renamed. Both
+#     look exactly like success.
+#   * It reports a timeout ahead of a missed mutant, so once any mutant times out a
+#     genuine survivor is invisible at the exit code.
+#
+# So this reads `outcomes.json`, prints the breakdown, and fails on a survivor, a
+# timeout, or a run that gated nothing.
+#
+# The one legitimate way to generate no mutants is a diff that changes only test
+# code. That must not fail — but it must not pass unchecked either, because
+# deleting the test that kills a survivor brings the survivor back while the diff
+# itself contains nothing to mutate. So a `--in-diff` run that yields nothing falls
+# back to mutating the whole of each file the diff touched.
+#
+# Usage:
+#   scripts/mutants.sh <output-dir> [extra cargo-mutants args...]
+#
+#   scripts/mutants.sh target/mutants                     # the whole module
+#   scripts/mutants.sh target/mutants --in-diff pr.diff   # only what a diff touched
+#
+# MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
+# because cargo-mutants rejects it twice over.
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: scripts/mutants.sh <output-dir> [cargo-mutants args...]" >&2
+    exit 2
+fi
+out=$1
+shift
+
+# `**` so a file moved into a subdirectory of the module stays covered; keep this in
+# step with the git pathspec the in-diff caller uses.
+readonly SMOKE_GLOB='crates/glass-mcp/src/smoke/**/*.rs'
+
+# cargo-mutants derives its per-mutant timeout from the unmutated baseline, which never waits:
+# the teardown paths this module tests are only reached when something fails. A mutant that
+# removes the kill makes four tests each wait out `READER_JOIN_TIMEOUT`, measured at 42s where
+# the baseline takes 7s — so the derived timeout is always too tight, and the mutant is scored
+# TIMEOUT rather than caught. Fixed here so the grade does not depend on how fast the host is.
+readonly MUTANT_TIMEOUT=180
+
+# The caller's `--in-diff` path, and the same argument list with it removed — the
+# fallback re-runs without it but must keep everything else, `--test-tool` included.
+diff_file=""
+passthrough=()
+skip_next=false
+for arg in "$@"; do
+    if [ "$skip_next" = true ]; then
+        diff_file=$arg
+        skip_next=false
+        continue
+    fi
+    case "$arg" in
+        --in-diff) skip_next=true ;;
+        --in-diff=*) diff_file=${arg#--in-diff=} ;;
+        *) passthrough+=("$arg") ;;
+    esac
+done
+
+# How many mutants a set of scope arguments yields, ignoring any `--shard` the caller
+# passed. Listing costs ~0.1s and builds nothing, so the "did this gate anything"
+# question is answered before a single mutant is compiled — and answered for the whole
+# run rather than for one shard, which may legitimately receive none.
+list_count() {
+    cargo mutants --list --package glass-mcp "$@" \
+        ${diff_file:+--in-diff "$diff_file"} 2>/dev/null | wc -l
+}
+
+total=0 caught=0 missed=0 timed_out=0 unviable=0 status=0
+
+# Run cargo-mutants into $1 with the remaining arguments, and read the outcome counts.
+# A missing outcomes.json means it generated nothing and wrote no report at all.
+attempt() {
+    local dir=$1
+    shift
+    status=0
+    cargo mutants \
+        --package glass-mcp \
+        --cargo-arg=--locked \
+        --timeout "$MUTANT_TIMEOUT" \
+        -j "${MUTANTS_JOBS:-2}" \
+        --output "$dir" \
+        "$@" || status=$?
+
+    local outcomes="$dir/mutants.out/outcomes.json"
+    if [ -f "$outcomes" ]; then
+        read -r total caught missed timed_out unviable < <(
+            jq -r '[.total_mutants, .caught, .missed, .timeout, .unviable] | @tsv' "$outcomes"
+        )
+    else
+        total=0 caught=0 missed=0 timed_out=0 unviable=0
+    fi
+}
+
+# Choose the scope before building anything: the module glob, or — when the diff
+# changed only test code and so yields nothing to mutate — the whole of each file it
+# touched, so a deleted test cannot bring a survivor back unnoticed.
+scope=(--file "$SMOKE_GLOB")
+planned=$(list_count "${scope[@]}")
+
+if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
+    # `+++ b/<path>` names each file the diff writes to; a deletion names /dev/null
+    # and drops out with the `.rs` filter.
+    mapfile -t touched < <(
+        sed -n 's|^+++ b/||p' "$diff_file" | grep -E '\.rs$' | sort -u
+    )
+    if [ "${#touched[@]}" -gt 0 ]; then
+        echo "The diff changed no mutable code — only tests, or only comments."
+        echo "Falling back to the whole of each file it touched, so a deleted test"
+        echo "cannot bring a survivor back unnoticed:"
+        printf '  %s\n' "${touched[@]}"
+        scope=()
+        for f in "${touched[@]}"; do
+            scope+=(--file "$f")
+        done
+        diff_file=""
+        planned=$(list_count "${scope[@]}")
+    fi
+fi
+
+if [ "$planned" -eq 0 ]; then
+    echo "This run would gate nothing: no mutants under the scope it was given."
+    echo "Check that --file still matches the files under test and that the package"
+    echo "still exists."
+    exit 1
+fi
+echo "mutants planned across the whole run: $planned"
+
+attempt "$out" "${scope[@]}" ${diff_file:+--in-diff "$diff_file"} \
+    ${passthrough[@]+"${passthrough[@]}"}
+graded=$out
+
+# A shard may legitimately draw none of the planned mutants; the count above is what
+# proves the run as a whole gated something.
+echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
+if [ "$missed" -gt 0 ]; then
+    echo "Survivors are listed in $graded/mutants.out/missed.txt"
+    exit 1
+fi
+if [ "$timed_out" -gt 0 ]; then
+    echo "A timeout also masks any survivor at cargo-mutants' own exit code."
+    echo "Timed-out mutants are listed in $graded/mutants.out/timeout.txt"
+    exit 1
+fi
+exit "$status"
