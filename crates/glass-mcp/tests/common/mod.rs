@@ -189,7 +189,8 @@ pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
 #[must_use]
 pub enum HostProbe {
     Available,
-    /// This host does not have the feature the gate drives, so there is nothing here to report.
+    /// The probe found no way for this gate to run here. Skipping is the honest answer to that;
+    /// where a run is mandatory, the `require_*` variable turns the skip into a failure.
     Absent,
     /// Either the probe could not answer, or this host has the feature and glass will not use it.
     /// Neither is a host to skip: the first would pass off an unasked question as an absent
@@ -208,7 +209,7 @@ pub const REQUIRE_ANDROID: &str = "GLASS_SMOKE_REQUIRE_ANDROID";
 impl HostProbe {
     /// Whether the gate can run, panicking rather than returning `false` for every answer a skip
     /// would misreport as a pass: a probe that could not answer, and — where `require_var`
-    /// demands a real run — a host that lacks what the gate needs.
+    /// demands a real run — a host the probe found no way to run on.
     #[must_use]
     pub fn can_run(self, require_var: &str, what: &str) -> bool {
         match self {
@@ -322,9 +323,9 @@ fn classify(doc: &serde_json::Value) -> HostProbe {
     }
 }
 
-/// Read a `doctor --json` document's verdict on android: can the gate run here, is this simply a
-/// host without android, or is it one that has android and will not run it? Split from running the
-/// binary because those readings are what needs testing, and none of them need a device.
+/// Read a `doctor --json` document's verdict on android: can the gate run here, did the probe find
+/// no way to get a device, or does this host have an AVD and refuse to use one? Split from running
+/// the binary because those readings are what needs testing, and none of them need a device.
 fn classify_android(doc: &serde_json::Value) -> HostProbe {
     let (adb, _) = match check_status(doc, "android", "adb") {
         Ok(v) => v,
@@ -342,15 +343,17 @@ fn classify_android(doc: &serde_json::Value) -> HostProbe {
         // Attached, or about to boot: the runner inherits glass's auto-boot lifecycle.
         "ok" | "warn" => HostProbe::Available,
         // `fail` is two conditions — no device and nothing to boot, and a refusal such as several
-        // online devices with no serial chosen. The `emulator` check is what tells them apart:
-        // doctor reports `device` as `warn` (will boot) whenever an AVD exists, so a `fail` beside
-        // AVDs is a refusal, and a `fail` without them is a host with nothing to run.
+        // online devices with no serial chosen. The `emulator` check is the only signal that
+        // separates them: doctor reports `device` as `warn` (will boot) whenever an AVD exists, so
+        // a `fail` beside AVDs is a refusal.
         "fail" => match check_status(doc, "android", "emulator") {
             Ok(("ok", _)) => HostProbe::Broken(format!(
                 "glass will not use any device on this host: {detail}"
             )),
-            // Every non-`ok` verdict means no AVD glass could boot — no emulator binary, or none
-            // listed. With no device either, this host is not set up for android at all.
+            // Every non-`ok` verdict means no AVD to fall back on — no emulator binary, or none
+            // listed. Usually a host with no android set up; a refusal on a host with devices
+            // attached but no AVDs is indistinguishable from that in what doctor exposes, so it
+            // skips too. `REQUIRE_ANDROID` is what makes that safe where a run is mandatory.
             Ok(("warn" | "fail" | "skip", _)) => HostProbe::Absent,
             Ok((other, _)) => HostProbe::Broken(format!(
                 "the android emulator check had unrecognized status {other:?}: {doc}"
