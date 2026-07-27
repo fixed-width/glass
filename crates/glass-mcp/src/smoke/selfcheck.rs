@@ -40,9 +40,15 @@ impl Scenario {
     }
 }
 
+/// How many faults [`run_self_check`] injects. Written out rather than read off the array, and
+/// annotated on it: a scenario dropped without this being changed with it is then a length
+/// mismatch the compiler rejects, rather than a self-check that reports success having injected
+/// one fewer. cargo-mutants does not mutate array literals, so no sweep would report that.
+const INJECTED_FAULTS: usize = 5;
+
 /// Faults, and the check that must catch each one — for the reason each is named after.
 pub fn run_self_check() -> Result<String, String> {
-    let scenarios = [
+    let scenarios: [Scenario; INJECTED_FAULTS] = [
         mutated_envelope_scenario(),
         untrusted_text_in_result_scenario(),
         noop_interaction_scenario(),
@@ -281,17 +287,14 @@ mod tests {
     }
 
     /// The Ok message is the only thing a caller sees on success, so it must state what was
-    /// actually exercised rather than an arbitrary string.
+    /// actually exercised. The count is written out rather than taken from [`INJECTED_FAULTS`]:
+    /// a count checked against its own source is equally true of "0 injected faults, all
+    /// caught", which is what an emptied scenario list would report.
     #[test]
     fn the_success_message_names_how_many_faults_were_injected() {
-        let msg = run_self_check().expect("the shipped scenarios must all be caught");
-        assert!(
-            msg.contains("injected faults"),
-            "must say what it did: {msg}"
-        );
-        assert!(
-            msg.chars().any(|c| c.is_ascii_digit()),
-            "must state the count: {msg}"
+        assert_eq!(
+            run_self_check().expect("the shipped scenarios must all be caught"),
+            "5 injected faults, all caught"
         );
     }
 }

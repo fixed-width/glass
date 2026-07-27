@@ -452,11 +452,11 @@ mod tests {
         }
     }
 
-    /// Pinned to [`DRIVABLE`] so emptying it can't make every loop over it pass vacuously.
+    /// Written out rather than derived from [`DRIVABLE`] — a list checked against itself pins
+    /// nothing, and would stay green both if a name changed and if the table were emptied.
     #[test]
     fn drivable_backends_lists_every_row_of_the_table() {
-        let from_table: Vec<&str> = DRIVABLE.iter().map(|(name, _)| *name).collect();
-        assert_eq!(drivable_backends(), from_table);
+        assert_eq!(drivable_backends(), ["x11", "wayland"]);
     }
 
     /// `xed` heads both tables, so naming one candidate would not tell the two apart.

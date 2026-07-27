@@ -651,6 +651,32 @@ mod tests {
         assert_eq!(s.server_version().as_deref(), Some("9.9.9-test"));
     }
 
+    /// The handshake is not finished when the result arrives: an MCP client must follow it with
+    /// `notifications/initialized`. Dropping that line changes nothing this suite would otherwise
+    /// notice — the other initialize tests read only `server_version` — and cargo-mutants cannot
+    /// see it either, since it replaces whole function bodies rather than deleting statements.
+    #[test]
+    fn initialize_follows_the_result_with_the_initialized_notification() {
+        let (tx, rx) = mpsc::channel();
+        tx.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n".into())
+            .unwrap();
+        let mut s = Session::new(Vec::new(), rx, Duration::from_secs(5));
+        s.initialize().expect("initialize");
+
+        let raw = s.into_sink();
+        let sent = String::from_utf8_lossy(&raw);
+        let msgs: Vec<Value> = sent
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON message"))
+            .collect();
+        assert_eq!(msgs.len(), 2, "the request and the notification: {sent}");
+        assert_eq!(msgs[1]["method"], "notifications/initialized");
+        assert!(
+            msgs[1].get("id").is_none(),
+            "a notification carries no id: {sent}"
+        );
+    }
+
     #[test]
     fn a_server_reporting_no_version_records_none_rather_than_failing() {
         let (tx, rx) = mpsc::channel();
@@ -703,18 +729,45 @@ mod tests {
         );
     }
 
-    /// The tail keeps the LAST lines: a server that logs heavily before panicking must not
-    /// push its panic out of the buffer, and the bound must not collapse the tail.
+    /// The tail keeps the LAST lines: a server that logs heavily before panicking must not push
+    /// its panic out of the buffer. The counts are written out rather than derived from
+    /// [`STDERR_TAIL_LINES`] — a bound checked against itself holds at any value, including one
+    /// too small to carry anything useful.
     #[test]
     fn the_stderr_tail_keeps_the_last_lines_up_to_the_bound() {
         let mut tail = VecDeque::new();
-        for i in 0..(STDERR_TAIL_LINES + 5) {
+        for i in 0..25 {
             push_bounded(&mut tail, format!("line {i}"));
         }
-        let newest: Vec<String> = (5..STDERR_TAIL_LINES + 5)
-            .map(|i| format!("line {i}"))
-            .collect();
+        let newest: Vec<String> = (5..25).map(|i| format!("line {i}")).collect();
         assert_eq!(Vec::from(tail), newest);
+    }
+
+    /// What the tail is for: a server panic reaching the failure detail whole. A Rust panic is
+    /// three lines — the `panicked at` header, the message, and the backtrace note — so a bound
+    /// that keeps fewer still reports something, just never the cause.
+    #[test]
+    fn the_tail_carries_a_whole_panic_past_a_chatty_server() {
+        let panic_lines = [
+            "thread 'main' panicked at src/main.rs:1:1:",
+            "the server fell over",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+        ];
+        let mut tail = VecDeque::new();
+        for i in 0..50 {
+            push_bounded(&mut tail, format!("chatter {i}"));
+        }
+        for line in panic_lines {
+            push_bounded(&mut tail, line.to_string());
+        }
+
+        let kept = Vec::from(tail);
+        for line in panic_lines {
+            assert!(
+                kept.contains(&line.to_string()),
+                "the tail dropped {line:?}: {kept:?}"
+            );
+        }
     }
 
     /// What a stub server reports at `initialize` — unlike this crate's own version, which the
