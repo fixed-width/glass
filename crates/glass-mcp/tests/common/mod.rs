@@ -310,11 +310,8 @@ fn classify(doc: &serde_json::Value) -> HostProbe {
     match status {
         "ok" => HostProbe::Available,
         "warn" | "fail" | "skip" => HostProbe::Absent,
-        // `Some(other)` (rather than `other` alone) keeps this message identical to when this
-        // read `check["status"].as_str()` directly, which is what `sway_probe_tests` still checks.
         other => HostProbe::Broken(format!(
-            "sway >=1.12 check had unrecognized status {:?}: {doc}",
-            Some(other)
+            "sway >=1.12 check had unrecognized status {other:?}: {doc}"
         )),
     }
 }
@@ -337,7 +334,6 @@ fn classify_android(doc: &serde_json::Value) -> HostProbe {
     match device {
         // Attached, or about to boot: the runner inherits glass's auto-boot lifecycle.
         "ok" | "warn" => HostProbe::Available,
-        "skip" => HostProbe::Absent,
         // `fail` is two conditions — nothing to run, and a refusal such as several online devices
         // with no serial chosen. A host whose adb works has android set up, so both are worth
         // reporting; doctor's own detail is the only thing that says which.
@@ -427,7 +423,7 @@ mod sway_probe_tests {
     fn a_status_outside_the_known_set_cannot_be_read_as_an_answer() {
         let why = why_broken(&doctor_reporting("green"));
         assert!(
-            why.contains("unrecognized status Some(\"green\")"),
+            why.contains("unrecognized status \"green\""),
             "must name what it got: {why}"
         );
     }
@@ -545,14 +541,6 @@ mod android_probe_tests {
         }
     }
 
-    #[test]
-    fn a_skipped_device_check_is_absent() {
-        assert!(matches!(
-            classify_android(&doctor_reporting("ok", "skip", "skipped — adb unavailable")),
-            HostProbe::Absent
-        ));
-    }
-
     /// The trap: `fail` covers both "nothing to run" and "several devices, pick one". A host with
     /// adb working has android set up, so a refusal is a problem to report, not a reason to skip
     /// quietly — and the report must carry doctor's own detail, which is the only thing that says
@@ -573,7 +561,13 @@ mod android_probe_tests {
     #[test]
     fn a_device_status_outside_the_known_set_cannot_be_read_as_an_answer() {
         let why = why_broken(&doctor_reporting("ok", "green", "…"));
-        assert!(why.contains("green"), "must name what it got: {why}");
+        // The fuller phrase, not just "green": the fixture document also carries the raw
+        // `"status": "green"` field, so a bare `contains("green")` would pass even if the
+        // extracted status were never read into the message at all.
+        assert!(
+            why.contains("unrecognized status \"green\""),
+            "must name what it got: {why}"
+        );
     }
 
     #[test]
