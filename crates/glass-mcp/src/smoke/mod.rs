@@ -12,11 +12,11 @@ pub mod transport;
 
 use std::ffi::OsStr;
 
-use profile::{Candidate, Profile, WAYLAND_CANDIDATES, X11_CANDIDATES};
+use profile::{Candidate, Profile, Resolution, WAYLAND_CANDIDATES, X11_CANDIDATES};
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
 
 pub struct SmokeOptions {
-    /// Backend to exercise (see [`candidates_for`] for the supported set).
+    /// Backend to exercise (see [`backend_for`] for the supported set).
     pub backend: String,
     /// Force a specific candidate app instead of probing for the first one present on the host.
     pub app: Option<String>,
@@ -24,27 +24,53 @@ pub struct SmokeOptions {
     pub dry_run: bool,
 }
 
-/// Every backend the smoke runner drives, with its candidate apps: the resolution below and the
-/// errors it produces read this table, and `cli.rs`'s hand-written help is tested against it.
-const DRIVABLE: &[(&str, &[Candidate])] =
-    &[("x11", &X11_CANDIDATES), ("wayland", &WAYLAND_CANDIDATES)];
+/// One backend the smoke runner drives. The resolution below, the errors it produces, the
+/// reference doc's table and `cli.rs`'s hand-written help all read this table.
+pub struct DrivableBackend {
+    pub name: &'static str,
+    pub candidates: &'static [Candidate],
+    pub resolution: Resolution,
+    /// Whether a launch may boot a device first. Tracked separately from `resolution` because
+    /// they are different facts: an already-attached device needs no boot, and its target is
+    /// preinstalled either way.
+    pub boots_a_device: bool,
+}
+
+const DRIVABLE: &[DrivableBackend] = &[
+    DrivableBackend {
+        name: "x11",
+        candidates: &X11_CANDIDATES,
+        resolution: Resolution::OnPath,
+        boots_a_device: false,
+    },
+    DrivableBackend {
+        name: "wayland",
+        candidates: &WAYLAND_CANDIDATES,
+        resolution: Resolution::OnPath,
+        boots_a_device: false,
+    },
+];
 
 /// The drivable backend names, in table order, for a message that tells the caller what to pass.
 pub fn drivable_backends() -> Vec<&'static str> {
-    DRIVABLE.iter().map(|(name, _)| *name).collect()
+    DRIVABLE.iter().map(|b| b.name).collect()
 }
 
 /// What a bare `smoke` drives. Derived from the table so `--backend`'s clap default and the
 /// error telling a caller what to pass cannot name different backends.
-pub const DEFAULT_BACKEND: &str = DRIVABLE[0].0;
+pub const DEFAULT_BACKEND: &str = DRIVABLE[0].name;
 
 /// The reference doc's target-app table, rendered from [`DRIVABLE`]. A doc-sync test compares it
 /// against the checked-in markdown, so a candidate can't land in the code and not in the docs.
 pub fn render_candidate_table() -> String {
     let mut out = String::from("| Backend | Candidates, in probe order |\n|---|---|\n");
-    for (backend, candidates) in DRIVABLE {
-        let bins: Vec<String> = candidates.iter().map(|c| format!("`{}`", c.bin)).collect();
-        out.push_str(&format!("| `{backend}` | {} |\n", bins.join(", ")));
+    for b in DRIVABLE {
+        let bins: Vec<String> = b
+            .candidates
+            .iter()
+            .map(|c| format!("`{}`", c.bin))
+            .collect();
+        out.push_str(&format!("| `{}` | {} |\n", b.name, bins.join(", ")));
     }
     out
 }
@@ -54,10 +80,10 @@ pub fn render_candidate_table() -> String {
 const DRIVES_CLAUSE: &str = "the smoke runner drives: ";
 
 /// Resolve `--backend` through [`crate::recognized_backend`] — the crate's single
-/// backend-recognition predicate — and return the canonical name alongside its candidate apps.
-/// Keying the table off what that returns is what stops `smoke --backend X11` being rejected
-/// while `GLASS_BACKEND=X11` is honoured everywhere else in the binary.
-fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]), String> {
+/// backend-recognition predicate — and return the row. Keying the table off what that returns is
+/// what stops `smoke --backend X11` being rejected while `GLASS_BACKEND=X11` is honoured
+/// everywhere else in the binary.
+fn backend_for(backend: &str) -> Result<&'static DrivableBackend, String> {
     let drivable = drivable_backends().join(", ");
     let Some(name) = crate::recognized_backend(backend) else {
         return Err(format!(
@@ -65,16 +91,12 @@ fn candidates_for(backend: &str) -> Result<(&'static str, &'static [Candidate]),
             crate::BACKENDS.join(", ")
         ));
     };
-    DRIVABLE
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(n, c)| (*n, *c))
-        .ok_or_else(|| {
-            format!(
-                "no smoke candidates for backend {name:?} yet — {DRIVES_CLAUSE}{drivable}. \
-                 Pass --backend {DEFAULT_BACKEND}."
-            )
-        })
+    DRIVABLE.iter().find(|b| b.name == name).ok_or_else(|| {
+        format!(
+            "no smoke candidates for backend {name:?} yet — {DRIVES_CLAUSE}{drivable}. \
+             Pass --backend {DEFAULT_BACKEND}."
+        )
+    })
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -139,19 +161,25 @@ pub fn run(opts: SmokeOptions) -> Result<SmokeReport, String> {
 /// `PATH` itself — the seam that lets tests drive it against a directory they control instead
 /// of the host's real environment. `run` is the only caller that should pass the host's `PATH`.
 fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, String> {
-    let (backend, candidates) = candidates_for(&opts.backend)?;
+    let b = backend_for(&opts.backend)?;
 
     // Resolve an explicit `--app` up front, dry run or not: naming a candidate that doesn't
     // exist in the table is a typo in the caller's input, not an environment gap, so it must
     // be rejected the same way in both modes rather than only once probing would happen.
     let forced = match &opts.app {
-        Some(name) => Some(candidates.iter().find(|c| c.label == name).ok_or_else(|| {
-            let names: Vec<&str> = candidates.iter().map(|c| c.label).collect();
-            format!(
-                "unknown app {name:?} for {backend} — use one of: {}",
-                names.join(", ")
-            )
-        })?),
+        Some(name) => Some(
+            b.candidates
+                .iter()
+                .find(|c| c.label == name)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = b.candidates.iter().map(|c| c.label).collect();
+                    format!(
+                        "unknown app {name:?} for {} — use one of: {}",
+                        b.name,
+                        names.join(", ")
+                    )
+                })?,
+        ),
         None => None,
     };
 
@@ -161,18 +189,20 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
         // instead of erroring. A forced `--app` is probed too: a plan naming an app the host
         // does not have is otherwise indistinguishable from one it does.
         let app = match forced {
-            Some(c) if !profile::runnable(c, path) => TargetApp::Unavailable(format!(
-                "would fail: --app {} was given, but {} is not runnable on PATH",
-                c.label, c.bin
-            )),
+            Some(c) if !profile::runnable(c, path, b.resolution) => {
+                TargetApp::Unavailable(format!(
+                    "would fail: --app {} was given, but {} is not runnable on PATH",
+                    c.label, c.bin
+                ))
+            }
             Some(c) => TargetApp::Selected(c.label.to_string()),
-            None => match profile::resolve_app(candidates, path) {
+            None => match profile::resolve_app(b.candidates, path, b.resolution) {
                 Ok(c) => TargetApp::Selected(c.label.to_string()),
-                Err(e) => TargetApp::Unavailable(e.plan_note(candidates)),
+                Err(e) => TargetApp::Unavailable(e.plan_note(b.candidates)),
             },
         };
         return Ok(SmokeReport {
-            backend: backend.to_string(),
+            backend: b.name.to_string(),
             // No server is spawned, so nothing reports a version over MCP; this is the one
             // compiled into the binary that would have been spawned.
             version: Some(crate::VERSION.to_string()),
@@ -186,10 +216,11 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     // fall back to here.
     let app = match forced {
         Some(c) => c,
-        None => profile::resolve_app(candidates, path).map_err(|e| e.blocking_error(candidates))?,
+        None => profile::resolve_app(b.candidates, path, b.resolution)
+            .map_err(|e| e.blocking_error(b.candidates))?,
     };
     let p = Profile {
-        backend: backend.to_string(),
+        backend: b.name.to_string(),
         app,
     };
 
@@ -199,7 +230,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     // inheriting the caller's shell, or check 2 would grade a backend this run is not
     // exercising. `check_health` re-reads the active backend, so this plumbing breaking is a
     // visible failure rather than a silently misdirected verdict.
-    let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", backend)])?;
+    let mut t = client::StdioClient::spawn(&exe, &[("GLASS_BACKEND", b.name)])?;
     let version = t.server_version();
     let mut out = vec![
         checks::check_start(&mut t, &p),
@@ -213,7 +244,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     out.push(checks::check_error_honesty(&mut t));
     out.push(checks::check_stop(&mut t));
 
-    let checks = out.into_iter().map(|c| ledger::apply(backend, c)).collect();
+    let checks = out.into_iter().map(|c| ledger::apply(b.name, c)).collect();
     Ok(SmokeReport {
         backend: p.backend,
         version,
@@ -441,14 +472,34 @@ mod tests {
     #[test]
     fn every_drivable_row_can_actually_be_resolved() {
         let mut seen = std::collections::BTreeSet::new();
-        for (name, candidates) in DRIVABLE {
+        for b in DRIVABLE {
             assert_eq!(
-                crate::recognized_backend(name),
-                Some(*name),
-                "{name:?} is not the canonical spelling glass resolves to"
+                crate::recognized_backend(b.name),
+                Some(b.name),
+                "{:?} is not the canonical spelling glass resolves to",
+                b.name
             );
-            assert!(!candidates.is_empty(), "{name:?} has no candidate apps");
-            assert!(seen.insert(*name), "{name:?} appears twice");
+            assert!(
+                !b.candidates.is_empty(),
+                "{:?} has no candidate apps",
+                b.name
+            );
+            assert!(seen.insert(b.name), "{:?} appears twice", b.name);
+        }
+    }
+
+    /// Nothing else requires a row's resolution to be reachable: a `Preinstalled` row whose table is
+    /// empty resolves to an error whose prose tells the caller to install something, on a backend
+    /// where installing is not the remedy.
+    #[test]
+    fn every_drivable_row_has_a_candidate_its_policy_can_return() {
+        for b in DRIVABLE {
+            assert!(
+                !b.candidates.is_empty(),
+                "{:?} has no candidate for {:?} to return",
+                b.name,
+                b.resolution
+            );
         }
     }
 
@@ -462,9 +513,9 @@ mod tests {
     /// `xed` heads both tables, so naming one candidate would not tell the two apart.
     #[test]
     fn wayland_resolves_the_wayland_table() {
-        let (name, candidates) = candidates_for("wayland").expect("wayland must be drivable");
-        assert_eq!(name, "wayland");
-        let resolved: Vec<&str> = candidates.iter().map(|c| c.bin).collect();
+        let b = backend_for("wayland").expect("wayland must be drivable");
+        assert_eq!(b.name, "wayland");
+        let resolved: Vec<&str> = b.candidates.iter().map(|c| c.bin).collect();
         let wayland: Vec<&str> = WAYLAND_CANDIDATES.iter().map(|c| c.bin).collect();
         assert_eq!(resolved, wayland);
     }
