@@ -37,15 +37,16 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     outcome(
         1,
         "start",
-        t.call("glass_start", args).and_then(|r| {
-            let result = check_envelope("glass_start", &r)?;
-            for field in ["x", "y", "width", "height"] {
-                if !result[field].is_number() {
-                    return Err(format!("glass_start returned no `{field}` in its geometry"));
+        t.call_with_deadline("glass_start", args, p.start_deadline)
+            .and_then(|r| {
+                let result = check_envelope("glass_start", &r)?;
+                for field in ["x", "y", "width", "height"] {
+                    if !result[field].is_number() {
+                        return Err(format!("glass_start returned no `{field}` in its geometry"));
+                    }
                 }
-            }
-            Ok(format!("{}x{}", result["width"], result["height"]))
-        }),
+                Ok(format!("{}x{}", result["width"], result["height"]))
+            }),
     )
 }
 
@@ -377,7 +378,8 @@ mod tests {
     use super::*;
     use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
-    use crate::smoke::transport::{CallResult, ScriptedTransport};
+    use crate::smoke::transport::{CALL_TIMEOUT, CallResult, ScriptedTransport};
+    use std::time::Duration;
 
     fn ok(tool: &str, result: Value, siblings: &[&str], images: usize) -> CallResult {
         CallResult::ok(tool, result, siblings, images)
@@ -396,6 +398,7 @@ mod tests {
         Profile {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
+            start_deadline: CALL_TIMEOUT,
         }
     }
 
@@ -403,6 +406,7 @@ mod tests {
         Profile {
             backend: "wayland".into(),
             app: &WAYLAND_CANDIDATES[0],
+            start_deadline: CALL_TIMEOUT,
         }
     }
 
@@ -457,6 +461,45 @@ mod tests {
         let _ = check_start(&mut t, &profile());
         let args = t.args_for("glass_start").expect("glass_start was called");
         assert!(args.get("env").is_none(), "got: {args}");
+    }
+
+    /// Check 1 is the only call that may wait out a device boot, and the profile is where that budget
+    /// is decided. A hardcoded deadline here would ignore it silently.
+    #[test]
+    fn start_is_called_with_the_profiles_deadline() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Ok(CallResult::ok(
+                "glass_start",
+                json!({ "x": 0, "y": 0, "width": 8, "height": 6 }),
+                &[],
+                0,
+            )),
+        )]);
+        let mut p = profile();
+        p.start_deadline = Duration::from_secs(321);
+        let _ = check_start(&mut t, &p);
+        assert_eq!(
+            t.deadline_for("glass_start"),
+            Some(Duration::from_secs(321))
+        );
+    }
+
+    /// Only the launch gets the long budget: a five-minute hang is justified where a boot can happen
+    /// and nowhere else.
+    #[test]
+    fn a_check_that_cannot_boot_a_device_uses_the_default_deadline() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_screenshot",
+            Ok(CallResult::ok(
+                "glass_screenshot",
+                json!({ "width": 8, "height": 6 }),
+                &[],
+                1,
+            )),
+        )]);
+        let _ = check_screenshot(&mut t);
+        assert_eq!(t.deadline_for("glass_screenshot"), Some(CALL_TIMEOUT));
     }
 
     #[test]

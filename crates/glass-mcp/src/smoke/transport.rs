@@ -4,6 +4,11 @@
 //! without a display.
 
 use serde_json::Value;
+use std::time::Duration;
+
+/// A server that has not answered in this long is treated as hung. Every call uses it except a
+/// launch that may boot a device first — see the smoke module's `start_deadline`.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default)]
 pub struct CallResult {
@@ -17,7 +22,17 @@ pub struct CallResult {
 }
 
 pub trait McpTransport {
-    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String>;
+    /// Call `tool`, giving the server `deadline` to answer.
+    fn call_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String>;
+
+    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        self.call_with_deadline(tool, args, CALL_TIMEOUT)
+    }
 }
 
 impl CallResult {
@@ -76,6 +91,7 @@ impl CallResult {
 pub struct ScriptedTransport {
     queue: std::collections::VecDeque<(String, Result<CallResult, String>)>,
     calls: Vec<(String, Value)>,
+    deadlines: Vec<(String, Duration)>,
 }
 
 impl ScriptedTransport {
@@ -86,6 +102,7 @@ impl ScriptedTransport {
                 .map(|(t, r)| (t.to_string(), r))
                 .collect(),
             calls: Vec::new(),
+            deadlines: Vec::new(),
         }
     }
 
@@ -107,11 +124,30 @@ impl ScriptedTransport {
         );
         Some(args)
     }
+
+    /// The deadline the one call to `tool` was made with. Same single-call rule as `args_for`:
+    /// answering about the first of several would hand an assertion a green result about the
+    /// wrong call.
+    pub fn deadline_for(&self, tool: &str) -> Option<Duration> {
+        let mut matching = self.deadlines.iter().filter(|(t, _)| t == tool);
+        let (_, d) = matching.next()?;
+        assert!(
+            matching.next().is_none(),
+            "{tool} was called more than once; use calls() to pick the call you mean"
+        );
+        Some(*d)
+    }
 }
 
 impl McpTransport for ScriptedTransport {
-    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+    fn call_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String> {
         self.calls.push((tool.to_string(), args));
+        self.deadlines.push((tool.to_string(), deadline));
         match self.queue.pop_front() {
             None => Err(format!("script exhausted; unexpected call to {tool}")),
             Some((expected, r)) if expected == tool => r,

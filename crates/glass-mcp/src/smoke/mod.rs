@@ -11,11 +11,13 @@ pub mod selfcheck;
 pub mod transport;
 
 use std::ffi::OsStr;
+use std::time::Duration;
 
 use profile::{
     ANDROID_CANDIDATES, Candidate, Profile, Resolution, WAYLAND_CANDIDATES, X11_CANDIDATES,
 };
 use report::{CheckOutcome, RunMode, SmokeReport, TargetApp};
+use transport::CALL_TIMEOUT;
 
 pub struct SmokeOptions {
     /// Backend to exercise (see [`backend_for`] for the supported set).
@@ -121,6 +123,34 @@ fn backend_for(backend: &str) -> Result<&'static DrivableBackend, String> {
              Pass --backend {DEFAULT_BACKEND}."
         )
     })
+}
+
+/// The emulator boot budget glass applies when `GLASS_EMULATOR_BOOT_TIMEOUT_MS` is unset. Kept in
+/// step with the android backend's own default: a smaller value here would make this client give
+/// up while the device is still within the budget glass granted it.
+const BOOT_BUDGET_DEFAULT_MS: u64 = 120_000;
+
+/// Extra budget beyond the device's boot, for the install-and-launch that follows it.
+const START_SLACK: Duration = Duration::from_secs(120);
+
+/// How long `glass_start` may take. Derived rather than chosen: a backend that may boot a device
+/// must outlast the device's own boot budget, or this client gives up before the boot it is
+/// waiting for can finish — and reports it as a launch failure, which is the hardest thing there
+/// is to diagnose from the report. A boot budget already inside `CALL_TIMEOUT` needs no slack
+/// added on top of it: the ordinary deadline already covers it. `get` is injected so the
+/// arithmetic is testable without touching the process environment.
+fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> Duration {
+    if !b.boots_a_device {
+        return CALL_TIMEOUT;
+    }
+    let ms = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(BOOT_BUDGET_DEFAULT_MS);
+    let boot_budget = Duration::from_millis(ms);
+    if boot_budget < CALL_TIMEOUT {
+        return CALL_TIMEOUT;
+    }
+    boot_budget + START_SLACK
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -246,6 +276,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     let p = Profile {
         backend: b.name.to_string(),
         app,
+        start_deadline: start_deadline(b, &|k| std::env::var(k).ok()),
     };
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
@@ -281,6 +312,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Every row a report must carry, in order, written out rather than derived from
     /// [`CHECK_NAMES`] — a list checked against itself pins nothing. Deleting a check must
@@ -734,5 +766,81 @@ mod tests {
             "{t}"
         );
         assert!(row("x11").contains("first runnable on `PATH`"), "{t}");
+    }
+
+    fn android() -> &'static DrivableBackend {
+        backend_for("android").expect("android must be drivable")
+    }
+
+    /// A backend that launches into a compositor already running does not need to outlast a boot.
+    #[test]
+    fn a_backend_that_never_boots_a_device_keeps_the_default_deadline() {
+        let x11 = backend_for("x11").expect("x11 must be drivable");
+        assert!(!x11.boots_a_device);
+        assert_eq!(start_deadline(x11, &|_| None), CALL_TIMEOUT);
+    }
+
+    /// The relationship the whole function exists for: a client deadline inside the device's own boot
+    /// budget makes an ordinary cold boot look like a failed launch.
+    #[test]
+    fn a_booting_backend_outlasts_the_devices_own_boot_budget() {
+        let d = start_deadline(android(), &|_| None);
+        assert!(
+            d > Duration::from_millis(BOOT_BUDGET_DEFAULT_MS),
+            "a deadline inside the boot budget reports the boot as a launch failure: {d:?}"
+        );
+        assert_eq!(
+            d,
+            Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + START_SLACK
+        );
+    }
+
+    /// Raising the device's budget must raise this one. Leaving it fixed would make the client give
+    /// up first at the exact moment an operator asked to wait longer.
+    #[test]
+    fn raising_the_boot_budget_raises_the_deadline() {
+        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "600000".to_string());
+        assert_eq!(
+            start_deadline(android(), &get),
+            Duration::from_millis(600_000) + START_SLACK
+        );
+    }
+
+    /// An unreadable value is not a shorter budget: glass falls back to its own default, so this must
+    /// too, or the two would disagree about how long a boot may take.
+    #[test]
+    fn an_unreadable_boot_budget_falls_back_to_the_default() {
+        for v in ["", "   ", "soon", "-1", "12.5", "99999999999999999999"] {
+            let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| v.to_string());
+            assert_eq!(
+                start_deadline(android(), &get),
+                Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + START_SLACK,
+                "{v:?} must not shorten the deadline"
+            );
+        }
+    }
+
+    /// A boot budget below the default must not drag the launch deadline below what every other call
+    /// already gets.
+    #[test]
+    fn a_tiny_boot_budget_does_not_shrink_the_deadline_below_the_default() {
+        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "1".to_string());
+        assert_eq!(start_deadline(android(), &get), CALL_TIMEOUT);
+    }
+
+    /// The reader is scoped to one variable: reading any name would let an unrelated setting move a
+    /// deadline nobody connected to it.
+    #[test]
+    fn the_deadline_reads_only_the_boot_budget_variable() {
+        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "600000".to_string());
+        let other = |_: &str| Some("600000".to_string());
+        assert_ne!(
+            start_deadline(android(), &get),
+            start_deadline(android(), &|_| None)
+        );
+        assert_eq!(
+            start_deadline(android(), &other),
+            start_deadline(android(), &get)
+        );
     }
 }

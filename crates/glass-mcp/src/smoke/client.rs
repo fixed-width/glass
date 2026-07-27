@@ -15,7 +15,7 @@
 //! reader joins are bounded by [`READER_JOIN_TIMEOUT`], and a failed kill or
 //! reap is reported rather than discarded.
 
-use crate::smoke::transport::{CallResult, McpTransport};
+use crate::smoke::transport::{CALL_TIMEOUT, CallResult, McpTransport};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -25,9 +25,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-/// A server that has not answered in this long is treated as hung.
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long teardown waits for a reader thread to exit before abandoning it: only something
 /// else still holding the child's write end — a grandchild, say — reaches this bound, and an
@@ -86,15 +83,25 @@ impl<W: Write> Session<W> {
         self.send(&serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
     }
 
-    /// Send a request and wait for its matching response, bounded by `self.timeout` for the whole
+    /// Send a request and wait for its matching response, bounded by `deadline` for the whole
     /// round trip. Killing the child on failure is the caller's job.
-    pub(super) fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    pub(super) fn request_with_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value, String> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(
             &serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         )?;
-        wait_for_response(&self.rx, id, self.timeout).map_err(|e| format!("{method}: {e}"))
+        wait_for_response(&self.rx, id, deadline).map_err(|e| format!("{method}: {e}"))
+    }
+
+    /// Bounded by `self.timeout`, the per-session default set at construction.
+    pub(super) fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_deadline(method, params, self.timeout)
     }
 
     pub(super) fn initialize(&mut self) -> Result<(), String> {
@@ -117,15 +124,28 @@ impl<W: Write> Session<W> {
         self.notify("notifications/initialized", serde_json::json!({}))
     }
 
-    pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
-        let v = self.request(
+    pub(super) fn call_tool_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String> {
+        let v = self.request_with_deadline(
             "tools/call",
             serde_json::json!({ "name": tool, "arguments": args }),
+            deadline,
         )?;
         if let Some(err) = v.get("error") {
             return Err(format!("{tool}: JSON-RPC error {err}"));
         }
         Ok(CallResult::from_mcp(&v["result"]))
+    }
+
+    /// Test-only: `StdioClient` always supplies an explicit deadline via
+    /// `call_tool_with_deadline`, so nothing in production calls this any more.
+    #[cfg(test)]
+    pub(super) fn call_tool(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
+        self.call_tool_with_deadline(tool, args, self.timeout)
     }
 
     /// Drop the receiving end of the reader thread's channel so its next `send` fails and it
@@ -398,8 +418,13 @@ fn wait_for_response(rx: &Receiver<String>, id: i64, budget: Duration) -> Result
 }
 
 impl McpTransport for StdioClient {
-    fn call(&mut self, tool: &str, args: Value) -> Result<CallResult, String> {
-        match self.session.call_tool(tool, args) {
+    fn call_with_deadline(
+        &mut self,
+        tool: &str,
+        args: Value,
+        deadline: Duration,
+    ) -> Result<CallResult, String> {
+        match self.session.call_tool_with_deadline(tool, args, deadline) {
             Ok(r) => Ok(r),
             Err(e) => Err(self.on_failure(e)),
         }
@@ -921,6 +946,9 @@ exec sleep 10
     /// teardown bounded, a surviving child costs `READER_JOIN_TIMEOUT` and no elapsed-time check
     /// tells it apart. The stub answers nothing and spawns no grandchild, so it is still running
     /// when the deadline fires and its pid is the only one in play.
+    ///
+    /// Calls `call_with_deadline` directly rather than `call`: the trait's default always uses
+    /// the production `CALL_TIMEOUT`, so only an explicit deadline keeps this test fast.
     #[cfg(unix)]
     #[test]
     fn a_timed_out_call_reaps_the_server() {
@@ -930,7 +958,11 @@ exec sleep 10
         assert!(pid_is_alive(pid), "the stub must run before the call");
 
         let e = client
-            .call("glass_stop", serde_json::json!({}))
+            .call_with_deadline(
+                "glass_stop",
+                serde_json::json!({}),
+                Duration::from_millis(200),
+            )
             .expect_err("a stub that never answers must time the call out");
         assert!(e.contains("no response within"), "expected a timeout: {e}");
         assert!(!pid_is_alive(pid), "pid {pid} survived a timed-out call");

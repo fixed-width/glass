@@ -103,6 +103,9 @@ pub const ANDROID_CANDIDATES: [Candidate; 2] = [
 pub struct Profile {
     pub backend: String,
     pub app: &'static Candidate,
+    /// How long the launch may take. Larger than every other call's budget only where a launch
+    /// may boot a device first.
+    pub start_deadline: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
