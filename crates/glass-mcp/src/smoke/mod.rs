@@ -10,6 +10,7 @@ pub mod report;
 pub mod selfcheck;
 pub mod transport;
 
+use std::env::VarError;
 use std::ffi::OsStr;
 use std::time::Duration;
 
@@ -125,10 +126,14 @@ fn backend_for(backend: &str) -> Result<&'static DrivableBackend, String> {
     })
 }
 
-/// The emulator boot budget glass applies when `GLASS_EMULATOR_BOOT_TIMEOUT_MS` is unset — the
+/// The emulator boot budget glass applies when [`BOOT_BUDGET_VAR`] is unset — the
 /// android backend's own constant, not a second copy of the number: a smaller value here would
 /// make this client give up while the device is still within the budget glass granted it.
 const BOOT_BUDGET_DEFAULT_MS: u64 = glass_android::DEFAULT_BOOT_TIMEOUT_MS;
+
+/// What an operator raises to grant a slow host a longer boot. Read here and, independently, by
+/// `glass-android` itself, which is why both must derive the same number from it.
+const BOOT_BUDGET_VAR: &str = "GLASS_EMULATOR_BOOT_TIMEOUT_MS";
 
 /// How long `glass_start` may take. Derived rather than chosen: a backend that may boot a device
 /// must outlast the device's own boot budget, or this client gives up before the boot it is
@@ -136,20 +141,48 @@ const BOOT_BUDGET_DEFAULT_MS: u64 = glass_android::DEFAULT_BOOT_TIMEOUT_MS;
 /// is to diagnose from the report. The addend is `CALL_TIMEOUT`, not a fraction of it: once the
 /// device is up, installing and launching the app is just an ordinary call, so it gets an
 /// ordinary call's worth of time on top of the whole boot budget — at every budget, not only
-/// above some threshold. That also means the result always exceeds `CALL_TIMEOUT`, so nothing
-/// has to clamp it back up for a small budget. `get` is injected so the arithmetic is testable
-/// without touching the process environment.
-fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> Duration {
+/// above some threshold. That also means the result is never below `CALL_TIMEOUT`, so nothing
+/// has to clamp it back up for a small budget. `get` and `warn` are injected so the arithmetic
+/// and what it reports are both testable without touching the process environment.
+fn start_deadline(
+    b: &DrivableBackend,
+    get: &dyn Fn(&str) -> Result<String, VarError>,
+    warn: &mut dyn FnMut(String),
+) -> Duration {
     if !b.boots_a_device {
         return CALL_TIMEOUT;
     }
-    // No `.trim()`: `glass-android` reads this same variable with a bare `.parse()`, so a
-    // whitespace-padded value is unreadable to the device too. Trimming here would derive a
-    // deadline from a boot budget the device itself fell back away from.
-    let ms = get("GLASS_EMULATOR_BOOT_TIMEOUT_MS")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(BOOT_BUDGET_DEFAULT_MS);
+    // Parsed exactly as `glass-android` parses it — no `.trim()`, no wider grammar, non-UTF-8
+    // falling back too — so the two always wait out the same budget. Reading it more liberally
+    // here would derive a deadline from a budget the device itself fell back away from.
+    let ms = match get(BOOT_BUDGET_VAR) {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(ms) => ms,
+            Err(_) => {
+                warn(unusable_boot_budget(&v));
+                BOOT_BUDGET_DEFAULT_MS
+            }
+        },
+        // Set, and unusable to both readers. `std::env::var(..).ok()` would report this as unset,
+        // which is the one thing it is not.
+        Err(VarError::NotUnicode(v)) => {
+            warn(unusable_boot_budget(&v.to_string_lossy()));
+            BOOT_BUDGET_DEFAULT_MS
+        }
+        Err(VarError::NotPresent) => BOOT_BUDGET_DEFAULT_MS,
+    };
     Duration::from_millis(ms) + CALL_TIMEOUT
+}
+
+/// What an operator who raised the boot budget and had it ignored has to be told: the value is
+/// unusable to the boot as well, so the longer wait they asked for is in effect nowhere. Silence
+/// here left a deliberately-raised budget indistinguishable from one never set.
+fn unusable_boot_budget(value: &str) -> String {
+    format!(
+        "warning: {BOOT_BUDGET_VAR} is set to {value:?}, which is not a whole number of \
+         milliseconds — using {BOOT_BUDGET_DEFAULT_MS} instead. glass's android backend reads \
+         this variable the same way, so the boot itself falls back to the same default."
+    )
 }
 
 /// Everything a real run's calls read about the app under test, assembled where the backend row,
@@ -160,13 +193,14 @@ fn profile_for(
     b: &'static DrivableBackend,
     app: &'static Candidate,
     path: Option<&OsStr>,
-    get: &dyn Fn(&str) -> Option<String>,
+    get: &dyn Fn(&str) -> Result<String, VarError>,
+    warn: &mut dyn FnMut(String),
 ) -> Profile {
     Profile {
         backend: b.name.to_string(),
         app,
         alternatives: alternatives(b, app, path),
-        start_deadline: start_deadline(b, get),
+        start_deadline: start_deadline(b, get, warn),
     }
 }
 
@@ -303,7 +337,9 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
         None => profile::resolve_app(b.candidates, path, b.resolution)
             .map_err(|e| e.blocking_error(b.candidates))?,
     };
-    let p = profile_for(b, app, path, &|k| std::env::var(k).ok());
+    let p = profile_for(b, app, path, &|k| std::env::var(k), &mut |m| {
+        eprintln!("glass: {m}")
+    });
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
     // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
@@ -794,19 +830,47 @@ mod tests {
         backend_for("android").expect("android must be drivable")
     }
 
+    /// An environment where nothing at all is set.
+    fn unset(_: &str) -> Result<String, VarError> {
+        Err(VarError::NotPresent)
+    }
+
+    /// An environment holding the boot budget and nothing else, answering as `std::env::var` does.
+    fn budget_of(v: &'static str) -> impl Fn(&str) -> Result<String, VarError> {
+        move |k| match k {
+            "GLASS_EMULATOR_BOOT_TIMEOUT_MS" => Ok(v.to_string()),
+            _ => Err(VarError::NotPresent),
+        }
+    }
+
+    /// The deadline together with everything deriving it warned about, so a test can assert on
+    /// both. A warning nobody can observe is one a test cannot require.
+    fn deadline_and_warnings(
+        b: &DrivableBackend,
+        get: &dyn Fn(&str) -> Result<String, VarError>,
+    ) -> (Duration, Vec<String>) {
+        let mut warnings = Vec::new();
+        let d = start_deadline(b, get, &mut |m| warnings.push(m));
+        (d, warnings)
+    }
+
+    fn deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Result<String, VarError>) -> Duration {
+        deadline_and_warnings(b, get).0
+    }
+
     /// A backend that launches into a compositor already running does not need to outlast a boot.
     #[test]
     fn a_backend_that_never_boots_a_device_keeps_the_default_deadline() {
         let x11 = backend_for("x11").expect("x11 must be drivable");
         assert!(!x11.boots_a_device);
-        assert_eq!(start_deadline(x11, &|_| None), CALL_TIMEOUT);
+        assert_eq!(deadline(x11, &unset), CALL_TIMEOUT);
     }
 
     /// The relationship the whole function exists for: a client deadline inside the device's own boot
     /// budget makes an ordinary cold boot look like a failed launch.
     #[test]
     fn a_booting_backend_outlasts_the_devices_own_boot_budget() {
-        let d = start_deadline(android(), &|_| None);
+        let d = deadline(android(), &unset);
         assert!(
             d > Duration::from_millis(BOOT_BUDGET_DEFAULT_MS),
             "a deadline inside the boot budget reports the boot as a launch failure: {d:?}"
@@ -817,15 +881,13 @@ mod tests {
         );
     }
 
-    /// Raising the device's budget must raise this one. Leaving it fixed would make the client give
-    /// up first at the exact moment an operator asked to wait longer.
+    /// Raising the device's budget must raise this one, and quietly: a warning on a value that was
+    /// honoured would train an operator to ignore the one that says it was not.
     #[test]
     fn raising_the_boot_budget_raises_the_deadline() {
-        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "600000".to_string());
-        assert_eq!(
-            start_deadline(android(), &get),
-            Duration::from_millis(600_000) + CALL_TIMEOUT
-        );
+        let (d, warnings) = deadline_and_warnings(android(), &budget_of("600000"));
+        assert_eq!(d, Duration::from_millis(600_000) + CALL_TIMEOUT);
+        assert_eq!(warnings, Vec::<String>::new());
     }
 
     /// An unreadable value is not a shorter budget: glass falls back to its own default, so this must
@@ -833,9 +895,8 @@ mod tests {
     #[test]
     fn an_unreadable_boot_budget_falls_back_to_the_default() {
         for v in ["", "   ", "soon", "-1", "12.5", "99999999999999999999"] {
-            let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| v.to_string());
             assert_eq!(
-                start_deadline(android(), &get),
+                deadline(android(), &budget_of(v)),
                 Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT,
                 "{v:?} must not shorten the deadline"
             );
@@ -845,14 +906,79 @@ mod tests {
     /// `glass-android` parses this same variable with a bare `.parse()` — no `.trim()` — so a
     /// whitespace-padded value is unreadable to the device too. Trimming it here would derive a
     /// deadline from a boot budget the device itself fell back away from, the two silently
-    /// disagreeing about how long the boot may take.
+    /// disagreeing about how long the boot may take. The padding an operator cannot see is
+    /// exactly why the fallback has to announce itself.
     #[test]
     fn a_whitespace_padded_boot_budget_falls_back_to_the_default_like_glass_android() {
-        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| " 600000 ".to_string());
+        let (d, warnings) = deadline_and_warnings(android(), &budget_of(" 600000 "));
         assert_eq!(
-            start_deadline(android(), &get),
+            d,
             Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT
         );
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    }
+
+    /// Falling back is right; falling back in silence is not. The operator who raised the budget
+    /// for a slow host otherwise cannot tell a value that was ignored from one never set — and the
+    /// boot is not getting it either, which is the part they have to hear.
+    #[test]
+    fn an_unreadable_boot_budget_says_so_rather_than_falling_back_in_silence() {
+        let (_, warnings) = deadline_and_warnings(android(), &budget_of("300s"));
+        let [w] = warnings.as_slice() else {
+            panic!("exactly one warning, got: {warnings:?}");
+        };
+        assert!(
+            w.contains("GLASS_EMULATOR_BOOT_TIMEOUT_MS"),
+            "must name the variable: {w}"
+        );
+        assert!(
+            w.contains("300s"),
+            "must quote the value it could not use: {w}"
+        );
+        assert!(
+            w.contains(&BOOT_BUDGET_DEFAULT_MS.to_string()),
+            "must name the budget used instead: {w}"
+        );
+        assert!(
+            w.contains("android backend reads this variable the same way"),
+            "must say the boot falls back too: {w}"
+        );
+    }
+
+    /// An unset variable is not a mistake — it is the ordinary case, and warning about it would
+    /// bury the warning that matters.
+    #[test]
+    fn an_unset_boot_budget_warns_about_nothing() {
+        let (_, warnings) = deadline_and_warnings(android(), &unset);
+        assert_eq!(warnings, Vec::<String>::new());
+    }
+
+    /// A value whose bytes are not UTF-8 is *set* — `std::env::var(..).ok()` reports it as unset,
+    /// which would leave an operator's garbled budget as silent as no budget at all.
+    #[test]
+    fn a_non_utf8_boot_budget_is_set_but_unusable_not_unset() {
+        let (d, warnings) =
+            deadline_and_warnings(android(), &|_| Err(VarError::NotUnicode(not_utf8())));
+        assert_eq!(
+            d,
+            Duration::from_millis(BOOT_BUDGET_DEFAULT_MS) + CALL_TIMEOUT,
+            "the value glass-android derives from it is the default"
+        );
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    }
+
+    /// A value `std::env::var` would reject as `NotUnicode`, built per platform because a
+    /// non-UTF-8 environment value is spelled in bytes on one and in UTF-16 on the other.
+    #[cfg(unix)]
+    fn not_utf8() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0x33, 0x30, 0x30, 0x80])
+    }
+    #[cfg(windows)]
+    fn not_utf8() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate: representable in a Windows environment block, not in UTF-8.
+        std::ffi::OsString::from_wide(&[0x33, 0x30, 0x30, 0xD800])
     }
 
     /// A boot budget smaller than one ordinary call still leaves a full ordinary call's worth of
@@ -860,9 +986,8 @@ mod tests {
     /// clamp that only engages above some threshold.
     #[test]
     fn a_tiny_boot_budget_still_leaves_a_full_call_to_launch() {
-        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "1".to_string());
         assert_eq!(
-            start_deadline(android(), &get),
+            deadline(android(), &budget_of("1")),
             Duration::from_millis(1) + CALL_TIMEOUT
         );
     }
@@ -872,7 +997,7 @@ mod tests {
     /// `#[ignore]`d gates green while a cold boot on a slow host reported itself as a failed launch.
     #[test]
     fn a_profile_carries_the_deadline_its_backend_derives() {
-        let android = profile_for(android(), &ANDROID_CANDIDATES[0], None, &|_| None);
+        let android = profile_for(android(), &ANDROID_CANDIDATES[0], None, &unset, &mut |_| ());
         assert!(
             android.start_deadline > Duration::from_millis(BOOT_BUDGET_DEFAULT_MS),
             "a launch that may boot a device must outlast the device's own budget: {:?}",
@@ -881,7 +1006,7 @@ mod tests {
 
         let (_dir, path) = host_with(&["zenity"]);
         let x11 = backend_for("x11").expect("x11 must be drivable");
-        let x11 = profile_for(x11, &X11_CANDIDATES[2], Some(&path), &|_| None);
+        let x11 = profile_for(x11, &X11_CANDIDATES[2], Some(&path), &unset, &mut |_| ());
         assert_eq!(
             x11.start_deadline, CALL_TIMEOUT,
             "a backend that launches into a running compositor waits out no boot"
@@ -899,7 +1024,7 @@ mod tests {
         let app = profile::resolve_app(b.candidates, Some(&path), b.resolution)
             .expect("zenity is installed");
         assert_eq!(app.label, "zenity", "the fixture must select a middle row");
-        let p = profile_for(b, app, Some(&path), &|_| None);
+        let p = profile_for(b, app, Some(&path), &unset, &mut |_| ());
         assert_eq!(p.alternatives, ["xterm"]);
     }
 
@@ -909,7 +1034,7 @@ mod tests {
     /// `--app` accepts.
     #[test]
     fn an_offer_from_a_preinstalled_backend_names_every_other_row() {
-        let p = profile_for(android(), &ANDROID_CANDIDATES[0], None, &|_| None);
+        let p = profile_for(android(), &ANDROID_CANDIDATES[0], None, &unset, &mut |_| ());
         assert_eq!(
             p.alternatives,
             ["settings"],
@@ -923,11 +1048,11 @@ mod tests {
     fn an_offer_never_names_the_candidate_the_run_selected() {
         let (_dir, path) = host_with(&["zenity", "xterm"]);
         let b = backend_for("x11").expect("x11 must be drivable");
-        let p = profile_for(b, &X11_CANDIDATES[3], Some(&path), &|_| None);
+        let p = profile_for(b, &X11_CANDIDATES[3], Some(&path), &unset, &mut |_| ());
         assert_eq!(p.app.label, "xterm");
         assert_eq!(p.alternatives, ["zenity"]);
 
-        let p = profile_for(android(), &ANDROID_CANDIDATES[1], None, &|_| None);
+        let p = profile_for(android(), &ANDROID_CANDIDATES[1], None, &unset, &mut |_| ());
         assert_eq!(p.alternatives, ["contacts"]);
     }
 
@@ -935,15 +1060,14 @@ mod tests {
     /// deadline nobody connected to it.
     #[test]
     fn the_deadline_reads_only_the_boot_budget_variable() {
-        let get = |k: &str| (k == "GLASS_EMULATOR_BOOT_TIMEOUT_MS").then(|| "600000".to_string());
-        let other = |_: &str| Some("600000".to_string());
+        let every_variable = |_: &str| Ok("600000".to_string());
         assert_ne!(
-            start_deadline(android(), &get),
-            start_deadline(android(), &|_| None)
+            deadline(android(), &budget_of("600000")),
+            deadline(android(), &unset)
         );
         assert_eq!(
-            start_deadline(android(), &other),
-            start_deadline(android(), &get)
+            deadline(android(), &every_variable),
+            deadline(android(), &budget_of("600000"))
         );
     }
 }
