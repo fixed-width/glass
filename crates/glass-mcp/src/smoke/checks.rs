@@ -396,7 +396,7 @@ pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
+    use crate::smoke::profile::{ANDROID_CANDIDATES, WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::{CALL_TIMEOUT, CallResult, ScriptedTransport};
     use std::time::Duration;
@@ -582,6 +582,33 @@ mod tests {
             !out.detail.contains("--app"),
             "a pass has no alternatives to offer: {}",
             out.detail
+        );
+    }
+
+    /// `label` and `bin` coincide in every candidate above, so a filter or map that used `bin`
+    /// where it meant `label` would still pass all of them. Android is the one table where the
+    /// two diverge, and the backend this whole feature exists for — nothing probes it, so a
+    /// mixed-up offer would ship silently and read out a raw component string instead of the
+    /// short name `--app` accepts.
+    #[test]
+    fn an_android_offer_names_the_label_operators_pass_not_the_component() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
+        let mut p = profile();
+        p.backend = "android".into();
+        p.candidates = &ANDROID_CANDIDATES;
+        p.app = &ANDROID_CANDIDATES[0];
+        let out = check_start(&mut t, &p);
+        let (_, offered) = out
+            .detail
+            .split_once("other candidates: ")
+            .unwrap_or_else(|| panic!("must carry an offer: {}", out.detail));
+        assert!(
+            offered.contains(ANDROID_CANDIDATES[1].label),
+            "must offer the settings label: {offered}"
+        );
+        assert!(
+            !offered.contains(ANDROID_CANDIDATES[1].bin),
+            "must offer the short label, not the raw component string: {offered}"
         );
     }
 
