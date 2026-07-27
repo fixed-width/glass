@@ -111,8 +111,7 @@ pub fn all_check_names() -> Vec<&'static str> {
     planned_rows().into_iter().map(|(_, name)| name).collect()
 }
 
-/// The step whose `detail` carries an unavailable app: `start` is the check that would hit
-/// the gap, and the one the how-to already sends a reader to when a run goes wrong.
+/// The step whose `detail` carries an unavailable app: `start` is the check that would hit the gap.
 const START_STEP: u8 = 1;
 
 /// `--dry-run`'s rows: every check a real run would produce, each a `skip` saying what it
@@ -451,6 +450,22 @@ mod tests {
             assert!(!candidates.is_empty(), "{name:?} has no candidate apps");
             assert!(seen.insert(*name), "{name:?} appears twice");
         }
+    }
+
+    /// The tests that loop over this list are only as good as the list. Emptying it makes every
+    /// such loop pass vacuously, so the list is pinned to the table it claims to render.
+    #[test]
+    fn drivable_backends_lists_every_row_of_the_table() {
+        let from_table: Vec<&str> = DRIVABLE.iter().map(|(name, _)| *name).collect();
+        assert_eq!(drivable_backends(), from_table);
+        assert!(
+            !drivable_backends().is_empty(),
+            "an empty list makes every loop over it vacuous"
+        );
+        assert!(
+            drivable_backends().iter().all(|b| !b.is_empty()),
+            "an empty name makes `contains` match anything"
+        );
     }
 
     /// `xed` heads both tables, so naming one candidate would not tell the two apart.
