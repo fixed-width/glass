@@ -221,6 +221,7 @@ fn dropped_error_message_scenario() -> Scenario {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke::report::CheckOutcome;
 
     #[test]
     fn every_injected_fault_is_caught() {
@@ -240,5 +241,57 @@ mod tests {
         );
         let err = s.names_an_assertion().unwrap_err();
         assert!(err.contains("unnamed assertion"), "got: {err}");
+    }
+
+    fn scenario(outcome: CheckOutcome, expect_detail: &'static str) -> Scenario {
+        Scenario {
+            name: "fixture",
+            outcome,
+            expect_detail,
+        }
+    }
+
+    #[test]
+    fn a_check_that_failed_for_the_named_reason_is_caught() {
+        let s = scenario(
+            CheckOutcome::fail(1, "start", "expected true, got false"),
+            "expected true",
+        );
+        assert!(s.caught());
+    }
+
+    /// `Fail`, but for the wrong reason — the status-only match the module header argues against.
+    #[test]
+    fn a_check_that_failed_for_another_reason_is_not_caught() {
+        let s = scenario(
+            CheckOutcome::fail(1, "start", "script exhausted"),
+            "expected true",
+        );
+        assert!(!s.caught());
+    }
+
+    /// A passing check has not been caught however well its detail reads.
+    #[test]
+    fn a_check_that_passed_is_not_caught() {
+        let s = scenario(
+            CheckOutcome::pass(1, "start", "expected true"),
+            "expected true",
+        );
+        assert!(!s.caught());
+    }
+
+    /// The Ok message is the only thing a caller sees on success, so it must state what was
+    /// actually exercised rather than an arbitrary string.
+    #[test]
+    fn the_success_message_names_how_many_faults_were_injected() {
+        let msg = run_self_check().expect("the shipped scenarios must all be caught");
+        assert!(
+            msg.contains("injected faults"),
+            "must say what it did: {msg}"
+        );
+        assert!(
+            msg.chars().any(|c| c.is_ascii_digit()),
+            "must state the count: {msg}"
+        );
     }
 }
