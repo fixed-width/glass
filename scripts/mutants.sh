@@ -65,6 +65,15 @@ for arg in "$@"; do
     esac
 done
 
+# How many mutants a set of scope arguments yields, ignoring any `--shard` the caller
+# passed. Listing costs ~0.1s and builds nothing, so the "did this gate anything"
+# question is answered before a single mutant is compiled — and answered for the whole
+# run rather than for one shard, which may legitimately receive none.
+list_count() {
+    cargo mutants --list --package glass-mcp "$@" \
+        ${diff_file:+--in-diff "$diff_file"} 2>/dev/null | wc -l
+}
+
 total=0 caught=0 missed=0 timed_out=0 unviable=0 status=0
 
 # Run cargo-mutants into $1 with the remaining arguments, and read the outcome counts.
@@ -91,10 +100,13 @@ attempt() {
     fi
 }
 
-attempt "$out" --file "$SMOKE_GLOB" "$@"
-graded=$out
+# Choose the scope before building anything: the module glob, or — when the diff
+# changed only test code and so yields nothing to mutate — the whole of each file it
+# touched, so a deleted test cannot bring a survivor back unnoticed.
+scope=(--file "$SMOKE_GLOB")
+planned=$(list_count "${scope[@]}")
 
-if [ "$total" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
+if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
     # `+++ b/<path>` names each file the diff writes to; a deletion names /dev/null
     # and drops out with the `.rs` filter.
     mapfile -t touched < <(
@@ -105,22 +117,30 @@ if [ "$total" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
         echo "Falling back to the whole of each file it touched, so a deleted test"
         echo "cannot bring a survivor back unnoticed:"
         printf '  %s\n' "${touched[@]}"
-        file_args=()
+        scope=()
         for f in "${touched[@]}"; do
-            file_args+=(--file "$f")
+            scope+=(--file "$f")
         done
-        graded="$out-files"
-        attempt "$graded" "${file_args[@]}" ${passthrough[@]+"${passthrough[@]}"}
+        diff_file=""
+        planned=$(list_count "${scope[@]}")
     fi
 fi
 
-echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
-
-if [ "$total" -eq 0 ]; then
-    echo "This run gated nothing. Check that --file still matches the files under test"
-    echo "and that the package still exists."
+if [ "$planned" -eq 0 ]; then
+    echo "This run would gate nothing: no mutants under the scope it was given."
+    echo "Check that --file still matches the files under test and that the package"
+    echo "still exists."
     exit 1
 fi
+echo "mutants planned across the whole run: $planned"
+
+attempt "$out" "${scope[@]}" ${diff_file:+--in-diff "$diff_file"} \
+    ${passthrough[@]+"${passthrough[@]}"}
+graded=$out
+
+# A shard may legitimately draw none of the planned mutants; the count above is what
+# proves the run as a whole gated something.
+echo "mutants: $total generated, $caught caught, $missed missed, $timed_out timed out, $unviable unviable"
 if [ "$missed" -gt 0 ]; then
     echo "Survivors are listed in $graded/mutants.out/missed.txt"
     exit 1

@@ -15,8 +15,13 @@ env:
 
 jobs:
   sweep:
-    name: Mutation sweep (smoke · full module)
+    name: Mutation sweep shard ${{ matrix.shard }} (smoke)
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports: one red shard must not hide a second one.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
@@ -30,10 +35,13 @@ jobs:
       - name: Sweep
         # nextest runs each test in its own process, so the module's deliberate
         # multi-second teardown waits overlap instead of summing: 42s to 11s here.
-        run: scripts/mutants.sh "$RUNNER_TEMP/mutants" --test-tool nextest
+        run: |
+          scripts/mutants.sh "$RUNNER_TEMP/mutants" \
+            --test-tool nextest \
+            --shard ${{ matrix.shard }}/4 --sharding round-robin
       - name: Upload the outcome
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mutants-sweep
+          name: mutants-sweep-${{ matrix.shard }}
           path: ${{ runner.temp }}/mutants/mutants.out/
