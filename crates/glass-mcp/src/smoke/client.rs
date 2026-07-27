@@ -191,6 +191,12 @@ impl StdioClient {
         self.session.server_version()
     }
 
+    /// The spawned server's pid, so a test can assert it was reaped.
+    #[cfg(all(test, unix))]
+    fn child_id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Kill the child, then append its stderr to `e`. Every session failure lands here — a
     /// timeout, a closed pipe, or a JSON-RPC error response — so a single rejected call tears the
     /// server down and the checks that follow will find it gone.
@@ -269,13 +275,20 @@ fn spawn_stderr_reader(
                 let Ok(mut tail) = tail.lock() else {
                     return; // a poisoned lock means the client is already unwinding
                 };
-                if tail.len() == STDERR_TAIL_LINES {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
+                push_bounded(&mut tail, line);
             }
         })
         .map_err(|e| format!("could not spawn the stderr-reader thread: {e}"))
+}
+
+/// Keep the newest [`STDERR_TAIL_LINES`] lines: push, then drop from the front when that puts
+/// the tail over the bound. Outside the reader thread's closure so a test can reach it — a wrong
+/// comparison here silently shrinks the tail that carries a server panic into a failure detail.
+fn push_bounded(tail: &mut VecDeque<String>, line: String) {
+    tail.push_back(line);
+    if tail.len() > STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
 }
 
 /// Waits on `rx` for a JSON-RPC message whose `id` matches, skipping
@@ -566,5 +579,180 @@ mod tests {
             e.contains("no such tool"),
             "must carry the server's message: {e}"
         );
+    }
+
+    /// The tail keeps the LAST lines: a server that logs heavily before panicking must not
+    /// push its panic out of the buffer, and the bound must not collapse the tail.
+    #[test]
+    fn the_stderr_tail_keeps_the_last_lines_up_to_the_bound() {
+        let mut tail = VecDeque::new();
+        for i in 0..(STDERR_TAIL_LINES + 5) {
+            push_bounded(&mut tail, format!("line {i}"));
+        }
+        let newest: Vec<String> = (5..STDERR_TAIL_LINES + 5)
+            .map(|i| format!("line {i}"))
+            .collect();
+        assert_eq!(Vec::from(tail), newest);
+    }
+
+    /// What a stub server reports at `initialize` — unlike this crate's own version, which the
+    /// client already holds and so could not be told apart from one the server answered.
+    #[cfg(unix)]
+    const STUB_VERSION: &str = "7.7.7-stub";
+
+    /// A stub MCP server that answers `initialize`, answers one `tools/call` by running
+    /// `on_call`, and exits when its stdin closes.
+    #[cfg(unix)]
+    fn stub_answering(on_call: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+  *'"method":"initialize"'*)
+    printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"serverInfo":{{"version":"{STUB_VERSION}"}}}}}}'
+    ;;
+  *'"method":"tools/call"'*)
+{on_call}
+    ;;
+  esac
+done
+"#
+        )
+    }
+
+    /// A stub MCP server that answers `initialize` and then stops reading its stdin: dropping
+    /// the client closes that pipe, so a stub still in `read` would exit on its own and a `Drop`
+    /// that reaps nothing would look correct. The `sleep` bounds how long a leaked child runs.
+    #[cfg(unix)]
+    fn stub_outliving_its_stdin() -> String {
+        format!(
+            r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"serverInfo":{{"version":"{STUB_VERSION}"}}}}}}'
+exec sleep 10
+"#
+        )
+    }
+
+    /// Writes `script` as an executable in a fresh temporary directory and returns both. The
+    /// caller must hold the directory: dropping it deletes the script, including while a
+    /// failing assertion unwinds.
+    #[cfg(unix)]
+    fn write_stub(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory for the stub server");
+        let exe = dir.path().join("stub-server.sh");
+        std::fs::write(&exe, script).expect("write the stub server");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub server executable");
+        (dir, exe)
+    }
+
+    /// A stub answers in milliseconds; bounding the session well under `spawn`'s production
+    /// budget keeps a handshake that never completes a fast failure rather than a two-minute stall.
+    #[cfg(unix)]
+    const STUB_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Spawn a stub server, retrying past a transient ETXTBSY: a sibling test thread's fork
+    /// can momentarily hold the freshly written script's fd open, racing our exec (same
+    /// rationale as the glass-x11 and glass-ios fixture tests).
+    #[cfg(unix)]
+    fn spawn_stub(exe: &std::path::Path) -> StdioClient {
+        let mut last = None;
+        for _ in 0..100 {
+            match StdioClient::spawn_with_timeout(exe, &[], STUB_TIMEOUT) {
+                Err(m) if m.contains("Text file busy") => {
+                    thread::sleep(Duration::from_millis(10));
+                    last = Some(m);
+                }
+                r => return r.expect("spawn the stub server"),
+            }
+        }
+        panic!("ETXTBSY persisted after 100 retries: {last:?}")
+    }
+
+    /// A reaped child is gone from the process table; a leaked one — running or a zombie —
+    /// still answers signal 0.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success()
+    }
+
+    /// The version in the report must be the one that came back over the wire: client and
+    /// server are the same executable in a real run, so only a spawned server reporting a
+    /// version nothing else holds can tell a relayed value from an invented one.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_server_reports_the_version_it_sent() {
+        let (_dir, exe) = write_stub(&stub_answering("    :"));
+        let client = spawn_stub(&exe);
+        assert_eq!(client.server_version().as_deref(), Some(STUB_VERSION));
+    }
+
+    /// Every check grades what `call` returns, so it must carry the server's envelope out of
+    /// the process rather than anything the client could have built without asking.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_server_call_returns_the_servers_envelope() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"tool\":\"glass_stop\",\"result\":{\"stopped\":true}}"}],"isError":false}}"#;
+        let (_dir, exe) = write_stub(&stub_answering(&format!("    printf '%s\\n' '{reply}'")));
+        let mut client = spawn_stub(&exe);
+        let r = client
+            .call("glass_stop", serde_json::json!({}))
+            .expect("the stub answers the call");
+        assert_eq!(
+            r.envelope,
+            Some(serde_json::json!({
+                "ok": true, "tool": "glass_stop", "result": { "stopped": true }
+            }))
+        );
+    }
+
+    /// A JSON-RPC error response reaches `on_failure` like any other session failure, so it
+    /// tears the server down too — a contract no glass tool reaches today, and so one that
+    /// nothing but this test holds in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_json_rpc_error_response_kills_the_server() {
+        let reply = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no such tool"}}"#;
+        let on_call = format!(
+            "    printf '%s\\n' 'stub refused the call' >&2\n    printf '%s\\n' '{reply}'\n    exit 0"
+        );
+        let (_dir, exe) = write_stub(&stub_answering(&on_call));
+        let mut client = spawn_stub(&exe);
+        let pid = client.child_id();
+
+        let e = client
+            .call("glass_nope", serde_json::json!({}))
+            .unwrap_err();
+        assert!(e.contains("glass_nope"), "must name the tool: {e}");
+        assert!(
+            e.contains("stub refused the call"),
+            "must carry the server's stderr: {e}"
+        );
+        assert!(!pid_is_alive(pid), "pid {pid} survived a rejected call");
+    }
+
+    /// Dropping the client must reap the server: a leaked one outlives the run and holds
+    /// whatever the run was driving.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_client_reaps_the_spawned_server() {
+        let (_dir, exe) = write_stub(&stub_outliving_its_stdin());
+        let client = spawn_stub(&exe);
+        let pid = client.child_id();
+        // Signal 0 must reach the stub while it still runs, or a pid that is not ours — one we
+        // may not signal, or that never existed — would read as reaped below.
+        assert!(
+            pid_is_alive(pid),
+            "the stub must run before the client is dropped"
+        );
+        drop(client);
+        assert!(!pid_is_alive(pid), "pid {pid} outlived the client");
     }
 }
