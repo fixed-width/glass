@@ -13,10 +13,10 @@ const SERVER: &str = env!("CARGO_BIN_EXE_glass-mcp");
 fn smoke_android_passes_against_a_stock_app() {
     // The backend attaches to an online device or boots the configured AVD, so there is nothing
     // to start here — but a host with no android at all must skip rather than report a failure
-    // it cannot act on.
+    // it cannot act on. A host that has android and will not run it is reported, not skipped.
     if !android_probe(SERVER).can_run(
         REQUIRE_ANDROID,
-        "adb-reachable android device or AVD to boot",
+        "android setup glass can drive — adb, plus an online device or an AVD to boot",
     ) {
         return;
     }

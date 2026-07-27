@@ -1,6 +1,6 @@
-//! What the two `#[ignore]`d smoke gates share: the private Xvfb the x11 run needs (the MCP
-//! server connects to an X display at startup), the sway probe the wayland run needs, and the
-//! report readers and assertions both apply to whichever backend they drove.
+//! What the three `#[ignore]`d smoke gates share: the private Xvfb the x11 run needs (the MCP
+//! server connects to an X display at startup), the host probes the wayland and android runs need,
+//! and the report readers and assertions all three apply to whichever backend they drove.
 
 #![allow(dead_code)]
 
@@ -182,14 +182,18 @@ pub fn assert_fixture_checks_pass(json: &serde_json::Value, stdout: &str) {
     }
 }
 
-/// Whether this host has what a gate needs, or why the question could not be answered. A probe
-/// that cannot answer is not a host without the thing: the first must fail the test, the second
-/// must skip it.
+/// Whether this host has what a gate needs, or why it cannot be used. A host that simply lacks the
+/// feature is not the same as one that has it and cannot run it: the first must skip, and the
+/// second — like a probe that could not answer at all — must fail loudly.
 #[derive(Debug)]
 #[must_use]
 pub enum HostProbe {
     Available,
+    /// This host does not have the feature the gate drives, so there is nothing here to report.
     Absent,
+    /// Either the probe could not answer, or this host has the feature and glass will not use it.
+    /// Neither is a host to skip: the first would pass off an unasked question as an absent
+    /// feature, the second a setup gap the operator can act on.
     Broken(String),
 }
 
@@ -216,7 +220,9 @@ impl HostProbe {
                 eprintln!("no {what}; skipping");
                 false
             }
-            Self::Broken(why) => panic!("cannot tell whether this host can run the gate: {why}"),
+            Self::Broken(why) => {
+                panic!("the gate cannot run here, and this host is not one to skip: {why}")
+            }
         }
     }
 }
@@ -316,8 +322,9 @@ fn classify(doc: &serde_json::Value) -> HostProbe {
     }
 }
 
-/// Read a `doctor --json` document's verdict on android. Split from running the binary because
-/// the ways the document can be unreadable are what needs testing, and none of them need a device.
+/// Read a `doctor --json` document's verdict on android: can the gate run here, is this simply a
+/// host without android, or is it one that has android and will not run it? Split from running the
+/// binary because those readings are what needs testing, and none of them need a device.
 fn classify_android(doc: &serde_json::Value) -> HostProbe {
     let (adb, _) = match check_status(doc, "android", "adb") {
         Ok(v) => v,
@@ -334,12 +341,22 @@ fn classify_android(doc: &serde_json::Value) -> HostProbe {
     match device {
         // Attached, or about to boot: the runner inherits glass's auto-boot lifecycle.
         "ok" | "warn" => HostProbe::Available,
-        // `fail` is two conditions — nothing to run, and a refusal such as several online devices
-        // with no serial chosen. A host whose adb works has android set up, so both are worth
-        // reporting; doctor's own detail is the only thing that says which.
-        "fail" => HostProbe::Broken(format!(
-            "glass will not use any device on this host: {detail}"
-        )),
+        // `fail` is two conditions — no device and nothing to boot, and a refusal such as several
+        // online devices with no serial chosen. The `emulator` check is what tells them apart:
+        // doctor reports `device` as `warn` (will boot) whenever an AVD exists, so a `fail` beside
+        // AVDs is a refusal, and a `fail` without them is a host with nothing to run.
+        "fail" => match check_status(doc, "android", "emulator") {
+            Ok(("ok", _)) => HostProbe::Broken(format!(
+                "glass will not use any device on this host: {detail}"
+            )),
+            // Every non-`ok` verdict means no AVD glass could boot — no emulator binary, or none
+            // listed. With no device either, this host is not set up for android at all.
+            Ok(("warn" | "fail" | "skip", _)) => HostProbe::Absent,
+            Ok((other, _)) => HostProbe::Broken(format!(
+                "the android emulator check had unrecognized status {other:?}: {doc}"
+            )),
+            Err(why) => HostProbe::Broken(why),
+        },
         other => HostProbe::Broken(format!(
             "the android device check had unrecognized status {other:?}: {doc}"
         )),
@@ -488,16 +505,22 @@ mod android_probe_tests {
     use super::*;
     use serde_json::json;
 
-    /// A `doctor --json` document shaped like the real one's android section. A shape that
-    /// drifted from doctor's own would make every host `Broken`, which panics — so this fixture
-    /// cannot rot quietly.
-    fn doctor_reporting(adb: &str, device: &str, device_detail: &str) -> serde_json::Value {
+    /// A `doctor --json` document shaped like the real one's android section, in doctor's own
+    /// check order. A shape that drifted from doctor's own would make every host `Broken`, which
+    /// panics — so this fixture cannot rot quietly.
+    fn doctor_reporting(
+        adb: &str,
+        emulator: &str,
+        device: &str,
+        device_detail: &str,
+    ) -> serde_json::Value {
         json!({
             "sections": [{
                 "title": "android",
                 "backend": "android",
                 "checks": [
                     { "name": "adb", "status": adb, "detail": "adb at …" },
+                    { "name": "emulator", "status": emulator, "detail": "emulator at …" },
                     { "name": "device", "status": device, "detail": device_detail },
                     { "name": "screencap", "status": "ok", "detail": "…" },
                 ],
@@ -519,7 +542,7 @@ mod android_probe_tests {
         for device in ["ok", "warn"] {
             assert!(
                 matches!(
-                    classify_android(&doctor_reporting("ok", device, "…")),
+                    classify_android(&doctor_reporting("ok", "ok", device, "…")),
                     HostProbe::Available
                 ),
                 "device {device:?} must read as a host that can run"
@@ -533,7 +556,7 @@ mod android_probe_tests {
         for device in ["skip", "fail", "ok"] {
             assert!(
                 matches!(
-                    classify_android(&doctor_reporting("fail", device, "…")),
+                    classify_android(&doctor_reporting("fail", "ok", device, "…")),
                     HostProbe::Absent
                 ),
                 "no adb must read as absent even when device says {device:?}"
@@ -541,13 +564,35 @@ mod android_probe_tests {
         }
     }
 
-    /// The trap: `fail` covers both "nothing to run" and "several devices, pick one". A host with
-    /// adb working has android set up, so a refusal is a problem to report, not a reason to skip
-    /// quietly — and the report must carry doctor's own detail, which is the only thing that says
-    /// which of the two it was.
+    /// The ordinary contributor: a distro-packaged `adb`, no phone and no AVD. Nothing here is
+    /// set up for android and nothing is misconfigured, so this must skip — the same shape as a
+    /// host with no sway — rather than fail a gate the developer never asked to run.
     #[test]
-    fn a_failing_device_check_on_a_host_with_adb_is_reported_not_skipped() {
+    fn a_host_with_adb_but_nothing_to_run_is_absent() {
+        for emulator in ["warn", "fail", "skip"] {
+            assert!(
+                matches!(
+                    classify_android(&doctor_reporting(
+                        "ok",
+                        emulator,
+                        "fail",
+                        "no online device and no AVD to boot",
+                    )),
+                    HostProbe::Absent
+                ),
+                "emulator {emulator:?} means no AVD to boot, so this host has nothing to run"
+            );
+        }
+    }
+
+    /// The other half of a failing `device` check: an AVD exists, so doctor would have said "will
+    /// boot" had that been the whole story — the failure is a refusal. That is a host with android
+    /// set up, which is worth reporting rather than skipping quietly, and doctor's own detail is
+    /// the only thing that says what glass refused over.
+    #[test]
+    fn a_refusal_on_a_host_with_an_avd_is_reported_not_skipped() {
         let why = why_broken(&doctor_reporting(
+            "ok",
             "ok",
             "fail",
             "2 online devices; set GLASS_ANDROID_SERIAL to one of: [emulator-5554, emulator-5556]",
@@ -560,7 +605,7 @@ mod android_probe_tests {
 
     #[test]
     fn a_device_status_outside_the_known_set_cannot_be_read_as_an_answer() {
-        let why = why_broken(&doctor_reporting("ok", "green", "…"));
+        let why = why_broken(&doctor_reporting("ok", "ok", "green", "…"));
         // The fuller phrase, not just "green": the fixture document also carries the raw
         // `"status": "green"` field, so a bare `contains("green")` would pass even if the
         // extracted status were never read into the message at all.
@@ -568,6 +613,33 @@ mod android_probe_tests {
             why.contains("unrecognized status \"green\""),
             "must name what it got: {why}"
         );
+    }
+
+    /// The emulator check is what decides skip-or-report, so a verdict nobody mapped cannot be
+    /// guessed at in either direction.
+    #[test]
+    fn an_emulator_status_outside_the_known_set_cannot_be_read_as_an_answer() {
+        let why = why_broken(&doctor_reporting("ok", "green", "fail", "…"));
+        assert!(
+            why.contains("emulator check had unrecognized status \"green\""),
+            "must name the check and what it got: {why}"
+        );
+    }
+
+    /// Without the emulator check there is nothing to tell a refusal from an empty host, and
+    /// guessing either way is worse than saying so.
+    #[test]
+    fn an_android_section_with_no_emulator_check_cannot_be_read_as_an_answer() {
+        let why = why_broken(&json!({
+            "sections": [{
+                "title": "android",
+                "checks": [
+                    { "name": "adb", "status": "ok", "detail": "…" },
+                    { "name": "device", "status": "fail", "detail": "…" },
+                ],
+            }],
+        }));
+        assert!(why.contains("emulator"), "must name the check: {why}");
     }
 
     #[test]
