@@ -278,7 +278,9 @@ jobs:
   mutants:
     name: Mutation gate (smoke · in-diff)
     runs-on: ubuntu-latest
-    # Non-blocking until the module's existing survivors are fixed; Task 9 removes this.
+    # A push carries no base ref to diff against; this gate is a pull-request check.
+    if: github.event_name == 'pull_request'
+    # Non-blocking until the module reaches zero surviving mutants.
     continue-on-error: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
