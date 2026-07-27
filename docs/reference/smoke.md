@@ -41,10 +41,13 @@ A `--backend wayland` run also needs a discoverable sway ≥ 1.12 — the backen
 headless one per session, and [Set up Linux](../how-to/setup-linux.md#wayland-sway) covers where it
 looks. Without one, check 1 (`start`) fails: there is no compositor to launch the app into.
 
-An `android` run needs a reachable `adb` and either an online device or an AVD glass can boot —
-`glass-mcp doctor` reports both under `android`. Because nothing probes the device, a component
-that is not installed on the image under test fails check 1 (`start`) with the launch error the
-device reported; the failure names the other candidates and how to select one.
+An `android` run needs a reachable `adb` and either an online device or an AVD glass can boot.
+`GLASS_BACKEND=android glass-mcp doctor` reports both under `android` as the run will meet them.
+Under any other backend, doctor softens that section's failures to advisory warnings — they are not
+required for the backend it is grading — so a host with no device and no AVD reads there as a
+warning rather than a failure, and the exit code stays 0. Because nothing probes the device, a
+component that is not installed on the image under test fails check 1 (`start`) with the launch
+error the device reported; the failure names the other candidates and how to select one.
 
 ## Checks
 
