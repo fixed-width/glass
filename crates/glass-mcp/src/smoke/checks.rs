@@ -27,20 +27,14 @@ fn excerpt(s: &str) -> String {
     format!("{}…", s.chars().take(MAX).collect::<String>())
 }
 
-/// The candidates this run did not select, as a line telling the caller how to choose one.
-/// Derived from the table rather than written per backend: prose that names a table drifts from it
-/// silently, and this is the only place a run without a probe can say what else exists.
+/// The candidates this run did not select, as a line telling the caller how to choose one. Which
+/// candidates those are is decided in `smoke::profile_for`, where the resolution policy and the
+/// search path are known; a backend with nothing to offer appends nothing at all.
 fn other_candidates(p: &Profile) -> Option<String> {
-    let others: Vec<&str> = p
-        .candidates
-        .iter()
-        .filter(|c| c.label != p.app.label)
-        .map(|c| c.label)
-        .collect();
-    (!others.is_empty()).then(|| {
+    (!p.alternatives.is_empty()).then(|| {
         format!(
             "other candidates: {} — select with --app",
-            others.join(", ")
+            p.alternatives.join(", ")
         )
     })
 }
@@ -396,7 +390,7 @@ pub fn check_stop(t: &mut dyn McpTransport) -> CheckOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::smoke::profile::{ANDROID_CANDIDATES, WAYLAND_CANDIDATES, X11_CANDIDATES};
+    use crate::smoke::profile::{WAYLAND_CANDIDATES, X11_CANDIDATES};
     use crate::smoke::report::CheckStatus;
     use crate::smoke::transport::{CALL_TIMEOUT, CallResult, ScriptedTransport};
     use std::time::Duration;
@@ -414,11 +408,13 @@ mod tests {
         }
     }
 
+    /// Offers nothing: what a run offers is `smoke::profile_for`'s decision, so a test that wants
+    /// an offer states it.
     fn profile() -> Profile {
         Profile {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
-            candidates: &X11_CANDIDATES,
+            alternatives: vec![],
             start_deadline: CALL_TIMEOUT,
         }
     }
@@ -427,7 +423,7 @@ mod tests {
         Profile {
             backend: "wayland".into(),
             app: &WAYLAND_CANDIDATES[0],
-            candidates: &WAYLAND_CANDIDATES,
+            alternatives: vec![],
             start_deadline: CALL_TIMEOUT,
         }
     }
@@ -508,7 +504,7 @@ mod tests {
     }
 
     /// A failed launch is the only place a run tells the operator what else it could have driven,
-    /// because nothing probed for alternatives beforehand.
+    /// and the launch error it failed with has to survive alongside the offer.
     #[test]
     fn a_failed_start_names_the_candidates_it_did_not_try() {
         let mut t = ScriptedTransport::new(vec![(
@@ -517,6 +513,7 @@ mod tests {
         )]);
         let mut p = profile();
         p.app = &X11_CANDIDATES[0];
+        p.alternatives = vec!["gnome-text-editor", "zenity", "xterm"];
         let out = check_start(&mut t, &p);
         assert_eq!(out.status, CheckStatus::Fail);
         assert!(
@@ -534,32 +531,14 @@ mod tests {
         assert!(out.detail.contains("--app"), "must say how: {}", out.detail);
     }
 
-    /// The selected candidate is not an alternative to itself; offering it would send the operator
-    /// back to the run that just failed.
+    /// A run with nothing else to offer must append nothing: a dangling "other candidates:" reads
+    /// as an offer.
     #[test]
-    fn the_offer_excludes_the_candidate_the_run_selected() {
+    fn a_run_with_nothing_to_offer_appends_nothing() {
         let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
         let mut p = profile();
         p.app = &X11_CANDIDATES[0];
-        let out = check_start(&mut t, &p);
-        let (_, offered) = out
-            .detail
-            .split_once("other candidates: ")
-            .unwrap_or_else(|| panic!("must carry an offer: {}", out.detail));
-        assert!(
-            !offered.contains(X11_CANDIDATES[0].label),
-            "the failed candidate must not be offered again: {offered}"
-        );
-    }
-
-    /// A table with nothing else in it has nothing to offer, and a dangling "other candidates:" would
-    /// read as one.
-    #[test]
-    fn a_single_candidate_backend_offers_nothing() {
-        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
-        let mut p = profile();
-        p.candidates = &X11_CANDIDATES[..1];
-        p.app = &X11_CANDIDATES[0];
+        p.alternatives = vec![];
         let out = check_start(&mut t, &p);
         assert_eq!(out.detail, "boom", "nothing to offer, so nothing appended");
     }
@@ -582,33 +561,6 @@ mod tests {
             !out.detail.contains("--app"),
             "a pass has no alternatives to offer: {}",
             out.detail
-        );
-    }
-
-    /// `label` and `bin` coincide in every candidate above, so a filter or map that used `bin`
-    /// where it meant `label` would still pass all of them. Android is the one table where the
-    /// two diverge, and the backend this whole feature exists for — nothing probes it, so a
-    /// mixed-up offer would ship silently and read out a raw component string instead of the
-    /// short name `--app` accepts.
-    #[test]
-    fn an_android_offer_names_the_label_operators_pass_not_the_component() {
-        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
-        let mut p = profile();
-        p.backend = "android".into();
-        p.candidates = &ANDROID_CANDIDATES;
-        p.app = &ANDROID_CANDIDATES[0];
-        let out = check_start(&mut t, &p);
-        let (_, offered) = out
-            .detail
-            .split_once("other candidates: ")
-            .unwrap_or_else(|| panic!("must carry an offer: {}", out.detail));
-        assert!(
-            offered.contains(ANDROID_CANDIDATES[1].label),
-            "must offer the settings label: {offered}"
-        );
-        assert!(
-            !offered.contains(ANDROID_CANDIDATES[1].bin),
-            "must offer the short label, not the raw component string: {offered}"
         );
     }
 

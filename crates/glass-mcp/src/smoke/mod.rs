@@ -22,7 +22,7 @@ use transport::CALL_TIMEOUT;
 pub struct SmokeOptions {
     /// Backend to exercise (see [`backend_for`] for the supported set).
     pub backend: String,
-    /// Force a specific candidate app instead of probing for the first one present on the host.
+    /// Drive this candidate instead of the one the backend's resolution would select.
     pub app: Option<String>,
     /// Print the plan and exit without calling anything.
     pub dry_run: bool,
@@ -125,10 +125,10 @@ fn backend_for(backend: &str) -> Result<&'static DrivableBackend, String> {
     })
 }
 
-/// The emulator boot budget glass applies when `GLASS_EMULATOR_BOOT_TIMEOUT_MS` is unset. Kept in
-/// step with the android backend's own default: a smaller value here would make this client give
-/// up while the device is still within the budget glass granted it.
-const BOOT_BUDGET_DEFAULT_MS: u64 = 120_000;
+/// The emulator boot budget glass applies when `GLASS_EMULATOR_BOOT_TIMEOUT_MS` is unset — the
+/// android backend's own constant, not a second copy of the number: a smaller value here would
+/// make this client give up while the device is still within the budget glass granted it.
+const BOOT_BUDGET_DEFAULT_MS: u64 = glass_android::DEFAULT_BOOT_TIMEOUT_MS;
 
 /// How long `glass_start` may take. Derived rather than chosen: a backend that may boot a device
 /// must outlast the device's own boot budget, or this client gives up before the boot it is
@@ -150,6 +150,37 @@ fn start_deadline(b: &DrivableBackend, get: &dyn Fn(&str) -> Option<String>) -> 
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(BOOT_BUDGET_DEFAULT_MS);
     Duration::from_millis(ms) + CALL_TIMEOUT
+}
+
+/// Everything a real run's calls read about the app under test, assembled where the backend row,
+/// its resolution policy and the search path are all in hand. Extracted from [`run_with`] because
+/// a real run spawns a server and no test reaches it: this is the last point at which a derived
+/// deadline and a derived offer can be checked against the backend they came from.
+fn profile_for(
+    b: &'static DrivableBackend,
+    app: &'static Candidate,
+    path: Option<&OsStr>,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Profile {
+    Profile {
+        backend: b.name.to_string(),
+        app,
+        alternatives: alternatives(b, app, path),
+        start_deadline: start_deadline(b, get),
+    }
+}
+
+/// The candidates a failed launch may offer to try instead. Filtered by the backend's own
+/// resolution, not by the selected label alone: under [`Resolution::OnPath`] this run probed, so
+/// offering a candidate that is not runnable here sends the operator to an `--app` that fails the
+/// same launch — a real run does not probe a forced app. Under [`Resolution::Preinstalled`]
+/// nothing was probed, so nothing is known absent.
+fn alternatives(b: &DrivableBackend, app: &Candidate, path: Option<&OsStr>) -> Vec<&'static str> {
+    b.candidates
+        .iter()
+        .filter(|c| c.label != app.label && profile::runnable(c, path, b.resolution))
+        .map(|c| c.label)
+        .collect()
 }
 
 /// The checks, in order, except `stop` (appended last). Envelope discipline is not among
@@ -272,12 +303,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
         None => profile::resolve_app(b.candidates, path, b.resolution)
             .map_err(|e| e.blocking_error(b.candidates))?,
     };
-    let p = Profile {
-        backend: b.name.to_string(),
-        app,
-        candidates: b.candidates,
-        start_deadline: start_deadline(b, &|k| std::env::var(k).ok()),
-    };
+    let p = profile_for(b, app, path, &|k| std::env::var(k).ok());
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate this binary: {e}"))?;
     // The spawned server resolves its own backend from `GLASS_BACKEND`, and `glass_doctor`
@@ -508,6 +534,13 @@ mod tests {
             None,
         )
         .unwrap_err();
+        // The branch, not just the backend name: the unknown-backend error also names what was
+        // asked for and carries the same drives clause, so dropping `ios` from `crate::BACKENDS`
+        // would leave this asserting about the wrong error.
+        assert!(
+            err.contains("no smoke candidates for backend"),
+            "must be the not-yet-drivable branch: {err}"
+        );
         assert!(
             err.contains("ios"),
             "must name the backend asked for: {err}"
@@ -524,7 +557,10 @@ mod tests {
     /// Nothing else requires a [`DRIVABLE`] name to be the canonical spelling `recognized_backend`
     /// returns. `("Wayland", …)` compiles, never matches the lookup below it, and conceals itself:
     /// the error prose and the CLI help test both read this table, so both go on calling a dead
-    /// row drivable while `--backend Wayland` errors.
+    /// row drivable while `--backend Wayland` errors. Nor does anything else require a row's
+    /// resolution to be reachable: a [`Resolution::Preinstalled`] row with an empty table resolves
+    /// to an error whose prose tells the caller to install something, on a backend where
+    /// installing is not the remedy.
     #[test]
     fn every_drivable_row_can_actually_be_resolved() {
         let mut seen = std::collections::BTreeSet::new();
@@ -537,25 +573,11 @@ mod tests {
             );
             assert!(
                 !b.candidates.is_empty(),
-                "{:?} has no candidate apps",
-                b.name
-            );
-            assert!(seen.insert(b.name), "{:?} appears twice", b.name);
-        }
-    }
-
-    /// Nothing else requires a row's resolution to be reachable: a `Preinstalled` row whose table is
-    /// empty resolves to an error whose prose tells the caller to install something, on a backend
-    /// where installing is not the remedy.
-    #[test]
-    fn every_drivable_row_has_a_candidate_its_policy_can_return() {
-        for b in DRIVABLE {
-            assert!(
-                !b.candidates.is_empty(),
                 "{:?} has no candidate for {:?} to return",
                 b.name,
                 b.resolution
             );
+            assert!(seen.insert(b.name), "{:?} appears twice", b.name);
         }
     }
 
@@ -843,6 +865,70 @@ mod tests {
             start_deadline(android(), &get),
             Duration::from_millis(1) + CALL_TIMEOUT
         );
+    }
+
+    /// What a real run drives with. A real run spawns a server, so no test reaches it — and a
+    /// profile built with a written-out deadline would leave every test, the lint gate and the
+    /// `#[ignore]`d gates green while a cold boot on a slow host reported itself as a failed launch.
+    #[test]
+    fn a_profile_carries_the_deadline_its_backend_derives() {
+        let android = profile_for(android(), &ANDROID_CANDIDATES[0], None, &|_| None);
+        assert!(
+            android.start_deadline > Duration::from_millis(BOOT_BUDGET_DEFAULT_MS),
+            "a launch that may boot a device must outlast the device's own budget: {:?}",
+            android.start_deadline
+        );
+
+        let (_dir, path) = host_with(&["zenity"]);
+        let x11 = backend_for("x11").expect("x11 must be drivable");
+        let x11 = profile_for(x11, &X11_CANDIDATES[2], Some(&path), &|_| None);
+        assert_eq!(
+            x11.start_deadline, CALL_TIMEOUT,
+            "a backend that launches into a running compositor waits out no boot"
+        );
+    }
+
+    /// The host the offer used to mislead on: only `zenity` and `xterm` are installed, so the run
+    /// selects `zenity` — and the two candidates ahead of it are ones this run's own probe just
+    /// found absent. Offering them sends the operator to an `--app` that fails the same launch,
+    /// because a real run does not probe a forced app.
+    #[test]
+    fn an_offer_from_a_probing_backend_names_only_what_is_installed() {
+        let (_dir, path) = host_with(&["zenity", "xterm"]);
+        let b = backend_for("x11").expect("x11 must be drivable");
+        let app = profile::resolve_app(b.candidates, Some(&path), b.resolution)
+            .expect("zenity is installed");
+        assert_eq!(app.label, "zenity", "the fixture must select a middle row");
+        let p = profile_for(b, app, Some(&path), &|_| None);
+        assert_eq!(p.alternatives, ["xterm"]);
+    }
+
+    /// Nothing probed the device, so nothing about it is known absent and every other row is worth
+    /// offering. `label` and `bin` diverge only on android, so this is also the one table where an
+    /// offer built from `bin` would read out a raw component string instead of the short name
+    /// `--app` accepts.
+    #[test]
+    fn an_offer_from_a_preinstalled_backend_names_every_other_row() {
+        let p = profile_for(android(), &ANDROID_CANDIDATES[0], None, &|_| None);
+        assert_eq!(
+            p.alternatives,
+            ["settings"],
+            "written out, because the component `settings` stands for is not what --app takes"
+        );
+    }
+
+    /// The selected candidate is not an alternative to itself; offering it would send the operator
+    /// back to the run that just failed. Both policies, because each builds its own list.
+    #[test]
+    fn an_offer_never_names_the_candidate_the_run_selected() {
+        let (_dir, path) = host_with(&["zenity", "xterm"]);
+        let b = backend_for("x11").expect("x11 must be drivable");
+        let p = profile_for(b, &X11_CANDIDATES[3], Some(&path), &|_| None);
+        assert_eq!(p.app.label, "xterm");
+        assert_eq!(p.alternatives, ["zenity"]);
+
+        let p = profile_for(android(), &ANDROID_CANDIDATES[1], None, &|_| None);
+        assert_eq!(p.alternatives, ["contacts"]);
     }
 
     /// The reader is scoped to one variable: reading any name would let an unrelated setting move a

@@ -4,7 +4,8 @@ use std::ffi::OsStr;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate {
-    /// Executable to look for on PATH.
+    /// What to launch: an executable name resolved on `PATH`, or — on a backend whose targets live
+    /// on a device — the `package/.Activity` component to start there.
     pub bin: &'static str,
     /// Its arguments. Must open a non-destructive, unsaved surface.
     pub args: &'static [&'static str],
@@ -103,8 +104,10 @@ pub const ANDROID_CANDIDATES: [Candidate; 2] = [
 pub struct Profile {
     pub backend: String,
     pub app: &'static Candidate,
-    /// The backend's whole table, so a failure can name what this run did not try.
-    pub candidates: &'static [Candidate],
+    /// What a failed launch may offer instead, as the labels `--app` accepts. Resolved where the
+    /// backend's resolution policy and search path are both known, so a backend that probes never
+    /// offers a candidate that probe already found absent.
+    pub alternatives: Vec<&'static str>,
     /// How long the launch may take. Larger than every other call's budget only where a launch
     /// may boot a device first.
     pub start_deadline: std::time::Duration,

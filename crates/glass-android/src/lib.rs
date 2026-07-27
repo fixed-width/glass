@@ -25,7 +25,7 @@ mod target;
 pub use a11y::AndroidA11y;
 pub use a11y_service::{A11yServiceRegistry, ServiceA11y, a11y_apk};
 pub use agent::{AgentClient, AgentRegistry};
-pub use avd::EmulatorRegistry;
+pub use avd::{DEFAULT_BOOT_TIMEOUT_MS, EmulatorRegistry};
 pub use platform::AndroidPlatform;
 pub use target::{AdbTarget, AttachedDevice};
 
