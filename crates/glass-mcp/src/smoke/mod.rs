@@ -275,6 +275,7 @@ fn run_with(opts: SmokeOptions, path: Option<&OsStr>) -> Result<SmokeReport, Str
     let p = Profile {
         backend: b.name.to_string(),
         app,
+        candidates: b.candidates,
         start_deadline: start_deadline(b, &|k| std::env::var(k).ok()),
     };
 

@@ -27,6 +27,24 @@ fn excerpt(s: &str) -> String {
     format!("{}…", s.chars().take(MAX).collect::<String>())
 }
 
+/// The candidates this run did not select, as a line telling the caller how to choose one.
+/// Derived from the table rather than written per backend: prose that names a table drifts from it
+/// silently, and this is the only place a run without a probe can say what else exists.
+fn other_candidates(p: &Profile) -> Option<String> {
+    let others: Vec<&str> = p
+        .candidates
+        .iter()
+        .filter(|c| c.label != p.app.label)
+        .map(|c| c.label)
+        .collect();
+    (!others.is_empty()).then(|| {
+        format!(
+            "other candidates: {} — select with --app",
+            others.join(", ")
+        )
+    })
+}
+
 pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     let mut run = vec![Value::String(p.app.bin.to_string())];
     run.extend(p.app.args.iter().map(|a| Value::String((*a).to_string())));
@@ -34,20 +52,22 @@ pub fn check_start(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
     if !p.app.env.is_empty() {
         args["env"] = p.app.env.iter().copied().collect();
     }
-    outcome(
-        1,
-        "start",
-        t.call_with_deadline("glass_start", args, p.start_deadline)
-            .and_then(|r| {
-                let result = check_envelope("glass_start", &r)?;
-                for field in ["x", "y", "width", "height"] {
-                    if !result[field].is_number() {
-                        return Err(format!("glass_start returned no `{field}` in its geometry"));
-                    }
+    let launched = t
+        .call_with_deadline("glass_start", args, p.start_deadline)
+        .and_then(|r| {
+            let result = check_envelope("glass_start", &r)?;
+            for field in ["x", "y", "width", "height"] {
+                if !result[field].is_number() {
+                    return Err(format!("glass_start returned no `{field}` in its geometry"));
                 }
-                Ok(format!("{}x{}", result["width"], result["height"]))
-            }),
-    )
+            }
+            Ok(format!("{}x{}", result["width"], result["height"]))
+        })
+        .map_err(|e| match other_candidates(p) {
+            Some(offer) => format!("{e}; {offer}"),
+            None => e,
+        });
+    outcome(1, "start", launched)
 }
 
 pub fn check_health(t: &mut dyn McpTransport, p: &Profile) -> CheckOutcome {
@@ -398,6 +418,7 @@ mod tests {
         Profile {
             backend: "x11".into(),
             app: &X11_CANDIDATES[3],
+            candidates: &X11_CANDIDATES,
             start_deadline: CALL_TIMEOUT,
         }
     }
@@ -406,6 +427,7 @@ mod tests {
         Profile {
             backend: "wayland".into(),
             app: &WAYLAND_CANDIDATES[0],
+            candidates: &WAYLAND_CANDIDATES,
             start_deadline: CALL_TIMEOUT,
         }
     }
@@ -482,6 +504,84 @@ mod tests {
         assert_eq!(
             t.deadline_for("glass_start"),
             Some(Duration::from_secs(321))
+        );
+    }
+
+    /// A failed launch is the only place a run tells the operator what else it could have driven,
+    /// because nothing probed for alternatives beforehand.
+    #[test]
+    fn a_failed_start_names_the_candidates_it_did_not_try() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Err("Error type 3: Activity class does not exist".to_string()),
+        )]);
+        let mut p = profile();
+        p.app = &X11_CANDIDATES[0];
+        let out = check_start(&mut t, &p);
+        assert_eq!(out.status, CheckStatus::Fail);
+        assert!(
+            out.detail.contains("Activity class does not exist"),
+            "the launch error must survive: {}",
+            out.detail
+        );
+        for other in ["gnome-text-editor", "zenity", "xterm"] {
+            assert!(
+                out.detail.contains(other),
+                "must offer {other}: {}",
+                out.detail
+            );
+        }
+        assert!(out.detail.contains("--app"), "must say how: {}", out.detail);
+    }
+
+    /// The selected candidate is not an alternative to itself; offering it would send the operator
+    /// back to the run that just failed.
+    #[test]
+    fn the_offer_excludes_the_candidate_the_run_selected() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
+        let mut p = profile();
+        p.app = &X11_CANDIDATES[0];
+        let out = check_start(&mut t, &p);
+        let (_, offered) = out
+            .detail
+            .split_once("other candidates: ")
+            .unwrap_or_else(|| panic!("must carry an offer: {}", out.detail));
+        assert!(
+            !offered.contains(X11_CANDIDATES[0].label),
+            "the failed candidate must not be offered again: {offered}"
+        );
+    }
+
+    /// A table with nothing else in it has nothing to offer, and a dangling "other candidates:" would
+    /// read as one.
+    #[test]
+    fn a_single_candidate_backend_offers_nothing() {
+        let mut t = ScriptedTransport::new(vec![("glass_start", Err("boom".to_string()))]);
+        let mut p = profile();
+        p.candidates = &X11_CANDIDATES[..1];
+        p.app = &X11_CANDIDATES[0];
+        let out = check_start(&mut t, &p);
+        assert_eq!(out.detail, "boom", "nothing to offer, so nothing appended");
+    }
+
+    /// The offer belongs to failure. A passing launch must report geometry and nothing else.
+    #[test]
+    fn a_successful_start_carries_no_offer() {
+        let mut t = ScriptedTransport::new(vec![(
+            "glass_start",
+            Ok(CallResult::ok(
+                "glass_start",
+                json!({ "x": 0, "y": 0, "width": 8, "height": 6 }),
+                &[],
+                0,
+            )),
+        )]);
+        let out = check_start(&mut t, &profile());
+        assert_eq!(out.status, CheckStatus::Pass);
+        assert!(
+            !out.detail.contains("--app"),
+            "a pass has no alternatives to offer: {}",
+            out.detail
         );
     }
 
