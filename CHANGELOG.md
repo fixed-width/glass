@@ -16,6 +16,13 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Removed
+- The `smoke` subcommand. It drove glass's own tools against a real app to check a build, and it
+  was never part of a release — v1.1.0 predates it — so nothing that shipped is affected. Its
+  checks now live in a script that drives any `glass-mcp` over stdio from outside, which means a
+  release artifact no longer carries its own test harness. `glass-mcp doctor` is unchanged and
+  remains the way to check an install.
+
 ### Added
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined

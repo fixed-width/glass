@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mutation-test the smoke module with cargo-mutants and grade the outcome.
+# Mutation-test glass-core with cargo-mutants and grade the outcome.
 #
 # Why this wrapper rather than a bare `cargo mutants`: its exit code alone cannot
 # tell a clean run from one that gated nothing.
@@ -22,7 +22,7 @@
 # Usage:
 #   scripts/mutants.sh <output-dir> [extra cargo-mutants args...]
 #
-#   scripts/mutants.sh target/mutants                     # the whole module
+#   scripts/mutants.sh target/mutants                     # the whole crate
 #   scripts/mutants.sh target/mutants --in-diff pr.diff   # only what a diff touched
 #
 # MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
@@ -36,15 +36,16 @@ fi
 out=$1
 shift
 
-# `**` so a file moved into a subdirectory of the module stays covered; keep this in
+# glass-core is the platform-agnostic heart — the Platform/Accessibility seams, session,
+# frame diffing, stability, the log buffer — so it is pure logic that mutates meaningfully and
+# tests without a display. `**` so a file moved into a subdirectory stays covered; keep this in
 # step with the git pathspec the in-diff caller uses.
-readonly SMOKE_GLOB='crates/glass-mcp/src/smoke/**/*.rs'
+readonly TARGET_GLOB='crates/glass-core/src/**/*.rs'
+readonly TARGET_PACKAGE='glass-core'
 
-# cargo-mutants derives its per-mutant timeout from the unmutated baseline, which never waits:
-# the teardown paths this module tests are only reached when something fails. A mutant that
-# removes the kill makes four tests each wait out `READER_JOIN_TIMEOUT`, measured at 42s where
-# the baseline takes 7s — so the derived timeout is always too tight, and the mutant is scored
-# TIMEOUT rather than caught. Fixed here so the grade does not depend on how fast the host is.
+# Fixed rather than derived from the unmutated baseline: cargo-mutants ranks a timeout above a
+# missed mutant, so once anything times out a genuine survivor is invisible at the exit code. A
+# generous explicit value keeps the grade from depending on how loaded the host is.
 readonly MUTANT_TIMEOUT=180
 
 # The caller's `--in-diff` path, and the same argument list with it removed — the
@@ -70,7 +71,7 @@ done
 # question is answered before a single mutant is compiled — and answered for the whole
 # run rather than for one shard, which may legitimately receive none.
 list_count() {
-    cargo mutants --list --package glass-mcp "$@" \
+    cargo mutants --list --package "$TARGET_PACKAGE" "$@" \
         ${diff_file:+--in-diff "$diff_file"} 2>/dev/null | wc -l
 }
 
@@ -83,7 +84,7 @@ attempt() {
     shift
     status=0
     cargo mutants \
-        --package glass-mcp \
+        --package "$TARGET_PACKAGE" \
         --cargo-arg=--locked \
         --timeout "$MUTANT_TIMEOUT" \
         -j "${MUTANTS_JOBS:-2}" \
@@ -103,7 +104,7 @@ attempt() {
 # Choose the scope before building anything: the module glob, or — when the diff
 # changed only test code and so yields nothing to mutate — the whole of each file it
 # touched, so a deleted test cannot bring a survivor back unnoticed.
-scope=(--file "$SMOKE_GLOB")
+scope=(--file "$TARGET_GLOB")
 planned=$(list_count "${scope[@]}")
 
 if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
