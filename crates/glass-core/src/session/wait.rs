@@ -1997,6 +1997,37 @@ mod tests {
         assert_eq!(o.cursor, line.seq + 1);
     }
 
+    /// The note means "this was already in the buffer *before* your call", and its advice —
+    /// pass cursor:0 — is only right for such a line. One that arrives after the wait has taken
+    /// its starting cursor sits at or past it, and must not be described that way. The empty
+    /// batches put the line on the pump that happens after the poll gives up.
+    #[test]
+    fn wait_for_log_does_not_report_a_line_that_arrived_during_the_call() {
+        let platform = FakePlatform::new(10, 10).with_log_batches(vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![(Stream::Stdout, "arrived during the wait")],
+        ]);
+        let mut g = glass_with(platform);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_log(&WaitLogParams {
+                contains: "arrived during the wait".into(),
+                stream: None,
+                cursor: None,
+                interval_ms: 0,
+                timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(!o.matched, "the poll gave up before the line landed");
+        assert!(
+            o.note.is_none(),
+            "the line arrived during the call, so it was not buffered beforehand: {:?}",
+            o.note
+        );
+    }
+
     #[test]
     fn wait_for_log_default_cursor_skips_old_lines_and_times_out() {
         // The line already in the buffer is "old" (before the default start cursor),

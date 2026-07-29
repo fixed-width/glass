@@ -31,6 +31,7 @@ pub(crate) struct FakePlatform {
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
+    log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
     scroll_log: Arc<Mutex<Vec<PointerEvent>>>,
     drag_log: Arc<Mutex<Vec<PointerEvent>>>,
@@ -108,6 +109,16 @@ impl FakePlatform {
     }
     pub(crate) fn with_logs(mut self, logs: Vec<(Stream, &str)>) -> Self {
         self.pending_logs = logs.into_iter().map(|(s, t)| (s, t.to_string())).collect();
+        self
+    }
+    /// One batch per drain, in order, so a line can be made to arrive on a chosen pump rather
+    /// than all at once. `start` pumps before any wait begins, so staging a line for a later
+    /// drain is the only way to have it land after a call has taken its starting cursor.
+    pub(crate) fn with_log_batches(mut self, batches: Vec<Vec<(Stream, &str)>>) -> Self {
+        self.log_batches = batches
+            .into_iter()
+            .map(|b| b.into_iter().map(|(s, t)| (s, t.to_string())).collect())
+            .collect();
         self
     }
     pub(crate) fn with_windows(mut self, windows: Vec<WindowInfo>) -> Self {
@@ -261,6 +272,9 @@ impl Platform for FakePlatform {
         Ok(self.geometry.clone())
     }
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+        if let Some(batch) = self.log_batches.pop_front() {
+            return batch;
+        }
         std::mem::take(&mut self.pending_logs)
     }
     fn get_clipboard(&mut self) -> Result<String> {
