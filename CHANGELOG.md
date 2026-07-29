@@ -104,6 +104,11 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- macOS: the release `.zip` and `.dmg` now carry a `README.md`, as every other platform's artifact
+  already did. It covers the drag-to-`/Applications` install, the two permission grants (including
+  that granting Screen Recording relaunches the app), and the `http://127.0.0.1:7300/` endpoint —
+  the platform with the most first-run setup was the one shipping none of it. The file sits beside
+  `GlassMcp.app` rather than inside it, so the bundle's signature and notarization are untouched.
 - iOS: `glass_start` now reads the display scale from the Simulator rather than from the app's
   accessibility tree, so a launch no longer depends on the app having rendered. The scale is a
   property of the device (`idb describe` reports it before any app runs), but glass derived it by

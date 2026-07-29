@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build a drag-install .dmg around a signed GlassMcp.app: stage the app + an /Applications symlink,
-# then hdiutil a compressed read-only image. Sign/notarize/staple happen separately (notarize.sh).
+# Build a drag-install .dmg around a signed GlassMcp.app: stage the app, a README and an
+# /Applications symlink, then hdiutil a compressed read-only image. Sign/notarize/staple happen
+# separately (notarize.sh).
 #
 #   ./packaging/macos/make-dmg.sh --app <path.app> --out <dir> --version <X.Y.Z>
 set -euo pipefail
@@ -26,6 +27,11 @@ trap 'rm -rf "$staging"' EXIT
 # ditto (not cp -R) is the guaranteed-faithful copy for a signed bundle — it preserves the
 # bundle layout + code signature, matching release.yml's Package step.
 ditto "$app" "$staging/$(basename "$app")"
+# Beside the bundle, never inside it: a file added within the .app would invalidate its
+# signature. Resolved from this script's own location so callers need not pass it.
+readme="$(cd "$(dirname "$0")/.." && pwd)/README-macos.md"
+[ -f "$readme" ] || { echo "error: README not found: $readme" >&2; exit 1; }
+cp "$readme" "$staging/README.md"
 ln -s /Applications "$staging/Applications"
 dmg="$out/${name}.dmg"
 rm -f "$dmg"
