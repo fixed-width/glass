@@ -6,7 +6,6 @@
 //! `glass-mcp` serves MCP over stdio (the default).
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,26 +97,6 @@ pub enum Command {
     /// the window's rendering + buttons can be smoke-tested without building the .app. macOS-only.
     #[command(hide = true)]
     DebugChecklist,
-    /// Drive glass's own MCP tools against a real app and report whether this build
-    /// works. Experimental: not part of the stable tool surface.
-    Smoke {
-        /// Backend to exercise. The smoke runner drives x11, wayland and android.
-        #[arg(long, default_value = crate::smoke::DEFAULT_BACKEND)]
-        backend: String,
-        /// Write the JSON report to PATH (the text report always goes to stdout).
-        #[arg(long, value_name = "PATH")]
-        report: Option<PathBuf>,
-        /// Force a target app instead of the one the backend would choose on its own.
-        #[arg(long)]
-        app: Option<String>,
-        /// Prove the checks can fail: run them against injected faults, then exit. Runs
-        /// nothing else, so it cannot be combined with the flags that configure a real run.
-        #[arg(long, conflicts_with_all = ["backend", "report", "app", "dry_run"])]
-        self_check: bool,
-        /// Print what would run and exit, touching nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 #[cfg(test)]
@@ -294,37 +273,6 @@ mod tests {
     }
 
     #[test]
-    fn smoke_self_check_parses_on_its_own() {
-        let cli = Cli::try_parse_from(["glass-mcp", "smoke", "--self-check"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Smoke {
-                self_check: true,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn smoke_self_check_conflicts_with_the_flags_it_would_ignore() {
-        // `--self-check` runs the fault injection and exits; silently ignoring a real run's
-        // flags would let `smoke --self-check --app xterm` look like it drove that app.
-        for other in [
-            vec!["--dry-run"],
-            vec!["--backend", "x11"],
-            vec!["--app", "xterm"],
-            vec!["--report", "/tmp/r.json"],
-        ] {
-            let mut argv = vec!["glass-mcp", "smoke", "--self-check"];
-            argv.extend(other.iter().copied());
-            let Err(err) = Cli::try_parse_from(&argv) else {
-                panic!("{argv:?} must be rejected, not silently ignored");
-            };
-            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-        }
-    }
-
-    #[test]
     fn help_and_version_are_handled() {
         let help = Cli::try_parse_from(["glass-mcp", "--help"]).unwrap_err();
         assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
@@ -344,43 +292,6 @@ mod tests {
         assert!(
             !crate::VERSION.is_empty(),
             "GLASS_VERSION must be populated by build.rs"
-        );
-    }
-
-    #[test]
-    fn the_backend_help_names_every_drivable_backend() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let smoke = cmd.find_subcommand("smoke").expect("smoke subcommand");
-        let arg = smoke
-            .get_arguments()
-            .find(|a| a.get_id() == "backend")
-            .expect("--backend argument");
-        let help = arg.get_help().expect("--backend help").to_string();
-        for b in crate::smoke::drivable_backends() {
-            assert!(
-                help.contains(b),
-                "the --backend description must name {b:?}: {help}"
-            );
-        }
-    }
-
-    /// This help outlived the probe it described. Not every backend probes — android's table is
-    /// resolved without one — so `--app` overrides a table position there, not a search. The claim
-    /// is what must stay out; the wording around it is free.
-    #[test]
-    fn the_app_help_does_not_claim_every_backend_probes() {
-        use clap::CommandFactory;
-        let cmd = Cli::command();
-        let smoke = cmd.find_subcommand("smoke").expect("smoke subcommand");
-        let arg = smoke
-            .get_arguments()
-            .find(|a| a.get_id() == "app")
-            .expect("--app argument");
-        let help = arg.get_help().expect("--app help").to_string();
-        assert!(
-            !help.contains("prob"),
-            "not every backend probes for a target app: {help}"
         );
     }
 }

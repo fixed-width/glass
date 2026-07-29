@@ -44,13 +44,6 @@ jobs:
       - run: cargo build --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - name: smoke self-check
-        run: cargo run -p glass-mcp -- smoke --self-check
-      # This runner has none of the X11 target apps installed, so it is exactly the host that
-      # must degrade rather than hard-fail: a plan is printed, the `start` row names what to
-      # install, and the run exits 0. Nothing else exercises that path end to end.
-      - name: smoke plan on a host with no target app
-        run: cargo run -p glass-mcp -- smoke --dry-run
 
   miri:
     name: Miri (UB check · pure crates)
@@ -88,14 +81,12 @@ jobs:
         # Ubuntu 24.04 runners restrict them via AppArmor (bwrap then fails "setting up
         # uid map: Permission denied"), so re-enable them (no-op on images without the knob).
         # python3-gi + gir1.2-gtk-4.0: the software_render integration test drives a real GTK4 app.
-        # zenity + at-spi2-core: the smoke (x11) step below needs a target app on PATH plus
-        # a running AT-SPI bus for its accessibility checks; the runner ships neither by default.
+        # zenity + at-spi2-core: the X11 suite needs a target app on PATH plus a running
+        # AT-SPI bus for its accessibility tests; the runner ships neither by default.
         run: |
           sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 zenity at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: ./scripts/test-x11.sh
-      - name: smoke (x11)
-        run: cargo test -p glass-mcp --test smoke_x11 -- --ignored
 
   wayland:
     name: Wayland integration (sway)
@@ -116,8 +107,8 @@ jobs:
         # the GLVND loaders + Mesa software EGL/DRI (not just libgl1-mesa-dri). Plus Xwayland
         # for the app, and bubblewrap for sandbox_* — whose unprivileged user namespaces
         # Ubuntu 24.04 restricts via AppArmor, so re-enable them (no-op if the knob is absent).
-        # zenity + at-spi2-core: the smoke (wayland) step below needs a target app on PATH plus
-        # a running AT-SPI bus for its accessibility checks; the runner ships neither by default.
+        # zenity + at-spi2-core: the Wayland suite needs a target app on PATH plus a running
+        # AT-SPI bus for its accessibility tests; the runner ships neither by default.
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri bubblewrap \
@@ -130,12 +121,6 @@ jobs:
             | tar -C ~/.local/share/glass/sway -xz
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
-      - name: smoke (wayland)
-        # The runner fetched sway above, so a skip here means a broken fetch or broken discovery
-        # reporting a step outcome byte-identical to a real pass.
-        env:
-          GLASS_SMOKE_REQUIRE_WAYLAND: "1"
-        run: cargo test -p glass-mcp --test smoke_wayland -- --ignored --nocapture
 
   macos:
     name: macOS (build · clippy · test)
@@ -276,7 +261,7 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation shard ${{ matrix.shard }} (smoke)
+    name: Mutation shard ${{ matrix.shard }} (glass-core)
     runs-on: ubuntu-latest
     # A push carries no base ref to diff against; this gate is a pull-request check.
     if: github.event_name == 'pull_request'
@@ -291,7 +276,7 @@ jobs:
           # `--in-diff` needs a merge base to diff against; the default depth-1 checkout has
           # none, which would yield an empty diff, mutate nothing, and pass green.
           fetch-depth: 0
-      - name: Diff the smoke module against the merge base
+      - name: Diff glass-core against the merge base
         id: diff
         # A ref name may contain `;`, `` ` ``, `$` and more, so it reaches the shell as data.
         env:
@@ -305,13 +290,13 @@ jobs:
           # `:(glob)` so `**` spans directories, matching scripts/mutants.sh's --file; without
           # it git reads `**` as an ordinary fnmatch pattern and selects nothing at all.
           git diff "origin/$BASE_REF...HEAD" \
-            -- ':(glob)crates/glass-mcp/src/smoke/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+            -- ':(glob)crates/glass-core/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
           else
             echo "touched=false" >> "$GITHUB_OUTPUT"
-            echo "this PR changes no .rs file under crates/glass-mcp/src/smoke/ — nothing to mutate"
+            echo "this PR changes no .rs file under crates/glass-core/src/ — nothing to mutate"
           fi
       # Installing a toolchain and two cargo tools costs more than the check itself,
       # so a PR that touches no smoke file skips straight past them.
@@ -328,8 +313,7 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'
-        # nextest runs each test in its own process, so the module's deliberate
-        # multi-second teardown waits overlap instead of summing: 42s to 11s here.
+        # nextest runs each test in its own process, so slow tests overlap rather than sum.
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \

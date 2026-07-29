@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(v["height"], json!(60));
     }
 
-    /// The link the smoke runner's wayland profile rests on: `glass_start`'s `env` argument
+    /// The link a wayland smoke run rests on: `glass_start`'s `env` argument
     /// reaching the backend as `AppSpec.env`. Every smoke check passes with that env removed, so
     /// no run observes it.
     #[test]

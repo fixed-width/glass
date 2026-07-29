@@ -61,33 +61,3 @@ macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
 
-## `smoke`
-
-**Experimental** — see [Stability and versioning](stability.md#experimental-subcommands). Drive
-glass's own MCP tools against a real app and report whether this build works end to end. The checks,
-the statuses, and the report's fields are described in
-[smoke checks and report](smoke.md).
-
-- `--backend <name>` — backend to exercise. The smoke runner drives `x11` (the default), `wayland`
-  and `android`; each backend's candidates, and how it chooses among them, are listed in
-  [smoke checks and report](smoke.md#target-apps), and a `wayland` run additionally needs a
-  discoverable sway ≥ 1.12 to launch the app into.
-  Also sets `GLASS_BACKEND` for the server the run spawns, overriding any ambient value, so
-  the session and `glass_doctor`'s verdict always agree on which backend is under test.
-- `--report <path>` — also write the JSON report to `path` (the text report always goes to stdout).
-- `--app <name>` — force a specific candidate app instead of the one the backend would choose on its
-  own. The name must be one of the backend's candidates; a name that is not is a usage error. A real
-  run does not check the named app for presence, so naming one that is not there fails at the
-  `start` check. Under `--dry-run`, `x11` and `wayland` do check `PATH` and mark the plan unavailable
-  when the named app is not on it; nothing on the host can check an `android` candidate, so its
-  `--dry-run` always accepts the name.
-- `--dry-run` — print the plan and exit without spawning a server, launching an app, or calling a
-  tool. Every check is a `skip`, the heading reads `PASS (plan only)`, and the exit code is 0. With
-  `--report`, the plan is written as JSON like any other run. Unlike a real run, this does not
-  require a target app to be installed: if none of the candidates is present, the `start` row says
-  what to install instead of the command failing.
-- `--self-check` — prove the checks can still fail: run them against deliberately wrong responses
-  and confirm each one catches its fault, for the reason it names. Drives nothing real — no app, no
-  display — and exits when done, so it cannot be combined with the flags above; passing one is a
-  usage error rather than a silently ignored argument. Exit code 0 when every injected fault was
-  caught.
