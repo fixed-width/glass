@@ -87,17 +87,6 @@ pub fn parse_bounds(s: &str, window: &WindowGeometry) -> Option<AxRect> {
     })
 }
 
-/// Surface the `uiautomator dump` idle-state / error failure mode loudly.
-pub fn check_dump_status(stdout: &str) -> Result<()> {
-    if stdout.contains("ERROR") || stdout.contains("could not get idle state") {
-        return Err(GlassError::AccessibilityUnavailable(format!(
-            "uiautomator dump failed: {}",
-            stdout.trim()
-        )));
-    }
-    Ok(())
-}
-
 /// Parse uiautomator XML into an `AxTree`. Ids are left unset (the caller runs
 /// `AxTree::assign_ids`). The hierarchy is wrapped in a synthetic `Window` root
 /// sized to the app window.
@@ -299,13 +288,6 @@ mod tests {
         let r = parse_bounds("[40,100][300,160]", &win).unwrap();
         assert_eq!((r.x, r.y, r.width, r.height), (40, 37, 260, 60));
         assert!(parse_bounds("garbage", &win).is_none());
-    }
-
-    #[test]
-    fn dump_status_detects_idle_failure() {
-        assert!(check_dump_status("UI hierchary dumped to: /sdcard/glass_dump.xml").is_ok());
-        let err = check_dump_status("ERROR: could not get idle state!").unwrap_err();
-        assert!(matches!(err, GlassError::AccessibilityUnavailable(_)));
     }
 
     #[test]

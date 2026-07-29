@@ -2,15 +2,49 @@
 //! over adb and maps the result via `crate::axmap`. Resolves its own device
 //! lazily, since the `Accessibility` trait is handed only an `AxContext`.
 
+use std::time::{Duration, Instant};
+
 use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
 use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry};
 
 use crate::adb::Adb;
-use crate::axmap::{build_tree, check_dump_status};
+use crate::axmap::build_tree;
 use crate::input::{key_commands, pointer_commands};
 use crate::target::{choose_serial, parse_devices};
 
 const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
+
+/// How long a snapshot keeps retrying the dump. A device reports `sys.boot_completed` —
+/// all the platform waits for before reporting the app up — several seconds before
+/// `uiautomator` can serve a dump, so a snapshot taken right after a cold boot would
+/// otherwise fail on a device that is merely still starting.
+const DUMP_READY_TIMEOUT_MS: u64 = 30_000;
+const DUMP_POLL_INTERVAL_MS: u64 = 500;
+
+/// One `uiautomator dump`, returning the XML it wrote.
+///
+/// `uiautomator dump` exits 0 even when it fails and reports the reason on stderr, so
+/// neither its exit status nor its stdout can be trusted; the file it was asked to write
+/// — removed first, so a previous run's tree cannot stand in for it — is the only
+/// reliable success signal.
+pub(crate) fn dump_once(adb: &Adb, path: &str) -> Result<String> {
+    let _ = adb.run(["shell", "rm", "-f", path]);
+    let (out, err) = adb.run_streams(["shell", "uiautomator", "dump", path])?;
+    adb.run(["shell", "cat", path])
+        .map_err(|read_err| dump_failed(path, &out, &err, &read_err))
+}
+
+/// The error for a dump that wrote no file: it names the dump rather than the read that
+/// came up empty, and quotes uiautomator's own diagnosis in preference to ours. Pure, so
+/// the cold-device signature is tested without a device.
+fn dump_failed(path: &str, stdout: &str, stderr: &str, read_err: &GlassError) -> GlassError {
+    let why = [stderr, stdout]
+        .into_iter()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map_or_else(|| read_err.to_string(), str::to_string);
+    GlassError::AccessibilityUnavailable(format!("uiautomator dump did not write {path}: {why}"))
+}
 
 /// Reads the active window's accessibility tree via `uiautomator`.
 pub struct AndroidA11y {
@@ -90,11 +124,14 @@ impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let window = ctx.window.clone();
         let adb = self.ensure_adb()?;
-        // Remove any stale dump so a dump that fails to (re)write can't yield a prior tree.
-        let _ = adb.run(["shell", "rm", "-f", DUMP_PATH]);
-        let status = adb.run(["shell", "uiautomator", "dump", DUMP_PATH])?;
-        check_dump_status(&status)?;
-        let xml = adb.run(["shell", "cat", DUMP_PATH])?;
+        let deadline = Instant::now() + Duration::from_millis(DUMP_READY_TIMEOUT_MS);
+        let xml = loop {
+            match dump_once(&adb, DUMP_PATH) {
+                Ok(xml) => break xml,
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(DUMP_POLL_INTERVAL_MS)),
+            }
+        };
         build_tree(&xml, &window, ctx.limits)
     }
 
@@ -132,9 +169,69 @@ impl Accessibility for AndroidA11y {
 
 #[cfg(test)]
 mod tests {
-    use super::locate_editable_target;
+    use super::{dump_failed, locate_editable_target};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, WindowGeometry};
+
+    /// What `uiautomator dump` writes to stderr on a device that has booted but whose
+    /// accessibility bridge is not serving yet — captured from a cold emulator.
+    const NOT_READY: &str = "ERROR: null root node returned by UiTestAutomationBridge.";
+
+    /// What the read of the unwritten file reports, and what the old code surfaced.
+    fn read_err() -> GlassError {
+        GlassError::Backend(
+            "`adb -s emulator-5554 shell cat /sdcard/glass_dump.xml` failed: \
+             cat: /sdcard/glass_dump.xml: No such file or directory"
+                .into(),
+        )
+    }
+
+    #[test]
+    fn dump_failure_names_the_dump_not_the_read() {
+        let e = dump_failed("/sdcard/glass_dump.xml", "", NOT_READY, &read_err());
+        let msg = e.to_string();
+        assert!(
+            msg.contains("uiautomator dump did not write /sdcard/glass_dump.xml"),
+            "must name the step that should have written the file: {msg}"
+        );
+        assert!(
+            !msg.contains("cat:"),
+            "must not send the reader to the missing file instead of the dump: {msg}"
+        );
+    }
+
+    #[test]
+    fn dump_failure_quotes_uiautomators_own_diagnosis() {
+        let e = dump_failed("/sdcard/glass_dump.xml", "", NOT_READY, &read_err());
+        assert!(e.to_string().contains(NOT_READY), "{e}");
+        assert!(matches!(e, GlassError::AccessibilityUnavailable(_)));
+    }
+
+    #[test]
+    fn dump_failure_prefers_stderr_over_stdout() {
+        // The failing dump leaves stdout empty, but a version that also chatters on stdout
+        // must not bury the diagnosis.
+        let e = dump_failed(
+            "/p.xml",
+            "UI hierchary dumped to: /p.xml",
+            NOT_READY,
+            &read_err(),
+        );
+        let msg = e.to_string();
+        assert!(msg.contains(NOT_READY), "{msg}");
+        assert!(
+            !msg.contains("hierchary"),
+            "the success chatter is not the reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn dump_failure_falls_back_to_the_read_error_when_the_dump_said_nothing() {
+        // A dump that says nothing on either stream leaves the read as the only evidence,
+        // so a silent failure still reports something a reader can act on.
+        let e = dump_failed("/p.xml", "  ", "\n", &read_err());
+        assert!(e.to_string().contains("No such file or directory"), "{e}");
+    }
 
     const WIN: WindowGeometry = WindowGeometry {
         x: 0,

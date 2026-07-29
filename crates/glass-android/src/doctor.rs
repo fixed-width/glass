@@ -6,9 +6,9 @@
 
 use glass_core::{Check, CheckStatus};
 
+use crate::a11y::dump_once;
 use crate::adb::Adb;
 use crate::avd::{Action, Lifecycle, decide, parse_list_avds, resolve_emulator_bin};
-use crate::axmap::check_dump_status;
 use crate::target::{Device, parse_devices};
 
 /// Skip detail the deep-capture checks (`screencap`, `uiautomator`) emit when `--deep`
@@ -217,16 +217,10 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
         Err(e) => Err(e.to_string()),
     };
 
-    // Remove any stale dump so a failed `uiautomator dump` can't yield a false positive
-    // from a prior run's file; validate the dump command's own status (parity with
-    // AndroidA11y) before trusting the cat'd XML.
-    let _ = dev.run(["shell", "rm", "-f", DUMP_PATH]);
-    let uiautomator = match dev
-        .run(["shell", "uiautomator", "dump", DUMP_PATH])
-        .and_then(|status| {
-            check_dump_status(&status)?;
-            dev.run(["shell", "cat", DUMP_PATH])
-        }) {
+    // Deliberately one attempt, where AndroidA11y retries: doctor reports what the device
+    // can do now, and a dump that only succeeds after a wait is what this check exists to
+    // reveal.
+    let uiautomator = match dump_once(&dev, DUMP_PATH) {
         Ok(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
         Ok(_) => Err("uiautomator dump produced no hierarchy".to_string()),
         Err(e) => Err(e.to_string()),

@@ -41,12 +41,22 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let argv = build_argv(
-            self.serial.as_deref(),
-            &args.into_iter().collect::<Vec<_>>(),
-        );
-        let out = self.spawn(&argv)?;
-        decode_text(&self.bin, &argv, out)
+        let out = self.output(args)?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Run adb capturing stdout *and* stderr. For a command whose exit status does not
+    /// signal success — `uiautomator dump` exits 0 when it fails, and explains itself on
+    /// stderr — the caller has to judge the outcome from the streams itself.
+    pub fn run_streams<'a, I>(&self, args: I) -> Result<(String, String)>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let out = self.output(args)?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
     }
 
     /// Run adb capturing raw stdout bytes (e.g. `exec-out screencap`).
@@ -54,23 +64,28 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
+        Ok(self.output(args)?.stdout)
+    }
+
+    /// Run adb and return the completed process, erroring on spawn failure or non-zero
+    /// exit so every caller reports those two the same way.
+    fn output<'a, I>(&self, args: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         let argv = build_argv(
             self.serial.as_deref(),
             &args.into_iter().collect::<Vec<_>>(),
         );
-        let out = self.spawn(&argv)?;
+        let out = Command::new(&self.bin)
+            .args(&argv)
+            .output()
+            .map_err(|e| GlassError::Backend(format!("failed to run `{}`: {e}", self.bin)))?;
         if out.status.success() {
-            Ok(out.stdout)
+            Ok(out)
         } else {
             Err(exit_error(&self.bin, &argv, &out))
         }
-    }
-
-    fn spawn(&self, argv: &[String]) -> Result<Output> {
-        Command::new(&self.bin)
-            .args(argv)
-            .output()
-            .map_err(|e| GlassError::Backend(format!("failed to run `{}`: {e}", self.bin)))
     }
 }
 
@@ -84,14 +99,6 @@ pub(crate) fn build_argv(serial: Option<&str>, args: &[&str]) -> Vec<String> {
     }
     v.extend(args.iter().map(|a| a.to_string()));
     v
-}
-
-fn decode_text(bin: &str, argv: &[String], out: Output) -> Result<String> {
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(exit_error(bin, argv, &out))
-    }
 }
 
 fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
