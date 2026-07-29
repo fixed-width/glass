@@ -39,7 +39,7 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
@@ -133,6 +133,44 @@ mod macos_main {
         }
     }
 
+    /// Snapshot repeats behind one launch in [`print_snapshot_cost`]. Enough samples that one
+    /// slow outlier doesn't set the mean, few enough that several probed apps stay inside the
+    /// granted run (mirrors the Windows probe's constant of the same name).
+    const COST_REPEATS: usize = 10;
+
+    /// Re-snapshot the already-launched app [`COST_REPEATS`] times and print each walk's
+    /// wall-clock. Repeating inside one launch leaves app startup out of the number, so what
+    /// remains is the walk — the cost a per-node read (glass's `description`) adds to. Printed,
+    /// never asserted: a latency bound would flake on a loaded box.
+    fn print_snapshot_cost(
+        label: &str,
+        a11y: &mut MacosA11y,
+        ctx: &AxContext,
+    ) -> Result<(), String> {
+        let mut samples = Vec::with_capacity(COST_REPEATS);
+        for _ in 0..COST_REPEATS {
+            let started = Instant::now();
+            let tree = a11y
+                .snapshot(ctx)
+                .map_err(|e| format!("{label}: snapshot failed during the cost repeats: {e}"))?;
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            // The tree is read, not dropped unexamined, so no future laziness can move walk
+            // work out from under the timer.
+            std::hint::black_box(tree.root.children.len());
+        }
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        println!(
+            "  snapshot cost over {} repeats (mean {mean:.0}ms): {}",
+            samples.len(),
+            samples
+                .iter()
+                .map(|ms| format!("{ms:.0}ms"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(())
+    }
+
     /// Run `body`, then always call `platform.stop_app()` afterward regardless of whether
     /// `body` succeeded — mirrors `tests/bundle_launch.rs`'s identically-named helper.
     fn with_stop_app<T>(
@@ -213,6 +251,7 @@ mod macos_main {
                 "{}",
                 description_census_report(run0, &tree, DescriptionSourcing::Unsourced)
             );
+            print_snapshot_cost(run0, &mut a11y, &ctx)?;
             // Checked after the histogram is printed, so the evidence that explains a failure
             // is already in the output when the failure is reported.
             let violations = mapped_token_violations(run0, &tree);

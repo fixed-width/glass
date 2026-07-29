@@ -10,7 +10,7 @@
 #![allow(unsafe_code)]
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
@@ -1135,6 +1135,42 @@ fn render_role_histogram(label: &str, tree: &AxTree) -> String {
     out
 }
 
+/// Snapshot repeats behind one launch in [`render_snapshot_cost`]. Enough samples that one slow
+/// outlier doesn't set the mean, few enough that four probed apps stay inside the on-box run.
+const COST_REPEATS: usize = 10;
+
+/// Re-snapshot the already-launched app [`COST_REPEATS`] times and render each walk's wall-clock.
+/// Repeating inside one launch leaves app startup out of the number, so what remains is the walk —
+/// the cost a per-node read (glass's `description`) adds to. Printed, never asserted: a latency
+/// bound would flake on a loaded box.
+fn render_snapshot_cost(label: &str, a11y: &mut WindowsA11y, ctx: &AxContext) -> String {
+    use std::fmt::Write as _;
+    let mut samples = Vec::with_capacity(COST_REPEATS);
+    for _ in 0..COST_REPEATS {
+        let started = Instant::now();
+        let tree = a11y
+            .snapshot(ctx)
+            .unwrap_or_else(|e| panic!("{label}: snapshot failed during the cost repeats: {e}"));
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        // The tree is read, not dropped unexamined, so no future laziness can move walk work
+        // out from under the timer.
+        std::hint::black_box(tree.count);
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  snapshot cost over {} repeats (mean {mean:.0}ms): {}",
+        samples.len(),
+        samples
+            .iter()
+            .map(|ms| format!("{ms:.0}ms"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    out
+}
+
 /// UIA control-type names glass maps to a role, and that a probed app has actually been seen to
 /// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
 /// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
@@ -1223,6 +1259,10 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
     let census_block = description_census_report(label, &tree, DescriptionSourcing::Unsourced);
     print!("{census_block}");
     report.push_str(&census_block);
+
+    let cost_block = render_snapshot_cost(label, &mut a11y, &ctx);
+    print!("{cost_block}");
+    report.push_str(&cost_block);
 
     // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
     let mut candidates = Vec::new();
