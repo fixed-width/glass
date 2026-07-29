@@ -295,8 +295,17 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           name="glass-mcp-${tag}-universal-apple-darwin"
           mkdir -p dist
-          # ditto (not zip) preserves the bundle layout + signature.
-          ditto -c -k --keepParent target/macos-app/GlassMcp.app "dist/${name}.zip"
+          # The README sits beside the bundle, never inside it: a file added within
+          # GlassMcp.app would invalidate its signature and its notarization.
+          stage="$(mktemp -d)"
+          trap 'rm -rf "$stage"' EXIT
+          # ditto (not cp -R) is the guaranteed-faithful copy for a signed bundle — the same
+          # copy make-dmg.sh already makes of the stapled app, so the ticket survives it too.
+          ditto target/macos-app/GlassMcp.app "$stage/GlassMcp.app"
+          cp packaging/README-macos.md "$stage/README.md"
+          # Archive the staging directory's *contents* (no --keepParent), so the app stays at
+          # the root of the zip next to the README rather than nested under a folder.
+          ditto -c -k "$stage" "dist/${name}.zip"
           ( cd dist && for f in *.zip *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done )
 
       - name: Attest build provenance

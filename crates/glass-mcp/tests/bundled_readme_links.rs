@@ -1,6 +1,7 @@
 //! Guard: the per-platform READMEs bundled INTO the release archives
-//! (`packaging/README-{gnu,musl,windows}.md`) ship standalone — `release.yml` puts only the
-//! binary and that one file (renamed `README.md`) in each tarball/zip, no other repo files. So
+//! (`packaging/README-{gnu,musl,windows,macos}.md`) ship standalone — `release.yml` puts only the
+//! binary (on macOS, the `GlassMcp.app` bundle) and that one file, renamed `README.md`, in each
+//! tarball/zip/dmg, and no other repo files. So
 //! every inline link in them must be an ABSOLUTE URL (or an in-page anchor): a repo-relative link
 //! like `../docs/…` or a sibling `README-windows.md` resolves on GitHub but is broken the moment a
 //! user extracts the archive. This test also forbids the exact stale claims a past drift shipped
@@ -21,6 +22,7 @@ const BUNDLED: &[&str] = &[
     "packaging/README-gnu.md",
     "packaging/README-musl.md",
     "packaging/README-windows.md",
+    "packaging/README-macos.md",
 ];
 
 /// Every inline link / image target `](target)` in the markdown, target read up to the first `)`.

@@ -78,7 +78,9 @@ Tagging `v*` runs the `macos` job in [`.github/workflows/release.yml`](../../.gi
 which builds a **universal2** (`arm64` + `x86_64`) `GlassMcp.app`, Developer-ID-signs it
 (hardened runtime + secure timestamp, nested clip-shim dylib included), notarizes and
 staples it via `xcrun notarytool` + `stapler`, and uploads
-`glass-mcp-<tag>-universal-apple-darwin.zip` to the GitHub Release.
+`glass-mcp-<tag>-universal-apple-darwin.{zip,dmg}` (each with a `.sha256`) to the GitHub
+Release. Both carry `../README-macos.md` as `README.md` beside the bundle — never inside
+it, which would break the signature.
 
 The job **skips cleanly** (no failure) until these repository secrets are set, so releases
 still publish the Linux/Windows artifacts before macOS signing is available:
