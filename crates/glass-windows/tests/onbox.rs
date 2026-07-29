@@ -1254,9 +1254,8 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
     print!("{block}");
     report.push_str(&block);
 
-    // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every app —
-    // flip this when it reads HelpText/FullDescription.
-    let census_block = description_census_report(label, &tree, DescriptionSourcing::Unsourced);
+    // `Sourced`: this reader reads UIA `HelpText`, so a zero here is a fact about the app.
+    let census_block = description_census_report(label, &tree, DescriptionSourcing::Sourced);
     print!("{census_block}");
     report.push_str(&census_block);
 

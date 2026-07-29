@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget,
+    TruncationLimit, WalkBudget, normalize_description,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -149,6 +149,12 @@ fn walk(
         .map(str::to_string)
         .unwrap_or_else(|| format!("UIA:{ct_id}"));
     let name = nonempty(el.get_name().unwrap_or_default());
+    // UIA's secondary label is `HelpText`, the tooltip — one more cross-process round-trip per
+    // node, which the probe harness's cost block measures. `FullDescription` is UIA's other
+    // secondary label; `uiautomation` 0.25 exposes no accessor for it (only
+    // `UIProperty::FullDescription` through `get_property_value`).
+    let description =
+        normalize_description(&el.get_help_text().unwrap_or_default(), name.as_deref());
     let bounds = window_relative_bounds(el, origin);
     let (facts, value) = gather(el, ct_id);
     let states = crate::mapping::map_states(&facts);
@@ -192,9 +198,7 @@ fn walk(
         role: crate::mapping::map_role(ct_id, facts.checkable),
         raw_role,
         name,
-        // This reader reads neither of UIA's secondary labels yet: `HelpText` (the tooltip)
-        // and `FullDescription`.
-        description: None,
+        description,
         value,
         states,
         bounds,
