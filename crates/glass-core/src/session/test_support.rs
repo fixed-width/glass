@@ -31,6 +31,7 @@ pub(crate) struct FakePlatform {
     started: bool,
     capture_log: Arc<Mutex<Vec<Option<Region>>>>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
+    key_log: Arc<Mutex<Vec<KeyEvent>>>,
     scroll_log: Arc<Mutex<Vec<PointerEvent>>>,
     drag_log: Arc<Mutex<Vec<PointerEvent>>>,
     stop_count: Option<Arc<Mutex<u32>>>,
@@ -81,6 +82,12 @@ impl FakePlatform {
     }
     pub(crate) fn with_click_log(mut self, log: Arc<Mutex<Vec<(i32, i32)>>>) -> Self {
         self.click_log = log;
+        self
+    }
+    /// Records every chord/text the session sends, so a keyboard-driven path can be asserted
+    /// on the keystrokes it produced rather than only on its end state.
+    pub(crate) fn with_key_log(mut self, log: Arc<Mutex<Vec<KeyEvent>>>) -> Self {
+        self.key_log = log;
         self
     }
     pub(crate) fn with_scroll_log(mut self, log: Arc<Mutex<Vec<PointerEvent>>>) -> Self {
@@ -195,6 +202,7 @@ impl Platform for FakePlatform {
     }
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         self.key_events.push(event.clone());
+        self.key_log.lock().unwrap().push(event.clone());
         Ok(())
     }
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
@@ -667,6 +675,21 @@ pub(crate) fn fake_tree_with_popover_option() -> AxTree {
         children: vec![list],
     };
     AxTree::new(root)
+}
+
+/// The same popover shape, but with the list container horizontally offset. The validated
+/// fixture above has the container at x=0, where subtracting its origin and adding it give the
+/// same answer — so the horizontal half of the translation is unpinned by it.
+pub(crate) fn fake_tree_with_offset_popover_option() -> AxTree {
+    let mut tree = fake_tree_with_popover_option();
+    let list = &mut tree.root.children[0];
+    if let Some(b) = list.bounds.as_mut() {
+        b.x = 40;
+    }
+    if let Some(b) = list.children[0].bounds.as_mut() {
+        b.x = 70;
+    }
+    tree
 }
 
 /// A bare-minimum `Platform` that overrides nothing — every optional method

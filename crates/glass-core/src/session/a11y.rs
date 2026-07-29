@@ -477,7 +477,10 @@ impl Glass {
         // Opening focuses the current selection; step from it to the target, then Enter.
         let current_idx = options.iter().position(|(_, sel)| *sel).unwrap_or(0);
         let delta = target_idx as i32 - current_idx as i32;
-        let chord = if delta >= 0 { "Down" } else { "Up" };
+        // `is_negative` rather than a comparison against 0: the two differ only at delta == 0,
+        // where the loop below runs zero times and the chord is never sent, so which comparison
+        // is written cannot be observed.
+        let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
             self.key(&KeyEvent::Chord(chord.to_string()))?;
         }
@@ -741,6 +744,369 @@ fn menu_container_bounds(
 mod tests {
     use super::*;
     use crate::session::test_support::*;
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> AxRect {
+        AxRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Centre is origin plus half the extent, on each axis independently. Odd extents floor,
+    /// which is what keeps the point inside the rect.
+    #[test]
+    fn rect_center_is_the_midpoint_of_each_axis() {
+        assert_eq!(rect_center(&rect(0, 0, 10, 20)), (5, 10));
+        assert_eq!(rect_center(&rect(100, 200, 10, 20)), (105, 210));
+        // Odd extents floor rather than round up or land on the far edge.
+        assert_eq!(rect_center(&rect(0, 0, 5, 7)), (2, 3));
+        // Negative origins keep the offset positive, so the axes cannot be swapped unnoticed.
+        assert_eq!(rect_center(&rect(-30, -8, 10, 4)), (-25, -6));
+        // A zero extent is the origin itself.
+        assert_eq!(rect_center(&rect(7, 9, 0, 0)), (7, 9));
+    }
+
+    /// Picks the *nearest* combo, not the first in pre-order — the two differ only when the
+    /// nearest is later in the tree, which is the case that matters.
+    #[test]
+    fn find_combo_near_picks_the_closest_not_the_first() {
+        let far = ax_node(1, AxRole::ComboBox, Some(rect(0, 0, 10, 10)), vec![]);
+        let near = ax_node(2, AxRole::ComboBox, Some(rect(100, 100, 10, 10)), vec![]);
+        let root = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 200, 200)),
+            vec![far, near],
+        );
+
+        // Target sits on top of the second combo, which is last in pre-order.
+        let want_near = rect(100, 100, 10, 10);
+        assert_eq!(
+            find_combo_near(&root, Some(&want_near)).map(|n| n.id),
+            Some(AxNodeId(2))
+        );
+        // And the mirror, so "always the last" is wrong too.
+        let want_far = rect(0, 0, 10, 10);
+        assert_eq!(
+            find_combo_near(&root, Some(&want_far)).map(|n| n.id),
+            Some(AxNodeId(1))
+        );
+        // Ties keep the first seen, so the comparison is strict.
+        let equidistant = rect(50, 50, 10, 10);
+        assert_eq!(
+            find_combo_near(&root, Some(&equidistant)).map(|n| n.id),
+            Some(AxNodeId(1)),
+            "a tie must not be taken by the later node"
+        );
+        // The distance is a difference of coordinates, squared and summed. Candidates near the
+        // origin cannot tell that apart from a ratio or a product: put the target far from the
+        // origin and give each candidate its whole error on one axis, so a divide collapses one
+        // term to nothing and a product collapses both.
+        let far_x = ax_node(4, AxRole::ComboBox, Some(rect(-5, 995, 10, 10)), vec![]);
+        let near_y = ax_node(5, AxRole::ComboBox, Some(rect(995, 985, 10, 10)), vec![]);
+        let root_x = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![far_x, near_y],
+        );
+        let t = rect(995, 995, 10, 10);
+        assert_eq!(
+            find_combo_near(&root_x, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(5)),
+            "1000 away on x must beat 10 away on y only by difference, not by ratio"
+        );
+
+        // Mirrored, so the same collapse on the other axis is caught too.
+        let far_y = ax_node(6, AxRole::ComboBox, Some(rect(995, -5, 10, 10)), vec![]);
+        let near_x = ax_node(7, AxRole::ComboBox, Some(rect(985, 995, 10, 10)), vec![]);
+        let root_y = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![far_y, near_x],
+        );
+        assert_eq!(
+            find_combo_near(&root_y, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(7))
+        );
+
+        // No target: the first combo, the documented single-combo fallback.
+        assert_eq!(
+            find_combo_near(&root, None).map(|n| n.id),
+            Some(AxNodeId(1))
+        );
+        // A combo with no bounds is unreachable by proximity but still the fallback.
+        let unbounded = ax_node(3, AxRole::ComboBox, None, vec![]);
+        let only_unbounded = ax_node(0, AxRole::Window, Some(rect(0, 0, 20, 20)), vec![unbounded]);
+        assert_eq!(
+            find_combo_near(&only_unbounded, Some(&want_near)).map(|n| n.id),
+            Some(AxNodeId(3))
+        );
+    }
+
+    /// Same proximity rule, but deliberately no fallback: a toggle verify with no captured
+    /// bounds must fail rather than risk latching onto a same-named sibling.
+    #[test]
+    fn find_checkable_near_has_no_fallback_without_bounds() {
+        let mut a = ax_node(1, AxRole::CheckBox, Some(rect(0, 0, 10, 10)), vec![]);
+        a.states.checkable = true;
+        let mut b = ax_node(2, AxRole::CheckBox, Some(rect(100, 100, 10, 10)), vec![]);
+        b.states.checkable = true;
+        let root = ax_node(0, AxRole::Window, Some(rect(0, 0, 200, 200)), vec![a, b]);
+
+        let near_b = rect(100, 100, 10, 10);
+        assert_eq!(
+            find_checkable_near(&root, Some(&near_b)).map(|n| n.id),
+            Some(AxNodeId(2))
+        );
+        let near_a = rect(0, 0, 10, 10);
+        assert_eq!(
+            find_checkable_near(&root, Some(&near_a)).map(|n| n.id),
+            Some(AxNodeId(1))
+        );
+        // Same coordinate-collapse cases as for combos: a difference, not a ratio or product.
+        let mut fx = ax_node(4, AxRole::CheckBox, Some(rect(-5, 995, 10, 10)), vec![]);
+        fx.states.checkable = true;
+        let mut ny = ax_node(5, AxRole::CheckBox, Some(rect(995, 985, 10, 10)), vec![]);
+        ny.states.checkable = true;
+        let far_root = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![fx, ny],
+        );
+        let t = rect(995, 995, 10, 10);
+        assert_eq!(
+            find_checkable_near(&far_root, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(5))
+        );
+
+        // Ties keep the first seen here too, so the comparison is strict.
+        let equidistant = rect(50, 50, 10, 10);
+        assert_eq!(
+            find_checkable_near(&root, Some(&equidistant)).map(|n| n.id),
+            Some(AxNodeId(1)),
+            "a tie must not be taken by the later node"
+        );
+        // The documented refusal — unlike find_combo_near, there is no first-match fallback.
+        assert_eq!(find_checkable_near(&root, None).map(|n| n.id), None);
+        // Not-checkable nodes are invisible to it, whatever their role.
+        let plain = ax_node(5, AxRole::CheckBox, Some(rect(0, 0, 10, 10)), vec![]);
+        let no_checkables = ax_node(0, AxRole::Window, Some(rect(0, 0, 20, 20)), vec![plain]);
+        assert_eq!(find_checkable_near(&no_checkables, Some(&near_a)), None);
+    }
+
+    /// Both halves are required: the right role AND actually expanded.
+    #[test]
+    fn find_expanded_combo_needs_role_and_state() {
+        let mut collapsed = ax_node(1, AxRole::ComboBox, None, vec![]);
+        collapsed.states.expanded = false;
+        let mut expanded = ax_node(2, AxRole::ComboBox, None, vec![]);
+        expanded.states.expanded = true;
+        let mut expanded_list = ax_node(3, AxRole::List, None, vec![]);
+        expanded_list.states.expanded = true;
+
+        let root = ax_node(
+            0,
+            AxRole::Window,
+            None,
+            vec![collapsed, expanded_list, expanded],
+        );
+        assert_eq!(find_expanded_combo(&root).map(|n| n.id), Some(AxNodeId(2)));
+
+        // An expanded node of another role is not a match, nor is a collapsed combo.
+        let mut only_list = ax_node(3, AxRole::List, None, vec![]);
+        only_list.states.expanded = true;
+        let no_combo = ax_node(0, AxRole::Window, None, vec![only_list]);
+        assert_eq!(find_expanded_combo(&no_combo), None);
+    }
+
+    /// Pre-order, first match wins, and a role that is absent yields None rather than the root.
+    #[test]
+    fn find_role_returns_the_first_in_pre_order() {
+        let deep = ax_node(2, AxRole::Button, None, vec![]);
+        let branch = ax_node(1, AxRole::Group, None, vec![deep]);
+        let sibling = ax_node(3, AxRole::Button, None, vec![]);
+        let root = ax_node(0, AxRole::Window, None, vec![branch, sibling]);
+
+        assert_eq!(
+            find_role(&root, AxRole::Button).map(|n| n.id),
+            Some(AxNodeId(2))
+        );
+        assert_eq!(
+            find_role(&root, AxRole::Window).map(|n| n.id),
+            Some(AxNodeId(0))
+        );
+        assert_eq!(find_role(&root, AxRole::Slider), None);
+    }
+
+    /// Containment is half-open on each axis: the left/top edges are inside, the right/bottom
+    /// edges are not. Every bound is asserted from both sides, since one comparison flipped or
+    /// one conjunction loosened still leaves the ordinary cases right.
+    #[test]
+    fn owning_popover_containment_is_half_open_on_every_edge() {
+        let active = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 400,
+        };
+        // Popover occupying (100,100) to (200,200) exclusive.
+        let pop = WindowGeometry {
+            x: 100,
+            y: 100,
+            width: 100,
+            height: 100,
+        };
+        let windows = vec![
+            window_info(1, active.clone(), true),
+            window_info(2, pop.clone(), false),
+        ];
+        // The element's centre is what is tested, so a 2x2 rect centres on its own origin + 1.
+        let at = |x: i32, y: i32| AxRect {
+            x: x - 1,
+            y: y - 1,
+            width: 2,
+            height: 2,
+        };
+
+        assert_eq!(
+            owning_popover(at(150, 150), &active, &windows),
+            Some(WindowId(2))
+        );
+        // Inclusive on the near edges.
+        assert_eq!(
+            owning_popover(at(100, 150), &active, &windows),
+            Some(WindowId(2))
+        );
+        assert_eq!(
+            owning_popover(at(150, 100), &active, &windows),
+            Some(WindowId(2))
+        );
+        // Exclusive on the far edges — 200 is the first column outside.
+        assert_eq!(owning_popover(at(200, 150), &active, &windows), None);
+        assert_eq!(owning_popover(at(150, 200), &active, &windows), None);
+        assert_eq!(
+            owning_popover(at(199, 199), &active, &windows),
+            Some(WindowId(2))
+        );
+        // Outside on one axis only: every bound must hold, not any of them.
+        assert_eq!(owning_popover(at(150, 50), &active, &windows), None);
+        assert_eq!(owning_popover(at(50, 150), &active, &windows), None);
+        assert_eq!(owning_popover(at(150, 350), &active, &windows), None);
+        assert_eq!(owning_popover(at(350, 150), &active, &windows), None);
+    }
+
+    /// Ties are broken by area, not by perimeter: a tall thin window and a squat wide one can
+    /// share a sum while differing in area.
+    #[test]
+    fn owning_popover_prefers_the_smaller_area_not_the_smaller_sum() {
+        let active = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 400,
+            height: 400,
+        };
+        // 10x100 (area 1000, sum 110) vs 60x60 (area 3600, sum 120): the first wins on area,
+        // and on sum too — so make the sums disagree with the areas.
+        let thin = WindowGeometry {
+            x: 100,
+            y: 100,
+            width: 4,
+            height: 100,
+        };
+        let squat = WindowGeometry {
+            x: 100,
+            y: 100,
+            width: 52,
+            height: 52,
+        };
+        // thin: area 400, sum 104. squat: area 2704, sum 104. Equal sums, different areas.
+        let windows = vec![
+            window_info(1, active.clone(), true),
+            window_info(2, squat, false),
+            window_info(3, thin, false),
+        ];
+        let at = AxRect {
+            x: 101,
+            y: 101,
+            width: 2,
+            height: 2,
+        };
+        assert_eq!(owning_popover(at, &active, &windows), Some(WindowId(3)));
+    }
+
+    /// The container is the ancestor whose size is closest to the popover's, within 16px on
+    /// both axes — so the tolerance is a difference, and the score sums the two axes.
+    #[test]
+    fn menu_container_bounds_scores_by_summed_axis_difference() {
+        let popover = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        // Within tolerance on both axes, closer on the sum.
+        let close = ax_node(2, AxRole::List, Some(rect(0, 0, 100, 100)), vec![]);
+        // Also within tolerance, but further.
+        let looser = ax_node(1, AxRole::Group, Some(rect(0, 0, 110, 110)), vec![close]);
+        let root = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![looser]);
+        assert_eq!(
+            menu_container_bounds(&root, AxNodeId(2), &popover),
+            Some(rect(0, 0, 100, 100))
+        );
+
+        // Exactly at the tolerance on one axis is still in; one past it is out.
+        let edge = ax_node(2, AxRole::List, Some(rect(0, 0, 116, 100)), vec![]);
+        let root_edge = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![edge]);
+        assert_eq!(
+            menu_container_bounds(&root_edge, AxNodeId(2), &popover),
+            Some(rect(0, 0, 116, 100))
+        );
+        let past = ax_node(2, AxRole::List, Some(rect(0, 0, 117, 100)), vec![]);
+        let root_past = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![past]);
+        assert_eq!(
+            menu_container_bounds(&root_past, AxNodeId(2), &popover),
+            None
+        );
+
+        // The same on the other axis, so one tolerance tightened is not covered by the other.
+        let edge_h = ax_node(2, AxRole::List, Some(rect(0, 0, 100, 116)), vec![]);
+        let root_edge_h = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![edge_h]);
+        assert_eq!(
+            menu_container_bounds(&root_edge_h, AxNodeId(2), &popover),
+            Some(rect(0, 0, 100, 116))
+        );
+        let past_h = ax_node(2, AxRole::List, Some(rect(0, 0, 100, 117)), vec![]);
+        let root_past_h = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![past_h]);
+        assert_eq!(
+            menu_container_bounds(&root_past_h, AxNodeId(2), &popover),
+            None
+        );
+
+        // The score sums the axes rather than multiplying them, and the two orderings
+        // disagree here: (1,10) sums to 11 and multiplies to 10, while (5,5) sums to 10 and
+        // multiplies to 25. Candidates differing on only one axis cannot tell them apart.
+        let lopsided = ax_node(2, AxRole::List, Some(rect(0, 0, 101, 110)), vec![]);
+        let even = ax_node(1, AxRole::Group, Some(rect(0, 0, 105, 105)), vec![lopsided]);
+        let root_score = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![even]);
+        assert_eq!(
+            menu_container_bounds(&root_score, AxNodeId(2), &popover),
+            Some(rect(0, 0, 105, 105)),
+            "the lower summed difference must win, not the lower product"
+        );
+
+        // The difference is absolute: smaller than the popover counts the same as larger.
+        let smaller = ax_node(2, AxRole::List, Some(rect(0, 0, 90, 90)), vec![]);
+        let root_small = ax_node(0, AxRole::Window, Some(rect(0, 0, 400, 400)), vec![smaller]);
+        assert_eq!(
+            menu_container_bounds(&root_small, AxNodeId(2), &popover),
+            Some(rect(0, 0, 90, 90))
+        );
+    }
 
     #[test]
     fn owning_popover_none_when_element_only_in_active_window() {
@@ -1670,6 +2036,47 @@ mod tests {
         );
     }
 
+    /// The click is translated into the popover's container, on both axes. The validated
+    /// fixture's container sits at x=0, where subtracting and adding its origin agree, so this
+    /// repeats it with the container offset horizontally.
+    #[test]
+    fn click_element_translates_the_x_axis_into_the_container_too() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let a = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let b = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![a, b])
+            .with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_offset_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        g.click_element(globex_id).unwrap();
+
+        // Item at x=70 inside a container at x=40 is 30 in; y is unchanged from the validated
+        // fixture at 248 - 194.
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((30, 54)));
+    }
+
     #[test]
     fn click_element_routes_into_owning_popover_and_restores_active_window() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
@@ -1968,6 +2375,107 @@ mod tests {
             ..ax_node(0, AxRole::ComboBox, Some(bounds), vec![])
         };
         tree_with(340, 300, vec![combo])
+    }
+
+    /// The commit walks from the currently-selected option to the wanted one, so both the
+    /// direction and the number of steps come from their index difference. Asserted on the
+    /// keystrokes: the end state alone is reached by any number of Downs past the target.
+    #[test]
+    fn set_combo_value_steps_from_the_current_selection_to_the_target() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // Selected is "Beta" (index 1); the target "Delta" is index 3, so two Downs forward.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Beta", &[]),
+                combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                combo("Delta", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Delta").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chords,
+            vec!["Down", "Down", "Return"],
+            "two steps forward from index 1 to index 3, then commit"
+        );
+    }
+
+    /// The mirror: a target above the current selection walks up, not down.
+    #[test]
+    fn set_combo_value_walks_up_to_an_earlier_option() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // Selected is "Delta" (index 3); the target "Alpha" is index 0, so three Ups.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Delta", &[]),
+                combo("Delta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                combo("Alpha", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Alpha").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chords, vec!["Up", "Up", "Up", "Return"]);
+    }
+
+    /// With nothing selected the walk starts from the first option, so the step count is the
+    /// target's own index.
+    #[test]
+    fn set_combo_value_starts_from_the_first_option_when_none_is_selected() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // `combo` marks an option selected by matching the name, so a name outside the option
+        // list leaves every one of them unselected.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Nothing", &[]),
+                combo("Nothing", &["Alpha", "Beta", "Gamma"]),
+                combo("Gamma", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Gamma").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chords, vec!["Down", "Down", "Return"], "index 0 to index 2");
     }
 
     #[test]
