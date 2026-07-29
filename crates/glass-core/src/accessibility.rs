@@ -90,53 +90,6 @@ impl AxRole {
         AxRole::Heading,
     ];
 
-    /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
-    /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
-    /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
-    /// every one of them; this match stops compiling until the variant is classified — listed in
-    /// the first arm and in `ALL`, or in the second arm as a deliberate exclusion.
-    #[expect(dead_code, reason = "exists only for its exhaustive match")]
-    fn all_is_exhaustive(role: AxRole) {
-        match role {
-            AxRole::Application
-            | AxRole::Window
-            | AxRole::Dialog
-            | AxRole::Group
-            | AxRole::Button
-            | AxRole::ToggleButton
-            | AxRole::RadioButton
-            | AxRole::CheckBox
-            | AxRole::MenuBar
-            | AxRole::Menu
-            | AxRole::MenuItem
-            | AxRole::Label
-            | AxRole::TextField
-            | AxRole::TextArea
-            | AxRole::ComboBox
-            | AxRole::List
-            | AxRole::ListItem
-            | AxRole::Table
-            | AxRole::Cell
-            | AxRole::Tree
-            | AxRole::TreeItem
-            | AxRole::TabList
-            | AxRole::Tab
-            | AxRole::ScrollBar
-            | AxRole::Slider
-            | AxRole::SpinButton
-            | AxRole::ProgressBar
-            | AxRole::Image
-            | AxRole::Link
-            | AxRole::Separator
-            | AxRole::Toolbar
-            | AxRole::StatusBar
-            | AxRole::Heading => {}
-            // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
-            // mapping target.
-            AxRole::Other => {}
-        }
-    }
-
     /// Whether this role denotes an element a user acts on (clicks / types into) —
     /// the elements worth a Set-of-Mark number. Containers, the window, and static
     /// text return `false`.
@@ -926,6 +879,118 @@ pub fn element_match<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
+    /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
+    /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
+    /// every one of them; this match stops compiling until the variant is classified — listed in
+    /// the first arm and in `ALL`, or in the second arm as a deliberate exclusion.
+    #[expect(dead_code, reason = "exists only for its exhaustive match")]
+    fn all_is_exhaustive(role: AxRole) {
+        match role {
+            AxRole::Application
+            | AxRole::Window
+            | AxRole::Dialog
+            | AxRole::Group
+            | AxRole::Button
+            | AxRole::ToggleButton
+            | AxRole::RadioButton
+            | AxRole::CheckBox
+            | AxRole::MenuBar
+            | AxRole::Menu
+            | AxRole::MenuItem
+            | AxRole::Label
+            | AxRole::TextField
+            | AxRole::TextArea
+            | AxRole::ComboBox
+            | AxRole::List
+            | AxRole::ListItem
+            | AxRole::Table
+            | AxRole::Cell
+            | AxRole::Tree
+            | AxRole::TreeItem
+            | AxRole::TabList
+            | AxRole::Tab
+            | AxRole::ScrollBar
+            | AxRole::Slider
+            | AxRole::SpinButton
+            | AxRole::ProgressBar
+            | AxRole::Image
+            | AxRole::Link
+            | AxRole::Separator
+            | AxRole::Toolbar
+            | AxRole::StatusBar
+            | AxRole::Heading => {}
+            // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
+            // mapping target.
+            AxRole::Other => {}
+        }
+    }
+
+    /// The budget's accessors report what it actually counted, and the two exhaustion tests
+    /// fire at their own bound rather than sharing one.
+    #[test]
+    fn walk_budget_reports_and_bounds_what_it_counted() {
+        let limits = WalkLimits {
+            nodes: 3,
+            depth: 2,
+            siblings: 4,
+        };
+        let mut b = WalkBudget::with_limits(limits);
+        assert_eq!(b.nodes_walked(), 0);
+        assert!(!b.nodes_exhausted());
+
+        b.visit();
+        assert_eq!(b.nodes_walked(), 1, "one visit is one node");
+        assert!(!b.nodes_exhausted());
+        b.visit();
+        b.visit();
+        assert_eq!(b.nodes_walked(), 3);
+        assert!(b.nodes_exhausted(), "the bound is reached, not exceeded");
+
+        // Depth is a separate bound, read per call rather than from the running count.
+        assert!(!b.depth_exhausted(0));
+        assert!(!b.depth_exhausted(1));
+        assert!(b.depth_exhausted(2), "reaching the bound stops the descent");
+        assert!(b.depth_exhausted(3));
+    }
+
+    /// The disclosure notice names the unit that stopped the walk, so the three are distinct.
+    #[test]
+    fn truncation_limits_have_distinct_labels() {
+        assert_eq!(TruncationLimit::Nodes.label(), "nodes");
+        assert_eq!(TruncationLimit::Depth.label(), "levels deep");
+        assert_eq!(TruncationLimit::Siblings.label(), "siblings per level");
+    }
+
+    /// A backend that does not implement value-setting must say so, not silently succeed:
+    /// reporting Ok having changed nothing is the "no silent fallbacks" invariant inverted.
+    #[test]
+    fn set_value_defaults_to_unsupported() {
+        struct Bare;
+        impl Accessibility for Bare {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                Err(crate::error::GlassError::AxUnsupported)
+            }
+        }
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: None,
+            bounds: None,
+        };
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        };
+        let err = Bare
+            .set_value(&ctx, &target, "x")
+            .expect_err("the default must refuse, not report success");
+        assert!(matches!(err, crate::error::GlassError::AxUnsupported));
+    }
 
     /// Every arm of the condition table, plus the predicate each one selects. `Appears` and
     /// `Disappears` share an always-true predicate; the rest split into a pair per state, so
