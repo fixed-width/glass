@@ -45,8 +45,8 @@ pub fn wait_for_element(glass: &mut Glass, a: &WaitForElementArgs) -> ToolResult
 }
 
 /// The matched a11y element as an untrusted sibling block (empty when nothing
-/// matched). Its `name`/`value` are app-controlled, so they must never ride in the
-/// trusted `result` envelope.
+/// matched). Its `name`/`description`/`value` are app-controlled, so they must never ride in
+/// the trusted `result` envelope.
 fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> {
     match element {
         Some(e) => {
@@ -54,6 +54,9 @@ fn element_sibling(element: Option<glass_core::ElementInfo>) -> Vec<OutContent> 
                 "id": e.id.0,
                 "role": format!("{:?}", e.role),
                 "name": e.name,
+                // An icon-only element's only label; without it the block that reports the
+                // match carries no label at all for a node the outline labels desc="…".
+                "description": e.description,
                 "value": e.value,
                 "bounds": e.bounds.map(|b| json!({ "x": b.x, "y": b.y, "width": b.width, "height": b.height })),
                 "states": e.states.active(),
@@ -325,6 +328,7 @@ mod tests {
             role: AxRole::Button,
             raw_role: "push button".into(),
             name: Some("Save".into()),
+            description: None,
             value: None,
             states: AxStates {
                 focusable: true,
@@ -344,6 +348,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -393,6 +398,26 @@ mod tests {
             }
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn a_matched_element_reports_its_description() {
+        // An icon-only control has no name, so without `description` the match block would
+        // carry no label at all for a node the outline shows as `desc="Bold"`.
+        let mut tree = fake_tree();
+        tree.root.children[0].name = None;
+        tree.root.children[0].description = Some("Bold".into());
+        let mut g = started_a11y_with(tree);
+        let mut a = elem_args();
+        a.role = Some("Button".into());
+        let out = wait_for_element(&mut g, &a).unwrap();
+        let OutContent::Text(sibling) = &out.0[1] else {
+            panic!("expected untrusted element sibling")
+        };
+        assert!(
+            sibling.contains("\"description\":\"Bold\""),
+            "the element's only label must be reported: {sibling}"
+        );
     }
 
     fn started_a11y_with(tree: AxTree) -> Glass {

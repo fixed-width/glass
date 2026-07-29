@@ -192,6 +192,9 @@ fn walk(
         role: crate::mapping::map_role(ct_id, facts.checkable),
         raw_role,
         name,
+        // This reader reads neither of UIA's secondary labels yet: `HelpText` (the tooltip)
+        // and `FullDescription`.
+        description: None,
         value,
         states,
         bounds,

@@ -29,7 +29,10 @@ use std::time::Duration;
 
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader
 use glass_core::accessibility::{AxContext, WalkLimits};
-use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
+use glass_core::{
+    AppSpec, AxRole, AxTree, DescriptionSourcing, Platform, SandboxLevel,
+    description_census_report, role_histogram,
+};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 
 /// Comma-separated bundle ids or `.app` paths to probe, e.g. `com.apple.Preferences`. Unset
@@ -225,6 +228,12 @@ fn role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({target}): {e}"));
         tree.assign_ids();
         print_role_histogram(target, &tree);
+        // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every
+        // app — flip this when it reads accessibilityHint.
+        print!(
+            "{}",
+            description_census_report(target, &tree, DescriptionSourcing::Unsourced)
+        );
         violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
 

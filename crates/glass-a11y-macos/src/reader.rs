@@ -424,6 +424,9 @@ fn walk(
         role,
         raw_role,
         name,
+        // `AXDescription` is already read above as the name fallback, so reading it here would
+        // normalize away as a duplicate; `AXHelp` (the tooltip) is the unread secondary label.
+        description: None,
         value,
         states,
         bounds,

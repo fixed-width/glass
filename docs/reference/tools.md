@@ -230,9 +230,9 @@ no accessibility tree.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms}`. On a match, the matched element (`{id, role, name, value, bounds,
-states}`) rides as an untrusted sibling text block, since its `name`/`value` are app-controlled; its
-`id` is usable with `glass_click_element`. No sibling on timeout.
+Returns `{matched, elapsed_ms}`. On a match, the matched element (`{id, role, name, description,
+value, bounds, states}`) rides as an untrusted sibling text block, since its `name`/`description`/
+`value` are app-controlled; its `id` is usable with `glass_click_element`. No sibling on timeout.
 
 ### `glass_wait_for_region`
 
@@ -455,8 +455,16 @@ reads the Simulator's accessibility tree over `idb_companion` (install it — se
 
 Capture the active window's accessibility tree as compact text. Returns `{}`; the tree itself
 rides as an untrusted sibling text block, one line per element:
-`#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`. An element
-whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
+`#<id> <Role> "<name>" desc="<description>" (x,y wxh) [states]`; pass an `#id` to
+`glass_click_element`. `desc="…"` carries a secondary label the platform exposes separately from
+the name — help or tooltip text, or the human-readable label where the name is a
+developer-assigned id. It appears only where glass's reader sources that label, which today is the
+AT-SPI (Linux) reader alone; the UI Automation, AX, `uiautomator` and `idb` readers do not read
+their platform's secondary label yet, so `desc` never appears there no matter what the app
+exposes. It is also omitted when the description duplicates the name. **`desc` is display-only:
+`glass_wait_for_element` and `glass_scroll_to_element` select on `name`, never on the
+description.** An element whose platform role glass
+has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
 
@@ -471,10 +479,14 @@ what each backend can produce.
 ### `glass_a11y_marks`
 
 Screenshot of the active window with a numbered Set-of-Mark box on each interactable element, plus a
-text legend (`#<id> <Role> "<name>"`). No parameters. Returns `{count}` — the number of marked
-elements; the image and the legend text follow as siblings (the legend untrusted-wrapped), per the
-image ordering above. Same ids as `glass_a11y_snapshot`. The box is only as precise as the toolkit's
-a11y geometry (can drift ~10–20px), but the `#id` and the click are exact.
+text legend (`#<id> <Role> "<name>"`). An element with no name but a description is labelled from it
+and rendered as `#<id> <Role> desc="<description>"`, the same spelling the snapshot outline uses, so
+the legend never shows a description where a matchable `name` would be.
+
+No parameters. Returns `{count}` — the number of marked elements; the image and the legend text
+follow as siblings (the legend untrusted-wrapped), per the image ordering above. Same ids as
+`glass_a11y_snapshot`. The box is only as precise as the toolkit's a11y geometry (can drift
+~10–20px), but the `#id` and the click are exact.
 
 ### `glass_click_element`
 
@@ -526,9 +538,9 @@ Errors if the app exposes no accessibility tree.
 - `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
 
 Returns `{matched, elapsed_ms, scrolled{steps, reversed, direction}}` — `direction` is the resolved
-(possibly inferred) sweep direction. On a match, the matched element (`{id, role, name, value, bounds,
-states}`) rides as an untrusted sibling text block, since its `name`/`value` are app-controlled; its
-`id` is usable with `glass_click_element`. No sibling on timeout.
+(possibly inferred) sweep direction. On a match, the matched element (`{id, role, name, description,
+value, bounds, states}`) rides as an untrusted sibling text block, since its `name`/`description`/
+`value` are app-controlled; its `id` is usable with `glass_click_element`. No sibling on timeout.
 
 ## Clipboard
 

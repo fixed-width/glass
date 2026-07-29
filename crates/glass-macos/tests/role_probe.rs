@@ -43,8 +43,8 @@ mod macos_main {
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxRole, AxTree, Platform, SandboxLevel, WalkLimits,
-        role_histogram,
+        Accessibility, AppSpec, AxContext, AxRole, AxTree, DescriptionSourcing, Platform,
+        SandboxLevel, WalkLimits, description_census_report, role_histogram,
     };
     use glass_macos::MacosPlatform;
 
@@ -207,6 +207,12 @@ mod macos_main {
             // of how big the tree actually was.
             tree.assign_ids();
             print_role_histogram(run0, &tree);
+            // `Unsourced`: this reader leaves `description: None`, so the count is 0 for
+            // every app — flip this when it reads AXHelp.
+            print!(
+                "{}",
+                description_census_report(run0, &tree, DescriptionSourcing::Unsourced)
+            );
             // Checked after the histogram is printed, so the evidence that explains a failure
             // is already in the output when the failure is reported.
             let violations = mapped_token_violations(run0, &tree);

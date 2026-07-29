@@ -69,8 +69,8 @@ mod macos_main {
     const CLICK_SETTLE: Duration = Duration::from_millis(400);
 
     /// The four elements the fixture exposes, asserted as substrings of the tree outline.
-    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, using only `name` (never
-    /// `value`) — so the editable field's stable label (`setAccessibilityLabel("Note")`,
+    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, rendering `name` and never
+    /// `value` — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
     /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
     const NEEDLES: [&str; 4] = [
@@ -81,9 +81,9 @@ mod macos_main {
     ];
 
     /// Pre-order search for the first `TextField` node — the fixture's editable "Note" field.
-    /// Separate from the [`NEEDLES`] outline check because `to_outline` only ever renders
-    /// `name`; this reaches `AxNode::value` directly to prove content is read independently of
-    /// the (stable) label.
+    /// Separate from the [`NEEDLES`] outline check because `to_outline` renders labels (`name`,
+    /// plus `desc` where a reader sources one) and never `value`; this reaches `AxNode::value`
+    /// directly to prove content is read independently of the (stable) label.
     fn find_text_field(node: &AxNode) -> Option<&AxNode> {
         if node.role == AxRole::TextField {
             return Some(node);

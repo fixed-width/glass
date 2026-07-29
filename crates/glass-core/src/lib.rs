@@ -72,11 +72,11 @@ pub mod accessibility;
 pub use accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
     ClickMethod, ElementCondition, ElementInfo, ElementMatch, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
-    Truncation, TruncationLimit, WalkBudget, WalkLimits, element_match,
+    Truncation, TruncationLimit, WalkBudget, WalkLimits, element_match, normalize_description,
 };
 
 pub mod marks;
-pub use marks::Mark;
+pub use marks::{Mark, MarkLabel};
 
 pub mod outline;
 
@@ -84,6 +84,12 @@ pub mod role_support;
 
 pub mod role_histogram;
 pub use role_histogram::{RoleTally, role_histogram};
+
+pub mod description_census;
+pub use description_census::{
+    DescribedSample, DescriptionCensus, DescriptionSourcing, description_census,
+    description_census_report,
+};
 
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};

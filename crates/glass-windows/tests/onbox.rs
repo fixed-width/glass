@@ -15,8 +15,9 @@ use std::time::Duration;
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
-    Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory, PointerEvent,
-    WalkLimits, WindowGeometry, WindowHint, WindowOp, role_histogram,
+    DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform,
+    PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    description_census_report, role_histogram,
 };
 use glass_windows::WindowsPlatform;
 
@@ -1216,6 +1217,12 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
     let block = render_role_histogram(label, &tree);
     print!("{block}");
     report.push_str(&block);
+
+    // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every app —
+    // flip this when it reads HelpText/FullDescription.
+    let census_block = description_census_report(label, &tree, DescriptionSourcing::Unsourced);
+    print!("{census_block}");
+    report.push_str(&census_block);
 
     // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
     let mut candidates = Vec::new();

@@ -28,17 +28,21 @@ use crate::accessibility::{AxNode, AxRole, AxTree};
 /// - a **focusable** container is actable: Jetpack Compose surfaces a real button as a
 ///   clickable `Group` with the role lost (see `accessibility::element_match`), so eliding
 ///   it would hide a button that is still clickable — invisible but addressable;
+/// - a **described** container is labelled: a description is the only label a node with no
+///   name has, so eliding it drops the one thing that says what the container is;
 /// - a multi-child container conveys grouping; a single-child one does not.
 fn is_scaffolding(node: &AxNode) -> bool {
     matches!(node.role, AxRole::Group | AxRole::Other)
         && node.name.is_none()
+        && node.description.is_none()
         && node.value.is_none()
         && !node.states.focusable
         && node.children.len() == 1
 }
 
-/// Write one node's line: `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]`, name/bounds/
-/// states elided when absent, two spaces of indent per depth level.
+/// Write one node's line: `#<id> <Role> "<name>" desc="<description>" (<x>,<y> <w>x<h>)
+/// [<states>]`, name/description/bounds/states elided when absent, two spaces of indent per
+/// depth level.
 ///
 /// A node glass has no role mapping for renders as `Other(<native token>)` — the AT-SPI role,
 /// UIA control-type name, AX role string, Android widget class or iOS role string the backend
@@ -57,6 +61,9 @@ pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
     }
     if let Some(name) = &node.name {
         let _ = write!(out, " {name:?}");
+    }
+    if let Some(description) = &node.description {
+        let _ = write!(out, " desc={description:?}");
     }
     if let Some(b) = &node.bounds {
         let _ = write!(out, " ({},{} {}x{})", b.x, b.y, b.width, b.height);
@@ -115,10 +122,19 @@ mod tests {
             role,
             raw_role: String::new(),
             name: name.map(Into::into),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
             children: vec![],
+        }
+    }
+
+    /// `node`, plus a description.
+    fn described(role: AxRole, name: Option<&str>, description: &str) -> AxNode {
+        AxNode {
+            description: Some(description.into()),
+            ..node(role, name)
         }
     }
 
@@ -188,6 +204,18 @@ mod tests {
         assert!(
             render_compact(&tree_of(g)).contains("Group"),
             "a focusable Group is actable and must never be elided"
+        );
+    }
+
+    #[test]
+    fn a_described_group_is_kept() {
+        // A toolkit can put a description on any container (GTK4 accepts DESCRIPTION on a
+        // plain Gtk.Box), and there it is the container's only label.
+        let mut g = described(AxRole::Group, None, "Formatting");
+        g.children = vec![node(AxRole::Button, Some("Save"))];
+        assert!(
+            render_compact(&tree_of(g)).contains(r#"Group desc="Formatting""#),
+            "a description is the only label an unnamed container has"
         );
     }
 
@@ -303,6 +331,61 @@ mod tests {
         n.raw_role = "AXDisclosureTriangle".into();
         let t = tree_of(n);
         assert_eq!(render_compact(&t), t.to_outline());
+    }
+
+    #[test]
+    fn a_description_renders_between_the_name_and_the_bounds() {
+        let mut n = described(AxRole::Button, Some("Save"), "Saves and closes the sheet");
+        n.bounds = Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        });
+        let out = render_compact(&tree_of(n));
+        assert!(
+            out.contains(r#"Button "Save" desc="Saves and closes the sheet" (0,0 80x24)"#),
+            "unexpected line: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_element_still_renders_its_description() {
+        let out = render_compact(&tree_of(described(AxRole::Button, None, "Bold")));
+        assert!(
+            out.contains(r#"Button desc="Bold""#),
+            "unexpected line: {out}"
+        );
+    }
+
+    #[test]
+    fn a_description_is_escaped_and_stays_on_one_line() {
+        // App-controlled text: a raw newline would split one node across two lines and break
+        // the one-node-per-line contract the outline diff and the id lookups rely on.
+        let out = render_compact(&tree_of(described(
+            AxRole::Button,
+            None,
+            "say \"hi\"\nthen go",
+        )));
+        assert!(
+            out.contains(r#"desc="say \"hi\"\nthen go""#),
+            "quote and newline must be escaped: {out}"
+        );
+        assert_eq!(out.lines().count(), 2, "Window + Button only: {out}");
+    }
+
+    #[test]
+    fn a_node_without_a_description_renders_exactly_as_before() {
+        let out = render_compact(&tree_of(node(AxRole::Button, Some("Save"))));
+        assert!(!out.contains("desc="), "unexpected line: {out}");
+    }
+
+    #[test]
+    fn to_outline_renders_the_description_too() {
+        // Both renders share write_line; this pins that they cannot drift on this field.
+        let t = tree_of(described(AxRole::Button, Some("Save"), "Saves and closes"));
+        assert_eq!(t.to_outline(), render_compact(&t));
+        assert!(t.to_outline().contains(r#"desc="Saves and closes""#));
     }
 
     #[test]

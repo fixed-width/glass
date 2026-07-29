@@ -17,6 +17,13 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
+- Accessibility elements can now carry a second label. `glass_a11y_snapshot` renders it as
+  `desc="…"` after the name — an icon-only button that used to reach you as a role and a
+  rectangle now says what it is — and the `glass_a11y_marks` legend labels an unnamed element
+  from it, spelled `desc="…"` there too. `glass_wait_for_element` and `glass_scroll_to_element`
+  report it on the element they matched. It is display-only: both tools still select on `name`.
+  Only the AT-SPI (Linux) reader sources the field today, so `desc` does not appear on Windows,
+  macOS, Android or iOS yet.
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
   (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is

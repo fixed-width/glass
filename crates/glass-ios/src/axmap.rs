@@ -122,6 +122,7 @@ pub fn build_tree(
         role: AxRole::Window,
         raw_role: "AXWindow".into(),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -232,6 +233,10 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
         role,
         raw_role: ax_type,
         name,
+        // `AXLabel` — the human label behind the stable `AXUniqueId` this reader prefers for
+        // `name`, exactly the split `AxNode::description` exists for — is already read above
+        // into `name` or `value`; `accessibilityHint` is the unread one.
+        description: None,
         value,
         states,
         bounds,

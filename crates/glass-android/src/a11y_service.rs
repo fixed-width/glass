@@ -96,6 +96,10 @@ fn json_to_node(
         // name: the element's own text label, falling back to content-description.
         // value: editable text content only (content-description is not user-entered text).
         name: text.or(desc).map(str::to_string),
+        // The content-description is Android's secondary label and is already read above as
+        // the `name` fallback; the unread ones are the node's hint and state-description,
+        // which the on-device service's node JSON does not carry.
+        description: None,
         value: text.map(str::to_string),
         states: AxStates {
             enabled: flag("enabled"),

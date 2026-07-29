@@ -11,7 +11,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget,
+    TruncationLimit, WalkBudget, normalize_description,
 };
 
 use crate::mapping::{map_role, map_states};
@@ -375,17 +375,18 @@ async fn walk(
     budget: &mut WalkBudget,
 ) -> Result<AxNode> {
     budget.visit();
-    // Issue the six independent per-node reads concurrently on the shared connection and await
-    // the slowest, instead of paying six sequential D-Bus round-trips (~6x the per-node latency).
-    // zbus multiplexes concurrent method calls over one connection. Traversal order, `budget`
-    // accounting, the child-gate, and child recursion below are all unchanged, so node ids stay
-    // in lockstep with `find_nth`. On the error path `join!` completes all six before we bail
-    // (vs. short-circuiting) — the result is identical, at the cost of a few reads on a snapshot
-    // that was already failing.
-    let (role_res, raw_role_res, name_res, state_res, bounds, child_refs_res) = tokio::join!(
+    // Issue the seven independent per-node reads concurrently on the shared connection and await
+    // the slowest, instead of paying seven sequential D-Bus round-trips (~7x the per-node
+    // latency). zbus multiplexes concurrent method calls over one connection. Traversal order,
+    // `budget` accounting, the child-gate, and child recursion below are all unchanged, so node
+    // ids stay in lockstep with `find_nth`. On the error path `join!` completes all seven before
+    // we bail (vs. short-circuiting) — the result is identical, at the cost of a few reads on a
+    // snapshot that was already failing.
+    let (role_res, raw_role_res, name_res, description_res, state_res, bounds, child_refs_res) = tokio::join!(
         proxy.get_role(),
         proxy.get_role_name(),
         proxy.name(),
+        proxy.description(),
         proxy.get_state(),
         extents(proxy, conn),
         proxy.get_children(),
@@ -393,6 +394,7 @@ async fn walk(
     let role = role_res.map_err(bus_err)?;
     let raw_role = raw_role_res.unwrap_or_default();
     let name = nonempty(name_res.unwrap_or_default());
+    let description = normalize_description(&description_res.unwrap_or_default(), name.as_deref());
     let states = map_states(&state_res.map_err(bus_err)?);
 
     let mut children = Vec::new();
@@ -427,6 +429,7 @@ async fn walk(
         role: map_role(role),
         raw_role,
         name,
+        description,
         value,
         states,
         bounds,

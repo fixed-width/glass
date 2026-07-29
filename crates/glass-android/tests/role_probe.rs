@@ -37,7 +37,10 @@ use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidA11y, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
 use glass_core::accessibility::{Accessibility, AxContext, WalkLimits};
-use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
+use glass_core::{
+    AppSpec, AxRole, AxTree, DescriptionSourcing, Platform, SandboxLevel,
+    description_census_report, role_histogram,
+};
 
 /// Comma-separated `package/activity` components to probe, e.g.
 /// `com.android.settings/.Settings`. Each element is exactly what `AppSpec::run`'s first
@@ -261,6 +264,12 @@ fn uiautomator_role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({component}): {e}"));
         tree.assign_ids();
         print_role_histogram(component, &tree);
+        // `Unsourced`: neither Android reader sources the field, so the count is 0 for
+        // every app — flip this when one reads the hint / state-description.
+        print!(
+            "{}",
+            description_census_report(component, &tree, DescriptionSourcing::Unsourced)
+        );
         violations.extend(thin_tree_violation(component, &tree));
         violations.extend(mapped_class_violations(component, &tree));
 
@@ -326,6 +335,10 @@ fn service_role_histogram_probe() {
         tree.assign_ids();
         let label = format!("{component} (service)");
         print_role_histogram(&label, &tree);
+        print!(
+            "{}",
+            description_census_report(&label, &tree, DescriptionSourcing::Unsourced)
+        );
         violations.extend(thin_tree_violation(&label, &tree));
         violations.extend(mapped_class_violations(&label, &tree));
 

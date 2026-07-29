@@ -124,6 +124,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
         role: AxRole::Window,
         raw_role: "hierarchy".into(),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -209,6 +210,10 @@ fn map_node(
         role,
         raw_role: class.to_string(),
         name,
+        // `content-desc` is Android's secondary label and is already read above as the
+        // preferred `name`; the hint and state-description are unread, and a `uiautomator`
+        // dump exposes neither as an attribute anyway.
+        description: None,
         value,
         states,
         bounds: parse_bounds(attr("bounds"), window),
