@@ -472,8 +472,9 @@ pub async fn run_arm_a(client: &Peer<RoleClient>) -> ArmReport {
 }
 
 /// `(x, y, w, h)` for node #id, parsed from its outline line's `(x,y wxh)` field. Uses the
-/// LAST `(...)` group on the line, not the first: a widget's quoted name precedes its
-/// bounds and can itself contain a literal `(` (e.g. a button named "Apply (default)"), so
+/// LAST `(...)` group on the line, not the first: a widget's quoted name and quoted `desc`
+/// both precede the bounds and can contain a literal `(` (e.g. a button named "Apply
+/// (default)"), so
 /// `rfind` is required — the bounds are always the final parenthesized group (states after
 /// them use `[...]`, not parens).
 pub fn parse_bounds(outline: &str, id: u32) -> Option<(i64, i64, u32, u32)> {

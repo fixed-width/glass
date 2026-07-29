@@ -81,9 +81,9 @@ mod macos_main {
     ];
 
     /// Pre-order search for the first `TextField` node — the fixture's editable "Note" field.
-    /// Separate from the [`NEEDLES`] outline check because `to_outline` only ever renders
-    /// `name`; this reaches `AxNode::value` directly to prove content is read independently of
-    /// the (stable) label.
+    /// Separate from the [`NEEDLES`] outline check because `to_outline` renders labels (`name`,
+    /// plus `desc` where a reader sources one) and never `value`; this reaches `AxNode::value`
+    /// directly to prove content is read independently of the (stable) label.
     fn find_text_field(node: &AxNode) -> Option<&AxNode> {
         if node.role == AxRole::TextField {
             return Some(node);
