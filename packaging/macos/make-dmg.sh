@@ -27,8 +27,9 @@ trap 'rm -rf "$staging"' EXIT
 # ditto (not cp -R) is the guaranteed-faithful copy for a signed bundle — it preserves the
 # bundle layout + code signature, matching release.yml's Package step.
 ditto "$app" "$staging/$(basename "$app")"
-# Beside the bundle, never inside it: a file added within the .app would invalidate its
-# signature. Resolved from this script's own location so callers need not pass it.
+# Beside the bundle, never inside it — a file added within the .app would invalidate its
+# signature — and resolved from this script's own location rather than passed in, so no
+# caller can pass the wrong one.
 readme="$(cd "$(dirname "$0")/.." && pwd)/README-macos.md"
 [ -f "$readme" ] || { echo "error: README not found: $readme" >&2; exit 1; }
 cp "$readme" "$staging/README.md"
