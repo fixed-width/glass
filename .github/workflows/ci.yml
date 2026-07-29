@@ -323,7 +323,7 @@ jobs:
   # A matrix job's checks are named per shard, so the branch ruleset has nothing stable
   # to require. This one has a fixed name and fails if any shard did.
   mutants-gate:
-    name: Mutation gate (smoke)
+    name: Mutation gate (glass-core)
     runs-on: ubuntu-latest
     needs: mutants
     if: always()
