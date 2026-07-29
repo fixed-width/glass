@@ -72,9 +72,9 @@ pub fn description_census(tree: &AxTree) -> DescriptionCensus {
 /// The census as a printable block: one summary line, then one line per sample. Returns a
 /// `String` rather than printing so a caller that saves a report can fold it in.
 ///
-/// `sourcing` decides whether a zero is a finding about the app or about glass, and says
-/// which on the summary line — a reader that leaves the field `None` counts zero on every
-/// app, and an unqualified "0 of 412 nodes described" reads as the opposite of that.
+/// `sourcing` says on the summary line which kind of zero this is: a reader that leaves the
+/// field `None` counts zero on every app, which unqualified reads as a finding about the
+/// platform.
 pub fn description_census_report(
     label: &str,
     tree: &AxTree,

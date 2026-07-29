@@ -815,8 +815,8 @@ pub struct ElementInfo {
     pub id: AxNodeId,
     pub role: AxRole,
     pub name: Option<String>,
-    /// Carried so an element the outline labels `desc="…"` still has a label here. Reported
-    /// only — the selector matched on `name`.
+    /// Carried so an element the outline labels `desc="…"` still has a label here; reported
+    /// only, since the selector matched on `name`.
     pub description: Option<String>,
     pub value: Option<String>,
     pub bounds: Option<AxRect>,
@@ -2246,9 +2246,8 @@ mod tests {
         assert_eq!(normalize_description("   ", None), None);
         // A description identical to the name would print the same label twice per line.
         assert_eq!(normalize_description("Save", Some("Save")), None);
-        // Both sides are trimmed before the comparison, so surrounding whitespace cannot
-        // smuggle a duplicate in from either. The name side is reachable: the readers'
-        // `nonempty` helper does not trim, so a name can arrive as `Some("Save ")`.
+        // Both sides are trimmed, and the name side is reachable: the readers' `nonempty`
+        // helper does not trim, so a name can arrive as `Some("Save ")`.
         assert_eq!(normalize_description("  Save  ", Some("Save")), None);
         assert_eq!(normalize_description("Save", Some("  Save  ")), None);
     }

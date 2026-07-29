@@ -159,9 +159,8 @@ fn snapshot_covers_the_declared_linux_roles() {
         "{}",
         description_census_report("fixture", &tree, DescriptionSourcing::Sourced)
     );
-    // The suite passes no --nocapture, so the block above is invisible on a pass. The fixture
-    // has described widgets, so assert on the count too — a reader that regressed to `None`
-    // everywhere would still print a plausible-looking zero.
+    // The suite passes no --nocapture, so the block above is invisible on a pass and a reader
+    // regressed to `None` everywhere would print a plausible-looking zero unchallenged.
     assert!(
         description_census(&tree).described() >= 1,
         "the fixture's described widgets must reach the census"
@@ -466,9 +465,8 @@ fn launch_fixture() -> Glass {
 }
 
 /// Every description case in one launch: the AT-SPI bus is shared per process and the suite
-/// runs single-threaded, so a second fixture launch costs ~3s for nothing. `stop()` comes
-/// before the asserts — glass-core has no `Drop`, so a failing assert would otherwise leak
-/// the GTK4 fixture into the rest of the suite.
+/// runs single-threaded, so a second launch costs ~3s for nothing. `stop()` precedes the
+/// asserts because glass-core has no `Drop` — a failing assert would leak the GTK4 fixture.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_reads_a_widget_description() {
@@ -486,10 +484,8 @@ fn snapshot_reads_a_widget_description() {
     let save = find_node(&tree.root, "Save").expect("Save button");
     assert_eq!(save.description, None);
 
-    // The fixture gives Italic a description equal to its name — the case
-    // normalize_description exists for, and the one a reader that passed the wrong `name`
-    // (or skipped the helper) would get wrong, doubling the label on every line of a
-    // toolkit that reports both fields.
+    // Italic's description equals its name — the clause normalize_description exists for, and
+    // the one a reader passing the wrong `name` gets wrong, doubling the label on every line.
     let italic = find_node(&tree.root, "Italic").expect("Italic button");
     assert_eq!(italic.description, None);
 }
