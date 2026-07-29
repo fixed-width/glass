@@ -5,7 +5,8 @@ launches an app, screenshots what's on screen, clicks and types into it, reads i
 logs, and detects visual changes — so the agent can build and debug a GUI on its own
 instead of asking you "does this look right?".
 
-This is the **macOS universal** build (Apple Silicon and Intel), signed and notarized.
+This is the **macOS universal** build, signed and notarized. It carries both
+architectures, though only Apple Silicon is tested — Intel Macs aren't yet verified.
 See the project README for the full picture:
 <https://github.com/fixed-width/glass>.
 The full macOS guide is
@@ -15,12 +16,14 @@ The full macOS guide is
 
 ## 1. System requirements
 
-macOS 14 or later. Nothing else to install — capture, input and the accessibility tree
-all use built-in macOS APIs.
+macOS 14 or later. Nothing else to install — capture, input, the accessibility tree and
+the Seatbelt sandbox that launched apps run under are all built into macOS.
 
 ## 2. Install
 
-Drag **`GlassMcp.app`** to **`/Applications`**, then double-click it.
+Drag **`GlassMcp.app`** to **`/Applications`**, then double-click it. macOS may first
+ask you to confirm an app downloaded from the internet — that is the quarantine prompt
+every download gets, not a permission request.
 
 Unlike the Linux and Windows builds, this one is a **GUI app, not a command-line
 binary**: macOS grants screen and input access to an application's signed identity, so
@@ -29,17 +32,19 @@ glass ships as one.
 ## 3. Grant the two permissions
 
 On first launch a **permission checklist** appears, listing **Accessibility** and
-**Screen Recording**. Click **Open Settings** next to each, one at a time, and turn it
-on — the app asks on its own behalf, so the grant lands on `GlassMcp.app` with nothing
-to add by hand.
+**Screen Recording**. Click **Request…** next to each, one at a time. macOS raises its
+own consent prompt — use the **Open System Settings** button on it to reach the pane and
+turn the permission on. The app asks on its own behalf, so it is already listed there
+with nothing to add by hand.
 
-**Granting Screen Recording relaunches the app.** macOS quits and reopens it so the
-grant takes effect; that relaunch is expected, not a failure. If a grant doesn't show
-up, click **Re-check**.
+**Granting Screen Recording needs the app to restart.** macOS offers **Quit & Reopen**;
+accept it, so the grant takes effect. That restart is expected, not a failure. If a
+grant doesn't show up, click **Re-check**.
 
 Once both are on, the checklist is replaced by a **`glass ●`** menu-bar item and glass
-starts serving. The grants are one-time — they survive restarts and updates. Why they
-behave this way is in
+starts serving. It also installs a LaunchAgent, so it **starts again at every login** —
+**Quit glass** or **Uninstall glass…** from that menu are how you stop it. The grants
+are one-time and survive restarts and updates. Why they behave this way is in
 [docs/explanation/macos-permissions.md](https://github.com/fixed-width/glass/blob/master/docs/explanation/macos-permissions.md).
 
 ## 4. Connect your agent (MCP over HTTP)
@@ -49,15 +54,20 @@ spawned by the agent the way the Linux and Windows binaries do. Point your clien
 that URL; loopback needs no token. See
 [docs/how-to/connect-an-agent.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/connect-an-agent.md#over-http).
 
-Copy the endpoint straight from the **`glass ●`** menu with **Copy endpoint**.
+The **`glass ●`** menu also has **Copy endpoint**, **Restart** (after a fresh grant),
+**Quit glass**, and **Uninstall glass…**.
 
 ## 5. Check it works
 
 Ask your agent something like:
 
-> "Use glass to launch `/System/Applications/Font Book.app` and take a screenshot."
+> "Use glass to launch `/System/Applications/Font Book.app` with `sandbox` set to `off`
+> and take a screenshot."
 
-You should get back an image of the app. The tools it now has include `glass_start`,
+You should get back an image of the app. **Apple's own apps need `sandbox: "off"`**:
+macOS requires them to be started through LaunchServices, which glass cannot then place
+under Seatbelt, so a contained launch of one fails rather than running it unconfined.
+Apps you are developing take the default and stay contained. The tools it now has include `glass_start`,
 `glass_screenshot`, `glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`,
 `glass_logs`, `glass_a11y_snapshot`, `glass_click_element`, and `glass_doctor`.
 

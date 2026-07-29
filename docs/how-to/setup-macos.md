@@ -14,12 +14,13 @@ macOS opens it without a Gatekeeper detour, and first-run is a double-click:
 1. **Download** the `.dmg` from Releases and open it.
 2. **Drag `GlassMcp.app` to `/Applications`.**
 3. **Double-click `GlassMcp.app`.** A **permission checklist window** appears, listing **Accessibility**
-   and **Screen Recording**, each with a ✓/○ status and its own **Open Settings** button.
-4. Click **Open Settings** for each permission, **one at a time**. It adds `GlassMcp.app` to that
-   permission's pane under **System Settings → Privacy & Security** and opens the pane so you can turn
-   it on. Because the app is asking for *itself*, the grant lands on `GlassMcp.app` directly — no manual
-   `＋`-add needed. Granting **Screen Recording relaunches `GlassMcp.app` automatically** (macOS quits
-   and reopens it to pick up the grant) — that relaunch is expected, not an error. If you grant the two
+   and **Screen Recording**, each with a ✓/○ status and its own **Request…** button.
+4. Click **Request…** for each permission, **one at a time**. macOS raises its own consent prompt,
+   whose **Open System Settings** button navigates to that permission's pane under **System Settings →
+   Privacy & Security**. Because the app is asking for *itself*, `GlassMcp.app` is already listed there
+   — no manual `＋`-add needed. glass deliberately does not force the pane open itself, which fought
+   the system's own prompt. Granting **Screen Recording needs `GlassMcp.app` to restart** — macOS
+   offers **Quit & Reopen** — and that restart is expected, not an error. If you grant the two
    out of order, or a grant made elsewhere doesn't show up, click **Re-check**. Grants are **one-time**:
    keyed to the app's signed identity, they survive restarts and updates (see
    [the permission model](../explanation/macos-permissions.md)).
