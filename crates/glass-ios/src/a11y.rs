@@ -3,7 +3,7 @@
 //! against a stale id landing on a different element), focuses it, clears it, and
 //! types the new text via synthetic HID input.
 use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree};
-use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry};
+use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
 
 use crate::axmap;
 use crate::idb::client::IdbClient;
@@ -13,35 +13,32 @@ use crate::injector::IdbInjector;
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
     client: IdbClient,
-    /// The target's own scale, fetched on first need and kept: it is a property of the
-    /// device, so unlike the tree's it does not change between snapshots.
-    device_scale: std::cell::Cell<Option<f64>>,
-}
-
-/// The point→pixel scale for a describe response: the capture window's pixel width over
-/// the describe root's logical-point width. Preferred over the device's own scale because
-/// the tree's frames are in exactly these points, so it stays right even where the two
-/// disagree. Computed per describe rather than cached, since the tree it divides is too.
-/// `None` if the tree carries no positive root width — the caller falls back then.
-fn scale_from(json: &str, window: &WindowGeometry) -> Option<f64> {
-    axmap::scale_from_width(json, window.width)
+    /// The target's scale, fetched on first need and kept: a property of the device, so it
+    /// does not change between snapshots.
+    scale: Option<f64>,
 }
 
 impl IosA11y {
     pub(crate) fn new(client: IdbClient) -> Self {
         IosA11y {
             client,
-            device_scale: std::cell::Cell::new(None),
+            scale: None,
         }
     }
 
-    /// The target's point→pixel scale, for when the tree carries no root width to divide.
-    fn device_scale(&self) -> Result<f64> {
-        if let Some(scale) = self.device_scale.get() {
+    /// The target's point→pixel scale, from the device rather than from the tree.
+    ///
+    /// Not the tree's own `capture width / root point width`: that divides by the widest
+    /// *top-level* element, which equals the screen only when one spans it, and it is
+    /// unavailable at all for the second or so an app takes to render. The platform's
+    /// injector converts with the device's scale, so a reader using a different one would
+    /// report bounds that tap somewhere else.
+    fn scale(&mut self) -> Result<f64> {
+        if let Some(scale) = self.scale {
             return Ok(scale);
         }
         let scale = crate::platform::checked_scale(self.client.describe()?.density)?;
-        self.device_scale.set(Some(scale));
+        self.scale = Some(scale);
         Ok(scale)
     }
 
@@ -49,16 +46,9 @@ impl IosA11y {
     /// scale from `ctx.window` (pixels, valid once the app has started) and the describe
     /// root's point width, and map the id-assigned tree. Returns the tree and the scale,
     /// since `set_value` needs the same scale to place synthetic input.
-    fn describe(&self, ctx: &AxContext) -> Result<(AxTree, f64)> {
+    fn describe(&mut self, ctx: &AxContext) -> Result<(AxTree, f64)> {
+        let scale = self.scale()?;
         let json = self.client.describe_all()?;
-        // An app mid-launch reports a tree with no root width for a second or two. Falling
-        // back to the device's scale rather than erroring lets that arrive as an empty tree,
-        // which `wait_for_element` can poll through — an error would abort its poll, since
-        // `poll_until` treats a tick error as fatal.
-        let scale = match scale_from(&json, &ctx.window) {
-            Some(scale) => scale,
-            None => self.device_scale()?,
-        };
         let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
         tree.assign_ids();
         Ok((tree, scale))
@@ -159,28 +149,6 @@ mod tests {
         let mut t = AxTree::new(root);
         t.assign_ids();
         t
-    }
-
-    fn window_px(width: u32) -> WindowGeometry {
-        WindowGeometry {
-            x: 0,
-            y: 0,
-            width,
-            height: 2622,
-        }
-    }
-
-    #[test]
-    fn scale_from_divides_window_pixels_by_root_point_width() {
-        // A 1206px-wide capture over a 402pt describe root is the ×3 backing scale — the
-        // real value this reader must recover per call, not the provisional 1.0.
-        let json = r#"[{"frame":{"width":402}}]"#;
-        assert_eq!(scale_from(json, &window_px(1206)), Some(3.0));
-    }
-
-    #[test]
-    fn scale_from_is_none_without_a_root_point_width() {
-        assert_eq!(scale_from("[]", &window_px(1206)), None);
     }
 
     #[test]

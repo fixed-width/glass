@@ -121,7 +121,8 @@ const LAUNCH_FAILURE_LOG_LINES: usize = 4;
 /// Measured on a Simulator: an app that rejects a launch argument and calls `fatalError`
 /// disappears from `ps` about 465 ms after `simctl launch` returns, repeatably. The window is set
 /// above that so the check is not a race, and it is spent rather than assumed: the work between
-/// launch and check is a screenshot and one scale RPC, which does not reliably cover it.
+/// launch and check is a screenshot, plus one scale RPC when a driver is present, which does not
+/// reliably cover it.
 ///
 /// A window can only ever bound "died at startup"; an app that exits later is a running app that
 /// stopped, which the next operation reports.
@@ -464,11 +465,10 @@ impl Platform for IosPlatform {
         };
         // With a driver present, learn the point→pixel scale and build the injector at it
         // before reporting the app as running, so no tap is ever issued at an unverified
-        // scale (`describe` reports point frames while the screenshot is in pixels; their
-        // ratio is the scale). On scale-discovery failure the app is left unregistered (no
-        // active session) rather than driven at a wrong scale. In observe-only mode (no
-        // companion) there is no injector — input is unsupported — but geometry is still
-        // reported so capture/logs/clipboard work.
+        // scale. On scale-discovery failure the app is left unregistered (no active session)
+        // rather than driven at a wrong scale. In observe-only mode (no companion) there is
+        // no injector — input is unsupported — but geometry is still reported so
+        // capture/logs/clipboard work.
         let injector = match &self.driver {
             Some(driver) => Some(IdbInjector::new(discover_scale(&driver.client)?)),
             None => None,
@@ -693,9 +693,12 @@ mod tests {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let err = match checked_scale(bad) {
                 Ok(scale) => panic!("{bad} must be rejected, was accepted as scale {scale}"),
-                Err(e) => e.to_string(),
+                Err(e) => e,
             };
-            assert!(err.contains("display scale"), "{err}");
+            assert!(
+                matches!(&err, GlassError::Backend(m) if m.contains("display scale")),
+                "{err}"
+            );
         }
     }
 }

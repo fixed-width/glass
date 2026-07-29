@@ -212,18 +212,20 @@ impl IdbClient {
 
 #[cfg(test)]
 mod tests {
-    /// glass drives input at two scales that must agree: the target's density, used at launch
-    /// because it is known before the app renders (#246), and the ratio the live accessibility
-    /// tree implies. Do not assert the density against idb's own `width_points` instead — idb
-    /// derives that field *from* the density, so such a check cannot fail.
+
+    use super::*;
+
+    /// The scale glass drives every tap at comes from this RPC (`platform::discover_scale`),
+    /// so a target that stops reporting a usable density silently breaks input placement.
+    /// That the value is *correct* is proved end-to-end by `tests/drive_integration.rs`,
+    /// which taps elements by their accessibility bounds and asserts the app responded.
     ///
     /// ```sh
-    /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib density_matches -- --ignored --nocapture
+    /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib describe_reports -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator and idb_companion"]
-    fn density_matches_the_scale_the_live_tree_implies() {
-        use std::time::{Duration, Instant};
+    fn describe_reports_a_usable_density_with_no_app_running() {
         let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
         let companion =
             crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
@@ -233,45 +235,16 @@ mod tests {
         let d = client
             .describe()
             .expect("describe must report screen dimensions");
+        println!(
+            "pixels {}x{}, points {}x{}, density {}",
+            d.width, d.height, d.width_points, d.height_points, d.density
+        );
         assert!(
             d.density.is_finite() && d.density > 0.0,
             "a target reporting no usable density leaves glass unable to place input: {}",
             d.density
         );
-
-        // A stock app, so this needs nothing installed; the tree has no root width until
-        // something is drawn.
-        let out = std::process::Command::new("xcrun")
-            .args(["simctl", "launch", &udid, "com.apple.Preferences"])
-            .output()
-            .expect("xcrun simctl launch must run");
-        assert!(
-            out.status.success(),
-            "the comparison is meaningless if the app never launched: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let live = loop {
-            let json = client.describe_all().expect("describe_all must work");
-            if let Some(scale) = crate::axmap::scale_from_width(&json, d.width as u32) {
-                break scale;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the tree never carried a root width"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        };
-
-        assert_eq!(
-            d.density, live,
-            "the device's density and the live tree's ratio are the two scales glass drives \
-             input at; a disagreement places taps at the wrong point"
-        );
     }
-
-    use super::*;
 
     #[test]
     fn map_timed_folds_an_elapsed_deadline_into_a_backend_timeout() {
