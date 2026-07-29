@@ -42,10 +42,9 @@ impl IosA11y {
         Ok(scale)
     }
 
-    /// One describe round-trip: fetch the accessibility JSON, derive the point→pixel
-    /// scale from `ctx.window` (pixels, valid once the app has started) and the describe
-    /// root's point width, and map the id-assigned tree. Returns the tree and the scale,
-    /// since `set_value` needs the same scale to place synthetic input.
+    /// One describe round-trip: fetch the accessibility JSON and map the id-assigned tree at
+    /// the target's scale. Returns the scale alongside it, since `set_value` places synthetic
+    /// input at the same one.
     fn describe(&mut self, ctx: &AxContext) -> Result<(AxTree, f64)> {
         let scale = self.scale()?;
         let json = self.client.describe_all()?;
