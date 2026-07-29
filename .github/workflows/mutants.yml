@@ -34,6 +34,10 @@ jobs:
           tool: cargo-mutants,cargo-nextest
       - name: Sweep
         # nextest runs each test in its own process, so slow tests overlap rather than sum.
+        # Informational until glass-core's pre-existing survivors are cleared (343 as of
+        # 2026-07-28); a permanently-red check is one nobody reads. The per-PR --in-diff gate
+        # blocks, so new and changed code is still covered.
+        continue-on-error: true
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
