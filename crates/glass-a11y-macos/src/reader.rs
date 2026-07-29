@@ -20,7 +20,7 @@ use glass_core::coords::pixel_geometry_from_content_rect;
 use glass_core::platform::WindowGeometry;
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxTarget, AxTree, GlassError,
-    Result, TruncationLimit, WalkBudget,
+    Result, TruncationLimit, WalkBudget, normalize_description,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
@@ -368,8 +368,20 @@ fn walk(
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
-    let name = ffi::attribute_string(el, attr::TITLE)
-        .or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
+    let title = ffi::attribute_string(el, attr::TITLE);
+    let titled = title.is_some();
+    let name = title.or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
+    // `AXHelp` (the tooltip), else `AXDescription` — but only where `AXTitle` already took the
+    // name, since otherwise `AXDescription` IS the name and would normalize away as a duplicate.
+    // So `AXDescription` costs at most one read per node either way: as the name fallback when
+    // there is no title, here when there is.
+    let description = ffi::attribute_string(el, attr::HELP)
+        .or_else(|| {
+            titled
+                .then(|| ffi::attribute_string(el, attr::DESCRIPTION))
+                .flatten()
+        })
+        .and_then(|raw| normalize_description(&raw, name.as_deref()));
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
     let states = mapping::map_states(&gather_states(el, role));
@@ -424,9 +436,7 @@ fn walk(
         role,
         raw_role,
         name,
-        // `AXDescription` is already read above as the name fallback, so reading it here would
-        // normalize away as a duplicate; `AXHelp` (the tooltip) is the unread secondary label.
-        description: None,
+        description,
         value,
         states,
         bounds,

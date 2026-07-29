@@ -245,11 +245,11 @@ mod macos_main {
             // of how big the tree actually was.
             tree.assign_ids();
             print_role_histogram(run0, &tree);
-            // `Unsourced`: this reader leaves `description: None`, so the count is 0 for
-            // every app — flip this when it reads AXHelp.
+            // `Sourced`: this reader reads `AXHelp` (else `AXDescription` where `AXTitle` took
+            // the name), so a zero here is a fact about the app.
             print!(
                 "{}",
-                description_census_report(run0, &tree, DescriptionSourcing::Unsourced)
+                description_census_report(run0, &tree, DescriptionSourcing::Sourced)
             );
             print_snapshot_cost(run0, &mut a11y, &ctx)?;
             // Checked after the histogram is printed, so the evidence that explains a failure

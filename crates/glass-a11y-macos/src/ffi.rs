@@ -47,6 +47,7 @@ pub(crate) mod attr {
     pub(crate) const ROLE_DESCRIPTION: &str = "AXRoleDescription";
     pub(crate) const TITLE: &str = "AXTitle";
     pub(crate) const DESCRIPTION: &str = "AXDescription";
+    pub(crate) const HELP: &str = "AXHelp";
     pub(crate) const CHILDREN: &str = "AXChildren";
     pub(crate) const WINDOWS: &str = "AXWindows";
     pub(crate) const POSITION: &str = "AXPosition";
