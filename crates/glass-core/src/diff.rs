@@ -950,6 +950,91 @@ mod tests {
         assert!(has_many_siblings(&two, 1, 1, 3, 3));
     }
 
+    /// A 5x5 vertical edge: two black columns, one mid-grey column, two white columns. The
+    /// grey column is what an anti-aliased edge looks like, and (2,2) sits in it.
+    fn aa_edge() -> Vec<u8> {
+        let mut px = Vec::with_capacity(5 * 5 * 4);
+        for _y in 0..5 {
+            for x in 0..5u32 {
+                let v = match x {
+                    0 | 1 => 0u8,
+                    2 => 128,
+                    _ => 255,
+                };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        px
+    }
+
+    /// True needs all of it: a darker neighbour, a brighter one, few identical ones, and both
+    /// extremes sitting in flat regions of *both* images.
+    #[test]
+    fn is_antialiased_accepts_an_edge_and_rejects_what_is_not_one() {
+        let edge = aa_edge();
+        assert!(is_antialiased(&edge, 2, 2, 5, 5, &edge));
+
+        // Uniform: every neighbour is identical, so the third one gives up early.
+        let flat: Vec<u8> = std::iter::repeat_n([70u8, 70, 70, 255], 25)
+            .flatten()
+            .collect();
+        assert!(!is_antialiased(&flat, 2, 2, 5, 5, &flat));
+
+        // Brightest in its neighbourhood: every delta is positive, so there is no darker
+        // neighbour and `min_d` never moves off zero.
+        let mut brightest = flat.clone();
+        brightest[(2 * 5 + 2) * 4..(2 * 5 + 2) * 4 + 4].copy_from_slice(&[200, 200, 200, 255]);
+        assert!(!is_antialiased(&brightest, 2, 2, 5, 5, &brightest));
+
+        // And the mirror: darkest, so `max_d` never moves. Both halves of the same guard.
+        let mut darkest = flat.clone();
+        darkest[(2 * 5 + 2) * 4..(2 * 5 + 2) * 4 + 4].copy_from_slice(&[10, 10, 10, 255]);
+        assert!(!is_antialiased(&darkest, 2, 2, 5, 5, &darkest));
+    }
+
+    /// The edge must look flat in the *other* image too — that is what stops a real change
+    /// from being written off as anti-aliasing.
+    #[test]
+    fn is_antialiased_requires_the_other_image_to_agree() {
+        let edge = aa_edge();
+        // Same geometry, but the other image is noise, so neither extreme has siblings there.
+        let noisy: Vec<u8> = (0..25u8)
+            .flat_map(|i| {
+                [
+                    i.wrapping_mul(37),
+                    i.wrapping_mul(11),
+                    i.wrapping_mul(29),
+                    255,
+                ]
+            })
+            .collect();
+        assert!(!is_antialiased(&edge, 2, 2, 5, 5, &noisy));
+    }
+
+    /// classify routes on the outcome of both, so an anti-aliased edge is not counted as
+    /// changed while a genuine recolor is.
+    #[test]
+    fn classify_separates_anti_aliasing_from_a_real_change() {
+        let edge = aa_edge();
+        assert!(matches!(
+            classify(&edge, &edge, 2, 2, 5, 5, 0.0),
+            PixelClass::Same
+        ));
+
+        let mut moved = edge.clone();
+        // Shift the grey column one pixel: the edge is in a different place, which is what an
+        // anti-aliased render difference looks like.
+        for y in 0..5usize {
+            let at = |x: usize| (y * 5 + x) * 4;
+            moved[at(2)..at(2) + 4].copy_from_slice(&[0, 0, 0, 255]);
+            moved[at(3)..at(3) + 4].copy_from_slice(&[128, 128, 128, 255]);
+        }
+        assert!(matches!(
+            classify(&edge, &moved, 3, 2, 5, 5, 100.0),
+            PixelClass::AntiAliased
+        ));
+    }
+
     #[test]
     fn color_delta_properties() {
         let black = [0u8, 0, 0, 255];
