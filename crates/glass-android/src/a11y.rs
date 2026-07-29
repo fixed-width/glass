@@ -15,16 +15,14 @@ use crate::target::{choose_serial, parse_devices};
 const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
 
 /// How long the *first* snapshot of a session waits for `uiautomator` to become able to
-/// dump. A device reaches `sys.boot_completed` — all the platform waits for before
-/// reporting the app up — several seconds before the dump can serve one, so a snapshot
-/// taken right after a cold boot would otherwise fail on a device that is merely still
-/// starting. Later snapshots do not wait: once a dump has succeeded the readiness
-/// question is settled, and waiting again would blow the budget of a caller like
-/// `wait_for_element`, whose own poll runs a snapshot per tick.
+/// dump: a device reaches `sys.boot_completed` — all the platform waits for before
+/// reporting the app up — several seconds before the dump can serve one. Later snapshots
+/// must not wait, or a caller like `wait_for_element`, which runs a snapshot per tick
+/// inside its own budget, would be held long past it.
 const DUMP_READY_TIMEOUT_MS: u64 = 30_000;
 const DUMP_POLL_INTERVAL_MS: u64 = 1_000;
 
-/// Runs one adb command and returns its `(stdout, stderr)`. The seam that lets the dump
+/// Runs one adb command and returns its `(stdout, stderr)` — the seam that lets the dump
 /// sequence be driven by a fake instead of a device.
 type AdbRunner<'a> = dyn FnMut(&[&str]) -> Result<(String, String)> + 'a;
 
@@ -37,16 +35,16 @@ pub(crate) fn adb_runner(adb: &Adb) -> impl FnMut(&[&str]) -> Result<(String, St
 ///
 /// `uiautomator dump` exits 0 even when it fails and reports the reason on stderr, so
 /// neither its exit status nor its stdout can be trusted; the file it was asked to write
-/// is the only reliable success signal. Any stale file is removed first, so a previous
-/// run's tree cannot stand in for one this dump never wrote.
+/// is the only reliable success signal. A stale file is removed first, best-effort, so a
+/// previous run's tree does not stand in for one this dump never wrote.
 pub(crate) fn dump_once(run: &mut AdbRunner<'_>, path: &str) -> Result<String> {
     let _ = run(&["shell", "rm", "-f", path]);
     let (_, stderr) = run(&["shell", "uiautomator", "dump", path])?;
     match run(&["shell", "cat", path]) {
         Ok((xml, _)) => Ok(xml),
-        // The dump explained itself on stderr, so that is why there is no file to read and
-        // is the diagnosis worth reporting — naming the dump, not the read that came up
-        // empty. Its stdout is never the reason: it carries only the success line.
+        // The dump explained itself on stderr: that is why there is no file, and it names
+        // the dump rather than the read that came up empty. Its stdout is never the reason
+        // — it carries only the success line.
         Err(_) if !stderr.trim().is_empty() => Err(GlassError::AccessibilityUnavailable(format!(
             "uiautomator dump did not write {path}: {}",
             stderr.trim()
