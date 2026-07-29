@@ -72,10 +72,10 @@ fn key(code: u16, down: bool) -> proto::HidEvent {
 
 impl IdbInjector {
     /// Build an injector for a device whose point→pixel scale is `scale`. `scale` must be
-    /// finite and positive — it is a divisor for every coordinate, and callers only reach
-    /// here with a scale derived from a positive root width (see `axmap::scale_from_width`),
-    /// so the `debug_assert` documents that precondition and catches a future regression in
-    /// debug builds.
+    /// finite and positive — it is a divisor for every coordinate, and both callers reach here
+    /// through a check that guarantees it (`platform::checked_scale`, or a positive root width
+    /// via `axmap::scale_from_width`), so the `debug_assert` documents that precondition and
+    /// catches a future regression in debug builds.
     pub(crate) fn new(scale: f64) -> Self {
         debug_assert!(
             scale.is_finite() && scale > 0.0,

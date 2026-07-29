@@ -137,42 +137,6 @@ pub fn build_tree(
     Ok(tree)
 }
 
-/// The widest top-level element's logical-point width from idb's nested
-/// `accessibility_info` JSON — the describe root's `frame.width`. This is the point
-/// counterpart to the capture frame's pixel width, so dividing the two yields the
-/// device's point→pixel scale (`scale = pixel_width / point_width`).
-///
-/// Reads the structured `frame` object, matching [`build_tree`]: the sibling `AXFrame`
-/// is a stringified CGRect, not a number, so it is deliberately ignored. Returns `None`
-/// when the JSON does not parse, carries no top-level element, or no element has a
-/// numeric `frame.width` — the caller treats that as "scale undetermined" rather than
-/// assuming a default.
-pub fn root_point_width(json: &str) -> Option<f64> {
-    fn frame_width(n: &Value) -> Option<f64> {
-        n.get("frame")?.get("width")?.as_f64()
-    }
-    let v: Value = serde_json::from_str(json).ok()?;
-    match v {
-        Value::Array(a) => a.iter().filter_map(frame_width).reduce(f64::max),
-        obj @ Value::Object(_) => frame_width(&obj),
-        _ => None,
-    }
-}
-
-/// The device's point→pixel scale for a describe response: the capture's pixel width
-/// (`frame_px_width`) over the describe root's logical-point width (from
-/// [`root_point_width`]), i.e. `scale = frame_px_width / root_point_width`.
-///
-/// Returns `None` when the tree carries no *positive* root width — a non-positive width
-/// can't yield a usable scale, so callers treat `None` as "scale undetermined" rather
-/// than dividing by it. Shared by the accessibility reader and the platform's scale
-/// discovery so both compute the ratio one way.
-pub fn scale_from_width(json: &str, frame_px_width: u32) -> Option<f64> {
-    root_point_width(json)
-        .filter(|w| *w > 0.0)
-        .map(|pt| f64::from(frame_px_width) / pt)
-}
-
 /// iOS `(checkable, checked)` from the normalized role and idb's `AXValue` string. A UISwitch
 /// reports role AXCheckBox/AXSwitch/AXToggle with AXValue "0"/"1". Claims `checkable` ONLY for a
 /// determinate "0"/"1" on a checkable role (the #170 invariant); anything else → (false, false).
@@ -341,6 +305,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_tree_maps_to_an_empty_window_rather_than_an_error() {
+        // What an app reports for the second or so it takes to render. `IosA11y` relies on
+        // this arriving as an empty tree: an error here would abort `wait_for_element`'s
+        // poll, which treats a tick error as fatal, so an agent could not wait it out.
+        let tree = build_tree("[]", 3.0, &win(), WalkLimits::DEFAULT)
+            .expect("an unrendered app is an empty tree, not a failure");
+        assert!(tree.root.children.is_empty());
+    }
+
+    #[test]
     fn build_tree_wraps_elements_in_a_window_root_sized_to_geometry() {
         let tree = built();
         assert_eq!(tree.root.role, AxRole::Window);
@@ -448,58 +422,6 @@ mod tests {
         // A bare scalar is neither an element object nor an array of elements.
         let err = build_tree("42", SCALE, &win(), WalkLimits::DEFAULT).unwrap_err();
         assert!(matches!(err, GlassError::AccessibilityUnavailable(_)));
-    }
-
-    #[test]
-    fn root_point_width_reads_widest_frame() {
-        let j = r#"[{"frame":{"x":0,"y":0,"width":402,"height":874}}]"#;
-        assert_eq!(root_point_width(j), Some(402.0));
-    }
-
-    #[test]
-    fn root_point_width_picks_the_widest_top_level_element() {
-        let j = r#"[{"frame":{"width":320}},{"frame":{"width":402}}]"#;
-        assert_eq!(root_point_width(j), Some(402.0));
-    }
-
-    #[test]
-    fn root_point_width_reads_a_single_object_root() {
-        let j = r#"{"frame":{"width":390}}"#;
-        assert_eq!(root_point_width(j), Some(390.0));
-    }
-
-    #[test]
-    fn root_point_width_is_none_without_a_numeric_frame_width() {
-        // `AXFrame` is a stringified CGRect, not a number, and there is no structured
-        // `frame` here — so there is no usable width to read.
-        let j = r#"[{"AXFrame":"{{0, 0}, {402, 874}}"}]"#;
-        assert_eq!(root_point_width(j), None);
-    }
-
-    #[test]
-    fn root_point_width_is_none_on_malformed_json() {
-        assert_eq!(root_point_width("not json"), None);
-    }
-
-    #[test]
-    fn root_point_width_matches_the_fixture_application_width() {
-        // The real describe-all fixture's application root is 402 logical points wide.
-        assert_eq!(root_point_width(FIXTURE), Some(402.0));
-    }
-
-    #[test]
-    fn scale_from_width_divides_pixels_by_root_point_width() {
-        // 1206px capture over a 402pt describe root is the ×3 backing scale.
-        let json = r#"[{"frame":{"width":402}}]"#;
-        assert_eq!(scale_from_width(json, 1206), Some(3.0));
-    }
-
-    #[test]
-    fn scale_from_width_is_none_without_a_positive_root_width() {
-        // No usable width (empty tree) and a non-positive width both yield None, so no
-        // caller ever divides by a zero-or-negative point width.
-        assert_eq!(scale_from_width("[]", 1206), None);
-        assert_eq!(scale_from_width(r#"[{"frame":{"width":0}}]"#, 1206), None);
     }
 
     #[test]

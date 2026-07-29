@@ -120,9 +120,9 @@ const LAUNCH_FAILURE_LOG_LINES: usize = 4;
 ///
 /// Measured on a Simulator: an app that rejects a launch argument and calls `fatalError`
 /// disappears from `ps` about 465 ms after `simctl launch` returns, repeatably. The window is set
-/// above that so the check is not a race, and it is spent rather than assumed — the work between
-/// launch and check (a screenshot, and scale discovery when a driver is present) usually covers
-/// it, but that is a property of neighbouring code, and an observe-only launch skips half of it.
+/// above that so the check is not a race, and it is spent rather than assumed: the work between
+/// launch and check is a screenshot, plus one scale RPC when a driver is present, which does not
+/// reliably cover it.
 ///
 /// A window can only ever bound "died at startup"; an app that exits later is a running app that
 /// stopped, which the next operation reports.
@@ -344,59 +344,27 @@ impl IosPlatform {
 /// failed stream so launch is never blocked for long.
 const LOG_STREAM_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many times [`retry_for_scale`] polls for a positive scale before giving up.
-const SCALE_ATTEMPTS: usize = 3;
-/// How long [`retry_for_scale`] waits between polls while the tree is still empty.
-const SCALE_RETRY_DELAY: Duration = Duration::from_millis(200);
-
-/// Poll `next_scale` up to [`SCALE_ATTEMPTS`] times, `delay` apart, for the device's
-/// point→pixel scale. Each outcome is handled distinctly:
-///
-/// - `Ok(Some(scale))` — discovered; returned immediately.
-/// - `Ok(None)` — the tree parsed but has no positive root width yet (the app may still be
-///   rendering). This is the transient case worth retrying.
-/// - `Err(e)` — a real describe/RPC failure (dead transport, unparseable JSON, a timeout).
-///   Retrying can't help and a per-attempt timeout would cost the full deadline each try, so
-///   it is surfaced at once, wrapped with its cause.
-///
-/// If every attempt yields `Ok(None)`, the give-up error names the still-unrendered tree.
-/// `delay` is a parameter (rather than the [`SCALE_RETRY_DELAY`] constant inline) purely so
-/// tests can drive the loop with no sleeps.
-fn retry_for_scale(
-    delay: Duration,
-    mut next_scale: impl FnMut() -> Result<Option<f64>>,
-) -> Result<f64> {
-    for attempt in 0..SCALE_ATTEMPTS {
-        match next_scale() {
-            Ok(Some(scale)) => return Ok(scale),
-            Ok(None) => {}
-            Err(e) => {
-                return Err(GlassError::Backend(format!(
-                    "could not determine the iOS display scale; last describe error: {e}"
-                )));
-            }
-        }
-        if attempt + 1 < SCALE_ATTEMPTS {
-            std::thread::sleep(delay);
-        }
-    }
-    Err(GlassError::Backend(
-        "could not determine the iOS display scale from the accessibility tree; \
-         the app may not have finished rendering"
-            .into(),
-    ))
+/// Discover the device's point→pixel scale, which idb reports for the *target* — so it is
+/// known before the app has drawn anything, unlike the accessibility tree this used to derive
+/// it from. `IosA11y` prefers the tree's own ratio where it has one, that being the only
+/// independent second opinion: idb derives the screen's point width from this same density.
+/// It never falls back to a placeholder — an undetermined scale would place every tap at the
+/// wrong point, so the failure surfaces as an error and the session is left unstarted.
+fn discover_scale(client: &IdbClient) -> Result<f64> {
+    checked_scale(client.describe()?.density)
 }
 
-/// Discover the device's point→pixel scale by dividing the capture's pixel width by the
-/// accessibility root's logical-point width. `describe` can briefly lag a launch, so the
-/// retry loop in [`retry_for_scale`] tolerates a transient empty tree. It never falls back
-/// to a placeholder: an undetermined scale would place every tap at the wrong point, so the
-/// failure surfaces as an error and the caller leaves the session unstarted.
-fn discover_scale(client: &IdbClient, frame_px_width: u32) -> Result<f64> {
-    retry_for_scale(SCALE_RETRY_DELAY, || {
-        let json = client.describe_all()?;
-        Ok(crate::axmap::scale_from_width(&json, frame_px_width))
-    })
+/// Reject a density that cannot be a scale: idb's field is a plain `double`, and a zero from
+/// a target that failed to report one would divide every tap to infinity. Split from the RPC
+/// so it is testable without a simulator.
+pub(crate) fn checked_scale(density: f64) -> Result<f64> {
+    if !density.is_finite() || density <= 0.0 {
+        return Err(GlassError::Backend(format!(
+            "could not determine the iOS display scale: idb reported a screen density of \
+             {density}"
+        )));
+    }
+    Ok(density)
 }
 
 impl Platform for IosPlatform {
@@ -497,16 +465,12 @@ impl Platform for IosPlatform {
         };
         // With a driver present, learn the point→pixel scale and build the injector at it
         // before reporting the app as running, so no tap is ever issued at an unverified
-        // scale (`describe` reports point frames while the screenshot is in pixels; their
-        // ratio is the scale). On scale-discovery failure the app is left unregistered (no
-        // active session) rather than driven at a wrong scale. In observe-only mode (no
-        // companion) there is no injector — input is unsupported — but geometry is still
-        // reported so capture/logs/clipboard work.
+        // scale. On scale-discovery failure the app is left unregistered (no active session)
+        // rather than driven at a wrong scale. In observe-only mode (no companion) there is
+        // no injector — input is unsupported — but geometry is still reported so
+        // capture/logs/clipboard work.
         let injector = match &self.driver {
-            Some(driver) => Some(IdbInjector::new(discover_scale(
-                &driver.client,
-                frame.width,
-            )?)),
+            Some(driver) => Some(IdbInjector::new(discover_scale(&driver.client)?)),
             None => None,
         };
         // Everything above would look identical for an app that died on launch: `simctl launch`
@@ -717,53 +681,25 @@ mod tests {
     }
 
     #[test]
-    fn retry_for_scale_returns_the_first_positive_scale() {
-        // Empty tree twice (still rendering), then a real scale on the third poll: it must
-        // keep trying and return that scale — the `describe`-lags-a-launch case.
-        let calls = std::cell::Cell::new(0usize);
-        let scale = retry_for_scale(Duration::ZERO, || {
-            let n = calls.get();
-            calls.set(n + 1);
-            Ok(if n < 2 { None } else { Some(3.0) })
-        })
-        .expect("scale should be discovered on the third poll");
-        assert_eq!(scale, 3.0);
-        assert_eq!(calls.get(), 3, "should have polled exactly three times");
+    fn a_reported_density_is_the_scale() {
+        // 3x is what the Simulator reports for an iPhone 17.
+        assert_eq!(checked_scale(3.0).unwrap(), 3.0);
     }
 
     #[test]
-    fn retry_for_scale_gives_up_after_the_last_attempt() {
-        // A tree that never gains a width: after exhausting every attempt, give up with the
-        // still-rendering error rather than looping forever or inventing a scale.
-        let calls = std::cell::Cell::new(0usize);
-        let err = retry_for_scale(Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            Ok(None)
-        })
-        .expect_err("an always-empty tree must give up, not succeed");
-        assert_eq!(calls.get(), SCALE_ATTEMPTS, "should exhaust every attempt");
-        assert!(
-            matches!(&err, GlassError::Backend(m) if m.contains("finished rendering")),
-            "give-up error should name the unrendered tree: {err:?}"
-        );
-    }
-
-    #[test]
-    fn retry_for_scale_surfaces_a_describe_error_without_retrying() {
-        // A hard describe/RPC failure can't be fixed by waiting, so it must surface on the
-        // first poll with its cause — never retried (retrying would cost a full deadline).
-        let calls = std::cell::Cell::new(0usize);
-        let err = retry_for_scale(Duration::ZERO, || {
-            calls.set(calls.get() + 1);
-            Err(GlassError::Backend("dead transport".into()))
-        })
-        .expect_err("a describe error must surface, not be retried");
-        assert_eq!(calls.get(), 1, "a hard error must not be retried");
-        assert!(
-            matches!(&err, GlassError::Backend(m)
-                if m.contains("last describe error") && m.contains("dead transport")),
-            "error should wrap the describe cause: {err:?}"
-        );
+    fn a_density_that_cannot_be_a_scale_is_rejected() {
+        // Guessing here would place every tap at the wrong point, so it is an error and the
+        // caller leaves the session unstarted.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = match checked_scale(bad) {
+                Ok(scale) => panic!("{bad} must be rejected, was accepted as scale {scale}"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(&err, GlassError::Backend(m) if m.contains("display scale")),
+                "{err}"
+            );
+        }
     }
 }
 
