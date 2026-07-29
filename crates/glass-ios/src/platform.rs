@@ -120,9 +120,8 @@ const LAUNCH_FAILURE_LOG_LINES: usize = 4;
 ///
 /// Measured on a Simulator: an app that rejects a launch argument and calls `fatalError`
 /// disappears from `ps` about 465 ms after `simctl launch` returns, repeatably. The window is set
-/// above that so the check is not a race, and it is spent rather than assumed — the work between
-/// launch and check (a screenshot, and scale discovery when a driver is present) usually covers
-/// it, but that is a property of neighbouring code, and an observe-only launch skips half of it.
+/// above that so the check is not a race, and it is spent rather than assumed: the work between
+/// launch and check is a screenshot and one scale RPC, which does not reliably cover it.
 ///
 /// A window can only ever bound "died at startup"; an app that exits later is a running app that
 /// stopped, which the next operation reports.
@@ -346,10 +345,12 @@ const LOG_STREAM_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Discover the device's point→pixel scale, which idb reports for the *target* — so it is
 /// known before the app has drawn anything, unlike the accessibility tree this used to derive
-/// it from. Taken as the screen's density rather than divided out of its own pixel and point
-/// widths, because a density does not swap axes when the device rotates. It never falls back
-/// to a placeholder: an undetermined scale would place every tap at the wrong point, so the
-/// failure surfaces as an error and the caller leaves the session unstarted.
+/// it from. idb derives the screen's point width from this same density, so dividing those
+/// two out again would be the same number by construction, not a second opinion — where a
+/// real second opinion exists, the accessibility tree's own ratio, `IosA11y` prefers it. It
+/// never falls back to a placeholder: an undetermined scale would place every tap at the
+/// wrong point, so the failure surfaces as an error and the caller leaves the session
+/// unstarted.
 fn discover_scale(client: &IdbClient) -> Result<f64> {
     checked_scale(client.describe()?.density)
 }
@@ -357,7 +358,7 @@ fn discover_scale(client: &IdbClient) -> Result<f64> {
 /// Reject a density that cannot be a scale. Separated from the RPC so this is testable
 /// without a simulator, and kept because idb's field is a plain `double`: a zero from a
 /// target that failed to report one would otherwise divide every tap to infinity.
-fn checked_scale(density: f64) -> Result<f64> {
+pub(crate) fn checked_scale(density: f64) -> Result<f64> {
     if !density.is_finite() || density <= 0.0 {
         return Err(GlassError::Backend(format!(
             "could not determine the iOS display scale: idb reported a screen density of \
@@ -692,11 +693,11 @@ mod tests {
         // Guessing here would place every tap at the wrong point, so it is an error and the
         // caller leaves the session unstarted rather than driven at a wrong scale.
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let err = checked_scale(bad).expect_err("{bad} cannot be a scale");
-            assert!(
-                matches!(&err, GlassError::Backend(m) if m.contains("display scale")),
-                "{err}"
-            );
+            let err = match checked_scale(bad) {
+                Ok(scale) => panic!("{bad} must be rejected, was accepted as scale {scale}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("display scale"), "{err}");
         }
     }
 }

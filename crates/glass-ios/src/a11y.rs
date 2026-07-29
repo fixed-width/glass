@@ -13,21 +13,36 @@ use crate::injector::IdbInjector;
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
     client: IdbClient,
+    /// The target's own scale, fetched on first need and kept: it is a property of the
+    /// device, so unlike the tree's it does not change between snapshots.
+    device_scale: std::cell::Cell<Option<f64>>,
 }
 
 /// The point→pixel scale for a describe response: the capture window's pixel width over
-/// the describe root's logical-point width. Computed per describe rather than cached,
-/// because this reader is built before the app launches — when the real scale is still
-/// unknown — so a scale frozen at construction would be wrong. `None` if the tree carries
-/// no positive root width. Delegates to [`axmap::scale_from_width`] so the reader and the
-/// platform's scale discovery compute the ratio one way.
+/// the describe root's logical-point width. Preferred over the device's own scale because
+/// the tree's frames are in exactly these points, so it stays right even where the two
+/// disagree. Computed per describe rather than cached, since the tree it divides is too.
+/// `None` if the tree carries no positive root width — the caller falls back then.
 fn scale_from(json: &str, window: &WindowGeometry) -> Option<f64> {
     axmap::scale_from_width(json, window.width)
 }
 
 impl IosA11y {
     pub(crate) fn new(client: IdbClient) -> Self {
-        IosA11y { client }
+        IosA11y {
+            client,
+            device_scale: std::cell::Cell::new(None),
+        }
+    }
+
+    /// The target's point→pixel scale, for when the tree carries no root width to divide.
+    fn device_scale(&self) -> Result<f64> {
+        if let Some(scale) = self.device_scale.get() {
+            return Ok(scale);
+        }
+        let scale = crate::platform::checked_scale(self.client.describe()?.density)?;
+        self.device_scale.set(Some(scale));
+        Ok(scale)
     }
 
     /// One describe round-trip: fetch the accessibility JSON, derive the point→pixel
@@ -36,11 +51,14 @@ impl IosA11y {
     /// since `set_value` needs the same scale to place synthetic input.
     fn describe(&self, ctx: &AxContext) -> Result<(AxTree, f64)> {
         let json = self.client.describe_all()?;
-        let scale = scale_from(&json, &ctx.window).ok_or_else(|| {
-            GlassError::Backend(
-                "could not determine the iOS accessibility scale from the tree".into(),
-            )
-        })?;
+        // An app mid-launch reports a tree with no root width for a second or two. Falling
+        // back to the device's scale rather than erroring lets that arrive as an empty tree,
+        // which `wait_for_element` can poll through — an error would abort its poll, since
+        // `poll_until` treats a tick error as fatal.
+        let scale = match scale_from(&json, &ctx.window) {
+            Some(scale) => scale,
+            None => self.device_scale()?,
+        };
         let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
         tree.assign_ids();
         Ok((tree, scale))
