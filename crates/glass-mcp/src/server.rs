@@ -373,8 +373,11 @@ impl GlassServer {
                        elements: role, name, description, window-relative bounds) as compact \
                        text — deterministic, low-token element addressing alongside \
                        screenshots. Each line is `#<id> <Role> \"<name>\" desc=\"<description>\" \
-                       (x,y wxh) [states]`, with desc present only when the platform exposes a \
-                       secondary label distinct from the name; pass an #id to \
+                       (x,y wxh) [states]`. desc appears only where glass's reader for the \
+                       running backend sources the platform's secondary label — not all of \
+                       them do yet — and it differs from the name; it is display-only, since \
+                       glass_wait_for_element and glass_scroll_to_element select on name, not \
+                       description. Pass an #id to \
                        glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
@@ -556,7 +559,8 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
      SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the app exposes \
      an accessibility tree, glass_a11y_snapshot returns its elements as TEXT (#id, role, \
-     name, description, window-relative bounds) — deterministic, no image tokens. Address \
+     name, window-relative bounds, and a description where the running backend's reader \
+     sources one) — deterministic, no image tokens. Address \
      elements by #id: glass_click_element clicks one, glass_set_value writes an editable element's \
      value, and glass_wait_for_element blocks until an element reaches a state (e.g. Save \
      becomes enabled). Prefer this over screenshots and pixel-hunting whenever it works.\n\n\

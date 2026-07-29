@@ -424,7 +424,9 @@ fn walk(
         role,
         raw_role,
         name,
-        // This reader does not read the platform's description yet.
+        // `AXDescription` is already read above as the name fallback, so reading it here
+        // would normalize away as a duplicate of `name`. `AXHelp` — the tooltip — is the
+        // secondary label this reader does not read yet.
         description: None,
         value,
         states,

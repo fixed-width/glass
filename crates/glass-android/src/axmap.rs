@@ -210,7 +210,9 @@ fn map_node(
         role,
         raw_role: class.to_string(),
         name,
-        // This reader does not read the platform's description yet.
+        // `content-desc` is Android's secondary label and is already read above, as the
+        // preferred `name`. The hint and state-description are unread: a `uiautomator`
+        // dump exposes neither as an attribute.
         description: None,
         value,
         states,

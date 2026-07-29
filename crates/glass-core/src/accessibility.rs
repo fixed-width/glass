@@ -552,9 +552,9 @@ impl AxTree {
         walk(&self.root, id)
     }
 
-    /// Render a compact indented outline, one line per node:
-    /// `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]` — name/bounds/states
-    /// elided when absent. Two spaces of indent per depth level.
+    /// Render a compact indented outline, one line per node, in `outline::write_line`'s format —
+    /// the single definition of it, shared with [`crate::outline::render_compact`]. This render
+    /// differs only in keeping every node: nothing is collapsed.
     ///
     /// Pure tree text — no truncation notice is appended here. Keeping this render pure
     /// means `scroll_to_element`'s saturation check (which diffs consecutive `to_outline`
