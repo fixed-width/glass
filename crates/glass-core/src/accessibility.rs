@@ -90,53 +90,6 @@ impl AxRole {
         AxRole::Heading,
     ];
 
-    /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
-    /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
-    /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
-    /// every one of them; this match stops compiling until the variant is classified — listed in
-    /// the first arm and in `ALL`, or in the second arm as a deliberate exclusion.
-    #[expect(dead_code, reason = "exists only for its exhaustive match")]
-    fn all_is_exhaustive(role: AxRole) {
-        match role {
-            AxRole::Application
-            | AxRole::Window
-            | AxRole::Dialog
-            | AxRole::Group
-            | AxRole::Button
-            | AxRole::ToggleButton
-            | AxRole::RadioButton
-            | AxRole::CheckBox
-            | AxRole::MenuBar
-            | AxRole::Menu
-            | AxRole::MenuItem
-            | AxRole::Label
-            | AxRole::TextField
-            | AxRole::TextArea
-            | AxRole::ComboBox
-            | AxRole::List
-            | AxRole::ListItem
-            | AxRole::Table
-            | AxRole::Cell
-            | AxRole::Tree
-            | AxRole::TreeItem
-            | AxRole::TabList
-            | AxRole::Tab
-            | AxRole::ScrollBar
-            | AxRole::Slider
-            | AxRole::SpinButton
-            | AxRole::ProgressBar
-            | AxRole::Image
-            | AxRole::Link
-            | AxRole::Separator
-            | AxRole::Toolbar
-            | AxRole::StatusBar
-            | AxRole::Heading => {}
-            // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
-            // mapping target.
-            AxRole::Other => {}
-        }
-    }
-
     /// Whether this role denotes an element a user acts on (clicks / types into) —
     /// the elements worth a Set-of-Mark number. Containers, the window, and static
     /// text return `false`.
@@ -273,9 +226,9 @@ impl AxRect {
     /// click on the window edge that never lands on the element (the "no silent fallbacks"
     /// invariant).
     fn visible_intersection(&self, win_w: u32, win_h: u32) -> Option<(i32, i32, i32, i32)> {
-        if self.width == 0 || self.height == 0 || win_w == 0 || win_h == 0 {
-            return None;
-        }
+        // No zero-area early return: the emptiness test below already covers it. A zero-width
+        // rect forces `right <= left`, a zero-width window forces `right <= 0 <= left`, and
+        // both dimensions are symmetric — so a separate guard is a branch nothing can observe.
         let left = self.x.max(0);
         let top = self.y.max(0);
         let right = (self.x + self.width as i32).min(win_w as i32);
@@ -926,6 +879,443 @@ pub fn element_match<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
+    /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
+    /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
+    /// every one of them; this match stops compiling until the variant is classified — listed in
+    /// the first arm and in `ALL`, or in the second arm as a deliberate exclusion.
+    #[expect(dead_code, reason = "exists only for its exhaustive match")]
+    fn all_is_exhaustive(role: AxRole) {
+        match role {
+            AxRole::Application
+            | AxRole::Window
+            | AxRole::Dialog
+            | AxRole::Group
+            | AxRole::Button
+            | AxRole::ToggleButton
+            | AxRole::RadioButton
+            | AxRole::CheckBox
+            | AxRole::MenuBar
+            | AxRole::Menu
+            | AxRole::MenuItem
+            | AxRole::Label
+            | AxRole::TextField
+            | AxRole::TextArea
+            | AxRole::ComboBox
+            | AxRole::List
+            | AxRole::ListItem
+            | AxRole::Table
+            | AxRole::Cell
+            | AxRole::Tree
+            | AxRole::TreeItem
+            | AxRole::TabList
+            | AxRole::Tab
+            | AxRole::ScrollBar
+            | AxRole::Slider
+            | AxRole::SpinButton
+            | AxRole::ProgressBar
+            | AxRole::Image
+            | AxRole::Link
+            | AxRole::Separator
+            | AxRole::Toolbar
+            | AxRole::StatusBar
+            | AxRole::Heading => {}
+            // Deliberately excluded from `ALL`: the sink for unmapped native tokens, not a
+            // mapping target.
+            AxRole::Other => {}
+        }
+    }
+
+    /// The budget's accessors report what it actually counted, and the two exhaustion tests
+    /// fire at their own bound rather than sharing one.
+    #[test]
+    fn walk_budget_reports_and_bounds_what_it_counted() {
+        let limits = WalkLimits {
+            nodes: 3,
+            depth: 2,
+            siblings: 4,
+        };
+        let mut b = WalkBudget::with_limits(limits);
+        assert_eq!(b.nodes_walked(), 0);
+        assert!(!b.nodes_exhausted());
+
+        b.visit();
+        assert_eq!(b.nodes_walked(), 1, "one visit is one node");
+        assert!(!b.nodes_exhausted());
+        b.visit();
+        b.visit();
+        assert_eq!(b.nodes_walked(), 3);
+        assert!(b.nodes_exhausted(), "the bound is reached, not exceeded");
+
+        // Depth is a separate bound, read per call rather than from the running count.
+        assert!(!b.depth_exhausted(0));
+        assert!(!b.depth_exhausted(1));
+        assert!(b.depth_exhausted(2), "reaching the bound stops the descent");
+        assert!(b.depth_exhausted(3));
+    }
+
+    /// The disclosure notice names the unit that stopped the walk, so the three are distinct.
+    #[test]
+    fn truncation_limits_have_distinct_labels() {
+        assert_eq!(TruncationLimit::Nodes.label(), "nodes");
+        assert_eq!(TruncationLimit::Depth.label(), "levels deep");
+        assert_eq!(TruncationLimit::Siblings.label(), "siblings per level");
+    }
+
+    /// A backend that does not implement value-setting must say so, not silently succeed:
+    /// reporting Ok having changed nothing is the "no silent fallbacks" invariant inverted.
+    #[test]
+    fn set_value_defaults_to_unsupported() {
+        struct Bare;
+        impl Accessibility for Bare {
+            fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+                Err(crate::error::GlassError::AxUnsupported)
+            }
+        }
+        let target = AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: None,
+            bounds: None,
+        };
+        let ctx = AxContext {
+            pids: vec![],
+            window: WindowGeometry::default(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        };
+        let err = Bare
+            .set_value(&ctx, &target, "x")
+            .expect_err("the default must refuse, not report success");
+        assert!(matches!(err, crate::error::GlassError::AxUnsupported));
+    }
+
+    /// Every arm of the condition table, plus the predicate each one selects. `Appears` and
+    /// `Disappears` share an always-true predicate; the rest split into a pair per state, so
+    /// each is asserted both ways round.
+    #[test]
+    fn every_condition_parses_and_selects_its_predicate() {
+        use ElementCondition::*;
+        let pairs: [(&str, ElementCondition); 13] = [
+            ("appears", Appears),
+            ("disappears", Disappears),
+            ("enabled", Enabled),
+            ("disabled", Disabled),
+            ("checked", Checked),
+            ("unchecked", Unchecked),
+            ("selected", Selected),
+            ("unselected", Unselected),
+            ("expanded", Expanded),
+            ("collapsed", Collapsed),
+            ("focused", Focused),
+            ("visible", Visible),
+            ("hidden", Hidden),
+        ];
+        for (name, cond) in pairs {
+            assert_eq!(ElementCondition::from_name(name), Some(cond), "{name}");
+            assert_eq!(
+                ElementCondition::from_name(&name.to_ascii_uppercase()),
+                Some(cond),
+                "{name} uppercased"
+            );
+        }
+        assert_eq!(ElementCondition::from_name("nosuchcondition"), None);
+
+        // `on` sets every flag; `off` clears them. A predicate wired to the wrong field, or
+        // negated, disagrees with one of the two.
+        let on = AxStates {
+            focused: true,
+            focusable: true,
+            enabled: true,
+            visible: true,
+            selected: true,
+            checkable: true,
+            checked: true,
+            expanded: true,
+            editable: true,
+        };
+        let off = AxStates::default();
+
+        for (cond, want_on, want_off) in [
+            (Appears, true, true),
+            (Disappears, true, true),
+            (Enabled, true, false),
+            (Disabled, false, true),
+            (Checked, true, false),
+            (Unchecked, false, false),
+            (Selected, true, false),
+            (Unselected, false, true),
+            (Expanded, true, false),
+            (Collapsed, false, true),
+            (Focused, true, false),
+            (Visible, true, false),
+            (Hidden, false, true),
+        ] {
+            assert_eq!(cond.state_pred()(&on), want_on, "{cond:?} against all-set");
+            assert_eq!(
+                cond.state_pred()(&off),
+                want_off,
+                "{cond:?} against all-clear"
+            );
+        }
+
+        // Checkable gates both check predicates: a node that cannot be checked satisfies
+        // neither, which is not the same as being unchecked. That is why `Unchecked` is false
+        // against the all-clear state above — it is not checkable there.
+        let not_checkable = AxStates {
+            checkable: false,
+            checked: false,
+            ..on
+        };
+        assert!(!Checked.state_pred()(&not_checkable));
+        assert!(!Unchecked.state_pred()(&not_checkable));
+
+        // The all-set / all-clear pair moves every flag together, so a predicate wired to a
+        // neighbouring field agrees with the correct one on both. These split them apart.
+        let visible_not_focused = AxStates {
+            visible: true,
+            focused: false,
+            ..off
+        };
+        assert!(Visible.state_pred()(&visible_not_focused));
+        assert!(!Hidden.state_pred()(&visible_not_focused));
+        assert!(!Focused.state_pred()(&visible_not_focused));
+        let focused_not_visible = AxStates {
+            visible: false,
+            focused: true,
+            ..off
+        };
+        assert!(!Visible.state_pred()(&focused_not_visible));
+        assert!(Hidden.state_pred()(&focused_not_visible));
+        assert!(Focused.state_pred()(&focused_not_visible));
+        // Same for the enabled/selected pair.
+        let enabled_not_selected = AxStates {
+            enabled: true,
+            selected: false,
+            ..off
+        };
+        assert!(Enabled.state_pred()(&enabled_not_selected));
+        assert!(!Selected.state_pred()(&enabled_not_selected));
+        assert!(Unselected.state_pred()(&enabled_not_selected));
+
+        // Checkable and not checked is the one state `Unchecked` accepts.
+        let checkable_off = AxStates {
+            checkable: true,
+            checked: false,
+            ..off
+        };
+        assert!(Unchecked.state_pred()(&checkable_off));
+        assert!(!Checked.state_pred()(&checkable_off));
+    }
+
+    /// Tolerance is inclusive and applied per axis, so a rect that is within it on three axes
+    /// and past it on the fourth is still inconsistent.
+    #[test]
+    fn bounds_consistent_compares_every_axis_within_tolerance() {
+        let want = AxRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        let target = |bounds| AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::Button,
+            name: None,
+            bounds,
+        };
+        let t = target(Some(want));
+
+        assert!(t.bounds_consistent(Some(want), 0));
+        // No expectation accepts anything; an expectation with nothing to compare does not.
+        assert!(target(None).bounds_consistent(None, 0));
+        assert!(!t.bounds_consistent(None, 1000));
+
+        // Exactly at the tolerance, on each axis in turn.
+        for shift in [
+            AxRect { x: 12, ..want },
+            AxRect { y: 22, ..want },
+            AxRect { width: 32, ..want },
+            AxRect { height: 42, ..want },
+        ] {
+            assert!(
+                t.bounds_consistent(Some(shift), 2),
+                "{shift:?} at tolerance 2"
+            );
+            assert!(
+                !t.bounds_consistent(Some(shift), 1),
+                "{shift:?} at tolerance 1"
+            );
+        }
+
+        // Negative differences count the same: the comparison is on the absolute value.
+        assert!(t.bounds_consistent(Some(AxRect { x: 8, ..want }), 2));
+        assert!(!t.bounds_consistent(Some(AxRect { x: 8, ..want }), 1));
+    }
+
+    /// The click point is the centre of the *visible* intersection, so an element hanging off
+    /// an edge aims inside the window rather than at its own off-screen middle.
+    #[test]
+    fn clamped_center_uses_the_visible_intersection() {
+        // Fully inside: the element's own centre.
+        let inside = AxRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        assert_eq!(inside.clamped_center(100, 100), Some((25, 40)));
+
+        // Hanging off the right and bottom: clipped to the window before centring.
+        let over = AxRect {
+            x: 80,
+            y: 80,
+            width: 40,
+            height: 40,
+        };
+        assert_eq!(over.clamped_center(100, 100), Some((90, 90)));
+
+        // Hanging off the left and top: the negative side is clamped to zero.
+        let under = AxRect {
+            x: -20,
+            y: -20,
+            width: 40,
+            height: 40,
+        };
+        assert_eq!(under.clamped_center(100, 100), Some((10, 10)));
+
+        // Nothing to click: zero-sized, zero-sized window, or entirely outside.
+        assert_eq!(
+            AxRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 10
+            }
+            .clamped_center(100, 100),
+            None
+        );
+        assert_eq!(
+            AxRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 0
+            }
+            .clamped_center(100, 100),
+            None
+        );
+        assert_eq!(inside.clamped_center(0, 100), None);
+        assert_eq!(inside.clamped_center(100, 0), None);
+        assert_eq!(
+            AxRect {
+                x: 200,
+                y: 0,
+                width: 10,
+                height: 10
+            }
+            .clamped_center(100, 100),
+            None
+        );
+        assert_eq!(
+            AxRect {
+                x: -50,
+                y: 0,
+                width: 10,
+                height: 10
+            }
+            .clamped_center(100, 100),
+            None
+        );
+        // Starting exactly on the far edge clips to zero width, which is empty, not a
+        // one-pixel sliver at the boundary.
+        assert_eq!(
+            AxRect {
+                x: 100,
+                y: 10,
+                width: 10,
+                height: 10
+            }
+            .clamped_center(100, 100),
+            None
+        );
+        assert_eq!(
+            AxRect {
+                x: 10,
+                y: 100,
+                width: 10,
+                height: 10
+            }
+            .clamped_center(100, 100),
+            None
+        );
+    }
+
+    /// Every arm of the role table, and the guarantee that the table covers `AxRole::ALL`:
+    /// a variant added without a parse arm fails here rather than silently becoming
+    /// unparseable. `Other` is deliberately outside `ALL` but still has a name.
+    #[test]
+    fn every_role_parses_from_its_name() {
+        use AxRole::*;
+        let pairs: [(&str, AxRole); 34] = [
+            ("application", Application),
+            ("window", Window),
+            ("dialog", Dialog),
+            ("group", Group),
+            ("button", Button),
+            ("togglebutton", ToggleButton),
+            ("radiobutton", RadioButton),
+            ("checkbox", CheckBox),
+            ("menubar", MenuBar),
+            ("menu", Menu),
+            ("menuitem", MenuItem),
+            ("label", Label),
+            ("textfield", TextField),
+            ("textarea", TextArea),
+            ("combobox", ComboBox),
+            ("list", List),
+            ("listitem", ListItem),
+            ("table", Table),
+            ("cell", Cell),
+            ("tree", Tree),
+            ("treeitem", TreeItem),
+            ("tablist", TabList),
+            ("tab", Tab),
+            ("scrollbar", ScrollBar),
+            ("slider", Slider),
+            ("spinbutton", SpinButton),
+            ("progressbar", ProgressBar),
+            ("image", Image),
+            ("link", Link),
+            ("separator", Separator),
+            ("toolbar", Toolbar),
+            ("statusbar", StatusBar),
+            ("heading", Heading),
+            ("other", Other),
+        ];
+
+        for (name, role) in pairs {
+            assert_eq!(AxRole::from_name(name), Some(role), "{name}");
+            // Documented as case-insensitive, so the folding is part of the contract.
+            assert_eq!(
+                AxRole::from_name(&name.to_ascii_uppercase()),
+                Some(role),
+                "{name} uppercased"
+            );
+        }
+
+        for role in AxRole::ALL {
+            assert!(
+                pairs.iter().any(|&(_, r)| r == role),
+                "{role:?} is in ALL but no name parses to it"
+            );
+        }
+
+        assert_eq!(AxRole::from_name("nosuchrole"), None);
+        assert_eq!(AxRole::from_name(""), None);
+    }
 
     #[test]
     fn trait_is_object_safe() {
