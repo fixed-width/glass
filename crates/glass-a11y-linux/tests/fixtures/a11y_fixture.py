@@ -2,6 +2,7 @@
 """Minimal GTK4 app with a known accessibility tree, for glass-a11y-linux tests.
 Window "Glass A11y Fixture" containing a Label "Ready", a Button "Save", a
 Button "Bold" (AT-SPI description "Bold text", distinct from its name), a
+Button "Italic" (AT-SPI description "Italic", the SAME string as its name), a
 CheckButton "Enable", an Entry "Field" (initial text "hello"), a SpinButton
 "Amount" (initial value 1), a DropDown "Company" (Acme/Globex/Initech), a
 Switch "Active" (off), a virtualized GtkListView of 80 rows ("Row 000".."Row
@@ -37,6 +38,11 @@ class FixtureApp(Gtk.Application):
         # update_property(DESCRIPTION) populates AT-SPI Description (verified on the bus).
         bold.update_property([Gtk.AccessibleProperty.DESCRIPTION], ["Bold text"])
         box.append(bold)
+        italic = Gtk.Button(label="Italic")
+        # Description == name, the case normalize_description drops: toolkits routinely
+        # report one label in both fields, and the outline must not print it twice.
+        italic.update_property([Gtk.AccessibleProperty.DESCRIPTION], ["Italic"])
+        box.append(italic)
         box.append(Gtk.CheckButton(label="Enable"))
         entry = Gtk.Entry()
         entry.set_text("hello")

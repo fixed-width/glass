@@ -465,13 +465,16 @@ fn launch_fixture() -> Glass {
     glass
 }
 
-/// Both assertions in one launch: the AT-SPI bus is shared per process and the suite runs
-/// single-threaded, so a second fixture launch costs ~3s for nothing.
+/// Every description case in one launch: the AT-SPI bus is shared per process and the suite
+/// runs single-threaded, so a second fixture launch costs ~3s for nothing. `stop()` comes
+/// before the asserts — glass-core has no `Drop`, so a failing assert would otherwise leak
+/// the GTK4 fixture into the rest of the suite.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_reads_a_widget_description() {
     let mut glass = launch_fixture();
     let tree = glass.a11y_snapshot(None).expect("snapshot");
+    glass.stop().expect("stop");
 
     let bold = find_node(&tree.root, "Bold").expect("Bold button");
     assert_eq!(bold.description.as_deref(), Some("Bold text"));
@@ -483,7 +486,12 @@ fn snapshot_reads_a_widget_description() {
     let save = find_node(&tree.root, "Save").expect("Save button");
     assert_eq!(save.description, None);
 
-    glass.stop().expect("stop");
+    // The fixture gives Italic a description equal to its name — the case
+    // normalize_description exists for, and the one a reader that passed the wrong `name`
+    // (or skipped the helper) would get wrong, doubling the label on every line of a
+    // toolkit that reports both fields.
+    let italic = find_node(&tree.root, "Italic").expect("Italic button");
+    assert_eq!(italic.description, None);
 }
 
 /// The GTK fixture's Switch "Active" exposes an AT-SPI activation action ("toggle") —

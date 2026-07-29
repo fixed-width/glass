@@ -359,6 +359,22 @@ mod tests {
     }
 
     #[test]
+    fn a_description_is_escaped_and_stays_on_one_line() {
+        // App-controlled text: a raw newline would split one node across two lines and break
+        // the one-node-per-line contract the outline diff and the id lookups rely on.
+        let out = render_compact(&tree_of(described(
+            AxRole::Button,
+            None,
+            "say \"hi\"\nthen go",
+        )));
+        assert!(
+            out.contains(r#"desc="say \"hi\"\nthen go""#),
+            "quote and newline must be escaped: {out}"
+        );
+        assert_eq!(out.lines().count(), 2, "Window + Button only: {out}");
+    }
+
+    #[test]
     fn a_node_without_a_description_renders_exactly_as_before() {
         let out = render_compact(&tree_of(node(AxRole::Button, Some("Save"))));
         assert!(!out.contains("desc="), "unexpected line: {out}");
