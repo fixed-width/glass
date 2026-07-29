@@ -24,7 +24,7 @@ pub struct StabilityTracker {
 
 impl StabilityTracker {
     pub fn new(settle_frames: u32, tolerance: u8) -> Self {
-        Self::with_mask(settle_frames, tolerance, IgnoreMask::empty())
+        Self::with_mask(settle_frames, tolerance, IgnoreMask::default())
     }
 
     /// Like [`new`](Self::new), but pixels covered by `mask` are excluded from the
