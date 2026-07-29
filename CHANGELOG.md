@@ -16,13 +16,6 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
-### Removed
-- The `smoke` subcommand. It drove glass's own tools against a real app to check a build, and it
-  was never part of a release — v1.1.0 predates it — so nothing that shipped is affected. Its
-  checks now live in a script that drives any `glass-mcp` over stdio from outside, which means a
-  release artifact no longer carries its own test harness. `glass-mcp doctor` is unchanged and
-  remains the way to check an install.
-
 ### Added
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
@@ -49,20 +42,6 @@ internal refactors, CI, or test-only changes.
   (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
   diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
   of parsing prose. Purely additive: `report` is unchanged.
-- `glass-mcp smoke --backend x11` — drives glass's own MCP tools against a real app and
-  reports whether this build works, in the same report style as `glass-mcp doctor`: a glyph and a
-  status word per check, and a `Summary:` line carrying the verdict. `--dry-run` prints the plan
-  without driving anything, on any host: with no target app installed it says what to install
-  rather than failing. Experimental; see `docs/reference/smoke.md` for the checks and the
-  report shape.
-- `glass-mcp smoke` drives the `wayland` backend: `smoke --backend wayland` launches a stock GTK app
-  under the backend's headless sway and runs the same eight checks as `x11`. The target is launched
-  with `GDK_BACKEND=wayland`, so a toolkit that cannot use the Wayland backend fails the launch
-  rather than falling back to Xwayland.
-- `glass-mcp smoke --backend android` drives a stock app on a connected device or emulator,
-  reporting the same eight checks as the x11 and wayland runners. The target is a
-  `package/.Activity` component chosen from a small table rather than probed for; `--app` selects a
-  different one.
 
 ### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
