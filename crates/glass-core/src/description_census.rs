@@ -13,7 +13,9 @@ use crate::accessibility::{AxNode, AxTree};
 pub struct DescribedSample {
     /// The backend's native role string, as carried in [`AxNode::raw_role`].
     pub raw_role: String,
+    /// The node's name, alongside the description.
     pub name: Option<String>,
+    /// The node's description — the reason this sample exists.
     pub description: String,
 }
 
@@ -116,6 +118,32 @@ mod tests {
                 .map(|s| s.description.as_str())
                 .collect::<Vec<_>>(),
             vec!["Bold", "Saves and closes"]
+        );
+    }
+
+    #[test]
+    fn census_orders_ties_by_raw_role_then_name() {
+        // Same description on every node (plausible: several "OK" controls on one screen), so
+        // this pins both tie-break clauses: `raw_role` separates "checkbox" from "push button",
+        // then `name` separates the two "push button" samples from each other.
+        let tree = tree_of(vec![
+            described("push button", Some("Zeta"), Some("OK")),
+            described("checkbox", Some("Enable"), Some("OK")),
+            described("push button", Some("Alpha"), Some("OK")),
+        ]);
+        let census = description_census(&tree);
+        let order: Vec<(&str, Option<&str>)> = census
+            .samples
+            .iter()
+            .map(|s| (s.raw_role.as_str(), s.name.as_deref()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("checkbox", Some("Enable")),
+                ("push button", Some("Alpha")),
+                ("push button", Some("Zeta")),
+            ]
         );
     }
 
