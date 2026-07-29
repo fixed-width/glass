@@ -462,6 +462,27 @@ fn launch_fixture() -> Glass {
     glass
 }
 
+/// Both assertions in one launch: the AT-SPI bus is shared per process and the suite runs
+/// single-threaded, so a second fixture launch costs ~3s for nothing.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn snapshot_reads_a_widget_description() {
+    let mut glass = launch_fixture();
+    let tree = glass.a11y_snapshot(None).expect("snapshot");
+
+    let bold = find_node(&tree.root, "Bold").expect("Bold button");
+    assert_eq!(bold.description.as_deref(), Some("Bold text"));
+    // The description must not have displaced the name.
+    assert_eq!(bold.name.as_deref(), Some("Bold"));
+
+    // A widget the fixture gives no description reports None, not an empty string — so a
+    // reader that returned "" for everything could not pass the test above by accident.
+    let save = find_node(&tree.root, "Save").expect("Save button");
+    assert_eq!(save.description, None);
+
+    glass.stop().expect("stop");
+}
+
 /// The GTK fixture's Switch "Active" exposes an AT-SPI activation action ("toggle") —
 /// click_element must take the native path and actually toggle it.
 ///
