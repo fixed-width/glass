@@ -28,10 +28,13 @@ use crate::accessibility::{AxNode, AxRole, AxTree};
 /// - a **focusable** container is actable: Jetpack Compose surfaces a real button as a
 ///   clickable `Group` with the role lost (see `accessibility::element_match`), so eliding
 ///   it would hide a button that is still clickable — invisible but addressable;
+/// - a **described** container is labelled: a description is the only label a node with no
+///   name has, so eliding it drops the one thing that says what the container is;
 /// - a multi-child container conveys grouping; a single-child one does not.
 fn is_scaffolding(node: &AxNode) -> bool {
     matches!(node.role, AxRole::Group | AxRole::Other)
         && node.name.is_none()
+        && node.description.is_none()
         && node.value.is_none()
         && !node.states.focusable
         && node.children.len() == 1
@@ -201,6 +204,18 @@ mod tests {
         assert!(
             render_compact(&tree_of(g)).contains("Group"),
             "a focusable Group is actable and must never be elided"
+        );
+    }
+
+    #[test]
+    fn a_described_group_is_kept() {
+        // A toolkit can put a description on any container (GTK4 accepts DESCRIPTION on a
+        // plain Gtk.Box), and there it is the container's only label.
+        let mut g = described(AxRole::Group, None, "Formatting");
+        g.children = vec![node(AxRole::Button, Some("Save"))];
+        assert!(
+            render_compact(&tree_of(g)).contains(r#"Group desc="Formatting""#),
+            "a description is the only label an unnamed container has"
         );
     }
 

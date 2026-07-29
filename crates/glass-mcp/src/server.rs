@@ -431,7 +431,9 @@ impl GlassServer {
     #[tool(
         description = "Screenshot of the active window with a numbered box drawn on each \
                        interactable element (Set-of-Mark) — returns the annotated image plus a \
-                       text legend (`#<id> <Role> \"<name>\"`). Pick an element visually, then \
+                       text legend (`#<id> <Role> \"<name>\"`, or `#<id> <Role> \
+                       desc=\"<description>\"` for an element that has only a description). \
+                       Pick an element visually, then \
                        click it with glass_click_element using its #id (same ids as \
                        glass_a11y_snapshot). Chips sit just outside each element so small icon \
                        buttons stay visible. The box is only as precise as the toolkit's \

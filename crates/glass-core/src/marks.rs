@@ -14,7 +14,18 @@ use crate::frame::Frame;
 pub struct Mark {
     pub id: AxNodeId,
     pub role: AxRole,
-    pub name: Option<String>,
+    /// The node's name, or its description when the node has no name — an icon-only
+    /// control's only label. `None` when it has neither.
+    pub label: Option<MarkLabel>,
+}
+
+/// A mark's label and which field it came from. Selectors match on `name` only, so a legend
+/// that printed a description in the same quoted slot as a name would invite a `name:` query
+/// that can never match; the renderer keeps them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkLabel {
+    Name(String),
+    Description(String),
 }
 
 const SCALE: i32 = 2; // integer upscale of the 3x5 font cells
@@ -61,7 +72,11 @@ fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
             role: node.role,
             // An icon-only control is exactly the mark that has no name; its description is
             // the only label the legend can show.
-            name: node.name.clone().or_else(|| node.description.clone()),
+            label: match (&node.name, &node.description) {
+                (Some(name), _) => Some(MarkLabel::Name(name.clone())),
+                (None, Some(description)) => Some(MarkLabel::Description(description.clone())),
+                (None, None) => None,
+            },
         });
     }
     for child in &node.children {
@@ -269,7 +284,9 @@ mod tests {
         b.name = None;
         b.description = Some("Bold".into());
         let (_, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
-        assert_eq!(legend[0].name.as_deref(), Some("Bold"));
+        // Description, not Name: the legend renders the two differently because only a name
+        // is matchable by a selector.
+        assert_eq!(legend[0].label, Some(MarkLabel::Description("Bold".into())));
     }
 
     #[test]
@@ -287,7 +304,25 @@ mod tests {
         );
         b.description = Some("Saves and closes".into());
         let (_, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
-        assert_eq!(legend[0].name.as_deref(), Some("Save"));
+        assert_eq!(legend[0].label, Some(MarkLabel::Name("Save".into())));
+    }
+
+    #[test]
+    fn a_mark_with_neither_name_nor_description_has_no_label() {
+        let mut b = node(
+            0,
+            AxRole::Button,
+            "",
+            Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 16,
+            }),
+        );
+        b.name = None;
+        let (_, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        assert_eq!(legend[0].label, None);
     }
 
     #[test]
@@ -306,7 +341,7 @@ mod tests {
         assert_eq!(legend.len(), 1);
         assert_eq!(legend[0].id, AxNodeId(1));
         assert_eq!(legend[0].role, AxRole::Button);
-        assert_eq!(legend[0].name.as_deref(), Some("Save"));
+        assert_eq!(legend[0].label, Some(MarkLabel::Name("Save".into())));
         assert_eq!(px(&out, 10, 10), OUTLINE);
         assert_eq!(px(&out, 10, 40), [0, 0, 0, 255]);
     }

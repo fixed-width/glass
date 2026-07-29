@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use glass_core::{
-    AppSpec, AxNodeId, Glass, MouseButton, WindowGeometry, WindowHint, WindowId, WindowOp,
-    frame_to_webp,
+    AppSpec, AxNodeId, Glass, MarkLabel, MouseButton, WindowGeometry, WindowHint, WindowId,
+    WindowOp, frame_to_webp,
 };
 use serde_json::json;
 
@@ -435,8 +435,12 @@ pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
     } else {
         marks
             .iter()
-            .map(|m| match &m.name {
-                Some(name) => format!("#{} {:?} {name:?}", m.id.0, m.role),
+            // Same spelling as the outline's line: a quoted bare label is the accessible
+            // name a `name:` selector matches, `desc="…"` is a description and matches
+            // nothing.
+            .map(|m| match &m.label {
+                Some(MarkLabel::Name(name)) => format!("#{} {:?} {name:?}", m.id.0, m.role),
+                Some(MarkLabel::Description(d)) => format!("#{} {:?} desc={d:?}", m.id.0, m.role),
                 None => format!("#{} {:?}", m.id.0, m.role),
             })
             .collect::<Vec<_>>()
@@ -1391,6 +1395,51 @@ mod tests {
             OutContent::Text(t) => assert!(t.contains("#1 Button \"Save\""), "legend: {t}"),
             _ => panic!("expected legend text"),
         }
+    }
+
+    #[test]
+    fn a11y_marks_legend_spells_a_description_apart_from_a_name() {
+        use glass_core::{AxRect, Frame};
+        let mut tree = fake_tree();
+        let mut icon = tree.root.children[0].clone();
+        icon.name = None;
+        icon.description = Some("Bold".into());
+        icon.bounds = Some(AxRect {
+            x: 40,
+            y: 10,
+            width: 20,
+            height: 20,
+        });
+        tree.root.children.push(icon);
+        let platform =
+            FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let mut g = glass_with_a11y(platform, tree);
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        let out = a11y_marks(&mut g).unwrap();
+        let OutContent::Text(legend) = &out.0[2] else {
+            panic!("expected legend text")
+        };
+        // A real name rides in the quoted slot a `name:` selector matches; a description
+        // rides in `desc="…"`, exactly as the outline spells it.
+        assert!(legend.contains("#1 Button \"Save\""), "legend: {legend}");
+        assert!(
+            legend.contains("#2 Button desc=\"Bold\""),
+            "legend: {legend}"
+        );
+        assert!(
+            !legend.contains("Button \"Bold\""),
+            "a description must never render as a name: {legend}"
+        );
     }
 
     #[test]

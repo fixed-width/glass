@@ -76,7 +76,7 @@ pub use accessibility::{
 };
 
 pub mod marks;
-pub use marks::Mark;
+pub use marks::{Mark, MarkLabel};
 
 pub mod outline;
 

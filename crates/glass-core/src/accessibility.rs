@@ -815,6 +815,9 @@ pub struct ElementInfo {
     pub id: AxNodeId,
     pub role: AxRole,
     pub name: Option<String>,
+    /// Carried so an element the outline labels `desc="…"` still has a label here. Reported
+    /// only — the selector matched on `name`.
+    pub description: Option<String>,
     pub value: Option<String>,
     pub bounds: Option<AxRect>,
     pub states: AxStates,
@@ -827,6 +830,7 @@ impl ElementInfo {
             id: n.id,
             role: n.role,
             name: n.name.clone(),
+            description: n.description.clone(),
             value: n.value.clone(),
             bounds: n.bounds,
             states: n.states,
