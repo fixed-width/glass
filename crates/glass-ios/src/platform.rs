@@ -345,19 +345,17 @@ const LOG_STREAM_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Discover the device's point→pixel scale, which idb reports for the *target* — so it is
 /// known before the app has drawn anything, unlike the accessibility tree this used to derive
-/// it from. idb derives the screen's point width from this same density, so dividing those
-/// two out again would be the same number by construction, not a second opinion — where a
-/// real second opinion exists, the accessibility tree's own ratio, `IosA11y` prefers it. It
-/// never falls back to a placeholder: an undetermined scale would place every tap at the
-/// wrong point, so the failure surfaces as an error and the caller leaves the session
-/// unstarted.
+/// it from. `IosA11y` prefers the tree's own ratio where it has one, that being the only
+/// independent second opinion: idb derives the screen's point width from this same density.
+/// It never falls back to a placeholder — an undetermined scale would place every tap at the
+/// wrong point, so the failure surfaces as an error and the session is left unstarted.
 fn discover_scale(client: &IdbClient) -> Result<f64> {
     checked_scale(client.describe()?.density)
 }
 
-/// Reject a density that cannot be a scale. Separated from the RPC so this is testable
-/// without a simulator, and kept because idb's field is a plain `double`: a zero from a
-/// target that failed to report one would otherwise divide every tap to infinity.
+/// Reject a density that cannot be a scale: idb's field is a plain `double`, and a zero from
+/// a target that failed to report one would divide every tap to infinity. Split from the RPC
+/// so it is testable without a simulator.
 pub(crate) fn checked_scale(density: f64) -> Result<f64> {
     if !density.is_finite() || density <= 0.0 {
         return Err(GlassError::Backend(format!(
@@ -691,7 +689,7 @@ mod tests {
     #[test]
     fn a_density_that_cannot_be_a_scale_is_rejected() {
         // Guessing here would place every tap at the wrong point, so it is an error and the
-        // caller leaves the session unstarted rather than driven at a wrong scale.
+        // caller leaves the session unstarted.
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let err = match checked_scale(bad) {
                 Ok(scale) => panic!("{bad} must be rejected, was accepted as scale {scale}"),

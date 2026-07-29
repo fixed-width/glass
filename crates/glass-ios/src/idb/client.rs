@@ -212,12 +212,10 @@ impl IdbClient {
 
 #[cfg(test)]
 mod tests {
-    /// glass drives input at two scales that must agree: the target's density, which
-    /// `platform::discover_scale` uses at launch because it is available before the app
-    /// renders (#246), and the ratio the live accessibility tree implies, which `IosA11y`
-    /// prefers because the tree's frames are in exactly those points. Asserting the density
-    /// against idb's own `width_points` would prove nothing — idb derives that field *from*
-    /// the density — so this compares it against the live tree instead.
+    /// glass drives input at two scales that must agree: the target's density, used at launch
+    /// because it is known before the app renders (#246), and the ratio the live accessibility
+    /// tree implies. Do not assert the density against idb's own `width_points` instead — idb
+    /// derives that field *from* the density, so such a check cannot fail.
     ///
     /// ```sh
     /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib density_matches -- --ignored --nocapture
