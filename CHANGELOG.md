@@ -104,6 +104,14 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- iOS: `glass_start` now reads the display scale from the Simulator rather than from the app's
+  accessibility tree, so a launch no longer depends on the app having rendered. The scale is a
+  property of the device (`idb describe` reports it before any app runs), but glass derived it by
+  dividing the capture's pixel width by the accessibility root's point width — a value that is
+  absent for around two seconds after launch, against a retry budget of about half a second. A
+  launch that lost that race failed with `could not determine the iOS display scale from the
+  accessibility tree` and left no session, and the retry loop it needed is gone with the
+  dependency.
 - Android: `glass_a11y_snapshot` no longer fails on the first call against a device that has just
   booted, and a dump that does fail now says why. A device reaches `sys.boot_completed` — all
   `glass_start` waits for — several seconds before `uiautomator` can produce a dump, so the first

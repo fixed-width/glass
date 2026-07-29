@@ -157,6 +157,28 @@ impl IdbClient {
         Ok(resp.into_inner().json)
     }
 
+    /// Describe the target itself: its screen's pixel size, logical-point size and density.
+    /// These are properties of the device, so unlike [`describe_all`](Self::describe_all)
+    /// they are available before the app under test has rendered anything.
+    pub fn describe(&self) -> Result<proto::ScreenDimensions> {
+        self.ensure_off_runtime("idb describe")?;
+        let mut client = self.client.clone();
+        let outcome = self.rt.block_on(async move {
+            tokio::time::timeout(
+                RPC_TIMEOUT,
+                client.describe(proto::TargetDescriptionRequest {
+                    fetch_diagnostics: false,
+                }),
+            )
+            .await
+        });
+        let resp = map_timed("idb describe", RPC_TIMEOUT, outcome)?;
+        resp.into_inner()
+            .target_description
+            .and_then(|t| t.screen_dimensions)
+            .ok_or_else(|| GlassError::Backend("idb describe returned no screen dimensions".into()))
+    }
+
     /// Send one HID event stream (client-streaming `hid`). A tap is two events
     /// (touch DOWN, touch UP); a chord is modifier + key down/up pairs.
     pub fn hid(&self, events: Vec<proto::HidEvent>) -> Result<()> {
@@ -190,6 +212,46 @@ impl IdbClient {
 
 #[cfg(test)]
 mod tests {
+    /// The scale glass drives input at comes from this RPC (see `platform::discover_scale`),
+    /// so this checks the target reports one at all and that it is the screen's own pixel/point
+    /// ratio rather than some unrelated field. Needs no app launched — which is the point:
+    /// the value is a property of the device, available before anything has rendered (#246).
+    ///
+    /// ```sh
+    /// GLASS_IOS_UDID=<udid> cargo test -p glass-ios --lib describe_reports -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator and idb_companion"]
+    fn describe_reports_a_density_that_is_the_screens_pixel_to_point_ratio() {
+        let udid = std::env::var("GLASS_IOS_UDID").expect("set GLASS_IOS_UDID to a booted sim");
+        let companion =
+            crate::idb::companion::IdbCompanion::spawn(&udid).expect("idb_companion must start");
+        let client =
+            IdbClient::connect(companion.socket()).expect("companion must accept a client");
+
+        let d = client
+            .describe()
+            .expect("describe must report screen dimensions");
+        println!(
+            "pixels {}x{}, points {}x{}, density {}",
+            d.width, d.height, d.width_points, d.height_points, d.density
+        );
+        assert!(
+            d.density.is_finite() && d.density > 0.0,
+            "a target that reports no usable density leaves glass unable to place input: {}",
+            d.density
+        );
+        assert!(
+            d.width_points > 0,
+            "a screen with no point width cannot be cross-checked"
+        );
+        assert_eq!(
+            d.density,
+            d.width as f64 / d.width_points as f64,
+            "density must be the screen's own pixel/point ratio"
+        );
+    }
+
     use super::*;
 
     #[test]
