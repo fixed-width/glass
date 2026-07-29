@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader
 use glass_core::accessibility::{AxContext, WalkLimits};
-use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
+use glass_core::{
+    AppSpec, AxRole, AxTree, Platform, SandboxLevel, description_census, role_histogram,
+};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 
 /// Comma-separated bundle ids or `.app` paths to probe, e.g. `com.apple.Preferences`. Unset
@@ -168,6 +170,22 @@ fn print_role_histogram(label: &str, tree: &AxTree) {
     }
 }
 
+/// Print `description_census(tree)`: how many nodes carry a description, and a sample of
+/// which ones — the evidence for whether this platform's secondary label is worth wiring up.
+fn print_description_census(label: &str, tree: &AxTree) {
+    let census = description_census(tree);
+    println!(
+        "{label}: {} of {} nodes described",
+        census.described, census.nodes
+    );
+    for sample in &census.samples {
+        println!(
+            "  {} name={:?} desc={:?}",
+            sample.raw_role, sample.name, sample.description
+        );
+    }
+}
+
 #[test]
 #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator + idb_companion, and \
             GLASS_A11Y_PROBE_APPS naming bundle ids or .app paths"]
@@ -225,6 +243,7 @@ fn role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({target}): {e}"));
         tree.assign_ids();
         print_role_histogram(target, &tree);
+        print_description_census(target, &tree);
         violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
 

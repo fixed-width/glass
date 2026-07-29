@@ -16,7 +16,7 @@ use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
     Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform, PlatformFactory, PointerEvent,
-    WalkLimits, WindowGeometry, WindowHint, WindowOp, role_histogram,
+    WalkLimits, WindowGeometry, WindowHint, WindowOp, description_census, role_histogram,
 };
 use glass_windows::WindowsPlatform;
 
@@ -1134,6 +1134,28 @@ fn render_role_histogram(label: &str, tree: &AxTree) -> String {
     out
 }
 
+/// Render `description_census(tree)` in the same block-returning style as
+/// [`render_role_histogram`], so [`probe_role_histogram`] can fold it into the same
+/// printed/saved report.
+fn render_description_census(label: &str, tree: &AxTree) -> String {
+    use std::fmt::Write as _;
+    let census = description_census(tree);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{label}: {} of {} nodes described",
+        census.described, census.nodes
+    );
+    for sample in &census.samples {
+        let _ = writeln!(
+            out,
+            "  {} name={:?} desc={:?}",
+            sample.raw_role, sample.name, sample.description
+        );
+    }
+    out
+}
+
 /// UIA control-type names glass maps to a role, and that a probed app has actually been seen to
 /// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
 /// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
@@ -1216,6 +1238,10 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
     let block = render_role_histogram(label, &tree);
     print!("{block}");
     report.push_str(&block);
+
+    let census_block = render_description_census(label, &tree);
+    print!("{census_block}");
+    report.push_str(&census_block);
 
     // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
     let mut candidates = Vec::new();

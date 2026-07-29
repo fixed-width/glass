@@ -140,7 +140,7 @@ fn snapshot_finds_gtk_widgets() {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_covers_the_declared_linux_roles() {
-    use glass_core::{AxRole, role_histogram};
+    use glass_core::{AxRole, description_census, role_histogram};
 
     let mut glass = glass_x11_with_a11y();
     glass.start(&fixture_spec()).expect("start fixture");
@@ -151,6 +151,19 @@ fn snapshot_covers_the_declared_linux_roles() {
     glass.stop().expect("stop");
 
     let seen: Vec<AxRole> = role_histogram(&tree).into_iter().map(|t| t.role).collect();
+
+    let census = description_census(&tree);
+    println!(
+        "fixture: {} of {} nodes described",
+        census.described, census.nodes
+    );
+    for sample in &census.samples {
+        println!(
+            "  {} name={:?} desc={:?}",
+            sample.raw_role, sample.name, sample.description
+        );
+    }
+
     // A GTK4 Entry reports AT-SPI `Text`, so the fixture's text input is a `TextArea`, not a
     // `TextField` — see the existing note on the set_value tests in this file.
     for expected in [

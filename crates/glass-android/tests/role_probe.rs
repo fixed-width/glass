@@ -37,7 +37,9 @@ use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidA11y, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
 use glass_core::accessibility::{Accessibility, AxContext, WalkLimits};
-use glass_core::{AppSpec, AxRole, AxTree, Platform, SandboxLevel, role_histogram};
+use glass_core::{
+    AppSpec, AxRole, AxTree, Platform, SandboxLevel, description_census, role_histogram,
+};
 
 /// Comma-separated `package/activity` components to probe, e.g.
 /// `com.android.settings/.Settings`. Each element is exactly what `AppSpec::run`'s first
@@ -178,6 +180,22 @@ fn print_role_histogram(label: &str, tree: &AxTree) {
     }
 }
 
+/// Print `description_census(tree)`: how many nodes carry a description, and a sample of
+/// which ones — the evidence for whether this platform's secondary label is worth wiring up.
+fn print_description_census(label: &str, tree: &AxTree) {
+    let census = description_census(tree);
+    println!(
+        "{label}: {} of {} nodes described",
+        census.described, census.nodes
+    );
+    for sample in &census.samples {
+        println!(
+            "  {} name={:?} desc={:?}",
+            sample.raw_role, sample.name, sample.description
+        );
+    }
+}
+
 /// The components named by [`PROBE_APPS_VAR`], or `None` when the variable is unset or names
 /// nothing — the caller prints what to set and returns without probing.
 fn probe_targets() -> Option<Vec<String>> {
@@ -261,6 +279,7 @@ fn uiautomator_role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({component}): {e}"));
         tree.assign_ids();
         print_role_histogram(component, &tree);
+        print_description_census(component, &tree);
         violations.extend(thin_tree_violation(component, &tree));
         violations.extend(mapped_class_violations(component, &tree));
 
@@ -326,6 +345,7 @@ fn service_role_histogram_probe() {
         tree.assign_ids();
         let label = format!("{component} (service)");
         print_role_histogram(&label, &tree);
+        print_description_census(&label, &tree);
         violations.extend(thin_tree_violation(&label, &tree));
         violations.extend(mapped_class_violations(&label, &tree));
 
