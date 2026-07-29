@@ -140,7 +140,9 @@ fn snapshot_finds_gtk_widgets() {
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn snapshot_covers_the_declared_linux_roles() {
-    use glass_core::{AxRole, description_census, role_histogram};
+    use glass_core::{
+        AxRole, DescriptionSourcing, description_census, description_census_report, role_histogram,
+    };
 
     let mut glass = glass_x11_with_a11y();
     glass.start(&fixture_spec()).expect("start fixture");
@@ -152,17 +154,18 @@ fn snapshot_covers_the_declared_linux_roles() {
 
     let seen: Vec<AxRole> = role_histogram(&tree).into_iter().map(|t| t.role).collect();
 
-    let census = description_census(&tree);
-    println!(
-        "fixture: {} of {} nodes described",
-        census.described, census.nodes
+    // `Sourced`: this reader reads AT-SPI's Description, so the count is about the fixture.
+    print!(
+        "{}",
+        description_census_report("fixture", &tree, DescriptionSourcing::Sourced)
     );
-    for sample in &census.samples {
-        println!(
-            "  {} name={:?} desc={:?}",
-            sample.raw_role, sample.name, sample.description
-        );
-    }
+    // The suite passes no --nocapture, so the block above is invisible on a pass. The fixture
+    // has described widgets, so assert on the count too — a reader that regressed to `None`
+    // everywhere would still print a plausible-looking zero.
+    assert!(
+        description_census(&tree).described() >= 1,
+        "the fixture's described widgets must reach the census"
+    );
 
     // A GTK4 Entry reports AT-SPI `Text`, so the fixture's text input is a `TextArea`, not a
     // `TextField` — see the existing note on the set_value tests in this file.

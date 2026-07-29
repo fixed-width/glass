@@ -86,7 +86,10 @@ pub mod role_histogram;
 pub use role_histogram::{RoleTally, role_histogram};
 
 pub mod description_census;
-pub use description_census::{DescribedSample, DescriptionCensus, description_census};
+pub use description_census::{
+    DescribedSample, DescriptionCensus, DescriptionSourcing, description_census,
+    description_census_report,
+};
 
 pub mod audit;
 pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef, WindowRef};

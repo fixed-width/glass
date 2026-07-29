@@ -30,7 +30,8 @@ use std::time::Duration;
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader
 use glass_core::accessibility::{AxContext, WalkLimits};
 use glass_core::{
-    AppSpec, AxRole, AxTree, Platform, SandboxLevel, description_census, role_histogram,
+    AppSpec, AxRole, AxTree, DescriptionSourcing, Platform, SandboxLevel,
+    description_census_report, role_histogram,
 };
 use glass_ios::{IosPlatform, SimulatorRegistry};
 
@@ -170,22 +171,6 @@ fn print_role_histogram(label: &str, tree: &AxTree) {
     }
 }
 
-/// Print `description_census(tree)`: how many nodes carry a description, and a sample of
-/// which ones — the evidence for whether this platform's secondary label is worth wiring up.
-fn print_description_census(label: &str, tree: &AxTree) {
-    let census = description_census(tree);
-    println!(
-        "{label}: {} of {} nodes described",
-        census.described, census.nodes
-    );
-    for sample in &census.samples {
-        println!(
-            "  {} name={:?} desc={:?}",
-            sample.raw_role, sample.name, sample.description
-        );
-    }
-}
-
 #[test]
 #[ignore = "on-box only: needs a macOS host with a booted iOS Simulator + idb_companion, and \
             GLASS_A11Y_PROBE_APPS naming bundle ids or .app paths"]
@@ -243,7 +228,12 @@ fn role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({target}): {e}"));
         tree.assign_ids();
         print_role_histogram(target, &tree);
-        print_description_census(target, &tree);
+        // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every
+        // app — flip this when it reads accessibilityHint.
+        print!(
+            "{}",
+            description_census_report(target, &tree, DescriptionSourcing::Unsourced)
+        );
         violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
 
