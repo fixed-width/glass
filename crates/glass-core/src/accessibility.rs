@@ -305,10 +305,26 @@ pub struct AxNode {
     /// The backend's native role string — the escape hatch for unmapped roles.
     pub raw_role: String,
     pub name: Option<String>,
+    /// A secondary human label the platform exposes separately from `name`: help/tooltip text
+    /// on desktop, or the human label where `name` is a developer-assigned id. Kept out of
+    /// `name` because `name` is half the [`AxTarget`] fingerprint `set_value` re-walks against
+    /// and has to stay stable.
+    pub description: Option<String>,
     pub value: Option<String>,
     pub states: AxStates,
     pub bounds: Option<AxRect>,
     pub children: Vec<AxNode>,
+}
+
+/// A node's description, or `None` when it would add nothing: empty, whitespace-only, or the
+/// same string as `name` (platforms routinely report both fields with one label in them).
+/// Every backend normalizes through this so the rule cannot drift per-platform.
+pub fn normalize_description(raw: &str, name: Option<&str>) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || Some(trimmed) == name.map(str::trim) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Bounds on how much of an app's accessibility tree a backend walks. Shared by every OS
@@ -1616,6 +1632,7 @@ mod tests {
             role,
             raw_role: format!("{role:?}").to_lowercase(),
             name: Some(name.into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -1656,6 +1673,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Settings".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -1813,6 +1831,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("App".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -1851,6 +1870,7 @@ mod tests {
             role: AxRole::Group,
             raw_role: "panel".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates {
                 focusable: true,
@@ -1865,6 +1885,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("App".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -2212,5 +2233,34 @@ mod tests {
         };
         assert_eq!(p.label(), "pointer");
         assert_eq!(p.native_fallback(), Some("reason"));
+    }
+
+    #[test]
+    fn normalize_description_drops_what_adds_nothing() {
+        // Empty and whitespace-only are "the platform exposed no description".
+        assert_eq!(normalize_description("", None), None);
+        assert_eq!(normalize_description("   ", None), None);
+        // A description identical to the name would print the same label twice per line.
+        assert_eq!(normalize_description("Save", Some("Save")), None);
+        // Equality is judged after trimming, so surrounding whitespace cannot smuggle a duplicate in.
+        assert_eq!(normalize_description("  Save  ", Some("Save")), None);
+    }
+
+    #[test]
+    fn normalize_description_keeps_an_informative_value() {
+        assert_eq!(
+            normalize_description("  Saves and closes  ", Some("Save")),
+            Some("Saves and closes".to_string())
+        );
+        // With no name, any non-empty description is the only label the node has.
+        assert_eq!(
+            normalize_description("Bold", None),
+            Some("Bold".to_string())
+        );
+        // Case and inner spacing are the platform's; only exact duplicates are dropped.
+        assert_eq!(
+            normalize_description("save", Some("Save")),
+            Some("save".to_string())
+        );
     }
 }

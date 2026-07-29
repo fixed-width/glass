@@ -115,6 +115,7 @@ mod tests {
             role,
             raw_role: String::new(),
             name: name.map(Into::into),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,

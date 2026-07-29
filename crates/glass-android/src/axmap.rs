@@ -124,6 +124,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
         role: AxRole::Window,
         raw_role: "hierarchy".into(),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -209,6 +210,8 @@ fn map_node(
         role,
         raw_role: class.to_string(),
         name,
+        // This reader does not read the platform's description yet.
+        description: None,
         value,
         states,
         bounds: parse_bounds(attr("bounds"), window),

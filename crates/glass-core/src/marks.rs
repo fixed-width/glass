@@ -177,6 +177,7 @@ mod tests {
             role,
             raw_role: String::new(),
             name: Some(name.into()),
+            description: None,
             value: None,
             states: Default::default(),
             bounds,
@@ -213,6 +214,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: Default::default(),
             bounds: Some(AxRect {

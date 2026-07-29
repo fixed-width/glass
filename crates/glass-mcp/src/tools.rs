@@ -726,6 +726,7 @@ pub(crate) mod testutil {
             role: AxRole::Button,
             raw_role: "push button".into(),
             name: Some("Save".into()),
+            description: None,
             value: None,
             states: AxStates {
                 focusable: true,
@@ -745,6 +746,7 @@ pub(crate) mod testutil {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -765,6 +767,7 @@ pub(crate) mod testutil {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {

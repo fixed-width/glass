@@ -122,6 +122,7 @@ pub fn build_tree(
         role: AxRole::Window,
         raw_role: "AXWindow".into(),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -232,6 +233,8 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
         role,
         raw_role: ax_type,
         name,
+        // This reader does not read the platform's description yet.
+        description: None,
         value,
         states,
         bounds,

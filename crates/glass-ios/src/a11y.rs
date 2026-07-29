@@ -119,6 +119,7 @@ mod tests {
             role,
             raw_role: String::new(),
             name: Some(name.into()),
+            description: None,
             value: None,
             states: AxStates {
                 editable: true,
@@ -135,6 +136,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "AXWindow".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {

@@ -192,6 +192,8 @@ fn walk(
         role: crate::mapping::map_role(ct_id, facts.checkable),
         raw_role,
         name,
+        // This reader does not read the platform's description yet.
+        description: None,
         value,
         states,
         bounds,

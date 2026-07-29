@@ -424,6 +424,8 @@ fn walk(
         role,
         raw_role,
         name,
+        // This reader does not read the platform's description yet.
+        description: None,
         value,
         states,
         bounds,

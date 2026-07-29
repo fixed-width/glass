@@ -1470,6 +1470,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "window".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -1483,6 +1484,7 @@ mod tests {
                 role: AxRole::Button,
                 raw_role: "button".into(),
                 name: Some("5".into()),
+                description: None,
                 value: None,
                 states: AxStates::default(),
                 bounds: Some(bounds),
@@ -1594,6 +1596,7 @@ mod tests {
             role: AxRole::Label,
             raw_role: "label".into(),
             name: Some("nobounds".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -1718,6 +1721,7 @@ mod tests {
             role: AxRole::Button,
             raw_role: "button".into(),
             name: Some("hidden".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -1741,6 +1745,7 @@ mod tests {
             role: AxRole::Button,
             raw_role: "button".into(),
             name: Some("hidden".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,
@@ -1820,6 +1825,7 @@ mod tests {
             role,
             raw_role: name.into(),
             name: Some(name.into()),
+            description: None,
             value: None,
             states: AxStates {
                 checkable,
@@ -1833,6 +1839,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "window".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -1922,6 +1929,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "window".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -1935,6 +1943,7 @@ mod tests {
                 role: AxRole::CheckBox,
                 raw_role: "checkbox".into(),
                 name: Some("labeled".into()),
+                description: None,
                 value: None,
                 states: AxStates {
                     checkable: true,
@@ -1973,6 +1982,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "window".into(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -1986,6 +1996,7 @@ mod tests {
                 role: AxRole::CheckBox,
                 raw_role: "checkbox".into(),
                 name: Some("tight".into()),
+                description: None,
                 value: None,
                 states: AxStates {
                     checkable: true,
@@ -2244,6 +2255,7 @@ mod tests {
             role: AxRole::ListItem,
             raw_role: "list item".into(),
             name: Some("Globex".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -2259,6 +2271,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -2723,6 +2736,7 @@ mod tests {
             role: AxRole::CheckBox,
             raw_role: "switch".into(),
             name: Some("Sw".into()),
+            description: None,
             value: None,
             states: AxStates {
                 checkable: true,
@@ -2742,6 +2756,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {
@@ -2885,6 +2900,7 @@ mod tests {
             role: AxRole::CheckBox,
             raw_role: "switch".into(),
             name: Some("Sw".into()),
+            description: None,
             value: None,
             states: AxStates {
                 checkable: true,
@@ -2906,6 +2922,7 @@ mod tests {
             role: AxRole::Window,
             raw_role: "frame".into(),
             name: Some("Win".into()),
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: Some(AxRect {

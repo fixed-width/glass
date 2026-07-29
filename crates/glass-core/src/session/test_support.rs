@@ -373,6 +373,7 @@ pub(crate) fn fake_tree() -> AxTree {
         role: AxRole::Button,
         raw_role: "push button".into(),
         name: Some("Save".into()),
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -388,6 +389,7 @@ pub(crate) fn fake_tree() -> AxTree {
         role: AxRole::Window,
         raw_role: "frame".into(),
         name: Some("Win".into()),
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -432,6 +434,7 @@ pub(crate) fn ax_node(
         role,
         raw_role: format!("{role:?}"),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds,
@@ -593,6 +596,7 @@ pub(crate) fn tree_with(win_w: u32, win_h: u32, children: Vec<AxNode>) -> AxTree
         role: AxRole::Window,
         raw_role: "frame".into(),
         name: Some("Win".into()),
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -648,6 +652,7 @@ pub(crate) fn fake_tree_with_popover_option() -> AxTree {
         role: AxRole::ListItem,
         raw_role: "list item".into(),
         name: Some("Globex".into()),
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -663,6 +668,7 @@ pub(crate) fn fake_tree_with_popover_option() -> AxTree {
         role: AxRole::List,
         raw_role: "list".into(),
         name: None,
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {
@@ -678,6 +684,7 @@ pub(crate) fn fake_tree_with_popover_option() -> AxTree {
         role: AxRole::Window,
         raw_role: "frame".into(),
         name: Some("Win".into()),
+        description: None,
         value: None,
         states: AxStates::default(),
         bounds: Some(AxRect {

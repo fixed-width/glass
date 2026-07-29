@@ -427,6 +427,7 @@ async fn walk(
         role: map_role(role),
         raw_role,
         name,
+        description: None,
         value,
         states,
         bounds,

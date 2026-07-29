@@ -68,6 +68,7 @@ mod tests {
             role,
             raw_role: raw.to_string(),
             name: None,
+            description: None,
             value: None,
             states: AxStates::default(),
             bounds: None,

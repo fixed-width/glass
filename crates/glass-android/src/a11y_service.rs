@@ -96,6 +96,8 @@ fn json_to_node(
         // name: the element's own text label, falling back to content-description.
         // value: editable text content only (content-description is not user-entered text).
         name: text.or(desc).map(str::to_string),
+        // This reader does not read the platform's description yet.
+        description: None,
         value: text.map(str::to_string),
         states: AxStates {
             enabled: flag("enabled"),
