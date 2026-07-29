@@ -104,6 +104,15 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- Android: `glass_a11y_snapshot` no longer fails on the first call against a device that has just
+  booted, and a dump that does fail now says why. A device reaches `sys.boot_completed` — all
+  `glass_start` waits for — several seconds before `uiautomator` can produce a dump, so the first
+  snapshot now waits for it (up to 30s, once per session; later snapshots do not wait). When a dump
+  genuinely fails, the error names the dump and quotes its own reason —
+  `uiautomator dump did not write /sdcard/glass_dump.xml: ERROR: null root node returned by
+  UiTestAutomationBridge.` — where it used to report the unrelated read of the file the dump had
+  never written (`cat: /sdcard/glass_dump.xml: No such file or directory`). `glass_doctor --deep`
+  keeps its single attempt, so it still reports whether the device can dump right now.
 - Linux (`backend: "wayland"`): glass now recovers a window an X11 app opened that the compositor
   never surfaced. Under load, a window the app maps can reach the compositor's Xwayland server and
   never reach the compositor itself — sway has no view for it, so `glass_list_windows` leaves it
