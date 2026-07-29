@@ -59,7 +59,9 @@ fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
         legend.push(Mark {
             id: node.id,
             role: node.role,
-            name: node.name.clone(),
+            // An icon-only control is exactly the mark that has no name; its description is
+            // the only label the legend can show.
+            name: node.name.clone().or_else(|| node.description.clone()),
         });
     }
     for child in &node.children {
@@ -228,6 +230,64 @@ mod tests {
         let mut t = AxTree::new(root);
         t.assign_ids();
         t
+    }
+
+    /// A Window containing exactly `child`, ids assigned.
+    fn tree_of(child: AxNode) -> AxTree {
+        let root = AxNode {
+            children: vec![child],
+            ..node(
+                0,
+                AxRole::Window,
+                "Win",
+                Some(AxRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                }),
+            )
+        };
+        let mut t = AxTree::new(root);
+        t.assign_ids();
+        t
+    }
+
+    #[test]
+    fn an_unnamed_mark_takes_its_label_from_the_description() {
+        let mut b = node(
+            0,
+            AxRole::Button,
+            "",
+            Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 16,
+            }),
+        );
+        b.name = None;
+        b.description = Some("Bold".into());
+        let (_, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        assert_eq!(legend[0].name.as_deref(), Some("Bold"));
+    }
+
+    #[test]
+    fn a_named_mark_keeps_its_name() {
+        let mut b = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 16,
+            }),
+        );
+        b.description = Some("Saves and closes".into());
+        let (_, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        assert_eq!(legend[0].name.as_deref(), Some("Save"));
     }
 
     #[test]
