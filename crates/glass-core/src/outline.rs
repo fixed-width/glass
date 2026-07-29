@@ -37,8 +37,9 @@ fn is_scaffolding(node: &AxNode) -> bool {
         && node.children.len() == 1
 }
 
-/// Write one node's line: `#<id> <Role> "<name>" (<x>,<y> <w>x<h>) [<states>]`, name/bounds/
-/// states elided when absent, two spaces of indent per depth level.
+/// Write one node's line: `#<id> <Role> "<name>" desc="<description>" (<x>,<y> <w>x<h>)
+/// [<states>]`, name/description/bounds/states elided when absent, two spaces of indent per
+/// depth level.
 ///
 /// A node glass has no role mapping for renders as `Other(<native token>)` — the AT-SPI role,
 /// UIA control-type name, AX role string, Android widget class or iOS role string the backend
@@ -57,6 +58,9 @@ pub(crate) fn write_line(node: &AxNode, depth: usize, out: &mut String) {
     }
     if let Some(name) = &node.name {
         let _ = write!(out, " {name:?}");
+    }
+    if let Some(description) = &node.description {
+        let _ = write!(out, " desc={description:?}");
     }
     if let Some(b) = &node.bounds {
         let _ = write!(out, " ({},{} {}x{})", b.x, b.y, b.width, b.height);
@@ -120,6 +124,14 @@ mod tests {
             states: AxStates::default(),
             bounds: None,
             children: vec![],
+        }
+    }
+
+    /// `node`, plus a description.
+    fn described(role: AxRole, name: Option<&str>, description: &str) -> AxNode {
+        AxNode {
+            description: Some(description.into()),
+            ..node(role, name)
         }
     }
 
@@ -304,6 +316,45 @@ mod tests {
         n.raw_role = "AXDisclosureTriangle".into();
         let t = tree_of(n);
         assert_eq!(render_compact(&t), t.to_outline());
+    }
+
+    #[test]
+    fn a_description_renders_between_the_name_and_the_bounds() {
+        let mut n = described(AxRole::Button, Some("Save"), "Saves and closes the sheet");
+        n.bounds = Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        });
+        let out = render_compact(&tree_of(n));
+        assert!(
+            out.contains(r#"Button "Save" desc="Saves and closes the sheet" (0,0 80x24)"#),
+            "unexpected line: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_element_still_renders_its_description() {
+        let out = render_compact(&tree_of(described(AxRole::Button, None, "Bold")));
+        assert!(
+            out.contains(r#"Button desc="Bold""#),
+            "unexpected line: {out}"
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_description_renders_exactly_as_before() {
+        let out = render_compact(&tree_of(node(AxRole::Button, Some("Save"))));
+        assert!(!out.contains("desc="), "unexpected line: {out}");
+    }
+
+    #[test]
+    fn to_outline_renders_the_description_too() {
+        // Both renders share write_line; this pins that they cannot drift on this field.
+        let t = tree_of(described(AxRole::Button, Some("Save"), "Saves and closes"));
+        assert_eq!(t.to_outline(), render_compact(&t));
+        assert!(t.to_outline().contains(r#"desc="Saves and closes""#));
     }
 
     #[test]
