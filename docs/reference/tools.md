@@ -480,11 +480,13 @@ what each backend can produce.
 
 Screenshot of the active window with a numbered Set-of-Mark box on each interactable element, plus a
 text legend (`#<id> <Role> "<name>"`). An element with no name but a description is labelled from it
-and rendered as `#<id> <Role> desc="<description>"`, the same spelling the snapshot outline uses —
-so the legend never shows a description where a matchable `name` would be. No parameters. Returns `{count}` — the number of marked
-elements; the image and the legend text follow as siblings (the legend untrusted-wrapped), per the
-image ordering above. Same ids as `glass_a11y_snapshot`. The box is only as precise as the toolkit's
-a11y geometry (can drift ~10–20px), but the `#id` and the click are exact.
+and rendered as `#<id> <Role> desc="<description>"`, the same spelling the snapshot outline uses, so
+the legend never shows a description where a matchable `name` would be.
+
+No parameters. Returns `{count}` — the number of marked elements; the image and the legend text
+follow as siblings (the legend untrusted-wrapped), per the image ordering above. Same ids as
+`glass_a11y_snapshot`. The box is only as precise as the toolkit's a11y geometry (can drift
+~10–20px), but the `#id` and the click are exact.
 
 ### `glass_click_element`
 

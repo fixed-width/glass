@@ -69,8 +69,8 @@ mod macos_main {
     const CLICK_SETTLE: Duration = Duration::from_millis(400);
 
     /// The four elements the fixture exposes, asserted as substrings of the tree outline.
-    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, using only `name` (never
-    /// `value`) — so the editable field's stable label (`setAccessibilityLabel("Note")`,
+    /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, rendering `name` and never
+    /// `value` — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
     /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
     const NEEDLES: [&str; 4] = [
