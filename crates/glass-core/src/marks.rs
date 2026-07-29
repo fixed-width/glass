@@ -78,9 +78,9 @@ fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
     let top = b.y.max(0);
     let right = (b.x + b.width as i32).min(fw);
     let bottom = (b.y + b.height as i32).min(fh);
-    if right > left && bottom > top {
-        draw_rect_outline(frame, left, top, right - left, bottom - top, OUTLINE);
-    }
+    // No emptiness check here: draw_rect_outline already returns on a non-positive extent,
+    // and a second guard in front of it is a branch no test can distinguish.
+    draw_rect_outline(frame, left, top, right - left, bottom - top, OUTLINE);
 
     // 2. numbered chip, anchored OUTSIDE the element's top-left (up & left), then
     //    clamped into the frame so an edge-hugging element still shows its chip.
@@ -271,6 +271,193 @@ mod tests {
         let (out, legend) = render(&frame, &label_only);
         assert!(legend.is_empty());
         assert_eq!(out, frame);
+    }
+
+    /// Exact chip geometry. The constants make it computable: PAD 1, SCALE 2, DIGIT_W 3,
+    /// DIGIT_H 5, DIGIT_GAP 1, so a one-digit chip is 8x12 and each extra digit adds 8.
+    #[test]
+    fn chip_is_anchored_above_left_of_the_element_at_a_computed_size() {
+        let bg = [0u8, 0, 0, 255];
+        let mut f = Frame::solid(60, 60, bg);
+        draw_mark(
+            &mut f,
+            AxRect {
+                x: 20,
+                y: 20,
+                width: 10,
+                height: 10,
+            },
+            1,
+        );
+
+        // One digit: 8 wide, 12 tall, its bottom-right touching the element's top-left.
+        assert_eq!(px(&f, 12, 8), OUTLINE, "chip top-left");
+        assert_eq!(px(&f, 19, 19), OUTLINE, "chip bottom-right");
+        assert_eq!(px(&f, 11, 8), bg, "one column left of the chip");
+        assert_eq!(px(&f, 12, 7), bg, "one row above the chip");
+        assert_eq!(px(&f, 20, 8), bg, "one column right of the chip");
+
+        // The element's own outline: x 20..30, so its right border is column 29 and column 30
+        // is clear. Without this the box's width is unpinned.
+        assert_eq!(px(&f, 20, 25), OUTLINE, "outline left border");
+        assert_eq!(px(&f, 19, 25), bg, "one column left of the outline");
+        assert_eq!(px(&f, 25, 20), OUTLINE, "outline top border");
+        assert_eq!(px(&f, 29, 25), OUTLINE, "outline right border");
+        assert_eq!(px(&f, 30, 25), bg, "one column past the outline");
+        assert_eq!(px(&f, 25, 29), OUTLINE, "outline bottom border");
+        assert_eq!(px(&f, 25, 30), bg, "one row past the outline");
+
+        // Digit '1' lights font column 1 of row 0, a SCALE-sized block at (cx+PAD+SCALE, cy+PAD)
+        // = (15, 9). Pins where the glyphs start, which the stride test cannot.
+        assert_eq!(px(&f, 15, 9), DIGIT_FG, "first digit pixel");
+        assert_eq!(px(&f, 13, 9), OUTLINE, "chip padding, not glyph");
+
+        // Two digits: 8 wider, same height, so it starts 8 further left.
+        let mut g = Frame::solid(60, 60, bg);
+        draw_mark(
+            &mut g,
+            AxRect {
+                x: 20,
+                y: 20,
+                width: 10,
+                height: 10,
+            },
+            42,
+        );
+        assert_eq!(px(&g, 4, 8), OUTLINE, "two-digit chip top-left");
+        assert_eq!(px(&g, 3, 8), bg, "one column left of the two-digit chip");
+        assert_eq!(px(&g, 4, 7), bg, "height does not change with digit count");
+    }
+
+    /// Digits step by (DIGIT_W + DIGIT_GAP) * SCALE = 8. Asserted with a repeated digit, so
+    /// the two glyphs are identical and any difference is the stride alone.
+    #[test]
+    fn digits_are_laid_out_one_stride_apart() {
+        let mut f = Frame::solid(60, 60, [0, 0, 0, 255]);
+        draw_mark(
+            &mut f,
+            AxRect {
+                x: 30,
+                y: 30,
+                width: 10,
+                height: 10,
+            },
+            11,
+        );
+        // chip_w for two digits is 16, so cx = 14, and the digits start at cx + PAD = 15.
+        for row in 0..10u32 {
+            for col in 0..6u32 {
+                assert_eq!(
+                    px(&f, 15 + col, 19 + row),
+                    px(&f, 23 + col, 19 + row),
+                    "glyphs differ at ({col},{row}); the stride is wrong"
+                );
+            }
+        }
+        // And the two are not simply both blank.
+        let lit = (0..10u32)
+            .flat_map(|r| (0..6u32).map(move |c| (c, r)))
+            .filter(|&(c, r)| px(&f, 15 + c, 19 + r) == DIGIT_FG)
+            .count();
+        assert!(lit > 0, "no digit pixels were drawn at all");
+    }
+
+    #[test]
+    fn digits_of_splits_and_orders() {
+        assert_eq!(digits_of(0), vec![0]);
+        assert_eq!(digits_of(7), vec![7]);
+        // Most significant first, so a missing reverse shows up here.
+        assert_eq!(digits_of(42), vec![4, 2]);
+        assert_eq!(digits_of(507), vec![5, 0, 7]);
+    }
+
+    /// A zero-area element is skipped entirely: it can carry no outline, and a chip with no
+    /// box to point at is worse than nothing.
+    #[test]
+    fn zero_area_elements_are_not_marked() {
+        for bounds in [
+            AxRect {
+                x: 10,
+                y: 10,
+                width: 0,
+                height: 10,
+            },
+            AxRect {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 0,
+            },
+        ] {
+            let (out, legend) = render(&Frame::solid(40, 40, [0, 0, 0, 255]), &one_button(bounds));
+            assert!(legend.is_empty(), "{bounds:?} produced a legend entry");
+            assert_eq!(
+                out,
+                Frame::solid(40, 40, [0, 0, 0, 255]),
+                "{bounds:?} drew something"
+            );
+        }
+    }
+
+    /// An element entirely off the left/top of the frame has no in-frame box, so no outline is
+    /// drawn — but it still earns a legend entry and a clamped chip.
+    #[test]
+    fn a_fully_offscreen_box_draws_no_outline() {
+        let bg = [0u8, 0, 0, 255];
+        let mut f = Frame::solid(40, 40, bg);
+        draw_mark(
+            &mut f,
+            AxRect {
+                x: -50,
+                y: -50,
+                width: 10,
+                height: 10,
+            },
+            1,
+        );
+        // The chip clamps to the origin; everything past it is untouched.
+        assert_eq!(px(&f, 39, 39), bg);
+        assert_eq!(px(&f, 20, 20), bg);
+    }
+
+    /// The outline is a border, not a filled box.
+    #[test]
+    fn outline_draws_only_its_border() {
+        let bg = [0u8, 0, 0, 255];
+        let mut f = Frame::solid(20, 20, bg);
+        draw_rect_outline(&mut f, 4, 4, 6, 6, OUTLINE);
+        assert_eq!(px(&f, 4, 4), OUTLINE, "top-left");
+        assert_eq!(px(&f, 9, 9), OUTLINE, "bottom-right, so w-1/h-1 are right");
+        assert_eq!(px(&f, 9, 4), OUTLINE, "top-right");
+        assert_eq!(px(&f, 4, 9), OUTLINE, "bottom-left");
+        assert_eq!(px(&f, 6, 6), bg, "interior stays clear");
+        assert_eq!(px(&f, 10, 4), bg, "one past the right edge");
+
+        // A degenerate rect draws nothing rather than a stray line.
+        let before = f.clone();
+        draw_rect_outline(&mut f, 2, 2, 0, 5, OUTLINE);
+        draw_rect_outline(&mut f, 2, 2, 5, 0, OUTLINE);
+        assert_eq!(f, before);
+    }
+
+    /// Out-of-frame writes are dropped on every side, and the in-frame index is exact.
+    #[test]
+    fn put_px_clips_and_addresses_correctly() {
+        let bg = [0u8, 0, 0, 255];
+        let mut f = Frame::solid(4, 3, bg);
+        for (x, y) in [(-1, 0), (0, -1), (4, 0), (0, 3)] {
+            put_px(&mut f, x, y, OUTLINE);
+        }
+        assert_eq!(
+            f,
+            Frame::solid(4, 3, bg),
+            "an out-of-frame write landed somewhere"
+        );
+
+        // Row-major: (1,2) is index (2 * 4 + 1) * 4.
+        put_px(&mut f, 1, 2, OUTLINE);
+        assert_eq!(px(&f, 1, 2), OUTLINE);
+        assert_eq!(px(&f, 2, 1), bg, "x and y are transposed");
     }
 
     /// A single interactable Button with the given bounds, ids assigned.
