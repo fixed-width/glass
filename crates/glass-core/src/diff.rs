@@ -833,6 +833,123 @@ mod tests {
         assert_eq!(r.bbox, None);
     }
 
+    /// Each channel weighted by its own coefficient and summed. Asserted on the primaries
+    /// rather than on white, where the coefficients sum to 1 and any mix-up still yields 255.
+    #[test]
+    fn yiq_conversion_weights_each_channel() {
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} != {want}");
+        near(rgb2y(255.0, 0.0, 0.0), 76.2183);
+        near(rgb2y(0.0, 255.0, 0.0), 149.5887);
+        near(rgb2y(0.0, 0.0, 255.0), 29.1930);
+        near(rgb2y(255.0, 255.0, 255.0), 255.0);
+
+        // I and Q subtract two of their three channels; a sign flip lands on the wrong side
+        // of zero, which an absolute-value assertion would miss.
+        near(rgb2i(255.0, 0.0, 0.0), 151.9744);
+        near(rgb2i(0.0, 255.0, 0.0), -69.9149);
+        near(rgb2i(0.0, 0.0, 255.0), -82.0595);
+        near(rgb2q(255.0, 0.0, 0.0), 53.9249);
+        near(rgb2q(0.0, 255.0, 0.0), -133.2674);
+        near(rgb2q(0.0, 0.0, 255.0), 79.3425);
+
+        // Grey carries no chroma, so both chroma axes are zero however the terms are ordered.
+        near(rgb2i(255.0, 255.0, 255.0), 0.0);
+        near(rgb2q(255.0, 255.0, 255.0), 0.0);
+    }
+
+    /// Opaque returns the raw channels; anything translucent is composited over neutral grey.
+    #[test]
+    fn blended_rgb_composites_only_when_translucent() {
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} != {want}");
+
+        let opaque = [200u8, 100, 50, 255];
+        let (r, g, b) = blended_rgb(&opaque, 0);
+        near(r, 200.0);
+        near(g, 100.0);
+        near(b, 50.0);
+
+        // Fully transparent is the background itself, whatever the colour channels say.
+        let clear = [200u8, 100, 50, 0];
+        let (r, g, b) = blended_rgb(&clear, 0);
+        near(r, 128.0);
+        near(g, 128.0);
+        near(b, 128.0);
+
+        // Half alpha lands between the two, and on the side the channel sits: 200 is above
+        // the background and 0 below it, so an inverted blend would show up as a swap.
+        let half = [200u8, 0, 128, 128];
+        let (r, g, b) = blended_rgb(&half, 0);
+        near(r, 164.1412);
+        near(g, 63.7490);
+        near(b, 128.0);
+    }
+
+    /// `y_only` is the signed luminance difference, and it is what anti-alias detection reads.
+    #[test]
+    fn color_delta_y_only_is_the_signed_luminance_difference() {
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} != {want}");
+        let black = [0u8, 0, 0, 255];
+        let white = [255u8, 255, 255, 255];
+        near(color_delta(&black, 0, &white, 0, true), -255.0);
+        near(color_delta(&white, 0, &black, 0, true), 255.0);
+
+        // Pure red against black differs in luminance by red's own Y weight, so `y_only`
+        // cannot be returning the full three-axis delta.
+        let red = [255u8, 0, 0, 255];
+        near(color_delta(&red, 0, &black, 0, true), 76.2183);
+
+        // The full delta weights all three axes, so it is far larger than luminance alone.
+        let full = color_delta(&red, 0, &black, 0, false);
+        assert!(
+            full.abs() > 10_000.0,
+            "full delta should weight I and Q too, got {full}"
+        );
+    }
+
+    /// A pixel counts a sibling only where the whole RGBA quad matches; a frame edge counts
+    /// as one on its own, which is what lets a corner pixel qualify.
+    #[test]
+    fn has_many_siblings_counts_identical_neighbours() {
+        let px = |c: [u8; 4]| c;
+        // 3x3, uniform: the centre has eight identical neighbours.
+        let uniform: Vec<u8> = std::iter::repeat_n(px([10, 20, 30, 255]), 9)
+            .flatten()
+            .collect();
+        assert!(has_many_siblings(&uniform, 1, 1, 3, 3));
+
+        // Centre differs from all eight, and is not on an edge, so it has none.
+        let mut lone = uniform.clone();
+        lone[16..20].copy_from_slice(&[99, 99, 99, 255]);
+        assert!(!has_many_siblings(&lone, 1, 1, 3, 3));
+
+        // Alpha is part of the comparison: same RGB, different A, is not a sibling.
+        let mut alpha: Vec<u8> = std::iter::repeat_n(px([10, 20, 30, 255]), 9)
+            .flatten()
+            .collect();
+        for i in 0..9 {
+            if i != 4 {
+                alpha[i * 4 + 3] = 128;
+            }
+        }
+        assert!(!has_many_siblings(&alpha, 1, 1, 3, 3));
+
+        // Exactly two matches: the threshold is "more than two", so this is still false. All
+        // the cases above have either eight matches or none, and those cannot tell a
+        // `zeroes > 2` from a `zeroes < 2` — both answer the same on either side.
+        let mut two: Vec<u8> = std::iter::repeat_n(px([99, 99, 99, 255]), 9)
+            .flatten()
+            .collect();
+        let centre = [10u8, 20, 30, 255];
+        two[16..20].copy_from_slice(&centre);
+        two[0..4].copy_from_slice(&centre);
+        two[4..8].copy_from_slice(&centre);
+        assert!(!has_many_siblings(&two, 1, 1, 3, 3));
+
+        // And one more match tips it over.
+        two[8..12].copy_from_slice(&centre);
+        assert!(has_many_siblings(&two, 1, 1, 3, 3));
+    }
+
     #[test]
     fn color_delta_properties() {
         let black = [0u8, 0, 0, 255];
