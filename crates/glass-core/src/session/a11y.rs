@@ -477,7 +477,10 @@ impl Glass {
         // Opening focuses the current selection; step from it to the target, then Enter.
         let current_idx = options.iter().position(|(_, sel)| *sel).unwrap_or(0);
         let delta = target_idx as i32 - current_idx as i32;
-        let chord = if delta >= 0 { "Down" } else { "Up" };
+        // `is_negative` rather than a comparison against 0: the two differ only at delta == 0,
+        // where the loop below runs zero times and the chord is never sent, so which comparison
+        // is written cannot be observed.
+        let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
             self.key(&KeyEvent::Chord(chord.to_string()))?;
         }
@@ -797,6 +800,39 @@ mod tests {
             Some(AxNodeId(1)),
             "a tie must not be taken by the later node"
         );
+        // The distance is a difference of coordinates, squared and summed. Candidates near the
+        // origin cannot tell that apart from a ratio or a product: put the target far from the
+        // origin and give each candidate its whole error on one axis, so a divide collapses one
+        // term to nothing and a product collapses both.
+        let far_x = ax_node(4, AxRole::ComboBox, Some(rect(-5, 995, 10, 10)), vec![]);
+        let near_y = ax_node(5, AxRole::ComboBox, Some(rect(995, 985, 10, 10)), vec![]);
+        let root_x = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![far_x, near_y],
+        );
+        let t = rect(995, 995, 10, 10);
+        assert_eq!(
+            find_combo_near(&root_x, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(5)),
+            "1000 away on x must beat 10 away on y only by difference, not by ratio"
+        );
+
+        // Mirrored, so the same collapse on the other axis is caught too.
+        let far_y = ax_node(6, AxRole::ComboBox, Some(rect(995, -5, 10, 10)), vec![]);
+        let near_x = ax_node(7, AxRole::ComboBox, Some(rect(985, 995, 10, 10)), vec![]);
+        let root_y = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![far_y, near_x],
+        );
+        assert_eq!(
+            find_combo_near(&root_y, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(7))
+        );
+
         // No target: the first combo, the documented single-combo fallback.
         assert_eq!(
             find_combo_near(&root, None).map(|n| n.id),
@@ -831,6 +867,23 @@ mod tests {
             find_checkable_near(&root, Some(&near_a)).map(|n| n.id),
             Some(AxNodeId(1))
         );
+        // Same coordinate-collapse cases as for combos: a difference, not a ratio or product.
+        let mut fx = ax_node(4, AxRole::CheckBox, Some(rect(-5, 995, 10, 10)), vec![]);
+        fx.states.checkable = true;
+        let mut ny = ax_node(5, AxRole::CheckBox, Some(rect(995, 985, 10, 10)), vec![]);
+        ny.states.checkable = true;
+        let far_root = ax_node(
+            0,
+            AxRole::Window,
+            Some(rect(0, 0, 2000, 2000)),
+            vec![fx, ny],
+        );
+        let t = rect(995, 995, 10, 10);
+        assert_eq!(
+            find_checkable_near(&far_root, Some(&t)).map(|n| n.id),
+            Some(AxNodeId(5))
+        );
+
         // Ties keep the first seen here too, so the comparison is strict.
         let equidistant = rect(50, 50, 10, 10);
         assert_eq!(
@@ -1983,6 +2036,47 @@ mod tests {
         );
     }
 
+    /// The click is translated into the popover's container, on both axes. The validated
+    /// fixture's container sits at x=0, where subtracting and adding its origin agree, so this
+    /// repeats it with the container offset horizontally.
+    #[test]
+    fn click_element_translates_the_x_axis_into_the_container_too() {
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let a = window_info(
+            1,
+            WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 340,
+                height: 300,
+            },
+            true,
+        );
+        let b = window_info(
+            2,
+            WindowGeometry {
+                x: -3,
+                y: 220,
+                width: 326,
+                height: 135,
+            },
+            false,
+        );
+        let platform = FakePlatform::new(340, 300)
+            .with_windows(vec![a, b])
+            .with_click_log(clicks.clone());
+        let mut g = glass_with_a11y(platform, fake_tree_with_offset_popover_option());
+        g.start(&spec()).unwrap();
+        let tree = g.a11y_snapshot(None).unwrap();
+        let globex_id = tree.root.children[0].children[0].id;
+
+        g.click_element(globex_id).unwrap();
+
+        // Item at x=70 inside a container at x=40 is 30 in; y is unchanged from the validated
+        // fixture at 248 - 194.
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((30, 54)));
+    }
+
     #[test]
     fn click_element_routes_into_owning_popover_and_restores_active_window() {
         let clicks = Arc::new(Mutex::new(Vec::new()));
@@ -2281,6 +2375,107 @@ mod tests {
             ..ax_node(0, AxRole::ComboBox, Some(bounds), vec![])
         };
         tree_with(340, 300, vec![combo])
+    }
+
+    /// The commit walks from the currently-selected option to the wanted one, so both the
+    /// direction and the number of steps come from their index difference. Asserted on the
+    /// keystrokes: the end state alone is reached by any number of Downs past the target.
+    #[test]
+    fn set_combo_value_steps_from_the_current_selection_to_the_target() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // Selected is "Beta" (index 1); the target "Delta" is index 3, so two Downs forward.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Beta", &[]),
+                combo("Beta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                combo("Delta", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Delta").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chords,
+            vec!["Down", "Down", "Return"],
+            "two steps forward from index 1 to index 3, then commit"
+        );
+    }
+
+    /// The mirror: a target above the current selection walks up, not down.
+    #[test]
+    fn set_combo_value_walks_up_to_an_earlier_option() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // Selected is "Delta" (index 3); the target "Alpha" is index 0, so three Ups.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Delta", &[]),
+                combo("Delta", &["Alpha", "Beta", "Gamma", "Delta"]),
+                combo("Alpha", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Alpha").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chords, vec!["Up", "Up", "Up", "Return"]);
+    }
+
+    /// With nothing selected the walk starts from the first option, so the step count is the
+    /// target's own index.
+    #[test]
+    fn set_combo_value_starts_from_the_first_option_when_none_is_selected() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let platform = FakePlatform::new(340, 300).with_key_log(keys.clone());
+        // `combo` marks an option selected by matching the name, so a name outside the option
+        // list leaves every one of them unselected.
+        let (mut g, _) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Nothing", &[]),
+                combo("Nothing", &["Alpha", "Beta", "Gamma"]),
+                combo("Gamma", &[]),
+            ],
+            InvokeBehavior::Unsupported,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(1), "Gamma").unwrap();
+
+        let chords: Vec<String> = keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|k| match k {
+                KeyEvent::Chord(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chords, vec!["Down", "Down", "Return"], "index 0 to index 2");
     }
 
     #[test]
