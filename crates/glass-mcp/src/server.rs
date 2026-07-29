@@ -370,10 +370,12 @@ impl GlassServer {
 
     #[tool(
         description = "Capture the active window's accessibility tree (semantic \
-                       elements: role, name, window-relative bounds) as compact text — \
-                       deterministic, low-token element addressing alongside screenshots. \
-                       Each line is `#<id> <Role> \"<name>\" (x,y wxh) [states]`; pass an \
-                       #id to glass_click_element. Errors if the backend or app exposes no \
+                       elements: role, name, description, window-relative bounds) as compact \
+                       text — deterministic, low-token element addressing alongside \
+                       screenshots. Each line is `#<id> <Role> \"<name>\" desc=\"<description>\" \
+                       (x,y wxh) [states]`, with desc present only when the platform exposes a \
+                       secondary label distinct from the name; pass an #id to \
+                       glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
                        to remove the element-count limit (default caps protect the token budget)."
@@ -552,8 +554,8 @@ const SERVER_INSTRUCTIONS: &str = "glass gives you a build → see → interact 
      glass_start launches the app and captures its logs (glass_logs for stdout/stderr).\n\n\
      SEE AND ADDRESS THE UI CHEAPLY FIRST — the low-token default. When the app exposes \
      an accessibility tree, glass_a11y_snapshot returns its elements as TEXT (#id, role, \
-     name, window-relative bounds) — deterministic, no image tokens. Address elements by \
-     #id: glass_click_element clicks one, glass_set_value writes an editable element's \
+     name, description, window-relative bounds) — deterministic, no image tokens. Address \
+     elements by #id: glass_click_element clicks one, glass_set_value writes an editable element's \
      value, and glass_wait_for_element blocks until an element reaches a state (e.g. Save \
      becomes enabled). Prefer this over screenshots and pixel-hunting whenever it works.\n\n\
      PIXELS ARE THE FALLBACK — for a canvas/black-box app with no tree (glass_a11y_snapshot \

@@ -455,8 +455,11 @@ reads the Simulator's accessibility tree over `idb_companion` (install it — se
 
 Capture the active window's accessibility tree as compact text. Returns `{}`; the tree itself
 rides as an untrusted sibling text block, one line per element:
-`#<id> <Role> "<name>" (x,y wxh) [states]`; pass an `#id` to `glass_click_element`. An element
-whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
+`#<id> <Role> "<name>" desc="<description>" (x,y wxh) [states]`; pass an `#id` to
+`glass_click_element`. `desc="…"` appears only when the platform exposes a secondary label that
+differs from the name — help or tooltip text on desktop, or the human-readable label where the
+name is a developer-assigned id — and is omitted otherwise. An element whose platform role glass
+has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
 
