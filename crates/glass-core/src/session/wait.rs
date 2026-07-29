@@ -1326,6 +1326,100 @@ mod tests {
         assert!(out.element.unwrap().bounds.is_none());
     }
 
+    /// `reversed` says whether the match came from the second, opposite sweep. Every existing
+    /// case returns through the tail, which hardcodes `true`, so the flag is only observable
+    /// from a return *inside* the loop — here, a match on the first direction.
+    #[test]
+    fn scroll_to_element_reports_not_reversed_when_found_on_the_first_sweep() {
+        let absent = tree_with(100, 100, vec![]);
+        let realized = tree_with(
+            100,
+            100,
+            vec![AxNode {
+                name: Some("Ghost".into()),
+                ..ax_node(1, AxRole::Button, None, vec![])
+            }],
+        );
+        let mut g = glass_with_a11y_seq(FakePlatform::new(100, 100), vec![absent, realized]);
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: SCROLL_TO_DEFAULT_TIMEOUT_MS,
+            })
+            .unwrap();
+        assert!(out.matched);
+        assert!(
+            !out.reversed,
+            "found on the primary sweep, so the opposite one never ran"
+        );
+    }
+
+    /// Either bound ends the sweep on its own. A zero timeout is spent before the first step,
+    /// so nothing is scrolled — which a conjunction of the two bounds would not honour, since
+    /// the step count is still far below its cap.
+    #[test]
+    fn scroll_to_element_stops_on_the_timeout_alone() {
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Ghost".into()),
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 0,
+            })
+            .unwrap();
+        assert!(!out.matched);
+        assert_eq!(out.steps, 0, "the timeout is spent before the first scroll");
+        assert!(!out.reversed, "it gave up on the primary sweep");
+    }
+
+    /// The anchor is clamped to the last addressable pixel, so an element whose centre lies
+    /// past the window edge still yields a point inside it.
+    #[test]
+    fn scroll_anchor_clamps_to_the_last_pixel_inside_the_window() {
+        let past = AxRect {
+            x: 300,
+            y: 300,
+            width: 40,
+            height: 40,
+        };
+        // Horizontal sweep anchors x at the window centre and y on the element's row.
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Right, Some(past), 100, 100),
+            (50, 99)
+        );
+        // Vertical sweep anchors y at the centre and x on the element's column.
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Down, Some(past), 100, 100),
+            (99, 50)
+        );
+        // Negative centres clamp up to zero on the same axis.
+        let before = AxRect {
+            x: -300,
+            y: -300,
+            width: 40,
+            height: 40,
+        };
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Right, Some(before), 100, 100),
+            (50, 0)
+        );
+        assert_eq!(
+            scroll_anchor(ScrollDirection::Down, Some(before), 100, 100),
+            (0, 50)
+        );
+    }
+
     #[test]
     fn scroll_to_element_absent_with_omitted_direction_defaults_to_down() {
         // Omitted direction + a target never in the tree: inference has nothing to go
@@ -1992,6 +2086,98 @@ mod tests {
         assert_eq!(Up.as_str(), "up");
         assert_eq!(Left.as_str(), "left");
         assert_eq!(Right.as_str(), "right");
+    }
+
+    /// The overflow magnitudes decide which edge wins, and each is built from its own
+    /// arithmetic. The existing tie-break is 2001 against 501, where a term being off by one
+    /// changes nothing — these put the two candidates exactly one apart, so any single altered
+    /// operand flips the answer. `max_by_key` keeps the *last* maximum, so a tie hands it to
+    /// the later direction in the table.
+    #[test]
+    fn offscreen_direction_tie_breaks_on_a_single_pixel() {
+        let at = |x: i32, y: i32| AxRect {
+            x,
+            y,
+            width: 10,
+            height: 10,
+        };
+        // Right 11 vs Down 10.
+        assert_eq!(
+            offscreen_direction(at(110, 109), 100, 100),
+            Some(ScrollDirection::Right)
+        );
+        // Left 11 vs Up 10.
+        assert_eq!(
+            offscreen_direction(at(-20, -19), 100, 100),
+            Some(ScrollDirection::Left)
+        );
+        // Right 11 vs Up 10.
+        assert_eq!(
+            offscreen_direction(at(110, -19), 100, 100),
+            Some(ScrollDirection::Right)
+        );
+        // Left 11 vs Down 10.
+        assert_eq!(
+            offscreen_direction(at(-20, 109), 100, 100),
+            Some(ScrollDirection::Left)
+        );
+        // And the other way round on each pair, so "always the first row" is wrong too.
+        assert_eq!(
+            offscreen_direction(at(109, 110), 100, 100),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(
+            offscreen_direction(at(-19, -20), 100, 100),
+            Some(ScrollDirection::Up)
+        );
+
+        // Exact ties. Because the last maximum wins, a later row keeps a tie — so a later row
+        // losing one pixel is only visible from a tie, never from a margin it already leads by.
+        assert_eq!(
+            offscreen_direction(at(110, 110), 100, 100),
+            Some(ScrollDirection::Down),
+            "Right and Down both overflow by 11; the later row keeps the tie"
+        );
+        assert_eq!(
+            offscreen_direction(at(110, -20), 100, 100),
+            Some(ScrollDirection::Up),
+            "Right and Up both overflow by 11; the later row keeps the tie"
+        );
+    }
+
+    /// Each edge is half-open in its own direction: touching it is still on-screen, one past it
+    /// is not.
+    #[test]
+    fn offscreen_direction_boundaries_are_exact() {
+        let at = |x: i32, y: i32| AxRect {
+            x,
+            y,
+            width: 10,
+            height: 10,
+        };
+        // x == win_w is off; one less still intersects.
+        assert_eq!(
+            offscreen_direction(at(100, 50), 100, 100),
+            Some(ScrollDirection::Right)
+        );
+        assert_eq!(offscreen_direction(at(99, 50), 100, 100), None);
+        // x + w == 0 is off; one more still intersects.
+        assert_eq!(
+            offscreen_direction(at(-10, 50), 100, 100),
+            Some(ScrollDirection::Left)
+        );
+        assert_eq!(offscreen_direction(at(-9, 50), 100, 100), None);
+        // Same on the vertical axis, including the Up case the older test omits.
+        assert_eq!(
+            offscreen_direction(at(50, 100), 100, 100),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(offscreen_direction(at(50, 99), 100, 100), None);
+        assert_eq!(
+            offscreen_direction(at(50, -10), 100, 100),
+            Some(ScrollDirection::Up)
+        );
+        assert_eq!(offscreen_direction(at(50, -9), 100, 100), None);
     }
 
     #[test]
