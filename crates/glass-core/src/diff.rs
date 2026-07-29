@@ -42,11 +42,6 @@ pub struct IgnoreMask {
 }
 
 impl IgnoreMask {
-    /// A mask that excludes nothing.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
     /// Reject a zero-area rect up front: it can never mask anything, so it is a
     /// caller bug worth naming rather than silently dropping. Shared by [`new`]
     /// and [`for_region`] so both entry points validate identically.
@@ -205,7 +200,7 @@ fn pixel_changed(ra: &[u8], rb: &[u8], off: usize, tolerance: u8) -> bool {
 /// Compare two same-size frames. A pixel counts as changed when the maximum
 /// per-channel absolute difference exceeds `tolerance`.
 pub fn diff(a: &Frame, b: &Frame, tolerance: u8) -> Result<DiffResult> {
-    diff_with_mask(a, b, tolerance, &IgnoreMask::empty())
+    diff_with_mask(a, b, tolerance, &IgnoreMask::default())
 }
 
 /// Like [`diff`], but pixels covered by `mask` are excluded: they never count as
@@ -476,7 +471,7 @@ fn classify(a: &[u8], b: &[u8], x: u32, y: u32, w: u32, h: u32, max_delta: f32) 
 /// Compare two same-size frames perceptually. See [`diff_perceptual_with_mask`];
 /// pixels covered by `mask` are excluded exactly as in [`diff_with_mask`].
 pub fn diff_perceptual(a: &Frame, b: &Frame, threshold: f32) -> Result<DiffResult> {
-    diff_perceptual_with_mask(a, b, threshold, &IgnoreMask::empty())
+    diff_perceptual_with_mask(a, b, threshold, &IgnoreMask::default())
 }
 
 /// Like [`diff_perceptual`], but pixels covered by `mask` are excluded: they never
@@ -877,11 +872,13 @@ mod tests {
 
         // Half alpha lands between the two, and on the side the channel sits: 200 is above
         // the background and 0 below it, so an inverted blend would show up as a swap.
-        let half = [200u8, 0, 128, 128];
+        // No channel may sit *on* the background: at 128 the blend term is zero, so adding
+        // or subtracting it gives the same answer and the operator is unpinned.
+        let half = [200u8, 0, 60, 128];
         let (r, g, b) = blended_rgb(&half, 0);
         near(r, 164.1412);
         near(g, 63.7490);
-        near(b, 128.0);
+        near(b, 93.8667);
     }
 
     /// `y_only` is the signed luminance difference, and it is what anti-alias detection reads.
@@ -898,12 +895,43 @@ mod tests {
         let red = [255u8, 0, 0, 255];
         near(color_delta(&red, 0, &black, 0, true), 76.2183);
 
-        // The full delta weights all three axes, so it is far larger than luminance alone.
-        let full = color_delta(&red, 0, &black, 0, false);
-        assert!(
-            full.abs() > 10_000.0,
-            "full delta should weight I and Q too, got {full}"
-        );
+        // Exact, not an order-of-magnitude bound: the weighted sum is four operators, and a
+        // bound this loose accepts most ways of getting them wrong.
+        near(color_delta(&red, 0, &black, 0, false), 10410.246);
+        // The sign follows the luminance delta, so the reverse is the negation.
+        near(color_delta(&black, 0, &red, 0, false), -10410.246);
+    }
+
+    /// Equal luminance, different chroma. `dy` is exactly zero, which is the only input that
+    /// separates `dy < 0.0` from `dy <= 0.0` or `dy == 0.0`, and the delta stays non-zero, so
+    /// the I and Q terms must both reach it.
+    #[test]
+    fn color_delta_at_zero_luminance_difference_stays_positive() {
+        let near = |got: f32, want: f32| assert!((got - want).abs() < 0.01, "{got} != {want}");
+        // Both sides come to Y = 111.22486 to the bit.
+        let a = [60u8, 120, 200, 255];
+        let b = [67u8, 150, 28, 255];
+        near(color_delta(&a, 0, &b, 0, true), 0.0);
+        near(color_delta(&a, 0, &b, 0, false), 1684.1283);
+    }
+
+    /// `is_empty` reads the running count rather than answering a constant.
+    #[test]
+    fn ignore_mask_is_empty_tracks_what_was_masked() {
+        assert!(IgnoreMask::default().is_empty());
+        let masked = IgnoreMask::new(
+            &[Region {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            }],
+            10,
+            10,
+        )
+        .unwrap();
+        assert!(!masked.is_empty());
+        assert_eq!(masked.ignored_count(), 4);
     }
 
     /// A pixel counts a sibling only where the whole RGBA quad matches; a frame edge counts
@@ -990,6 +1018,59 @@ mod tests {
         let mut darkest = flat.clone();
         darkest[(2 * 5 + 2) * 4..(2 * 5 + 2) * 4 + 4].copy_from_slice(&[10, 10, 10, 255]);
         assert!(!is_antialiased(&darkest, 2, 2, 5, 5, &darkest));
+
+        // Every border pixel, so the neighbourhood is clamped on each side in turn: a bound
+        // that clamps past the last row or column indexes out of the buffer. The grey column
+        // still reads as an edge where it meets the top and bottom borders; the flat frame
+        // never does, wherever it is sampled.
+        for (x, y) in [(0, 2), (4, 2), (0, 0), (4, 4)] {
+            assert!(!is_antialiased(&edge, x, y, 5, 5, &edge), "edge at {x},{y}");
+        }
+        for (x, y) in [(2, 0), (2, 4)] {
+            assert!(is_antialiased(&edge, x, y, 5, 5, &edge), "edge at {x},{y}");
+        }
+        for (x, y) in [(0, 2), (4, 2), (2, 0), (2, 4), (0, 0), (4, 4)] {
+            assert!(!is_antialiased(&flat, x, y, 5, 5, &flat), "flat at {x},{y}");
+        }
+    }
+
+    /// The frame edge counts as one identical neighbour here too, and unlike in
+    /// `has_many_siblings` it pushes the count toward *rejecting* the pixel. Built so the
+    /// bonus is decisive: two real matches plus the edge is three, which bails out early;
+    /// without the bonus it is two, and the run continues to a positive answer.
+    #[test]
+    fn is_antialiased_counts_the_frame_edge_toward_its_bail_out() {
+        let mut f = Vec::with_capacity(5 * 5 * 4);
+        for _y in 0..5 {
+            for x in 0..5u32 {
+                let v: u8 = match x {
+                    0 | 1 => 0,
+                    2 => 128,
+                    _ => 255,
+                };
+                f.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        // Give the top-edge grey pixel a second identical neighbour.
+        let at = |x: usize, y: usize| (y * 5 + x) * 4;
+        f[at(1, 1)..at(1, 1) + 4].copy_from_slice(&[128, 128, 128, 255]);
+        assert!(!is_antialiased(&f, 2, 0, 5, 5, &f));
+
+        // The same again on a side edge with an interior row, where the column terms are the
+        // only ones true — a top-edge pixel cannot distinguish them.
+        let mut g = Vec::with_capacity(5 * 5 * 4);
+        for y in 0..5u32 {
+            for _x in 0..5 {
+                let v: u8 = match y {
+                    0 | 1 => 0,
+                    2 => 128,
+                    _ => 255,
+                };
+                g.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        g[at(1, 1)..at(1, 1) + 4].copy_from_slice(&[128, 128, 128, 255]);
+        assert!(!is_antialiased(&g, 0, 2, 5, 5, &g));
     }
 
     /// The edge must look flat in the *other* image too — that is what stops a real change
@@ -1033,6 +1114,41 @@ mod tests {
             classify(&edge, &moved, 3, 2, 5, 5, 100.0),
             PixelClass::AntiAliased
         ));
+    }
+
+    /// A frame edge counts as a sibling on its own. Asserted with *exactly two* real
+    /// neighbours, so the pixel qualifies only if the edge bonus is added: with it the count
+    /// is three, without it two, and the threshold sits between them.
+    #[test]
+    fn has_many_siblings_counts_the_frame_edge() {
+        let mut f = vec![0u8; 3 * 3 * 4];
+        let put = |f: &mut Vec<u8>, x: usize, y: usize, v: [u8; 4]| {
+            let o = (y * 3 + x) * 4;
+            f[o..o + 4].copy_from_slice(&v);
+        };
+        let c = [128u8, 128, 128, 255];
+        for y in 0..3 {
+            for x in 0..3 {
+                put(&mut f, x, y, [9, 9, 9, 255]);
+            }
+        }
+        // Bottom edge, interior column: only `y == y2` is true, so this pins that term alone.
+        put(&mut f, 1, 2, c);
+        put(&mut f, 0, 2, c);
+        put(&mut f, 1, 1, c);
+        assert!(has_many_siblings(&f, 1, 2, 3, 3));
+
+        // Left edge, interior row: only `x == x0`.
+        let mut g = vec![0u8; 3 * 3 * 4];
+        for y in 0..3 {
+            for x in 0..3 {
+                put(&mut g, x, y, [9, 9, 9, 255]);
+            }
+        }
+        put(&mut g, 0, 1, c);
+        put(&mut g, 0, 0, c);
+        put(&mut g, 1, 1, c);
+        assert!(has_many_siblings(&g, 0, 1, 3, 3));
     }
 
     #[test]
@@ -1393,7 +1509,7 @@ mod tests {
         let a = make(33, 9, 0);
         let b = make(33, 9, 4);
         let old = diff(&a, &b, 0).unwrap();
-        let new = diff_with_mask(&a, &b, 0, &IgnoreMask::empty()).unwrap();
+        let new = diff_with_mask(&a, &b, 0, &IgnoreMask::default()).unwrap();
         assert_eq!(old, new);
         assert_eq!(old.ignored_pixels, 0);
     }
@@ -1429,7 +1545,7 @@ mod tests {
     /// Mask shapes that exercise empty, sub-chunk, chunk-aligned, cross-chunk,
     /// full-row, and full-frame coverage.
     fn mask_matrix(w: u32, h: u32) -> Vec<(&'static str, IgnoreMask)> {
-        let mut out = vec![("empty", IgnoreMask::empty())];
+        let mut out = vec![("empty", IgnoreMask::default())];
         let mk = |label, rects: Vec<Region>| (label, IgnoreMask::new(&rects, w, h).unwrap());
         if w > 0 && h > 0 {
             out.push(mk("single-px", vec![rect(0, 0, 1, 1)]));
@@ -1520,7 +1636,7 @@ mod tests {
         let a = make(33, 17, 1);
         let b = make(33, 17, 5);
         let old = diff_perceptual(&a, &b, 0.1).unwrap();
-        let new = diff_perceptual_with_mask(&a, &b, 0.1, &IgnoreMask::empty()).unwrap();
+        let new = diff_perceptual_with_mask(&a, &b, 0.1, &IgnoreMask::default()).unwrap();
         assert_eq!(old, new);
     }
 
