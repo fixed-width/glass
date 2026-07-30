@@ -16,6 +16,15 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+- Every tool parameter now carries a description in the advertised MCP schema, so an agent can
+  read a parameter's meaning without inferring it from the name. The additions cover the
+  coordinate space (window-relative everywhere except `glass_window`'s `move`, which positions
+  the window on screen), the defaults for click count, drag/settle timing and log paging, and
+  behaviour a caller cannot see from the type — `glass_baseline_save` overwrites an existing
+  name silently, `glass_type` types into whatever already has focus, and `glass_start`'s
+  `timeout_ms` bounds waiting for the window, not the `build` step.
+
 ### Changed
 - On Linux, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
   Where the platform can say whether anything changed, a wait for something that has not happened
