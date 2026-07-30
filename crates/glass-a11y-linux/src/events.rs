@@ -12,19 +12,13 @@ use std::time::Duration;
 use atspi::connection::AccessibilityConnection;
 use glass_core::{AxContext, ChangeSignal, ChangeWait};
 
-/// Whether an event from `emitter` concerns the app glass is driving.
-///
-/// Compares the D-Bus unique name (`:1.15`) that owns the emitting object against the app's own.
-/// Pure so the rule can be tested without a bus — the only part of this file that can be.
+/// Whether an event from `emitter` concerns the app glass is driving — a unique-name match
+/// (`:1.15`), and the only part of this file testable without a bus.
 pub(crate) fn concerns_app(app_bus_name: &str, emitter_bus_name: &str) -> bool {
     !app_bus_name.is_empty() && app_bus_name == emitter_bus_name
 }
 
 /// A [`ChangeSignal`] fed by an AT-SPI event stream running on its own thread.
-///
-/// Reports [`ChangeWait::Unusable`] once the stream ends — a subscription that has stopped
-/// delivering must not read as a permanently quiet app, or the wait it feeds would stop looking at
-/// the tree and never see what it is waiting for.
 pub(crate) struct AtspiChanges {
     rx: Receiver<()>,
     live: bool,
@@ -78,8 +72,8 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     }
 }
 
-/// How long to wait for the registry to accept the subscription. Generous next to a walk (~732ms
-/// on a 1500-node tree) and bounded, because failing to subscribe must cost a poll, not a hang.
+/// How long to wait for the registry to accept the subscription — bounded, because failing to
+/// subscribe must cost a poll, not a hang.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Register for object events and forward the ones this app emitted.

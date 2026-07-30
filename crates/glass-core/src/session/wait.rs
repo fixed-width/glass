@@ -380,14 +380,12 @@ impl Glass {
             params.interval_ms,
             params.timeout_ms,
             // A backend that can say "nothing changed" saves the walk; one that cannot sleeps
-            // exactly as before. Either way the interval bounds the wait, so a subscription that
-            // dies silently costs latency, never a hang.
+            // exactly as before.
             |d| match signal.as_mut() {
                 Some(s) => match s.wait(d) {
                     ChangeWait::Changed => true,
                     ChangeWait::Quiet => false,
-                    // A signal that can no longer tell must not look like a permanently quiet app,
-                    // or the wait would stop reading the tree and never see what it waits for.
+                    // See `ChangeWait`: an unusable signal must not read as a quiet one.
                     ChangeWait::Unusable => {
                         signal = None;
                         true
@@ -1202,8 +1200,7 @@ mod tests {
 
     #[test]
     fn a_quiet_wait_walks_once() {
-        // The point of the change: told nothing changed, the wait must not re-read the tree. On a
-        // real backend each of those reads is a full walk — 732ms on a 1500-node AT-SPI tree.
+        // The point of the change: told nothing changed, the wait must not re-read the tree.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1238,8 +1235,7 @@ mod tests {
     #[test]
     fn a_signal_that_stops_working_falls_back_to_polling() {
         // The failure that would be invisible: a dead subscription reports no changes, which is
-        // indistinguishable from a quiet app unless it says so — and a wait that believed it would
-        // stop reading the tree and never see what it is waiting for.
+        // indistinguishable from a quiet app unless it says so.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],

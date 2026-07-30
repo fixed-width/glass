@@ -619,8 +619,7 @@ pub(crate) fn glass_with_a11y_counted(
     (g, walks)
 }
 
-/// A signal that never reports a change — a quiet UI, where the whole point is that the wait
-/// stops re-walking.
+/// A signal that never reports a change — a quiet UI.
 pub(crate) struct NeverSignals;
 impl ChangeSignal for NeverSignals {
     fn wait(&mut self, timeout: Duration) -> ChangeWait {
@@ -629,8 +628,7 @@ impl ChangeSignal for NeverSignals {
     }
 }
 
-/// A signal that stops working immediately — the case that must degrade to polling rather than to
-/// a wait that never looks again.
+/// A signal that stops working immediately.
 pub(crate) struct DeadSignal;
 impl ChangeSignal for DeadSignal {
     fn wait(&mut self, _timeout: Duration) -> ChangeWait {
@@ -638,8 +636,7 @@ impl ChangeSignal for DeadSignal {
     }
 }
 
-/// A signal that always reports a change immediately — a chatty app. The loop must stay bounded by
-/// its deadline rather than spinning on it.
+/// A signal that always reports a change immediately — a chatty app.
 pub(crate) struct AlwaysSignals;
 impl ChangeSignal for AlwaysSignals {
     fn wait(&mut self, _timeout: Duration) -> ChangeWait {
