@@ -36,10 +36,6 @@ impl Glass {
         self.snapshot_at_current_limits()
     }
 
-    /// Re-snapshot the active window reusing the limits the last user snapshot set — it does NOT
-    /// reset them. Used by compound operations (the `return:"snapshot"` fold, `wait_for_element`,
-    /// and the scroll/combo/toggle loops) so an agent working in a raised-cap tree keeps that
-    /// id-space instead of silently reverting to the default cap on the next internal snapshot.
     /// Subscribe to the backend's change notifications for the active app, if it has any.
     ///
     /// Callers hold the returned signal in a local, never in the session: a poll loop's tick
@@ -47,6 +43,10 @@ impl Glass {
     /// pause between ticks.
     pub(crate) fn subscribe_a11y_changes(&mut self) -> Option<Box<dyn ChangeSignal>> {
         let s = self.active_mut().ok()?;
+        // Reader check first, like `snapshot_at_current_limits`: the accessors below are platform
+        // round-trips (`app_pids` shells out to `adb` on Android), and a backend with no reader —
+        // or one taking the default `None` — must not pay them for a subscription it cannot have.
+        s.accessibility.as_ref()?;
         // The cached geometry, deliberately: subscribing must not depend on a window round-trip
         // that can fail, because failing to subscribe has to degrade to polling rather than to an
         // error. The reader only needs enough context to identify the app.
@@ -60,6 +60,10 @@ impl Glass {
         s.accessibility.as_mut()?.subscribe_changes(&ctx)
     }
 
+    /// Re-snapshot the active window reusing the limits the last user snapshot set — it does NOT
+    /// reset them. Used by compound operations (the `return:"snapshot"` fold, `wait_for_element`,
+    /// and the scroll/combo/toggle loops) so an agent working in a raised-cap tree keeps that
+    /// id-space instead of silently reverting to the default cap on the next internal snapshot.
     pub fn a11y_resnapshot(&mut self) -> Result<AxTree> {
         self.snapshot_at_current_limits()
     }
@@ -415,10 +419,9 @@ impl Glass {
                 return Ok(()); // truthful no-op, no actuation
             }
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
-            // Deliberately not event-gated, unlike `wait_for_element`: this poll waits on a change
-            // it just caused and usually sees it on the first or second read, while establishing a
-            // subscription costs a round-trip of its own — paid on every `set_value`, to save reads
-            // this loop rarely takes.
+            // Not event-gated, and cannot be: this branch runs only on a backend that frames a
+            // switch as its whole row, which today is iOS alone — a reader with no event stream to
+            // subscribe to.
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,

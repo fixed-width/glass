@@ -636,6 +636,20 @@ impl ChangeSignal for DeadSignal {
     }
 }
 
+/// A signal that reports one change, then goes quiet — an app that does the thing being waited
+/// for and then settles, which is the shape of every wait that succeeds.
+pub(crate) struct SignalsOnce(pub(crate) bool);
+impl ChangeSignal for SignalsOnce {
+    fn wait(&mut self, timeout: Duration) -> ChangeWait {
+        if self.0 {
+            self.0 = false;
+            return ChangeWait::Changed;
+        }
+        std::thread::sleep(timeout);
+        ChangeWait::Quiet
+    }
+}
+
 /// A signal that always reports a change immediately — a chatty app.
 pub(crate) struct AlwaysSignals;
 impl ChangeSignal for AlwaysSignals {

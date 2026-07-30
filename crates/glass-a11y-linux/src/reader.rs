@@ -345,27 +345,36 @@ async fn find_nth(
     Ok(None)
 }
 
+/// Every unique D-Bus name belonging to the app in `ctx` — the keys the event filter matches on.
+///
+/// A set, not one name: a walk crosses process boundaries (each child is proxied at *its own* bus
+/// name), so an app that embeds an out-of-process view publishes part of its tree from a second
+/// connection. Filtering on one name would walk that subtree while dropping every event it emits.
+/// Matched by pid, the same rule [`find_app`] applies — though not at the same moment: this
+/// resolves once when the subscription is taken, and a walk re-resolves each time.
+pub(crate) async fn app_bus_names(ctx: &AxContext, conn: &AccessibilityConnection) -> Vec<String> {
+    let zbus_conn = conn.connection().clone();
+    let Ok(root) = conn.root_accessible_on_registry().await else {
+        return Vec::new();
+    };
+    let Ok(children) = root.get_children().await else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for app_ref in children {
+        if app_matches(&app_ref, ctx, &zbus_conn).await
+            && let Some(name) = app_ref.name()
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
 /// Does this AT-SPI application belong to the launched process? PID is the reliable
 /// signal: the app matches when its owning pid is in `ctx.pids` (the launched app's PID
 /// set — root + enumerable descendants). An empty set (no pid hint, e.g. a backend that
 /// can't enumerate) accepts the first app (refine later).
-/// The unique D-Bus name of the app in `ctx` — the key the event filter matches on, resolved the
-/// same way [`find_app`] resolves the app itself so a subscription and a walk cannot disagree
-/// about which application they are about.
-pub(crate) async fn app_bus_name(
-    ctx: &AxContext,
-    conn: &AccessibilityConnection,
-) -> Option<String> {
-    let zbus_conn = conn.connection().clone();
-    let root = conn.root_accessible_on_registry().await.ok()?;
-    for app_ref in root.get_children().await.ok()? {
-        if app_matches(&app_ref, ctx, &zbus_conn).await {
-            return app_ref.name().map(|n| n.to_string());
-        }
-    }
-    None
-}
-
 async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Connection) -> bool {
     if ctx.pids.is_empty() {
         return true; // no pid hint: accept the first app (refine by geometry/title elsewhere)

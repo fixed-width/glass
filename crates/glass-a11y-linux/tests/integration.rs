@@ -6,12 +6,11 @@
 
 use glass_core::{AppSpec, Backend, BaselineStore, Glass, PlatformFactory, WindowHint};
 
-/// Counts the walks a session performs, so a test can assert what an event subscription is *for*
-/// — wall-clock cannot tell a wait that waited efficiently from one that walked slowly.
+/// Counts the walks a session performs — wall-clock cannot tell a wait that waited efficiently
+/// from one that walked slowly.
 ///
-/// Forwards every trait method. A forgotten forward would silently disable the subscription and
-/// leave the test measuring the polling it was written to replace, which is why the walk-saving
-/// test asserts the wrapper still yields a signal.
+/// Forwards every trait method; `subscribe_changes` has a default body, so a forgotten forward
+/// would compile and silently disable what the test measures.
 struct Counting<A> {
     inner: A,
     walks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1203,16 +1202,16 @@ fn a_quiet_wait_stops_re_walking_the_tree() {
     let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
     glass.stop().expect("stop");
 
-    // Logged like the bench walk's timing: the number is the point of the change, and a reader
-    // of CI output should not have to re-derive it.
+    // Logged: the number is the point of the change.
     eprintln!("quiet 3s wait at 100ms: {walked} walks (polling would be ~30)");
     assert!(!out.matched, "the element must not exist");
-    // The wrapper forwards `subscribe_changes`: without this the test would silently measure the
-    // polling it exists to replace.
+    // See `Counting`: without this the test could measure polling and pass.
     assert!(subscribed > 0, "no subscription was established");
     // Polling at 100ms over 3s would walk ~30 times, and the fixture is quiet.
+    // Three: one at the start, plus the forced re-read the quiet ceiling makes about once a
+    // second. Polling the same wait takes ~30.
     assert!(
-        walked <= 3,
+        walked <= 5,
         "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
     );
 }

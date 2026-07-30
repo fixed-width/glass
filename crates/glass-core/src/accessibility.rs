@@ -664,19 +664,15 @@ impl AxTarget {
     }
 }
 
-/// The OS accessibility seam — one impl per OS. Object-safe; the session stores
-/// it boxed as `Send` (the `Send` bound lives at the storage site, not on the
-/// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
-/// display-server.
 /// A backend's notification that the app's accessibility tree may have changed.
 ///
-/// Exists so a wait can stop re-reading the whole tree on a timer: on a large tree a walk costs far
-/// more than the poll interval it is nominally paced by (measured on AT-SPI: 732ms for 1500 nodes
-/// against a 100ms interval), so a wait for something that has not happened yet spends its whole
-/// budget re-reading an unchanged tree.
+/// Exists so a wait can stop re-reading the whole tree on a timer. A walk is not free and grows
+/// with the tree — measured on AT-SPI, 36ms for a small fixture and 732ms at the 1500-node cap —
+/// so a wait for something that has not happened yet spends its whole budget re-reading a tree
+/// that did not change.
 ///
-/// Public and object-safe on purpose: a caller has to be able to write a fake — the case worth
-/// pinning is a signal that fires *constantly*, which must not turn a poll loop into a spin.
+/// Public and object-safe because it crosses the `Accessibility` seam, which backends implement
+/// out-of-crate.
 pub trait ChangeSignal: Send {
     /// Block until a change arrives or `timeout` elapses.
     ///
@@ -702,6 +698,10 @@ pub enum ChangeWait {
     Unusable,
 }
 
+/// The OS accessibility seam — one impl per OS. Object-safe; the session stores
+/// it boxed as `Send` (the `Send` bound lives at the storage site, not on the
+/// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
+/// display-server.
 pub trait Accessibility {
     /// Snapshot the active window's accessibility subtree, normalized and in
     /// window-relative coordinates. Node ids are assigned by the caller
@@ -710,12 +710,15 @@ pub trait Accessibility {
 
     /// Subscribe to change notifications for the app described by `ctx`.
     ///
-    /// `None` — the default — means this backend has no event stream, and its callers keep polling
-    /// exactly as they did before. Two backends can never implement it: Android's `uiautomator`
-    /// reader is a dump per call, and iOS's is an `idb describe` per call.
+    /// `None` — the default — means this reader has no event stream, and its callers keep polling
+    /// exactly as they did before. Two readers cannot have one as built: Android's `uiautomator`
+    /// reader is a dump per call and iOS's is an `idb describe` per call. Android's *other* reader,
+    /// the on-device accessibility service, is driven by events and is the natural next one.
     ///
-    /// The subscription must be established *before* the caller's first read, or a change landing
-    /// between the two is lost and the caller waits out an interval on a tree that already matches.
+    /// Subscribe before the first read, not after: a change that lands after a read but before the
+    /// subscription is announced to nobody, and the caller then waits out its *entire* budget on a
+    /// condition that already holds. (A change between subscribing and reading is safe — the read
+    /// sees it.)
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
         None
     }
