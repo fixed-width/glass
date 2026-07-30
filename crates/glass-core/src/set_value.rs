@@ -60,7 +60,7 @@ pub fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, request
 /// was there before.
 ///
 /// `read_back` is `None` when the element reports no value, which for a text field means it is
-/// empty — every mobile reader maps an empty value away — so it compares as `""`.
+/// empty — the `uiautomator` and `idb` mappers both drop an empty value — so it compares as `""`.
 ///
 /// The cost of the strictness: a field that reformats what it is given (a phone number becoming
 /// `"(123) 456-7890"`) reports the write as not applied even though it landed. That is the safer
@@ -72,22 +72,18 @@ pub fn typed_text_landed(read_back: Option<&str>, requested: &str) -> bool {
     read_back.unwrap_or("") == requested
 }
 
-/// Whether a *clear* — a typed write of `""` — landed, judged from the value read back and the value
-/// the field held before.
+/// Whether a *clear* — a typed write of `""` — landed, judged from the value read back.
 ///
-/// A clear cannot be judged by comparing the read-back to `""`, because a platform may report an
-/// empty field's *hint* as its value: measured on the dogfood AVD, `uiautomator dump` gives an empty
-/// `EditText` `text="Search settings"`, its placeholder, and exposes no separate hint attribute, so
-/// an empty hinted field is indistinguishable from one holding that text. Comparing to `""` would
-/// report every clear of a hinted field as not applied.
+/// Empty only. Do not weaken this to "empty, or the value changed": the tap that begins a clear can
+/// itself change a field that reformats on focus — a currency field showing `"$1,234.00"` unfocused
+/// and `"1234.00"` while editing — so "changed" would confirm a clear whose delete never fired.
 ///
-/// So a clear is confirmed when the field reads back empty, or when its value changed at all — which
-/// on a hinted field is the hint reappearing. The weaker rule is confined to this case: for a clear
-/// there is nothing else to compare against, and a clear that did not fire leaves the value exactly
-/// as it was.
-pub fn typed_clear_landed(read_back: Option<&str>, before: Option<&str>) -> bool {
-    let after = read_back.unwrap_or("");
-    after.is_empty() || Some(after) != before
+/// The cost is a false *failure*: on the dogfood AVD an emptied `EditText` reports its placeholder as
+/// its text (`text="Search settings"`, and `uiautomator` exposes no separate hint attribute), so a
+/// clear that worked reads as not applied. An agent can read the element and see the placeholder; the
+/// other direction would have it believing an unchanged field was cleared.
+pub fn typed_clear_landed(read_back: Option<&str>) -> bool {
+    read_back.unwrap_or("").is_empty()
 }
 
 #[cfg(test)]
@@ -127,15 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_is_confirmed_by_an_empty_field_or_by_the_value_changing() {
-        // Empty is the obvious case.
-        assert!(typed_clear_landed(None, Some("hello")));
-        assert!(typed_clear_landed(Some(""), Some("hello")));
-        // The hint case, which is why this rule is not "reads back empty": an emptied Android
-        // EditText reports its placeholder, so the evidence is that the value changed.
-        assert!(typed_clear_landed(Some("Search settings"), Some("glass")));
-        // A clear that did not fire leaves the value exactly as it was.
-        assert!(!typed_clear_landed(Some("glass"), Some("glass")));
+    fn a_clear_is_confirmed_only_by_an_empty_field() {
+        assert!(typed_clear_landed(None));
+        assert!(typed_clear_landed(Some("")));
+        // A clear that did not fire.
+        assert!(!typed_clear_landed(Some("glass")));
+        // The cost, pinned as a decision: a platform that reports an emptied field's placeholder
+        // reads as not applied.
+        assert!(!typed_clear_landed(Some("Search settings")));
     }
 
     #[test]

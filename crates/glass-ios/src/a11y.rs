@@ -84,43 +84,52 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
         .ok_or_else(|| GlassError::Backend("a11y set_value: element has no bounds".into()))
 }
 
-/// How long to let the app commit typed text before each read-back attempt. The device test's own
-/// helper allows up to twelve 300ms-spaced describes for a typed value to become observable, so one
-/// read at 300ms is not on its own enough — hence [`VERIFY_ATTEMPTS`].
+/// How long to let the app commit typed text before each read-back attempt. Generous next to a
+/// keystroke and small next to the `describe` that follows it.
 const VERIFY_SETTLE: Duration = Duration::from_millis(300);
 
 /// How many times to read the element back before reporting the write as not applied. A landed write
-/// confirms on the first attempt.
+/// confirms on the first attempt and pays for one describe; the retries cover a field that commits a
+/// frame or two later.
 const VERIFY_ATTEMPTS: usize = 3;
 
 /// Judge a typed `set_value` from a tree described after it. `Ok(())` only when the field holds
-/// exactly what was asked for.
+/// exactly what was asked for, or — for a clear — reads back empty.
 ///
 /// Exact match, not "changed from before": tap-and-type is not atomic, so a dropped key or a field
 /// that filters input leaves something that is neither the request nor the old value, and calling
-/// that success is the failure this check exists to prevent. `glass_core::typed_text_landed` carries
-/// the rule and the cost of it. Twin of `verify_write` in `glass-android/src/a11y.rs` — keep the two
-/// in step.
+/// that success is the failure this check exists to prevent. `glass_core::typed_text_landed` and
+/// `glass_core::typed_clear_landed` carry the rules and the cost of them. Twin of `verify_write` in
+/// `glass-android/src/a11y.rs` — keep the two in step.
 ///
 /// The element is re-resolved by its pre-order id, which the write itself can perturb (the keyboard
 /// appears between the two describes), so a mismatch is [`GlassError::AxElementChanged`] —
-/// "re-snapshot" — rather than a claim about the write.
-fn verify_write(
-    after_tree: &AxTree,
-    target: &AxTarget,
-    before: Option<&str>,
-    text: &str,
-) -> Result<()> {
-    let node = after_tree
-        .find(target.id)
-        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+/// "re-snapshot" — rather than a claim about the write. A tree cut short by the walk caps explains an
+/// absent element better than drift does, so that case says so instead.
+///
+/// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
+/// in `value`, so a label that changed inside the settle window would otherwise read as a successful
+/// write into a Label.
+fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()> {
+    let Some(node) = after_tree.find(target.id) else {
+        return Err(match &after_tree.truncated {
+            // `Truncation::notice()` is written to close a rendered outline — a leading ellipsis and
+            // its own pixel-fallback advice — so this states the cap itself instead.
+            Some(t) => GlassError::AccessibilityUnavailable(format!(
+                "a11y set_value: the text was typed, but the read-back could not find element {} \
+                 because the tree was truncated at {} {}; re-snapshot rather than retyping",
+                target.id.0,
+                t.limit_value,
+                t.limit.label(),
+            )),
+            None => GlassError::AxElementChanged(target.id.0),
+        });
+    };
     if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
-    // A clear is judged differently, because an emptied field may report its hint as its value —
-    // see `typed_clear_landed`.
     let landed = if text.is_empty() {
-        typed_clear_landed(node.value.as_deref(), before)
+        typed_clear_landed(node.value.as_deref())
     } else {
         typed_text_landed(node.value.as_deref(), text)
     };
@@ -141,8 +150,6 @@ impl Accessibility for IosA11y {
         // the ids here are final, not walked again.
         let (tree, scale) = self.describe(ctx)?;
         let bounds = verify(&tree, target)?;
-        // Needed only to judge a clear — see `typed_clear_landed`.
-        let before = tree.find(target.id).and_then(|n| n.value.clone());
         let (cx, cy) = bounds
             .clamped_center(ctx.window.width, ctx.window.height)
             .ok_or_else(|| GlassError::Backend("a11y set_value: element not on screen".into()))?;
@@ -166,8 +173,6 @@ impl Accessibility for IosA11y {
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
-        // Re-read up to `VERIFY_ATTEMPTS` times, but only while unconfirmed: a landed write pays for
-        // one describe, and a field that commits a frame later still gets seen.
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
             std::thread::sleep(VERIFY_SETTLE);
@@ -177,9 +182,12 @@ impl Accessibility for IosA11y {
                      re-snapshot to see whether it landed rather than retyping"
                 ))
             })?;
-            match verify_write(&after, target, before.as_deref(), text) {
+            match verify_write(&after, target, text) {
                 Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
+                // Only a not-applied verdict can change on a later describe: drift and truncation
+                // are structural, so re-describing for them reaches the same answer more slowly.
+                Err(e @ GlassError::AxValueNotApplied(_)) => last = Some(e),
+                Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or(GlassError::AxValueNotApplied(target.id.0)))
@@ -257,7 +265,7 @@ mod tests {
     #[test]
     fn a_write_that_landed_is_reported_as_success() {
         let after = tree_with_value(Some("world"));
-        assert!(verify_write(&after, &matching_target(), Some("hello"), "world").is_ok());
+        assert!(verify_write(&after, &matching_target(), "world").is_ok());
     }
 
     #[test]
@@ -265,14 +273,44 @@ mod tests {
         // An empty field reports no value at all, so a rule that read `None` as "unknown" made
         // `set_value(id, "")` fail every time.
         let after = tree_with_value(None);
-        assert!(verify_write(&after, &matching_target(), Some("hello"), "").is_ok());
+        assert!(verify_write(&after, &matching_target(), "").is_ok());
+    }
+
+    #[test]
+    fn a_cleared_field_still_reporting_text_reads_as_not_applied() {
+        // A clear is judged by "reads back empty", not by "the value changed": the tap that begins
+        // the clear can itself change a field that reformats on focus, and accepting that would
+        // confirm a clear whose delete never fired.
+        let after = tree_with_value(Some("Search settings"));
+        assert!(matches!(
+            verify_write(&after, &matching_target(), ""),
+            Err(GlassError::AxValueNotApplied(_))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_read_back_says_so_rather_than_blaming_drift() {
+        // The iOS tree carries the same truncation record Android's does; reporting "it moved" would
+        // throw away the one fact that explains the absence.
+        let mut after = tree_with_value(Some("world"));
+        after.truncated = Some(glass_core::accessibility::Truncation {
+            limit: glass_core::accessibility::TruncationLimit::Nodes,
+            limit_value: 1,
+            nodes_walked: 1,
+        });
+        let mut t = matching_target();
+        t.id = AxNodeId(99);
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
     }
 
     #[test]
     fn a_field_that_never_changed_is_not_a_successful_write() {
         let after = tree_with_value(Some("hello"));
         assert!(matches!(
-            verify_write(&after, &matching_target(), Some("hello"), "world"),
+            verify_write(&after, &matching_target(), "world"),
             Err(GlassError::AxValueNotApplied(1))
         ));
     }
@@ -283,7 +321,7 @@ mod tests {
         // called it success.
         let after = tree_with_value(Some("worl"));
         assert!(matches!(
-            verify_write(&after, &matching_target(), Some("hello"), "world"),
+            verify_write(&after, &matching_target(), "world"),
             Err(GlassError::AxValueNotApplied(1))
         ));
     }
@@ -294,7 +332,7 @@ mod tests {
         let mut t = matching_target();
         t.name = Some("A different field".into());
         assert!(matches!(
-            verify_write(&after, &t, Some("hello"), "world"),
+            verify_write(&after, &t, "world"),
             Err(GlassError::AxElementChanged(1))
         ));
     }
@@ -306,7 +344,7 @@ mod tests {
         let mut after = tree_with_value(Some("world"));
         after.root.children[0].states.editable = false;
         assert!(matches!(
-            verify_write(&after, &matching_target(), Some("hello"), "world"),
+            verify_write(&after, &matching_target(), "world"),
             Err(GlassError::AxElementChanged(1))
         ));
     }
@@ -317,7 +355,7 @@ mod tests {
         let mut t = matching_target();
         t.id = AxNodeId(9);
         assert!(matches!(
-            verify_write(&after, &t, Some("hello"), "world"),
+            verify_write(&after, &t, "world"),
             Err(GlassError::AxElementChanged(9))
         ));
     }

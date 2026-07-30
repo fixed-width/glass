@@ -1,11 +1,15 @@
 //! Live accessibility verification against a running AVD. Ignored by default:
 //!   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
-//!     cargo test -p glass-android --test a11y_loop -- --ignored --nocapture
+//!     cargo test -p glass-android --test a11y_loop -- --ignored --nocapture --test-threads=1
+//!
+//! `--test-threads=1` is required, not tidiness: both tests drive Settings on the one attached
+//! device, so in parallel each tears down the app the other is mid-interaction with.
 //!
 //! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
 //! is non-trivial and carries named, role-typed elements. A second test writes into a real
-//! `EditText` and checks that a landed write is confirmed against the live field — including a
-//! clear, which this platform reports by showing the field's hint rather than an empty value.
+//! `EditText` and checks that a landed write is confirmed against the live field — and that a
+//! clear cannot be confirmed here at all, because this platform reports the emptied field's hint
+//! as its text.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
@@ -142,15 +146,13 @@ fn set_value_reports_whether_the_write_landed() {
         "field holds {held:?} after the write"
     );
 
-    // Clearing the field, which no other test exercises on a device and which is where the first two
-    // versions of this check were wrong: a rule that read an absent value as "the read failed"
-    // reported every clear as a failure, and a rule that demanded the field read back empty failed
-    // here too, because this field reports its hint instead (see the assertion below).
+    // Clearing the field, on the device whose behaviour decided the rule: an emptied Android
+    // `EditText` reports its *hint* as its text and `uiautomator` exposes no hint attribute, so a
+    // clear cannot be confirmed here at all — the deliberate cost of judging one by "reads back
+    // empty". What the device still has to show is that the text went.
     //
-    // The target is re-located first, deliberately: typing into Settings' search renders a results
-    // list, which shifts every pre-order id after it, so the target captured before the write is
-    // stale by now — and `set_value` says so (`AxElementChanged`) rather than writing to whatever
-    // inherited the id. Re-locating is what an agent does after a write that changes the screen.
+    // The target is re-located first: typing into Settings' search renders a results list, so the
+    // screen the pre-write target was captured against is gone.
     let mut before_clear = a11y.snapshot(&ctx).expect("snapshot before the clear");
     before_clear.assign_ids();
     let field = find(&before_clear.root, &|n| n.states.editable).expect("the field is still there");
@@ -160,18 +162,21 @@ fn set_value_reports_whether_the_write_landed() {
         name: field.name.clone(),
         bounds: field.bounds,
     };
-    a11y.set_value(&ctx, &target, "")
-        .expect("clearing a field is a write that can succeed");
+    match a11y.set_value(&ctx, &target, "") {
+        Err(GlassError::AxValueNotApplied(_)) => {}
+        other => panic!("a field that reports its hint cannot confirm a clear: {other:?}"),
+    }
     let mut cleared = a11y.snapshot(&ctx).expect("snapshot after clear");
     cleared.assign_ids();
-    let left = cleared
-        .find(target.id)
-        .and_then(|n| n.value.clone())
-        .unwrap_or_default();
-    // Not `is_empty()`: an emptied Android `EditText` reports its *hint* as its text, and
-    // `uiautomator` exposes no separate hint attribute — which is exactly why a clear is judged by
-    // the value changing rather than by it reading back empty.
-    assert_ne!(left, "glass", "the field still holds what was typed");
+    // Found by what it is, not by an id the clear may have shifted, so this cannot pass by failing
+    // to look.
+    let field = find(&cleared.root, &|n| n.states.editable)
+        .expect("the field is still there after the clear");
+    assert_ne!(
+        field.value.as_deref(),
+        Some("glass"),
+        "the typed text is gone from the field"
+    );
 
     // A stale target is refused before anything is typed — the pre-write fingerprint check, which
     // predates the read-back. Kept as a regression guard, not as evidence about the read-back.

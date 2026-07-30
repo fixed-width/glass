@@ -24,8 +24,11 @@ internal refactors, CI, or test-only changes.
   asserted afterwards was against a screen that never changed. They now read the element back and
   require it to hold exactly what you asked for. A field that reformats what it is given (a phone
   number becoming `(123) 456-7890`) is reported as not applied even though the text arrived: read the
-  element to see what it holds. Windows and macOS already read the value back, and Android's
-  on-device service reader already did too; the Linux reader still trusts the toolkit's own answer.
+  element to see what it holds. Clearing a field is judged its own way — it has to read back empty —
+  so on a platform that reports an emptied field's placeholder as its text (Android does), a clear
+  that worked is also reported as not applied. Windows and macOS already read the value back, and
+  Android's on-device service reader already did too; the Linux reader still trusts the toolkit's own
+  answer.
 - An Android or iOS Simulator command that stops answering no longer hangs the tool it was
   serving. Every one-shot call glass makes to `adb`, `emulator`, `xcrun simctl`, `plutil` or `ps`
   now has a deadline sized for what that call does — a full accessibility dump gets longer than a
