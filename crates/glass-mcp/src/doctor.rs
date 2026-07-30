@@ -1199,6 +1199,26 @@ mod tests {
         }
 
         #[test]
+        fn each_session_state_maps_to_its_own_console_meaning() {
+            // The only untested line the a11y wiring added. Swapping two arms compiles and keeps the
+            // workspace green, while telling a locked-screen operator to log in — the contradiction
+            // with `display awake` that three-valuing this was meant to remove.
+            use glass_a11y_macos::doctor::ConsoleSession;
+            assert_eq!(
+                console_session(glass_macos::SessionState::Unlocked),
+                ConsoleSession::Unlocked
+            );
+            assert_eq!(
+                console_session(glass_macos::SessionState::Locked),
+                ConsoleSession::Locked
+            );
+            assert_eq!(
+                console_session(glass_macos::SessionState::NoSession),
+                ConsoleSession::NoSession
+            );
+        }
+
+        #[test]
         fn a_locked_session_does_not_fail_the_whole_run() {
             // This section is always critical (`backend: None`), so a `Fail` here exits non-zero
             // even for someone driving android on a Mac. A locked screen is transient and not a

@@ -156,10 +156,32 @@ pub(crate) fn probe_system_wide() -> SystemWideProbe {
     probe_system_wide_attr(crate::doctor::PROBE_ATTRIBUTE)
 }
 
-/// How long one doctor AX read may wait before the API gives up. A system-wide
-/// `AXFocusedApplication` read is forwarded to the frontmost application, so this has to allow for
-/// a busy-but-healthy app, not just for the round trip.
+/// How long one doctor AX read may wait before the API gives up — chosen to leave room for a busy
+/// frontmost application rather than measured against one.
 const PROBE_TIMEOUT_SECS: f32 = 2.0;
+
+/// The process-global AX messaging timeout, restored on drop.
+///
+/// A guard rather than a pair of calls so an unwind between them cannot leave the whole server
+/// running with the probe's short bound.
+struct ProbeTimeout<'a>(&'a AXUIElement);
+
+impl<'a> ProbeTimeout<'a> {
+    fn set(el: &'a AXUIElement) -> Self {
+        // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
+        // lifetime preconditions. A timeout that could not be set leaves the system default in
+        // place: the probe is then bounded only by that default, as it was before.
+        let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
+        Self(el)
+    }
+}
+
+impl Drop for ProbeTimeout<'_> {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`; 0 on the system-wide object restores the documented default.
+        let _ = unsafe { self.0.set_messaging_timeout(0.0) };
+    }
+}
 
 /// [`probe_system_wide`] with the attribute as a seam, so a live test can drive the classifier with
 /// an attribute the system-wide element does not carry and see a real non-`Success` code come back
@@ -169,21 +191,18 @@ fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
     // documented contract (the binding itself `.expect()`s on this).
     let el = unsafe { AXUIElement::new_system_wide() };
     // Setting a timeout on the *system-wide* object sets it globally for the process (Apple's
-    // documented behaviour), so this would otherwise cap every later glass_a11y_snapshot in the
-    // server — a diagnostic changing what the product does. It is restored below.
-    //
-    // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
-    // lifetime preconditions. A timeout that could not be set leaves the system default in place:
-    // the probe is then bounded only by that default, which is the pre-existing behaviour.
-    let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
+    // documented behaviour), so the bound is restored the moment the read returns — otherwise one
+    // `glass_doctor` call would cap every later a11y read in the server, a diagnostic changing what
+    // the product does. `glass_doctor` does not run on the serialized platform thread, so an a11y
+    // read *concurrent* with the probe still sees the cap; that window is one attribute read long,
+    // where the alternative is an unbounded doctor.
+    let _timeout = ProbeTimeout::set(&el);
     let attr = CFString::from_str(attr_name);
     let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
     // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
     let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
-    // SAFETY: as above; 0 restores the process-global default, leaving the AX subsystem as the
-    // probe found it.
-    let _ = unsafe { el.set_messaging_timeout(0.0) };
+    drop(_timeout);
     if err == AXError::Success
         && let Some(nn) = NonNull::new(raw.cast_mut())
     {
@@ -425,7 +444,7 @@ mod tests {
     /// Needs a GUI session; whether it needs the Accessibility grant is untested — an attribute the
     /// element does not carry is not trust-gated on the evidence this crate has.
     #[test]
-    #[ignore = "needs a macOS GUI session (run by scripts/test-macos-a11y.sh)"]
+    #[ignore = "needs a macOS GUI session; CI has none, so run it on a dev Mac: cargo test -p glass-a11y-macos --lib ffi::tests -- --ignored"]
     fn an_attribute_the_element_lacks_is_not_reported_as_answered() {
         assert_ne!(
             probe_system_wide_attr("AXNoSuchAttributeGlassDoctorProbe"),
@@ -438,7 +457,7 @@ mod tests {
     /// process still gets an answer from it — needs an untrusted process and is not asserted
     /// anywhere.
     #[test]
-    #[ignore = "needs a macOS GUI session (run by scripts/test-macos-a11y.sh)"]
+    #[ignore = "needs a macOS GUI session; CI has none, so run it on a dev Mac: cargo test -p glass-a11y-macos --lib ffi::tests -- --ignored"]
     fn axrole_answers_on_the_system_wide_element() {
         assert_eq!(
             probe_system_wide_attr("AXRole"),

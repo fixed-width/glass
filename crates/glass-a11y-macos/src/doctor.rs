@@ -60,8 +60,8 @@ pub enum ConsoleSession {
     Unlocked,
     Locked,
     /// Nobody is logged in at the console. Distinct from locked: unlocking is not the remedy, and
-    /// telling this operator the session is unlocked is a falsehood the report contradicts two
-    /// lines further up.
+    /// telling this operator the session is unlocked contradicts the `display awake` check the same
+    /// report prints.
     NoSession,
 }
 
@@ -123,7 +123,7 @@ pub fn a11y_checks(
                     "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and the \
                      console session is locked"
                 ),
-                _ => format!(
+                ConsoleSession::NoSession | ConsoleSession::Unlocked => format!(
                     "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and no \
                      account is logged in at the console"
                 ),
@@ -133,15 +133,19 @@ pub fn a11y_checks(
             ConsoleSession::Locked => {
                 "unlock the session and re-run (see the `display awake` check)"
             }
-            _ => "log in at the console and re-run (see the `display awake` check)",
+            ConsoleSession::NoSession | ConsoleSession::Unlocked => {
+                "log in at the console and re-run (see the `display awake` check)"
+            }
         }),
+        // Reached only with the grant held, so "go and grant it" would send the operator to a pane
+        // where the box is already ticked. A stale TCC record is the case that produces this.
         SystemWideProbe::ApiDisabled => fail(
             format!(
-                "assistive access is off for this process (AXError {API_DISABLED}), so the \
-                 accessibility tools will fail"
+                "assistive access is off for this process (AXError {API_DISABLED}) even though it \
+                 holds the Accessibility grant, so the accessibility tools will fail"
             ),
-            "enable assistive access for this binary in System Settings > Privacy & Security > \
-             Accessibility, then restart it",
+            "remove this binary from System Settings > Privacy & Security > Accessibility, add it \
+             again, and restart it",
         ),
         SystemWideProbe::DidNotComplete => fail(
             format!(
@@ -276,11 +280,14 @@ mod tests {
     #[test]
     fn an_untrusted_process_never_reports_a_green_reader() {
         // The probe cannot rescue an untrusted process: it holds no grant, so no tree read can
-        // succeed whatever the system-wide element answered.
+        // succeed whatever the system-wide element answered. The remedy points at the grant check
+        // rather than repeating its System Settings text, so there is one thing to do, not two.
         for p in EVERY_PROBE {
-            let c = reader(p, false, ConsoleSession::Unlocked);
-            assert_eq!(c.status, CheckStatus::Fail, "{p:?} -> {c:?}");
-            assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY), "{p:?}");
+            for session in EVERY_SESSION {
+                let c = reader(p, false, session);
+                assert_eq!(c.status, CheckStatus::Fail, "{p:?} {session:?} -> {c:?}");
+                assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY), "{p:?} {session:?}");
+            }
         }
     }
 
@@ -401,20 +408,6 @@ mod tests {
                         );
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn an_untrusted_process_is_pointed_at_the_grant_check_not_at_a_second_copy_of_it() {
-        // The grant check owns the System Settings pane; this line points at it instead, so an
-        // untrusted operator is given one thing to do rather than two. (A *granted* process whose
-        // assistive access is off is a different case: the grant line reads green there, so that
-        // arm names the pane itself.)
-        for p in EVERY_PROBE {
-            for session in EVERY_SESSION {
-                let c = reader(p, false, session);
-                assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY), "{p:?} {session:?}");
             }
         }
     }
