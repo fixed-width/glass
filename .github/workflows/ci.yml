@@ -116,7 +116,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri bubblewrap \
-            zenity at-spi2-core
+            zenity at-spi2-core xvfb python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Fetch prebuilt sway bundle
         run: |
@@ -125,6 +125,9 @@ jobs:
             | tar -C ~/.local/share/glass/sway -xz
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
+      # The a11y suite's Wayland launch tests, which need this job's sway: the X11 job runs the
+      # other 25 and names these as skipped.
+      - run: ./scripts/test-a11y.sh wayland_a11y
 
   macos:
     name: macOS (build · clippy · test)
