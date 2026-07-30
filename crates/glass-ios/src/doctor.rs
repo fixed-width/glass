@@ -26,6 +26,9 @@ pub struct Probe<'a> {
     pub runtimes: &'a [String],
     /// iPhone simulator lines from `xcrun simctl list devices available`.
     pub iphones: &'a [String],
+    /// Name of an already-booted iOS simulator, if any. Everything glass does on iOS needs a booted
+    /// target, and booting one is not the doctor's business.
+    pub booted: Option<&'a str>,
 }
 
 const INSTALL_XCODE_REMEDY: &str =
@@ -87,16 +90,27 @@ fn runtime_check(p: &Probe) -> Check {
 }
 
 fn device_check(p: &Probe) -> Check {
-    if p.iphones.is_empty() {
-        Check::new("device", CheckStatus::Fail, "no iPhone simulator available").with_remedy(
-            "create one in Xcode (Window > Devices and Simulators) or with `xcrun simctl create`",
+    match (p.iphones.is_empty(), p.booted) {
+        (true, _) => Check::new("device", CheckStatus::Fail, "no iPhone simulator available")
+            .with_remedy(
+                "create one in Xcode (Window > Devices and Simulators) or with `xcrun simctl create`",
+            ),
+        // Available is not driveable: every iOS tool needs a *booted* target, so a host with twelve
+        // simulators and none booted used to read green and then fail on the first call.
+        (false, None) => Check::new(
+            "device",
+            CheckStatus::Warn,
+            format!(
+                "{} iPhone simulator(s) available, none booted",
+                p.iphones.len()
+            ),
         )
-    } else {
-        Check::new(
+        .with_remedy("boot one with `xcrun simctl boot <udid>` (glass does not boot it for you here)"),
+        (false, Some(name)) => Check::new(
             "device",
             CheckStatus::Ok,
-            format!("{} iPhone simulator(s) available", p.iphones.len()),
-        )
+            format!("{} available, booted: {name}", p.iphones.len()),
+        ),
     }
 }
 
@@ -148,11 +162,18 @@ pub fn checks(_deep: bool) -> Vec<Check> {
         .map(|l| l.trim().to_string())
         .collect();
 
+    // The same listing `booted_udid` reads, by name rather than udid: a name is what the operator
+    // sees in Xcode. Nothing here boots anything — doctor reports on the host, it does not change it.
+    let booted = simctl_out(&["simctl", "list", "devices", "available", "--json"])
+        .and_then(|json| parse_devices(&json).ok())
+        .and_then(|devices| booted_name(&devices));
+
     build_checks(&Probe {
         xcode_dir,
         simctl_ok,
         runtimes: &runtimes,
         iphones: &iphones,
+        booted: booted.as_deref(),
     })
 }
 
@@ -299,6 +320,16 @@ fn booted_udid() -> Option<String> {
     booted_from(&parse_devices(&list).ok()?)
 }
 
+/// Name of an already-booted iOS simulator, chosen the same way [`booted_from`] chooses its udid so
+/// the reported device is the one a driving call would attach to.
+fn booted_name(devices: &[SimDevice]) -> Option<String> {
+    let udid = booted_from(devices)?;
+    devices
+        .iter()
+        .find(|d| d.udid == udid)
+        .map(|d| d.name.clone())
+}
+
 /// Pure booted-sim selection: `resolve(_, None, None)` returns `Attach` iff an iOS sim is
 /// already booted, so `Attach` is exactly "spawn against it without booting"; `Boot`/`Error`
 /// mean nothing is booted. The testable seam for [`booted_udid`].
@@ -355,6 +386,60 @@ mod tests {
     }
 
     #[test]
+    fn simulators_available_but_none_booted_is_not_green() {
+        // The gap this closes: everything glass does on iOS needs a booted target, so reporting
+        // "12 iPhone simulator(s) available" as Ok sent an operator into a run that could not work.
+        let runtimes = vec!["iOS 26.5".to_string()];
+        let iphones = vec!["iPhone 17".to_string(), "iPhone 17 Pro".to_string()];
+        let p = Probe {
+            xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl_ok: true,
+            runtimes: &runtimes,
+            iphones: &iphones,
+            booted: None,
+        };
+        let device = build_checks(&p)
+            .into_iter()
+            .find(|c| c.name == "device")
+            .unwrap();
+        assert_eq!(device.status, CheckStatus::Warn);
+        assert!(
+            device.remedy.as_deref().unwrap().contains("simctl boot"),
+            "{:?}",
+            device.remedy
+        );
+    }
+
+    #[test]
+    fn a_booted_simulator_is_named_so_the_operator_knows_which_one() {
+        let runtimes = vec!["iOS 26.5".to_string()];
+        let iphones = vec!["iPhone 17".to_string(), "iPhone 17 Pro".to_string()];
+        let p = Probe {
+            xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
+            simctl_ok: true,
+            runtimes: &runtimes,
+            iphones: &iphones,
+            booted: Some("iPhone 17 Pro"),
+        };
+        let device = build_checks(&p)
+            .into_iter()
+            .find(|c| c.name == "device")
+            .unwrap();
+        assert_eq!(device.status, CheckStatus::Ok);
+        assert!(device.detail.contains("iPhone 17 Pro"), "{}", device.detail);
+    }
+
+    #[test]
+    fn booted_name_reports_the_device_a_driving_call_would_attach_to() {
+        let devices = vec![
+            dev("AAA", "iPhone 17", "Shutdown"),
+            dev("BBB", "iPhone 17 Pro", "Booted"),
+        ];
+        assert_eq!(booted_name(&devices), Some("iPhone 17 Pro".to_string()));
+        assert_eq!(booted_name(&devices[..1]), None);
+    }
+
+    #[test]
     fn all_green_when_fully_configured() {
         let runtimes = vec!["iOS 26.5".to_string()];
         let iphones = vec!["iPhone 17".to_string()];
@@ -363,6 +448,7 @@ mod tests {
             simctl_ok: true,
             runtimes: &runtimes,
             iphones: &iphones,
+            booted: Some("iPhone 17"),
         };
         let cs = build_checks(&p);
         assert!(cs.iter().all(|c| c.status == CheckStatus::Ok), "{cs:?}");
@@ -375,6 +461,7 @@ mod tests {
             simctl_ok: false,
             runtimes: &[],
             iphones: &[],
+            booted: None,
         };
         let cs = build_checks(&p);
         let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
@@ -399,6 +486,7 @@ mod tests {
             simctl_ok: false,
             runtimes: &[],
             iphones: &[],
+            booted: None,
         };
         let cs = build_checks(&p);
         let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
@@ -417,6 +505,7 @@ mod tests {
             simctl_ok: true,
             runtimes: &[],
             iphones: &[],
+            booted: None,
         };
         let cs = build_checks(&p);
         assert_eq!(
