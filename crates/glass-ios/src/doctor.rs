@@ -104,18 +104,25 @@ fn device_check(p: &Probe) -> Check {
 /// calls. Best-effort: a missing tool simply makes the corresponding check report
 /// not-ok with a remedy, rather than failing this function. `_deep` is accepted for
 /// signature parity with the other backends' doctors; iOS has no expensive deep probe.
+/// Deadline for each doctor probe. Doctor reports on the host rather than driving it, so every
+/// probe here is a fast query; a tool that does not answer in this long is itself the finding.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub fn checks(_deep: bool) -> Vec<Check> {
-    let xcode_dir = Command::new("xcode-select")
-        .arg("-p")
-        .output()
+    // Bounded like every other one-shot: doctor's job is to report, and a doctor that hangs on a
+    // wedged tool reports nothing at all. A timeout lands in the same `None` as a missing tool,
+    // so the check still says not-ok with its remedy.
+    let mut xcode_select = Command::new("xcode-select");
+    xcode_select.arg("-p");
+    let xcode_dir = glass_core::run_bounded(&mut xcode_select, PROBE_BUDGET, "xcode-select:-p")
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
     let simctl_out = |args: &[&str]| {
-        Command::new("xcrun")
-            .args(args)
-            .output()
+        let mut cmd = Command::new("xcrun");
+        cmd.args(args);
+        glass_core::run_bounded(&mut cmd, PROBE_BUDGET, "xcrun:doctor probe")
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())

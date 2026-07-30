@@ -173,10 +173,11 @@ fn launch_stderr_tail(simctl: &Simctl, udid: &str) -> Option<String> {
 fn pid_is_running(pid: u32) -> bool {
     // Absolute path: `ps` resolved through `PATH` could be a shim whose non-zero exit would be
     // read below as "the app died", turning a healthy launch into a confident false report.
-    match Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "state="])
-        .output()
-    {
+    let mut cmd = Command::new("/bin/ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "state="]);
+    // A timeout here reads the same as `ps` being missing: not knowable, so not evidence the app
+    // died (see this function's doc). Bounded so a wedged `ps` cannot hold up a launch.
+    match glass_core::run_bounded(&mut cmd, std::time::Duration::from_secs(10), "ps:pid-state") {
         // A process that has exited but not yet been reaped is still listed, in state `Z`. That
         // is a real window here — the app's parent is `launchd_sim`, not this process — and a
         // zombie is a dead app, so the state is read rather than just the exit status.
@@ -235,10 +236,13 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
         .ok_or_else(|| GlassError::Backend("cannot start app: run command is empty".into()))?;
     if looks_like_app_path(first) {
         let plist = format!("{first}/Info.plist");
-        let out = Command::new("plutil")
-            .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist])
-            .output()
-            .map_err(|e| GlassError::Backend(format!("plutil: {e}")))?;
+        let mut cmd = Command::new("plutil");
+        cmd.args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist]);
+        let out = glass_core::run_bounded(
+            &mut cmd,
+            std::time::Duration::from_secs(10),
+            "plutil:CFBundleIdentifier",
+        )?;
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "could not read CFBundleIdentifier from {plist}: {}",
@@ -427,9 +431,13 @@ impl Platform for IosPlatform {
         for (k, v) in &spec.env {
             launch.env(format!("SIMCTL_CHILD_{k}"), v);
         }
-        let out = launch
-            .output()
-            .map_err(|e| GlassError::Backend(format!("simctl launch: {e}")))?;
+        // Bounded like every other simctl call, but spelled out here because this one cannot go
+        // through `Simctl::run`: it needs `SIMCTL_CHILD_*` in the child's environment.
+        let out = glass_core::run_bounded(
+            &mut launch,
+            crate::simctl::SimctlOp::Lifecycle.budget(),
+            "simctl:launch",
+        )?;
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "simctl launch failed: {}",
