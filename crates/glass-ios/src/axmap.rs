@@ -33,8 +33,6 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXSearchField", AxRole::TextField),
     ("AXTextView", AxRole::TextArea),
     ("AXImage", AxRole::Image),
-    ("AXSwitch", AxRole::ToggleButton),
-    ("AXToggle", AxRole::ToggleButton),
     ("AXCheckBox", AxRole::CheckBox),
     ("AXSlider", AxRole::Slider),
     ("AXLink", AxRole::Link),
@@ -64,6 +62,27 @@ pub fn ax_role(role: &str) -> AxRole {
         .find(|(token, _)| *token == role)
         .map(|(_, r)| *r)
         .unwrap_or(AxRole::Other)
+}
+
+/// Subroles that decide a role on their own, whatever base role carries them.
+///
+/// A `UISwitch` reports `role=AXCheckBox subrole=AXSwitch` (measured on iOS 26.5); macOS puts the
+/// same subrole on a different base role again (`AXButton` for an AppKit `NSSwitch`). The subrole is
+/// what the platforms agree on, so it is matched on its own rather than as a (role, subrole) pair.
+pub const SUBROLE_TOKENS: &[(&str, AxRole)] = &[
+    ("AXSwitch", AxRole::ToggleButton),
+    ("AXToggle", AxRole::ToggleButton),
+];
+
+/// [`ax_role`], but a subrole in [`SUBROLE_TOKENS`] wins over the base role.
+///
+/// Without one, the base role alone calls a `UISwitch` a checkbox — a different control from the one
+/// the other four backends report for the same widget.
+pub fn ax_role_with_subrole(role: &str, subrole: Option<&str>) -> AxRole {
+    subrole
+        .and_then(|sub| SUBROLE_TOKENS.iter().find(|(token, _)| *token == sub))
+        .map(|(_, r)| *r)
+        .unwrap_or_else(|| ax_role(role))
 }
 
 /// Parse idb's nested accessibility JSON into an [`AxTree`]. Each element's
@@ -163,7 +182,9 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
             .map(str::to_string)
     };
     let ax_type = s("role").unwrap_or_default();
-    let role = ax_role(&ax_type);
+    // `subrole` is a real key in idb's node schema — present on every node, null where there is
+    // none — so this is a plain field read, not an extra round-trip.
+    let role = ax_role_with_subrole(&ax_type, s("subrole").as_deref());
     let editable = matches!(role, AxRole::TextField | AxRole::TextArea);
     let uid = s("AXUniqueId");
     let label = s("AXLabel");
@@ -303,8 +324,6 @@ mod tests {
         assert_eq!(ax_role("AXApplication"), AxRole::Application);
         assert_eq!(ax_role("AXImage"), AxRole::Image);
         // The checkable roles the toggle-state derivation depends on.
-        assert_eq!(ax_role("AXSwitch"), AxRole::ToggleButton);
-        assert_eq!(ax_role("AXToggle"), AxRole::ToggleButton);
         assert_eq!(ax_role("AXCheckBox"), AxRole::CheckBox);
         assert_eq!(ax_role("AXWhatever"), AxRole::Other);
     }
@@ -562,10 +581,77 @@ mod tests {
     }
 
     #[test]
+    fn a_uiswitch_is_a_togglebutton_not_a_checkbox() {
+        // Measured on iOS 26.5: a UISwitch reports role=AXCheckBox subrole=AXSwitch. Reading the
+        // base role alone reports it as the checkbox it is not, and disagrees with the role the
+        // other four backends give the same control.
+        assert_eq!(
+            ax_role_with_subrole("AXCheckBox", Some("AXSwitch")),
+            AxRole::ToggleButton
+        );
+        assert_eq!(
+            ax_role_with_subrole("AXCheckBox", Some("AXToggle")),
+            AxRole::ToggleButton
+        );
+    }
+
+    #[test]
+    fn a_real_checkbox_is_still_a_checkbox() {
+        assert_eq!(ax_role_with_subrole("AXCheckBox", None), AxRole::CheckBox);
+        assert_eq!(
+            ax_role_with_subrole("AXCheckBox", Some("AXSomethingElse")),
+            AxRole::CheckBox
+        );
+    }
+
+    #[test]
+    fn a_switch_keeps_its_checked_state_through_the_role_change() {
+        // The regression this slice must not cause: `checkable_checked` keys off the role, so a
+        // switch that becomes a ToggleButton has to keep reporting checkable/checked.
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, Some("1")),
+            (true, true)
+        );
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, Some("0")),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn a_switch_maps_end_to_end_from_the_json_idb_actually_sends() {
+        // The node verbatim from the scratch fixture read, so the parse is pinned to the shape the
+        // device sends rather than to one written here.
+        let j = r#"[{"role":"AXCheckBox","subrole":"AXSwitch","type":"CheckBox",
+            "AXUniqueId":"the-switch","AXLabel":null,"AXValue":"1","enabled":true,
+            "frame":{"x":0,"y":0,"width":51,"height":31},"children":[]}]"#;
+        let tree = build_tree(
+            j,
+            1.0,
+            &WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            WalkLimits::DEFAULT,
+        )
+        .expect("parse");
+        let n = &tree.root.children[0];
+        assert_eq!(n.role, AxRole::ToggleButton);
+        assert!(n.states.checkable && n.states.checked, "{:?}", n.states);
+    }
+
+    #[test]
     fn map_matches_declared_column() {
         use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
-            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role);
+            // Both tables: a role this backend can only produce from a subrole (a switch) is as
+            // mapped as one produced from a role token, and the matrix does not distinguish them.
+            let mapped = ROLE_TOKENS
+                .iter()
+                .chain(SUBROLE_TOKENS)
+                .any(|(_, r)| *r == role);
             match support(role, AxBackend::Ios).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no token maps to it")
