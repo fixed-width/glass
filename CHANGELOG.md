@@ -17,6 +17,23 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
+  used to say the reader was available whatever the accessibility API was doing, so the one case you
+  need it for — the reader is not answering — showed green. It now reads one attribute off the
+  system-wide accessibility element and reports what happened, with the error code. macOS gives the
+  same code for several causes, so the line names the one that applies: not trusted, nobody logged in
+  at the console, assistive access switched off, or a binary that was never granted despite the
+  system reporting it as trusted — each with its own remedy. A logged-out console is a warning rather
+  than a failure, since it is not a broken install.
+- `glass doctor`'s iOS device line now reports which simulator glass would drive, by running the same
+  resolution `glass_start` runs. It listed how many were available and nothing more. Nothing booted
+  is fine and says so — glass boots one at start — and an iPad-only host is no longer reported as
+  having no device, since glass drives any iOS simulator. What is now reported as a failure is what
+  the start path will not fix for you: a `GLASS_IOS_UDID` that names a simulator which is not booted,
+  or is not on this host, or is not an iOS simulator at all (glass attaches to a pinned device
+  without booting or checking it, so every call would fail against it), and a `GLASS_IOS_DEVICE` that
+  matches nothing here — each with the remedy that fits. A device listing that cannot be read says
+  that, rather than reporting it as nothing booted.
 - `glass_set_value` now tells you when a write did not take on Android (without the on-device
   accessibility service) and on the iOS Simulator. Those two backends tap the element, clear it and
   type — and used to report success without ever looking again, so a tap that landed slightly off, a

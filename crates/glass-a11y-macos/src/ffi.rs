@@ -28,6 +28,7 @@
 
 use std::ptr::NonNull;
 
+use crate::doctor::SystemWideProbe;
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint, CGSize,
@@ -139,6 +140,81 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
     // ownership rule — an already-retained (+1) `CFTypeRef` on success — so
     // `CFRetained::from_raw` takes ownership without an extra retain (mirrors `axwindow`).
     Ok(Some(unsafe { CFRetained::from_raw(nn) }))
+}
+
+/// One system-wide accessibility read, for the doctor: does the AX API answer at all?
+///
+/// Reads [`SystemWideProbe`]'s probe attribute and throws the value away — the question is whether
+/// the call was *answered*, not what is focused — so it needs no target application and mutates
+/// nothing. It cannot go through [`copy_attribute_checked`], which returns a `GlassError` and
+/// discards the `AXError` discriminant the doctor classifies on.
+///
+/// Bounded by an explicit messaging timeout: an AX read is synchronous IPC to another process, and
+/// "the accessibility stack is wedged" — the headline condition this probe exists to catch — is
+/// exactly the case that blocks. A doctor that hangs reports nothing at all.
+pub(crate) fn probe_system_wide() -> SystemWideProbe {
+    probe_system_wide_attr(crate::doctor::PROBE_ATTRIBUTE)
+}
+
+/// How long one doctor AX read may wait before the API gives up — chosen to leave room for a busy
+/// frontmost application rather than measured against one.
+const PROBE_TIMEOUT_SECS: f32 = 2.0;
+
+/// The process-global AX messaging timeout, restored on drop.
+///
+/// A guard rather than a pair of calls so an unwind between them cannot leave the whole server
+/// running with the probe's short bound.
+struct ProbeTimeout<'a>(&'a AXUIElement);
+
+impl<'a> ProbeTimeout<'a> {
+    fn set(el: &'a AXUIElement) -> Self {
+        // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
+        // lifetime preconditions. A timeout that could not be set leaves the system default in
+        // place: the probe is then bounded only by that default, as it was before.
+        let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
+        Self(el)
+    }
+}
+
+impl Drop for ProbeTimeout<'_> {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`; 0 on the system-wide object restores the documented default.
+        let _ = unsafe { self.0.set_messaging_timeout(0.0) };
+    }
+}
+
+/// [`probe_system_wide`] with the attribute as a seam, so a live test can drive the classifier with
+/// an attribute the system-wide element does not carry and see a real non-`Success` code come back
+/// from the API rather than from a fixture.
+fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
+    // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
+    // documented contract (the binding itself `.expect()`s on this).
+    let el = unsafe { AXUIElement::new_system_wide() };
+    // Setting a timeout on the *system-wide* object sets it globally for the process (Apple's
+    // documented behaviour), so the bound is restored the moment the read returns — otherwise one
+    // `glass_doctor` call would cap every later a11y read in the server, a diagnostic changing what
+    // the product does. `glass_doctor` does not run on the serialized platform thread, so an a11y
+    // read *concurrent* with the probe still sees the cap; that window is one attribute read long,
+    // where the alternative is an unbounded doctor.
+    let _timeout = ProbeTimeout::set(&el);
+    let attr = CFString::from_str(attr_name);
+    let mut raw: *const CFType = std::ptr::null();
+    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
+    // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
+    let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
+    drop(_timeout);
+    if err == AXError::Success
+        && let Some(nn) = NonNull::new(raw.cast_mut())
+    {
+        // SAFETY: on `Success` the Copy call returned an already-retained (+1) value per Core
+        // Foundation's Copy/Create rule; taking ownership here releases it at end of scope rather
+        // than leaking the frontmost application element on every doctor run. Only on `Success`:
+        // on any other code the out-param is not ours to release.
+        drop(unsafe { CFRetained::from_raw(nn) });
+    }
+    // A `Success` with a null value is `Answered` here, though `copy_attribute_checked` calls the
+    // same pair a backend error: this probe asks whether the call was answered, and it was.
+    SystemWideProbe::from_ax_code(err.0)
 }
 
 /// Read `el`'s `attr_name` as a `String`, or `None` when the attribute is absent, isn't a
@@ -356,8 +432,63 @@ fn ax_err(context: &str, err: AXError) -> GlassError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_absent_error;
+    use super::{is_absent_error, probe_system_wide_attr};
+    use crate::doctor::SystemWideProbe;
     use objc2_application_services::AXError;
+
+    // There is deliberately no live "the probe answers" test: on a granted process it answers and
+    // on an untrusted one it does not, so the assertion would encode which binaries the running
+    // host happens to trust. The classification it feeds is unit-tested in `doctor`, on any host.
+
+    /// Live: a real `AXError` from the API reaches the classifier and is told apart from `Answered`.
+    /// Needs a GUI session; whether it needs the Accessibility grant is untested — an attribute the
+    /// element does not carry is not trust-gated on the evidence this crate has.
+    #[test]
+    #[ignore = "needs a macOS GUI session; CI has none, so run it on a dev Mac: cargo test -p glass-a11y-macos --lib ffi::tests -- --ignored"]
+    fn an_attribute_the_element_lacks_is_not_reported_as_answered() {
+        assert_ne!(
+            probe_system_wide_attr("AXNoSuchAttributeGlassDoctorProbe"),
+            SystemWideProbe::Answered
+        );
+    }
+
+    /// Live: `AXRole` answers on the system-wide element. Half of the reason
+    /// [`crate::doctor::PROBE_ATTRIBUTE`] is not `AXRole`; the other half — that an *untrusted*
+    /// process still gets an answer from it — needs an untrusted process and is not asserted
+    /// anywhere.
+    #[test]
+    #[ignore = "needs a macOS GUI session; CI has none, so run it on a dev Mac: cargo test -p glass-a11y-macos --lib ffi::tests -- --ignored"]
+    fn axrole_answers_on_the_system_wide_element() {
+        assert_eq!(
+            probe_system_wide_attr("AXRole"),
+            SystemWideProbe::Answered,
+            "if this fails, the reason PROBE_ATTRIBUTE is AXFocusedApplication no longer holds"
+        );
+    }
+
+    /// The doctor hand-copies these codes so its classifier compiles on any host; nothing else
+    /// keeps them equal to the binding's, and a one-digit slip would silently reclassify a disabled
+    /// API as an unrecognised failure.
+    #[test]
+    fn the_doctors_ax_codes_match_the_binding() {
+        use crate::doctor::SystemWideProbe;
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::APIDisabled.0),
+            SystemWideProbe::ApiDisabled
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::CannotComplete.0),
+            SystemWideProbe::DidNotComplete
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::NoValue.0),
+            SystemWideProbe::NothingFocused
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::Success.0),
+            SystemWideProbe::Answered
+        );
+    }
 
     #[test]
     fn absent_ax_errors_classified_as_absent() {

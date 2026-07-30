@@ -133,8 +133,10 @@ reads the pasteboard over `simctl`, not through an in-app `UIPasteboard` read, s
 GLASS_BACKEND=ios glass-mcp doctor
 ```
 
-Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, an iPhone
-simulator is available, and `idb_companion` is installed (for input + accessibility) — each failing
+Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, which simulator
+glass would drive (it boots one itself at start unless `GLASS_IOS_UDID` pins a specific device — a
+pin that is not booted is reported as a failure, since glass attaches to it without booting), and
+whether `idb_companion` is installed (for input + accessibility) — each failing
 check comes with its own remedy (the commands above). The `[ios]` section (including the
 `idb_companion` line) also appears when iOS is driven per-call from a server whose default backend is
 macOS; there an absent `idb_companion` is shown as an advisory warning rather than a failure, since it

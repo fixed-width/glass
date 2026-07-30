@@ -218,7 +218,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         sections.push(Section::new(
             "accessibility (macos)",
             None,
-            macos_a11y_checks(glass_macos::accessibility_granted()),
+            macos_a11y_checks(
+                glass_a11y_macos::doctor::probe(),
+                glass_macos::accessibility_granted(),
+                console_session(glass_macos::session_state()),
+            ),
         ));
     }
 
@@ -519,35 +523,51 @@ fn macos_checks(resolved_backend: &str) -> Vec<Check> {
     )
 }
 
-/// The "accessibility (macos)" section: the `glass-a11y-macos` reader (AXUIElement) is a
-/// system framework, not an optional install like Linux's AT-SPI daemon or a service that
-/// needs spinning up — so it's always present in a macOS build, and the only real
-/// precondition left to report is the Accessibility TCC grant itself. Pure — takes the
-/// already-gathered grant fact, makes no OS calls — so it's unit-tested without needing a
-/// real grant, mirroring `glass_a11y_linux::doctor::a11y_checks`/
-/// `glass_a11y_windows::doctor::a11y_checks`.
+/// Translate the platform crate's session read into the a11y reader's vocabulary.
+///
+/// Locked collapses into `LoggedIn`: a locked session was measured not to change what the probe
+/// returns, and the lock's real consequence is already the `display awake` check's to report.
 #[cfg(target_os = "macos")]
-fn macos_a11y_checks(accessibility_granted: bool) -> Vec<Check> {
-    vec![
+fn console_session(state: glass_macos::SessionState) -> glass_a11y_macos::doctor::ConsoleSession {
+    use glass_a11y_macos::doctor::ConsoleSession;
+    match state {
+        glass_macos::SessionState::Unlocked | glass_macos::SessionState::Locked => {
+            ConsoleSession::LoggedIn
+        }
+        glass_macos::SessionState::NoSession => ConsoleSession::NoSession,
+    }
+}
+
+/// The "accessibility (macos)" section: the reader line, from a real system-wide AX read, and the
+/// Accessibility TCC grant beside it.
+///
+/// The two answer different questions and keep different remedies: the reader line says whether the
+/// API responded — which a *trusted* process still fails when the accessibility stack is not
+/// answering — and the grant line says whether this binary is trusted. Pure: it takes the three
+/// facts already gathered, so it is unit-tested without a grant, a lock, or a live AX stack,
+/// mirroring `glass_a11y_linux::doctor::a11y_checks`/`glass_a11y_windows::doctor::a11y_checks`.
+///
+/// Argument order matches `glass_a11y_macos::doctor::a11y_checks`, which it delegates to.
+#[cfg(target_os = "macos")]
+fn macos_a11y_checks(
+    probe: glass_a11y_macos::doctor::SystemWideProbe,
+    accessibility_granted: bool,
+    session: glass_a11y_macos::doctor::ConsoleSession,
+) -> Vec<Check> {
+    let mut checks = glass_a11y_macos::doctor::a11y_checks(probe, accessibility_granted, session);
+    checks.push(if accessibility_granted {
+        Check::new("Accessibility", CheckStatus::Ok, "granted")
+    } else {
         Check::new(
-            "a11y reader",
-            CheckStatus::Ok,
-            "AXUIElement reader available — glass_a11y_snapshot / glass_a11y_marks / \
-             glass_click_element / glass_set_value will work once Accessibility is granted (see below)",
-        ),
-        if accessibility_granted {
-            Check::new("Accessibility", CheckStatus::Ok, "granted")
-        } else {
-            Check::new(
-                "Accessibility",
-                CheckStatus::Fail,
-                "not granted — glass_a11y_snapshot / glass_a11y_marks / glass_click_element / \
-                 glass_set_value will fail with a permission error",
-            )
-            .with_remedy(glass_macos::accessibility_remedy())
-            .with_remedy_action(format!("open {}", glass_macos::accessibility_pane_url()))
-        },
-    ]
+            "Accessibility",
+            CheckStatus::Fail,
+            "not granted — glass_a11y_snapshot / glass_a11y_marks / glass_click_element / \
+             glass_set_value will fail with a permission error",
+        )
+        .with_remedy(glass_macos::accessibility_remedy())
+        .with_remedy_action(format!("open {}", glass_macos::accessibility_pane_url()))
+    });
+    checks
 }
 
 #[cfg(test)]
@@ -1112,18 +1132,40 @@ mod tests {
         }
 
         #[test]
-        fn a11y_reader_is_always_reported_present() {
-            // The AXUIElement reader is a system framework compiled unconditionally into
-            // a macOS build — unlike Linux's AT-SPI daemon, there's no "not installed"
-            // state to detect, so this line is always Ok regardless of the grant.
-            let checks = macos_a11y_checks(false);
-            let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
-            assert_eq!(reader.status, CheckStatus::Ok);
+        fn the_reader_line_reports_the_probe_not_a_constant() {
+            // The defect this replaced: the line was `Ok` whatever the AX stack was doing, so the
+            // one case an operator needs it for — the reader is not answering — read green.
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let answered =
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn);
+            let refused = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                true,
+                ConsoleSession::LoggedIn,
+            );
+            assert_eq!(
+                answered
+                    .iter()
+                    .find(|c| c.name == "a11y reader")
+                    .unwrap()
+                    .status,
+                CheckStatus::Ok
+            );
+            assert_eq!(
+                refused
+                    .iter()
+                    .find(|c| c.name == "a11y reader")
+                    .unwrap()
+                    .status,
+                CheckStatus::Fail
+            );
         }
 
         #[test]
-        fn a11y_granted_is_all_ok() {
-            let checks = macos_a11y_checks(true);
+        fn a_granted_process_whose_ax_stack_answers_is_all_ok() {
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks =
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn);
             assert!(
                 checks.iter().all(|c| c.status == CheckStatus::Ok),
                 "{checks:?}"
@@ -1131,8 +1173,77 @@ mod tests {
         }
 
         #[test]
+        fn an_ungranted_process_gets_one_remedy_per_question() {
+            // The grant line owns the System Settings remedy; the reader line points at it rather
+            // than repeating it, so the operator is given one thing to do rather than two.
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                false,
+                ConsoleSession::LoggedIn,
+            );
+            let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
+            let grant = checks.iter().find(|c| c.name == "Accessibility").unwrap();
+            assert_eq!(
+                grant.remedy.as_deref(),
+                Some(glass_macos::accessibility_remedy())
+            );
+            // Not `assert_ne!` on the two Options: that passes when the reader line has no remedy
+            // at all, which is the dead end this is meant to rule out.
+            let reader_remedy = reader
+                .remedy
+                .as_deref()
+                .expect("the reader line needs a remedy");
+            assert!(
+                reader_remedy.contains("see the check below"),
+                "{reader_remedy}"
+            );
+        }
+
+        #[test]
+        fn each_session_state_maps_to_its_own_console_meaning() {
+            // The only untested line the a11y wiring added. Swapping two arms compiles and keeps the
+            // workspace green, while telling a locked-screen operator to log in — the contradiction
+            // with `display awake` that three-valuing this was meant to remove.
+            use glass_a11y_macos::doctor::ConsoleSession;
+            assert_eq!(
+                console_session(glass_macos::SessionState::Unlocked),
+                ConsoleSession::LoggedIn
+            );
+            // Measured: a locked session does not change what the probe returns, so it maps to the
+            // same vocabulary as unlocked and the lock is reported by `display awake` alone.
+            assert_eq!(
+                console_session(glass_macos::SessionState::Locked),
+                ConsoleSession::LoggedIn
+            );
+            assert_eq!(
+                console_session(glass_macos::SessionState::NoSession),
+                ConsoleSession::NoSession
+            );
+        }
+
+        #[test]
+        fn a_console_with_nobody_logged_in_does_not_fail_the_whole_run() {
+            // This section is always critical (`backend: None`), so a `Fail` here exits non-zero
+            // even for someone driving android on a Mac. Nobody at the console is not a broken
+            // install, so it warns — asserted here rather than left to the comment.
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                true,
+                ConsoleSession::NoSession,
+            );
+            let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
+            assert_eq!(reader.status, CheckStatus::Warn);
+        }
+
+        #[test]
         fn a11y_not_granted_fails_with_the_shared_remedy() {
-            let checks = macos_a11y_checks(false);
+            let checks = macos_a11y_checks(
+                glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
+                false,
+                glass_a11y_macos::doctor::ConsoleSession::LoggedIn,
+            );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
             // Same remedy string as the "macos" section's own Accessibility check — no
@@ -1145,7 +1256,11 @@ mod tests {
 
         #[test]
         fn a11y_not_granted_points_at_the_accessibility_pane() {
-            let checks = macos_a11y_checks(false);
+            let checks = macos_a11y_checks(
+                glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
+                false,
+                glass_a11y_macos::doctor::ConsoleSession::LoggedIn,
+            );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             // Same pane URL as the "macos" section's own Accessibility check — kept in
             // sync for the same reason as the shared remedy string above.
