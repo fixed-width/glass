@@ -2493,10 +2493,9 @@ mod tests {
 
     #[test]
     fn the_combo_path_waits_for_the_popup_to_realize() {
-        // Both re-reads in the combo path are taken after a settle, because an a11y tree read the
-        // instant a popup opens or closes shows the previous state — the options missing, or the
-        // old label still selected. Timed rather than asserted structurally: the settle is a sleep,
-        // so removing it leaves every other assertion in this file green.
+        // A tree read the instant a popup opens or closes shows the previous state, so both re-reads
+        // in the combo path follow a settle. Timed rather than asserted structurally: the settle is
+        // a sleep, so removing it leaves every other assertion in this file green.
         let platform = FakePlatform::new(340, 300);
         let (mut g, _invoke_log) = glass_with_a11y_seq_invoke(
             platform,

@@ -81,9 +81,8 @@ mod macos_main {
     const NEEDLES: [&str; 5] = [
         "Button \"Save\"",
         "CheckBox \"Enable\"",
-        // The switch beside it. AppKit reports an NSSwitch as AXButton with an AXSwitch subrole,
-        // so this line is the on-box proof that the reader consults the subrole: without it the
-        // node renders as Button and this needle is absent.
+        // The on-box proof that the reader consults the subrole: without it an NSSwitch renders as
+        // Button and this needle is absent.
         "ToggleButton \"Active\"",
         "TextField \"Note\"",
         "Label \"Status\"",

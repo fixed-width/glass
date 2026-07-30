@@ -734,9 +734,8 @@ mod tests {
 
     #[test]
     fn a_cell_names_the_token_it_carries() {
-        // `named_token` is what makes a cell checkable: each backend's column test resolves the
-        // token through its own map and asserts it does not produce the role. A cell that stopped
-        // reporting its token would make every one of those assertions vacuous.
+        // A cell that stopped reporting its token would make every backend column test vacuous:
+        // each resolves this token through its own map and asserts it does not produce the role.
         assert_eq!(RoleSupport::Mapped.named_token(), None);
         assert_eq!(
             RoleSupport::Gap {

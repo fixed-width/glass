@@ -135,8 +135,7 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
 /// round-trip reading its `AXValue`.
 ///
 /// One list, not two: the reader gates its read on the same predicate [`checkable_checked`] judges
-/// with, so a role added to one cannot be missed by the other — dropping `ToggleButton` from the
-/// reader's copy alone left every test green while macOS switches lost their checked state.
+/// with, because a second copy could be dropped with every test still green.
 pub fn role_carries_checked(role: AxRole) -> bool {
     matches!(
         role,
@@ -150,9 +149,8 @@ pub fn role_carries_checked(role: AxRole) -> bool {
 /// encoding, `2`/`-1`/…, is deliberately not relied on here). Claims `checkable` ONLY for a
 /// determinate `0`/`1` (the #170 invariant); every other value, and an unread `None`, →
 /// `(false, false)`, so a mixed or unreadable box matches neither `condition:"checked"` nor
-/// `"unchecked"`. `ToggleButton` is in the list because that is what a switch maps to; the AppKit
-/// variant reports `AXButton`, so it alone carried no checked state before — the SwiftUI variant
-/// already did, as a `CheckBox`.
+/// `"unchecked"`. `ToggleButton` is in the list because that is what a switch maps to, and the
+/// AppKit variant — an `AXButton` — carried no checked state at all before that.
 pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
     if !role_carries_checked(role) {
         return (false, false);
@@ -187,8 +185,6 @@ mod tests {
 
     #[test]
     fn a_switch_is_a_togglebutton_whichever_base_role_carries_it() {
-        // Measured on macOS 26.5: an AppKit NSSwitch is an AXButton with subrole AXSwitch, and a
-        // SwiftUI/system switch is an AXCheckBox with the same subrole. Both are the same control.
         // `AXToggle` is deliberately absent: AppKit documents it for on/off *buttons*, and no probe
         // has reported it, so mapping it would reclassify ordinary toggle buttons on a guess.
         assert_eq!(map_role("AXButton", Some("AXSwitch")), AxRole::ToggleButton);
@@ -215,11 +211,8 @@ mod tests {
 
     #[test]
     fn the_reader_and_the_judgement_agree_on_which_roles_carry_checked() {
-        // The reader gates its AXValue read on this; if the two lists were separate, dropping a
-        // role from the reader's copy would cost the state with every test still green.
-        // Quantified over every role, not a hand-picked few: a role added to one and missed by
-        // the other is exactly the divergence the shared predicate exists to prevent, and a
-        // three-role list could not detect it.
+        // Quantified over every role: a hand-picked list cannot detect the divergence the shared
+        // predicate exists to prevent.
         for role in AxRole::ALL {
             assert_eq!(
                 role_carries_checked(role),

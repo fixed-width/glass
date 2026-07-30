@@ -69,10 +69,8 @@ pub fn ax_role(role: &str) -> AxRole {
 ///
 /// Subroles that decide a role, and the base roles that can carry one.
 ///
-/// A `UISwitch` reports `role=AXCheckBox subrole=AXSwitch` (measured on iOS 26.5); macOS puts the
-/// same subrole on `AXButton` as well, for an AppKit `NSSwitch`. The subrole is what the platforms
-/// agree on — but it is still matched against the base roles known to carry it, so one stray
-/// attribute cannot re-role an unrelated node.
+/// A `UISwitch` reports `role=AXCheckBox subrole=AXSwitch` (measured on iOS 26.5). Matched against
+/// the base roles known to carry it, so one stray attribute cannot re-role an unrelated node.
 pub const SUBROLE_TOKENS: &[(&str, AxRole, &[&str])] =
     &[("AXSwitch", AxRole::ToggleButton, &["AXCheckBox"])];
 
@@ -608,8 +606,7 @@ mod tests {
     #[test]
     fn a_real_checkbox_is_still_a_checkbox() {
         assert_eq!(ax_role_with_subrole("AXCheckBox", None), AxRole::CheckBox);
-        // A carrying base role is required, as on macOS: a subrole on something else is not a
-        // switch, and matching it anywhere would let one stray attribute re-role any node.
+        // A subrole on a base role that does not carry one is not a switch.
         assert_eq!(
             ax_role_with_subrole("AXCell", Some("AXSwitch")),
             AxRole::Cell
@@ -636,8 +633,7 @@ mod tests {
 
     #[test]
     fn the_fixture_of_record_carries_a_switch_and_maps_it() {
-        // The claim this whole change rests on, checked against the captured device output rather
-        // than against JSON written in this file: a UISwitch arrives as AXCheckBox + AXSwitch.
+        // Checked against the captured device output rather than JSON written in this file.
         let tree = build_tree(FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).expect("parse");
         let sw = find_by_name(&tree.root, "toggleSwitch").expect("the fixture carries a switch");
         assert_eq!(sw.role, AxRole::ToggleButton);
