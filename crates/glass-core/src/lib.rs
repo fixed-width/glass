@@ -15,6 +15,9 @@ pub use toolpath::tool_path;
 pub mod bounded;
 pub use bounded::{TIMED_OUT, run_bounded, run_bounded_with_stdin};
 
+pub mod set_value;
+pub use set_value::{read_back_confirms, typed_clear_landed, typed_text_landed};
+
 pub mod frame;
 pub use frame::{Frame, Region};
 

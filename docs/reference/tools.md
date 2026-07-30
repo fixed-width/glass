@@ -503,8 +503,13 @@ Returns `{id}` — the `#id` you clicked — plus `observed: {settled, saw_motio
 
 ### `glass_set_value`
 
-Set an editable element's value directly via accessibility (instant, no keystrokes). Errors if the
-element isn't editable, changed since the snapshot, or the app exposes no accessibility tree.
+Where the platform can write the value directly this is instant and takes no keystrokes. On a mobile
+backend (Android without the on-device accessibility service, and the iOS Simulator) it taps the
+element, clears it and types, then reads the element back to confirm — up to three reads, since a
+field may commit a frame or two later. Errors if the element isn't editable, changed since the
+snapshot, does not hold the requested value afterwards, or the app exposes no accessibility tree. A
+field that reformats what it is given, and a cleared field that reports its placeholder as its text,
+both read as not applied even though the text arrived — read the element to see what it holds.
 
 - `id` (integer, **required**) — the element's `#id`.
 - `text` (string, **required**) — the value to set.

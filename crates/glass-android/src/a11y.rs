@@ -5,7 +5,10 @@
 use std::time::{Duration, Instant};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
-use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry};
+use glass_core::{
+    GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
+    typed_text_landed,
+};
 
 use crate::adb::Adb;
 use crate::axmap::build_tree;
@@ -80,6 +83,76 @@ fn dump_until_ready(
     }
 }
 
+/// Judge a typed `set_value` from a tree read back after it. `Ok(())` only when the field holds
+/// exactly what was asked for, or — for a clear — reads back empty.
+///
+/// Exact match, not "changed from before": tap-and-type is not atomic, so a dropped key or an input
+/// filter leaves the field holding something that is neither the request nor the old value, and
+/// calling that success is the failure this check exists to prevent. `glass_core::typed_text_landed`
+/// and `glass_core::typed_clear_landed` carry the rules and the cost of them.
+///
+/// The element is re-resolved by its pre-order id, which the write can perturb if the tap changes
+/// what is on screen. Raising the soft keyboard does not: measured on the dogfood AVD with
+/// `mInputShown=true`, `uiautomator dump` emits the focused window only and no IME window, so the
+/// keyboard cannot shift ids. A tap that navigates — Settings' search entry opens a different
+/// window — does shift them, so a mismatch is [`GlassError::AxElementChanged`] ("re-snapshot")
+/// rather than a claim about the write.
+///
+/// Role and name are checked but bounds deliberately are not, unlike the pre-write
+/// [`locate_editable_target`]: the IME reflows the layout under the field it is typing into, so a
+/// moved-but-correct element is the normal case here.
+///
+/// The node must also still be editable, which excludes a non-editable neighbour that inherited the
+/// id — but not a second nameless editable, since an editable's name comes from `content-desc` alone
+/// and `AxTarget::matches` compares `None` to `None`. The exact-value requirement is what covers
+/// that case.
+fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()> {
+    let Some(node) = after_tree.find(target.id) else {
+        // A tree cut short by the node cap explains an absent element better than "it moved" does.
+        return Err(match &after_tree.truncated {
+            // `Truncation::notice()` is written to close a rendered outline — a leading ellipsis
+            // and its own pixel-fallback advice — so this states the cap itself instead.
+            Some(t) => GlassError::AccessibilityUnavailable(format!(
+                "set_value: the text was typed, but the read-back could not find element {} \
+                 because the tree was truncated at {} {}; re-snapshot rather than retyping",
+                target.id.0,
+                t.limit_value,
+                t.limit.label(),
+            )),
+            None => GlassError::AxElementChanged(target.id.0),
+        });
+    };
+    if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    let landed = if text.is_empty() {
+        typed_clear_landed(node.value.as_deref())
+    } else {
+        typed_text_landed(node.value.as_deref(), text)
+    };
+    if landed {
+        Ok(())
+    } else {
+        Err(GlassError::AxValueNotApplied(target.id.0))
+    }
+}
+
+/// How many times to read the element back before reporting the write as not applied. A landed
+/// write confirms on the first read and pays for one; the retries exist for a field that commits a
+/// frame or two later — a Compose recompose, a debounced handler — which the on-device service
+/// reader polls two whole seconds for.
+const VERIFY_ATTEMPTS: usize = 3;
+
+/// How long to let the toolkit commit typed text before reading it back. Generous relative to a
+/// keystroke and small next to the `uiautomator dump` that follows it.
+const VERIFY_SETTLE_MS: u64 = 300;
+
+/// Readiness budget for one post-write read-back. Do NOT reuse [`DUMP_READY_TIMEOUT_MS`] here: that
+/// is the once-per-session cold-boot budget, and at [`VERIFY_ATTEMPTS`] attempts it would let a
+/// routine write hold the single-threaded tool loop for a minute and a half. What this waits out is
+/// an IME animation, which takes hundreds of milliseconds.
+const VERIFY_READY_BUDGET_MS: u64 = 2_000;
+
 /// Reads the active window's accessibility tree via `uiautomator`.
 pub struct AndroidA11y {
     adb: Adb,
@@ -95,6 +168,24 @@ impl AndroidA11y {
             resolved: false,
             warmed: false,
         }
+    }
+
+    /// One dump, retrying a not-ready device for up to `budget`.
+    ///
+    /// Split out of [`Accessibility::snapshot`] so a caller that knows the UI is mid-flux can ask
+    /// for retries even on a warmed reader: `snapshot` gives a warmed reader no budget, which is
+    /// right for a `wait_for_element` tick and wrong immediately after typing.
+    fn snapshot_with_budget(&mut self, ctx: &AxContext, budget: Duration) -> Result<AxTree> {
+        let window = ctx.window.clone();
+        let adb = self.ensure_adb()?;
+        let xml = dump_until_ready(
+            &mut adb_runner(&adb),
+            DUMP_PATH,
+            budget,
+            Duration::from_millis(DUMP_POLL_INTERVAL_MS),
+        )?;
+        self.warmed = true;
+        build_tree(&xml, &window, ctx.limits)
     }
 
     /// Bind directly to an already-resolved (serial-bound) adb client. Used in production so
@@ -160,21 +251,12 @@ fn locate_editable_target(
 
 impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let window = ctx.window.clone();
-        let adb = self.ensure_adb()?;
         let budget = if self.warmed {
             Duration::ZERO
         } else {
             Duration::from_millis(DUMP_READY_TIMEOUT_MS)
         };
-        let xml = dump_until_ready(
-            &mut adb_runner(&adb),
-            DUMP_PATH,
-            budget,
-            Duration::from_millis(DUMP_POLL_INTERVAL_MS),
-        )?;
-        self.warmed = true;
-        build_tree(&xml, &window, ctx.limits)
+        self.snapshot_with_budget(ctx, budget)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -205,13 +287,41 @@ impl Accessibility for AndroidA11y {
                 adb.run(argv.iter().map(String::as_str))?;
             }
         }
-        Ok(())
+
+        // Each read-back is a whole `uiautomator dump` — measured at ~2.3s on the dogfood AVD — so
+        // this reads once and retries only the one verdict a later read can overturn.
+        //
+        // A failure of this read is NOT a failure of the write — the field has already been cleared
+        // and typed into — so it says so, because a caller that retries blindly types twice. The
+        // readiness budget is non-zero even on a warmed reader: the IME and any suggestion strip are
+        // still animating, which is exactly when a dump comes back not-ready.
+        let mut last = None;
+        for _ in 0..VERIFY_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(VERIFY_SETTLE_MS));
+            let mut after = self
+                .snapshot_with_budget(ctx, Duration::from_millis(VERIFY_READY_BUDGET_MS))
+                .map_err(|e| {
+                    GlassError::AccessibilityUnavailable(format!(
+                        "set_value: the text was typed, but reading the element back failed: {e}; \
+                         re-snapshot to see whether it landed rather than retyping"
+                    ))
+                })?;
+            after.assign_ids();
+            match verify_write(&after, target, text) {
+                Ok(()) => return Ok(()),
+                // Only a not-applied verdict can change on a later read: drift and truncation are
+                // structural, and re-dumping for them costs seconds to reach the same answer.
+                Err(e @ GlassError::AxValueNotApplied(_)) => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(GlassError::AxValueNotApplied(target.id.0)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dump_once, dump_until_ready, locate_editable_target};
+    use super::{dump_once, dump_until_ready, locate_editable_target, verify_write};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, Result, WindowGeometry};
     use std::time::Duration;
@@ -391,6 +501,14 @@ mod tests {
         t
     }
 
+    /// The same single-node tree, holding `value` — what a read-back sees.
+    fn tree_holding(value: Option<&str>) -> AxTree {
+        let mut t = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+        t.root.value = value.map(Into::into);
+        t.assign_ids();
+        t
+    }
+
     fn target(id: u32, name: Option<&str>, bounds: Option<AxRect>) -> AxTarget {
         AxTarget {
             id: AxNodeId(id),
@@ -398,6 +516,123 @@ mod tests {
             name: name.map(Into::into),
             bounds,
         }
+    }
+
+    #[test]
+    fn a_write_that_landed_is_reported_as_success() {
+        let after = tree_holding(Some("world"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(verify_write(&after, &t, "world").is_ok());
+    }
+
+    #[test]
+    fn clearing_a_field_is_a_write_that_can_succeed() {
+        // An empty field reports no value at all, so a rule that read `None` as "unknown" made
+        // `set_value(id, "")` fail every time — which is what it did before this was fixed.
+        let after = tree_holding(None);
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(verify_write(&after, &t, "").is_ok());
+    }
+
+    #[test]
+    fn a_cleared_field_reporting_its_hint_reads_as_not_applied() {
+        // The cost of judging a clear by "reads back empty", pinned as a decision: this device does
+        // empty the field and `uiautomator` does report the hint as its text. Accepting "the value
+        // changed" instead would accept a clear that never fired on any field that reformats when it
+        // takes focus, which is the false success this check exists to prevent.
+        let after = tree_holding(Some("Search settings"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, ""),
+            Err(GlassError::AxValueNotApplied(0))
+        ));
+    }
+
+    #[test]
+    fn a_field_that_never_changed_is_not_a_successful_write() {
+        // The case `verify_write`'s doc is about: the field still holds the old text.
+        let after = tree_holding(Some("hello"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AxValueNotApplied(0))
+        ));
+    }
+
+    #[test]
+    fn a_partly_typed_write_is_not_a_successful_write() {
+        // The reason the rule is an exact match; `typed_text_landed` carries the argument.
+        let after = tree_holding(Some("worl"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AxValueNotApplied(0))
+        ));
+    }
+
+    #[test]
+    fn a_field_that_reformats_what_it_was_given_reports_not_applied() {
+        // The cost of the strictness, pinned so it is a decision rather than a surprise: a mask that
+        // turns "1234567890" into "(123) 456-7890" reads as not applied. An agent can re-read the
+        // tree and see the value; a false success would have it asserting against the wrong text.
+        let after = tree_holding(Some("(123) 456-7890"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "1234567890"),
+            Err(GlassError::AxValueNotApplied(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
+        // The write may well have landed — on something that then moved. Saying "not applied"
+        // would send an agent to retype into whatever now sits at that id.
+        let after = tree_holding(Some("world"));
+        let t = target(0, Some("A different field"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_non_editable_node_at_the_id_is_reported_as_changed() {
+        // Excludes a non-editable neighbour that inherited the id — a label, or a container the
+        // walk shifted into place.
+        let mut after = tree_holding(Some("world"));
+        after.root.states.editable = false;
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_missing_from_the_read_back_is_reported_as_changed() {
+        let after = tree_holding(Some("world"));
+        let t = target(7, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AxElementChanged(7))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_read_back_says_so_rather_than_blaming_drift() {
+        // The tree carries the reason the element is absent; reporting "it moved" would throw away
+        // the one fact that explains it.
+        let mut after = tree_holding(Some("world"));
+        after.truncated = Some(glass_core::accessibility::Truncation {
+            limit: glass_core::accessibility::TruncationLimit::Nodes,
+            limit_value: 1,
+            nodes_walked: 1,
+        });
+        let t = target(7, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, "world"),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
     }
 
     #[test]

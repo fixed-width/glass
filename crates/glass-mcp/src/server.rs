@@ -415,10 +415,14 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Set an editable element's value directly via accessibility (instant, no \
-                       keystrokes) — pick the element's #id from glass_a11y_snapshot. Errors if the \
-                       element isn't editable, if it changed since the snapshot (re-snapshot), or if \
-                       the app exposes no accessibility tree. \
+        description = "Set an editable element's value — pick the element's #id from \
+                       glass_a11y_snapshot. Where the platform can write the value directly this is \
+                       instant and takes no keystrokes; where it has to be typed, glass taps the \
+                       element, clears it and types, then reads the element back to confirm — up to \
+                       three accessibility reads, since a field may commit a frame or two later. \
+                       Errors if the element isn't editable, if it changed \
+                       since the snapshot (re-snapshot), if the element does not hold the requested \
+                       value afterwards, or if the app exposes no accessibility tree. \
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
                        for the UI to stop \

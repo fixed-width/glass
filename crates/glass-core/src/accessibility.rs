@@ -396,8 +396,8 @@ pub enum TruncationLimit {
 }
 
 impl TruncationLimit {
-    /// Human-readable unit for the disclosure notice.
-    fn label(self) -> &'static str {
+    /// Human-readable unit for a disclosure notice: pairs with [`Truncation::limit_value`].
+    pub fn label(self) -> &'static str {
         match self {
             TruncationLimit::Nodes => "nodes",
             TruncationLimit::Depth => "levels deep",
