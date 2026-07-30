@@ -69,10 +69,7 @@ pub fn ax_role(role: &str) -> AxRole {
 /// A `UISwitch` reports `role=AXCheckBox subrole=AXSwitch` (measured on iOS 26.5); macOS puts the
 /// same subrole on a different base role again (`AXButton` for an AppKit `NSSwitch`). The subrole is
 /// what the platforms agree on, so it is matched on its own rather than as a (role, subrole) pair.
-pub const SUBROLE_TOKENS: &[(&str, AxRole)] = &[
-    ("AXSwitch", AxRole::ToggleButton),
-    ("AXToggle", AxRole::ToggleButton),
-];
+pub const SUBROLE_TOKENS: &[(&str, AxRole)] = &[("AXSwitch", AxRole::ToggleButton)];
 
 /// [`ax_role`], but a subrole in [`SUBROLE_TOKENS`] wins over the base role.
 pub fn ax_role_with_subrole(role: &str, subrole: Option<&str>) -> AxRole {
@@ -530,7 +527,8 @@ mod tests {
 
     #[test]
     fn build_tree_reads_switch_checked_state_and_keeps_label_as_value() {
-        // A UISwitch as idb reports it: role AXCheckBox, stable id, label, AXValue "1" (on).
+        // A UISwitch as idb reports it: role AXCheckBox with subrole AXSwitch (so the mapped role
+        // is ToggleButton), stable id, label, AXValue "1" (on).
         let j = r#"[{"role":"AXCheckBox","subrole":"AXSwitch","AXUniqueId":"boldText",
                      "AXLabel":"Bold Text","AXValue":"1",
                      "frame":{"x":0,"y":0,"width":100,"height":30}}]"#;
@@ -586,10 +584,15 @@ mod tests {
             ax_role_with_subrole("AXCheckBox", Some("AXSwitch")),
             AxRole::ToggleButton
         );
-        assert_eq!(
-            ax_role_with_subrole("AXCheckBox", Some("AXToggle")),
-            AxRole::ToggleButton
-        );
+    }
+
+    #[test]
+    fn the_switch_tokens_are_subroles_not_roles() {
+        // They were role-table entries until a device read showed idb sends them only as subroles.
+        // Pinned as `Other` so mapping either as a role again is a deliberate edit, the same
+        // convention `tokens_the_probe_found_map_to_their_roles` applies to every unmapped token.
+        assert_eq!(ax_role("AXSwitch"), AxRole::Other);
+        assert_eq!(ax_role("AXToggle"), AxRole::Other);
     }
 
     #[test]

@@ -2791,16 +2791,22 @@ mod tests {
 
     #[test]
     fn the_swipe_path_is_chosen_by_checkable_not_by_role() {
-        // What makes the switch normalization safe: iOS and macOS now report a switch as
-        // `ToggleButton` where they used to say `CheckBox`, and a path that keyed off the role
-        // would have stopped actuating switches on those two backends without any test noticing.
+        // What makes the switch normalization safe: a switch now reports `ToggleButton` where iOS
+        // said `CheckBox` and macOS said `Button` or `CheckBox` depending on the toolkit, and a
+        // path keyed off the role would have stopped actuating switches with no test noticing.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        for role in [AxRole::ToggleButton, AxRole::CheckBox] {
+        for (role, checkable, want_swipe) in [
+            (AxRole::ToggleButton, true, true),
+            (AxRole::CheckBox, true, true),
+            // The fact the path actually keys on: same role, not checkable, no swipe.
+            (AxRole::ToggleButton, false, false),
+        ] {
             let platform = FakePlatform::new(400, 400)
                 .with_drag_log(drags.clone())
                 .with_trailing_toggle_backend();
             let mut tree = sw(false);
             tree.root.children[0].role = role;
+            tree.root.children[0].states.checkable = checkable;
             let mut g = glass_with_a11y_seq(platform, vec![tree]);
             g.start(&spec()).unwrap();
             g.a11y_snapshot(None).unwrap();
@@ -2810,8 +2816,8 @@ mod tests {
 
             assert_eq!(
                 drags.lock().unwrap().len(),
-                1,
-                "{role:?} did not take the trailing-edge swipe"
+                usize::from(want_swipe),
+                "{role:?} checkable={checkable}"
             );
         }
     }
