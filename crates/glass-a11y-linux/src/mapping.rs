@@ -74,6 +74,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_switch_is_a_togglebutton_here_as_on_every_other_backend() {
+        // AT-SPI has one role for a switch and a toggle button alike, which is why glass normalizes
+        // on `ToggleButton` rather than adding a distinct `Switch` role the other backends could
+        // not fill. Pinned because iOS and macOS were changed to agree with this one.
+        assert_eq!(map_role(Role::ToggleButton), AxRole::ToggleButton);
+    }
+
+    #[test]
     fn common_roles_map() {
         assert_eq!(map_role(Role::Frame), AxRole::Window);
         assert_eq!(map_role(Role::Dialog), AxRole::Dialog);

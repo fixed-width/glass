@@ -147,6 +147,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_switch_is_a_togglebutton_here_as_on_every_other_backend() {
+        // UIA has no switch control type: a WinUI ToggleSwitch is a Button that supports the toggle
+        // pattern, which is the same shape a toggle button has. That is why glass normalizes on
+        // `ToggleButton` instead of adding a `Switch` role this backend could not fill. Pinned
+        // because iOS and macOS were changed to agree with this one.
+        assert_eq!(map_role(50000, true), AxRole::ToggleButton);
+        // A checkbox that toggles stays a checkbox — the toggle pattern alone does not make a switch.
+        assert_eq!(map_role(50002, true), AxRole::CheckBox);
+    }
+
+    #[test]
     fn common_control_types_map() {
         assert_eq!(map_role(50000, false), AxRole::Button);
         assert_eq!(map_role(50002, false), AxRole::CheckBox);

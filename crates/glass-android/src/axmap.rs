@@ -269,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_is_a_togglebutton_here_as_on_every_other_backend() {
+        // Already true; pinned because iOS and macOS were changed to agree with it, and a mapping
+        // edit that moved this one would re-split the role for the same control.
+        for class in [
+            "android.widget.Switch",
+            "androidx.appcompat.widget.SwitchCompat",
+            "com.google.android.material.switchmaterial.SwitchMaterial",
+        ] {
+            assert_eq!(class_to_role(class), AxRole::ToggleButton, "{class}");
+        }
+        // Material 3 renamed the widget to `MaterialSwitch` in its own package. Not asserted here:
+        // no probe has reported that class, and this table carries only classes actually observed.
+        assert_eq!(
+            class_to_role("com.google.android.material.materialswitch.MaterialSwitch"),
+            AxRole::Other
+        );
+    }
+
+    #[test]
     fn class_maps_to_roles() {
         assert_eq!(class_to_role("android.widget.Button"), AxRole::Button);
         assert_eq!(class_to_role("android.widget.EditText"), AxRole::TextField);
