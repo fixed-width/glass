@@ -14,9 +14,13 @@ use std::time::{Duration, Instant};
 
 use crate::{GlassError, Result};
 
+/// The phrase a timeout error carries, so a caller can recognise one without matching on prose it
+/// does not own — `glass-android` offers `adb kill-server` for a timeout and for nothing else.
+pub const TIMED_OUT: &str = "no answer within";
+
 /// Longest gap between checks on a child that has not exited yet. The wait starts far tighter and
-/// backs off to this, so a one-shot that answers in a millisecond is not billed a full tick while
-/// waiting out a three-minute boot still costs only a handful of wakeups.
+/// backs off to this, so a one-shot that answers in a millisecond is not billed a full tick and a
+/// long wait settles to one wakeup every 20ms.
 const POLL: Duration = Duration::from_millis(20);
 
 /// First gap between checks, doubled up to [`POLL`].
@@ -33,7 +37,7 @@ const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 /// caller who has already spent their whole budget. A stray zombie is the cheaper outcome.
 const KILL_REAP: Duration = Duration::from_millis(500);
 
-/// Most output one call may buffer, so a drain thread left reading a pipe some grandchild still
+/// Most output ONE PIPE may buffer, so a drain thread left reading a pipe something else still
 /// holds cannot grow without bound. Far past any real one-shot's output — a full `uiautomator dump`
 /// of a deep tree is a few hundred KiB.
 const MAX_CAPTURE: usize = 64 * 1024 * 1024;
@@ -83,14 +87,22 @@ fn run_bounded_inner(
         .spawn()
         .map_err(|e| GlassError::Backend(format!("{op}: failed to start: {e}")))?;
 
-    if let Some(bytes) = stdin {
-        // Best-effort and detached: a child that never reads its stdin must not block the parent,
-        // and whatever it does read it reads before it exits, which the deadline already covers.
-        if let Some(mut pipe) = child.stdin.take() {
-            std::thread::spawn(move || {
-                let _ = pipe.write_all(&bytes);
-            });
-        }
+    // Written on its own thread: a child that answers without consuming its input would otherwise
+    // leave the parent blocked in `write` with the deadline out of reach. The outcome is shared
+    // back, because a payload that only partly landed is the same silent truncation as a partial
+    // read — `pbcopy` would report a clipboard it never fully received.
+    let wrote: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+    if let Some(bytes) = stdin
+        && let Some(mut pipe) = child.stdin.take()
+    {
+        let outcome = Arc::clone(&wrote);
+        std::thread::spawn(move || {
+            if let Err(e) = pipe.write_all(&bytes)
+                && let Ok(mut outcome) = outcome.lock()
+            {
+                *outcome = Some(e);
+            }
+        });
     }
 
     let stdout = Pipe::drain(child.stdout.take());
@@ -131,10 +143,17 @@ fn run_bounded_inner(
     // tolerant line scanner that would read a truncated dump as a shorter window list, and glass
     // would then report the wrong geometry. `Command::output` cannot produce this — it reads to EOF
     // — so failing here keeps the contract callers already had.
+    if let Ok(mut wrote) = wrote.lock()
+        && let Some(e) = wrote.take()
+    {
+        return Err(GlassError::Backend(format!(
+            "{op}: could not write all of its input ({e}), so it acted on a partial payload"
+        )));
+    }
     if !out_done || !err_done {
         return Err(GlassError::Backend(format!(
-            "{op}: exited {status} but its output was still arriving {DRAIN_SETTLE:?} later \
-             (something inherited its pipe), so the {} bytes read may be incomplete",
+            "{op}: exited, but its output pipe had not reached end-of-file {DRAIN_SETTLE:?} \
+             later (something it started may still hold it), so the {} bytes read may be incomplete",
             out_bytes.len() + err_bytes.len()
         )));
     }
@@ -249,16 +268,9 @@ fn kill_and_reap(child: &mut Child) -> bool {
     reaped
 }
 
-/// Kill the child and describe the timeout, including whatever it managed to say first — a partial
-/// `uiautomator dump` tells a reader more about the hang than silence does.
-fn timed_out(
-    child: &mut Child,
-    op: &str,
-    budget: Duration,
-    stdout: Pipe,
-    stderr: Pipe,
-) -> GlassError {
-    let reaped = kill_and_reap(child);
+/// Whatever the child managed to say before it was killed — a partial `uiautomator dump` tells a
+/// reader more about a hang than silence does.
+fn said_before_the_kill(stdout: &Pipe, stderr: &Pipe) -> String {
     let out = String::from_utf8_lossy(&stdout.snapshot())
         .trim()
         .to_string();
@@ -272,17 +284,30 @@ fn timed_out(
     if !err.is_empty() {
         said.push(format!("stderr: {err}"));
     }
-    let said = if said.is_empty() {
+    if said.is_empty() {
         "it produced no output before the kill".to_string()
     } else {
         format!("before the kill — {}", said.join("; "))
-    };
+    }
+}
+
+/// Kill the child and describe the timeout, including whatever it managed to say first — a partial
+/// `uiautomator dump` tells a reader more about the hang than silence does.
+fn timed_out(
+    child: &mut Child,
+    op: &str,
+    budget: Duration,
+    stdout: Pipe,
+    stderr: Pipe,
+) -> GlassError {
+    let reaped = kill_and_reap(child);
+    let said = said_before_the_kill(&stdout, &stderr);
     let fate = if reaped {
         "so the process was killed"
     } else {
         "so the process was killed, though it had not exited yet (it may be stuck in the kernel)"
     };
-    GlassError::Backend(format!("{op}: no answer within {budget:?}, {fate}; {said}"))
+    GlassError::Backend(format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"))
 }
 #[cfg(test)]
 mod tests {
@@ -422,6 +447,7 @@ mod tests {
         // `kill -0` fails once the process is gone, including as a zombie's parent has reaped it.
         let alive = Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -441,16 +467,28 @@ mod tests {
     }
 
     #[test]
-    fn a_child_that_ignores_its_stdin_still_returns() {
-        // A tool that answers without consuming its input would block a parent that wrote inline.
-        let out = run_bounded_with_stdin(
+    fn a_child_that_ignores_its_stdin_ends_promptly_and_says_the_payload_did_not_land() {
+        // Two properties, and the first is why the write is on a thread at all: a tool that answers
+        // without reading its input must not leave the parent blocked in `write`. The second is
+        // that the payload going nowhere is reported — `pbcopy` exits 0 whether or not it received
+        // the whole clipboard, so silence here would be a clipboard glass claims it set.
+        let started = Instant::now();
+        let err = run_bounded_with_stdin(
             Command::new("/bin/sh").args(["-c", "printf done"]),
             Duration::from_secs(10),
             "test:stdin-ignored",
-            &vec![b'x'; 1024 * 1024],
+            &vec![b'x'; 4 * 1024 * 1024],
         )
-        .expect("must not block on an unread stdin");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "done");
+        .expect_err("an unwritten payload must not pass silently");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} — the write must not block the call",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains("partial payload"),
+            "must say the input did not land: {err}"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use glass_core::{GlassError, Result, run_bounded};
+use glass_core::{GlassError, Result, TIMED_OUT, run_bounded};
 
 /// What an adb invocation is doing, which is what decides how long it may take.
 ///
@@ -22,7 +22,8 @@ pub enum AdbOp {
     Transfer,
     /// `am start -W`, which blocks until the activity is up. A first launch after an install pays
     /// for ART compiling and a cold page cache, so it is nothing like the tap it would otherwise
-    /// share a budget with.
+    /// share a budget with. `am` alone is NOT this: `am force-stop` runs during teardown, inside
+    /// `glass_core::TEARDOWN_BUDGET`, and must keep the short deadline.
     Launch,
     /// Everything else: `input`, `dumpsys`, `devices`, `forward`, `getprop`, `pidof`.
     Shell,
@@ -58,7 +59,7 @@ impl AdbOp {
             }
             (Some("shell"), Some("uiautomator" | "cat")) => Self::Dump,
             (Some("exec-out" | "shell"), Some("screencap")) => Self::Screencap,
-            (Some("shell"), Some("am")) => Self::Launch,
+            (Some("shell"), Some("am")) if args.get(2) == Some(&"start") => Self::Launch,
             _ => Self::Shell,
         }
     }
@@ -170,9 +171,9 @@ impl Adb {
 /// setup problem — where `adb kill-server` is advice for a binary that is not there.
 fn with_adb_hint(e: GlassError) -> GlassError {
     match e {
-        GlassError::Backend(msg) if msg.contains("no answer within") => GlassError::Backend(
-            format!("{msg}; if this repeats, run `adb kill-server` and retry"),
-        ),
+        GlassError::Backend(msg) if msg.contains(TIMED_OUT) => GlassError::Backend(format!(
+            "{msg}; if this repeats, run `adb kill-server` and retry"
+        )),
         other => other,
     }
 }
@@ -341,9 +342,15 @@ mod tests {
         ));
         assert!(!spawn.to_string().contains("kill-server"), "{spawn}");
 
-        let timeout = with_adb_hint(GlassError::Backend(
-            "adb:shell: no answer within 10s, so the process was killed".into(),
-        ));
+        // Built by running a real timeout rather than typed here: the gate keys on wording that
+        // `glass-core` owns, so a fixture repeating that wording could not notice it drifting.
+        let real_timeout = glass_core::run_bounded(
+            std::process::Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            std::time::Duration::from_millis(200),
+            "adb:shell",
+        )
+        .expect_err("must time out");
+        let timeout = with_adb_hint(real_timeout);
         assert!(timeout.to_string().contains("adb kill-server"), "{timeout}");
         // Extending the message must not wrap one Backend in another: Display prints its prefix
         // per layer, and "backend error: backend error: ..." is what an agent would read.

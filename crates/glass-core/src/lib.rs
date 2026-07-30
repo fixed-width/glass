@@ -13,7 +13,7 @@ pub mod toolpath;
 pub use toolpath::tool_path;
 
 pub mod bounded;
-pub use bounded::{run_bounded, run_bounded_with_stdin};
+pub use bounded::{TIMED_OUT, run_bounded, run_bounded_with_stdin};
 
 pub mod frame;
 pub use frame::{Frame, Region};

@@ -21,7 +21,7 @@ pub enum SimctlOp {
     Install,
     /// `io <udid> screenshot` — encodes a frame.
     Screenshot,
-    /// Everything else: `list`, `pbpaste`, `terminate`, `spawn`.
+    /// Everything else: `list`, `pbcopy`, `pbpaste`, `terminate`, `spawn`.
     Query,
 }
 
@@ -175,6 +175,7 @@ mod tests {
             ),
             (vec!["list", "devices", "-j"], SimctlOp::Query),
             (vec!["pbpaste", "UDID"], SimctlOp::Query),
+            (vec!["pbcopy", "UDID"], SimctlOp::Query),
             (
                 vec!["terminate", "UDID", "com.example.app"],
                 SimctlOp::Query,

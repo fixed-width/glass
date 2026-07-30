@@ -599,12 +599,11 @@ impl Platform for IosPlatform {
                 .simctl()
                 .full_args(&["pbcopy", self.target.udid()]),
         );
-        let out = glass_core::run_bounded_with_stdin(
-            &mut cmd,
-            crate::simctl::SimctlOp::Query.budget(),
-            "simctl:pbcopy",
-            text.as_bytes(),
-        )?;
+        // Budget and label from the classifier, like every other simctl call — this site only
+        // exists apart because the payload goes on stdin, not because it is special.
+        let op = crate::simctl::SimctlOp::for_sub(&["pbcopy"]);
+        let out =
+            glass_core::run_bounded_with_stdin(&mut cmd, op.budget(), op.label(), text.as_bytes())?;
         if out.status.success() {
             Ok(())
         } else {
