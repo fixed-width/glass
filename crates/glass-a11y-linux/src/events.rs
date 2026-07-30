@@ -1,14 +1,11 @@
 //! AT-SPI change notifications, so a wait stops re-walking a tree that has not changed.
 //!
-//! The stream carries every app registered on the bus it is taken from, not just the one being
-//! driven — each event names its emitter's unique bus name. So the events are filtered, and
-//! filtered to a *set* of names: a walk crosses process boundaries (each child is proxied at its
-//! own name), so an app embedding an out-of-process view publishes part of its tree from a second
-//! connection, and matching one name would walk that subtree while dropping its events.
+//! The stream carries every app registered on the bus it is taken from, each event naming its
+//! emitter's unique bus name, so events are filtered to the *set* of names the app publishes from
+//! (see [`crate::reader::app_bus_names`] for why a set).
 //!
 //! (A probe on 2026-07-30 watched a *host* session bus and saw unrelated desktop applications on
-//! it. glass reads its own private bus, where that does not apply — the multi-process case above
-//! is what the filter is really for.)
+//! it; glass reads its own private bus, so the multi-process case is what the filter is for.)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,13 +152,9 @@ async fn pump(
         let _ = ready.send(true);
         forward(&mut stream, &tx, &app_bus_names, &running).await;
     }
-    // Outside the block, so the stream is dropped first: it is no longer polled, and zbus's message
-    // channel is bounded and does not overflow, so a burst arriving during these round-trips would
-    // stall delivery of their own replies and park this thread forever — reinstating the leak the
-    // shutdown exists to remove. Bounded for the same reason.
-    //
-    // Leaving the registration behind would keep every app on the bus forwarding object events to
-    // a listener nobody reads.
+    // Drop the stream first, and bound this: zbus's message channel does not overflow, so a burst
+    // arriving while nothing polls it would stall the replies to these round-trips and park the
+    // thread here — the same leak, at the one place that exists to close it.
     let _ = tokio::time::timeout(
         DEREGISTER_TIMEOUT,
         conn.deregister_event::<atspi_common::events::ObjectEvents>(),
@@ -171,9 +164,8 @@ async fn pump(
 
 /// Forward this app's events until the signal is dropped, the stream ends, or it stops parsing.
 ///
-/// Split out so every way of leaving it returns to one caller: the deregister below used to be
-/// reachable from only one of four exits, so the common end-of-wait path — an event arriving after
-/// the signal was dropped — left the registration behind.
+/// Do not inline this back into the pump: with the loop written there, the deregister was reachable
+/// from one of four exits, and the common end-of-wait path was not it.
 async fn forward(
     stream: &mut std::pin::Pin<
         &mut impl futures_core::Stream<Item = Result<atspi::Event, atspi::AtspiError>>,

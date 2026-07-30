@@ -33,10 +33,9 @@ pub fn poll_until<T>(
 
 /// [`poll_until`] with the wait between ticks supplied by the caller, and the power to skip a tick.
 ///
-/// `pause` is handed the interval and answers whether the next tick is worth running. A caller that
-/// can be *told* nothing changed — an accessibility event stream, say — returns `false`, and the
-/// loop waits again instead of redoing work whose answer cannot have changed. Returning `true`
-/// reproduces a plain sleep-and-retry.
+/// `pause` is handed the interval and answers whether the next tick is worth running: `false` from
+/// a caller that can be *told* nothing changed skips work whose answer cannot have changed, and
+/// `true` reproduces a plain sleep-and-retry.
 ///
 /// The deadline is checked every iteration, tick or no tick, so a `pause` that always says "skip"
 /// still ends the loop on time; and a `pause` that never blocks spins only until the deadline.

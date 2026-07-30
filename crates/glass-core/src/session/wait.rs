@@ -401,17 +401,12 @@ impl Glass {
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
-            // A backend that can say "nothing changed" saves the walk; one that cannot sleeps
-            // exactly as before.
             |d| {
                 let paused_at = std::time::Instant::now();
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(d) {
                         ChangeWait::Changed => true,
-                        // Re-read anyway now and then. The signal reports the change classes it
-                        // subscribed to, from the senders it resolved; anything outside that would
-                        // otherwise make the wait answer "not matched" without ever looking — turning
-                        // a cost optimization into a wrong result.
+                        // Read anyway now and then — see `QUIET_RUNS_BEFORE_REREAD`.
                         ChangeWait::Quiet => {
                             quiet_budget = quiet_budget.saturating_sub(1);
                             if quiet_budget == 0 {
@@ -1274,7 +1269,10 @@ mod tests {
 
         // Ten intervals fit in the budget; a spin runs to thousands.
         let calls = QUIET_WITHOUT_BLOCKING_CALLS.load(Ordering::Relaxed);
-        assert!(calls <= 40, "the loop spun: {calls} pauses in ten intervals");
+        assert!(
+            calls <= 40,
+            "the loop spun: {calls} pauses in ten intervals"
+        );
     }
 
     #[test]
@@ -1308,8 +1306,6 @@ mod tests {
 
     #[test]
     fn a_signal_that_never_stops_firing_stays_bounded_by_the_deadline() {
-        // A chatty app must not turn the loop into a spin: the pause may return early, but the
-        // deadline still governs, so the walk count stays in the same order as the interval allows.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1332,9 +1328,8 @@ mod tests {
 
     #[test]
     fn a_long_quiet_wait_reads_anyway_now_and_then() {
-        // The ceiling: a signal reports only what it subscribed to, so believing "quiet" forever
-        // would let a wait answer "not matched" without ever looking again. 25 intervals is two
-        // ceilings, so two forced reads on top of the first.
+        // 25 intervals is two `QUIET_RUNS_BEFORE_REREAD` ceilings, so two forced reads on top of
+        // the first.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
