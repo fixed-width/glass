@@ -17,6 +17,16 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- A switch now reports the same role on Windows, macOS, Android and iOS. `glass_a11y_snapshot`
+  called one a `CheckBox` on iOS, and a `Button` or a `CheckBox` on macOS depending on which toolkit
+  drew it, so a `role:"ToggleButton"` selector that worked on one machine silently matched nothing on
+  another. Both now read the platform's switch marker and report `ToggleButton`. A macOS switch drawn
+  with AppKit also gains the checked state it never reported, so `condition:"checked"` works on it.
+
+  Two things to know. A `role:"CheckBox"` selector that used to match a switch on iOS or macOS no
+  longer does — match `ToggleButton`, or match by name. And Linux is unchanged and still differs: a
+  GTK4 switch is published over AT-SPI as a check box, indistinguishable from a real one, so it
+  arrives as `CheckBox` there.
 - `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
   used to say the reader was available whatever the accessibility API was doing, so the one case you
   need it for — the reader is not answering — showed green. It now reads one attribute off the

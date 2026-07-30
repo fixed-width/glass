@@ -2492,6 +2492,35 @@ mod tests {
     }
 
     #[test]
+    fn the_combo_path_waits_for_the_popup_to_realize() {
+        // A tree read the instant a popup opens or closes shows the previous state, so both re-reads
+        // in the combo path follow a settle. Timed rather than asserted structurally: the settle is
+        // a sleep, so removing it leaves every other assertion in this file green.
+        let platform = FakePlatform::new(340, 300);
+        let (mut g, _invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Acme", &[]),
+                combo("Acme", &["Acme", "Globex"]),
+                combo("Globex", &[]),
+            ],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let started = std::time::Instant::now();
+        g.set_value(AxNodeId(1), "Globex").unwrap();
+        let elapsed = started.elapsed();
+
+        // Two settles, 250ms each; a generous floor so a loaded machine cannot make this flake.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "combo commit returned in {elapsed:?}, too fast to have settled twice"
+        );
+    }
+
+    #[test]
     fn set_value_on_a_combo_opens_the_popup_with_a_pointer_click_even_when_invoke_succeeds() {
         // The combo commit loop is keyboard navigation (Down/Up/Return), so the popup must be
         // opened by something that takes keyboard focus. A native "expand" action doesn't
@@ -2730,10 +2759,13 @@ mod tests {
     /// A row-shaped CheckBox "Sw" (300x30 at the origin) as the single child of a root Window —
     /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
     /// numbering gives the switch id 1.
+    /// A switch as the readers report one *after* the subrole normalization: `ToggleButton`, row
+    /// shaped, checkable — a fixture still calling a switch a `CheckBox` would test the swipe path
+    /// against a role no backend produces.
     fn sw(checked: bool) -> AxTree {
         let switch = AxNode {
             id: AxNodeId(0),
-            role: AxRole::CheckBox,
+            role: AxRole::ToggleButton,
             raw_role: "switch".into(),
             name: Some("Sw".into()),
             description: None,
@@ -2784,6 +2816,39 @@ mod tests {
         g.set_value(AxNodeId(1), "true").unwrap();
 
         assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn the_swipe_path_is_chosen_by_checkable_not_by_role() {
+        // What makes the switch normalization safe: a switch now reports `ToggleButton` where iOS
+        // said `CheckBox` and macOS said `Button` or `CheckBox` depending on the toolkit, and a
+        // path keyed off the role would have stopped actuating switches with no test noticing.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        for (role, checkable, want_swipe) in [
+            (AxRole::ToggleButton, true, true),
+            (AxRole::CheckBox, true, true),
+            // The fact the path actually keys on: same role, not checkable, no swipe.
+            (AxRole::ToggleButton, false, false),
+        ] {
+            let platform = FakePlatform::new(400, 400)
+                .with_drag_log(drags.clone())
+                .with_trailing_toggle_backend();
+            let mut tree = sw(false);
+            tree.root.children[0].role = role;
+            tree.root.children[0].states.checkable = checkable;
+            let mut g = glass_with_a11y_seq(platform, vec![tree]);
+            g.start(&spec()).unwrap();
+            g.a11y_snapshot(None).unwrap();
+            drags.lock().unwrap().clear();
+
+            g.click_element(AxNodeId(1)).unwrap();
+
+            assert_eq!(
+                drags.lock().unwrap().len(),
+                usize::from(want_swipe),
+                "{role:?} checkable={checkable}"
+            );
+        }
     }
 
     #[test]

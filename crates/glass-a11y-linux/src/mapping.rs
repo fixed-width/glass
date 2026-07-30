@@ -74,6 +74,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_gtk_switch_is_a_checkbox_here_unlike_the_other_backends() {
+        // Measured, not inferred: `tests/integration.rs::set_value_toggles_switch` locates the
+        // fixture's real `Gtk.Switch` as a `CheckBox`, and passes. AT-SPI has no switch role at all
+        // (atspi's `Role` has `ToggleButton` and `CheckBox`, nothing between), and GTK4 publishes a
+        // switch as a check box — indistinguishable here from a real checkbox, so glass cannot
+        // normalize it the way the subrole lets macOS and iOS.
+        //
+        // Do not "fix" this by mapping `Role::ToggleButton` to something else or by special-casing
+        // switches: `reader::toggle_state_flag` picks `State::Pressed` for `ToggleButton` and
+        // `State::Checked` otherwise, so a switch re-roled to `ToggleButton` would have `set_value`
+        // poll a flag a GtkSwitch never sets.
+        assert_eq!(map_role(Role::CheckBox), AxRole::CheckBox);
+        assert_eq!(map_role(Role::ToggleButton), AxRole::ToggleButton);
+    }
+
+    #[test]
     fn common_roles_map() {
         assert_eq!(map_role(Role::Frame), AxRole::Window);
         assert_eq!(map_role(Role::Dialog), AxRole::Dialog);

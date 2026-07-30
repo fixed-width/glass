@@ -269,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_is_a_togglebutton_here_as_on_the_two_apple_backends() {
+        // Already true; pinned because iOS and macOS were changed to agree with it. Not Linux:
+        // a GTK4 switch is published over AT-SPI as a check box and cannot be told from one.
+        for class in [
+            "android.widget.Switch",
+            "androidx.appcompat.widget.SwitchCompat",
+            "com.google.android.material.switchmaterial.SwitchMaterial",
+        ] {
+            assert_eq!(class_to_role(class), AxRole::ToggleButton, "{class}");
+        }
+        // Material 3 renamed the widget to `MaterialSwitch` in its own package. Not asserted here:
+        // no probe has reported that class, and this table carries only classes actually observed.
+        assert_eq!(
+            class_to_role("com.google.android.material.materialswitch.MaterialSwitch"),
+            AxRole::Other
+        );
+    }
+
+    #[test]
     fn class_maps_to_roles() {
         assert_eq!(class_to_role("android.widget.Button"), AxRole::Button);
         assert_eq!(class_to_role("android.widget.EditText"), AxRole::TextField);

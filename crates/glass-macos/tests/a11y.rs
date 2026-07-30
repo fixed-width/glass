@@ -2,7 +2,9 @@
 //! the whole `glass-a11y-macos` snapshot + set_value + invoke path (`MacosPlatform::start_app`
 //! -> `AxContext` -> `MacosA11y::snapshot`/`set_value`/`invoke` -> AXUIElement walk ->
 //! `AxTree`), driven against the `a11y_fixture` Cocoa app (a "Save" button, an "Enable"
-//! checkbox, a "Bold" button whose accessibility label differs from its title, an editable
+//! checkbox, an "Active" NSSwitch beside it — AppKit reports the two differently, so the pair
+//! is what proves the reader consults the subrole — a "Bold" button whose accessibility label
+//! differs from its title, an editable
 //! "Note" field — labeled "Note" via `setAccessibilityLabel`, holding the content "hello" —
 //! and a non-interactive "Status" label). Four of them carry a deliberate `AXHelp`/`AXTitle`
 //! arrangement, so the snapshot checks pin which attribute the reader's `description` comes
@@ -76,9 +78,12 @@ mod macos_main {
     /// `value` — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").
     /// The content is checked separately, via [`find_text_field`], against `AxNode::value`.
-    const NEEDLES: [&str; 4] = [
+    const NEEDLES: [&str; 5] = [
         "Button \"Save\"",
         "CheckBox \"Enable\"",
+        // The on-box proof that the reader consults the subrole: without it an NSSwitch renders as
+        // Button and this needle is absent.
+        "ToggleButton \"Active\"",
         "TextField \"Note\"",
         "Label \"Status\"",
     ];

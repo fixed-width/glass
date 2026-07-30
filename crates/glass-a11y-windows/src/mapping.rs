@@ -249,6 +249,10 @@ mod tests {
     }
 
     #[test]
+    // UIA has no switch control type (see `CONTROL_TYPES`), so a switch and a toggle button are the
+    // same shape here — which is why glass normalizes a switch onto `ToggleButton` rather than a
+    // `Switch` role this backend could not fill. What a real WinUI `ToggleSwitch` reports has not
+    // been probed on this backend.
     fn toggleable_button_maps_to_toggle_button() {
         // Observed on a stock text editor's formatting bar: Button nodes carrying the Toggle
         // pattern (Bold, Italic, Strikethrough, Link, Clear formatting).

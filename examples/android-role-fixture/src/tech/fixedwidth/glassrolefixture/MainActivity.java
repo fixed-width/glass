@@ -15,6 +15,7 @@ import android.widget.ListView;
 import android.widget.NumberPicker;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
+import android.widget.Switch;
 import android.widget.ScrollView;
 import android.widget.TabHost;
 import android.widget.TableLayout;
@@ -69,6 +70,13 @@ public class MainActivity extends Activity {
         root.addView(grid(), matchHeight(dp(80)));
         root.addView(label("table"), matchWrap());
         root.addView(table(), matchWrap());
+
+        // android.widget.Switch is what the platform's own Settings uses, and what CLASS_TOKENS
+        // maps to ToggleButton — the control that keeps that mapping re-readable on device.
+        Switch active = new Switch(this);
+        active.setChecked(true);
+        active.setContentDescription("the switch");
+        root.addView(active, wrapWrap());
 
         NumberPicker picker = new NumberPicker(this);
         picker.setMinValue(1);

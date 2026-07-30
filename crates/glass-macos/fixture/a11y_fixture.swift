@@ -50,6 +50,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         enable.frame = NSRect(x: 20, y: 100, width: 120, height: 24)
         enable.setAccessibilityLabel("Enable")
 
+        // An NSSwitch beside the checkbox, because AppKit publishes the two differently: this one
+        // reports AXButton with subrole AXSwitch (a SwiftUI switch reports AXCheckBox with the same
+        // subrole), so the reader's switch mapping has both forms to be read against on box.
+        let active = NSSwitch(frame: NSRect(x: 260, y: 100, width: 60, height: 24))
+        active.state = .on
+        active.setAccessibilityLabel("Active")
+
         // Title and label deliberately differ and no help text is set, so `AXTitle` supplies the
         // name and `AXDescription` is left to be the description — the reader's titled branch,
         // which no other control here exercises.
@@ -75,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.addSubview(save)
         contentView.addSubview(enable)
+        contentView.addSubview(active)
         contentView.addSubview(bold)
         contentView.addSubview(note)
         contentView.addSubview(status)
