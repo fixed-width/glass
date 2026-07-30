@@ -12,6 +12,9 @@ pub use error::{GlassError, Result};
 pub mod toolpath;
 pub use toolpath::tool_path;
 
+pub mod bounded;
+pub use bounded::run_bounded;
+
 pub mod frame;
 pub use frame::{Frame, Region};
 
