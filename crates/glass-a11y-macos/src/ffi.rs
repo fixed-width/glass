@@ -147,8 +147,7 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
 /// Reads `AXFocusedApplication` off `AXUIElementCreateSystemWide` and throws the value away — the
 /// question is whether the call was *answered*, not what is focused — so it needs no target
 /// application and mutates nothing. It cannot go through [`copy_attribute_checked`], which folds
-/// every real failure into one error string: the doctor has to tell `APIDisabled` (not trusted)
-/// from `CannotComplete` (the stack did not answer, which is what a locked screen looks like).
+/// every real failure into one error string; the doctor reports the code.
 pub(crate) fn probe_system_wide() -> SystemWideProbe {
     // `AXFocusedApplication`, not a cheaper attribute, because it is *trust-gated*: surveyed on the
     // dogfood mini, an untrusted process reading it off the system-wide element gets
@@ -408,10 +407,9 @@ mod tests {
     use crate::doctor::SystemWideProbe;
     use objc2_application_services::AXError;
 
-    // There is deliberately no live "healthy host answers" test: the Accessibility grant attaches
-    // to the binary, and a `cargo test` binary is never granted one — measured on the dogfood mini,
-    // where `glass-mcp doctor` answered and this harness got CannotComplete on the same host in the
-    // same session. That measurement is also why the doctor disambiguates -25204 with the grant bit.
+    // There is deliberately no live "healthy host answers" test: on the dogfood mini this harness
+    // gets `CannotComplete` while `glass-mcp doctor` answers, on the same host in the same session,
+    // so the assertion would encode which binaries that host happens to trust.
 
     /// Live: a real non-`Success` `AXError` reaches the classifier and is named, rather than every
     /// outcome collapsing to the healthy one — which is the defect this whole check replaces.
