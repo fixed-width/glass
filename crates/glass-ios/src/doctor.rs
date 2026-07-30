@@ -25,29 +25,29 @@ pub struct Probe<'a> {
     pub simctl_ok: bool,
     /// iOS runtime lines from `xcrun simctl list runtimes`.
     pub runtimes: &'a [String],
-    /// iPhone simulator lines from `xcrun simctl list devices available`.
-    pub iphones: &'a [String],
     /// What the device listing said about the target glass would drive.
     pub target: &'a TargetFacts,
 }
 
 /// What the doctor could learn about the simulator glass would drive at start.
 ///
-/// Three-valued on purpose: a listing that failed is not a host with nothing booted, and reporting
-/// one as the other is how a diagnostic sends an operator to fix something that is not broken.
+/// Every arm is the outcome of running the *real* resolution the start path runs
+/// ([`crate::device::resolve`] with the same `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` preferences), so
+/// the doctor reports what would happen rather than a proxy for it. A listing that could not be read
+/// is its own arm: reporting it as "nothing booted" is a remedy the operator cannot follow to green.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TargetFacts {
-    /// The listing was read.
-    Known {
-        /// Name of an already-booted iOS-family simulator (an iPad counts — `resolve` drives any
-        /// iOS-family device, and only *prefers* an iPhone), if any.
-        booted: Option<String>,
-        /// `GLASS_IOS_UDID`, when set: glass attaches to that udid **without booting it**, so a
-        /// shut-down one makes every call fail against a dead target.
-        pinned_udid: Option<String>,
-        /// Whether `pinned_udid` names a device the listing reports as booted.
-        pinned_is_booted: bool,
-    },
+    /// A booted device glass would attach to, and how many iOS-family simulators are available.
+    Attaching { name: String, available: usize },
+    /// Nothing booted; glass boots this one at start.
+    WillBoot { name: String, available: usize },
+    /// `GLASS_IOS_UDID` names a device the listing does not contain.
+    PinnedMissing(String),
+    /// `GLASS_IOS_UDID` names a device that is present but not booted. glass attaches to a pinned
+    /// udid *without* booting it, so this is the one state the start path will not fix for you.
+    PinnedNotBooted(String),
+    /// Resolution failed outright — no available simulator, or `GLASS_IOS_DEVICE` names none.
+    Unresolvable(String),
     /// The listing could not be read, carrying why.
     Unknown(String),
 }
@@ -111,36 +111,17 @@ fn runtime_check(p: &Probe) -> Check {
 }
 
 fn device_check(p: &Probe) -> Check {
-    if p.iphones.is_empty() {
-        return Check::new("device", CheckStatus::Fail, "no iPhone simulator available").with_remedy(
-            "create one in Xcode (Window > Devices and Simulators) or with `xcrun simctl create`",
-        );
-    }
-    let n = p.iphones.len();
+    let ok = |detail: String| Check::new("device", CheckStatus::Ok, detail);
     match p.target {
         // Nothing booted is the ordinary cold state, not a finding: `SimTarget::from_env` boots one
         // with `bootstatus -b` at start. Warning here would prescribe a command glass runs itself.
-        TargetFacts::Known {
-            pinned_udid: None,
-            booted,
-            ..
-        } => Check::new(
-            "device",
-            CheckStatus::Ok,
-            match booted {
-                Some(name) => format!("{n} iPhone simulator(s) available, booted: {name}"),
-                None => format!(
-                    "{n} iPhone simulator(s) available, none booted (glass boots one at start)"
-                ),
-            },
-        ),
-        // A pinned udid is the one case the start path will not boot for you: `resolve` returns it
-        // unconditionally, so a shut-down one is a dead target and every call fails against it.
-        TargetFacts::Known {
-            pinned_udid: Some(udid),
-            pinned_is_booted: false,
-            ..
-        } => Check::new(
+        TargetFacts::WillBoot { name, available } => ok(format!(
+            "{available} iOS simulator(s) available, none booted (glass boots {name} at start)"
+        )),
+        TargetFacts::Attaching { name, available } => {
+            ok(format!("{available} iOS simulator(s) available, booted: {name}"))
+        }
+        TargetFacts::PinnedNotBooted(udid) => Check::new(
             "device",
             CheckStatus::Fail,
             format!(
@@ -151,22 +132,24 @@ fn device_check(p: &Probe) -> Check {
         .with_remedy(format!(
             "boot it with `xcrun simctl boot {udid}`, or unset GLASS_IOS_UDID and let glass pick"
         )),
-        TargetFacts::Known {
-            pinned_udid: Some(udid),
-            ..
-        } => Check::new(
+        // Distinct from not-booted: `simctl boot` on a udid the listing does not carry answers
+        // "Invalid device", so the remedy has to be a different one.
+        TargetFacts::PinnedMissing(udid) => Check::new(
             "device",
-            CheckStatus::Ok,
-            format!(
-                "{n} iPhone simulator(s) available; GLASS_IOS_UDID pins {udid}, which is booted"
-            ),
-        ),
-        TargetFacts::Unknown(cause) => Check::new(
-            "device",
-            CheckStatus::Warn,
-            format!("{n} iPhone simulator(s) available; could not tell what is booted: {cause}"),
+            CheckStatus::Fail,
+            format!("GLASS_IOS_UDID pins {udid}, which this host has no simulator for"),
         )
-        .with_remedy("run `xcrun simctl list devices available --json` and check it parses"),
+        .with_remedy(
+            "check the udid against `xcrun simctl list devices available`, or unset GLASS_IOS_UDID",
+        ),
+        TargetFacts::Unresolvable(why) => Check::new("device", CheckStatus::Fail, why.clone())
+            .with_remedy(
+                "create one in Xcode (Window > Devices and Simulators) or with `xcrun simctl create`",
+            ),
+        TargetFacts::Unknown(cause) => {
+            Check::new("device", CheckStatus::Warn, format!("could not tell what glass would drive: {cause}"))
+                .with_remedy("run `xcrun simctl list devices available --json` and check it parses")
+        }
     }
 }
 
@@ -211,20 +194,12 @@ pub fn checks(_deep: bool) -> Vec<Check> {
         .filter(|l| l.contains("iOS"))
         .map(|l| l.trim().to_string())
         .collect();
-    let iphones: Vec<String> = simctl_out(&["simctl", "list", "devices", "available"])
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.contains("iPhone"))
-        .map(|l| l.trim().to_string())
-        .collect();
-
     let target = gather_target(&simctl_out, &|k| std::env::var(k).ok());
 
     build_checks(&Probe {
         xcode_dir,
         simctl_ok,
         runtimes: &runtimes,
-        iphones: &iphones,
         target: &target,
     })
 }
@@ -374,43 +349,62 @@ fn booted_udid() -> Option<String> {
 
 /// Read the device listing once and answer what the start path would do with it.
 ///
-/// Every failure to read it becomes [`TargetFacts::Unknown`] carrying the cause, rather than the
-/// `None` that means "nothing is booted": a timed-out or unparseable listing reported as "none
-/// booted" is a remedy the operator cannot follow to green.
+/// One listing, not two: a second `simctl` call is a second thing that can fail, and when both fail
+/// the doctor has to describe the failure rather than infer an empty host from it.
 fn gather_target(
     simctl_out: &dyn Fn(&[&str]) -> Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> TargetFacts {
-    let Some(json) = simctl_out(&["simctl", "list", "devices", "available", "--json"]) else {
-        return TargetFacts::Unknown("`xcrun simctl list devices --json` did not answer".into());
+    let args = ["simctl", "list", "devices", "available", "--json"];
+    let Some(json) = simctl_out(&args) else {
+        return TargetFacts::Unknown(format!("`xcrun {}` did not answer", args.join(" ")));
     };
     match parse_devices(&json) {
-        Ok(devices) => target_from(&devices, wants(env).0),
+        Ok(devices) => {
+            let (udid, name, _) = wants(env);
+            target_from(&devices, udid.as_deref(), name.as_deref())
+        }
         Err(e) => TargetFacts::Unknown(e.to_string()),
     }
 }
 
-/// The pure half of [`gather_target`]: what the listing says about the target glass would drive.
-fn target_from(devices: &[SimDevice], pinned_udid: Option<String>) -> TargetFacts {
-    let booted = booted_name(devices);
-    let pinned_is_booted = pinned_udid
-        .as_deref()
-        .is_some_and(|u| devices.iter().any(|d| d.udid == u && d.state == "Booted"));
-    TargetFacts::Known {
-        booted,
-        pinned_udid,
-        pinned_is_booted,
+/// The pure half of [`gather_target`]: run the start path's own resolution and describe its outcome.
+///
+/// Both preferences are passed, because both change what a driving call does: `GLASS_IOS_DEVICE`
+/// naming a simulator this host lacks makes `glass_start` fail outright, which the doctor should say
+/// rather than report a green line about some other device.
+fn target_from(
+    devices: &[SimDevice],
+    want_udid: Option<&str>,
+    want_name: Option<&str>,
+) -> TargetFacts {
+    let available = devices.iter().filter(|d| ios_target(d)).count();
+    match resolve(devices, want_udid, want_name) {
+        Resolve::Attach(udid) => match devices.iter().find(|d| d.udid == udid) {
+            // Only a pinned udid can name something the listing does not carry: the unpinned path
+            // picks from the listing itself.
+            None => TargetFacts::PinnedMissing(udid),
+            Some(d) if d.state != "Booted" => TargetFacts::PinnedNotBooted(udid),
+            Some(d) => TargetFacts::Attaching {
+                name: d.name.clone(),
+                available,
+            },
+        },
+        Resolve::Boot(udid) => TargetFacts::WillBoot {
+            name: devices
+                .iter()
+                .find(|d| d.udid == udid)
+                .map_or(udid, |d| d.name.clone()),
+            available,
+        },
+        Resolve::Error(why) => TargetFacts::Unresolvable(why),
     }
 }
 
-/// Name of the already-booted simulator [`booted_from`] would attach to — the same selection a
-/// driving call makes when `GLASS_IOS_UDID` is unset (a pinned udid bypasses this entirely).
-fn booted_name(devices: &[SimDevice]) -> Option<String> {
-    let udid = booted_from(devices)?;
-    devices
-        .iter()
-        .find(|d| d.udid == udid)
-        .map(|d| d.name.clone())
+/// A device a driving call could use: available, and on an iOS runtime (a watchOS or tvOS simulator
+/// is never a target). Mirrors the filter `resolve` selects with.
+fn ios_target(d: &SimDevice) -> bool {
+    d.is_available && d.runtime.contains("iOS")
 }
 
 /// Pure booted-sim selection: `resolve(_, None, None)` returns `Attach` iff an iOS sim is
@@ -477,23 +471,12 @@ mod tests {
         assert_eq!(booted_from(&devices), None);
     }
 
-    /// A read listing, with an optional booted device and an optional `GLASS_IOS_UDID` pin.
-    fn known(booted: Option<&str>, pinned: Option<(&str, bool)>) -> TargetFacts {
-        TargetFacts::Known {
-            booted: booted.map(Into::into),
-            pinned_udid: pinned.map(|(u, _)| u.to_string()),
-            pinned_is_booted: pinned.is_some_and(|(_, b)| b),
-        }
-    }
-
     fn device_line(target: &TargetFacts) -> Check {
         let runtimes = vec!["iOS 26.5".to_string()];
-        let iphones = vec!["iPhone 17".to_string(), "iPhone 17 Pro".to_string()];
         let p = Probe {
             xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
             simctl_ok: true,
             runtimes: &runtimes,
-            iphones: &iphones,
             target,
         };
         build_checks(&p)
@@ -506,37 +489,44 @@ mod tests {
     fn nothing_booted_is_not_a_finding_because_glass_boots_one_at_start() {
         // `SimTarget::from_env` runs `bootstatus -b` when nothing is booted, so warning here would
         // prescribe a command glass runs itself, on a host with nothing wrong with it.
-        let c = device_line(&known(None, None));
+        let c = device_line(&TargetFacts::WillBoot {
+            name: "iPhone 17".into(),
+            available: 5,
+        });
         assert_eq!(c.status, CheckStatus::Ok);
-        assert!(c.detail.contains("boots one at start"), "{}", c.detail);
-    }
-
-    #[test]
-    fn a_booted_simulator_is_named_so_the_operator_knows_which_one() {
-        let c = device_line(&known(Some("iPhone 17 Pro"), None));
-        assert_eq!(c.status, CheckStatus::Ok);
-        assert!(c.detail.contains("iPhone 17 Pro"), "{}", c.detail);
+        assert!(
+            c.detail.contains("boots iPhone 17 at start"),
+            "{}",
+            c.detail
+        );
     }
 
     #[test]
     fn a_pinned_udid_that_is_not_booted_is_the_one_state_start_will_not_fix() {
         // `resolve` returns a pinned udid without checking its state and without booting it, so
         // glass attaches to a dead target and every later call fails against it.
-        let c = device_line(&known(Some("iPhone 17 Pro"), Some(("DEAD-UDID", false))));
+        let c = device_line(&TargetFacts::PinnedNotBooted("DEAD-UDID".into()));
         assert_eq!(c.status, CheckStatus::Fail);
-        assert!(c.detail.contains("DEAD-UDID"), "{}", c.detail);
         assert!(
-            c.remedy.as_deref().unwrap().contains("GLASS_IOS_UDID"),
+            c.remedy
+                .as_deref()
+                .unwrap()
+                .contains("simctl boot DEAD-UDID"),
             "{:?}",
             c.remedy
         );
     }
 
     #[test]
-    fn a_pinned_udid_that_is_booted_is_reported_not_warned_about() {
-        let c = device_line(&known(None, Some(("LIVE-UDID", true))));
-        assert_eq!(c.status, CheckStatus::Ok);
-        assert!(c.detail.contains("LIVE-UDID"), "{}", c.detail);
+    fn a_pinned_udid_the_host_lacks_is_not_told_to_boot_it() {
+        // `simctl boot` on an unknown udid answers "Invalid device", so this needs its own remedy.
+        let c = device_line(&TargetFacts::PinnedMissing("GHOST".into()));
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            !c.remedy.as_deref().unwrap().contains("simctl boot"),
+            "{:?}",
+            c.remedy
+        );
     }
 
     #[test]
@@ -556,9 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn booted_name_reports_the_device_a_driving_call_would_attach_to() {
-        // Two booted devices and a non-iOS one: a naive "first booted" pick names the watch or the
-        // wrong simulator, which is not what `resolve` — and so a driving call — would attach to.
+    fn the_reported_device_is_the_one_a_driving_call_would_attach_to() {
+        // Two booted devices and a booted watch: a naive "first booted" pick names the watch or the
+        // wrong simulator, neither of which is what `resolve` — and so a driving call — attaches to.
         let devices = vec![
             dev_on(
                 "WATCH",
@@ -569,53 +559,114 @@ mod tests {
             dev("IPAD", "iPad Pro 13-inch", "Booted"),
             dev("PHONE", "iPhone 17 Pro", "Booted"),
         ];
-        assert_eq!(booted_name(&devices), Some("iPhone 17 Pro".to_string()));
-        // A booted watch is not a target: nothing iOS-family is booted here.
-        assert_eq!(booted_name(&devices[..1]), None);
-    }
-
-    #[test]
-    fn a_pin_is_only_booted_when_the_listing_says_that_exact_udid_is() {
-        let devices = vec![
-            dev("AAA", "iPhone 17", "Shutdown"),
-            dev("BBB", "iPhone 17 Pro", "Booted"),
-        ];
         assert_eq!(
-            target_from(&devices, Some("AAA".into())),
-            known(Some("iPhone 17 Pro"), Some(("AAA", false)))
-        );
-        assert_eq!(
-            target_from(&devices, Some("BBB".into())),
-            known(Some("iPhone 17 Pro"), Some(("BBB", true)))
+            target_from(&devices, None, None),
+            TargetFacts::Attaching {
+                name: "iPhone 17 Pro".into(),
+                available: 2,
+            }
         );
     }
 
     #[test]
-    fn a_listing_that_does_not_answer_is_unknown_not_empty() {
+    fn an_ipad_only_host_is_driveable_and_reported_so() {
+        // `resolve` drives any iOS-family device and only *prefers* an iPhone, so failing an
+        // iPad-only host with "no iPhone simulator available" would report a working host as broken.
+        let devices = vec![dev("IPAD", "iPad Pro 13-inch", "Shutdown")];
+        assert_eq!(
+            target_from(&devices, None, None),
+            TargetFacts::WillBoot {
+                name: "iPad Pro 13-inch".into(),
+                available: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_pin_is_missing_when_the_listing_does_not_carry_it() {
+        let devices = vec![dev("BBB", "iPhone 17 Pro", "Booted")];
+        assert_eq!(
+            target_from(&devices, Some("TYPO"), None),
+            TargetFacts::PinnedMissing("TYPO".into())
+        );
+        assert_eq!(
+            target_from(&devices, Some("BBB"), None),
+            TargetFacts::Attaching {
+                name: "iPhone 17 Pro".into(),
+                available: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_device_name_that_matches_nothing_is_reported_not_ignored() {
+        // `GLASS_IOS_DEVICE` changes what a driving call resolves: a name this host lacks makes
+        // `glass_start` fail outright, so reading only the udid preference would report a green
+        // line about a device glass would never attach to.
+        let devices = vec![dev("AAA", "iPhone 17", "Shutdown")];
+        let facts = target_from(&devices, None, Some("iPhone 16"));
+        assert!(
+            matches!(&facts, TargetFacts::Unresolvable(why) if why.contains("iPhone 16")),
+            "{facts:?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_that_does_not_answer_names_the_command_that_did_not_answer() {
         let facts = gather_target(&|_| None, &|_| None);
-        assert!(matches!(facts, TargetFacts::Unknown(_)), "{facts:?}");
+        match facts {
+            TargetFacts::Unknown(cause) => {
+                assert!(
+                    cause.contains("simctl list devices available --json"),
+                    "{cause}"
+                )
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_read_listing_carries_the_pin_from_the_environment() {
+    fn a_read_listing_carries_both_preferences_from_the_environment() {
+        // Shut down, deliberately: `resolve` answers from the booted devices before it consults
+        // `GLASS_IOS_DEVICE`, so the name preference only changes the outcome when nothing is
+        // booted — and a fixture with a booted device would pass whether or not the doctor read
+        // the variable at all.
         let json = r#"{"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-26-5":[
-            {"udid":"BBB","name":"iPhone 17 Pro","state":"Booted","isAvailable":true}]}}"#;
+            {"udid":"BBB","name":"iPhone 17 Pro","state":"Shutdown","isAvailable":true}]}}"#;
         let facts = gather_target(&|_| Some(json.to_string()), &|k| {
-            (k == "GLASS_IOS_UDID").then(|| "BBB".to_string())
+            (k == "GLASS_IOS_DEVICE").then(|| "iPhone 16".to_string())
         });
-        assert_eq!(facts, known(Some("iPhone 17 Pro"), Some(("BBB", true))));
+        assert!(
+            matches!(&facts, TargetFacts::Unresolvable(why) if why.contains("iPhone 16")),
+            "{facts:?}"
+        );
+    }
+
+    #[test]
+    fn a_booted_device_wins_over_a_name_preference_that_matches_nothing() {
+        // Measured from `resolve`: the booted branch ignores `want_name` entirely. Pinned here so
+        // the doctor's "what would a driving call do" claim stays true if that ordering changes.
+        let devices = vec![dev("BBB", "iPhone 17 Pro", "Booted")];
+        assert_eq!(
+            target_from(&devices, None, Some("iPhone 16")),
+            TargetFacts::Attaching {
+                name: "iPhone 17 Pro".into(),
+                available: 1,
+            }
+        );
     }
 
     #[test]
     fn all_green_when_fully_configured() {
         let runtimes = vec!["iOS 26.5".to_string()];
-        let iphones = vec!["iPhone 17".to_string()];
         let p = Probe {
             xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
             simctl_ok: true,
             runtimes: &runtimes,
-            iphones: &iphones,
-            target: &known(Some("iPhone 17"), None),
+            target: &TargetFacts::Attaching {
+                name: "iPhone 17".into(),
+                available: 1,
+            },
         };
         let cs = build_checks(&p);
         assert!(cs.iter().all(|c| c.status == CheckStatus::Ok), "{cs:?}");
@@ -627,8 +678,7 @@ mod tests {
             xcode_dir: Some("/Library/Developer/CommandLineTools".into()),
             simctl_ok: false,
             runtimes: &[],
-            iphones: &[],
-            target: &known(None, None),
+            target: &TargetFacts::Unresolvable("no available iPhone simulator found".into()),
         };
         let cs = build_checks(&p);
         let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
@@ -652,8 +702,7 @@ mod tests {
             xcode_dir: None,
             simctl_ok: false,
             runtimes: &[],
-            iphones: &[],
-            target: &known(None, None),
+            target: &TargetFacts::Unresolvable("no available iPhone simulator found".into()),
         };
         let cs = build_checks(&p);
         let xcode = cs.iter().find(|c| c.name == "xcode").unwrap();
@@ -671,8 +720,7 @@ mod tests {
             xcode_dir: Some("/Applications/Xcode.app/Contents/Developer".into()),
             simctl_ok: true,
             runtimes: &[],
-            iphones: &[],
-            target: &known(None, None),
+            target: &TargetFacts::Unresolvable("no available iPhone simulator found".into()),
         };
         let cs = build_checks(&p);
         assert_eq!(

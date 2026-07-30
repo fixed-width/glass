@@ -53,6 +53,18 @@ impl SystemWideProbe {
     }
 }
 
+/// The console session's state, as the aggregator reads it. Mirrors `glass_macos::SessionState`
+/// without depending on it: this crate maps outcomes to text, and the platform crate owns the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleSession {
+    Unlocked,
+    Locked,
+    /// Nobody is logged in at the console. Distinct from locked: unlocking is not the remedy, and
+    /// telling this operator the session is unlocked is a falsehood the report contradicts two
+    /// lines further up.
+    NoSession,
+}
+
 /// Points at the grant check rather than repeating its remedy, so an untrusted process is one cause
 /// with one thing to do.
 const GRANT_REMEDY: &str = "grant Accessibility to this binary — see the check below";
@@ -62,18 +74,19 @@ const GRANT_REMEDY: &str = "grant Accessibility to this binary — see the check
 /// Takes two facts the caller has already gathered because the probe alone cannot be read
 /// correctly. `accessibility_granted`: an untrusted process gets `CannotComplete` (measured on
 /// macOS 26.5), the same code a trusted process gets when its read is not answered.
-/// `session_locked`: a locked console session is a known cause of accessibility calls misbehaving
-/// (`glass-macos`'s input tests record synthetic events being dropped while
-/// `CGSSessionScreenIsLocked` is set), and the aggregator already reads the real lock state — so
-/// this says the screen is locked when it *is*, rather than inferring it from an error code and
-/// contradicting the `display awake` check printed beside it.
+/// `session`: an unanswered read means something different with nobody at the console, and the
+/// aggregator already reads the real state — so this reports the session it *is* in rather than
+/// inferring one from an error code and contradicting the `display awake` check printed beside it.
+/// Whether a locked session actually produces this code is not established (`glass-macos`'s input
+/// tests record locked-session AX *writes* reporting success), which is why the session only
+/// qualifies the ambiguous code rather than explaining every failure.
 ///
 /// The grant keeps its own check next to this one: this line answers "did the API respond", that
 /// one answers "is this binary trusted".
 pub fn a11y_checks(
     probe: SystemWideProbe,
     accessibility_granted: bool,
-    session_locked: bool,
+    session: ConsoleSession,
 ) -> Vec<Check> {
     let ok = |detail: &str| Check::new("a11y reader", CheckStatus::Ok, detail);
     let fail = |detail: String, remedy: &str| {
@@ -99,18 +112,29 @@ pub fn a11y_checks(
         SystemWideProbe::NothingFocused => {
             ok("AXUIElement reader answered a system-wide read (no application is frontmost)")
         }
-        // Locked first: it explains every failing code below it, and it is measured rather than
-        // guessed, so an operator is never sent to log out over a screen they can just unlock.
-        p if session_locked => Check::new(
+        // Only the ambiguous code defers to the session: `ApiDisabled` and an unrecognised code
+        // mean what they mean whether or not anyone is at the console, and letting the session
+        // swallow them would downgrade a real defect to "unlock your screen".
+        SystemWideProbe::DidNotComplete if session != ConsoleSession::Unlocked => Check::new(
             "a11y reader",
             CheckStatus::Warn,
-            format!(
-                "the console session is locked, and the system-wide read did not succeed ({}) — \
-                 accessibility is unreliable while locked",
-                describe(p)
-            ),
+            match session {
+                ConsoleSession::Locked => format!(
+                    "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and the \
+                     console session is locked"
+                ),
+                _ => format!(
+                    "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and no \
+                     account is logged in at the console"
+                ),
+            },
         )
-        .with_remedy("unlock the session and re-run (see the `display awake` check)"),
+        .with_remedy(match session {
+            ConsoleSession::Locked => {
+                "unlock the session and re-run (see the `display awake` check)"
+            }
+            _ => "log in at the console and re-run (see the `display awake` check)",
+        }),
         SystemWideProbe::ApiDisabled => fail(
             format!(
                 "assistive access is off for this process (AXError {API_DISABLED}), so the \
@@ -122,7 +146,8 @@ pub fn a11y_checks(
         SystemWideProbe::DidNotComplete => fail(
             format!(
                 "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) — this process is \
-                 trusted and the session is unlocked, so the accessibility stack is not responding"
+                 trusted and someone is logged in at an unlocked console, so the accessibility \
+                 stack is not responding"
             ),
             "log out and back in; if it persists, report this with the `glass doctor` output",
         ),
@@ -160,9 +185,15 @@ pub fn probe() -> SystemWideProbe {
 mod tests {
     use super::*;
 
-    fn reader(probe: SystemWideProbe, granted: bool, locked: bool) -> Check {
-        a11y_checks(probe, granted, locked).remove(0)
+    fn reader(probe: SystemWideProbe, granted: bool, session: ConsoleSession) -> Check {
+        a11y_checks(probe, granted, session).remove(0)
     }
+
+    const EVERY_SESSION: [ConsoleSession; 3] = [
+        ConsoleSession::Unlocked,
+        ConsoleSession::Locked,
+        ConsoleSession::NoSession,
+    ];
 
     const EVERY_PROBE: [SystemWideProbe; 5] = [
         SystemWideProbe::Answered,
@@ -211,7 +242,12 @@ mod tests {
             SystemWideProbe::Failed(-25205)
         );
         assert_eq!(
-            reader(SystemWideProbe::from_ax_code(-25205), true, false).status,
+            reader(
+                SystemWideProbe::from_ax_code(-25205),
+                true,
+                ConsoleSession::Unlocked
+            )
+            .status,
             CheckStatus::Fail
         );
     }
@@ -219,14 +255,18 @@ mod tests {
     #[test]
     fn an_answering_ax_stack_is_ok() {
         assert_eq!(
-            reader(SystemWideProbe::Answered, true, false).status,
+            reader(SystemWideProbe::Answered, true, ConsoleSession::Unlocked).status,
             CheckStatus::Ok
         );
     }
 
     #[test]
     fn nothing_frontmost_still_proves_the_stack_answered() {
-        let c = reader(SystemWideProbe::NothingFocused, true, false);
+        let c = reader(
+            SystemWideProbe::NothingFocused,
+            true,
+            ConsoleSession::Unlocked,
+        );
         assert_eq!(c.status, CheckStatus::Ok);
         // The detail is the arm's whole point: collapsing it into `Answered` would lose the reason
         // the read came back empty.
@@ -238,9 +278,49 @@ mod tests {
         // The probe cannot rescue an untrusted process: it holds no grant, so no tree read can
         // succeed whatever the system-wide element answered.
         for p in EVERY_PROBE {
-            let c = reader(p, false, false);
+            let c = reader(p, false, ConsoleSession::Unlocked);
             assert_eq!(c.status, CheckStatus::Fail, "{p:?} -> {c:?}");
             assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_console_with_nobody_logged_in_is_not_told_the_session_is_unlocked() {
+        // `NoSession` used to fold into "unlocked", so the line asserted the opposite of the
+        // `display awake` check printed beside it and told a logged-out operator to log out.
+        let c = reader(
+            SystemWideProbe::DidNotComplete,
+            true,
+            ConsoleSession::NoSession,
+        );
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.detail.contains("no account is logged in"), "{}", c.detail);
+        assert!(
+            c.remedy
+                .as_deref()
+                .unwrap()
+                .contains("log in at the console"),
+            "{:?}",
+            c.remedy
+        );
+    }
+
+    #[test]
+    fn a_session_state_never_downgrades_a_defect_it_does_not_explain() {
+        // The session only qualifies the ambiguous code. An unlocked-session defect stays a defect
+        // when the screen happens to be locked — otherwise a rebuilt binary with assistive access
+        // off reads as "unlock your screen" and the doctor exits 0.
+        for session in EVERY_SESSION {
+            for p in [
+                SystemWideProbe::ApiDisabled,
+                SystemWideProbe::Failed(-25208),
+            ] {
+                assert_eq!(
+                    reader(p, true, session).status,
+                    CheckStatus::Fail,
+                    "{p:?} {session:?}"
+                );
+            }
         }
     }
 
@@ -248,7 +328,11 @@ mod tests {
     fn a_locked_session_is_a_warning_naming_the_lock_not_a_failure() {
         // Transient and not a configuration defect: failing here would exit(1) on a Mac driving
         // another backend with its screen locked. The lock is read, not inferred from the code.
-        let c = reader(SystemWideProbe::DidNotComplete, true, true);
+        let c = reader(
+            SystemWideProbe::DidNotComplete,
+            true,
+            ConsoleSession::Locked,
+        );
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.detail.contains("locked"), "{}", c.detail);
         assert!(
@@ -263,7 +347,11 @@ mod tests {
         // Same AXError, three causes; with the grant held and the session unlocked, the remaining
         // one is the stack. Sending this operator to unlock an unlocked screen — or to a grant they
         // already hold — is the diagnostic failing at its one job.
-        let c = reader(SystemWideProbe::DidNotComplete, true, false);
+        let c = reader(
+            SystemWideProbe::DidNotComplete,
+            true,
+            ConsoleSession::Unlocked,
+        );
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(
             !c.detail.to_lowercase().contains("not trusted"),
@@ -281,7 +369,7 @@ mod tests {
     #[test]
     fn a_granted_process_with_assistive_access_off_is_not_sent_to_the_grant_check() {
         // The grant line beside this one reads "granted", so pointing at it would be a dead end.
-        let c = reader(SystemWideProbe::ApiDisabled, true, false);
+        let c = reader(SystemWideProbe::ApiDisabled, true, ConsoleSession::Unlocked);
         assert_eq!(c.status, CheckStatus::Fail);
         assert_ne!(c.remedy.as_deref(), Some(GRANT_REMEDY));
         assert!(c.detail.contains(&API_DISABLED.to_string()), "{}", c.detail);
@@ -289,7 +377,11 @@ mod tests {
 
     #[test]
     fn an_unrecognized_error_still_reports_its_code() {
-        let c = reader(SystemWideProbe::Failed(-25208), true, false);
+        let c = reader(
+            SystemWideProbe::Failed(-25208),
+            true,
+            ConsoleSession::Unlocked,
+        );
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(c.detail.contains("-25208"), "{}", c.detail);
     }
@@ -300,12 +392,12 @@ mod tests {
         // worst exactly where the operator knows least.
         for p in EVERY_PROBE {
             for granted in [true, false] {
-                for locked in [true, false] {
-                    let c = reader(p, granted, locked);
+                for session in EVERY_SESSION {
+                    let c = reader(p, granted, session);
                     if c.status != CheckStatus::Ok {
                         assert!(
                             c.remedy.is_some(),
-                            "{p:?} granted={granted} locked={locked} -> {c:?}"
+                            "{p:?} granted={granted} session={session:?} -> {c:?}"
                         );
                     }
                 }
@@ -314,16 +406,16 @@ mod tests {
     }
 
     #[test]
-    fn the_reader_line_never_duplicates_the_grant_lines_remedy_text() {
+    fn an_untrusted_process_is_pointed_at_the_grant_check_not_at_a_second_copy_of_it() {
         // The grant check owns the System Settings pane; this line points at it instead, so an
-        // untrusted operator is given one thing to do rather than two.
+        // untrusted operator is given one thing to do rather than two. (A *granted* process whose
+        // assistive access is off is a different case: the grant line reads green there, so that
+        // arm names the pane itself.)
         for p in EVERY_PROBE {
-            let c = reader(p, false, false);
-            assert!(
-                !c.remedy.as_deref().unwrap().contains("System Settings"),
-                "{p:?} -> {:?}",
-                c.remedy
-            );
+            for session in EVERY_SESSION {
+                let c = reader(p, false, session);
+                assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY), "{p:?} {session:?}");
+            }
         }
     }
 }

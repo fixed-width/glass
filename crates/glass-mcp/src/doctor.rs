@@ -221,7 +221,7 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
             macos_a11y_checks(
                 glass_a11y_macos::doctor::probe(),
                 glass_macos::accessibility_granted(),
-                glass_macos::session_state() == glass_macos::SessionState::Locked,
+                console_session(glass_macos::session_state()),
             ),
         ));
     }
@@ -523,6 +523,19 @@ fn macos_checks(resolved_backend: &str) -> Vec<Check> {
     )
 }
 
+/// Translate the platform crate's session read into the a11y reader's vocabulary. Nobody at the
+/// console is not the same as a locked screen: unlocking is not the remedy, and the reader line
+/// would otherwise assert "unlocked" two lines under a `display awake` check saying the opposite.
+#[cfg(target_os = "macos")]
+fn console_session(state: glass_macos::SessionState) -> glass_a11y_macos::doctor::ConsoleSession {
+    use glass_a11y_macos::doctor::ConsoleSession;
+    match state {
+        glass_macos::SessionState::Unlocked => ConsoleSession::Unlocked,
+        glass_macos::SessionState::Locked => ConsoleSession::Locked,
+        glass_macos::SessionState::NoSession => ConsoleSession::NoSession,
+    }
+}
+
 /// The "accessibility (macos)" section: the reader line, from a real system-wide AX read, and the
 /// Accessibility TCC grant beside it.
 ///
@@ -537,10 +550,9 @@ fn macos_checks(resolved_backend: &str) -> Vec<Check> {
 fn macos_a11y_checks(
     probe: glass_a11y_macos::doctor::SystemWideProbe,
     accessibility_granted: bool,
-    session_locked: bool,
+    session: glass_a11y_macos::doctor::ConsoleSession,
 ) -> Vec<Check> {
-    let mut checks =
-        glass_a11y_macos::doctor::a11y_checks(probe, accessibility_granted, session_locked);
+    let mut checks = glass_a11y_macos::doctor::a11y_checks(probe, accessibility_granted, session);
     checks.push(if accessibility_granted {
         Check::new("Accessibility", CheckStatus::Ok, "granted")
     } else {
@@ -1121,9 +1133,14 @@ mod tests {
         fn the_reader_line_reports_the_probe_not_a_constant() {
             // The defect this replaced: the line was `Ok` whatever the AX stack was doing, so the
             // one case an operator needs it for — the reader is not answering — read green.
-            use glass_a11y_macos::doctor::SystemWideProbe;
-            let answered = macos_a11y_checks(SystemWideProbe::Answered, true, false);
-            let refused = macos_a11y_checks(SystemWideProbe::DidNotComplete, true, false);
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let answered =
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::Unlocked);
+            let refused = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                true,
+                ConsoleSession::Unlocked,
+            );
             assert_eq!(
                 answered
                     .iter()
@@ -1144,8 +1161,9 @@ mod tests {
 
         #[test]
         fn a_granted_process_whose_ax_stack_answers_is_all_ok() {
-            use glass_a11y_macos::doctor::SystemWideProbe;
-            let checks = macos_a11y_checks(SystemWideProbe::Answered, true, false);
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks =
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::Unlocked);
             assert!(
                 checks.iter().all(|c| c.status == CheckStatus::Ok),
                 "{checks:?}"
@@ -1156,8 +1174,12 @@ mod tests {
         fn an_ungranted_process_gets_one_remedy_per_question() {
             // The grant line owns the System Settings remedy; the reader line points at it rather
             // than repeating it, so the operator is given one thing to do rather than two.
-            use glass_a11y_macos::doctor::SystemWideProbe;
-            let checks = macos_a11y_checks(SystemWideProbe::DidNotComplete, false, false);
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                false,
+                ConsoleSession::Unlocked,
+            );
             let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
             let grant = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(
@@ -1180,9 +1202,13 @@ mod tests {
         fn a_locked_session_does_not_fail_the_whole_run() {
             // This section is always critical (`backend: None`), so a `Fail` here exits non-zero
             // even for someone driving android on a Mac. A locked screen is transient and not a
-            // configuration defect, so it warns.
-            use glass_a11y_macos::doctor::SystemWideProbe;
-            let checks = macos_a11y_checks(SystemWideProbe::DidNotComplete, true, true);
+            // configuration defect, so it warns — asserted here rather than left to the comment.
+            use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
+            let checks = macos_a11y_checks(
+                SystemWideProbe::DidNotComplete,
+                true,
+                ConsoleSession::Locked,
+            );
             let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
             assert_eq!(reader.status, CheckStatus::Warn);
         }
@@ -1192,7 +1218,7 @@ mod tests {
             let checks = macos_a11y_checks(
                 glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
                 false,
-                false,
+                glass_a11y_macos::doctor::ConsoleSession::Unlocked,
             );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
@@ -1209,7 +1235,7 @@ mod tests {
             let checks = macos_a11y_checks(
                 glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
                 false,
-                false,
+                glass_a11y_macos::doctor::ConsoleSession::Unlocked,
             );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             // Same pane URL as the "macos" section's own Accessibility check — kept in

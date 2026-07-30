@@ -156,8 +156,9 @@ pub(crate) fn probe_system_wide() -> SystemWideProbe {
     probe_system_wide_attr(crate::doctor::PROBE_ATTRIBUTE)
 }
 
-/// How long one doctor AX read may wait. Generous for a system-wide attribute read, which answers
-/// in microseconds on a healthy host.
+/// How long one doctor AX read may wait before the API gives up. A system-wide
+/// `AXFocusedApplication` read is forwarded to the frontmost application, so this has to allow for
+/// a busy-but-healthy app, not just for the round trip.
 const PROBE_TIMEOUT_SECS: f32 = 2.0;
 
 /// [`probe_system_wide`] with the attribute as a seam, so a live test can drive the classifier with
@@ -167,19 +168,29 @@ fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
     // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
     // documented contract (the binding itself `.expect()`s on this).
     let el = unsafe { AXUIElement::new_system_wide() };
+    // Setting a timeout on the *system-wide* object sets it globally for the process (Apple's
+    // documented behaviour), so this would otherwise cap every later glass_a11y_snapshot in the
+    // server — a diagnostic changing what the product does. It is restored below.
+    //
     // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
-    // lifetime preconditions. Its own failure is not reported: a timeout that could not be set
-    // leaves the system default in place, which is a slower probe, not a wrong one.
+    // lifetime preconditions. A timeout that could not be set leaves the system default in place:
+    // the probe is then bounded only by that default, which is the pre-existing behaviour.
     let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
     let attr = CFString::from_str(attr_name);
     let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
     // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
     let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
-    if let Some(nn) = NonNull::new(raw.cast_mut()) {
+    // SAFETY: as above; 0 restores the process-global default, leaving the AX subsystem as the
+    // probe found it.
+    let _ = unsafe { el.set_messaging_timeout(0.0) };
+    if err == AXError::Success
+        && let Some(nn) = NonNull::new(raw.cast_mut())
+    {
         // SAFETY: on `Success` the Copy call returned an already-retained (+1) value per Core
         // Foundation's Copy/Create rule; taking ownership here releases it at end of scope rather
-        // than leaking the frontmost application element on every doctor run.
+        // than leaking the frontmost application element on every doctor run. Only on `Success`:
+        // on any other code the out-param is not ours to release.
         drop(unsafe { CFRetained::from_raw(nn) });
     }
     // A `Success` with a null value is `Answered` here, though `copy_attribute_checked` calls the
@@ -422,9 +433,10 @@ mod tests {
         );
     }
 
-    /// Live: the surveyed fact the probe attribute is chosen for — `AXRole` answers where
-    /// `AXFocusedApplication` may not — so a maintainer swapping the attribute has something that
-    /// fails rather than a comment.
+    /// Live: `AXRole` answers on the system-wide element. Half of the reason
+    /// [`crate::doctor::PROBE_ATTRIBUTE`] is not `AXRole`; the other half — that an *untrusted*
+    /// process still gets an answer from it — needs an untrusted process and is not asserted
+    /// anywhere.
     #[test]
     #[ignore = "needs a macOS GUI session (run by scripts/test-macos-a11y.sh)"]
     fn axrole_answers_on_the_system_wide_element() {
@@ -432,6 +444,30 @@ mod tests {
             probe_system_wide_attr("AXRole"),
             SystemWideProbe::Answered,
             "if this fails, the reason PROBE_ATTRIBUTE is AXFocusedApplication no longer holds"
+        );
+    }
+
+    /// The doctor hand-copies these codes so its classifier compiles on any host; nothing else
+    /// keeps them equal to the binding's, and a one-digit slip would silently reclassify a disabled
+    /// API as an unrecognised failure.
+    #[test]
+    fn the_doctors_ax_codes_match_the_binding() {
+        use crate::doctor::SystemWideProbe;
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::APIDisabled.0),
+            SystemWideProbe::ApiDisabled
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::CannotComplete.0),
+            SystemWideProbe::DidNotComplete
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::NoValue.0),
+            SystemWideProbe::NothingFocused
+        );
+        assert_eq!(
+            SystemWideProbe::from_ax_code(AXError::Success.0),
+            SystemWideProbe::Answered
         );
     }
 
