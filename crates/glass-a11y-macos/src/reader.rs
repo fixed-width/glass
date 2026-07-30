@@ -168,9 +168,7 @@ impl Accessibility for MacosA11y {
         // Same fingerprint gate as set_value: role + name + bounds.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
-        // Same two reads, in the same order, that `walk` derived this element's `name` from —
-        // through the same helper, so a fingerprint can never be computed from a differently-read
-        // name and reject an element that never moved.
+        // `name` derived exactly as in `walk` and `set_value` — see there.
         let name = read_label(&el, attr::TITLE).or_else(|| read_label(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
