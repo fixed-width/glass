@@ -1,8 +1,7 @@
 //! `IosPlatform`: the `glass_core::Platform` implementation that drives a single
 //! foreground app on an iOS Simulator over `xcrun simctl`.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use glass_core::{
@@ -173,10 +172,11 @@ fn launch_stderr_tail(simctl: &Simctl, udid: &str) -> Option<String> {
 fn pid_is_running(pid: u32) -> bool {
     // Absolute path: `ps` resolved through `PATH` could be a shim whose non-zero exit would be
     // read below as "the app died", turning a healthy launch into a confident false report.
-    match Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "state="])
-        .output()
-    {
+    let mut cmd = Command::new("/bin/ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "state="]);
+    // A timeout here reads the same as `ps` being missing: not knowable, so not evidence the app
+    // died (see this function's doc). Bounded so a wedged `ps` cannot hold up a launch.
+    match glass_core::run_bounded(&mut cmd, std::time::Duration::from_secs(10), "ps:pid-state") {
         // A process that has exited but not yet been reaped is still listed, in state `Z`. That
         // is a real window here — the app's parent is `launchd_sim`, not this process — and a
         // zombie is a dead app, so the state is read rather than just the exit status.
@@ -196,7 +196,15 @@ fn pid_is_running(pid: u32) -> bool {
             );
             true
         }
-        Err(_) => true,
+        // Its sibling above logs before failing open; a `ps` that did not answer in ten seconds on
+        // a healthy host is at least as worth saying out loud as one that printed to stderr.
+        Err(e) => {
+            eprintln!(
+                "glass-ios: could not check whether the app is still running ({e}); \
+                 treating it as running"
+            );
+            true
+        }
     }
 }
 
@@ -235,10 +243,13 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
         .ok_or_else(|| GlassError::Backend("cannot start app: run command is empty".into()))?;
     if looks_like_app_path(first) {
         let plist = format!("{first}/Info.plist");
-        let out = Command::new("plutil")
-            .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist])
-            .output()
-            .map_err(|e| GlassError::Backend(format!("plutil: {e}")))?;
+        let mut cmd = Command::new("plutil");
+        cmd.args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist]);
+        let out = glass_core::run_bounded(
+            &mut cmd,
+            std::time::Duration::from_secs(10),
+            "plutil:CFBundleIdentifier",
+        )?;
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "could not read CFBundleIdentifier from {plist}: {}",
@@ -427,9 +438,13 @@ impl Platform for IosPlatform {
         for (k, v) in &spec.env {
             launch.env(format!("SIMCTL_CHILD_{k}"), v);
         }
-        let out = launch
-            .output()
-            .map_err(|e| GlassError::Backend(format!("simctl launch: {e}")))?;
+        // Bounded like every other simctl call, but spelled out here because this one cannot go
+        // through `Simctl::run`: it needs `SIMCTL_CHILD_*` in the child's environment.
+        let out = glass_core::run_bounded(
+            &mut launch,
+            crate::simctl::SimctlOp::Lifecycle.budget(),
+            "simctl:launch",
+        )?;
         if !out.status.success() {
             return Err(GlassError::Backend(format!(
                 "simctl launch failed: {}",
@@ -574,34 +589,21 @@ impl Platform for IosPlatform {
 
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
         self.running()?;
-        // `simctl pbcopy` reads the clipboard text from stdin, so it needs a piped child
-        // rather than the `Simctl::run` one-shot-output helper.
-        let mut child = Command::new(self.target.simctl().program())
-            .args(
-                self.target
-                    .simctl()
-                    .full_args(&["pbcopy", self.target.udid()]),
-            )
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| GlassError::Backend(format!("pbcopy: {e}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| GlassError::Backend("pbcopy: failed to open stdin".into()))?;
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
-            // Reap the child before returning so it doesn't outlive us as a zombie; its exit
-            // status doesn't matter here since we're already reporting the write failure.
-            let _ = child.wait();
-            return Err(GlassError::Backend(format!("pbcopy write: {e}")));
-        }
-        // Close our end so `pbcopy` sees EOF and exits; holding it open past this point
-        // would deadlock the `wait_with_output()` below.
-        drop(stdin);
-        let out = child
-            .wait_with_output()
-            .map_err(|e| GlassError::Backend(format!("pbcopy wait: {e}")))?;
+        // `simctl pbcopy` takes the clipboard text on stdin, so it cannot go through `Simctl::run`,
+        // which closes stdin — but it is a one-shot `simctl` call like any other and gets the same
+        // deadline. The runner writes stdin on its own thread, so a `pbcopy` that exits without
+        // reading everything cannot leave this blocked in `write`.
+        let mut cmd = Command::new(self.target.simctl().program());
+        cmd.args(
+            self.target
+                .simctl()
+                .full_args(&["pbcopy", self.target.udid()]),
+        );
+        // Budget and label from the classifier, like every other simctl call — this site only
+        // exists apart because the payload goes on stdin, not because it is special.
+        let op = crate::simctl::SimctlOp::for_sub(&["pbcopy"]);
+        let out =
+            glass_core::run_bounded_with_stdin(&mut cmd, op.budget(), op.label(), text.as_bytes())?;
         if out.status.success() {
             Ok(())
         } else {

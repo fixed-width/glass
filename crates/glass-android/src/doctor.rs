@@ -189,13 +189,23 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// `<bin> -list-avds`: `None` on spawn failure (binary absent), else the parsed names.
+/// `<bin> -list-avds`: `None` when the binary could not be run to an answer, else the parsed names.
+///
+/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool reports
+/// nothing at all, which is the one thing it must never do. A timeout still collapses into the same
+/// `None` as an absent binary — the caller renders that as "not found", which is then the wrong
+/// remedy — so it is logged, the way the iOS doctor logs its probes.
 fn list_avds(bin: &str) -> Option<Vec<String>> {
-    std::process::Command::new(bin)
-        .arg("-list-avds")
-        .output()
-        .ok()
-        .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("-list-avds");
+    glass_core::run_bounded(
+        &mut cmd,
+        crate::avd::EMULATOR_LIST_BUDGET,
+        "emulator:-list-avds",
+    )
+    .inspect_err(|e| eprintln!("glass-android doctor: {e}"))
+    .ok()
+    .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
 }
 
 /// Deep probe one online device: capture a frame (validated via the real decoder) and

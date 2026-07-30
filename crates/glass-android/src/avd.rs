@@ -242,7 +242,10 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
                 err.trim()
             )));
         }
-        let online = crate::target::parse_devices(&base.run(["devices"])?);
+        // Tolerant, like the `getprop` below it: this polls every 500ms inside the boot deadline, so
+        // one slow `devices` call is a hiccup, not a reason to abandon a boot — and propagating here
+        // would skip the deadline branch that kills the emulator, leaving it holding the AVD lock.
+        let online = crate::target::parse_devices(&base.run(["devices"]).unwrap_or_default());
         if let Some(serial) = new_serial(&before, &online) {
             let adb = base.with_serial(serial.clone());
             if adb
@@ -272,11 +275,15 @@ pub fn boot_avd(base: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<Stri
     }
 }
 
+/// Deadline for `emulator -list-avds`. It reads the AVD directory and prints names — a fast local
+/// query — but a broken SDK can wedge the binary, and this runs first on the `glass_start` boot
+/// path, so an unbounded call here hangs a launch before anything else happens.
+pub(crate) const EMULATOR_LIST_BUDGET: Duration = Duration::from_secs(15);
+
 fn run_emulator_list(bin: &str) -> Result<String> {
-    let out = Command::new(bin)
-        .arg("-list-avds")
-        .output()
-        .map_err(|e| GlassError::Backend(format!("failed to run `{bin} -list-avds`: {e}")))?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("-list-avds");
+    let out = glass_core::run_bounded(&mut cmd, EMULATOR_LIST_BUDGET, "emulator:-list-avds")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
