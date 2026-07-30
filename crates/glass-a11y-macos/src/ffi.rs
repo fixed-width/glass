@@ -150,10 +150,22 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
 /// every real failure into one error string: the doctor has to tell `APIDisabled` (not trusted)
 /// from `CannotComplete` (the stack did not answer, which is what a locked screen looks like).
 pub(crate) fn probe_system_wide() -> SystemWideProbe {
+    // `AXFocusedApplication`, not a cheaper attribute, because it is *trust-gated*: surveyed on the
+    // dogfood mini, an untrusted process reading it off the system-wide element gets
+    // `CannotComplete` while `AXRole` on the same element answers `Success`. So this attribute fails
+    // exactly when the reader would fail, and a "simpler" one would report green to a process that
+    // cannot read a single tree.
+    probe_system_wide_attr("AXFocusedApplication")
+}
+
+/// [`probe_system_wide`] with the attribute as a seam, so a live test can drive the classifier with
+/// an attribute the system-wide element definitely lacks and see a non-`Success` code come back from
+/// the real API rather than from a fixture.
+fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
     // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
     // documented contract (the binding itself `.expect()`s on this).
     let el = unsafe { AXUIElement::new_system_wide() };
-    let attr = CFString::from_str("AXFocusedApplication");
+    let attr = CFString::from_str(attr_name);
     let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
     // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
@@ -392,8 +404,25 @@ fn ax_err(context: &str, err: AXError) -> GlassError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_absent_error;
+    use super::{is_absent_error, probe_system_wide_attr};
+    use crate::doctor::SystemWideProbe;
     use objc2_application_services::AXError;
+
+    // There is deliberately no live "healthy host answers" test: the Accessibility grant attaches
+    // to the binary, and a `cargo test` binary is never granted one — measured on the dogfood mini,
+    // where `glass-mcp doctor` answered and this harness got CannotComplete on the same host in the
+    // same session. That measurement is also why the doctor disambiguates -25204 with the grant bit.
+
+    /// Live: a real non-`Success` `AXError` reaches the classifier and is named, rather than every
+    /// outcome collapsing to the healthy one — which is the defect this whole check replaces.
+    #[test]
+    #[ignore = "needs a macOS GUI session with Accessibility granted to this process"]
+    fn an_attribute_the_element_lacks_classifies_as_absent() {
+        assert_eq!(
+            probe_system_wide_attr("AXNoSuchAttributeGlassDoctorProbe"),
+            SystemWideProbe::AttributeAbsent
+        );
+    }
 
     #[test]
     fn absent_ax_errors_classified_as_absent() {

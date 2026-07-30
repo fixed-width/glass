@@ -26,13 +26,19 @@ const API_DISABLED: i32 = -25211;
 /// `kAXErrorCannotComplete`.
 const CANNOT_COMPLETE: i32 = -25204;
 
-/// Map a system-wide read to the `a11y reader` check.
+/// Map a system-wide read to the `a11y reader` check, disambiguated by whether this process holds
+/// the Accessibility grant.
 ///
-/// Deliberately says nothing about the Accessibility grant — that is its own check, with its own
-/// remedy. This one answers "did the API respond", which a granted process can still fail: with
-/// `CGSSessionScreenIsLocked` set, every AX tree on the host is withheld (measured 2026-07-29), and
-/// a diagnostic that reports only "failed" sends the reader hunting for a bug in glass.
-pub fn a11y_checks(probe: SystemWideProbe) -> Vec<Check> {
+/// The grant is needed because macOS reports both causes with the same code: measured on macOS 26.5,
+/// an *untrusted* process reading `AXFocusedApplication` off the system-wide element gets
+/// `kAXErrorCannotComplete` (-25204), the same code a trusted process gets when the host is
+/// withholding its trees — which is what a locked screen does (measured 2026-07-29). Reporting one
+/// remedy for both would send half the readers to the wrong fix, and the grant bit is already
+/// gathered, so the two are told apart here rather than left to the operator.
+///
+/// The grant still gets its own check beside this one: this line answers "did the API respond", that
+/// one answers "is this binary trusted".
+pub fn a11y_checks(probe: SystemWideProbe, accessibility_granted: bool) -> Vec<Check> {
     vec![match probe {
         SystemWideProbe::Answered => Check::new(
             "a11y reader",
@@ -53,19 +59,27 @@ pub fn a11y_checks(probe: SystemWideProbe) -> Vec<Check> {
                  will fail"
             ),
         )
-        .with_remedy("grant Accessibility to this binary — see the check below"),
+        .with_remedy(GRANT_REMEDY),
+        SystemWideProbe::DidNotComplete if !accessibility_granted => Check::new(
+            "a11y reader",
+            CheckStatus::Fail,
+            format!(
+                "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) — this process is \
+                 not trusted, which is what that code means for a binary without the Accessibility \
+                 grant"
+            ),
+        )
+        .with_remedy(GRANT_REMEDY),
         SystemWideProbe::DidNotComplete => Check::new(
             "a11y reader",
             CheckStatus::Fail,
             format!(
-                "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) — a locked \
-                 screen withholds every accessibility tree on the host, as does a wedged \
-                 accessibility stack"
+                "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) — this process is \
+                 trusted, so the host is withholding its accessibility trees: a locked screen does \
+                 this, as does a wedged accessibility stack"
             ),
         )
-        .with_remedy(
-            "unlock the screen and re-run; if it was already unlocked, log out and back in",
-        ),
+        .with_remedy("unlock the screen and re-run; if it was already unlocked, log out and back in"),
         SystemWideProbe::Failed(code) => Check::new(
             "a11y reader",
             CheckStatus::Fail,
@@ -74,14 +88,19 @@ pub fn a11y_checks(probe: SystemWideProbe) -> Vec<Check> {
     }]
 }
 
-/// Probe whether the AXUIElement reader is answering: one `AXUIElementCopyAttributeValue` against
-/// the system-wide element, which needs no target application and mutates nothing.
+/// Points at the grant check rather than repeating its remedy, so an ungranted process is one cause
+/// with one thing to do.
+const GRANT_REMEDY: &str = "grant Accessibility to this binary — see the check below";
+
+/// Probe whether the AXUIElement reader is answering — one `AXUIElementCopyAttributeValue` against
+/// the system-wide element, which needs no target application and mutates nothing — and report it
+/// beside `accessibility_granted`, which the caller has already gathered.
 ///
 /// macOS-only on purpose, with no off-macOS stub: a stub would have to invent an answer, which is
 /// the fabrication this module exists to remove. Host unit tests drive [`a11y_checks`] directly.
 #[cfg(target_os = "macos")]
-pub fn checks() -> Vec<Check> {
-    a11y_checks(probe())
+pub fn checks(accessibility_granted: bool) -> Vec<Check> {
+    a11y_checks(probe(), accessibility_granted)
 }
 
 /// The gathered probe on its own, for an aggregator that assembles this line beside checks of its
@@ -98,7 +117,7 @@ mod tests {
     #[test]
     fn an_answering_ax_stack_is_ok() {
         assert_eq!(
-            a11y_checks(SystemWideProbe::Answered)[0].status,
+            a11y_checks(SystemWideProbe::Answered, true)[0].status,
             CheckStatus::Ok
         );
     }
@@ -108,14 +127,14 @@ mod tests {
         // No focused application is a legitimate answer, not a broken stack: the call returned a
         // definite "no such attribute" rather than refusing to talk.
         assert_eq!(
-            a11y_checks(SystemWideProbe::AttributeAbsent)[0].status,
+            a11y_checks(SystemWideProbe::AttributeAbsent, true)[0].status,
             CheckStatus::Ok
         );
     }
 
     #[test]
     fn a_disabled_api_fails_and_carries_the_error_code() {
-        let c = &a11y_checks(SystemWideProbe::ApiDisabled)[0];
+        let c = &a11y_checks(SystemWideProbe::ApiDisabled, false)[0];
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(
             c.detail.contains("-25211"),
@@ -125,10 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_that_did_not_answer_names_the_locked_screen() {
+    fn a_trusted_process_that_gets_no_answer_names_the_locked_screen() {
         // The failure that cost an hour on 2026-07-29: the AX stack was fine and the screen was
         // locked, and nothing in the diagnostic said so.
-        let c = &a11y_checks(SystemWideProbe::DidNotComplete)[0];
+        let c = &a11y_checks(SystemWideProbe::DidNotComplete, true)[0];
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(
             c.detail.to_lowercase().contains("locked"),
@@ -138,8 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn an_untrusted_process_that_gets_no_answer_names_the_grant_instead() {
+        // Same AXError, different cause: macOS 26.5 gives an ungranted binary -25204 too (measured
+        // against the real API from an ungranted test binary). Sending that reader to unlock an
+        // already-unlocked screen is the diagnostic failing at its one job.
+        let c = &a11y_checks(SystemWideProbe::DidNotComplete, false)[0];
+        assert_eq!(c.status, CheckStatus::Fail);
+        assert!(
+            !c.detail.to_lowercase().contains("locked"),
+            "an ungranted process must not be told about the screen: {}",
+            c.detail
+        );
+        assert_eq!(c.remedy.as_deref(), Some(GRANT_REMEDY));
+    }
+
+    #[test]
     fn an_unrecognized_error_still_reports_its_code() {
-        let c = &a11y_checks(SystemWideProbe::Failed(-25200))[0];
+        let c = &a11y_checks(SystemWideProbe::Failed(-25200), true)[0];
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(c.detail.contains("-25200"), "detail: {}", c.detail);
     }
@@ -155,7 +189,7 @@ mod tests {
             SystemWideProbe::DidNotComplete,
             SystemWideProbe::Failed(-1),
         ] {
-            let c = &a11y_checks(p)[0];
+            let c = &a11y_checks(p, false)[0];
             assert!(
                 !c.detail.contains("System Settings"),
                 "the reader line must not duplicate the grant line's remedy: {}",

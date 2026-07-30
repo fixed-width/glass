@@ -535,7 +535,7 @@ fn macos_a11y_checks(
     accessibility_granted: bool,
     probe: glass_a11y_macos::doctor::SystemWideProbe,
 ) -> Vec<Check> {
-    let mut checks = glass_a11y_macos::doctor::a11y_checks(probe);
+    let mut checks = glass_a11y_macos::doctor::a11y_checks(probe, accessibility_granted);
     checks.push(if accessibility_granted {
         Check::new("Accessibility", CheckStatus::Ok, "granted")
     } else {
