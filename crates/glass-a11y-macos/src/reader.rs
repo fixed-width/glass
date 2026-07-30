@@ -334,18 +334,16 @@ fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
 ///
 /// Reads through the *error-aware* [`ffi::attribute_string_checked`] rather than
 /// [`ffi::attribute_string`], which folds a genuine read failure into the same `None` as a
-/// legitimately-absent attribute: an `AXOutlineRow` whose subrole read broke would silently
-/// degrade to `ListItem` with nothing to show for it.
+/// legitimately-absent attribute: an `AXOutlineRow` whose subrole read broke would silently degrade
+/// to `ListItem` with nothing to show for it. A failure still degrades to `None` — one unreadable
+/// attribute must not fail a whole snapshot — but it logs first, the same diagnostic-not-silence
+/// treatment `ffi::children` and `ffi::action_names` already get.
 ///
-/// Known limit, and the reason the log line matters more since the gate widened: a failed read on a
-/// switch degrades it to the plain `Button` or `CheckBox` its base role names, which is a valid
-/// interactive role rather than an obviously-wrong one, and nothing in the emitted tree marks it.
-/// Clicking it still works (this backend actuates by pointer or native action, neither of which
-/// consults the role), so the symptom is a switch an agent cannot select by role or verify by
-/// state — not one it cannot press. A failure still degrades to `None` — one
-/// unreadable attribute must not fail a whole snapshot — but it logs first, the same
-/// diagnostic-not-silence treatment `ffi::children` and `ffi::action_names` already get. Costs
-/// exactly the one attribute copy the direct read did.
+/// Known limit, and why that log line matters more since the gate widened: a failed read degrades a
+/// switch to the plain `Button` or `CheckBox` its base role names — a valid interactive role rather
+/// than an obviously-wrong one, marked nowhere in the emitted tree. Clicking it still works (this
+/// backend actuates by pointer or native action, neither consulting the role), so the symptom is a
+/// switch an agent cannot select by role or verify by state, not one it cannot press.
 fn read_subrole(el: &AXUIElement, ax_role: &str) -> Option<String> {
     if !mapping::subrole_matters(ax_role) {
         return None;
@@ -603,19 +601,18 @@ fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
     // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
     // is where a switch lands, whichever base role its toolkit gave it.
     let (checkable, checked) = if mapping::role_carries_checked(role) {
-        {
-            let value = ffi::attribute_i64(el, attr::VALUE);
-            if value.is_none() {
-                // A control of this role with no readable numeric value claims neither checked nor
-                // unchecked (the #170 invariant), so `condition:"checked"` silently matches nothing
-                // — say why here, since the tree cannot.
-                eprintln!(
-                    "glass-a11y-macos: {role:?} has no readable AXValue; \
-                     it will report neither checked nor unchecked"
-                );
-            }
-            mapping::checkable_checked(role, value)
+        let value = ffi::attribute_i64(el, attr::VALUE);
+        if value.is_none() {
+            // A control of this role with no readable numeric value claims neither checked nor
+            // unchecked (the #170 invariant), so `condition:"checked"` silently matches nothing —
+            // say why here, since the tree cannot. Reads through the error-blind `attribute_i64`,
+            // so this cannot distinguish an absent value from a failed read.
+            eprintln!(
+                "glass-a11y-macos: {role:?} has no readable AXValue; \
+                 it will report neither checked nor unchecked"
+            );
         }
+        mapping::checkable_checked(role, value)
     } else {
         (false, false)
     };
