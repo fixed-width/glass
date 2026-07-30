@@ -334,9 +334,7 @@ mod tests {
 
     #[test]
     fn only_a_timeout_gets_the_kill_server_remedy() {
-        // A spawn failure means adb is missing or mis-resolved — the most common Android setup
-        // problem — and telling an agent to run `adb kill-server` sends it at a binary that is not
-        // there, in place of the path that would have identified the real fault.
+        // The spawn case must stay bare: `with_adb_hint`'s doc says why.
         let spawn = with_adb_hint(GlassError::Backend(
             "adb:shell: failed to start: No such file or directory (os error 2)".into(),
         ));
@@ -359,8 +357,7 @@ mod tests {
 
     #[test]
     fn a_launch_is_not_billed_as_a_tap() {
-        // `am start -W` blocks until the activity is up; a cold first launch after an install runs
-        // for seconds while ART compiles, so sharing the tap budget failed healthy launches.
+        // Ordering only; the variant doc explains why a launch is not a tap.
         assert!(AdbOp::Launch.budget() > AdbOp::Shell.budget());
     }
 

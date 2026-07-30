@@ -27,8 +27,8 @@ const POLL: Duration = Duration::from_millis(20);
 const POLL_START: Duration = Duration::from_millis(1);
 
 /// How long to let a drain thread reach EOF after the child has exited. Normally instant — the pipe
-/// closes with the child — but a grandchild that inherited the write end keeps it open, and no
-/// output is worth stalling a completed call for.
+/// closes with the child — but something the child started may hold it open, and the call ends as
+/// an error rather than stalling for it.
 const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 
 /// How long to wait for a killed child to leave the process table. Bounded rather than a plain
@@ -38,8 +38,8 @@ const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 const KILL_REAP: Duration = Duration::from_millis(500);
 
 /// Most output ONE PIPE may buffer, so a drain thread left reading a pipe something else still
-/// holds cannot grow without bound. Far past any real one-shot's output — a full `uiautomator dump`
-/// of a deep tree is a few hundred KiB.
+/// holds cannot grow without bound. Far past any real one-shot's output: measured on the dogfood
+/// AVD, a `uiautomator dump` is ~12KB and the largest, `exec-out screencap`, is ~10MB.
 const MAX_CAPTURE: usize = 64 * 1024 * 1024;
 
 /// Run `cmd` to completion, or kill it and fail once `budget` elapses.
@@ -383,14 +383,10 @@ mod tests {
 
     #[test]
     fn a_pipe_still_open_after_the_child_exits_ends_promptly_as_an_error() {
-        // A grandchild that inherited the write end keeps the pipe open after the child exits, so
-        // EOF may never come. Two things must hold, and they pull against each other: the call must
-        // not stall waiting for EOF, and it must not pass off what arrived as the whole answer —
-        // `dumpsys window windows` is parsed by a tolerant line scanner that would read a truncated
-        // dump as a shorter window list, and glass would report the wrong geometry from it.
-        //
-        // The parent cannot tell "the grandchild will write nothing more" from "the grandchild is
-        // about to write", so both settle out as this error rather than a short success.
+        // Two properties that pull against each other: the call must not stall waiting for an EOF
+        // that may never come, and it must not pass off what arrived as the whole answer. The
+        // parent cannot tell "the grandchild will write nothing more" from "it is about to write",
+        // so both settle out as this error.
         let started = Instant::now();
         let err = run_bounded(
             Command::new("/bin/sh").args([
