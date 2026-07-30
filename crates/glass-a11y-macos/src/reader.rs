@@ -305,13 +305,12 @@ fn select_window(
 /// present-but-empty value, so `name` keeps the value it had before this reader sourced a
 /// description.
 ///
-/// The checked form earns its keep for the same reason [`read_subrole`] uses it: the direct read
-/// folds a genuine failure into the same `None` as a legitimately-absent attribute, and most nodes
-/// legitimately lack `AXHelp` — which is what would make the dishonest `None`s undetectable. A
-/// failure still degrades to `None`, since one unreadable attribute must not fail a whole snapshot,
-/// but it logs first. `AXTitle` earns it twice over: it decides `name`, half the `AxTarget`
-/// fingerprint `set_value` re-walks against, and (here) which attribute is free to be the
-/// description.
+/// Checked for [`read_subrole`]'s reason: the direct read folds a genuine failure into the same
+/// `None` as an absent attribute, and since most nodes legitimately lack `AXHelp`, the dishonest
+/// `None`s would be undetectable. A failure still degrades to `None` — one unreadable attribute
+/// must not fail a snapshot — but it logs first. `AXTitle` earns it twice over: it decides `name`,
+/// half the `AxTarget` fingerprint `set_value` re-walks against, and which attribute is left to
+/// describe the node.
 fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
     match ffi::attribute_string_checked(el, attr_name) {
         Ok(text) => text.filter(|t| !t.is_empty()),
@@ -404,8 +403,8 @@ fn walk(
     // either way: as the name when there is no title, as the description only when there IS a
     // title and no `AXHelp` — worth reading there, unlike the untitled case where
     // `AXDescription` IS the name and could only ever normalize away as a duplicate of it. (A
-    // titled node whose title and description hold the same string still normalizes away; that
-    // is the value check doing its job, not a wasted branch.)
+    // titled node whose title and description hold the same string still normalizes away — the
+    // value check, not the branch, is what drops it.)
     let (name, secondary) = match read_label(el, attr::TITLE) {
         Some(title) => (
             Some(title),

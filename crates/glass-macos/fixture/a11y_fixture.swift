@@ -17,11 +17,10 @@
 //     rather than silently doing nothing.
 //
 // Every control sets an explicit `accessibilityLabel` so the reader can find it by name
-// regardless of its visible title/string value — with one deliberate exception: "Bold"'s label
-// differs from its title, so the reader names it from `AXTitle` and the label becomes its
-// description. That, plus two `accessibilityHelp` settings, is what pins the reader's
-// secondary-label rule: "Save" carries help text distinct from its name, and "Status" carries help
-// identical to its name, which must be dropped rather than printed twice.
+// regardless of its visible title/string value — except "Bold", named by its title as above. That
+// exception plus two `accessibilityHelp` settings are what pin the reader's secondary-label rule:
+// "Save" carries help distinct from its name, and "Status" carries help identical to its name,
+// which must be dropped rather than printed twice.
 //
 // Sibling to `quadrants.swift` (the capture/input fixture) in this same directory; kept separate
 // because it exercises a different concern (accessibility-tree contents, not pixels or raw input

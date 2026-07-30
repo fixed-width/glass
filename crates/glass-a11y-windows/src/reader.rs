@@ -314,8 +314,7 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
 /// snapshot, but it logs first (the treatment [`toggle_pattern`] already gives its own failures).
 /// It matters more here than the `.ok()` on a pattern probe: `CurrentHelpText` answers an *unset*
 /// property with an empty string, so every `Err` is a genuine COM failure — a stale element, a hung
-/// or disconnected provider, a denied cross-integrity read — never "the app set no help text". The
-/// two must not reach the outline looking alike.
+/// or disconnected provider, a denied cross-integrity read — never "the app set no help text".
 ///
 /// `FullDescription` is UIA's other secondary label; `uiautomation` 0.25 exposes no accessor for it
 /// (only `UIProperty::FullDescription` through `get_property_value`), and no probed app was

@@ -144,8 +144,8 @@ mod macos_main {
     /// still a whole `snapshot` call — the Accessibility-grant gate and the `AXWindows` resolve,
     /// and then the walk. So the absolute figure is not walk time, and only the *difference*
     /// between two runs of this block is attributable to a change in what the walk reads per node
-    /// (glass's `description`). To get a per-node figure, divide that difference by the node count
-    /// in the histogram header above; dividing the mean itself by it means nothing.
+    /// (glass's `description`). A per-node figure is that difference over the node count in the
+    /// histogram header above, never the mean over it.
     ///
     /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot
     /// that fails here must not cost this app its role-parity check or the later apps their runs.
