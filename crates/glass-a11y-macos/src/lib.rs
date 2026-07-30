@@ -5,6 +5,7 @@
 // `mapping` module stays `unsafe`-free by convention.
 #![allow(unsafe_code)]
 
+pub mod doctor; // pure probe->Check mapping (cross-platform) + the macOS-only AX probe
 pub mod mapping; // pure AX->normalized mapping — cross-platform, unit-tested on any host
 
 // The cfg(macos) AXUIElement reader: `ffi` holds every `unsafe` AX read primitive, `reader`

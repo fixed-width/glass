@@ -28,6 +28,7 @@
 
 use std::ptr::NonNull;
 
+use crate::doctor::SystemWideProbe;
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint, CGSize,
@@ -139,6 +140,41 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
     // ownership rule — an already-retained (+1) `CFTypeRef` on success — so
     // `CFRetained::from_raw` takes ownership without an extra retain (mirrors `axwindow`).
     Ok(Some(unsafe { CFRetained::from_raw(nn) }))
+}
+
+/// One system-wide accessibility read, for the doctor: does the AX API answer at all?
+///
+/// Reads `AXFocusedApplication` off `AXUIElementCreateSystemWide` and throws the value away — the
+/// question is whether the call was *answered*, not what is focused — so it needs no target
+/// application and mutates nothing. It cannot go through [`copy_attribute_checked`], which folds
+/// every real failure into one error string: the doctor has to tell `APIDisabled` (not trusted)
+/// from `CannotComplete` (the stack did not answer, which is what a locked screen looks like).
+pub(crate) fn probe_system_wide() -> SystemWideProbe {
+    // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
+    // documented contract (the binding itself `.expect()`s on this).
+    let el = unsafe { AXUIElement::new_system_wide() };
+    let attr = CFString::from_str("AXFocusedApplication");
+    let mut raw: *const CFType = std::ptr::null();
+    // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
+    // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
+    let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
+    if err == AXError::Success {
+        if let Some(nn) = NonNull::new(raw.cast_mut()) {
+            // SAFETY: the Copy call returned an already-retained (+1) value per Core Foundation's
+            // Copy/Create rule; taking ownership here releases it at end of scope rather than
+            // leaking the focused application element on every doctor run.
+            drop(unsafe { CFRetained::from_raw(nn) });
+        }
+        return SystemWideProbe::Answered;
+    }
+    if is_absent_error(err) {
+        return SystemWideProbe::AttributeAbsent;
+    }
+    match err {
+        AXError::APIDisabled => SystemWideProbe::ApiDisabled,
+        AXError::CannotComplete => SystemWideProbe::DidNotComplete,
+        other => SystemWideProbe::Failed(other.0),
+    }
 }
 
 /// Read `el`'s `attr_name` as a `String`, or `None` when the attribute is absent, isn't a
