@@ -17,6 +17,12 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass_set_value` on Android and the iOS Simulator now tells you when a write did not take. It
+  used to tap the element, clear it, type, and report success without ever looking again — so a
+  read-only field, a tap that landed slightly off, or a keyboard that swallowed the text all came
+  back as `ok`, and everything you asserted afterwards was against a screen that never changed. It
+  now reads the element back once and reports the write as not applied when the value did not
+  change. The other backends already did this.
 - An Android or iOS Simulator command that stops answering no longer hangs the tool it was
   serving. Every one-shot call glass makes to `adb`, `emulator`, `xcrun simctl`, `plutil` or `ps`
   now has a deadline sized for what that call does — a full accessibility dump gets longer than a
