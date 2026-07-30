@@ -1,6 +1,68 @@
 use std::process::{Command, Output};
+use std::time::Duration;
 
-use glass_core::{GlassError, Result};
+use glass_core::{GlassError, Result, run_bounded};
+
+/// What an adb invocation is doing, which is what decides how long it may take.
+///
+/// One deadline for the whole backend would have to accommodate the slowest healthy call — a full
+/// `uiautomator dump`, or an APK install — and would then let a wedged `input` hang just as long.
+///
+/// Budgets are ~4x the slowest healthy run measured on the dogfood AVD, floored at 10s: a budget
+/// that fires on a loaded-but-working device is worse than the hang it replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdbOp {
+    /// `uiautomator dump` — walks the whole view tree on device.
+    Dump,
+    /// `exec-out screencap` — encodes a full-resolution frame.
+    Screencap,
+    /// `install` / `push` — copies and verifies a file over the wire.
+    Transfer,
+    /// Everything else: `shell`, `input`, `am start`, `devices`, `forward`, `getprop`.
+    Shell,
+}
+
+impl AdbOp {
+    /// The deadline for this kind of call.
+    pub fn budget(self) -> Duration {
+        match self {
+            Self::Dump => Duration::from_secs(20),
+            Self::Screencap => Duration::from_secs(15),
+            Self::Transfer => Duration::from_secs(120),
+            Self::Shell => Duration::from_secs(10),
+        }
+    }
+
+    /// Classify an adb argv, so no call site has to pass its own budget and none can pick a longer
+    /// one than its work needs. An unrecognized call is [`AdbOp::Shell`] — the SHORT budget, so a
+    /// future caller that forgets to extend this fails fast rather than hanging for two minutes.
+    pub fn for_args(args: &[&str]) -> Self {
+        if args.iter().any(|a| a.contains("uiautomator")) {
+            Self::Dump
+        } else if args.iter().any(|a| a.contains("screencap")) {
+            Self::Screencap
+        } else if args.iter().any(|a| {
+            matches!(
+                *a,
+                "install" | "install-multiple" | "push" | "pull" | "uninstall"
+            )
+        }) {
+            Self::Transfer
+        } else {
+            Self::Shell
+        }
+    }
+
+    /// Operation name for the timeout error, prefixed so a reader knows which tool hung.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dump => "adb:uiautomator dump",
+            Self::Screencap => "adb:screencap",
+            Self::Transfer => "adb:file transfer",
+            Self::Shell => "adb:shell",
+        }
+    }
+}
 
 /// A thin wrapper over the `adb` binary, targeting one device serial.
 #[derive(Clone, Debug)]
@@ -73,14 +135,18 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let argv = build_argv(
-            self.serial.as_deref(),
-            &args.into_iter().collect::<Vec<_>>(),
-        );
-        let out = Command::new(&self.bin)
-            .args(&argv)
-            .output()
-            .map_err(|e| GlassError::Backend(format!("failed to run `{}`: {e}", self.bin)))?;
+        let args: Vec<&str> = args.into_iter().collect();
+        let op = AdbOp::for_args(&args);
+        let argv = build_argv(self.serial.as_deref(), &args);
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(&argv);
+        // A wedged adb server answers nothing at all, and the fix is one command — so the remedy
+        // rides in the error the caller sees rather than in a log line nobody reads.
+        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(|e| {
+            GlassError::Backend(format!(
+                "{e}; if this repeats, run `adb kill-server` and retry"
+            ))
+        })?;
         if out.status.success() {
             Ok(out)
         } else {
@@ -111,6 +177,60 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 
 #[cfg(test)]
 mod tests {
+    use super::AdbOp;
+    use std::time::Duration;
+
+    #[test]
+    fn a_dump_gets_the_longest_budget_of_the_interactive_calls() {
+        // The slowest healthy call decides its own deadline; a single per-backend budget would
+        // have to be sized for it and would then let a wedged `input` hang exactly as long.
+        assert!(AdbOp::Dump.budget() > AdbOp::Shell.budget());
+        assert!(AdbOp::Transfer.budget() > AdbOp::Dump.budget());
+        assert!(AdbOp::Shell.budget() >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn every_argv_this_crate_actually_runs_classifies_as_intended() {
+        // The real argvs, taken from the call sites, so a refactor that renames a subcommand is
+        // caught here rather than by a call silently dropping to the short budget.
+        for (argv, want) in [
+            (
+                vec!["shell", "uiautomator", "dump", "/sdcard/glass_dump.xml"],
+                AdbOp::Dump,
+            ),
+            (vec!["exec-out", "screencap"], AdbOp::Screencap),
+            (vec!["install", "-r", "/tmp/app.apk"], AdbOp::Transfer),
+            (
+                vec!["push", "/tmp/agent.jar", "/data/local/tmp/agent.jar"],
+                AdbOp::Transfer,
+            ),
+            (
+                vec!["uninstall", "tech.fixedwidth.glass.a11y"],
+                AdbOp::Transfer,
+            ),
+            (vec!["shell", "input", "tap", "10", "20"], AdbOp::Shell),
+            (vec!["shell", "am", "start", "-n", "pkg/.Act"], AdbOp::Shell),
+            (vec!["shell", "dumpsys", "window", "windows"], AdbOp::Shell),
+            (vec!["devices"], AdbOp::Shell),
+            (
+                vec!["forward", "tcp:0", "localabstract:glass"],
+                AdbOp::Shell,
+            ),
+            (vec!["shell", "getprop", "sys.boot_completed"], AdbOp::Shell),
+            (vec!["emu", "kill"], AdbOp::Shell),
+            (vec!["version"], AdbOp::Shell),
+        ] {
+            assert_eq!(AdbOp::for_args(&argv), want, "argv {argv:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_call_takes_the_short_budget_not_a_generous_one() {
+        // Fail fast beats hanging for two minutes when a future caller forgets to extend the
+        // classifier.
+        assert_eq!(AdbOp::for_args(&["some-future-subcommand"]), AdbOp::Shell);
+    }
+
     use super::build_argv;
 
     #[test]
