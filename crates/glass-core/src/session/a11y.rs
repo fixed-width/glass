@@ -2730,10 +2730,14 @@ mod tests {
     /// A row-shaped CheckBox "Sw" (300x30 at the origin) as the single child of a root Window —
     /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
     /// numbering gives the switch id 1.
+    /// A switch as the readers report one *after* the subrole normalization: `ToggleButton`, row
+    /// shaped, checkable. The role matters here — the trailing-edge swipe path is chosen from
+    /// `states.checkable`, and a fixture still calling a switch a `CheckBox` would leave that
+    /// independence untested against the role the backends now produce.
     fn sw(checked: bool) -> AxTree {
         let switch = AxNode {
             id: AxNodeId(0),
-            role: AxRole::CheckBox,
+            role: AxRole::ToggleButton,
             raw_role: "switch".into(),
             name: Some("Sw".into()),
             description: None,
@@ -2784,6 +2788,33 @@ mod tests {
         g.set_value(AxNodeId(1), "true").unwrap();
 
         assert_eq!(drags.lock().unwrap().len(), 1, "a toggle swipe was emitted");
+    }
+
+    #[test]
+    fn the_swipe_path_is_chosen_by_checkable_not_by_role() {
+        // What makes the switch normalization safe: iOS and macOS now report a switch as
+        // `ToggleButton` where they used to say `CheckBox`, and a path that keyed off the role
+        // would have stopped actuating switches on those two backends without any test noticing.
+        let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        for role in [AxRole::ToggleButton, AxRole::CheckBox] {
+            let platform = FakePlatform::new(400, 400)
+                .with_drag_log(drags.clone())
+                .with_trailing_toggle_backend();
+            let mut tree = sw(false);
+            tree.root.children[0].role = role;
+            let mut g = glass_with_a11y_seq(platform, vec![tree]);
+            g.start(&spec()).unwrap();
+            g.a11y_snapshot(None).unwrap();
+            drags.lock().unwrap().clear();
+
+            g.click_element(AxNodeId(1)).unwrap();
+
+            assert_eq!(
+                drags.lock().unwrap().len(),
+                1,
+                "{role:?} did not take the trailing-edge swipe"
+            );
+        }
     }
 
     #[test]
