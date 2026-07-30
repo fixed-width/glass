@@ -189,13 +189,20 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// `<bin> -list-avds`: `None` on spawn failure (binary absent), else the parsed names.
+/// `<bin> -list-avds`: `None` on spawn failure (binary absent) or a timeout, else the parsed names.
+///
+/// Bounded like the boot path's copy of this call: a doctor that hangs on a wedged tool reports
+/// nothing at all, which is the one thing it must never do.
 fn list_avds(bin: &str) -> Option<Vec<String>> {
-    std::process::Command::new(bin)
-        .arg("-list-avds")
-        .output()
-        .ok()
-        .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("-list-avds");
+    glass_core::run_bounded(
+        &mut cmd,
+        crate::avd::EMULATOR_LIST_BUDGET,
+        "emulator:-list-avds",
+    )
+    .ok()
+    .map(|o| parse_list_avds(&String::from_utf8_lossy(&o.stdout)))
 }
 
 /// Deep probe one online device: capture a frame (validated via the real decoder) and

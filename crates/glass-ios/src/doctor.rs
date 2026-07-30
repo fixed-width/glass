@@ -100,14 +100,14 @@ fn device_check(p: &Probe) -> Check {
     }
 }
 
+/// Deadline for each doctor probe. Doctor reports on the host rather than driving it, so every
+/// probe here is a fast query; a tool that does not answer in this long is itself the finding.
+const PROBE_BUDGET: Duration = Duration::from_secs(10);
+
 /// Build the iOS doctor checks by probing the host with real `xcrun`/`xcode-select`
 /// calls. Best-effort: a missing tool simply makes the corresponding check report
 /// not-ok with a remedy, rather than failing this function. `_deep` is accepted for
 /// signature parity with the other backends' doctors; iOS has no expensive deep probe.
-/// Deadline for each doctor probe. Doctor reports on the host rather than driving it, so every
-/// probe here is a fast query; a tool that does not answer in this long is itself the finding.
-const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
 pub fn checks(_deep: bool) -> Vec<Check> {
     // Bounded like every other one-shot: doctor's job is to report, and a doctor that hangs on a
     // wedged tool reports nothing at all. A timeout lands in the same `None` as a missing tool,
@@ -115,14 +115,20 @@ pub fn checks(_deep: bool) -> Vec<Check> {
     let mut xcode_select = Command::new("xcode-select");
     xcode_select.arg("-p");
     let xcode_dir = glass_core::run_bounded(&mut xcode_select, PROBE_BUDGET, "xcode-select:-p")
+        .inspect_err(|e| eprintln!("glass-ios doctor: {e}"))
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
+    // Labelled per probe, not "doctor probe": a timeout has to say whether `help`, `list runtimes`
+    // or `list devices` hung. The error is logged rather than dropped, because `.ok()` folds a
+    // timeout into the same `None` as a missing tool, and the resulting check then recommends
+    // installing Xcode to someone whose Xcode is fine but whose CoreSimulator is wedged.
     let simctl_out = |args: &[&str]| {
         let mut cmd = Command::new("xcrun");
         cmd.args(args);
-        glass_core::run_bounded(&mut cmd, PROBE_BUDGET, "xcrun:doctor probe")
+        glass_core::run_bounded(&mut cmd, PROBE_BUDGET, &format!("xcrun:{}", args.join(" ")))
+            .inspect_err(|e| eprintln!("glass-ios doctor: {e}"))
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())

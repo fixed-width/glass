@@ -14,8 +14,11 @@ use glass_core::{GlassError, Result, run_bounded};
 pub enum SimctlOp {
     /// `bootstatus -b` — waits out the whole boot.
     BootStatus,
-    /// `launch` / `install` / `boot` / `shutdown` — device lifecycle.
+    /// `launch` / `boot` / `shutdown` — device lifecycle.
     Lifecycle,
+    /// `install` — copies an `.app` into the simulator and registers it. Payload-sized, like
+    /// Android's `Transfer`, and unlike the rest of the lifecycle verbs.
+    Install,
     /// `io <udid> screenshot` — encodes a frame.
     Screenshot,
     /// Everything else: `list`, `pbpaste`, `terminate`, `spawn`.
@@ -28,6 +31,7 @@ impl SimctlOp {
         match self {
             Self::BootStatus => Duration::from_secs(180),
             Self::Lifecycle => Duration::from_secs(60),
+            Self::Install => Duration::from_secs(120),
             Self::Screenshot => Duration::from_secs(15),
             Self::Query => Duration::from_secs(10),
         }
@@ -39,7 +43,8 @@ impl SimctlOp {
     pub fn for_sub(sub: &[&str]) -> Self {
         match sub.first().copied() {
             Some("bootstatus") => Self::BootStatus,
-            Some("launch" | "install" | "boot" | "shutdown" | "erase") => Self::Lifecycle,
+            Some("install") => Self::Install,
+            Some("launch" | "boot" | "shutdown" | "erase") => Self::Lifecycle,
             Some("io") => Self::Screenshot,
             _ => Self::Query,
         }
@@ -50,6 +55,7 @@ impl SimctlOp {
         match self {
             Self::BootStatus => "simctl:bootstatus",
             Self::Lifecycle => "simctl:lifecycle",
+            Self::Install => "simctl:install",
             Self::Screenshot => "simctl:io screenshot",
             Self::Query => "simctl:query",
         }
@@ -161,7 +167,7 @@ mod tests {
                 vec!["launch", "UDID", "com.example.app"],
                 SimctlOp::Lifecycle,
             ),
-            (vec!["install", "UDID", "/tmp/App.app"], SimctlOp::Lifecycle),
+            (vec!["install", "UDID", "/tmp/App.app"], SimctlOp::Install),
             (vec!["shutdown", "UDID"], SimctlOp::Lifecycle),
             (
                 vec!["io", "UDID", "screenshot", "/tmp/f.png"],

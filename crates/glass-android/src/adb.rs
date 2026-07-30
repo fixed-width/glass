@@ -12,14 +12,19 @@ use glass_core::{GlassError, Result, run_bounded};
 /// that fires on a loaded-but-working device is worse than the hang it replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdbOp {
-    /// `uiautomator dump` — walks the whole view tree on device.
+    /// `uiautomator dump`, and the `cat` that reads the tree it wrote — the two halves of one
+    /// snapshot, so they share a deadline rather than the read-back inheriting a tap's.
     Dump,
     /// `exec-out screencap` — encodes a full-resolution frame.
     Screencap,
     /// `install` / `push` / `pull` / `uninstall` — moves a file over the wire, and an install also
     /// verifies it on device.
     Transfer,
-    /// Everything else: `shell`, `input`, `am start`, `devices`, `forward`, `getprop`.
+    /// `am start -W`, which blocks until the activity is up. A first launch after an install pays
+    /// for ART compiling and a cold page cache, so it is nothing like the tap it would otherwise
+    /// share a budget with.
+    Launch,
+    /// Everything else: `input`, `dumpsys`, `devices`, `forward`, `getprop`, `pidof`.
     Shell,
 }
 
@@ -30,6 +35,7 @@ impl AdbOp {
             Self::Dump => Duration::from_secs(20),
             Self::Screencap => Duration::from_secs(15),
             Self::Transfer => Duration::from_secs(120),
+            Self::Launch => Duration::from_secs(60),
             Self::Shell => Duration::from_secs(10),
         }
     }
@@ -37,20 +43,23 @@ impl AdbOp {
     /// Classify an adb argv, so no call site has to pass its own budget and none can pick a longer
     /// one than its work needs. An unrecognized call is [`AdbOp::Shell`] — the SHORT budget, so a
     /// future caller that forgets to extend this fails fast rather than hanging for two minutes.
+    ///
+    /// Matched by POSITION, never by scanning the argv for a substring: arguments carry
+    /// caller-supplied data — an APK path from `AppSpec.run`, a package name, text a `glass_type`
+    /// sends — and a path like `~/uiautomator-samples/app.apk` would otherwise classify an install
+    /// as a dump and kill it at 20s instead of 120s, blaming the wrong operation as it went.
+    ///
+    /// `args` is what the caller passed, before [`build_argv`] prefixes `-s <serial>`, so `args[0]`
+    /// is always the subcommand.
     pub fn for_args(args: &[&str]) -> Self {
-        if args.iter().any(|a| a.contains("uiautomator")) {
-            Self::Dump
-        } else if args.iter().any(|a| a.contains("screencap")) {
-            Self::Screencap
-        } else if args.iter().any(|a| {
-            matches!(
-                *a,
-                "install" | "install-multiple" | "push" | "pull" | "uninstall"
-            )
-        }) {
-            Self::Transfer
-        } else {
-            Self::Shell
+        match (args.first().copied(), args.get(1).copied()) {
+            (Some("install" | "install-multiple" | "push" | "pull" | "uninstall"), _) => {
+                Self::Transfer
+            }
+            (Some("shell"), Some("uiautomator" | "cat")) => Self::Dump,
+            (Some("exec-out" | "shell"), Some("screencap")) => Self::Screencap,
+            (Some("shell"), Some("am")) => Self::Launch,
+            _ => Self::Shell,
         }
     }
 
@@ -60,6 +69,7 @@ impl AdbOp {
             Self::Dump => "adb:uiautomator dump",
             Self::Screencap => "adb:screencap",
             Self::Transfer => "adb:file transfer",
+            Self::Launch => "adb:am start",
             Self::Shell => "adb:shell",
         }
     }
@@ -143,19 +153,27 @@ impl Adb {
         cmd.args(&argv);
         // A wedged adb server answers nothing at all, and the fix is one command — so the remedy
         // rides in the error the caller sees rather than in a log line nobody reads.
-        // Extend the message rather than wrapping the error: nesting one `Backend` inside another
-        // makes `Display` print its prefix twice, and this text is read by an agent.
-        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(|e| match e {
-            GlassError::Backend(msg) => GlassError::Backend(format!(
-                "{msg}; if this repeats, run `adb kill-server` and retry"
-            )),
-            other => other,
-        })?;
+        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(with_adb_hint)?;
         if out.status.success() {
             Ok(out)
         } else {
             Err(exit_error(&self.bin, &argv, &out))
         }
+    }
+}
+
+/// Add adb's one-command remedy to a TIMEOUT, and nothing else.
+///
+/// Extends the message rather than wrapping the error: nesting one `Backend` inside another makes
+/// `Display` print its prefix twice, and an agent reads this text. Gated on the timeout because the
+/// other failure is a spawn failure — a missing or mis-resolved binary, the most common Android
+/// setup problem — where `adb kill-server` is advice for a binary that is not there.
+fn with_adb_hint(e: GlassError) -> GlassError {
+    match e {
+        GlassError::Backend(msg) if msg.contains("no answer within") => GlassError::Backend(
+            format!("{msg}; if this repeats, run `adb kill-server` and retry"),
+        ),
+        other => other,
     }
 }
 
@@ -181,7 +199,8 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 
 #[cfg(test)]
 mod tests {
-    use super::AdbOp;
+    use super::{Adb, AdbOp, build_argv, with_adb_hint};
+    use glass_core::GlassError;
     use std::time::Duration;
 
     /// Live proof that a wedged adb call ends instead of hanging. Ignored by default:
@@ -196,7 +215,7 @@ mod tests {
     #[test]
     #[ignore = "requires a booted AVD + GLASS_ADB"]
     fn a_shell_call_that_never_answers_dies_at_its_budget() {
-        let adb = super::Adb::from_env();
+        let adb = Adb::from_env();
         let budget = AdbOp::Shell.budget();
 
         let started = std::time::Instant::now();
@@ -259,8 +278,17 @@ mod tests {
                 vec!["uninstall", "tech.fixedwidth.glass.a11y"],
                 AdbOp::Transfer,
             ),
+            (vec!["shell", "cat", "/sdcard/glass_dump.xml"], AdbOp::Dump),
             (vec!["shell", "input", "tap", "10", "20"], AdbOp::Shell),
-            (vec!["shell", "am", "start", "-n", "pkg/.Act"], AdbOp::Shell),
+            (
+                vec!["shell", "am", "start", "-W", "-n", "pkg/.Act"],
+                AdbOp::Launch,
+            ),
+            (
+                vec!["shell", "rm", "-f", "/sdcard/glass_dump.xml"],
+                AdbOp::Shell,
+            ),
+            (vec!["shell", "pidof", "com.example.app"], AdbOp::Shell),
             (vec!["shell", "dumpsys", "window", "windows"], AdbOp::Shell),
             (vec!["devices"], AdbOp::Shell),
             (
@@ -276,13 +304,65 @@ mod tests {
     }
 
     #[test]
+    fn caller_supplied_data_cannot_choose_a_budget() {
+        // Each of these carries a word the classifier used to scan for anywhere in the argv. The
+        // install pair is the harmful direction: a 120s transfer cut to 20s and killed mid-flight,
+        // blamed on `adb:uiautomator dump`. The rest merely lengthened a tap's deadline.
+        for (argv, want) in [
+            (
+                vec!["install", "-r", "-t", "/home/u/uiautomator-samples/app.apk"],
+                AdbOp::Transfer,
+            ),
+            (
+                vec![
+                    "push",
+                    "/tmp/screencap-tools/agent.jar",
+                    "/data/local/tmp/agent.jar",
+                ],
+                AdbOp::Transfer,
+            ),
+            (vec!["shell", "input text 'uiautomator'"], AdbOp::Shell),
+            (
+                vec!["shell", "pidof", "com.example.uiautomator"],
+                AdbOp::Shell,
+            ),
+        ] {
+            assert_eq!(AdbOp::for_args(&argv), want, "argv {argv:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_timeout_gets_the_kill_server_remedy() {
+        // A spawn failure means adb is missing or mis-resolved — the most common Android setup
+        // problem — and telling an agent to run `adb kill-server` sends it at a binary that is not
+        // there, in place of the path that would have identified the real fault.
+        let spawn = with_adb_hint(GlassError::Backend(
+            "adb:shell: failed to start: No such file or directory (os error 2)".into(),
+        ));
+        assert!(!spawn.to_string().contains("kill-server"), "{spawn}");
+
+        let timeout = with_adb_hint(GlassError::Backend(
+            "adb:shell: no answer within 10s, so the process was killed".into(),
+        ));
+        assert!(timeout.to_string().contains("adb kill-server"), "{timeout}");
+        // Extending the message must not wrap one Backend in another: Display prints its prefix
+        // per layer, and "backend error: backend error: ..." is what an agent would read.
+        assert_eq!(timeout.to_string().matches("backend error").count(), 1);
+    }
+
+    #[test]
+    fn a_launch_is_not_billed_as_a_tap() {
+        // `am start -W` blocks until the activity is up; a cold first launch after an install runs
+        // for seconds while ART compiles, so sharing the tap budget failed healthy launches.
+        assert!(AdbOp::Launch.budget() > AdbOp::Shell.budget());
+    }
+
+    #[test]
     fn an_unrecognized_call_takes_the_short_budget_not_a_generous_one() {
         // Fail fast beats hanging for two minutes when a future caller forgets to extend the
         // classifier.
         assert_eq!(AdbOp::for_args(&["some-future-subcommand"]), AdbOp::Shell);
     }
-
-    use super::build_argv;
 
     #[test]
     fn argv_without_serial_is_passthrough() {

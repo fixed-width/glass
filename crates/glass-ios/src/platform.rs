@@ -1,8 +1,7 @@
 //! `IosPlatform`: the `glass_core::Platform` implementation that drives a single
 //! foreground app on an iOS Simulator over `xcrun simctl`.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use glass_core::{
@@ -197,7 +196,15 @@ fn pid_is_running(pid: u32) -> bool {
             );
             true
         }
-        Err(_) => true,
+        // Its sibling above logs before failing open; a `ps` that did not answer in ten seconds on
+        // a healthy host is at least as worth saying out loud as one that printed to stderr.
+        Err(e) => {
+            eprintln!(
+                "glass-ios: could not check whether the app is still running ({e}); \
+                 treating it as running"
+            );
+            true
+        }
     }
 }
 
@@ -582,34 +589,22 @@ impl Platform for IosPlatform {
 
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
         self.running()?;
-        // `simctl pbcopy` reads the clipboard text from stdin, so it needs a piped child
-        // rather than the `Simctl::run` one-shot-output helper.
-        let mut child = Command::new(self.target.simctl().program())
-            .args(
-                self.target
-                    .simctl()
-                    .full_args(&["pbcopy", self.target.udid()]),
-            )
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| GlassError::Backend(format!("pbcopy: {e}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| GlassError::Backend("pbcopy: failed to open stdin".into()))?;
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
-            // Reap the child before returning so it doesn't outlive us as a zombie; its exit
-            // status doesn't matter here since we're already reporting the write failure.
-            let _ = child.wait();
-            return Err(GlassError::Backend(format!("pbcopy write: {e}")));
-        }
-        // Close our end so `pbcopy` sees EOF and exits; holding it open past this point
-        // would deadlock the `wait_with_output()` below.
-        drop(stdin);
-        let out = child
-            .wait_with_output()
-            .map_err(|e| GlassError::Backend(format!("pbcopy wait: {e}")))?;
+        // `simctl pbcopy` takes the clipboard text on stdin, so it cannot go through `Simctl::run`,
+        // which closes stdin — but it is a one-shot `simctl` call like any other and gets the same
+        // deadline. The runner writes stdin on its own thread, so a `pbcopy` that exits without
+        // reading everything cannot leave this blocked in `write`.
+        let mut cmd = Command::new(self.target.simctl().program());
+        cmd.args(
+            self.target
+                .simctl()
+                .full_args(&["pbcopy", self.target.udid()]),
+        );
+        let out = glass_core::run_bounded_with_stdin(
+            &mut cmd,
+            crate::simctl::SimctlOp::Query.budget(),
+            "simctl:pbcopy",
+            text.as_bytes(),
+        )?;
         if out.status.success() {
             Ok(())
         } else {
