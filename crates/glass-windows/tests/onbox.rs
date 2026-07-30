@@ -1146,7 +1146,8 @@ const COST_REPEATS: usize = 10;
 /// whole `snapshot` call — a fresh thread, COM initialization and the window lookup, and then the
 /// walk. So the absolute figure is not walk time, and only the *difference* between two runs of
 /// this block is attributable to a change in what the walk reads per node (glass's `description`).
-/// Divide by the node count in the histogram header above, not into the mean.
+/// To get a per-node figure, divide that difference by the node count in the histogram header
+/// above; dividing the mean itself by it means nothing.
 ///
 /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot that
 /// fails here must not strand the window the caller is about to close, cost the later probes their
@@ -1243,15 +1244,6 @@ fn close_adopted_window(raw: Option<i64>) {
     }
 }
 
-/// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
-/// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
-/// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
-/// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
-/// launched or a snapshot can't be taken at all: a real breakage, never merely an unexpected
-/// role. Returns any [`mapped_token_violations`], which the caller fails on *after* the report
-/// is saved. Beyond that one check the histogram's contents are never asserted; reading it to
-/// decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
-/// justifies filling is the human's job.
 /// What [`probe_role_histogram`] hands back for the caller to assert on once every app has been
 /// probed and the report written.
 struct ProbeOutcome {
@@ -1263,6 +1255,16 @@ struct ProbeOutcome {
     described: usize,
 }
 
+/// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
+/// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
+/// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
+/// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
+/// launched or its FIRST snapshot can't be taken at all: a real breakage, never merely an
+/// unexpected role. A snapshot that fails later, inside [`render_snapshot_cost`]'s repeats, is
+/// reported in the block and not fatal. Returns the [`ProbeOutcome`] the caller asserts on *after*
+/// the report is saved. Beyond those checks the histogram's contents are never asserted; reading it
+/// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
+/// justifies filling is the human's job.
 #[must_use]
 fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> ProbeOutcome {
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");

@@ -1,7 +1,7 @@
 // a11y_fixture.swift — glass-macos accessibility-tree test fixture.
 //
-// A minimal Cocoa app whose window exposes a real NSAccessibility tree with four named
-// controls, for the macOS a11y reader's on-box tests to drive by name:
+// A minimal Cocoa app whose window exposes a real NSAccessibility tree with five controls, for
+// the macOS a11y reader's on-box tests to drive by name:
 //
 //   - an NSButton titled "Save" — prints `SAVE_CLICKED` to stdout (flushed) when its action
 //     fires, so both the bounds-agreement test (a real pointer click) and the native-invoke
@@ -16,13 +16,16 @@
 //     action, so the native-invoke test can confirm it is rejected as `AxActionUnavailable`
 //     rather than silently doing nothing.
 //
-// Each control sets an explicit `accessibilityLabel` so the reader can find it by name
-// regardless of its visible title/string value. Three also set `accessibilityHelp` (or a title
-// distinct from the label) to pin the reader's secondary-label rule: "Save" carries help text
-// distinct from its name, "Status" carries help identical to its name (which must be dropped, not
-// printed twice), and "Bold" carries neither help nor a matching title. Sibling to `quadrants.swift` (the
-// capture/input fixture) in this same directory; kept separate because it exercises a
-// different concern (accessibility-tree contents, not pixels or raw input events).
+// Every control sets an explicit `accessibilityLabel` so the reader can find it by name
+// regardless of its visible title/string value — with one deliberate exception: "Bold"'s label
+// differs from its title, so the reader names it from `AXTitle` and the label becomes its
+// description. That, plus two `accessibilityHelp` settings, is what pins the reader's
+// secondary-label rule: "Save" carries help text distinct from its name, and "Status" carries help
+// identical to its name, which must be dropped rather than printed twice.
+//
+// Sibling to `quadrants.swift` (the capture/input fixture) in this same directory; kept separate
+// because it exercises a different concern (accessibility-tree contents, not pixels or raw input
+// events).
 //
 // Build: swiftc -parse-as-library a11y_fixture.swift -o a11y_fixture
 //   (`-parse-as-library` is required because this file uses a top-level `@main` type

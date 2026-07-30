@@ -144,8 +144,8 @@ mod macos_main {
     /// still a whole `snapshot` call — the Accessibility-grant gate and the `AXWindows` resolve,
     /// and then the walk. So the absolute figure is not walk time, and only the *difference*
     /// between two runs of this block is attributable to a change in what the walk reads per node
-    /// (glass's `description`). Divide by the node count in the histogram header above, not into
-    /// the mean.
+    /// (glass's `description`). To get a per-node figure, divide that difference by the node count
+    /// in the histogram header above; dividing the mean itself by it means nothing.
     ///
     /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot
     /// that fails here must not cost this app its role-parity check or the later apps their runs.
@@ -223,6 +223,9 @@ mod macos_main {
     /// that one check the histogram's contents are never asserted; reading the printed output
     /// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native
     /// token now justifies filling is the human's job.
+    /// `Ok` carries how many of this app's nodes the reader gave a description — an observation
+    /// per app (an app with no `AXHelp` is a legitimate zero), summed by [`run`] so a whole run
+    /// of zeros can be challenged there.
     fn probe_one(run0: &str) -> Result<usize, String> {
         println!("\n--- launching {run0} ---");
         let mut platform =

@@ -2,8 +2,11 @@
 //! the whole `glass-a11y-macos` snapshot + set_value + invoke path (`MacosPlatform::start_app`
 //! -> `AxContext` -> `MacosA11y::snapshot`/`set_value`/`invoke` -> AXUIElement walk ->
 //! `AxTree`), driven against the `a11y_fixture` Cocoa app (a "Save" button, an "Enable"
-//! checkbox, an editable "Note" field — labeled "Note" via `setAccessibilityLabel`, holding
-//! the content "hello" — and a non-interactive "Status" label). After the snapshot checks,
+//! checkbox, a "Bold" button whose accessibility label differs from its title, an editable
+//! "Note" field — labeled "Note" via `setAccessibilityLabel`, holding the content "hello" —
+//! and a non-interactive "Status" label). Four of them carry a deliberate `AXHelp`/`AXTitle`
+//! arrangement, so the snapshot checks pin which attribute the reader's `description` comes
+//! from. After the snapshot checks,
 //! it round-trips `set_value` on the "Note" field ("hello" -> "world") and confirms the
 //! non-editable "Save" button rejects a write with `AxElementNotEditable`.
 //!
@@ -68,7 +71,7 @@ mod macos_main {
     /// reader before we drain.
     const CLICK_SETTLE: Duration = Duration::from_millis(400);
 
-    /// The four elements the fixture exposes, asserted as substrings of the tree outline.
+    /// Four of the fixture's element lines, asserted as substrings of the tree outline.
     /// `to_outline` renders each node as `#<id> <Role> "<name>" ...`, rendering `name` and never
     /// `value` — so the editable field's stable label (`setAccessibilityLabel("Note")`,
     /// surfaced as `AXDescription`) is what appears here, not its volatile content ("hello").

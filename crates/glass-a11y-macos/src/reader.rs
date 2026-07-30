@@ -402,8 +402,10 @@ fn walk(
     // Which attribute is left to describe the node therefore depends on which one named it, so
     // both labels are decided in one place. `AXDescription` costs at most one read per node
     // either way: as the name when there is no title, as the description only when there IS a
-    // title and no `AXHelp` — where the title took the name, so a description read cannot
-    // normalize away as a duplicate of it.
+    // title and no `AXHelp` — worth reading there, unlike the untitled case where
+    // `AXDescription` IS the name and could only ever normalize away as a duplicate of it. (A
+    // titled node whose title and description hold the same string still normalizes away; that
+    // is the value check doing its job, not a wasted branch.)
     let (name, secondary) = match read_label(el, attr::TITLE) {
         Some(title) => (
             Some(title),
