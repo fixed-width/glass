@@ -31,10 +31,9 @@ pub struct Probe<'a> {
 
 /// What the doctor could learn about the simulator glass would drive at start.
 ///
-/// Every arm is the outcome of running the *real* resolution the start path runs
-/// ([`crate::device::resolve`] with the same `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` preferences), so
-/// the doctor reports what would happen rather than a proxy for it. A listing that could not be read
-/// is its own arm: reporting it as "nothing booted" is a remedy the operator cannot follow to green.
+/// Every arm is the outcome of the *real* resolution the start path runs ([`crate::device::resolve`],
+/// with the same `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` preferences). A listing that could not be read
+/// is its own arm: reported as "nothing booted", it is a remedy the operator cannot follow to green.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TargetFacts {
     /// A booted device glass would attach to, and how many iOS-family simulators are available.
@@ -374,8 +373,8 @@ fn booted_udid() -> Option<String> {
 
 /// Read the device listing once and answer what the start path would do with it.
 ///
-/// One listing, not two: a second `simctl` call is a second thing that can fail, and when both fail
-/// the doctor has to describe the failure rather than infer an empty host from it.
+/// One listing, not two: a second `simctl` call is a second thing that can fail, and a failed
+/// listing has to be described rather than read as an empty host.
 fn gather_target(
     simctl_out: &dyn Fn(&[&str]) -> Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
@@ -395,9 +394,8 @@ fn gather_target(
 
 /// The pure half of [`gather_target`]: run the start path's own resolution and describe its outcome.
 ///
-/// Both preferences are passed, because both change what a driving call does: `GLASS_IOS_DEVICE`
-/// naming a simulator this host lacks makes `glass_start` fail outright, which the doctor should say
-/// rather than report a green line about some other device.
+/// Both preferences are passed because both change what a driving call does — `GLASS_IOS_DEVICE`
+/// naming a simulator this host lacks makes `glass_start` fail outright.
 fn target_from(
     devices: &[SimDevice],
     want_udid: Option<&str>,

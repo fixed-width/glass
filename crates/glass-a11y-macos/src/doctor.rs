@@ -6,11 +6,9 @@ use glass_core::{Check, CheckStatus};
 
 /// The attribute the doctor reads off the system-wide element.
 ///
-/// Do not swap this for a cheaper one. It is *access-gated*: a binary macOS will not let read the
-/// accessibility tree gets `CannotComplete` from it, while `AXRole` on the same element answers
-/// `Success` (surveyed on macOS 26.5). So this attribute fails exactly when the reader would fail,
-/// and a "simpler" one would report green to a process that cannot read a single tree — the
-/// fabrication this module exists to remove.
+/// Do not swap this for a cheaper one: it is *access-gated*, so a binary macOS will not let read the
+/// tree gets `CannotComplete` from it while `AXRole` on the same element answers `Success` (surveyed
+/// on macOS 26.5) — a simpler attribute reports green to a process that cannot read anything.
 pub const PROBE_ATTRIBUTE: &str = "AXFocusedApplication";
 
 /// `kAXErrorAPIDisabled`: assistive access is off for this process.
@@ -58,18 +56,17 @@ impl SystemWideProbe {
 /// The console session's state, as the aggregator reads it. Mirrors `glass_macos::SessionState`
 /// without depending on it: this crate maps outcomes to text, and the platform crate owns the read.
 ///
-/// A *locked* session is deliberately not distinguished from an unlocked one here. Measured on
-/// macOS 26.5 by locking a host mid-probe: with `CGSSessionScreenIsLocked` set, the system-wide
-/// read still answers `Success`, so a lock never produces the code this would have qualified. The
-/// lock's real consequence — capture and input are suppressed — is reported by the `display awake`
-/// check, and repeating it here would be a second copy of one fact.
+/// A *locked* session is deliberately not distinguished from an unlocked one: measured on macOS 26.5
+/// by locking a host mid-probe, the system-wide read still answers `Success` with
+/// `CGSSessionScreenIsLocked` set, so a lock never produces the code it would have qualified. The
+/// lock's real consequence — capture and input suppressed — is the `display awake` check's to report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleSession {
     /// Somebody is logged in at the console, locked or not.
     LoggedIn,
-    /// Nobody is logged in at the console. Unmeasured against this probe, unlike the locked case:
-    /// kept because if it *does* produce an unanswered read, "log in at the console" is the only
-    /// remedy that helps, and the alternative message would blame the binary's grant.
+    /// Nobody is logged in at the console — unmeasured against this probe, unlike the locked case,
+    /// and kept because if it does produce an unanswered read, logging in is the only remedy that
+    /// helps.
     NoSession,
 }
 
@@ -77,26 +74,16 @@ pub enum ConsoleSession {
 /// with one thing to do.
 const GRANT_REMEDY: &str = "grant Accessibility to this binary — see the check below";
 
-/// Map a system-wide read to the `a11y reader` check.
+/// Map a system-wide read to the `a11y reader` check, using two facts the caller has already
+/// gathered because the probe cannot be read correctly alone.
 ///
-/// Takes two facts the caller has already gathered because the probe alone cannot be read
-/// correctly. `accessibility_granted`: a denied process gets `CannotComplete` (measured on macOS
-/// 26.5), the same code a process gets when its read is genuinely not answered.
+/// `accessibility_granted` narrows the causes of `CannotComplete` without settling them: measured on
+/// one host at one moment, `glass-mcp` read the system-wide element successfully while another
+/// binary got that code **with `AXIsProcessTrusted` reporting it as trusted**, so a `true` grant bit
+/// does not mean this binary may read.
 ///
-/// The grant narrows the causes; it does not settle them. Measured on the same host at the same
-/// moment: `glass-mcp` read the system-wide element successfully while another binary got
-/// `CannotComplete` **with `AXIsProcessTrusted` reporting it as trusted**. So a `true` grant bit does
-/// not mean this binary may read, and the trusted-and-unlocked arm below says so rather than
-/// blaming the accessibility stack.
-///
-/// `session`: an unanswered read means something different with nobody at the console, and the
-/// aggregator already reads the real state — so this reports the session it *is* in rather than
-/// inferring one from an error code and contradicting the `display awake` check printed beside it.
-/// A locked session is not one of the causes: it was measured not to produce this code (see
-/// [`ConsoleSession`]).
-///
-/// The grant keeps its own check next to this one: this line answers "did the API respond", that
-/// one answers "is this binary trusted".
+/// `session` distinguishes nobody-at-the-console, where the remedy is to log in rather than to
+/// check a grant. A locked session is not a cause at all — see [`ConsoleSession`].
 pub fn a11y_checks(
     probe: SystemWideProbe,
     accessibility_granted: bool,
