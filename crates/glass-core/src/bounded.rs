@@ -132,7 +132,7 @@ fn run_bounded_inner(
             return Err(timed_out(&mut child, op, budget, stdout, stderr));
         }
         std::thread::sleep(wait);
-        wait = (wait * 2).min(POLL);
+        wait = next_wait(wait);
     };
 
     // One deadline for both pipes, so a finished call is never stalled twice over.
@@ -250,6 +250,13 @@ impl Pipe {
     }
 }
 
+/// The next gap between checks: double, capped at [`POLL`]. Its own function so the growth is
+/// pinned by a test — an arithmetic slip here only changes how often the parent wakes, which no
+/// behavioural test can see.
+fn next_wait(previous: Duration) -> Duration {
+    (previous * 2).min(POLL)
+}
+
 /// Whether appending `n` more bytes to a buffer of `len` would pass [`MAX_CAPTURE`].
 fn would_exceed_capture(len: usize, n: usize) -> bool {
     len + n > MAX_CAPTURE
@@ -322,11 +329,19 @@ fn timed_out(
 }
 #[cfg(test)]
 mod tests {
+    //! The tests that drive a real child use `/bin/sh` and friends, so they are `cfg(unix)`: this
+    //! module runs on Windows too — `glass-android` shells out to `adb` from any host — and a
+    //! hardcoded `/bin/sh` there fails with "the system cannot find the path specified" rather than
+    //! testing anything. What stays portable is everything that needs no process: the capture cap,
+    //! the deadline boundary, the backoff, and the pipe-drain behaviour, which takes any `Read`.
+
     use super::*;
+    #[cfg(unix)]
     use std::process::Command;
     use std::time::Duration;
 
     #[test]
+    #[cfg(unix)]
     fn a_fast_command_returns_its_output() {
         let out = run_bounded(
             Command::new("/bin/sh").args(["-c", "printf ready"]),
@@ -338,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_command_that_outlives_its_budget_is_killed_and_named() {
         let started = std::time::Instant::now();
         let err = run_bounded(
@@ -358,6 +374,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_nonzero_exit_is_returned_not_reported_as_a_timeout() {
         let out = run_bounded(
             Command::new("/bin/sh").args(["-c", "exit 3"]),
@@ -369,6 +386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stderr_is_captured_alongside_stdout() {
         let out = run_bounded(
             Command::new("/bin/sh").args(["-c", "printf out; printf err 1>&2"]),
@@ -381,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn what_a_hung_child_said_before_the_kill_rides_in_the_error() {
         // A partial `uiautomator dump` says more about a hang than silence does.
         let err = run_bounded(
@@ -393,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_pipe_still_open_after_the_child_exits_ends_promptly_as_an_error() {
         // Two properties that pull against each other: the call must not stall waiting for an EOF
         // that may never come, and it must not pass off what arrived as the whole answer. The
@@ -419,6 +439,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_flood_on_either_pipe_completes() {
         // 1 MiB down each stream: draining only stdout would deadlock on a stderr-heavy child.
         let out = run_bounded(
@@ -435,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_killed_child_is_reaped_not_left_a_zombie() {
         // `Child::drop` does not reap on Unix, and glass-mcp is long-lived, so a timeout that
         // skipped the wait would leak a zombie per hung call. The pid rides out in the error.
@@ -462,6 +484,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stdin_is_written_to_the_child() {
         let out = run_bounded_with_stdin(
             &mut Command::new("/bin/cat"),
@@ -474,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_child_that_ignores_its_stdin_ends_promptly_and_says_the_payload_did_not_land() {
         // Two properties, and the first is why the write is on a thread at all: a tool that answers
         // without reading its input must not leave the parent blocked in `write`. The second is
@@ -548,6 +572,45 @@ mod tests {
     }
 
     #[test]
+    fn any_other_read_error_ends_the_stream_and_is_not_a_complete_read() {
+        // Only EINTR resumes. Resuming past a real error would walk on to the next read and call
+        // whatever it found a finished stream — the truncation this module refuses to return.
+        struct Broken {
+            reads: usize,
+        }
+        impl Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => Err(std::io::Error::other("device disappeared")),
+                    _ => Ok(0),
+                }
+            }
+        }
+        let pipe = Pipe::drain(Some(Broken { reads: 0 }));
+        let (bytes, done) = pipe.take(Instant::now() + Duration::from_secs(5));
+        assert!(bytes.is_empty(), "{bytes:?}");
+        assert!(!done, "a broken read is not an end-of-file");
+    }
+
+    #[test]
+    fn the_wait_between_checks_doubles_up_to_the_cap() {
+        // A one-shot answering in a millisecond must not be billed a full tick, and a long wait
+        // must settle to a steady cadence rather than spinning.
+        assert_eq!(
+            next_wait(Duration::from_millis(1)),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            next_wait(Duration::from_millis(8)),
+            Duration::from_millis(16)
+        );
+        assert_eq!(next_wait(Duration::from_millis(16)), POLL);
+        assert_eq!(next_wait(POLL), POLL);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn one_pipe_left_open_is_enough_to_report_an_incomplete_read() {
         // stderr closes with the child; only stdout stays held. A check that demanded BOTH pipes be
         // incomplete would call this a clean, complete answer.
@@ -562,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_hung_child_that_only_wrote_to_stderr_is_quoted_too() {
         // The stdout branch is covered above; without this, deleting the emptiness check on the
         // stderr branch goes unnoticed.
@@ -580,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_missing_program_is_a_spawn_error_naming_the_operation() {
         let err = run_bounded(
             &mut Command::new("/nonexistent/glass-test-binary"),
