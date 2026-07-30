@@ -668,11 +668,40 @@ impl AxTarget {
 /// it boxed as `Send` (the `Send` bound lives at the storage site, not on the
 /// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
 /// display-server.
+/// A backend's notification that the app's accessibility tree may have changed.
+///
+/// Exists so a wait can stop re-reading the whole tree on a timer: on a large tree a walk costs far
+/// more than the poll interval it is nominally paced by (measured on AT-SPI: 732ms for 1500 nodes
+/// against a 100ms interval), so a wait for something that has not happened yet spends its whole
+/// budget re-reading an unchanged tree.
+///
+/// Public and object-safe on purpose: a caller has to be able to write a fake — the case worth
+/// pinning is a signal that fires *constantly*, which must not turn a poll loop into a spin.
+pub trait ChangeSignal: Send {
+    /// Block until a change arrives or `timeout` elapses. `true` means a change arrived, `false`
+    /// means the wait timed out — including permanently, if the subscription died. An
+    /// implementation must never block past `timeout`: the caller's deadline is the only thing
+    /// standing between a dead subscription and a hung wait.
+    fn wait(&mut self, timeout: std::time::Duration) -> bool;
+}
+
 pub trait Accessibility {
     /// Snapshot the active window's accessibility subtree, normalized and in
     /// window-relative coordinates. Node ids are assigned by the caller
     /// afterward via [`AxTree::assign_ids`]; the backend need not set them.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
+
+    /// Subscribe to change notifications for the app described by `ctx`.
+    ///
+    /// `None` — the default — means this backend has no event stream, and its callers keep polling
+    /// exactly as they did before. Two backends can never implement it: Android's `uiautomator`
+    /// reader is a dump per call, and iOS's is an `idb describe` per call.
+    ///
+    /// The subscription must be established *before* the caller's first read, or a change landing
+    /// between the two is lost and the caller waits out an interval on a tree that already matches.
+    fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        None
+    }
 
     /// Set the editable element identified by `target` to `text`. The backend
     /// re-walks pre-order to `target.id`, verifies role+name, then sets via the
