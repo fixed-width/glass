@@ -16,6 +16,15 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- An Android or iOS Simulator command that stops answering no longer hangs the tool it was
+  serving. Every one-shot call glass makes to `adb`, `xcrun simctl`, `plutil` or `ps` now has a
+  deadline sized for what that call does — a full accessibility dump gets longer than a tap, and
+  waiting out a simulator boot gets longer still — and a call that exceeds it comes back as an
+  error naming the operation, how long it waited, anything the tool managed to say first, and what
+  to try (for `adb`, `adb kill-server`). Log streaming is unaffected: it is meant to run until you
+  stop it.
+
 ### Added
 - Accessibility elements can now carry a second label. `glass_a11y_snapshot` renders it as
   `desc="…"` after the name — an icon-only button that used to reach you as a role and a
