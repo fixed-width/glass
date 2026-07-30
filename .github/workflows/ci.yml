@@ -87,6 +87,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 zenity at-spi2-core
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: ./scripts/test-x11.sh
+      # The AT-SPI suite owns every Linux accessibility fact the repo asserts — which role a GTK
+      # switch arrives as, and whether an event subscription actually stops a wait re-walking.
+      # It needs no dependency this job does not already install, and was simply never wired in.
+      - run: ./scripts/test-a11y.sh
 
   wayland:
     name: Wayland integration (sway)
