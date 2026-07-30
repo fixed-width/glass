@@ -45,23 +45,46 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
 /// Whether the reader should read this base role's `AXSubrole`.
 ///
 /// Each subrole read is an AX IPC round-trip on every matching node, so the gate is exactly the
-/// roles whose subrole [`map_role`] actually consults — today `AXRow` alone, where
-/// `AXOutlineRow` separates an outline row ([`AxRole::TreeItem`]) from a plain table row
-/// ([`AxRole::ListItem`]). AppKit gives other base roles subroles too (an `AXWindow` is a plain
-/// window or a dialog or a sheet, an `AXTextField` may be a search field), and they belong here
-/// as soon as something maps them — until then reading them would spend a round-trip per node
-/// on a value nothing reads.
+/// roles whose subrole [`map_role`] actually consults:
+///
+/// - `AXRow`, where `AXOutlineRow` separates an outline row ([`AxRole::TreeItem`]) from a plain
+///   table row ([`AxRole::ListItem`]);
+/// - `AXButton` and `AXCheckBox`, either of which may carry `AXSwitch`. Both are needed because the
+///   base role varies by toolkit: measured on macOS 26.5, an AppKit `NSSwitch` is an `AXButton` and
+///   a SwiftUI/system switch is an `AXCheckBox`, with the same subrole on each.
+///
+/// `AXButton` is the expensive entry — buttons are the commonest interactive node — and its cost is
+/// the price of a switch reporting the same role here as on the other four backends.
+///
+/// AppKit gives other base roles subroles too (an `AXWindow` is a plain window or a dialog or a
+/// sheet, an `AXTextField` may be a search field), and they belong here as soon as something maps
+/// them — until then reading them would spend a round-trip per node on a value nothing reads.
 pub fn subrole_matters(ax_role: &str) -> bool {
-    ax_role == "AXRow"
+    matches!(ax_role, "AXRow" | "AXButton" | "AXCheckBox")
 }
+
+/// Subroles that decide a role on their own, whatever base role carries them. Mirrors
+/// `glass_ios::axmap`'s table of the same name — the platforms agree on the subrole, not the role.
+const SUBROLE_TOKENS: &[(&str, AxRole)] = &[
+    ("AXSwitch", AxRole::ToggleButton),
+    ("AXToggle", AxRole::ToggleButton),
+];
 
 /// Map an AX role string, plus its `AXSubrole` when the reader took one, to the normalized
 /// `AxRole`; unmapped roles become `AxRole::Other` (the reader keeps the token in `raw_role`).
 pub fn map_role(ax_role: &str, subrole: Option<&str>) -> AxRole {
     // A row's subrole is what separates an outline row from a table row; AppKit reports both
-    // as AXRow. Every other disambiguation the probe found is expressible in the table.
+    // as AXRow.
     if ax_role == "AXRow" && subrole == Some("AXOutlineRow") {
         return AxRole::TreeItem;
+    }
+    // A switch's subrole outranks its base role, which is AXButton or AXCheckBox depending on the
+    // toolkit that drew it.
+    if let Some(role) = subrole
+        .and_then(|sub| SUBROLE_TOKENS.iter().find(|(token, _)| *token == sub))
+        .map(|(_, role)| *role)
+    {
+        return role;
     }
     ROLE_TOKENS
         .iter()
@@ -106,10 +129,12 @@ pub fn map_states(f: &AxStateFacts) -> AxStates {
 /// encoding, `2`/`-1`/…, is deliberately not relied on here). Claims `checkable` ONLY for a
 /// determinate `0`/`1` (the #170 invariant); every other value, and an unread `None`, →
 /// `(false, false)`, so a mixed or unreadable box matches neither `condition:"checked"` nor
-/// `"unchecked"`. A macOS `NSSwitch` reports role `AXCheckBox`, so `CheckBox` covers switches.
+/// `"unchecked"`. `ToggleButton` is in the list because that is what a switch maps to: an AppKit
+/// `NSSwitch` reports `AXButton` + subrole `AXSwitch`, so before this it carried no checked state
+/// at all.
 pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
     match role {
-        AxRole::CheckBox | AxRole::RadioButton => match ax_value {
+        AxRole::CheckBox | AxRole::RadioButton | AxRole::ToggleButton => match ax_value {
             Some(1) => (true, true),
             Some(0) => (true, false),
             _ => (false, false),
@@ -137,6 +162,56 @@ mod tests {
     fn unmapped_role_is_other() {
         assert_eq!(map_role("AXRuler", None), AxRole::Other);
         assert_eq!(map_role("", None), AxRole::Other);
+    }
+
+    #[test]
+    fn a_switch_is_a_togglebutton_whichever_base_role_carries_it() {
+        // Measured on macOS 26.5: an AppKit NSSwitch is an AXButton with subrole AXSwitch, and a
+        // SwiftUI/system switch is an AXCheckBox with the same subrole. Both are the same control.
+        assert_eq!(map_role("AXButton", Some("AXSwitch")), AxRole::ToggleButton);
+        assert_eq!(
+            map_role("AXCheckBox", Some("AXSwitch")),
+            AxRole::ToggleButton
+        );
+        assert_eq!(
+            map_role("AXCheckBox", Some("AXToggle")),
+            AxRole::ToggleButton
+        );
+    }
+
+    #[test]
+    fn a_plain_button_or_checkbox_keeps_its_role() {
+        assert_eq!(map_role("AXButton", None), AxRole::Button);
+        assert_eq!(map_role("AXCheckBox", None), AxRole::CheckBox);
+        // A subrole nothing maps must not disturb the base role — AppKit puts several on buttons.
+        assert_eq!(map_role("AXButton", Some("AXZoomButton")), AxRole::Button);
+        assert_eq!(
+            map_role("AXCheckBox", Some("AXSomethingElse")),
+            AxRole::CheckBox
+        );
+    }
+
+    #[test]
+    fn an_appkit_switch_gains_the_checked_state_it_never_had() {
+        // It reports AXButton, so before this it mapped to Button — and `checkable_checked` and the
+        // reader's AXValue read both key off the role, so no checked state was read at all.
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, Some(1)),
+            (true, true)
+        );
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, Some(0)),
+            (true, false)
+        );
+        // The #170 invariant still holds for it: indeterminate claims neither.
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, Some(2)),
+            (false, false)
+        );
+        assert_eq!(
+            checkable_checked(AxRole::ToggleButton, None),
+            (false, false)
+        );
     }
 
     #[test]
@@ -258,9 +333,12 @@ mod tests {
 
     #[test]
     fn subrole_is_read_only_where_it_disambiguates() {
-        // Reading AXSubrole costs an AX IPC round-trip per node, so the reader takes it only
-        // for the one base role whose subrole `map_role` consults.
-        assert!(subrole_matters("AXRow"), "AXRow must be gated in");
+        // Reading AXSubrole costs an AX IPC round-trip per node, so the reader takes it only for
+        // the base roles whose subrole `map_role` consults: a row (outline vs table) and the two
+        // that can carry AXSwitch — an AppKit switch is an AXButton, a SwiftUI one an AXCheckBox.
+        for role in ["AXRow", "AXButton", "AXCheckBox"] {
+            assert!(subrole_matters(role), "{role} must be gated in");
+        }
         // AXWindow/AXTextField/AXGroup/AXUnknown do carry meaningful subroles, but nothing maps
         // them, so the read would be paid for and thrown away.
         for role in [
@@ -268,7 +346,6 @@ mod tests {
             "AXTextField",
             "AXGroup",
             "AXUnknown",
-            "AXButton",
             "AXStaticText",
             "AXCell",
             "AXImage",

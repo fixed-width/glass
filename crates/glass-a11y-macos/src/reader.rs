@@ -585,10 +585,10 @@ fn window_relative_rect(el: &AXUIElement, scale: f64, win: &WindowGeometry) -> O
 /// didn't read.
 fn gather_states(el: &AXUIElement, role: AxRole) -> AxStateFacts {
     // Only a checkbox/radio/switch carries a checked state, so read the numeric `AXValue` (an
-    // extra AX IPC round-trip) only for those roles — every other node skips it. `map_role`
-    // maps an `NSSwitch` to `CheckBox`, so switches are covered.
+    // extra AX IPC round-trip) only for those roles — every other node skips it. `ToggleButton`
+    // is where a switch lands, whichever base role its toolkit gave it.
     let (checkable, checked) = match role {
-        AxRole::CheckBox | AxRole::RadioButton => {
+        AxRole::CheckBox | AxRole::RadioButton | AxRole::ToggleButton => {
             mapping::checkable_checked(role, ffi::attribute_i64(el, attr::VALUE))
         }
         _ => (false, false),
