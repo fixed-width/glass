@@ -1,5 +1,5 @@
 //! Environment checks for the macOS accessibility backend ("glass doctor"). The pure
-//! `a11y_checks` maps a gathered probe to `Check`s and is unit-tested on any host; `gather`
+//! `a11y_checks` maps a gathered probe to `Check`s and is unit-tested on any host; `probe`
 //! makes the one real AX call, on macOS only.
 
 use glass_core::{Check, CheckStatus};
@@ -81,7 +81,14 @@ pub fn a11y_checks(probe: SystemWideProbe) -> Vec<Check> {
 /// the fabrication this module exists to remove. Host unit tests drive [`a11y_checks`] directly.
 #[cfg(target_os = "macos")]
 pub fn checks() -> Vec<Check> {
-    a11y_checks(crate::ffi::probe_system_wide())
+    a11y_checks(probe())
+}
+
+/// The gathered probe on its own, for an aggregator that assembles this line beside checks of its
+/// own (`glass-mcp` pairs it with the Accessibility grant).
+#[cfg(target_os = "macos")]
+pub fn probe() -> SystemWideProbe {
+    crate::ffi::probe_system_wide()
 }
 
 #[cfg(test)]
