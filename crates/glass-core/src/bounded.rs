@@ -128,7 +128,7 @@ fn run_bounded_inner(
                 )));
             }
         }
-        if Instant::now() >= deadline {
+        if deadline_passed(Instant::now(), deadline) {
             return Err(timed_out(&mut child, op, budget, stdout, stderr));
         }
         std::thread::sleep(wait);
@@ -207,7 +207,7 @@ impl Pipe {
                     }
                     Ok(n) => {
                         let Ok(mut sink) = sink.lock() else { break };
-                        if sink.len() + n > MAX_CAPTURE {
+                        if would_exceed_capture(sink.len(), n) {
                             break;
                         }
                         sink.extend_from_slice(&chunk[..n]);
@@ -250,9 +250,20 @@ impl Pipe {
     }
 }
 
+/// Whether appending `n` more bytes to a buffer of `len` would pass [`MAX_CAPTURE`].
+fn would_exceed_capture(len: usize, n: usize) -> bool {
+    len + n > MAX_CAPTURE
+}
+
+/// Whether `deadline` has arrived. Its own function so the boundary — a deadline exactly reached
+/// counts as passed — is pinned by a test rather than by an inequality no timing test can pin.
+fn deadline_passed(now: Instant, deadline: Instant) -> bool {
+    now >= deadline
+}
+
 /// Sleep in [`POLL`] steps until `ready` answers true or `deadline` passes.
 fn poll_until(deadline: Instant, mut ready: impl FnMut() -> bool) {
-    while !ready() && Instant::now() < deadline {
+    while !ready() && !deadline_passed(Instant::now(), deadline) {
         std::thread::sleep(POLL);
     }
 }
@@ -484,6 +495,87 @@ mod tests {
         assert!(
             err.to_string().contains("partial payload"),
             "must say the input did not land: {err}"
+        );
+    }
+
+    #[test]
+    fn the_capture_cap_holds_the_largest_real_payload_and_stops_just_past_itself() {
+        // The cap exists to bound an abandoned drain thread, so it has to clear the biggest thing a
+        // one-shot really produces — a ~10MB `exec-out screencap` — by a wide margin.
+        // A const block, per clippy: the cap is a constant, so this is a compile-time claim. Under
+        // a mutation that shrinks it the crate stops compiling, which the gate counts too.
+        const { assert!(MAX_CAPTURE >= 10 * 1024 * 1024) };
+        // Exactly at the cap is still allowed; one byte past it is not.
+        assert!(!would_exceed_capture(MAX_CAPTURE, 0));
+        assert!(!would_exceed_capture(MAX_CAPTURE - 1, 1));
+        assert!(would_exceed_capture(MAX_CAPTURE, 1));
+    }
+
+    #[test]
+    fn a_deadline_exactly_reached_counts_as_passed() {
+        // The boundary no timing test can reach: waiting one more round at the deadline would mean
+        // a budget that is always at least one poll longer than it says.
+        let t = Instant::now();
+        assert!(deadline_passed(t, t));
+        assert!(deadline_passed(t + Duration::from_millis(1), t));
+        assert!(!deadline_passed(t, t + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn an_interrupted_read_resumes_instead_of_ending_the_stream() {
+        // EINTR is not end of stream: `read_to_end` retries it for you, a bare `read` does not, and
+        // glass-mcp installs signal handlers. Treating it as EOF would silently truncate.
+        struct Interrupts {
+            reads: usize,
+        }
+        impl Read for Interrupts {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    2 => {
+                        buf[..5].copy_from_slice(b"after");
+                        Ok(5)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let pipe = Pipe::drain(Some(Interrupts { reads: 0 }));
+        let (bytes, done) = pipe.take(Instant::now() + Duration::from_secs(5));
+        assert_eq!(String::from_utf8_lossy(&bytes), "after");
+        assert!(done, "the reader reached EOF, so the read is complete");
+    }
+
+    #[test]
+    fn one_pipe_left_open_is_enough_to_report_an_incomplete_read() {
+        // stderr closes with the child; only stdout stays held. A check that demanded BOTH pipes be
+        // incomplete would call this a clean, complete answer.
+        let err = run_bounded(
+            Command::new("/bin/sh")
+                .args(["-c", "printf head; { sleep 1; printf tail; } 2>/dev/null &"]),
+            Duration::from_secs(20),
+            "test:one-pipe",
+        )
+        .expect_err("one unfinished pipe is an incomplete read");
+        assert!(err.to_string().contains("may be incomplete"), "{err}");
+    }
+
+    #[test]
+    fn a_hung_child_that_only_wrote_to_stderr_is_quoted_too() {
+        // The stdout branch is covered above; without this, deleting the emptiness check on the
+        // stderr branch goes unnoticed.
+        let err = run_bounded(
+            Command::new("/bin/sh").args(["-c", "printf complaining 1>&2; sleep 30"]),
+            Duration::from_millis(300),
+            "test:stderr-only",
+        )
+        .expect_err("must time out");
+        let msg = err.to_string();
+        assert!(msg.contains("stderr: complaining"), "{msg}");
+        assert!(
+            !msg.contains("stdout:"),
+            "nothing was written to stdout: {msg}"
         );
     }
 
