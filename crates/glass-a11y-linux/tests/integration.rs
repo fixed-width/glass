@@ -6,6 +6,80 @@
 
 use glass_core::{AppSpec, Backend, BaselineStore, Glass, PlatformFactory, WindowHint};
 
+/// Counts the walks a session performs — wall-clock cannot tell a wait that waited efficiently
+/// from one that walked slowly.
+///
+/// Forwards every trait method; `subscribe_changes` has a default body, so a forgotten forward
+/// would compile and silently disable what the test measures.
+struct Counting<A> {
+    inner: A,
+    walks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<A: glass_core::Accessibility> glass_core::Accessibility for Counting<A> {
+    fn snapshot(&mut self, ctx: &glass_core::AxContext) -> glass_core::Result<glass_core::AxTree> {
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.snapshot(ctx)
+    }
+    fn subscribe_changes(
+        &mut self,
+        ctx: &glass_core::AxContext,
+    ) -> Option<Box<dyn glass_core::ChangeSignal>> {
+        let s = self.inner.subscribe_changes(ctx);
+        if s.is_some() {
+            self.signals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        s
+    }
+    fn set_value(
+        &mut self,
+        ctx: &glass_core::AxContext,
+        target: &glass_core::AxTarget,
+        text: &str,
+    ) -> glass_core::Result<()> {
+        self.inner.set_value(ctx, target, text)
+    }
+    fn invoke(
+        &mut self,
+        ctx: &glass_core::AxContext,
+        target: &glass_core::AxTarget,
+    ) -> glass_core::Result<()> {
+        self.inner.invoke(ctx, target)
+    }
+}
+
+/// A session whose reader counts walks and subscriptions.
+fn glass_counting() -> (
+    Glass,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let walks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (w, sg) = (walks.clone(), signals.clone());
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend {
+            platform: Box::new(glass_x11::X11Platform::from_env()?),
+            accessibility: Some(Box::new(Counting {
+                inner: glass_a11y_linux::LinuxA11y::new(),
+                walks: w.clone(),
+                signals: sg.clone(),
+            })),
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    (
+        Glass::new(factory, "x11".into(), BaselineStore::new(root), 100),
+        walks,
+        signals,
+    )
+}
+
 fn glass_x11_with_a11y() -> Glass {
     let factory: PlatformFactory = Box::new(|_backend| {
         Ok(Backend {
@@ -1098,5 +1172,45 @@ fn stopping_an_a11y_launch_finishes_inside_the_teardown_budget() {
         "tearing down an a11y launch (ask + signal ladder + private bus) must fit in the {:?} \
          glass-mcp allows teardown; this took {elapsed:?}",
         glass_core::TEARDOWN_BUDGET
+    );
+}
+
+/// The point of the event subscription, measured against a real app: a wait for something that
+/// never happens must stop re-reading the tree.
+///
+/// Counted rather than timed — a wait that walked slowly and a wait that waited efficiently take
+/// the same wall-clock, and only the walk count tells them apart.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn a_quiet_wait_stops_re_walking_the_tree() {
+    let (mut glass, walks, signals) = glass_counting();
+    glass.start(&fixture_spec()).expect("launch");
+    std::thread::sleep(std::time::Duration::from_millis(3_000));
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("no such element in this fixture".into()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 3_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    glass.stop().expect("stop");
+
+    // Logged: the number is the point of the change.
+    eprintln!("quiet 3s wait at 100ms: {walked} walks (polling took 22)");
+    assert!(!out.matched, "the element must not exist");
+    // See `Counting`: without this the test could measure polling and pass.
+    assert!(subscribed > 0, "no subscription was established");
+    // One read at the start plus the ceiling's forced re-read about once a second — 3 measured,
+    // against 22 for the same wait polling.
+    assert!(
+        walked <= 5,
+        "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
     );
 }

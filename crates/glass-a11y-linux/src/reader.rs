@@ -29,6 +29,10 @@ impl LinuxA11y {
 }
 
 impl Accessibility for LinuxA11y {
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn glass_core::ChangeSignal>> {
+        crate::events::subscribe(ctx)
+    }
+
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
@@ -339,6 +343,32 @@ async fn find_nth(
         }
     }
     Ok(None)
+}
+
+/// Every unique D-Bus name belonging to the app in `ctx` — the keys the event filter matches on.
+///
+/// A set, not one name: a walk crosses process boundaries (each child is proxied at *its own* bus
+/// name), so an app that embeds an out-of-process view publishes part of its tree from a second
+/// connection. Filtering on one name would walk that subtree while dropping every event it emits.
+/// Matched by pid, the same rule [`find_app`] applies — though not at the same moment: this
+/// resolves once when the subscription is taken, and a walk re-resolves each time.
+pub(crate) async fn app_bus_names(ctx: &AxContext, conn: &AccessibilityConnection) -> Vec<String> {
+    let zbus_conn = conn.connection().clone();
+    let Ok(root) = conn.root_accessible_on_registry().await else {
+        return Vec::new();
+    };
+    let Ok(children) = root.get_children().await else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for app_ref in children {
+        if app_matches(&app_ref, ctx, &zbus_conn).await
+            && let Some(name) = app_ref.name()
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 /// Does this AT-SPI application belong to the launched process? PID is the reliable

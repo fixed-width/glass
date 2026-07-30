@@ -88,6 +88,33 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: ./scripts/test-x11.sh
 
+  a11y:
+    name: AT-SPI integration (a11y)
+    runs-on: ubuntu-latest
+    # Its own job rather than a step on the X11 one: the suite takes ~2 minutes, which is the
+    # length of that job again, and every integration job runs in parallel. The three
+    # `wayland_a11y_*` tests need a sway this job does not fetch, so they run on the Wayland job
+    # and this one names them as skipped.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+      - name: Install system deps
+        # The suite launches a real GTK4 app (python3-gi + gir1.2-gtk-4.0) under an X server it
+        # starts itself, against glass's own private bus + AT-SPI registry (at-spi2-core).
+        # bubblewrap, and the AppArmor knob Ubuntu 24.04 restricts it with, are for the four tests
+        # that read the tree from inside a sandbox.
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb bubblewrap python3-gi gir1.2-gtk-4.0 at-spi2-core
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # This suite owns every Linux accessibility fact the repo asserts — which role a GTK switch
+      # arrives as, whether an event subscription actually stops a wait re-walking — and until now
+      # ran nowhere but a developer's machine.
+      - run: ./scripts/test-a11y.sh
+
   wayland:
     name: Wayland integration (sway)
     runs-on: ubuntu-latest
@@ -112,7 +139,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y \
             xwayland libegl1 libgl1 libgles2 libgbm1 libdrm2 libegl-mesa0 libgl1-mesa-dri bubblewrap \
-            zenity at-spi2-core
+            zenity at-spi2-core xvfb python3-gi gir1.2-gtk-4.0
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Fetch prebuilt sway bundle
         run: |
@@ -121,6 +148,9 @@ jobs:
             | tar -C ~/.local/share/glass/sway -xz
           ~/.local/share/glass/sway/bin/sway --version
       - run: ./scripts/test-wayland.sh
+      # The a11y suite's Wayland launch tests, which need this job's sway: the X11 job runs the
+      # other 25 and names these as skipped.
+      - run: ./scripts/test-a11y.sh wayland_a11y
 
   macos:
     name: macOS (build · clippy · test)

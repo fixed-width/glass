@@ -36,6 +36,31 @@ impl Glass {
         self.snapshot_at_current_limits()
     }
 
+    /// Subscribe to the backend's change notifications for the active app, if it has any.
+    ///
+    /// Callers hold the returned signal in a local, never in the session: a poll loop's tick
+    /// closure borrows `self` mutably, so a signal stored here could not be waited on from the
+    /// pause between ticks.
+    pub(crate) fn subscribe_a11y_changes(&mut self) -> Option<Box<dyn ChangeSignal>> {
+        let s = self.active_mut().ok()?;
+        // Reader check first, like `snapshot_at_current_limits`: the accessors below are platform
+        // round-trips (`app_pids` shells out to `adb` on Android). A reader that has no event
+        // stream still pays them once per wait, inside the caller's budget — nothing short of
+        // asking it can tell.
+        s.accessibility.as_ref()?;
+        // The cached geometry, deliberately: subscribing must not depend on a window round-trip
+        // that can fail, because failing to subscribe has to degrade to polling rather than to an
+        // error. The reader only needs enough context to identify the app.
+        let ctx = AxContext {
+            pids: s.platform.app_pids(),
+            window: s.geometry.clone(),
+            window_handle: s.platform.active_window_handle(),
+            a11y_bus_addr: s.platform.a11y_bus_addr(),
+            limits: s.a11y_limits,
+        };
+        s.accessibility.as_mut()?.subscribe_changes(&ctx)
+    }
+
     /// Re-snapshot the active window reusing the limits the last user snapshot set — it does NOT
     /// reset them. Used by compound operations (the `return:"snapshot"` fold, `wait_for_element`,
     /// and the scroll/combo/toggle loops) so an agent working in a raised-cap tree keeps that
@@ -395,6 +420,9 @@ impl Glass {
                 return Ok(()); // truthful no-op, no actuation
             }
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+            // Not event-gated, and cannot be: this branch runs only on a backend that frames a
+            // switch as its whole row, which today is iOS alone — a reader with no event stream to
+            // subscribe to.
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,

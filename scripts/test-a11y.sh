@@ -29,6 +29,16 @@ fi
 
 TEST_FILTER="${1:-}"
 
+# Three of these tests drive the app under Wayland, so they need the same sway >=1.12
+# scripts/test-wayland.sh does. Named, not silently dropped: a run that says nothing about them
+# reads as "the suite passed" when a quarter of the launch paths never ran.
+SKIP_ARGS=()
+SWAY_BUNDLE="${XDG_DATA_HOME:-$HOME/.local/share}/glass/sway/bin/sway"
+if [ ! -x "$SWAY_BUNDLE" ] && ! { command -v sway >/dev/null 2>&1 && sway --version 2>/dev/null | grep -qE 'version 1\.(1[2-9]|[2-9][0-9])'; }; then
+    echo "test-a11y: no glass-discoverable sway >=1.12 — skipping the wayland_a11y_* tests."
+    SKIP_ARGS=(--skip wayland_a11y)
+fi
+
 # Hermetic isolation: run the whole suite under a throwaway XDG_RUNTIME_DIR. AT-SPI derives its
 # socket dir from XDG_RUNTIME_DIR, so any at-spi-bus-launcher these tests spawn — through glass's
 # PrivateBus (which already overrides it) OR any other path — writes to this throwaway, NEVER the
@@ -46,4 +56,4 @@ export XDG_RUNTIME_DIR="$A11Y_TEST_RUNTIME"
 # org.a11y.Status.ScreenReaderEnabled advertisement that accesskit-based apps gate on) run
 # under the same throwaway XDG_RUNTIME_DIR isolation.
 cargo test -p glass-dbus-linux --lib -- --ignored --test-threads=1 "$TEST_FILTER"
-cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "$TEST_FILTER"
+cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 "${SKIP_ARGS[@]}" "$TEST_FILTER"

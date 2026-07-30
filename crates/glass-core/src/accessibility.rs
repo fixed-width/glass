@@ -664,6 +664,42 @@ impl AxTarget {
     }
 }
 
+/// A backend's notification that the app's accessibility tree may have changed.
+///
+/// Exists so a wait can stop re-reading the whole tree on a timer. A walk is not free and grows
+/// with the tree — measured on AT-SPI, 36ms for a small fixture and 732ms at the 1500-node cap —
+/// so a wait for something that has not happened yet spends its whole budget re-reading a tree
+/// that did not change.
+///
+/// Public and object-safe because it crosses the `Accessibility` seam, which backends implement
+/// out-of-crate.
+pub trait ChangeSignal: Send {
+    /// Block until a change arrives or `timeout` elapses.
+    ///
+    /// Must never block past `timeout`, and must actually block for it when there is nothing to
+    /// report: the deadline is the only thing standing between a subscription that stopped
+    /// delivering and a hung wait, and an implementation that returns instantly every time turns
+    /// the caller's poll loop into a spin.
+    fn wait(&mut self, timeout: std::time::Duration) -> ChangeWait;
+}
+
+/// What a [`ChangeSignal`] learned while waiting.
+///
+/// `Quiet` and `Unusable` are separate answers because a caller does opposite things with them: on
+/// `Quiet` it can skip re-reading the tree, which is the entire saving; on `Unusable` it must go
+/// back to re-reading on the interval, because a signal that can no longer tell would otherwise
+/// look like a permanently quiet app and the wait would never notice the state it is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeWait {
+    /// Something changed — read the tree.
+    Changed,
+    /// Nothing changed within the timeout, and the signal is still trustworthy.
+    Quiet,
+    /// The subscription can no longer report changes (the stream ended, the bus dropped). The
+    /// caller must stop trusting it and resume polling.
+    Unusable,
+}
+
 /// The OS accessibility seam — one impl per OS. Object-safe; the session stores
 /// it boxed as `Send` (the `Send` bound lives at the storage site, not on the
 /// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
@@ -673,6 +709,21 @@ pub trait Accessibility {
     /// window-relative coordinates. Node ids are assigned by the caller
     /// afterward via [`AxTree::assign_ids`]; the backend need not set them.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
+
+    /// Subscribe to change notifications for the app described by `ctx`.
+    ///
+    /// `None` — the default — means this reader has no event stream, and its callers keep polling
+    /// exactly as they did before. Two readers cannot have one as built: Android's `uiautomator`
+    /// reader is a dump per call and iOS's is an `idb describe` per call. Android's *other* reader,
+    /// the on-device accessibility service, is driven by events and is the natural next one.
+    ///
+    /// Subscribe before the first read, not after: a change that lands after a read but before the
+    /// subscription is announced to nobody, and the caller then waits out its *entire* budget on a
+    /// condition that already holds. (A change between subscribing and reading is safe — the read
+    /// sees it.)
+    fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        None
+    }
 
     /// Set the editable element identified by `target` to `text`. The backend
     /// re-walks pre-order to `target.id`, verifies role+name, then sets via the
