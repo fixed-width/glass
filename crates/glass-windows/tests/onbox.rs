@@ -1135,10 +1135,6 @@ fn render_role_histogram(label: &str, tree: &AxTree) -> String {
     out
 }
 
-/// Set to any value to make [`probe_role_histogram`] print the snapshot-cost block. Off by
-/// default — see the gate's own comment at the call site.
-const COST_ENV: &str = "GLASS_PROBE_COST";
-
 /// Extra snapshots [`render_snapshot_cost`] takes of each probed app. Every sample is printed
 /// beside the mean, so a single slow outlier is visible rather than hidden in the average.
 const COST_REPEATS: usize = 10;
@@ -1298,14 +1294,12 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Pro
     report.push_str(&census_block);
     let described = description_census(&tree).described();
 
-    // Off by default: the cost block adds `COST_REPEATS` full-tree walks per app to a run the
-    // bridge caps at 300s, and the number it produces answers a question (what does a per-node
-    // read cost?) that is asked when something changes, not on every evidence run.
-    if std::env::var_os(COST_ENV).is_some() {
-        let cost_block = render_snapshot_cost(&mut a11y, &ctx);
-        print!("{cost_block}");
-        report.push_str(&cost_block);
-    }
+    // `COST_REPEATS` extra walks per app cost ~3s across this probe's four apps (measured on
+    // box), well inside the 300s the bridge allows a run, so the block is unconditional rather
+    // than behind a flag the bridge has no way to pass through.
+    let cost_block = render_snapshot_cost(&mut a11y, &ctx);
+    print!("{cost_block}");
+    report.push_str(&cost_block);
 
     // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
     let mut candidates = Vec::new();
