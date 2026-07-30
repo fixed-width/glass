@@ -4,7 +4,8 @@
 //!
 //! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
 //! is non-trivial and carries named, role-typed elements. A second test writes into a real
-//! `EditText` and checks that `set_value` only claims success when the write actually landed.
+//! `EditText` and checks that a landed write is confirmed against the live field — including a
+//! clear, which the read-back rule has to treat as a value rather than as a failed read.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
@@ -70,7 +71,7 @@ fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNo
     node.children.iter().find_map(|c| find(c, want))
 }
 
-/// A real write into a real field, and a real write that cannot land.
+/// A real write into a real field, and a real clear of it.
 ///
 /// Settings has no editable field until its search entry is tapped, so the test taps it first and
 /// then drives `set_value` against the `EditText` that appears — which is the point: this exercises
@@ -127,12 +128,13 @@ fn set_value_reports_whether_the_write_landed() {
         bounds: field.bounds,
     };
 
-    // A write that lands: reported Ok, and the field really holds it afterwards.
+    // A write that lands: reported Ok, and the node at that id really holds it afterwards.
     a11y.set_value(&ctx, &target, "glass")
         .expect("a real write into a real field must succeed");
     let mut after = a11y.snapshot(&ctx).expect("snapshot after write");
     after.assign_ids();
-    let held = find(&after.root, &|n| n.states.editable)
+    let held = after
+        .find(target.id)
         .and_then(|n| n.value.clone())
         .unwrap_or_default();
     assert!(
@@ -140,8 +142,38 @@ fn set_value_reports_whether_the_write_landed() {
         "field holds {held:?} after the write"
     );
 
-    // A write that cannot land: the id names a node that is not the field any more. Before this
-    // change every one of these returned Ok.
+    // Clearing the field: the read-back sees no value at all, which the rule has to read as "empty"
+    // rather than "the read failed" — otherwise this reports failure for a clear that worked. Nothing
+    // else on device exercises that, and it is where the first version of this check was wrong.
+    //
+    // The target is re-located first, deliberately: typing into Settings' search renders a results
+    // list, which shifts every pre-order id after it, so the target captured before the write is
+    // stale by now — and `set_value` says so (`AxElementChanged`) rather than writing to whatever
+    // inherited the id. Re-locating is what an agent does after a write that changes the screen.
+    let mut before_clear = a11y.snapshot(&ctx).expect("snapshot before the clear");
+    before_clear.assign_ids();
+    let field = find(&before_clear.root, &|n| n.states.editable).expect("the field is still there");
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+    };
+    a11y.set_value(&ctx, &target, "")
+        .expect("clearing a field is a write that can succeed");
+    let mut cleared = a11y.snapshot(&ctx).expect("snapshot after clear");
+    cleared.assign_ids();
+    let left = cleared
+        .find(target.id)
+        .and_then(|n| n.value.clone())
+        .unwrap_or_default();
+    // Not `is_empty()`: an emptied Android `EditText` reports its *hint* as its text, and
+    // `uiautomator` exposes no separate hint attribute — which is exactly why a clear is judged by
+    // the value changing rather than by it reading back empty.
+    assert_ne!(left, "glass", "the field still holds what was typed");
+
+    // A stale target is refused before anything is typed — the pre-write fingerprint check, which
+    // predates the read-back. Kept as a regression guard, not as evidence about the read-back.
     let stale = AxTarget {
         id: target.id,
         role: target.role,

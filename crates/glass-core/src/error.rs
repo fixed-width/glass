@@ -94,7 +94,10 @@ pub enum GlassError {
     AxElementChanged(u32),
 
     #[error(
-        "set_value on element #{0} reported success but the value did not change (read-only a11y projection — use keystrokes)"
+        "set_value on element #{0} did not take — the element does not hold the requested value. On \
+         a desktop backend this usually means a read-only accessibility projection, so try \
+         keystrokes; on Android or the iOS Simulator the write already IS keystrokes, so the tap may \
+         have missed or the field rejected the input — re-snapshot to see what it holds"
     )]
     AxValueNotApplied(u32),
 
