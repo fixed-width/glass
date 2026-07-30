@@ -144,48 +144,47 @@ fn copy_attribute_checked(el: &AXUIElement, attr_name: &str) -> Result<Option<CF
 
 /// One system-wide accessibility read, for the doctor: does the AX API answer at all?
 ///
-/// Reads `AXFocusedApplication` off `AXUIElementCreateSystemWide` and throws the value away — the
-/// question is whether the call was *answered*, not what is focused — so it needs no target
-/// application and mutates nothing. It cannot go through [`copy_attribute_checked`], which folds
-/// every real failure into one error string; the doctor reports the code.
+/// Reads [`SystemWideProbe`]'s probe attribute and throws the value away — the question is whether
+/// the call was *answered*, not what is focused — so it needs no target application and mutates
+/// nothing. It cannot go through [`copy_attribute_checked`], which returns a `GlassError` and
+/// discards the `AXError` discriminant the doctor classifies on.
+///
+/// Bounded by an explicit messaging timeout: an AX read is synchronous IPC to another process, and
+/// "the accessibility stack is wedged" — the headline condition this probe exists to catch — is
+/// exactly the case that blocks. A doctor that hangs reports nothing at all.
 pub(crate) fn probe_system_wide() -> SystemWideProbe {
-    // `AXFocusedApplication`, not a cheaper attribute, because it is *trust-gated*: surveyed on the
-    // dogfood mini, an untrusted process reading it off the system-wide element gets
-    // `CannotComplete` while `AXRole` on the same element answers `Success`. So this attribute fails
-    // exactly when the reader would fail, and a "simpler" one would report green to a process that
-    // cannot read a single tree.
-    probe_system_wide_attr("AXFocusedApplication")
+    probe_system_wide_attr(crate::doctor::PROBE_ATTRIBUTE)
 }
 
+/// How long one doctor AX read may wait. Generous for a system-wide attribute read, which answers
+/// in microseconds on a healthy host.
+const PROBE_TIMEOUT_SECS: f32 = 2.0;
+
 /// [`probe_system_wide`] with the attribute as a seam, so a live test can drive the classifier with
-/// an attribute the system-wide element definitely lacks and see a non-`Success` code come back from
-/// the real API rather than from a fixture.
+/// an attribute the system-wide element does not carry and see a real non-`Success` code come back
+/// from the API rather than from a fixture.
 fn probe_system_wide_attr(attr_name: &str) -> SystemWideProbe {
     // SAFETY: `AXUIElementCreateSystemWide` takes no arguments and never returns NULL per Apple's
     // documented contract (the binding itself `.expect()`s on this).
     let el = unsafe { AXUIElement::new_system_wide() };
+    // SAFETY: `el` is a live `AXUIElement`; the call takes a plain timeout with no aliasing or
+    // lifetime preconditions. Its own failure is not reported: a timeout that could not be set
+    // leaves the system default in place, which is a slower probe, not a wrong one.
+    let _ = unsafe { el.set_messaging_timeout(PROBE_TIMEOUT_SECS) };
     let attr = CFString::from_str(attr_name);
     let mut raw: *const CFType = std::ptr::null();
     // SAFETY: `el` is a live `AXUIElement`; `raw` is a valid local out-param slot matching
     // `AXUIElementCopyAttributeValue`'s documented signature (mirrors `copy_attribute_checked`).
     let err = unsafe { el.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
-    if err == AXError::Success {
-        if let Some(nn) = NonNull::new(raw.cast_mut()) {
-            // SAFETY: the Copy call returned an already-retained (+1) value per Core Foundation's
-            // Copy/Create rule; taking ownership here releases it at end of scope rather than
-            // leaking the focused application element on every doctor run.
-            drop(unsafe { CFRetained::from_raw(nn) });
-        }
-        return SystemWideProbe::Answered;
+    if let Some(nn) = NonNull::new(raw.cast_mut()) {
+        // SAFETY: on `Success` the Copy call returned an already-retained (+1) value per Core
+        // Foundation's Copy/Create rule; taking ownership here releases it at end of scope rather
+        // than leaking the frontmost application element on every doctor run.
+        drop(unsafe { CFRetained::from_raw(nn) });
     }
-    if is_absent_error(err) {
-        return SystemWideProbe::AttributeAbsent;
-    }
-    match err {
-        AXError::APIDisabled => SystemWideProbe::ApiDisabled,
-        AXError::CannotComplete => SystemWideProbe::DidNotComplete,
-        other => SystemWideProbe::Failed(other.0),
-    }
+    // A `Success` with a null value is `Answered` here, though `copy_attribute_checked` calls the
+    // same pair a backend error: this probe asks whether the call was answered, and it was.
+    SystemWideProbe::from_ax_code(err.0)
 }
 
 /// Read `el`'s `attr_name` as a `String`, or `None` when the attribute is absent, isn't a
@@ -407,18 +406,32 @@ mod tests {
     use crate::doctor::SystemWideProbe;
     use objc2_application_services::AXError;
 
-    // There is deliberately no live "healthy host answers" test: on the dogfood mini this harness
-    // gets `CannotComplete` while `glass-mcp doctor` answers, on the same host in the same session,
-    // so the assertion would encode which binaries that host happens to trust.
+    // There is deliberately no live "the probe answers" test: on a granted process it answers and
+    // on an untrusted one it does not, so the assertion would encode which binaries the running
+    // host happens to trust. The classification it feeds is unit-tested in `doctor`, on any host.
 
-    /// Live: a real non-`Success` `AXError` reaches the classifier and is named, rather than every
-    /// outcome collapsing to the healthy one — which is the defect this whole check replaces.
+    /// Live: a real `AXError` from the API reaches the classifier and is told apart from `Answered`.
+    /// Needs a GUI session; whether it needs the Accessibility grant is untested — an attribute the
+    /// element does not carry is not trust-gated on the evidence this crate has.
     #[test]
-    #[ignore = "needs a macOS GUI session with Accessibility granted to this process"]
-    fn an_attribute_the_element_lacks_classifies_as_absent() {
-        assert_eq!(
+    #[ignore = "needs a macOS GUI session (run by scripts/test-macos-a11y.sh)"]
+    fn an_attribute_the_element_lacks_is_not_reported_as_answered() {
+        assert_ne!(
             probe_system_wide_attr("AXNoSuchAttributeGlassDoctorProbe"),
-            SystemWideProbe::AttributeAbsent
+            SystemWideProbe::Answered
+        );
+    }
+
+    /// Live: the surveyed fact the probe attribute is chosen for — `AXRole` answers where
+    /// `AXFocusedApplication` may not — so a maintainer swapping the attribute has something that
+    /// fails rather than a comment.
+    #[test]
+    #[ignore = "needs a macOS GUI session (run by scripts/test-macos-a11y.sh)"]
+    fn axrole_answers_on_the_system_wide_element() {
+        assert_eq!(
+            probe_system_wide_attr("AXRole"),
+            SystemWideProbe::Answered,
+            "if this fails, the reason PROBE_ATTRIBUTE is AXFocusedApplication no longer holds"
         );
     }
 

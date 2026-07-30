@@ -19,14 +19,16 @@ internal refactors, CI, or test-only changes.
 ### Fixed
 - `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
   used to say the reader was available whatever the accessibility API was doing, so the one case you
-  need it for — the reader is not answering — showed green. It now makes a system-wide accessibility
-  read and reports what happened, with the error code: a process that is not trusted and a host that
-  withholds its accessibility trees (a locked screen does this) are different lines with different
-  remedies.
-- `glass doctor`'s iOS device line now says whether a simulator is *booted*. It reported how many
-  were available, which reads as ready when nothing is running and every iOS call is about to fail.
-  It names the booted one — the same one a driving call would attach to — and warns with a remedy
-  when there is none. The doctor still boots nothing.
+  need it for — the reader is not answering — showed green. It now reads one attribute off the
+  system-wide accessibility element and reports what happened, with the error code. macOS gives the
+  same code for several causes, so the line names the one that applies: not trusted, a locked
+  session, assistive access switched off, or a stack that stopped answering — each with its own
+  remedy. A locked session is a warning rather than a failure, since it is not something to fix.
+- `glass doctor`'s iOS device line now reports which simulator glass would drive. It listed how many
+  were available and nothing more. Nothing booted is fine and says so — glass boots one at start —
+  but a `GLASS_IOS_UDID` that names a simulator which is *not* booted is now a failure, because glass
+  attaches to a pinned device without booting it and every call would fail against a dead target. A
+  device listing that cannot be read says that, rather than reporting it as nothing booted.
 - `glass_set_value` now tells you when a write did not take on Android (without the on-device
   accessibility service) and on the iOS Simulator. Those two backends tap the element, clear it and
   type — and used to report success without ever looking again, so a tap that landed slightly off, a

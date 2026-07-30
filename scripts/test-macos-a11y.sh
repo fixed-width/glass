@@ -45,4 +45,11 @@ cargo test -p glass-macos --test a11y --no-run
 # pre-builds one so the granted process doesn't need a writable `$TMPDIR` / working
 # `swiftc` invocation in that context. No machine-specific paths are hardcoded here; the
 # out-of-band recipe supplies them at run time.
-echo "test-macos-a11y.sh: OK (compile/link only — the granted run happens out-of-band; see comments above)."
+# The a11y *doctor* probe is a different matter: reading one attribute off the system-wide
+# element needs a GUI session but no TCC grant, so its `#[ignore]`d live tests can run right
+# here rather than out-of-band. They are what keeps `glass doctor`'s accessibility line from
+# drifting back into a claim nothing measures.
+echo "test-macos-a11y.sh: running the doctor's live system-wide probe tests…"
+cargo test -p glass-a11y-macos --lib ffi::tests -- --ignored --test-threads=1
+
+echo "test-macos-a11y.sh: OK (compile/link, plus the live doctor probe; the granted a11y run happens out-of-band — see comments above)."

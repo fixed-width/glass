@@ -134,7 +134,9 @@ GLASS_BACKEND=ios glass-mcp doctor
 ```
 
 Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, an iPhone
-simulator is available, and `idb_companion` is installed (for input + accessibility) — each failing
+simulator is available (and which one, if any, is already booted — glass boots one itself at start
+unless `GLASS_IOS_UDID` pins a specific device), and `idb_companion` is installed (for input +
+accessibility) — each failing
 check comes with its own remedy (the commands above). The `[ios]` section (including the
 `idb_companion` line) also appears when iOS is driven per-call from a server whose default backend is
 macOS; there an absent `idb_companion` is shown as an advisory warning rather than a failure, since it
