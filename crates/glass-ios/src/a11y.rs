@@ -3,7 +3,9 @@
 //! against a stale id landing on a different element), focuses it, clears it, and
 //! types the new text via synthetic HID input.
 use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree};
-use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result};
+use std::time::Duration;
+
+use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, read_back_confirms};
 
 use crate::axmap;
 use crate::idb::client::IdbClient;
@@ -74,6 +76,36 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
         .ok_or_else(|| GlassError::Backend("a11y set_value: element has no bounds".into()))
 }
 
+/// How long to let the app commit typed text before reading it back. Generous next to a keystroke,
+/// small next to the `describe` that follows it.
+const VERIFY_SETTLE: Duration = Duration::from_millis(300);
+
+/// Judge a `set_value` write from a tree described after it, against the value the target held
+/// before. `Ok(())` only when the read-back proves the write landed.
+///
+/// A tap-and-type can miss: the field may reject input, the keyboard may not have come up, or the
+/// tap may land on a neighbour. Reporting success then tells an agent a field holds text it does
+/// not hold. A target no longer at that id is [`GlassError::AxElementChanged`], since the write may
+/// have landed on something that then moved.
+fn verify_write(
+    after_tree: &AxTree,
+    target: &AxTarget,
+    before: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    let node = after_tree
+        .find(target.id)
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    if !target.matches(node.role, node.name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    if read_back_confirms(node.value.as_deref(), before, text) {
+        Ok(())
+    } else {
+        Err(GlassError::AxValueNotApplied(target.id.0))
+    }
+}
+
 impl Accessibility for IosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         Ok(self.describe(ctx)?.0)
@@ -84,6 +116,8 @@ impl Accessibility for IosA11y {
         // the ids here are final, not walked again.
         let (tree, scale) = self.describe(ctx)?;
         let bounds = verify(&tree, target)?;
+        // The baseline for the read-back, from the describe that already located the target.
+        let before = tree.find(target.id).and_then(|n| n.value.clone());
         let (cx, cy) = bounds
             .clamped_center(ctx.window.width, ctx.window.height)
             .ok_or_else(|| GlassError::Backend("a11y set_value: element not on screen".into()))?;
@@ -104,7 +138,11 @@ impl Accessibility for IosA11y {
             .hid(injector.key_events(&KeyEvent::Chord("Delete".into()))?)?;
         self.client
             .hid(injector.key_events(&KeyEvent::Text(text.to_string()))?)?;
-        Ok(())
+
+        // Read back once, not in a loop: a re-read is a whole `describe` round trip through idb.
+        std::thread::sleep(VERIFY_SETTLE);
+        let (after, _) = self.describe(ctx)?;
+        verify_write(&after, target, before.as_deref(), text)
     }
 }
 
@@ -150,6 +188,58 @@ mod tests {
         let mut t = AxTree::new(root);
         t.assign_ids();
         t
+    }
+
+    const FIELD: AxRect = AxRect {
+        x: 10,
+        y: 20,
+        width: 100,
+        height: 40,
+    };
+
+    /// The one-field tree a read-back sees, holding `value`.
+    fn tree_with_value(value: Option<&str>) -> AxTree {
+        let mut field = leaf(0, AxRole::TextField, "Note", FIELD);
+        field.value = value.map(Into::into);
+        tree_with(field)
+    }
+
+    /// A target matching that field as the snapshot before the write saw it.
+    fn matching_target() -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Note".into()),
+            bounds: Some(FIELD),
+        }
+    }
+
+    #[test]
+    fn a_write_that_landed_is_reported_as_success() {
+        let after = tree_with_value(Some("world"));
+        let t = matching_target();
+        assert!(verify_write(&after, &t, Some("hello"), "world").is_ok());
+    }
+
+    #[test]
+    fn a_field_that_never_changed_is_not_a_successful_write() {
+        let after = tree_with_value(Some("hello"));
+        let t = matching_target();
+        assert!(matches!(
+            verify_write(&after, &t, Some("hello"), "world"),
+            Err(GlassError::AxValueNotApplied(_))
+        ));
+    }
+
+    #[test]
+    fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
+        let after = tree_with_value(Some("world"));
+        let mut t = matching_target();
+        t.name = Some("A different field".into());
+        assert!(matches!(
+            verify_write(&after, &t, Some("hello"), "world"),
+            Err(GlassError::AxElementChanged(_))
+        ));
     }
 
     #[test]
