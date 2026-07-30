@@ -29,6 +29,10 @@ impl LinuxA11y {
 }
 
 impl Accessibility for LinuxA11y {
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn glass_core::ChangeSignal>> {
+        crate::events::subscribe(ctx)
+    }
+
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
@@ -345,6 +349,23 @@ async fn find_nth(
 /// signal: the app matches when its owning pid is in `ctx.pids` (the launched app's PID
 /// set — root + enumerable descendants). An empty set (no pid hint, e.g. a backend that
 /// can't enumerate) accepts the first app (refine later).
+/// The unique D-Bus name of the app in `ctx` — the key the event filter matches on, resolved the
+/// same way [`find_app`] resolves the app itself so a subscription and a walk cannot disagree
+/// about which application they are about.
+pub(crate) async fn app_bus_name(
+    ctx: &AxContext,
+    conn: &AccessibilityConnection,
+) -> Option<String> {
+    let zbus_conn = conn.connection().clone();
+    let root = conn.root_accessible_on_registry().await.ok()?;
+    for app_ref in root.get_children().await.ok()? {
+        if app_matches(&app_ref, ctx, &zbus_conn).await {
+            return app_ref.name().map(|n| n.to_string());
+        }
+    }
+    None
+}
+
 async fn app_matches(app_ref: &ObjectRefOwned, ctx: &AxContext, conn: &zbus::Connection) -> bool {
     if ctx.pids.is_empty() {
         return true; // no pid hint: accept the first app (refine by geometry/title elsewhere)
