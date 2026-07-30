@@ -5,7 +5,9 @@
 use std::time::{Duration, Instant};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
-use glass_core::{GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry};
+use glass_core::{
+    GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, read_back_confirms,
+};
 
 use crate::adb::Adb;
 use crate::axmap::build_tree;
@@ -79,6 +81,38 @@ fn dump_until_ready(
         }
     }
 }
+
+/// Judge a `set_value` write from a tree read back after it, against the value the target held
+/// before. `Ok(())` only when the read-back proves the write landed.
+///
+/// A tap-and-type can miss: the field may be read-only, the keyboard may swallow the text, or the
+/// tap may land on a neighbour. Reporting success then tells an agent a field holds text it does
+/// not hold, and every later assertion is made against a screen that never changed.
+///
+/// A target that is no longer at that id is [`GlassError::AxElementChanged`], not
+/// `AxValueNotApplied`: the write may well have landed, on something that then moved.
+fn verify_write(
+    after_tree: &AxTree,
+    target: &AxTarget,
+    before: Option<&str>,
+    text: &str,
+) -> Result<()> {
+    let node = after_tree
+        .find(target.id)
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    if !target.matches(node.role, node.name.as_deref()) {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    if read_back_confirms(node.value.as_deref(), before, text) {
+        Ok(())
+    } else {
+        Err(GlassError::AxValueNotApplied(target.id.0))
+    }
+}
+
+/// How long to let the toolkit commit typed text before reading it back. Generous relative to a
+/// keystroke and small next to the `uiautomator dump` that follows it.
+const VERIFY_SETTLE_MS: u64 = 300;
 
 /// Reads the active window's accessibility tree via `uiautomator`.
 pub struct AndroidA11y {
@@ -183,6 +217,9 @@ impl Accessibility for AndroidA11y {
         let mut tree = self.snapshot(ctx)?;
         tree.assign_ids();
         let (cx, cy) = locate_editable_target(&tree, target, &window)?;
+        // The baseline for the read-back, taken from the snapshot that located the target rather
+        // than from a read of its own.
+        let before = tree.find(target.id).and_then(|n| n.value.clone());
 
         let adb = self.ensure_adb()?;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
@@ -205,13 +242,20 @@ impl Accessibility for AndroidA11y {
                 adb.run(argv.iter().map(String::as_str))?;
             }
         }
-        Ok(())
+
+        // Read back once, not in a loop: a re-read here is a whole `uiautomator dump` (~2s on the
+        // dogfood AVD), so polling would cost seconds per write. The settle is the beat the toolkit
+        // needs to commit the text — small next to the dump that follows it.
+        std::thread::sleep(Duration::from_millis(VERIFY_SETTLE_MS));
+        let mut after = self.snapshot(ctx)?;
+        after.assign_ids();
+        verify_write(&after, target, before.as_deref(), text)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dump_once, dump_until_ready, locate_editable_target};
+    use super::{dump_once, dump_until_ready, locate_editable_target, verify_write};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, Result, WindowGeometry};
     use std::time::Duration;
@@ -391,6 +435,14 @@ mod tests {
         t
     }
 
+    /// The same single-node tree, holding `value` — what a read-back sees.
+    fn tree_holding(value: Option<&str>) -> AxTree {
+        let mut t = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+        t.root.value = value.map(Into::into);
+        t.assign_ids();
+        t
+    }
+
     fn target(id: u32, name: Option<&str>, bounds: Option<AxRect>) -> AxTarget {
         AxTarget {
             id: AxNodeId(id),
@@ -398,6 +450,56 @@ mod tests {
             name: name.map(Into::into),
             bounds,
         }
+    }
+
+    #[test]
+    fn a_write_that_landed_is_reported_as_success() {
+        let after = tree_holding(Some("world"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(verify_write(&after, &t, Some("hello"), "world").is_ok());
+    }
+
+    #[test]
+    fn a_field_that_never_changed_is_not_a_successful_write() {
+        // The tap missed, the field is read-only, or the keyboard swallowed the text. Reporting Ok
+        // here tells an agent the field holds text it does not hold.
+        let after = tree_holding(Some("hello"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, Some("hello"), "world"),
+            Err(GlassError::AxValueNotApplied(0))
+        ));
+    }
+
+    #[test]
+    fn a_reformatted_value_still_counts_as_landed() {
+        // A field may normalize what was typed; changed from the baseline is enough.
+        let after = tree_holding(Some("50.0"));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(verify_write(&after, &t, Some("0"), "50").is_ok());
+    }
+
+    #[test]
+    fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
+        // The write may well have landed — on something that then moved. Saying "not applied"
+        // would send an agent to retype into whatever now sits at that id.
+        let after = tree_holding(Some("world"));
+        let t = target(0, Some("A different field"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, Some("hello"), "world"),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_missing_from_the_read_back_is_reported_as_changed() {
+        let mut after = tree_holding(Some("world"));
+        after.root.children.clear();
+        let t = target(7, Some("Search"), Some(BOUNDS));
+        assert!(matches!(
+            verify_write(&after, &t, Some("hello"), "world"),
+            Err(GlassError::AxElementChanged(7))
+        ));
     }
 
     #[test]
