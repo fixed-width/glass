@@ -106,8 +106,10 @@ impl Accessibility for MacosA11y {
         // and it is rejected here rather than silently overwritten.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
-        let name = ffi::attribute_string(&el, attr::TITLE)
-            .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
+        // Same two reads, in the same order, that `walk` derived this element's `name` from —
+        // through the same helper, so a fingerprint can never be computed from a differently-read
+        // name and reject an element that never moved.
+        let name = read_label(&el, attr::TITLE).or_else(|| read_label(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
@@ -166,8 +168,10 @@ impl Accessibility for MacosA11y {
         // Same fingerprint gate as set_value: role + name + bounds.
         let ax_role = ffi::attribute_string(&el, attr::ROLE).unwrap_or_default();
         let role = mapping::map_role(&ax_role, read_subrole(&el, &ax_role).as_deref());
-        let name = ffi::attribute_string(&el, attr::TITLE)
-            .or_else(|| ffi::attribute_string(&el, attr::DESCRIPTION));
+        // Same two reads, in the same order, that `walk` derived this element's `name` from —
+        // through the same helper, so a fingerprint can never be computed from a differently-read
+        // name and reject an element that never moved.
+        let name = read_label(&el, attr::TITLE).or_else(|| read_label(&el, attr::DESCRIPTION));
         let bounds = window_relative_rect(&el, scale, &ctx.window);
         if !target.matches(role, name.as_deref())
             || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
@@ -295,6 +299,32 @@ fn select_window(
     best.map(|(_, w, scale)| (w, scale))
 }
 
+/// One of the label attributes a node's `name`/`description` come from (`AXTitle`,
+/// `AXDescription`, `AXHelp`), read through the *error-aware* [`ffi::attribute_string_checked`]
+/// and then folded to `None` when empty — exactly what [`ffi::attribute_string`] returns for a
+/// present-but-empty value, so `name` keeps the value it had before this reader sourced a
+/// description.
+///
+/// The checked form earns its keep for the same reason [`read_subrole`] uses it: the direct read
+/// folds a genuine failure into the same `None` as a legitimately-absent attribute, and most nodes
+/// legitimately lack `AXHelp` — which is what would make the dishonest `None`s undetectable. A
+/// failure still degrades to `None`, since one unreadable attribute must not fail a whole snapshot,
+/// but it logs first. `AXTitle` earns it twice over: it decides `name`, half the `AxTarget`
+/// fingerprint `set_value` re-walks against, and (here) which attribute is free to be the
+/// description.
+fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
+    match ffi::attribute_string_checked(el, attr_name) {
+        Ok(text) => text.filter(|t| !t.is_empty()),
+        Err(err) => {
+            eprintln!(
+                "glass-a11y-macos: {attr_name} read failed: {err}; treating the element as \
+                 having no {attr_name}"
+            );
+            None
+        }
+    }
+}
+
 /// `el`'s `AXSubrole`, but only for the base roles whose subrole actually changes the mapped
 /// role ([`mapping::subrole_matters`]) — every other node skips the AX IPC round-trip and gets
 /// `None`.
@@ -368,20 +398,23 @@ fn walk(
     // Name = title, else description — both stable labels (e.g. `setAccessibilityLabel`
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
-    let title = ffi::attribute_string(el, attr::TITLE);
-    let titled = title.is_some();
-    let name = title.or_else(|| ffi::attribute_string(el, attr::DESCRIPTION));
-    // `AXHelp` (the tooltip), else `AXDescription` — but only where `AXTitle` already took the
-    // name, since otherwise `AXDescription` IS the name and would normalize away as a duplicate.
-    // So `AXDescription` costs at most one read per node either way: as the name fallback when
-    // there is no title, here when there is.
-    let description = ffi::attribute_string(el, attr::HELP)
-        .or_else(|| {
-            titled
-                .then(|| ffi::attribute_string(el, attr::DESCRIPTION))
-                .flatten()
-        })
-        .and_then(|raw| normalize_description(&raw, name.as_deref()));
+    //
+    // Which attribute is left to describe the node therefore depends on which one named it, so
+    // both labels are decided in one place. `AXDescription` costs at most one read per node
+    // either way: as the name when there is no title, as the description only when there IS a
+    // title and no `AXHelp` — where the title took the name, so a description read cannot
+    // normalize away as a duplicate of it.
+    let (name, secondary) = match read_label(el, attr::TITLE) {
+        Some(title) => (
+            Some(title),
+            read_label(el, attr::HELP).or_else(|| read_label(el, attr::DESCRIPTION)),
+        ),
+        None => (
+            read_label(el, attr::DESCRIPTION),
+            read_label(el, attr::HELP),
+        ),
+    };
+    let description = secondary.and_then(|raw| normalize_description(&raw, name.as_deref()));
     let value = ffi::attribute_string(el, attr::VALUE);
     let bounds = window_relative_rect(el, scale, win);
     let states = mapping::map_states(&gather_states(el, role));

@@ -239,6 +239,31 @@ mod macos_main {
             ));
         }
 
+        // The secondary label, one case per rule. The census a probe run prints can only say that
+        // *something* arrived; these say which attribute produced it, and that the two cases which
+        // must produce nothing do.
+        for (name, want) in [
+            // `AXHelp`, distinct from the name.
+            ("Save", Some("Saves and closes the sheet")),
+            // `AXTitle` named it, so `AXDescription` is free to describe it.
+            ("Bold", Some("Bold text style")),
+            // Labelled but untitled: `AXDescription` IS the name, and must not be repeated.
+            ("Note", None),
+            // `AXHelp` identical to the name: dropped, not printed twice.
+            ("Status", None),
+        ] {
+            let node = match find_by_name(&tree.root, name) {
+                Some(n) => n,
+                None => return Err(format!("no {name:?} node in tree:\n{outline}")),
+            };
+            if node.description.as_deref() != want {
+                return Err(format!(
+                    "{name:?} description = {:?}, want {want:?}:\n{outline}",
+                    node.description
+                ));
+            }
+        }
+
         // The outline only proves `name`; confirm `value` is read separately, straight off
         // the field's content — not folded into `name` (that was the bug this test guards).
         let field = match find_text_field(&tree.root) {

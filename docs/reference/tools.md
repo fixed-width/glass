@@ -460,12 +460,12 @@ rides as an untrusted sibling text block, one line per element:
 the name — help or tooltip text, or the human-readable label where the name is a
 developer-assigned id. It appears only where glass's reader sources that label: the AT-SPI (Linux)
 reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, and the AX
-(macOS) reader reads `AXHelp` (plus `AXDescription` where `AXTitle` already supplied the name). The
-`uiautomator` (Android) and `idb` (iOS) readers do not read their platform's secondary label yet, so
-`desc` never appears there no matter what the app exposes. It is also omitted when the description duplicates the name. **`desc` is display-only:
-`glass_wait_for_element` and `glass_scroll_to_element` select on `name`, never on the
-description.** An element whose platform role glass
-has no mapping for renders as `Other(<native token>)` — e.g.
+(macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name. The
+Android readers and the `idb` (iOS) reader do not read their platform's secondary label yet, so
+`desc` never appears there no matter what the app exposes. It is also omitted when the description
+duplicates the name. **`desc` is display-only: `glass_wait_for_element` and
+`glass_scroll_to_element` select on `name`, never on the description.** An element whose platform
+role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
 

@@ -149,12 +149,7 @@ fn walk(
         .map(str::to_string)
         .unwrap_or_else(|| format!("UIA:{ct_id}"));
     let name = nonempty(el.get_name().unwrap_or_default());
-    // UIA's secondary label is `HelpText`, the tooltip — one more cross-process round-trip per
-    // node, which the probe harness's cost block measures. `FullDescription` is UIA's other
-    // secondary label; `uiautomation` 0.25 exposes no accessor for it (only
-    // `UIProperty::FullDescription` through `get_property_value`).
-    let description =
-        normalize_description(&el.get_help_text().unwrap_or_default(), name.as_deref());
+    let description = normalize_description(&help_text(el, ct_id), name.as_deref());
     let bounds = window_relative_bounds(el, origin);
     let (facts, value) = gather(el, ct_id);
     let states = crate::mapping::map_states(&facts);
@@ -310,6 +305,30 @@ fn gather(el: &UIElement, ct_id: u32) -> (crate::mapping::StateFacts, Option<Str
         checkable,
     };
     (facts, value)
+}
+
+/// `el`'s UIA `HelpText` — the tooltip, and the secondary label the outline renders as
+/// `desc="…"`. Costs one cross-process property read per node.
+///
+/// A failed read degrades to no description, since one unreadable property must not fail a whole
+/// snapshot, but it logs first (the treatment [`toggle_pattern`] already gives its own failures).
+/// It matters more here than the `.ok()` on a pattern probe: `CurrentHelpText` answers an *unset*
+/// property with an empty string, so every `Err` is a genuine COM failure — a stale element, a hung
+/// or disconnected provider, a denied cross-integrity read — never "the app set no help text". The
+/// two must not reach the outline looking alike.
+///
+/// `FullDescription` is UIA's other secondary label; `uiautomation` 0.25 exposes no accessor for it
+/// (only `UIProperty::FullDescription` through `get_property_value`), and no probed app was
+/// observed carrying one.
+fn help_text(el: &UIElement, ct_id: u32) -> String {
+    el.get_help_text().unwrap_or_else(|e| {
+        eprintln!(
+            "glass-a11y-windows: HelpText read failed on control type {ct_id} \
+             (HRESULT {:#010x}: {e}); treating the element as having no description",
+            e.code()
+        );
+        String::new()
+    })
 }
 
 /// UIA `BoundingRectangle` (screen) → window-relative `AxRect`, or `None` for zero-area.
