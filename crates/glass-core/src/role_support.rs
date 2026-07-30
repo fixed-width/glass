@@ -223,21 +223,7 @@ pub const ROLE_SUPPORT: &[(AxRole, [RoleSupport; AxBackend::ALL.len()])] = {
         ),
         (R::Group, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (R::Button, [Mapped, Mapped, Mapped, Mapped, Mapped]),
-        (
-            R::ToggleButton,
-            [
-                Mapped,
-                Mapped,
-                Gap {
-                    unmapped: Some("AXCheckBox"),
-                    why: "AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle \
-                     subrole; AXCheckBox is outside the reader's subrole gate, and no probed \
-                     app emitted either subrole",
-                },
-                Mapped,
-                Mapped,
-            ],
-        ),
+        (R::ToggleButton, [Mapped, Mapped, Mapped, Mapped, Mapped]),
         (
             R::RadioButton,
             [

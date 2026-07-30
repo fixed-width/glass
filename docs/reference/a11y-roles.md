@@ -3,6 +3,12 @@
 `glass_a11y_snapshot` normalizes every platform's accessibility vocabulary into one set of
 roles. This page states which roles each backend can produce.
 
+A platform switch is `ToggleButton` on every backend. The platforms disagree about what a switch
+*is* — AppKit calls it a button, UIKit and SwiftUI call it a checkbox, AT-SPI and UIA have no switch
+at all — so glass reads the `AXSwitch` subrole where one exists and normalizes on the one role the
+five can all produce. A `role:"ToggleButton"` selector written once therefore matches the same
+control everywhere.
+
 Each node also carries the backend's own token — the AT-SPI role, the UIA control type, the AX
 role string, the Android widget class, the iOS role string. When glass has no mapping for a
 token the role is `Other` and the outline shows the token in brackets — `Other(AXDisclosureTriangle)`
@@ -57,7 +63,7 @@ now, and the outline only names the token of an element that has none.
 | `Dialog` | yes | gap | gap | unmarked | unmarked |
 | `Group` | yes | yes | yes | yes | yes |
 | `Button` | yes | yes | yes | yes | yes |
-| `ToggleButton` | yes | yes | gap | yes | yes |
+| `ToggleButton` | yes | yes | yes | yes | yes |
 | `RadioButton` | yes | yes | yes | yes | absent |
 | `CheckBox` | yes | yes | yes | yes | yes |
 | `MenuBar` | yes | yes | yes | absent | absent |
@@ -95,7 +101,6 @@ now, and the outline only names the token of an element that has none.
 - `Dialog` / macOS (AX) — gap (`AXSheet` arrives unmapped): AXSheet, AXPopover and AXDrawer are not mapped yet
 - `Dialog` / Android — unmarked (reports `android.widget.FrameLayout` instead): a framework AlertDialog's panels report FrameLayout and LinearLayout under android:id/parentPanel, and AccessibilityWindowInfo's window types carry no dialog kind for a reader to fall back on
 - `Dialog` / iOS — unmarked: an alert and an action sheet each expose their title, message and buttons directly under the application element, with no container token between
-- `ToggleButton` / macOS (AX) — gap (`AXCheckBox` arrives unmapped): AppKit reports a switch as AXCheckBox with an AXSwitch or AXToggle subrole; AXCheckBox is outside the reader's subrole gate, and no probed app emitted either subrole
 - `RadioButton` / iOS — absent: UIKit has no radio control; a UISegmentedControl — the nearest equivalent — reports one AXTabGroup with no per-segment element
 - `MenuBar` / Android — absent: Android apps have no menu bar
 - `MenuBar` / iOS — absent: iOS apps have no menu bar

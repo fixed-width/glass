@@ -301,9 +301,13 @@ mod tests {
     fn map_matches_declared_column() {
         use glass_core::role_support::{AxBackend, RoleSupport, support};
         for role in AxRole::ALL {
-            // The outline-row/table-row split happens outside the token table (see
-            // `map_role`'s subrole check), so table membership alone would miss TreeItem.
-            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role)
+            // Two roles are produced outside the role-token table (see `map_role`'s subrole
+            // checks): TreeItem from an outline row, and ToggleButton from a switch's subrole.
+            // Table membership alone would call both unmapped.
+            let mapped = ROLE_TOKENS
+                .iter()
+                .chain(SUBROLE_TOKENS)
+                .any(|(_, r)| *r == role)
                 || map_role("AXRow", Some("AXOutlineRow")) == role;
             match support(role, AxBackend::MacOs).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {

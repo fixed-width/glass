@@ -17,6 +17,12 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- A switch now reports the same role on every backend. `glass_a11y_snapshot` called one a
+  `ToggleButton` on Linux, Windows and Android but a `CheckBox` on iOS and a `Button` or `CheckBox`
+  on macOS depending on which toolkit drew it — so a `role:"ToggleButton"` selector that worked on
+  one machine silently matched nothing on another. It is `ToggleButton` everywhere now. A macOS
+  switch drawn with AppKit also gains the checked state it never reported, so `condition:"checked"`
+  works on it.
 - `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
   used to say the reader was available whatever the accessibility API was doing, so the one case you
   need it for — the reader is not answering — showed green. It now reads one attribute off the
