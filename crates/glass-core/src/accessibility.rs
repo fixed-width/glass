@@ -678,11 +678,28 @@ impl AxTarget {
 /// Public and object-safe on purpose: a caller has to be able to write a fake — the case worth
 /// pinning is a signal that fires *constantly*, which must not turn a poll loop into a spin.
 pub trait ChangeSignal: Send {
-    /// Block until a change arrives or `timeout` elapses. `true` means a change arrived, `false`
-    /// means the wait timed out — including permanently, if the subscription died. An
-    /// implementation must never block past `timeout`: the caller's deadline is the only thing
-    /// standing between a dead subscription and a hung wait.
-    fn wait(&mut self, timeout: std::time::Duration) -> bool;
+    /// Block until a change arrives or `timeout` elapses.
+    ///
+    /// Must never block past `timeout`: the caller's deadline is the only thing standing between a
+    /// subscription that stopped delivering and a hung wait.
+    fn wait(&mut self, timeout: std::time::Duration) -> ChangeWait;
+}
+
+/// What a [`ChangeSignal`] learned while waiting.
+///
+/// `Quiet` and `Unusable` are separate answers because a caller does opposite things with them: on
+/// `Quiet` it can skip re-reading the tree, which is the entire saving; on `Unusable` it must go
+/// back to re-reading on the interval, because a signal that can no longer tell would otherwise
+/// look like a permanently quiet app and the wait would never notice the state it is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeWait {
+    /// Something changed — read the tree.
+    Changed,
+    /// Nothing changed within the timeout, and the signal is still trustworthy.
+    Quiet,
+    /// The subscription can no longer report changes (the stream ended, the bus dropped). The
+    /// caller must stop trusting it and resume polling.
+    Unusable,
 }
 
 pub trait Accessibility {

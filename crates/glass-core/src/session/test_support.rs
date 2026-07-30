@@ -4,11 +4,12 @@
 
 pub(crate) use super::*;
 pub(crate) use crate::accessibility::{
-    AxNode, AxRect, AxRole, AxStates, AxTarget, ElementCondition,
+    AxNode, AxRect, AxRole, AxStates, AxTarget, ChangeSignal, ChangeWait, ElementCondition,
 };
 pub(crate) use crate::audit::{Actuation, ActuationContext, AuditOutcome, AuditSink};
 pub(crate) use crate::platform::{SandboxLevel, Segment};
 pub(crate) use std::collections::VecDeque;
+pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::time::Duration;
 
@@ -538,13 +539,22 @@ pub(crate) struct SeqAccessibility {
     idx: usize,
     invoke_behavior: InvokeBehavior,
     invoke_log: Arc<Mutex<Vec<AxTarget>>>,
+    /// How many walks this backend was asked for. Wall-clock cannot tell a wait that waited
+    /// efficiently from one that walked slowly; the count can.
+    walks: Arc<AtomicUsize>,
+    /// What `subscribe_changes` hands back — `None` models every backend without an event stream.
+    signal: Option<fn() -> Box<dyn ChangeSignal>>,
 }
 
 impl Accessibility for SeqAccessibility {
     fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        self.walks.fetch_add(1, Ordering::Relaxed);
         let t = self.trees[self.idx.min(self.trees.len() - 1)].clone();
         self.idx += 1;
         Ok(t)
+    }
+    fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        self.signal.map(|make| make())
     }
     fn set_value(&mut self, _ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
         Ok(())
@@ -578,9 +588,63 @@ pub(crate) fn glass_with_a11y_seq_invoke(
             idx: 0,
             invoke_behavior: behavior,
             invoke_log: invoke_log.clone(),
+            walks: Arc::new(AtomicUsize::new(0)),
+            signal: None,
         }),
     );
     (g, invoke_log)
+}
+
+/// A session whose accessibility backend counts walks and hands out `signal`.
+///
+/// `signal` is a constructor rather than a value because `subscribe_changes` may be called more
+/// than once in a session's life; `None` models a backend with no event stream at all.
+pub(crate) fn glass_with_a11y_counted(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    signal: Option<fn() -> Box<dyn ChangeSignal>>,
+) -> (Glass, Arc<AtomicUsize>) {
+    let walks = Arc::new(AtomicUsize::new(0));
+    let g = glass_with_backend(
+        platform,
+        Box::new(SeqAccessibility {
+            trees,
+            idx: 0,
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
+            walks: walks.clone(),
+            signal,
+        }),
+    );
+    (g, walks)
+}
+
+/// A signal that never reports a change — a quiet UI, where the whole point is that the wait
+/// stops re-walking.
+pub(crate) struct NeverSignals;
+impl ChangeSignal for NeverSignals {
+    fn wait(&mut self, timeout: Duration) -> ChangeWait {
+        std::thread::sleep(timeout);
+        ChangeWait::Quiet
+    }
+}
+
+/// A signal that stops working immediately — the case that must degrade to polling rather than to
+/// a wait that never looks again.
+pub(crate) struct DeadSignal;
+impl ChangeSignal for DeadSignal {
+    fn wait(&mut self, _timeout: Duration) -> ChangeWait {
+        ChangeWait::Unusable
+    }
+}
+
+/// A signal that always reports a change immediately — a chatty app. The loop must stay bounded by
+/// its deadline rather than spinning on it.
+pub(crate) struct AlwaysSignals;
+impl ChangeSignal for AlwaysSignals {
+    fn wait(&mut self, _timeout: Duration) -> ChangeWait {
+        ChangeWait::Changed
+    }
 }
 
 pub(crate) fn named_node(id: u32, role: AxRole, name: &str, bounds: AxRect) -> AxNode {

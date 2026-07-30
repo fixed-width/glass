@@ -370,21 +370,47 @@ impl Glass {
     /// the backend has no accessibility reader (the first snapshot fails).
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
-        let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
-            let tree = self.a11y_resnapshot()?; // fresh snapshot; assigns ids, caches, pumps
-            Ok(
-                match element_match(
-                    &tree,
-                    params.name.as_deref(),
-                    params.role,
-                    params.value_contains.as_deref(),
-                    params.condition,
-                ) {
-                    ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
-                    ElementMatch::Pending => None,
+        // Subscribed before the first walk: a change landing between the two would otherwise be
+        // lost, and the wait would sleep out an interval on a tree that already matches.
+        let mut signal = self.subscribe_a11y_changes();
+        let outcome = crate::poll::poll_until_with_pause(
+            params.interval_ms,
+            params.timeout_ms,
+            // A backend that can say "nothing changed" saves the walk; one that cannot sleeps
+            // exactly as before. Either way the interval bounds the wait, so a subscription that
+            // dies silently costs latency, never a hang.
+            |d| match signal.as_mut() {
+                Some(s) => match s.wait(d) {
+                    ChangeWait::Changed => true,
+                    ChangeWait::Quiet => false,
+                    // A signal that can no longer tell must not look like a permanently quiet app,
+                    // or the wait would stop reading the tree and never see what it waits for.
+                    ChangeWait::Unusable => {
+                        signal = None;
+                        true
+                    }
                 },
-            )
-        })?;
+                None => {
+                    std::thread::sleep(d);
+                    true
+                }
+            },
+            || {
+                let tree = self.a11y_resnapshot()?; // fresh snapshot; assigns ids, caches, pumps
+                Ok(
+                    match element_match(
+                        &tree,
+                        params.name.as_deref(),
+                        params.role,
+                        params.value_contains.as_deref(),
+                        params.condition,
+                    ) {
+                        ElementMatch::Satisfied(node) => Some(node.map(ElementInfo::from_node)),
+                        ElementMatch::Pending => None,
+                    },
+                )
+            },
+        )?;
         Ok(WaitElementOutcome {
             matched: outcome.value.is_some(),
             element: outcome.value.flatten(),
@@ -1153,6 +1179,91 @@ mod tests {
         let e = o.element.expect("matched element");
         assert_eq!(e.id, AxNodeId(1));
         assert_eq!(e.name.as_deref(), Some("Save"));
+    }
+
+    /// A condition the fixed fake tree never satisfies, so the wait runs its full budget.
+    fn never_matches(interval_ms: u64, timeout_ms: u64) -> WaitElementParams {
+        WaitElementParams {
+            name: Some("Save".into()),
+            role: None,
+            value_contains: None,
+            condition: ElementCondition::Checked,
+            interval_ms,
+            timeout_ms,
+        }
+    }
+
+    #[test]
+    fn a_quiet_wait_walks_once() {
+        // The point of the change: told nothing changed, the wait must not re-read the tree. On a
+        // real backend each of those reads is a full walk — 732ms on a 1500-node AT-SPI tree.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(20, 120)).unwrap();
+
+        assert!(!o.matched);
+        assert_eq!(walks.load(Ordering::Relaxed), 1, "a quiet wait re-walked");
+    }
+
+    #[test]
+    fn a_signal_that_never_stops_firing_stays_bounded_by_the_deadline() {
+        // A chatty app must not turn the loop into a spin: the pause may return early, but the
+        // deadline still governs, so the walk count stays in the same order as the interval allows.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(AlwaysSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(20, 60)).unwrap();
+
+        assert!(!o.matched);
+        let n = walks.load(Ordering::Relaxed);
+        assert!(n > 1, "an always-firing signal should re-walk; walked {n}");
+    }
+
+    #[test]
+    fn a_signal_that_stops_working_falls_back_to_polling() {
+        // The failure that would be invisible: a dead subscription reports no changes, which is
+        // indistinguishable from a quiet app unless it says so — and a wait that believed it would
+        // stop reading the tree and never see what it is waiting for.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(DeadSignal) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(20, 80)).unwrap();
+
+        assert!(!o.matched);
+        assert!(
+            walks.load(Ordering::Relaxed) > 1,
+            "a dead signal must degrade to polling, not to silence"
+        );
+    }
+
+    #[test]
+    fn a_backend_without_a_signal_polls_exactly_as_before() {
+        // Every backend but one has no event stream, and two never can. Their waits must keep the
+        // behaviour they had: re-walk each interval.
+        let (mut g, walks) =
+            glass_with_a11y_counted(FakePlatform::new(100, 100), vec![fake_tree_enabled()], None);
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(10, 80)).unwrap();
+
+        assert!(!o.matched);
+        assert!(
+            walks.load(Ordering::Relaxed) > 1,
+            "a backend with no signal stopped polling"
+        );
     }
 
     #[test]
