@@ -17,6 +17,16 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
+  used to say the reader was available whatever the accessibility API was doing, so the one case you
+  need it for — the reader is not answering — showed green. It now makes a system-wide accessibility
+  read and reports what happened, with the error code: a process that is not trusted and a host that
+  withholds its accessibility trees (a locked screen does this) are different lines with different
+  remedies.
+- `glass doctor`'s iOS device line now says whether a simulator is *booted*. It reported how many
+  were available, which reads as ready when nothing is running and every iOS call is about to fail.
+  It names the booted one — the same one a driving call would attach to — and warns with a remedy
+  when there is none. The doctor still boots nothing.
 - `glass_set_value` now tells you when a write did not take on Android (without the on-device
   accessibility service) and on the iOS Simulator. Those two backends tap the element, clear it and
   type — and used to report success without ever looking again, so a tap that landed slightly off, a
