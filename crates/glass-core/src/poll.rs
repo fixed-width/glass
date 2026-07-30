@@ -40,6 +40,10 @@ pub fn poll_until<T>(
 ///
 /// The deadline is checked every iteration, tick or no tick, so a `pause` that always says "skip"
 /// still ends the loop on time; and a `pause` that never blocks spins only until the deadline.
+///
+/// `pause` is called even when `interval_ms` is 0 — sleeping for zero is what the default does, and
+/// a caller whose pause can *skip* must decide for itself whether a zero interval leaves it
+/// anything to wait for.
 pub fn poll_until_with_pause<T>(
     interval_ms: u64,
     timeout_ms: u64,
@@ -61,11 +65,7 @@ pub fn poll_until_with_pause<T>(
                 elapsed_ms: start.elapsed().as_millis() as u64,
             });
         }
-        run_tick = if interval_ms > 0 {
-            pause(Duration::from_millis(interval_ms))
-        } else {
-            true
-        };
+        run_tick = pause(Duration::from_millis(interval_ms));
     }
 }
 

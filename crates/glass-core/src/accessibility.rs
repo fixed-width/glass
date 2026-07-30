@@ -676,8 +676,10 @@ impl AxTarget {
 pub trait ChangeSignal: Send {
     /// Block until a change arrives or `timeout` elapses.
     ///
-    /// Must never block past `timeout`: the caller's deadline is the only thing standing between a
-    /// subscription that stopped delivering and a hung wait.
+    /// Must never block past `timeout`, and must actually block for it when there is nothing to
+    /// report: the deadline is the only thing standing between a subscription that stopped
+    /// delivering and a hung wait, and an implementation that returns instantly every time turns
+    /// the caller's poll loop into a spin.
     fn wait(&mut self, timeout: std::time::Duration) -> ChangeWait;
 }
 

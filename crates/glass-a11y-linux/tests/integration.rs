@@ -1203,13 +1203,12 @@ fn a_quiet_wait_stops_re_walking_the_tree() {
     glass.stop().expect("stop");
 
     // Logged: the number is the point of the change.
-    eprintln!("quiet 3s wait at 100ms: {walked} walks (polling would be ~30)");
+    eprintln!("quiet 3s wait at 100ms: {walked} walks (polling took 22)");
     assert!(!out.matched, "the element must not exist");
     // See `Counting`: without this the test could measure polling and pass.
     assert!(subscribed > 0, "no subscription was established");
-    // Polling at 100ms over 3s would walk ~30 times, and the fixture is quiet.
-    // Three: one at the start, plus the forced re-read the quiet ceiling makes about once a
-    // second. Polling the same wait takes ~30.
+    // One read at the start plus the ceiling's forced re-read about once a second — 3 measured,
+    // against 22 for the same wait polling.
     assert!(
         walked <= 5,
         "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"

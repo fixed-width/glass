@@ -2,7 +2,7 @@
 //! and the wait/scroll parameter and outcome types.
 use super::*;
 
-/// How many consecutive "nothing changed" answers to accept before reading the tree anyway.
+/// How many "nothing changed" answers to accept before reading the tree anyway.
 ///
 /// A signal reports the change classes it subscribed to, from the senders it resolved; anything
 /// outside that would otherwise let a wait answer "not matched" without ever looking again — a
@@ -397,7 +397,7 @@ impl Glass {
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
-        let mut quiet_runs = 0u32;
+        let mut quiet_budget = QUIET_RUNS_BEFORE_REREAD;
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
@@ -405,29 +405,17 @@ impl Glass {
             // exactly as before.
             |d| {
                 let paused_at = std::time::Instant::now();
-                match signal.as_mut() {
+                let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(d) {
-                        ChangeWait::Changed => {
-                            quiet_runs = 0;
-                            // Wake early, but never walk sooner than one interval after the last one.
-                            // A chatty app (spinner, clock, progress bar) would otherwise drive
-                            // back-to-back walks with no gap, hammering the same bus the app is trying
-                            // to serve: the interval is a contract with the app under test, not just a
-                            // sleep the caller wanted skipped.
-                            let spent = paused_at.elapsed();
-                            if spent < d {
-                                std::thread::sleep(d - spent);
-                            }
-                            true
-                        }
+                        ChangeWait::Changed => true,
                         // Re-read anyway now and then. The signal reports the change classes it
-                        // subscribed to, from the sender it resolved; anything outside that would
+                        // subscribed to, from the senders it resolved; anything outside that would
                         // otherwise make the wait answer "not matched" without ever looking — turning
                         // a cost optimization into a wrong result.
                         ChangeWait::Quiet => {
-                            quiet_runs += 1;
-                            if quiet_runs >= QUIET_RUNS_BEFORE_REREAD {
-                                quiet_runs = 0;
+                            quiet_budget = quiet_budget.saturating_sub(1);
+                            if quiet_budget == 0 {
+                                quiet_budget = QUIET_RUNS_BEFORE_REREAD;
                                 true
                             } else {
                                 false
@@ -439,11 +427,14 @@ impl Glass {
                             true
                         }
                     },
-                    None => {
-                        std::thread::sleep(d);
-                        true
-                    }
-                }
+                    None => true,
+                };
+                // One interval between reads, whatever woke us. A chatty app (spinner, clock,
+                // progress bar) would otherwise drive back-to-back walks with no gap, hammering the
+                // same bus the app is trying to serve — and a signal that returns early without
+                // blocking, which nothing here can enforce, would spin this loop at full tilt.
+                std::thread::sleep(d.saturating_sub(paused_at.elapsed()));
+                read_now
             },
             || {
                 let tree = self.a11y_resnapshot()?; // fresh snapshot; assigns ids, caches, pumps
@@ -1267,6 +1258,26 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_that_never_blocks_does_not_spin_the_loop() {
+        // `wait` must block for the timeout it is handed, and nothing in the seam can enforce that,
+        // so the loop paces itself: a signal that answers instantly would otherwise turn a 200ms
+        // wait into 200ms of a pegged core.
+        QUIET_WITHOUT_BLOCKING_CALLS.store(0, Ordering::Relaxed);
+        let (mut g, _walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(QuietWithoutBlocking) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let _ = g.wait_for_element(&never_matches(20, 200)).unwrap();
+
+        // Ten intervals fit in the budget; a spin runs to thousands.
+        let calls = QUIET_WITHOUT_BLOCKING_CALLS.load(Ordering::Relaxed);
+        assert!(calls <= 40, "the loop spun: {calls} pauses in ten intervals");
+    }
+
+    #[test]
     fn a_change_wakes_the_wait_and_it_finds_the_element() {
         // The contract, which every other test here leaves untested: they all wait for something
         // that never matches, so they would pass on a wait that skipped every read forever.
@@ -1306,16 +1317,85 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(20, 100)).unwrap();
+        let o = g.wait_for_element(&never_matches(20, 200)).unwrap();
 
         assert!(!o.matched);
         let n = walks.load(Ordering::Relaxed);
-        assert!(n > 1, "an always-firing signal should re-walk; walked {n}");
-        // And no faster than polling would: waking early must not remove the interval's ceiling,
-        // or a chatty app turns every wait into back-to-back walks against the app's own bus.
+        // A band, not a ceiling. Too many: waking early removed the interval's pacing, and a
+        // chatty app drives back-to-back walks against the bus it is trying to serve. Too few: the
+        // pacing over-sleeps, making the wake slower than the polling it replaced.
         assert!(
-            n <= 100 / 20 + 2,
-            "a chatty app drove {n} walks in 100ms at a 20ms interval"
+            (7..=12).contains(&n),
+            "a chatty app drove {n} walks in 200ms at a 20ms interval"
+        );
+    }
+
+    #[test]
+    fn a_long_quiet_wait_reads_anyway_now_and_then() {
+        // The ceiling: a signal reports only what it subscribed to, so believing "quiet" forever
+        // would let a wait answer "not matched" without ever looking again. 25 intervals is two
+        // ceilings, so two forced reads on top of the first.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(10, 250)).unwrap();
+
+        assert!(!o.matched);
+        let n = walks.load(Ordering::Relaxed);
+        assert!(
+            (2..=5).contains(&n),
+            "a quiet 250ms wait at a 10ms interval read {n} times; the ceiling is not firing"
+        );
+    }
+
+    #[test]
+    fn an_interval_of_zero_does_not_subscribe() {
+        // With no pause there is nothing a signal could save, and subscribing is a round-trip of
+        // its own — paid, on a real backend, out of the caller's budget.
+        let (mut g, walks, subscribes) = glass_with_a11y_counted_subs(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(0, 30)).unwrap();
+
+        assert!(!o.matched);
+        assert_eq!(
+            subscribes.load(Ordering::Relaxed),
+            0,
+            "subscribed for nothing"
+        );
+        assert!(
+            walks.load(Ordering::Relaxed) > 1,
+            "an interval of 0 must keep re-reading"
+        );
+    }
+
+    #[test]
+    fn a_change_arriving_mid_interval_still_paces_the_next_read() {
+        // The pacing is "wake early, but no sooner than one interval after the last read". A signal
+        // whose change lands halfway through is what tells the two arithmetics apart: sleeping the
+        // *remainder* keeps one read per interval, sleeping the elapsed time again halves the rate.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            Some(|| Box::new(ChangesMidInterval) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(20, 200)).unwrap();
+
+        assert!(!o.matched);
+        let n = walks.load(Ordering::Relaxed);
+        assert!(
+            (7..=12).contains(&n),
+            "a mid-interval change drove {n} walks in 200ms at a 20ms interval"
         );
     }
 

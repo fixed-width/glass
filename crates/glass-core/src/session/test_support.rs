@@ -544,6 +544,9 @@ pub(crate) struct SeqAccessibility {
     walks: Arc<AtomicUsize>,
     /// What `subscribe_changes` hands back — `None` models every backend without an event stream.
     signal: Option<fn() -> Box<dyn ChangeSignal>>,
+    /// How many times a subscription was asked for. A wait that subscribes when it cannot use the
+    /// signal pays a round-trip for nothing.
+    subscribes: Arc<AtomicUsize>,
 }
 
 impl Accessibility for SeqAccessibility {
@@ -554,6 +557,7 @@ impl Accessibility for SeqAccessibility {
         Ok(t)
     }
     fn subscribe_changes(&mut self, _ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        self.subscribes.fetch_add(1, Ordering::Relaxed);
         self.signal.map(|make| make())
     }
     fn set_value(&mut self, _ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
@@ -590,6 +594,7 @@ pub(crate) fn glass_with_a11y_seq_invoke(
             invoke_log: invoke_log.clone(),
             walks: Arc::new(AtomicUsize::new(0)),
             signal: None,
+            subscribes: Arc::new(AtomicUsize::new(0)),
         }),
     );
     (g, invoke_log)
@@ -604,7 +609,18 @@ pub(crate) fn glass_with_a11y_counted(
     trees: Vec<AxTree>,
     signal: Option<fn() -> Box<dyn ChangeSignal>>,
 ) -> (Glass, Arc<AtomicUsize>) {
+    let (g, walks, _) = glass_with_a11y_counted_subs(platform, trees, signal);
+    (g, walks)
+}
+
+/// [`glass_with_a11y_counted`], also reporting how many times a subscription was requested.
+pub(crate) fn glass_with_a11y_counted_subs(
+    platform: FakePlatform,
+    trees: Vec<AxTree>,
+    signal: Option<fn() -> Box<dyn ChangeSignal>>,
+) -> (Glass, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let walks = Arc::new(AtomicUsize::new(0));
+    let subscribes = Arc::new(AtomicUsize::new(0));
     let g = glass_with_backend(
         platform,
         Box::new(SeqAccessibility {
@@ -614,9 +630,10 @@ pub(crate) fn glass_with_a11y_counted(
             invoke_log: Arc::new(Mutex::new(Vec::new())),
             walks: walks.clone(),
             signal,
+            subscribes: subscribes.clone(),
         }),
     );
-    (g, walks)
+    (g, walks, subscribes)
 }
 
 /// A signal that never reports a change — a quiet UI.
@@ -646,6 +663,30 @@ impl ChangeSignal for SignalsOnce {
             return ChangeWait::Changed;
         }
         std::thread::sleep(timeout);
+        ChangeWait::Quiet
+    }
+}
+
+/// A signal that reports a change partway through each wait — a chatty app whose events arrive
+/// mid-interval, which is what makes the caller's pacing arithmetic observable.
+pub(crate) struct ChangesMidInterval;
+impl ChangeSignal for ChangesMidInterval {
+    fn wait(&mut self, timeout: Duration) -> ChangeWait {
+        std::thread::sleep(timeout / 2);
+        ChangeWait::Changed
+    }
+}
+
+/// A signal that answers `Quiet` without blocking for the timeout — an implementation that keeps
+/// half of [`ChangeSignal::wait`]'s contract. The loop must survive it; counted, because the
+/// failure is CPU burn, which nothing else here would notice.
+pub(crate) struct QuietWithoutBlocking;
+
+pub(crate) static QUIET_WITHOUT_BLOCKING_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+impl ChangeSignal for QuietWithoutBlocking {
+    fn wait(&mut self, _timeout: Duration) -> ChangeWait {
+        QUIET_WITHOUT_BLOCKING_CALLS.fetch_add(1, Ordering::Relaxed);
         ChangeWait::Quiet
     }
 }

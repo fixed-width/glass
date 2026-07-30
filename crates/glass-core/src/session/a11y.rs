@@ -44,8 +44,10 @@ impl Glass {
     pub(crate) fn subscribe_a11y_changes(&mut self) -> Option<Box<dyn ChangeSignal>> {
         let s = self.active_mut().ok()?;
         // Reader check first, like `snapshot_at_current_limits`: the accessors below are platform
-        // round-trips (`app_pids` shells out to `adb` on Android), and a backend with no reader —
-        // or one taking the default `None` — must not pay them for a subscription it cannot have.
+        // round-trips (`app_pids` shells out to `adb` on Android), and a backend with no reader at
+        // all must not pay them for a subscription it cannot have. A reader that has one but takes
+        // the default `None` still pays — once per wait, inside the caller's budget, because
+        // nothing short of asking it can tell.
         s.accessibility.as_ref()?;
         // The cached geometry, deliberately: subscribing must not depend on a window round-trip
         // that can fail, because failing to subscribe has to degrade to polling rather than to an

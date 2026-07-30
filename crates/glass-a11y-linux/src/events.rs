@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use atspi::connection::AccessibilityConnection;
 use glass_core::{AxContext, ChangeSignal, ChangeWait};
+use zbus::export::futures_core;
 
 /// Whether an event from `emitter` concerns the app glass is driving — a unique-name match
 /// (`:1.15`) against every connection the app publishes from.
@@ -112,6 +113,13 @@ async fn pump(
     ready: std::sync::mpsc::Sender<bool>,
     running: Arc<AtomicBool>,
 ) {
+    // No pid hint means `app_matches` accepts every app on the registry, so the filter below would
+    // pass everything and the wait would re-read on any app's event — polling, with a subscription's
+    // cost on top. Declining is the same behaviour it has today, for less.
+    if ctx.pids.is_empty() {
+        let _ = ready.send(false);
+        return;
+    }
     let Some(addr) = ctx.a11y_bus_addr.as_deref() else {
         let _ = ready.send(false);
         return;
@@ -141,9 +149,39 @@ async fn pump(
     // The stream is attached *before* the handshake, not after: until `event_stream` runs there is
     // no active receiver on the connection, and zbus drops messages that arrive with none. The
     // match rule alone does not hold them — which is the race the handshake exists to close.
-    let stream = conn.event_stream();
-    let mut stream = std::pin::pin!(stream);
-    let _ = ready.send(true);
+    {
+        let stream = conn.event_stream();
+        let mut stream = std::pin::pin!(stream);
+        let _ = ready.send(true);
+        forward(&mut stream, &tx, &app_bus_names, &running).await;
+    }
+    // Outside the block, so the stream is dropped first: it is no longer polled, and zbus's message
+    // channel is bounded and does not overflow, so a burst arriving during these round-trips would
+    // stall delivery of their own replies and park this thread forever — reinstating the leak the
+    // shutdown exists to remove. Bounded for the same reason.
+    //
+    // Leaving the registration behind would keep every app on the bus forwarding object events to
+    // a listener nobody reads.
+    let _ = tokio::time::timeout(
+        DEREGISTER_TIMEOUT,
+        conn.deregister_event::<atspi_common::events::ObjectEvents>(),
+    )
+    .await;
+}
+
+/// Forward this app's events until the signal is dropped, the stream ends, or it stops parsing.
+///
+/// Split out so every way of leaving it returns to one caller: the deregister below used to be
+/// reachable from only one of four exits, so the common end-of-wait path — an event arriving after
+/// the signal was dropped — left the registration behind.
+async fn forward(
+    stream: &mut std::pin::Pin<
+        &mut impl futures_core::Stream<Item = Result<atspi::Event, atspi::AtspiError>>,
+    >,
+    tx: &SyncSender<()>,
+    app_bus_names: &[String],
+    running: &AtomicBool,
+) {
     let mut consecutive_errors = 0u32;
     while running.load(Ordering::Relaxed) {
         // Bounded, so a dropped signal is noticed on a quiet app too: the stream itself never ends
@@ -151,9 +189,7 @@ async fn pump(
         // `poll_next` forever waiting for an event that may never come.
         let next = tokio::time::timeout(
             SHUTDOWN_CHECK,
-            std::future::poll_fn(|cx| {
-                zbus::export::futures_core::Stream::poll_next(stream.as_mut(), cx)
-            }),
+            std::future::poll_fn(|cx| futures_core::Stream::poll_next(stream.as_mut(), cx)),
         )
         .await;
         match next {
@@ -161,7 +197,7 @@ async fn pump(
             // says the same thing, so dropping this one loses nothing.
             Ok(Some(Ok(ev))) => {
                 consecutive_errors = 0;
-                if emitter_bus_name(&ev).is_some_and(|n| concerns_app(&app_bus_names, &n))
+                if emitter_bus_name(&ev).is_some_and(|n| concerns_app(app_bus_names, &n))
                     && tx
                         .try_send(())
                         .is_err_and(|e| matches!(e, std::sync::mpsc::TrySendError::Disconnected(_)))
@@ -185,12 +221,11 @@ async fn pump(
             Err(_) => {}
         }
     }
-    // Leaving the registration behind would keep every app on the desktop forwarding object
-    // events to a bus nobody reads.
-    let _ = conn
-        .deregister_event::<atspi_common::events::ObjectEvents>()
-        .await;
 }
+
+/// How long to wait for the registry to accept the unsubscribe. Bounded because a hung teardown is
+/// the leak again, wearing a different hat.
+const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the pump waits for an event before re-checking whether its signal still exists. Short
 /// enough that a dropped signal frees the thread promptly, long enough not to spin.
@@ -216,8 +251,7 @@ mod tests {
 
     #[test]
     fn only_this_apps_events_count() {
-        // The stream carries the whole session: unrelated desktop applications emit onto it, so an
-        // unfiltered wait would wake on a clock tick in another window.
+        // The bus carries every registered app, so an unfiltered wait would wake on another one.
         let app = vec![":1.15".to_string()];
         assert!(concerns_app(&app, ":1.15"));
         assert!(!concerns_app(&app, ":1.42"));
