@@ -6,7 +6,8 @@
 //! Field names below are the external contract, taken verbatim from real
 //! `idb ui describe-all --nested --json` output (`tests/fixtures/describe_nested.json`):
 //! - role in `role` (AX-prefixed, e.g. `AXButton`; the sibling `type` field holds the
-//!   un-prefixed form `Button` and is not used here),
+//!   un-prefixed form `Button` and is not used here), and its `subrole`, present on every node and
+//!   null where there is none — a `UISwitch` is the case that carries one (`AXSwitch`),
 //! - stable id in `AXUniqueId`, display label in `AXLabel`, value in `AXValue`.
 //!   The id becomes the node `name` when present; a non-editable element's `AXLabel`
 //!   is then surfaced as its `value` so the visible text is not lost,
@@ -616,6 +617,16 @@ mod tests {
             checkable_checked(AxRole::ToggleButton, Some("0")),
             (true, false)
         );
+    }
+
+    #[test]
+    fn the_fixture_of_record_carries_a_switch_and_maps_it() {
+        // The claim this whole change rests on, checked against the captured device output rather
+        // than against JSON written in this file: a UISwitch arrives as AXCheckBox + AXSwitch.
+        let tree = build_tree(FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).expect("parse");
+        let sw = find_by_name(&tree.root, "toggleSwitch").expect("the fixture carries a switch");
+        assert_eq!(sw.role, AxRole::ToggleButton);
+        assert!(sw.states.checkable && sw.states.checked, "{:?}", sw.states);
     }
 
     #[test]

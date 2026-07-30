@@ -31,6 +31,12 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
         let stepper = UIStepper()
         stepper.accessibilityIdentifier = "the-stepper"
 
+        // idb reports a UISwitch as role AXCheckBox with subrole AXSwitch; glass maps it to
+        // ToggleButton, so this is the control that keeps that mapping re-readable on device.
+        let toggle = UISwitch()
+        toggle.isOn = true
+        toggle.accessibilityIdentifier = "the-switch"
+
         let progress = UIProgressView(progressViewStyle: .default)
         progress.progress = 0.4
         progress.accessibilityIdentifier = "the-progress"
@@ -62,6 +68,7 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
             ])
 
         let stack = UIStackView(arrangedSubviews: [
+            toggle,
             segmented, stepper, progress, picker, sheetButton, alertButton, menuButton, table,
         ])
         stack.axis = .vertical
