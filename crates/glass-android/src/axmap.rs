@@ -269,9 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_is_a_togglebutton_here_as_on_every_other_backend() {
-        // Already true; pinned because iOS and macOS were changed to agree with it, and a mapping
-        // edit that moved this one would re-split the role for the same control.
+    fn a_switch_is_a_togglebutton_here_as_on_the_two_apple_backends() {
+        // Already true; pinned because iOS and macOS were changed to agree with it. Not Linux:
+        // a GTK4 switch is published over AT-SPI as a check box and cannot be told from one.
         for class in [
             "android.widget.Switch",
             "androidx.appcompat.widget.SwitchCompat",

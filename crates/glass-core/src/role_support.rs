@@ -56,22 +56,12 @@ impl AxBackend {
         AxBackend::Ios,
     ];
 
-    /// Compile-time guard for [`AxBackend::ALL`] — never called, and exists only for its
-    /// exhaustive match. Every completeness claim on the matrix is quantified over `ALL`, so a
-    /// new backend that is not added there would silently weaken all of them; this match stops
-    /// compiling until the new variant is listed here and in `ALL`.
-    #[expect(dead_code, reason = "exists only for its exhaustive match")]
-    fn all_is_exhaustive(backend: AxBackend) {
-        match backend {
-            AxBackend::Linux
-            | AxBackend::Windows
-            | AxBackend::MacOs
-            | AxBackend::Android
-            | AxBackend::Ios => {}
-        }
-    }
-
     /// Human-readable column heading, naming the native vocabulary.
+    ///
+    /// Also the compile-time guard for [`AxBackend::ALL`]: every completeness claim on the matrix
+    /// is quantified over `ALL`, so a backend missing from it would silently weaken all of them,
+    /// and this exhaustive match stops compiling until a new variant is classified here. (A
+    /// never-called guard function did that job before; it could not be tested, only compiled.)
     pub fn label(self) -> &'static str {
         match self {
             AxBackend::Linux => "Linux (AT-SPI)",
@@ -719,6 +709,62 @@ pub fn render_markdown() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_lists_each_backend_exactly_once() {
+        // `ALL` is what every completeness claim is quantified over, and `label`'s exhaustive match
+        // is what stops a new variant being added without being classified. Distinct labels are the
+        // observable half: a duplicated entry would quietly halve a claim's coverage.
+        let mut labels: Vec<&str> = AxBackend::ALL.iter().map(|b| b.label()).collect();
+        let listed = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), listed, "a backend is listed twice in ALL");
+        assert_eq!(
+            labels,
+            [
+                "Android",
+                "Linux (AT-SPI)",
+                "Windows (UIA)",
+                "iOS",
+                "macOS (AX)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cell_names_the_token_it_carries() {
+        // `named_token` is what makes a cell checkable: each backend's column test resolves the
+        // token through its own map and asserts it does not produce the role. A cell that stopped
+        // reporting its token would make every one of those assertions vacuous.
+        assert_eq!(RoleSupport::Mapped.named_token(), None);
+        assert_eq!(
+            RoleSupport::Gap {
+                unmapped: Some("AXSheet"),
+                why: "not mapped yet",
+            }
+            .named_token(),
+            Some("AXSheet")
+        );
+        assert_eq!(
+            RoleSupport::NotApplicable {
+                basis: Basis::Unmarked,
+                instead: Some("AXGroup"),
+                why: "reports a plain container",
+            }
+            .named_token(),
+            Some("AXGroup")
+        );
+        // A cell whose carrier is a field rather than a token names none.
+        assert_eq!(
+            RoleSupport::Gap {
+                unmapped: None,
+                why: "the reader does not read the property",
+            }
+            .named_token(),
+            None
+        );
+    }
 
     #[test]
     fn every_role_has_exactly_one_row() {

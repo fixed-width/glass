@@ -340,8 +340,9 @@ fn read_label(el: &AXUIElement, attr_name: &str) -> Option<String> {
 /// Known limit, and the reason the log line matters more since the gate widened: a failed read on a
 /// switch degrades it to the plain `Button` or `CheckBox` its base role names, which is a valid
 /// interactive role rather than an obviously-wrong one, and nothing in the emitted tree marks it.
-/// The node is still actuable — the click path keys off `checkable`, which is also lost — so the
-/// symptom an agent sees is a switch it cannot select by role or verify by state. A failure still degrades to `None` — one
+/// Clicking it still works (this backend actuates by pointer or native action, neither of which
+/// consults the role), so the symptom is a switch an agent cannot select by role or verify by
+/// state — not one it cannot press. A failure still degrades to `None` — one
 /// unreadable attribute must not fail a whole snapshot — but it logs first, the same
 /// diagnostic-not-silence treatment `ffi::children` and `ffi::action_names` already get. Costs
 /// exactly the one attribute copy the direct read did.

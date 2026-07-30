@@ -67,16 +67,24 @@ pub fn ax_role(role: &str) -> AxRole {
 
 /// Subroles that decide a role on their own, whatever base role carries them.
 ///
+/// Subroles that decide a role, and the base roles that can carry one.
+///
 /// A `UISwitch` reports `role=AXCheckBox subrole=AXSwitch` (measured on iOS 26.5); macOS puts the
-/// same subrole on a different base role again (`AXButton` for an AppKit `NSSwitch`). The subrole is
-/// what the platforms agree on, so it is matched on its own rather than as a (role, subrole) pair.
-pub const SUBROLE_TOKENS: &[(&str, AxRole)] = &[("AXSwitch", AxRole::ToggleButton)];
+/// same subrole on `AXButton` as well, for an AppKit `NSSwitch`. The subrole is what the platforms
+/// agree on — but it is still matched against the base roles known to carry it, so one stray
+/// attribute cannot re-role an unrelated node.
+pub const SUBROLE_TOKENS: &[(&str, AxRole, &[&str])] =
+    &[("AXSwitch", AxRole::ToggleButton, &["AXCheckBox"])];
 
 /// [`ax_role`], but a subrole in [`SUBROLE_TOKENS`] wins over the base role.
 pub fn ax_role_with_subrole(role: &str, subrole: Option<&str>) -> AxRole {
     subrole
-        .and_then(|sub| SUBROLE_TOKENS.iter().find(|(token, _)| *token == sub))
-        .map(|(_, r)| *r)
+        .and_then(|sub| {
+            SUBROLE_TOKENS
+                .iter()
+                .find(|(token, _, bases)| *token == sub && bases.contains(&role))
+                .map(|(_, r, _)| *r)
+        })
         .unwrap_or_else(|| ax_role(role))
 }
 
@@ -152,8 +160,9 @@ pub fn build_tree(
     Ok(tree)
 }
 
-/// iOS `(checkable, checked)` from the normalized role and idb's `AXValue` string. A UISwitch
-/// reports role AXCheckBox/AXSwitch/AXToggle with AXValue "0"/"1". Claims `checkable` ONLY for a
+/// iOS `(checkable, checked)` from the normalized role and idb's `AXValue` string. A `UISwitch`
+/// reports `role=AXCheckBox` with `subrole=AXSwitch` — normalized to `ToggleButton` by
+/// [`ax_role_with_subrole`] — and `AXValue` `"0"`/`"1"`. Claims `checkable` ONLY for a
 /// determinate "0"/"1" on a checkable role (the #170 invariant); anything else → (false, false).
 fn checkable_checked(role: AxRole, ax_value: Option<&str>) -> (bool, bool) {
     match role {
@@ -599,6 +608,12 @@ mod tests {
     #[test]
     fn a_real_checkbox_is_still_a_checkbox() {
         assert_eq!(ax_role_with_subrole("AXCheckBox", None), AxRole::CheckBox);
+        // A carrying base role is required, as on macOS: a subrole on something else is not a
+        // switch, and matching it anywhere would let one stray attribute re-role any node.
+        assert_eq!(
+            ax_role_with_subrole("AXCell", Some("AXSwitch")),
+            AxRole::Cell
+        );
         assert_eq!(
             ax_role_with_subrole("AXCheckBox", Some("AXSomethingElse")),
             AxRole::CheckBox
@@ -659,10 +674,12 @@ mod tests {
         for role in AxRole::ALL {
             // Both tables: a role this backend can only produce from a subrole (a switch) is as
             // mapped as one produced from a role token, and the matrix does not distinguish them.
-            let mapped = ROLE_TOKENS
-                .iter()
-                .chain(SUBROLE_TOKENS)
-                .any(|(_, r)| *r == role);
+            let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role)
+                || SUBROLE_TOKENS.iter().any(|(sub, _, bases)| {
+                    bases
+                        .iter()
+                        .any(|base| ax_role_with_subrole(base, Some(sub)) == role)
+                });
             match support(role, AxBackend::Ios).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no token maps to it")

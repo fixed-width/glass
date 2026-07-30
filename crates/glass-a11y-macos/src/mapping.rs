@@ -157,12 +157,9 @@ pub fn checkable_checked(role: AxRole, ax_value: Option<i64>) -> (bool, bool) {
     if !role_carries_checked(role) {
         return (false, false);
     }
-    match role {
-        AxRole::CheckBox | AxRole::RadioButton | AxRole::ToggleButton => match ax_value {
-            Some(1) => (true, true),
-            Some(0) => (true, false),
-            _ => (false, false),
-        },
+    match ax_value {
+        Some(1) => (true, true),
+        Some(0) => (true, false),
         _ => (false, false),
     }
 }
@@ -220,14 +217,18 @@ mod tests {
     fn the_reader_and_the_judgement_agree_on_which_roles_carry_checked() {
         // The reader gates its AXValue read on this; if the two lists were separate, dropping a
         // role from the reader's copy would cost the state with every test still green.
-        for role in [AxRole::CheckBox, AxRole::RadioButton, AxRole::ToggleButton] {
-            assert!(role_carries_checked(role), "{role:?}");
-            assert_eq!(checkable_checked(role, Some(1)), (true, true), "{role:?}");
+        // Quantified over every role, not a hand-picked few: a role added to one and missed by
+        // the other is exactly the divergence the shared predicate exists to prevent, and a
+        // three-role list could not detect it.
+        for role in AxRole::ALL {
+            assert_eq!(
+                role_carries_checked(role),
+                checkable_checked(role, Some(1)).0,
+                "{role:?} is judged by one and not the other"
+            );
         }
-        for role in [AxRole::Button, AxRole::Label, AxRole::Slider] {
-            assert!(!role_carries_checked(role), "{role:?}");
-            assert_eq!(checkable_checked(role, Some(1)), (false, false), "{role:?}");
-        }
+        assert!(role_carries_checked(AxRole::ToggleButton));
+        assert!(!role_carries_checked(AxRole::Button));
     }
 
     #[test]
@@ -348,9 +349,9 @@ mod tests {
             // not merely fail the dedicated test.
             let mapped = ROLE_TOKENS.iter().any(|(_, r)| *r == role)
                 || map_role("AXRow", Some("AXOutlineRow")) == role
-                || SUBROLE_TOKENS
-                    .iter()
-                    .any(|(sub, _, bases)| map_role(bases[0], Some(sub)) == role);
+                || SUBROLE_TOKENS.iter().any(|(sub, _, bases)| {
+                    bases.iter().any(|base| map_role(base, Some(sub)) == role)
+                });
             match support(role, AxBackend::MacOs).expect("declared in ROLE_SUPPORT") {
                 RoleSupport::Mapped => {
                     assert!(mapped, "{role:?} declared Mapped but no AX role maps to it")

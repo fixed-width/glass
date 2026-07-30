@@ -2492,6 +2492,36 @@ mod tests {
     }
 
     #[test]
+    fn the_combo_path_waits_for_the_popup_to_realize() {
+        // Both re-reads in the combo path are taken after a settle, because an a11y tree read the
+        // instant a popup opens or closes shows the previous state — the options missing, or the
+        // old label still selected. Timed rather than asserted structurally: the settle is a sleep,
+        // so removing it leaves every other assertion in this file green.
+        let platform = FakePlatform::new(340, 300);
+        let (mut g, _invoke_log) = glass_with_a11y_seq_invoke(
+            platform,
+            vec![
+                combo("Acme", &[]),
+                combo("Acme", &["Acme", "Globex"]),
+                combo("Globex", &[]),
+            ],
+            InvokeBehavior::Succeed,
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        let started = std::time::Instant::now();
+        g.set_value(AxNodeId(1), "Globex").unwrap();
+        let elapsed = started.elapsed();
+
+        // Two settles, 250ms each; a generous floor so a loaded machine cannot make this flake.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "combo commit returned in {elapsed:?}, too fast to have settled twice"
+        );
+    }
+
+    #[test]
     fn set_value_on_a_combo_opens_the_popup_with_a_pointer_click_even_when_invoke_succeeds() {
         // The combo commit loop is keyboard navigation (Down/Up/Return), so the popup must be
         // opened by something that takes keyboard focus. A native "expand" action doesn't
