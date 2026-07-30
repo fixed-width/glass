@@ -5,7 +5,7 @@
 //! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
 //! is non-trivial and carries named, role-typed elements. A second test writes into a real
 //! `EditText` and checks that a landed write is confirmed against the live field — including a
-//! clear, which the read-back rule has to treat as a value rather than as a failed read.
+//! clear, which this platform reports by showing the field's hint rather than an empty value.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
@@ -128,7 +128,7 @@ fn set_value_reports_whether_the_write_landed() {
         bounds: field.bounds,
     };
 
-    // A write that lands: reported Ok, and the node at that id really holds it afterwards.
+    // A write that lands: reported Ok, and the node at that id holds it afterwards.
     a11y.set_value(&ctx, &target, "glass")
         .expect("a real write into a real field must succeed");
     let mut after = a11y.snapshot(&ctx).expect("snapshot after write");
@@ -142,9 +142,10 @@ fn set_value_reports_whether_the_write_landed() {
         "field holds {held:?} after the write"
     );
 
-    // Clearing the field: the read-back sees no value at all, which the rule has to read as "empty"
-    // rather than "the read failed" — otherwise this reports failure for a clear that worked. Nothing
-    // else on device exercises that, and it is where the first version of this check was wrong.
+    // Clearing the field, which no other test exercises on a device and which is where the first two
+    // versions of this check were wrong: a rule that read an absent value as "the read failed"
+    // reported every clear as a failure, and a rule that demanded the field read back empty failed
+    // here too, because this field reports its hint instead (see the assertion below).
     //
     // The target is re-located first, deliberately: typing into Settings' search renders a results
     // list, which shifts every pre-order id after it, so the target captured before the write is

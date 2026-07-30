@@ -84,7 +84,8 @@ fn dump_until_ready(
 }
 
 /// Judge a typed `set_value` from a tree read back after it. `Ok(())` only when the field holds
-/// exactly what was asked for.
+/// exactly what was asked for — except for a clear, which `glass_core::typed_clear_landed` judges
+/// differently because an emptied field may report its hint as its value.
 ///
 /// Exact match, not "changed from before": tap-and-type is not atomic, so a dropped key or an input
 /// filter leaves the field holding something that is neither the request nor the old value, and
@@ -545,9 +546,7 @@ mod tests {
 
     #[test]
     fn a_partly_typed_write_is_not_a_successful_write() {
-        // A dropped keystroke leaves text that is neither the request nor the old value. Accepting
-        // "changed from before" would call this success and send an agent on to assert against a
-        // field holding "worl" — which is the whole failure this check exists to prevent.
+        // The reason the rule is an exact match; `typed_text_landed` carries the argument.
         let after = tree_holding(Some("worl"));
         let t = target(0, Some("Search"), Some(BOUNDS));
         assert!(matches!(
