@@ -21,10 +21,10 @@ internal refactors, CI, or test-only changes.
   used to say the reader was available whatever the accessibility API was doing, so the one case you
   need it for — the reader is not answering — showed green. It now reads one attribute off the
   system-wide accessibility element and reports what happened, with the error code. macOS gives the
-  same code for several causes, so the line names the one that applies: not trusted, a locked
-  session, nobody logged in at the console, assistive access switched off, or a stack that stopped
-  answering — each with its own remedy. A locked or logged-out session is a warning rather than a
-  failure, since neither is a broken install.
+  same code for several causes, so the line names the one that applies: not trusted, nobody logged in
+  at the console, assistive access switched off, or a binary that was never granted despite the
+  system reporting it as trusted — each with its own remedy. A logged-out console is a warning rather
+  than a failure, since it is not a broken install.
 - `glass doctor`'s iOS device line now reports which simulator glass would drive, by running the same
   resolution `glass_start` runs. It listed how many were available and nothing more. Nothing booted
   is fine and says so — glass boots one at start — and an iPad-only host is no longer reported as

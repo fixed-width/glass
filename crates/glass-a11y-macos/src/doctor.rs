@@ -6,10 +6,11 @@ use glass_core::{Check, CheckStatus};
 
 /// The attribute the doctor reads off the system-wide element.
 ///
-/// Do not swap this for a cheaper one. It is *trust-gated*: an untrusted process reading it gets
-/// `CannotComplete`, while `AXRole` on the same element answers `Success` (surveyed on macOS 26.5).
-/// So this attribute fails exactly when the reader would fail, and a "simpler" one would report
-/// green to a process that cannot read a single tree — the fabrication this module exists to remove.
+/// Do not swap this for a cheaper one. It is *access-gated*: a binary macOS will not let read the
+/// accessibility tree gets `CannotComplete` from it, while `AXRole` on the same element answers
+/// `Success` (surveyed on macOS 26.5). So this attribute fails exactly when the reader would fail,
+/// and a "simpler" one would report green to a process that cannot read a single tree — the
+/// fabrication this module exists to remove.
 pub const PROBE_ATTRIBUTE: &str = "AXFocusedApplication";
 
 /// `kAXErrorAPIDisabled`: assistive access is off for this process.
@@ -30,8 +31,9 @@ pub enum SystemWideProbe {
     NothingFocused,
     /// `kAXErrorAPIDisabled`.
     ApiDisabled,
-    /// `kAXErrorCannotComplete`. Ambiguous on its own: an untrusted process gets this, and so does a
-    /// trusted one whose read is not answered — which is why [`a11y_checks`] takes the grant.
+    /// `kAXErrorCannotComplete`. Ambiguous on its own: a binary macOS denies gets this, and so does
+    /// one whose read is genuinely not answered — and `AXIsProcessTrusted` does not separate them
+    /// (see [`a11y_checks`]).
     DidNotComplete,
     /// Any other `AXError`, carrying the raw code so a field report names it. Includes
     /// `kAXErrorAttributeUnsupported` (-25205), which for [`PROBE_ATTRIBUTE`] means the system-wide
@@ -55,13 +57,19 @@ impl SystemWideProbe {
 
 /// The console session's state, as the aggregator reads it. Mirrors `glass_macos::SessionState`
 /// without depending on it: this crate maps outcomes to text, and the platform crate owns the read.
+///
+/// A *locked* session is deliberately not distinguished from an unlocked one here. Measured on
+/// macOS 26.5 by locking a host mid-probe: with `CGSSessionScreenIsLocked` set, the system-wide
+/// read still answers `Success`, so a lock never produces the code this would have qualified. The
+/// lock's real consequence — capture and input are suppressed — is reported by the `display awake`
+/// check, and repeating it here would be a second copy of one fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleSession {
-    Unlocked,
-    Locked,
-    /// Nobody is logged in at the console. Distinct from locked: unlocking is not the remedy, and
-    /// telling this operator the session is unlocked contradicts the `display awake` check the same
-    /// report prints.
+    /// Somebody is logged in at the console, locked or not.
+    LoggedIn,
+    /// Nobody is logged in at the console. Unmeasured against this probe, unlike the locked case:
+    /// kept because if it *does* produce an unanswered read, "log in at the console" is the only
+    /// remedy that helps, and the alternative message would blame the binary's grant.
     NoSession,
 }
 
@@ -72,14 +80,20 @@ const GRANT_REMEDY: &str = "grant Accessibility to this binary — see the check
 /// Map a system-wide read to the `a11y reader` check.
 ///
 /// Takes two facts the caller has already gathered because the probe alone cannot be read
-/// correctly. `accessibility_granted`: an untrusted process gets `CannotComplete` (measured on
-/// macOS 26.5), the same code a trusted process gets when its read is not answered.
+/// correctly. `accessibility_granted`: a denied process gets `CannotComplete` (measured on macOS
+/// 26.5), the same code a process gets when its read is genuinely not answered.
+///
+/// The grant narrows the causes; it does not settle them. Measured on the same host at the same
+/// moment: `glass-mcp` read the system-wide element successfully while another binary got
+/// `CannotComplete` **with `AXIsProcessTrusted` reporting it as trusted**. So a `true` grant bit does
+/// not mean this binary may read, and the trusted-and-unlocked arm below says so rather than
+/// blaming the accessibility stack.
+///
 /// `session`: an unanswered read means something different with nobody at the console, and the
 /// aggregator already reads the real state — so this reports the session it *is* in rather than
 /// inferring one from an error code and contradicting the `display awake` check printed beside it.
-/// Whether a locked session actually produces this code is not established (`glass-macos`'s input
-/// tests record locked-session AX *writes* reporting success), which is why the session only
-/// qualifies the ambiguous code rather than explaining every failure.
+/// A locked session is not one of the causes: it was measured not to produce this code (see
+/// [`ConsoleSession`]).
 ///
 /// The grant keeps its own check next to this one: this line answers "did the API respond", that
 /// one answers "is this binary trusted".
@@ -112,31 +126,17 @@ pub fn a11y_checks(
         SystemWideProbe::NothingFocused => {
             ok("AXUIElement reader answered a system-wide read (no application is frontmost)")
         }
-        // Only the ambiguous code defers to the session: `ApiDisabled` and an unrecognised code
-        // mean what they mean whether or not anyone is at the console, and letting the session
-        // swallow them would downgrade a real defect to "unlock your screen".
-        SystemWideProbe::DidNotComplete if session != ConsoleSession::Unlocked => Check::new(
+        // Only the ambiguous code defers to the session, and only for the one session state that
+        // could plausibly cause it: nobody at the console is not a defect to fix, so it warns.
+        SystemWideProbe::DidNotComplete if session == ConsoleSession::NoSession => Check::new(
             "a11y reader",
             CheckStatus::Warn,
-            match session {
-                ConsoleSession::Locked => format!(
-                    "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and the \
-                     console session is locked"
-                ),
-                ConsoleSession::NoSession | ConsoleSession::Unlocked => format!(
-                    "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and no \
-                     account is logged in at the console"
-                ),
-            },
+            format!(
+                "the system-wide read was not answered (AXError {CANNOT_COMPLETE}) and no account \
+                 is logged in at the console"
+            ),
         )
-        .with_remedy(match session {
-            ConsoleSession::Locked => {
-                "unlock the session and re-run (see the `display awake` check)"
-            }
-            ConsoleSession::NoSession | ConsoleSession::Unlocked => {
-                "log in at the console and re-run (see the `display awake` check)"
-            }
-        }),
+        .with_remedy("log in at the console and re-run (see the `display awake` check)"),
         // Reached only with the grant held, so "go and grant it" would send the operator to a pane
         // where the box is already ticked. A stale TCC record is the case that produces this.
         SystemWideProbe::ApiDisabled => fail(
@@ -149,11 +149,13 @@ pub fn a11y_checks(
         ),
         SystemWideProbe::DidNotComplete => fail(
             format!(
-                "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) — this process is \
-                 trusted and someone is logged in at an unlocked console, so the accessibility \
-                 stack is not responding"
+                "the accessibility API did not answer (AXError {CANNOT_COMPLETE}) even though this \
+                 process reports as trusted — macOS reports trust for a binary whose reads it still \
+                 denies, so the likeliest cause is that this exact binary was never granted"
             ),
-            "log out and back in; if it persists, report this with the `glass doctor` output",
+            "grant Accessibility to the binary you are actually running — a rebuild at another path \
+             or under another name is a different binary to macOS — and restart it; if it already \
+             holds the grant, log out and back in",
         ),
         SystemWideProbe::Failed(code) => fail(
             format!("system-wide accessibility read failed (AXError {code})"),
@@ -193,11 +195,8 @@ mod tests {
         a11y_checks(probe, granted, session).remove(0)
     }
 
-    const EVERY_SESSION: [ConsoleSession; 3] = [
-        ConsoleSession::Unlocked,
-        ConsoleSession::Locked,
-        ConsoleSession::NoSession,
-    ];
+    const EVERY_SESSION: [ConsoleSession; 2] =
+        [ConsoleSession::LoggedIn, ConsoleSession::NoSession];
 
     const EVERY_PROBE: [SystemWideProbe; 5] = [
         SystemWideProbe::Answered,
@@ -249,7 +248,7 @@ mod tests {
             reader(
                 SystemWideProbe::from_ax_code(-25205),
                 true,
-                ConsoleSession::Unlocked
+                ConsoleSession::LoggedIn
             )
             .status,
             CheckStatus::Fail
@@ -259,7 +258,7 @@ mod tests {
     #[test]
     fn an_answering_ax_stack_is_ok() {
         assert_eq!(
-            reader(SystemWideProbe::Answered, true, ConsoleSession::Unlocked).status,
+            reader(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn).status,
             CheckStatus::Ok
         );
     }
@@ -269,7 +268,7 @@ mod tests {
         let c = reader(
             SystemWideProbe::NothingFocused,
             true,
-            ConsoleSession::Unlocked,
+            ConsoleSession::LoggedIn,
         );
         assert_eq!(c.status, CheckStatus::Ok);
         // The detail is the arm's whole point: collapsing it into `Answered` would lose the reason
@@ -332,21 +331,11 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_session_is_a_warning_naming_the_lock_not_a_failure() {
-        // Transient and not a configuration defect: failing here would exit(1) on a Mac driving
-        // another backend with its screen locked. The lock is read, not inferred from the code.
-        let c = reader(
-            SystemWideProbe::DidNotComplete,
-            true,
-            ConsoleSession::Locked,
-        );
-        assert_eq!(c.status, CheckStatus::Warn);
-        assert!(c.detail.contains("locked"), "{}", c.detail);
-        assert!(
-            c.remedy.as_deref().unwrap().contains("unlock"),
-            "{:?}",
-            c.remedy
-        );
+    fn a_locked_console_is_not_a_case_this_check_reports_on() {
+        // Measured by locking a macOS 26.5 host mid-probe: the system-wide read still answered, so
+        // there is no locked-session outcome to report here. `display awake` carries the lock.
+        let c = reader(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn);
+        assert_eq!(c.status, CheckStatus::Ok);
     }
 
     #[test]
@@ -357,7 +346,7 @@ mod tests {
         let c = reader(
             SystemWideProbe::DidNotComplete,
             true,
-            ConsoleSession::Unlocked,
+            ConsoleSession::LoggedIn,
         );
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(
@@ -376,7 +365,7 @@ mod tests {
     #[test]
     fn a_granted_process_with_assistive_access_off_is_not_sent_to_the_grant_check() {
         // The grant line beside this one reads "granted", so pointing at it would be a dead end.
-        let c = reader(SystemWideProbe::ApiDisabled, true, ConsoleSession::Unlocked);
+        let c = reader(SystemWideProbe::ApiDisabled, true, ConsoleSession::LoggedIn);
         assert_eq!(c.status, CheckStatus::Fail);
         assert_ne!(c.remedy.as_deref(), Some(GRANT_REMEDY));
         assert!(c.detail.contains(&API_DISABLED.to_string()), "{}", c.detail);
@@ -387,7 +376,7 @@ mod tests {
         let c = reader(
             SystemWideProbe::Failed(-25208),
             true,
-            ConsoleSession::Unlocked,
+            ConsoleSession::LoggedIn,
         );
         assert_eq!(c.status, CheckStatus::Fail);
         assert!(c.detail.contains("-25208"), "{}", c.detail);

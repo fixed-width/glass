@@ -523,15 +523,17 @@ fn macos_checks(resolved_backend: &str) -> Vec<Check> {
     )
 }
 
-/// Translate the platform crate's session read into the a11y reader's vocabulary. Nobody at the
-/// console is not the same as a locked screen: unlocking is not the remedy, and the reader line
-/// would otherwise assert "unlocked" two lines under a `display awake` check saying the opposite.
+/// Translate the platform crate's session read into the a11y reader's vocabulary.
+///
+/// Locked collapses into `LoggedIn`: a locked session was measured not to change what the probe
+/// returns, and the lock's real consequence is already the `display awake` check's to report.
 #[cfg(target_os = "macos")]
 fn console_session(state: glass_macos::SessionState) -> glass_a11y_macos::doctor::ConsoleSession {
     use glass_a11y_macos::doctor::ConsoleSession;
     match state {
-        glass_macos::SessionState::Unlocked => ConsoleSession::Unlocked,
-        glass_macos::SessionState::Locked => ConsoleSession::Locked,
+        glass_macos::SessionState::Unlocked | glass_macos::SessionState::Locked => {
+            ConsoleSession::LoggedIn
+        }
         glass_macos::SessionState::NoSession => ConsoleSession::NoSession,
     }
 }
@@ -1135,11 +1137,11 @@ mod tests {
             // one case an operator needs it for — the reader is not answering — read green.
             use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
             let answered =
-                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::Unlocked);
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn);
             let refused = macos_a11y_checks(
                 SystemWideProbe::DidNotComplete,
                 true,
-                ConsoleSession::Unlocked,
+                ConsoleSession::LoggedIn,
             );
             assert_eq!(
                 answered
@@ -1163,7 +1165,7 @@ mod tests {
         fn a_granted_process_whose_ax_stack_answers_is_all_ok() {
             use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
             let checks =
-                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::Unlocked);
+                macos_a11y_checks(SystemWideProbe::Answered, true, ConsoleSession::LoggedIn);
             assert!(
                 checks.iter().all(|c| c.status == CheckStatus::Ok),
                 "{checks:?}"
@@ -1178,7 +1180,7 @@ mod tests {
             let checks = macos_a11y_checks(
                 SystemWideProbe::DidNotComplete,
                 false,
-                ConsoleSession::Unlocked,
+                ConsoleSession::LoggedIn,
             );
             let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
             let grant = checks.iter().find(|c| c.name == "Accessibility").unwrap();
@@ -1206,11 +1208,13 @@ mod tests {
             use glass_a11y_macos::doctor::ConsoleSession;
             assert_eq!(
                 console_session(glass_macos::SessionState::Unlocked),
-                ConsoleSession::Unlocked
+                ConsoleSession::LoggedIn
             );
+            // Measured: a locked session does not change what the probe returns, so it maps to the
+            // same vocabulary as unlocked and the lock is reported by `display awake` alone.
             assert_eq!(
                 console_session(glass_macos::SessionState::Locked),
-                ConsoleSession::Locked
+                ConsoleSession::LoggedIn
             );
             assert_eq!(
                 console_session(glass_macos::SessionState::NoSession),
@@ -1219,15 +1223,15 @@ mod tests {
         }
 
         #[test]
-        fn a_locked_session_does_not_fail_the_whole_run() {
+        fn a_console_with_nobody_logged_in_does_not_fail_the_whole_run() {
             // This section is always critical (`backend: None`), so a `Fail` here exits non-zero
-            // even for someone driving android on a Mac. A locked screen is transient and not a
-            // configuration defect, so it warns — asserted here rather than left to the comment.
+            // even for someone driving android on a Mac. Nobody at the console is not a broken
+            // install, so it warns — asserted here rather than left to the comment.
             use glass_a11y_macos::doctor::{ConsoleSession, SystemWideProbe};
             let checks = macos_a11y_checks(
                 SystemWideProbe::DidNotComplete,
                 true,
-                ConsoleSession::Locked,
+                ConsoleSession::NoSession,
             );
             let reader = checks.iter().find(|c| c.name == "a11y reader").unwrap();
             assert_eq!(reader.status, CheckStatus::Warn);
@@ -1238,7 +1242,7 @@ mod tests {
             let checks = macos_a11y_checks(
                 glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
                 false,
-                glass_a11y_macos::doctor::ConsoleSession::Unlocked,
+                glass_a11y_macos::doctor::ConsoleSession::LoggedIn,
             );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             assert_eq!(c.status, CheckStatus::Fail);
@@ -1255,7 +1259,7 @@ mod tests {
             let checks = macos_a11y_checks(
                 glass_a11y_macos::doctor::SystemWideProbe::ApiDisabled,
                 false,
-                glass_a11y_macos::doctor::ConsoleSession::Unlocked,
+                glass_a11y_macos::doctor::ConsoleSession::LoggedIn,
             );
             let c = checks.iter().find(|c| c.name == "Accessibility").unwrap();
             // Same pane URL as the "macos" section's own Accessibility check — kept in
