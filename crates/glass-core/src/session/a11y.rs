@@ -415,6 +415,10 @@ impl Glass {
                 return Ok(()); // truthful no-op, no actuation
             }
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
+            // Deliberately not event-gated, unlike `wait_for_element`: this poll waits on a change
+            // it just caused and usually sees it on the first or second read, while establishing a
+            // subscription costs a round-trip of its own — paid on every `set_value`, to save reads
+            // this loop rarely takes.
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,

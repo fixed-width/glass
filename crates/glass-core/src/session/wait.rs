@@ -308,6 +308,9 @@ pub struct WaitLogOutcome {
 }
 
 impl Glass {
+    /// Not event-gated: this waits on *pixels* settling, and an accessibility event says nothing
+    /// about whether the frame stopped changing (an animation emits no a11y events; a tree change
+    /// may not move a pixel).
     pub fn wait_stable(&mut self, params: &WaitStableParams) -> Result<WaitStableOutcome> {
         let active = self.require_active()?;
         // The active window's cached geometry only bounds a stability_region when
@@ -570,6 +573,8 @@ impl Glass {
     /// crop to a stable `region` to avoid this. `ignore` excludes window-relative
     /// sub-rectangles from every comparison — pixels there never count toward
     /// `changed`/`matches` (see `WaitRegionParams::ignore`).
+    /// Not event-gated, for the same reason as [`Glass::wait_stable`]: the subject is a captured
+    /// region, not the accessibility tree.
     pub fn wait_for_region(&mut self, params: &WaitRegionParams) -> Result<WaitRegionOutcome> {
         let active = self.require_active()?;
         // As in `wait_stable`: the active window's cached geometry only bounds
@@ -640,6 +645,8 @@ impl Glass {
     /// scanning from `cursor` (default: the buffer end at call start, so only new
     /// lines count). Returns the matched line and a resume cursor; on timeout
     /// returns `{matched:false}` with the current end cursor.
+    /// Not event-gated: each tick reads the in-process log buffer, which costs nothing to re-read
+    /// — there is no walk here to save.
     pub fn wait_for_log(&mut self, params: &WaitLogParams) -> Result<WaitLogOutcome> {
         let start_cursor = {
             let s = self.active_mut()?;

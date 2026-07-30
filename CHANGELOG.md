@@ -16,6 +16,14 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer while it
+  waits. On Linux, where the platform can say whether anything changed, a wait that is waiting for
+  something which has not happened yet now reads the tree once instead of once per interval —
+  measured against a real app, 1 read for a 3-second wait where it previously took 22. Results are
+  unchanged; only the cost is. Every other backend polls exactly as before, and so does Linux if the
+  subscription cannot be established or stops delivering.
+
 ### Fixed
 - A switch now reports the same role on Windows, macOS, Android and iOS. `glass_a11y_snapshot`
   called one a `CheckBox` on iOS, and a `Button` or a `CheckBox` on macOS depending on which toolkit
