@@ -2731,9 +2731,8 @@ mod tests {
     /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
     /// numbering gives the switch id 1.
     /// A switch as the readers report one *after* the subrole normalization: `ToggleButton`, row
-    /// shaped, checkable. The role matters here — the trailing-edge swipe path is chosen from
-    /// `states.checkable`, and a fixture still calling a switch a `CheckBox` would leave that
-    /// independence untested against the role the backends now produce.
+    /// shaped, checkable — a fixture still calling a switch a `CheckBox` would test the swipe path
+    /// against a role no backend produces.
     fn sw(checked: bool) -> AxTree {
         let switch = AxNode {
             id: AxNodeId(0),

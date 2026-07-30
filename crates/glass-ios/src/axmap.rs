@@ -75,9 +75,6 @@ pub const SUBROLE_TOKENS: &[(&str, AxRole)] = &[
 ];
 
 /// [`ax_role`], but a subrole in [`SUBROLE_TOKENS`] wins over the base role.
-///
-/// Without one, the base role alone calls a `UISwitch` a checkbox — a different control from the one
-/// the other four backends report for the same widget.
 pub fn ax_role_with_subrole(role: &str, subrole: Option<&str>) -> AxRole {
     subrole
         .and_then(|sub| SUBROLE_TOKENS.iter().find(|(token, _)| *token == sub))

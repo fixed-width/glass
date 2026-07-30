@@ -53,8 +53,8 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
 ///   base role varies by toolkit: measured on macOS 26.5, an AppKit `NSSwitch` is an `AXButton` and
 ///   a SwiftUI/system switch is an `AXCheckBox`, with the same subrole on each.
 ///
-/// `AXButton` is the expensive entry — buttons are the commonest interactive node — and its cost is
-/// the price of a switch reporting the same role here as on the other four backends.
+/// `AXButton` is the expensive entry — buttons are the commonest interactive node — and measured at
+/// +6% on a walk of a settings-style app (48 gated nodes of 359).
 ///
 /// AppKit gives other base roles subroles too (an `AXWindow` is a plain window or a dialog or a
 /// sheet, an `AXTextField` may be a search field), and they belong here as soon as something maps
