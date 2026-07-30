@@ -10,14 +10,14 @@
 #![allow(unsafe_code)]
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
     DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform,
     PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
-    description_census_report, role_histogram,
+    description_census, description_census_report, role_histogram,
 };
 use glass_windows::WindowsPlatform;
 
@@ -1135,6 +1135,64 @@ fn render_role_histogram(label: &str, tree: &AxTree) -> String {
     out
 }
 
+/// Extra snapshots [`render_snapshot_cost`] takes of each probed app. Every sample is printed
+/// beside the mean, so a single slow outlier is visible rather than hidden in the average.
+const COST_REPEATS: usize = 10;
+
+/// Re-snapshot the already-launched app [`COST_REPEATS`] times and render each sample's
+/// wall-clock.
+///
+/// Repeating inside one launch leaves app *startup* out of the number, but each sample is still a
+/// whole `snapshot` call — a fresh thread, COM initialization and the window lookup, then the walk —
+/// so only the *difference* between two runs of this block is attributable to a change in what the
+/// walk reads per node (glass's `description`). A per-node figure is that difference over the node
+/// count in the histogram header above, never the mean over it.
+///
+/// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot that
+/// fails here must not strand the window the caller is about to close, cost the later probes their
+/// evidence, or skip the artifacts write. Twin of `print_snapshot_cost` in
+/// `glass-macos/tests/role_probe.rs` — keep the two in step.
+fn render_snapshot_cost(a11y: &mut WindowsA11y, ctx: &AxContext) -> String {
+    let mut samples = Vec::with_capacity(COST_REPEATS);
+    for repeat in 0..COST_REPEATS {
+        let started = Instant::now();
+        match a11y.snapshot(ctx) {
+            Ok(tree) => {
+                // Inside the timed window, so no future laziness could move walk work out from
+                // under the timer.
+                std::hint::black_box(&tree);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            // The samples taken so far go out with the error: "the first one failed" and
+            // "they grew from 40ms to 900ms and then failed" are different findings.
+            Err(e) => {
+                return format!(
+                    "  snapshot cost: repeat {repeat} of {COST_REPEATS} FAILED: {e}\n  \
+                     samples before it: {}\n",
+                    render_cost_samples(&samples)
+                );
+            }
+        }
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    format!(
+        "  snapshot cost over {COST_REPEATS} snapshots (mean {mean:.0}ms): {}\n",
+        render_cost_samples(&samples)
+    )
+}
+
+/// Cost samples as `19ms, 20ms, …`, or `(none)` when the first snapshot failed.
+fn render_cost_samples(samples: &[f64]) -> String {
+    if samples.is_empty() {
+        return "(none)".to_string();
+    }
+    samples
+        .iter()
+        .map(|ms| format!("{ms:.0}ms"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// UIA control-type names glass maps to a role, and that a probed app has actually been seen to
 /// emit. A histogram bucket carrying one of these must not come back [`AxRole::Other`]: the
 /// token reached the reader, so a mapped role is the only correct outcome, and `Other` would
@@ -1185,17 +1243,29 @@ fn close_adopted_window(raw: Option<i64>) {
     }
 }
 
+/// What [`probe_role_histogram`] hands back for the caller to assert on once every app has been
+/// probed and the report written.
+struct ProbeOutcome {
+    /// See [`mapped_token_violations`].
+    violations: Vec<String>,
+    /// Nodes whose `description` the reader sourced. Per-app this is an observation, not a
+    /// requirement — an app carrying no tooltips is a legitimate zero — but a run in which NO app
+    /// reports one means the reader stopped sourcing the field, which the caller does assert on.
+    described: usize,
+}
+
 /// Launch `spec`, snapshot its accessibility tree with the node cap lifted (so a big app's
 /// tree is never truncated mid-probe — depth/siblings keep their generous structural-rail
 /// defaults regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, append
 /// it to `report`, then stop the app. Panics — failing the test — only when the app can't be
-/// launched or a snapshot can't be taken at all: a real breakage, never merely an unexpected
-/// role. Returns any [`mapped_token_violations`], which the caller fails on *after* the report
-/// is saved. Beyond that one check the histogram's contents are never asserted; reading it to
-/// decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
+/// launched or its FIRST snapshot can't be taken at all: a real breakage, never merely an
+/// unexpected role. A snapshot that fails later, inside [`render_snapshot_cost`]'s repeats, is
+/// reported in the block and not fatal. Returns the [`ProbeOutcome`] the caller asserts on *after*
+/// the report is saved. Beyond those checks the histogram's contents are never asserted; reading it
+/// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native token now
 /// justifies filling is the human's job.
 #[must_use]
-fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec<String> {
+fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> ProbeOutcome {
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let geo = p
         .start_app(spec)
@@ -1218,11 +1288,19 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
     print!("{block}");
     report.push_str(&block);
 
-    // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every app —
-    // flip this when it reads HelpText/FullDescription.
-    let census_block = description_census_report(label, &tree, DescriptionSourcing::Unsourced);
+    // `Sourced`: this reader reads UIA `HelpText`, so a zero here is a fact about the app —
+    // modulo a read that failed, which `help_text` logs rather than counting.
+    let census_block = description_census_report(label, &tree, DescriptionSourcing::Sourced);
     print!("{census_block}");
     report.push_str(&census_block);
+    let described = description_census(&tree).described();
+
+    // `COST_REPEATS` extra walks per app cost ~3s across this probe's four apps (measured on
+    // box), well inside the 300s the bridge allows a run, so the block is unconditional rather
+    // than behind a flag the bridge has no way to pass through.
+    let cost_block = render_snapshot_cost(&mut a11y, &ctx);
+    print!("{cost_block}");
+    report.push_str(&cost_block);
 
     // Collect toggle-capable non-checkbox/radio nodes (evidence for ToggleButton row parity).
     let mut candidates = Vec::new();
@@ -1267,7 +1345,10 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Vec
         print!("{line}");
         report.push_str(&line);
     }
-    violations
+    ProbeOutcome {
+        violations,
+        described,
+    }
 }
 
 /// The evidence step behind the Windows half of the accessibility role-parity work: launch a
@@ -1323,26 +1404,17 @@ fn onbox_role_histogram_probe() {
 
     let mut report = String::new();
     let mut violations = Vec::new();
-    violations.extend(probe_role_histogram(
-        "charmap.exe (Character Map)",
-        &charmap_spec(),
-        &mut report,
-    ));
-    violations.extend(probe_role_histogram(
-        "notepad.exe (Notepad)",
-        &notepad_spec(),
-        &mut report,
-    ));
-    violations.extend(probe_role_histogram(
-        "taskmgr.exe (Task Manager)",
-        &taskmgr_spec(),
-        &mut report,
-    ));
-    violations.extend(probe_role_histogram(
-        "explorer.exe (File Explorer)",
-        &explorer_spec(),
-        &mut report,
-    ));
+    let mut described = 0usize;
+    for (label, spec) in [
+        ("charmap.exe (Character Map)", charmap_spec()),
+        ("notepad.exe (Notepad)", notepad_spec()),
+        ("taskmgr.exe (Task Manager)", taskmgr_spec()),
+        ("explorer.exe (File Explorer)", explorer_spec()),
+    ] {
+        let outcome = probe_role_histogram(label, &spec, &mut report);
+        violations.extend(outcome.violations);
+        described += outcome.described;
+    }
     save_report("role-histogram-windows.txt", &report);
     // Fail last, after every app has been probed and the artifacts file written: the histograms
     // are the evidence a violation has to be read against.
@@ -1350,5 +1422,15 @@ fn onbox_role_histogram_probe() {
         violations.is_empty(),
         "a token glass maps came back unmapped:\n{}",
         violations.join("\n")
+    );
+    // The census prints without a caveat now that this reader sources the field, so a reader
+    // regressed to `description: None` would print a plausible zero for every app and pass. Some
+    // app in this set must report one: File Explorer's toolbar buttons and Task Manager's column
+    // headers both carry HelpText. Deliberately NOT per-app — an app with no tooltips is a real
+    // observation, not a failure.
+    assert!(
+        described >= 1,
+        "no probed app reported a single described node: either every app lost its HelpText, or \
+         the reader stopped sourcing it"
     );
 }

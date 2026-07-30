@@ -39,12 +39,12 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
         Accessibility, AppSpec, AxContext, AxRole, AxTree, DescriptionSourcing, Platform,
-        SandboxLevel, WalkLimits, description_census_report, role_histogram,
+        SandboxLevel, WalkLimits, description_census, description_census_report, role_histogram,
     };
     use glass_macos::MacosPlatform;
 
@@ -133,6 +133,64 @@ mod macos_main {
         }
     }
 
+    /// Extra snapshots [`print_snapshot_cost`] takes of each probed app. Every sample is printed
+    /// beside the mean, so a single slow outlier is visible rather than hidden in the average.
+    const COST_REPEATS: usize = 10;
+
+    /// Re-snapshot the already-launched app [`COST_REPEATS`] times and print each sample's
+    /// wall-clock.
+    ///
+    /// Repeating inside one launch leaves app *startup* out of the number, but each sample is
+    /// still a whole `snapshot` call — the Accessibility-grant gate and the `AXWindows` resolve,
+    /// then the walk — so only the *difference* between two runs of this block is attributable to a
+    /// change in what the walk reads per node (glass's `description`). A per-node figure is that
+    /// difference over the node count in the histogram header above, never the mean over it.
+    ///
+    /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot
+    /// that fails here must not cost this app its role-parity check or the later apps their runs.
+    /// Twin of `render_snapshot_cost` in `glass-windows/tests/onbox.rs` — keep the two in step.
+    fn print_snapshot_cost(a11y: &mut MacosA11y, ctx: &AxContext) {
+        let mut samples = Vec::with_capacity(COST_REPEATS);
+        for repeat in 0..COST_REPEATS {
+            let started = Instant::now();
+            match a11y.snapshot(ctx) {
+                Ok(tree) => {
+                    // Inside the timed window, so no future laziness could move walk work out
+                    // from under the timer.
+                    std::hint::black_box(&tree);
+                    samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                // The samples taken so far go out with the error: "the first one failed" and
+                // "they grew from 40ms to 900ms and then failed" are different findings.
+                Err(e) => {
+                    println!(
+                        "  snapshot cost: repeat {repeat} of {COST_REPEATS} FAILED: {e}\n  \
+                         samples before it: {}",
+                        render_cost_samples(&samples)
+                    );
+                    return;
+                }
+            }
+        }
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        println!(
+            "  snapshot cost over {COST_REPEATS} snapshots (mean {mean:.0}ms): {}",
+            render_cost_samples(&samples)
+        );
+    }
+
+    /// Cost samples as `19ms, 20ms, …`, or `(none)` when the first snapshot failed.
+    fn render_cost_samples(samples: &[f64]) -> String {
+        if samples.is_empty() {
+            return "(none)".to_string();
+        }
+        samples
+            .iter()
+            .map(|ms| format!("{ms:.0}ms"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Run `body`, then always call `platform.stop_app()` afterward regardless of whether
     /// `body` succeeded — mirrors `tests/bundle_launch.rs`'s identically-named helper.
     fn with_stop_app<T>(
@@ -164,7 +222,10 @@ mod macos_main {
     /// that one check the histogram's contents are never asserted; reading the printed output
     /// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native
     /// token now justifies filling is the human's job.
-    fn probe_one(run0: &str) -> Result<(), String> {
+    /// `Ok` carries how many of this app's nodes the reader gave a description — an observation
+    /// per app (an app with no `AXHelp` is a legitimate zero), summed by [`run`] so a whole run
+    /// of zeros can be challenged there.
+    fn probe_one(run0: &str) -> Result<usize, String> {
         println!("\n--- launching {run0} ---");
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new() for {run0}: {e}"))?;
@@ -207,17 +268,19 @@ mod macos_main {
             // of how big the tree actually was.
             tree.assign_ids();
             print_role_histogram(run0, &tree);
-            // `Unsourced`: this reader leaves `description: None`, so the count is 0 for
-            // every app — flip this when it reads AXHelp.
+            // `Sourced`: this reader reads `AXHelp` (else `AXDescription` where `AXTitle` took
+            // the name), so a zero here is a fact about the app — modulo a read that failed,
+            // which `read_label` logs rather than counting.
             print!(
                 "{}",
-                description_census_report(run0, &tree, DescriptionSourcing::Unsourced)
+                description_census_report(run0, &tree, DescriptionSourcing::Sourced)
             );
+            print_snapshot_cost(&mut a11y, &ctx);
             // Checked after the histogram is printed, so the evidence that explains a failure
             // is already in the output when the failure is reported.
             let violations = mapped_token_violations(run0, &tree);
             if violations.is_empty() {
-                Ok(())
+                Ok(description_census(&tree).described())
             } else {
                 Err(violations.join("\n"))
             }
@@ -247,14 +310,28 @@ mod macos_main {
         }
 
         let mut failures = Vec::new();
+        let mut described = 0usize;
         for run0 in targets {
-            if let Err(e) = probe_one(run0) {
-                failures.push(e);
+            match probe_one(run0) {
+                Ok(n) => described += n,
+                Err(e) => failures.push(e),
             }
         }
 
         if !failures.is_empty() {
             fail(failures.join("\n\n"));
+        }
+        // Not a failure: which apps carry `AXHelp` is up to the apps, and the caller chooses them
+        // (System Settings really does report none). But the census now prints without a caveat,
+        // so a reader regressed to `description: None` would print a plausible zero for every app
+        // and this probe would pass silently. Say it once, at the end, where a whole-run zero is
+        // visible as one claim rather than N app facts.
+        if described == 0 {
+            println!(
+                "\nNOTE: no app in this run reported a single described node — either these apps \
+                 carry no AXHelp, or the reader stopped sourcing it (see read_label in \
+                 glass-a11y-macos)"
+            );
         }
         println!("\nROLE_PROBE_PASS");
         std::process::exit(0);
