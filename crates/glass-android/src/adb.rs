@@ -16,7 +16,8 @@ pub enum AdbOp {
     Dump,
     /// `exec-out screencap` — encodes a full-resolution frame.
     Screencap,
-    /// `install` / `push` — copies and verifies a file over the wire.
+    /// `install` / `push` / `pull` / `uninstall` — moves a file over the wire, and an install also
+    /// verifies it on device.
     Transfer,
     /// Everything else: `shell`, `input`, `am start`, `devices`, `forward`, `getprop`.
     Shell,
@@ -233,8 +234,7 @@ mod tests {
 
     #[test]
     fn a_dump_gets_the_longest_budget_of_the_interactive_calls() {
-        // The slowest healthy call decides its own deadline; a single per-backend budget would
-        // have to be sized for it and would then let a wedged `input` hang exactly as long.
+        // Ordering is the invariant here; the values themselves are calibrated on device.
         assert!(AdbOp::Dump.budget() > AdbOp::Shell.budget());
         assert!(AdbOp::Transfer.budget() > AdbOp::Dump.budget());
         assert!(AdbOp::Shell.budget() >= Duration::from_secs(10));

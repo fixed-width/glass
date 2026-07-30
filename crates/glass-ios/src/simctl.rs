@@ -109,8 +109,8 @@ mod tests {
     ///   GLASS_IOS_UDID=<booted udid> \
     ///     cargo test -p glass-ios --lib -- --ignored --nocapture a_spawned_command
     ///
-    /// `simctl spawn <udid> sleep` is a real call into a real simulator that never answers, which
-    /// is what the budget tests above cannot exercise. In-crate because `simctl` is a private
+    /// `simctl spawn <udid> /bin/sleep` is a real call into a real simulator that never answers,
+    /// which is what the budget tests above cannot exercise. In-crate because `simctl` is a private
     /// module, and a test is not a reason to widen the crate's public surface.
     #[test]
     #[ignore = "requires a booted simulator + GLASS_IOS_UDID"]
@@ -144,8 +144,8 @@ mod tests {
 
     #[test]
     fn bootstatus_may_take_far_longer_than_any_ordinary_call() {
-        // `simctl bootstatus <udid> -b` blocks until the simulator finishes booting — minutes on a
-        // cold machine — so it cannot share a deadline sized for a query.
+        // Pins what the enum doc explains, so a later edit cannot quietly fold BootStatus into
+        // the generic budget.
         assert!(SimctlOp::BootStatus.budget() >= Duration::from_secs(180));
         assert!(SimctlOp::Query.budget() < SimctlOp::Lifecycle.budget());
         assert!(SimctlOp::Query.budget() >= Duration::from_secs(10));
