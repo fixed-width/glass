@@ -244,8 +244,7 @@ impl Accessibility for AndroidA11y {
         }
 
         // Read back once, not in a loop: a re-read here is a whole `uiautomator dump` (~2s on the
-        // dogfood AVD), so polling would cost seconds per write. The settle is the beat the toolkit
-        // needs to commit the text — small next to the dump that follows it.
+        // dogfood AVD), so polling would cost seconds per write.
         std::thread::sleep(Duration::from_millis(VERIFY_SETTLE_MS));
         let mut after = self.snapshot(ctx)?;
         after.assign_ids();
@@ -461,8 +460,7 @@ mod tests {
 
     #[test]
     fn a_field_that_never_changed_is_not_a_successful_write() {
-        // The tap missed, the field is read-only, or the keyboard swallowed the text. Reporting Ok
-        // here tells an agent the field holds text it does not hold.
+        // The case `verify_write`'s doc is about: nothing changed, so nothing is confirmed.
         let after = tree_holding(Some("hello"));
         let t = target(0, Some("Search"), Some(BOUNDS));
         assert!(matches!(

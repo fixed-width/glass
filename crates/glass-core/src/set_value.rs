@@ -6,8 +6,8 @@
 //! same; a tap-and-type on a mobile field can land somewhere else entirely. Reporting `Ok` on any
 //! of those is a false success — the agent believes a field holds text it does not hold.
 //!
-//! So the judgement lives here, once, rather than in each reader: three of them had already grown
-//! their own copy of it.
+//! So the judgement lives here rather than in each reader: the macOS and Windows readers had each
+//! grown their own copy, and the two mobile backends were about to need it too.
 
 /// Whether a `set_value` write took, judged from the value read back.
 ///
