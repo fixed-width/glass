@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use glass_core::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget, normalize_description,
+    TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -567,36 +567,6 @@ fn find_nth(
     None
 }
 
-/// Whether a `set_value` write actually took, judged from the value read back. egui-style
-/// read-only editables (`TextEdit`) accept UIA `SetValue` without error but never change the
-/// buffer — a misleading success; a real set (`Slider`/`DragValue`) changes the value, possibly
-/// to a reformatted string. So it took iff the read-back equals the request OR differs from the
-/// pre-set value.
-pub(crate) fn set_value_took(before: &str, after: &str, requested: &str) -> bool {
-    after == requested || after != before
-}
-
-/// Whether a read-back poll can *confirm* a `set_value` write took. `read_back` is the value
-/// read after the write (`None` if that read failed); `before` is the pre-write baseline
-/// (`None` if the pre-read failed — baseline unknown). Confirms only when it can prove the
-/// write landed:
-/// - a failed post-write read (`read_back == None`) is inconclusive → never confirms (the
-///   caller keeps polling to its deadline, then reports `AxValueNotApplied`);
-/// - with a known baseline, delegates to [`set_value_took`] (equals request, or changed from it);
-/// - with an unknown baseline, only an exact match with the request confirms — "changed from
-///   before" is meaningless without a trustworthy baseline.
-///
-/// This is the honesty guard against a *failed read* masquerading as a change: the pre-fix loop
-/// collapsed both reads to `""` via `unwrap_or_default()`, so a failed read looked like a value
-/// that "differs from before" and reported false success. Mirrors the macOS reader.
-fn read_back_confirms(read_back: Option<&str>, before: Option<&str>, requested: &str) -> bool {
-    match (read_back, before) {
-        (None, _) => false,
-        (Some(after), Some(before)) => set_value_took(before, after, requested),
-        (Some(after), None) => after == requested,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,47 +613,5 @@ mod tests {
             budget.truncation().map(|t| t.limit),
             Some(TruncationLimit::Depth)
         );
-    }
-
-    #[test]
-    fn noop_is_not_taken() {
-        // read-only TextEdit: value unchanged AND not the requested text.
-        assert!(!set_value_took("#000000", "#000000", "#12AA34"));
-    }
-    #[test]
-    fn exact_match_took() {
-        assert!(set_value_took("#000000", "#12AA34", "#12AA34"));
-    }
-    #[test]
-    fn reformatted_numeric_change_took() {
-        // a slider set to "50" may read back "50.0" — changed from before, so it took.
-        assert!(set_value_took("0", "50.0", "50"));
-    }
-    #[test]
-    fn setting_current_value_is_taken() {
-        // edge: requesting the value it already holds → equals request → taken (acceptable).
-        assert!(set_value_took("50", "50", "50"));
-    }
-    #[test]
-    fn read_back_rejects_a_failed_post_read() {
-        // A failed post-write read (None) is inconclusive — never a false success.
-        assert!(!read_back_confirms(None, Some("hello"), "world"));
-    }
-    #[test]
-    fn read_back_confirms_change_against_known_baseline() {
-        // Known baseline + value changed from it → took (delegates to set_value_took).
-        assert!(read_back_confirms(Some("50.0"), Some("0"), "50"));
-    }
-    #[test]
-    fn read_back_rejects_unconfirmable_change_when_baseline_unknown() {
-        // Regression: pre-fix a failed pre-read defaulted to "", so a no-op that reads back its
-        // real (non-empty) value looked "changed" → false success. An unknown baseline must not
-        // confirm a mere difference; only an exact match can.
-        assert!(!read_back_confirms(Some("hello"), None, "world"));
-    }
-    #[test]
-    fn read_back_confirms_exact_match_when_baseline_unknown() {
-        // Unknown baseline, but the read-back equals the request → definitively took.
-        assert!(read_back_confirms(Some("world"), None, "world"));
     }
 }
