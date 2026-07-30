@@ -142,10 +142,13 @@ impl Adb {
         cmd.args(&argv);
         // A wedged adb server answers nothing at all, and the fix is one command — so the remedy
         // rides in the error the caller sees rather than in a log line nobody reads.
-        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(|e| {
-            GlassError::Backend(format!(
-                "{e}; if this repeats, run `adb kill-server` and retry"
-            ))
+        // Extend the message rather than wrapping the error: nesting one `Backend` inside another
+        // makes `Display` print its prefix twice, and this text is read by an agent.
+        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(|e| match e {
+            GlassError::Backend(msg) => GlassError::Backend(format!(
+                "{msg}; if this repeats, run `adb kill-server` and retry"
+            )),
+            other => other,
         })?;
         if out.status.success() {
             Ok(out)
@@ -179,6 +182,54 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 mod tests {
     use super::AdbOp;
     use std::time::Duration;
+
+    /// Live proof that a wedged adb call ends instead of hanging. Ignored by default:
+    ///   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
+    ///     cargo test -p glass-android --lib -- --ignored --nocapture a_shell_call
+    ///
+    /// The budget tests above cover which deadline a call gets, and `glass_core::bounded`'s cover
+    /// the mechanism against a local `sh`. Neither exercises what actually failed before this
+    /// existed: a real `adb` call that never answers. It lives in-crate rather than in
+    /// `tests/*_loop.rs` because `adb` is a private module, and a test is not a reason to widen the
+    /// crate's public surface.
+    #[test]
+    #[ignore = "requires a booted AVD + GLASS_ADB"]
+    fn a_shell_call_that_never_answers_dies_at_its_budget() {
+        let adb = super::Adb::from_env();
+        let budget = AdbOp::Shell.budget();
+
+        let started = std::time::Instant::now();
+        // Ten times the budget, so "it returned because the command finished" is no explanation.
+        let err = adb
+            .run(["shell", "sleep", "100"])
+            .expect_err("a call that outlives its budget must fail, not return");
+        let waited = started.elapsed();
+        println!("waited {waited:?} against a {budget:?} budget; error: {err}");
+
+        assert!(
+            waited < budget + Duration::from_secs(5),
+            "waited {waited:?}, past the {budget:?} budget — the bound did not fire"
+        );
+        let msg = err.to_string();
+        // Whoever reads this has to learn which call hung and what to do about it.
+        assert!(msg.contains("adb:shell"), "must name the operation: {msg}");
+        assert!(
+            msg.contains("adb kill-server"),
+            "must carry the remedy: {msg}"
+        );
+        // Extending the message must not wrap one Backend error in another: Display prints its
+        // prefix per layer, and "backend error: backend error: ..." is what an agent would read.
+        assert_eq!(
+            msg.matches("backend error").count(),
+            1,
+            "the error prefix must appear once: {msg}"
+        );
+
+        // The next call still works, so the timeout killed the child rather than leaving the
+        // connection wedged behind it.
+        let devices = adb.run(["devices"]).expect("adb usable after a timeout");
+        assert!(devices.contains("List of devices"), "{devices}");
+    }
 
     #[test]
     fn a_dump_gets_the_longest_budget_of_the_interactive_calls() {

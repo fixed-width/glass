@@ -105,6 +105,43 @@ impl Simctl {
 mod tests {
     use super::*;
 
+    /// Live proof that a wedged simctl call ends instead of hanging. Ignored by default:
+    ///   GLASS_IOS_UDID=<booted udid> \
+    ///     cargo test -p glass-ios --lib -- --ignored --nocapture a_spawned_command
+    ///
+    /// `simctl spawn <udid> sleep` is a real call into a real simulator that never answers, which
+    /// is what the budget tests above cannot exercise. In-crate because `simctl` is a private
+    /// module, and a test is not a reason to widen the crate's public surface.
+    #[test]
+    #[ignore = "requires a booted simulator + GLASS_IOS_UDID"]
+    fn a_spawned_command_that_never_answers_dies_at_its_budget() {
+        let udid = std::env::var("GLASS_IOS_UDID").expect("GLASS_IOS_UDID");
+        let budget = SimctlOp::Query.budget();
+
+        let started = std::time::Instant::now();
+        let err = Simctl::new()
+            // Absolute path: `spawn` runs the binary INSIDE the simulator, where a bare `sleep`
+            // is not on the path and fails instantly with ENOENT rather than hanging.
+            .run(&["spawn", &udid, "/bin/sleep", "100"])
+            .expect_err("a call that outlives its budget must fail, not return");
+        let waited = started.elapsed();
+        println!("waited {waited:?} against a {budget:?} budget; error: {err}");
+
+        assert!(
+            waited < budget + Duration::from_secs(5),
+            "waited {waited:?}, past the {budget:?} budget — the bound did not fire"
+        );
+        assert!(
+            err.to_string().contains("simctl:query"),
+            "must name the operation: {err}"
+        );
+        // The next call still works: the timeout killed the child, it did not wedge simctl.
+        let listed = Simctl::new()
+            .run(&["list", "devices"])
+            .expect("still usable");
+        assert!(listed.contains("Devices"), "{listed}");
+    }
+
     #[test]
     fn bootstatus_may_take_far_longer_than_any_ordinary_call() {
         // `simctl bootstatus <udid> -b` blocks until the simulator finishes booting — minutes on a
