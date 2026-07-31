@@ -228,7 +228,10 @@ no accessibility tree.
   `checked`, `unchecked`, `selected`, `unselected`, `expanded`, `collapsed`, `focused`, `visible`,
   `hidden`.
 - `value_contains` (string) — additionally require the matched element's value to contain this
-  substring; not a standalone selector (`name` and/or `role` still required).
+  substring; not a standalone selector (`name` and/or `role` still required). Only an element that
+  reports a value can match one: on Android's on-device accessibility-service reader that is the
+  editable elements alone, so filter a label, button or check box there on `name` instead — a
+  `value_contains` against one waits out the whole timeout and returns `{matched:false}`.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
@@ -478,6 +481,11 @@ Both Android readers name a control the same way: the visible text is the `name`
 content-description where there is no text — except on an editable element, where the text is
 already the `value` and the content-description is the `name` instead.
 
+One consequence of that rule: two controls that differ only in their content-description — "Save
+draft" and "Save and close", both reading `Save` on screen — now share a `name`, and a `name:`
+selector picks the first of them in tree order without reporting that a second matched. Where two
+controls read alike, address the one you want by its `id` from a snapshot.
+
 An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
@@ -543,7 +551,9 @@ Errors if the app exposes no accessibility tree.
   is required.
 - `role` (string) — role filter, e.g. `"ListItem"`, `"Button"` (selector).
 - `value_contains` (string) — additionally require the matched element's value to contain this
-  substring; not a standalone selector.
+  substring; not a standalone selector. Only an element that reports a value can match one: on
+  Android's on-device accessibility-service reader that is the editable elements alone, so filter
+  a label, button or check box there on `name` instead.
 - `direction` (string) — `"up"`/`"down"` (vertical) or `"left"`/`"right"` (horizontal). **Omit
   to infer** the direction from the target's off-screen position (e.g. an item at `x ≥ width`
   scrolls right); inference falls back to a vertical `down`→`up` sweep when the target isn't in

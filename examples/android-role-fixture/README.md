@@ -19,7 +19,7 @@ guarantee. Re-run it rather than trusting it; the read step below prints the API
 | `ProgressBar` | itself |
 | `PopupMenu` (button) | `android.widget.ListView`, entries `LinearLayout`/`RelativeLayout` |
 | `AlertDialog` (button) | `FrameLayout`/`LinearLayout` panels under `android:id/parentPanel` |
-| `Button` with `text` + a different `contentDescription` | `android.widget.Button`; the label each reader doesn't pick for `name` is what `desc="…"` carries |
+| `Button` with `text` + a different `contentDescription` | `android.widget.Button`; both readers name it by its `text` and carry the `contentDescription` as `desc="…"` |
 
 The last two need a tap. Each opens as the topmost window, so dump it separately.
 

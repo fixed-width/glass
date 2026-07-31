@@ -29,13 +29,23 @@ internal refactors, CI, or test-only changes.
   to name a filled text field by its own contents, so its name changed with the field's contents
   from one snapshot read to the next.
 
-  One loss to know about: on the accessibility-service reader, an *empty* text field that has a
-  hint but no content description used to be named by that hint — Android reports a hint through
-  the same `text` attribute a filled field uses, so an empty field's hint arrived
+  Two losses to know about, both on the accessibility-service reader. An *empty* text field that
+  has a hint but no content description used to be named by that hint — Android reports a hint
+  through the same `text` attribute a filled field uses, so an empty field's hint arrived
   indistinguishable from typed content — and it is now unnamed. That naming was never
   dependable: it held only while the field was empty and became the typed content the moment
   anything was entered, so it was not a stable selector either way. Carrying Android's hint as
   its own field is a separate change, not part of this one.
+
+  And an element that is not editable — a label, a button, a check box — no longer reports a
+  `value`; that reader used to copy the element's own text there as well as into `name`. Since a
+  `value_contains` filter matches only an element that has a value, `value_contains` against a
+  non-editable element under this reader now never matches, so a `glass_wait_for_element` written
+  that way waits out its whole timeout and answers `{matched:false}`. Match those elements on
+  `name` instead. It also retires an escape hatch worth naming: a Jetpack Compose button surfaces
+  as a clickable `Group`, and `role:"Button"` plus `value_contains:"Submit"` used to reach it —
+  use `role:"Button"` with `name:"Submit"`, which reaches it the same way. `uiautomator` never
+  matched this way, so a selector written against that reader is unaffected.
 
 ### Added
 - Every tool parameter now carries a description in the advertised MCP schema, so an agent can
