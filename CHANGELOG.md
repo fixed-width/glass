@@ -26,7 +26,8 @@ internal refactors, CI, or test-only changes.
   `Button "Save" desc="Save changes"` through both readers, where the two strings used to be
   swapped between them. An editable element is named by its content
   description and never by what has been typed into it; the accessibility-service reader used
-  to name a filled text field by its own contents, so its name changed on every keystroke.
+  to name a filled text field by its own contents, so its name changed with the field's contents
+  from one snapshot read to the next.
 
   One loss to know about: on the accessibility-service reader, an *empty* text field that has a
   hint but no content description used to be named by that hint — Android reports a hint through
@@ -34,7 +35,7 @@ internal refactors, CI, or test-only changes.
   indistinguishable from typed content — and it is now unnamed. That naming was never
   dependable: it held only while the field was empty and became the typed content the moment
   anything was entered, so it was not a stable selector either way. Carrying Android's hint as
-  its own field is the real fix, and is not part of this change.
+  its own field is a separate change, not part of this one.
 
 ### Added
 - Every tool parameter now carries a description in the advertised MCP schema, so an agent can
