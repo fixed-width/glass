@@ -22,7 +22,10 @@ internal refactors, CI, or test-only changes.
   *different* data — a recycled list row reusing the same view is the case this closes — is now
   rejected as changed since the snapshot rather than written to. An editable element with no
   content description and no resource id has no name at all, so role plus an 8px bounds match used
-  to be the whole fingerprint a write re-walked against.
+  to be the whole fingerprint a write re-walked against. The value only discriminates where there
+  was one to capture: rows of *empty* fields share a role, a name, a rect and no value alike, so a
+  write can still land on the wrong one of those — re-snapshot before writing into a list that has
+  scrolled.
 
 ### Changed
 - Both Android readers now name an element the same way. The same control used to answer

@@ -475,10 +475,12 @@ the name.
 **`desc` is display-only: `glass_wait_for_element` and `glass_scroll_to_element` select on `name`,
 never on the description.**
 
-On **Android** a description needs one node to carry both of its labels, and most controls carry
-only one — across four stock apps, only one node in roughly three hundred had both — so expect
-`desc` to be absent on most Android nodes, not routinely present. The other readers take it from a
-separate descriptor field, so there a node with a single label can still carry one.
+On **Android** a description drawn from the element's own two labels needs one node to carry both,
+and most controls carry only one — across four stock apps, only one node in roughly three hundred
+had both — so on a non-editable element expect `desc` to be absent, not routinely present. An
+editable element read through the on-device companion is the exception: its hint is a source of its
+own (below), needing no second label. The other readers take the description from a separate
+descriptor field, so there a node with a single label can still carry one.
 
 Both Android readers name a control the same way: the visible text is the `name`, or the
 content-description where there is no text — except on an editable element, where the text is
