@@ -308,6 +308,11 @@ mod tests {
         "<node index=\"2\" text=\"\" class=\"android.widget.Button\" package=\"com.x\" ",
         "content-desc=\"Save\" enabled=\"true\" focusable=\"true\" focused=\"false\" selected=\"false\" ",
         "checkable=\"false\" checked=\"false\" password=\"false\" bounds=\"[40,300][1040,380]\" />",
+        // A masked field whose class is in no table — the case `password` is the only signal for.
+        "<node index=\"3\" text=\"hunter2\" class=\"com.example.SecureField\" package=\"com.x\" ",
+        "content-desc=\"Password\" enabled=\"true\" focusable=\"true\" focused=\"false\" ",
+        "selected=\"false\" checkable=\"false\" checked=\"false\" password=\"true\" ",
+        "bounds=\"[40,400][1040,480]\" />",
         "</node></hierarchy>",
     );
 
@@ -374,7 +379,7 @@ mod tests {
         let frame = &tree.root.children[0];
         assert_eq!(frame.role, AxRole::Group);
         let kids = &frame.children;
-        assert_eq!(kids.len(), 3);
+        assert_eq!(kids.len(), 4);
         assert_eq!(
             (kids[0].role, kids[0].name.as_deref()),
             (AxRole::Label, Some("Settings"))
@@ -388,6 +393,19 @@ mod tests {
             (AxRole::Button, Some("Save"))
         );
         assert_eq!(kids[2].bounds.unwrap().width, 1000);
+    }
+
+    #[test]
+    fn a_password_node_is_editable_whatever_its_class() {
+        // `password="true"` is the only editable signal for a masked field whose class is in no
+        // table. Without it the node is non-editable, and a non-editable node is named by its
+        // text — so the name would become the field's own masked contents.
+        let tree = build_tree(XML, &win(), WalkLimits::DEFAULT).unwrap();
+        let secure = &tree.root.children[0].children[3];
+        assert_eq!(secure.role, AxRole::Other, "class is deliberately unmapped");
+        assert!(secure.states.editable, "password=true must imply editable");
+        assert_eq!(secure.name.as_deref(), Some("Password"));
+        assert_eq!(secure.value.as_deref(), Some("hunter2"));
     }
 
     /// A `<hierarchy>` with `n` flat top-level `<node>` elements, each a distinctly-named Button.
