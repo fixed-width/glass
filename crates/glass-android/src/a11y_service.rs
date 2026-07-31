@@ -236,10 +236,24 @@ impl Accessibility for ServiceA11y {
         loop {
             let mut after = self.snapshot(ctx)?;
             after.assign_ids();
-            let got = after.find(target.id).and_then(|n| n.value.clone());
+            let node = after.find(target.id);
+            let got = node.and_then(|n| n.value.clone());
             // An empty field reports no value (None), not Some(""), so compare against "".
             if got.as_deref().unwrap_or("") == text {
                 return Ok(());
+            }
+            // A field that has stopped reporting `editable` — a submit collapsing it to a display
+            // row, focus lost — also reports no value, which reads exactly like a write that never
+            // landed. Spending the rest of the budget to then blame the write would send the
+            // caller to clear a field that is already correct and to switch backends for nothing.
+            // `AndroidA11y`'s `verify_write` re-checks the same flag for the same reason.
+            if node.is_some_and(|n| !n.states.editable) {
+                return Err(GlassError::AccessibilityUnavailable(format!(
+                    "set_value on element {} was sent, but the element no longer reports itself \
+                     editable, so its value cannot be read back; re-snapshot to see what it holds \
+                     rather than retyping",
+                    target.id.0
+                )));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(GlassError::Backend(format!(
