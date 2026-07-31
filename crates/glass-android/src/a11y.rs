@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxTarget, AxTree};
+use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
     typed_text_landed,
@@ -223,17 +223,15 @@ impl Default for AndroidA11y {
     }
 }
 
-/// Locate `target` in an already-numbered `tree` and return the window-relative tap point for
-/// editing it. Errors specifically when the target is gone (`AxElementNotFound`), has drifted in
-/// role/name/bounds (`AxElementChanged`), is not editable (`AxElementNotEditable`), or has no
-/// clickable on-screen center (`AxElementNotClickable`). Pure (no device I/O) so `set_value`'s
-/// re-validation — the guard that stops it typing into the wrong element after a re-snapshot — is
-/// testable without a device.
-fn locate_editable_target(
-    tree: &AxTree,
-    target: &AxTarget,
-    window: &WindowGeometry,
-) -> Result<(i32, i32)> {
+/// Re-resolve `target` in an already-numbered `tree` and return the node only if it is still the
+/// element that was addressed and still editable. Errors specifically when the target is gone
+/// (`AxElementNotFound`), has drifted in role/name/bounds (`AxElementChanged`), or is not editable
+/// (`AxElementNotEditable`).
+///
+/// Both Android readers' `set_value` guards route through this — the check that stops a write
+/// landing on whatever inherited the id between the snapshot the caller read and the one the write
+/// acts on. Pure (no device I/O), so it is testable without a device.
+pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
         .ok_or(GlassError::AxElementNotFound(target.id.0))?;
@@ -244,7 +242,19 @@ fn locate_editable_target(
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
-    node.bounds
+    Ok(node)
+}
+
+/// [`editable_target`], plus the window-relative tap point for editing it — the extra step the
+/// `uiautomator` reader needs, because it edits by tapping where the on-device service can act on
+/// the node directly. Errors `AxElementNotClickable` when the element has no on-screen center.
+fn locate_editable_target(
+    tree: &AxTree,
+    target: &AxTarget,
+    window: &WindowGeometry,
+) -> Result<(i32, i32)> {
+    editable_target(tree, target)?
+        .bounds
         .and_then(|b| b.clamped_center(window.width, window.height))
         .ok_or(GlassError::AxElementNotClickable(target.id.0))
 }

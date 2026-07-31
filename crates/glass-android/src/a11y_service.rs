@@ -219,24 +219,14 @@ impl Accessibility for ServiceA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        // Guard: re-snapshot and verify the ref still points at the same editable element
-        // (role+name+bounds) before acting — the same drift protection as AndroidA11y::set_value.
+        // Guard: re-snapshot and verify the ref still points at the same editable element before
+        // acting. Shared with `AndroidA11y::set_value`, so both readers refuse the same drift.
         let tree = {
             let mut t = self.snapshot(ctx)?;
             t.assign_ids();
             t
         };
-        let node = tree
-            .find(target.id)
-            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-        if !target.matches(node.role, node.name.as_deref())
-            || !target.bounds_consistent(node.bounds, 8)
-        {
-            return Err(GlassError::AxElementChanged(target.id.0));
-        }
-        if !node.states.editable {
-            return Err(GlassError::AxElementNotEditable(target.id.0));
-        }
+        crate::a11y::editable_target(&tree, target)?;
         self.client.action(target.id.0, "set_text", Some(text))?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
