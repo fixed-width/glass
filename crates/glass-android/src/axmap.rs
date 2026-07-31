@@ -226,13 +226,10 @@ fn map_node(
 /// naming it by that text would move the name (and the role+name fingerprint) on every keystroke,
 /// so no `name:` selector could hold, and the content description is the only label left.
 ///
-/// That exception trades one failure for a smaller one. A text field with no content description
-/// is now unnamed, so role plus an 8px bounds match is the whole fingerprint `set_value` re-walks
-/// against. It removes a false *rejection* — the old service-reader name moved whenever the field's
-/// contents did, so a write could be refused for drift that never happened — at the cost of weaker
-/// discrimination against an in-place replacement, a recycled list row or a dialog reusing the
-/// rect. The weaker case stays bounded: `json_to_node` errors on a node with no bounds, so there is
-/// always a rect to compare.
+/// A text field with no content description is unnamed, so role plus an 8px bounds match is the
+/// whole fingerprint `set_value` re-walks against — weaker discrimination against an in-place
+/// replacement, a recycled list row, or a dialog reusing the rect. `json_to_node` errors on a node
+/// with no bounds, so that rect is always there to compare.
 ///
 /// A label with no non-whitespace content counts as absent. Left in place it would occupy the
 /// matchable `name` slot, where no `name:` selector reaches it and nothing falls back to the
