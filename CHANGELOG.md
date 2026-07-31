@@ -54,16 +54,15 @@ internal refactors, CI, or test-only changes.
   Both the id fallback and the hint on the accessibility-service reader need the updated on-device
   companion.
 
-  One loss remains, on the accessibility-service reader: an element that is not editable — a
-  label, a button, a check box — no longer reports a `value`; that reader used to copy the
-  element's own text there as well as into `name`. Since a `value_contains` filter matches only an
-  element that has a value, `value_contains` against a non-editable element under this reader now
-  never matches, so a `glass_wait_for_element` written
-  that way waits out its whole timeout and answers `{matched:false}`. Match those elements on
-  `name` instead. It also retires an escape hatch worth naming: a Jetpack Compose button surfaces
-  as a clickable `Group`, and `role:"Button"` plus `value_contains:"Submit"` used to reach it —
-  use `role:"Button"` with `name:"Submit"`, which reaches it the same way. `uiautomator` never
-  matched this way, so a selector written against that reader is unaffected.
+  One selector detail changes with it, though nothing becomes unreachable. On the
+  accessibility-service reader an element that is not editable — a label, a button, a check box —
+  no longer reports a `value`; that reader used to copy the element's own text there as well as
+  into `name`. A `value_contains` filter aimed at such an element therefore stops matching, and
+  `glass_wait_for_element` waits out its timeout. Match on `name` instead: it is a substring
+  filter too, and that text was always in `name` as well, so every selector has an equivalent —
+  including `role:"Button"` with `name:"Submit"`, which reaches a Jetpack Compose button surfacing
+  as a clickable `Group` exactly as the `value_contains` form did. `uiautomator` never reported a
+  value there, so a selector written against that reader is unaffected.
 
 ### Added
 - Every tool parameter now carries a description in the advertised MCP schema, so an agent can
