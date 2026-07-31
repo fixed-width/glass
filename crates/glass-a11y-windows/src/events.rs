@@ -174,10 +174,6 @@ impl ChangeSignal for UiaChanges {
 
 /// Subscribe to changes for the window in `ctx`, or `None` if no subscription could be
 /// established — the caller then polls exactly as it did before.
-///
-/// Not yet called: `WindowsA11y::subscribe_changes` wires this in as a follow-up, so nothing in
-/// the crate reaches this (or the rest of the module's production path) until then.
-#[allow(dead_code)]
 pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     let ctx = ctx.clone();
     // Capacity 1: the receiver only needs to learn that *something* changed, and a full channel

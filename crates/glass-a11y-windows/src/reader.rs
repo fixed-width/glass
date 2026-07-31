@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal, GlassError,
+    Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -55,6 +55,13 @@ impl Accessibility for WindowsA11y {
                 "accessibility snapshot timed out (UIA not responding)".into(),
             )),
         }
+    }
+
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        // Unlike `snapshot`/`set_value`/`invoke` above there is no timeout wrapper: the
+        // subscription's own thread is the long-lived one, and `subscribe` already bounds how
+        // long it will wait for the registrations to land.
+        crate::events::subscribe(ctx)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
