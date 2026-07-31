@@ -638,6 +638,11 @@ pub struct AxTarget {
     /// same-role+name element if the tree drifted, and that element sits
     /// elsewhere — see [`Self::bounds_consistent`].
     pub bounds: Option<AxRect>,
+    /// The element's value at snapshot time, when it had one. Captured on every backend; the
+    /// `set_value` path uses it to notice that a re-walk landed on a different element holding
+    /// different data — a recycled list row reuses the same view, so its role, name and rect are
+    /// all identical and only this differs.
+    pub value: Option<String>,
 }
 
 impl AxTarget {
@@ -1050,6 +1055,7 @@ mod tests {
             role: AxRole::TextField,
             name: None,
             bounds: None,
+            value: None,
         };
         let ctx = AxContext {
             pids: vec![],
@@ -1197,6 +1203,7 @@ mod tests {
             role: AxRole::Button,
             name: None,
             bounds,
+            value: None,
         };
         let t = target(Some(want));
 
@@ -1401,6 +1408,7 @@ mod tests {
             role: AxRole::TextField,
             name: Some("Email".into()),
             bounds: None,
+            value: None,
         };
         assert!(t.matches(AxRole::TextField, Some("Email")));
         assert!(!t.matches(AxRole::Button, Some("Email")), "role must match");
@@ -1418,6 +1426,7 @@ mod tests {
             role: AxRole::TextField,
             name: None,
             bounds: None,
+            value: None,
         };
         assert!(
             t_unnamed.matches(AxRole::TextField, None),
@@ -1442,6 +1451,7 @@ mod tests {
             role: AxRole::TextField,
             name: None,
             bounds: Some(r),
+            value: None,
         };
         // Exact and within-tolerance bounds pass.
         assert!(t.bounds_consistent(Some(r), 8));
@@ -1475,6 +1485,7 @@ mod tests {
             role: AxRole::TextField,
             name: None,
             bounds: None,
+            value: None,
         };
         assert!(t_nofp.bounds_consistent(Some(r), 8));
         assert!(t_nofp.bounds_consistent(None, 8));
@@ -2273,6 +2284,7 @@ mod tests {
             role: AxRole::Button,
             name: None,
             bounds: None,
+            value: None,
         };
         assert!(matches!(
             NoInvoke.invoke(&ctx, &target),

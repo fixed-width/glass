@@ -69,6 +69,7 @@ fn a11y_service_snapshot_and_actions() {
             role: node.role,
             name: node.name.clone(),
             bounds: node.bounds,
+            value: node.value.clone(),
         };
         a11y.set_value(&ctx, &target, "viaA11y")
             .expect("set_value via ACTION_SET_TEXT");

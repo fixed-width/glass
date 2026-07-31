@@ -525,6 +525,7 @@ mod tests {
             role: AxRole::TextField,
             name: name.map(Into::into),
             bounds,
+            value: None,
         }
     }
 

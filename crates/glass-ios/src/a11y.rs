@@ -259,6 +259,7 @@ mod tests {
             role: AxRole::TextField,
             name: Some("Note".into()),
             bounds: Some(FIELD),
+            value: None,
         }
     }
 
@@ -374,6 +375,7 @@ mod tests {
             role: AxRole::TextField,
             name: Some("inputField".into()),
             bounds: Some(r),
+            value: None,
         };
         assert_eq!(verify(&tree, &target).unwrap(), r);
     }
@@ -392,6 +394,7 @@ mod tests {
             role: AxRole::TextField,
             name: Some("inputField".into()),
             bounds: Some(r),
+            value: None,
         };
         assert!(verify(&tree, &target).is_err());
     }
@@ -411,6 +414,7 @@ mod tests {
             role: AxRole::TextField,
             name: Some("inputField".into()),
             bounds: Some(r),
+            value: None,
         };
         // Pin the variant: an unresolved id must report AxElementNotFound (naming the id),
         // not the generic AxUnsupported — both are `Err`, so `.is_err()` alone wouldn't guard it.
@@ -441,6 +445,7 @@ mod tests {
                 width: 100,
                 height: 30,
             }),
+            value: None,
         };
         assert!(verify(&tree, &target).is_err());
     }

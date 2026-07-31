@@ -305,6 +305,7 @@ impl Glass {
                 role: node.role,
                 name: node.name.clone(),
                 bounds: node.bounds,
+                value: node.value.clone(),
             };
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
@@ -370,6 +371,7 @@ impl Glass {
                 role: node.role,
                 name: node.name.clone(),
                 bounds: node.bounds,
+                value: node.value.clone(),
             };
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
@@ -2693,6 +2695,7 @@ mod tests {
                     width: 20,
                     height: 20
                 }),
+                value: None,
             }
         );
         assert_eq!(calls[0].1, "hello");
