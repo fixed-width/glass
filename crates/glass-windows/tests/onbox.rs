@@ -773,6 +773,7 @@ fn onbox_a11y_set_value() {
         role: field.role,
         name: field.name.clone(),
         bounds: field.bounds,
+        value: field.value.clone(),
     };
 
     const NEW: &str = "GLASSVALUE";
@@ -798,6 +799,7 @@ fn onbox_a11y_set_value() {
         role: b.role,
         name: b.name.clone(),
         bounds: b.bounds,
+        value: b.value.clone(),
     };
     assert!(
         matches!(
@@ -843,6 +845,7 @@ fn onbox_egui_set_value_honesty() {
         role: field.role,
         name: field.name.clone(),
         bounds: field.bounds,
+        value: field.value.clone(),
     };
     assert!(
         matches!(

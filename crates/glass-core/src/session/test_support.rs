@@ -460,8 +460,9 @@ pub(crate) fn glass_with(platform: FakePlatform) -> Glass {
 }
 
 /// Shared `Glass`-construction boilerplate for the a11y builders: a one-shot
-/// factory yielding a `Backend` over `platform` + `accessibility`.
-fn glass_with_backend(
+/// factory yielding a `Backend` over `platform` + `accessibility`. Public to the crate's tests
+/// so one that scripts its own `Accessibility` doesn't have to restate the factory.
+pub(crate) fn glass_with_backend(
     platform: FakePlatform,
     accessibility: Box<dyn Accessibility + Send>,
 ) -> Glass {

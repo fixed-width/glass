@@ -160,6 +160,25 @@ impl GlassError {
         )
     }
 
+    /// Whether a failed value-write is **proven** to have gone out before failing — the only case
+    /// where the session's captured value is stale and must be dropped. True for the read-back
+    /// verdict [`GlassError::AxValueNotApplied`], raised only after a write was dispatched; false
+    /// for everything else, including variants added later.
+    ///
+    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but decided by
+    /// an allowlist, because the two mistakes are not symmetric. Keeping the value can only make
+    /// the guard reject more — an `AxElementChanged` whose own message tells the caller to
+    /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
+    /// accepts is a write onto the wrong element, reported as `Ok`.
+    ///
+    /// Some verdicts cannot be classified at all: Android raises `Backend` and
+    /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
+    /// adb handshake fail the same way its post-write read-back does — so no variant-level split
+    /// separates them, and the recoverable answer has to win.
+    pub fn set_value_failed_after_writing(&self) -> bool {
+        matches!(self, GlassError::AxValueNotApplied(_))
+    }
+
     /// Runtime "this operation is unsupported on the active backend" error, worded
     /// consistently.
     ///
@@ -303,6 +322,26 @@ mod tests {
             GlassError::Backend("bus died".into()),
         ] {
             assert!(!e.invoke_fallback_eligible(), "{e}");
+        }
+    }
+
+    #[test]
+    fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
+        // The read-back verdict is reached only after the write went out.
+        assert!(GlassError::AxValueNotApplied(3).set_value_failed_after_writing());
+        // Everything else keeps the captured value: the pre-dispatch rejections, the transport
+        // errors raised on either side of the dispatch, and any variant not named (the wildcard).
+        for e in [
+            GlassError::AxElementNotFound(3),
+            GlassError::AxElementChanged(3),
+            GlassError::AxElementNotEditable(3),
+            GlassError::AxElementNotClickable(3),
+            GlassError::AxUnsupported,
+            GlassError::AccessibilityUnavailable("uiautomator dump not ready".into()),
+            GlassError::Backend("adb died".into()),
+            GlassError::Timeout(10),
+        ] {
+            assert!(!e.set_value_failed_after_writing(), "{e}");
         }
     }
 

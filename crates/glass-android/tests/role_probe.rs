@@ -285,7 +285,7 @@ fn uiautomator_role_histogram_probe() {
         println!(
             "\nNOTE: no app in this run reported a single described node — either these apps \
              give every element one label, or the reader stopped sourcing it (see the \
-             `description` binding in axmap::map_node / a11y_service::json_to_node)"
+             `description` binding in axmap::labels, which both readers route through)"
         );
     }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
@@ -365,7 +365,7 @@ fn service_role_histogram_probe() {
         println!(
             "\nNOTE: no app in this run reported a single described node — either these apps \
              give every element one label, or the reader stopped sourcing it (see the \
-             `description` binding in axmap::map_node / a11y_service::json_to_node)"
+             `description` binding in axmap::labels, which both readers route through)"
         );
     }
     // `_restore` puts the device's accessibility settings back as it drops, after this

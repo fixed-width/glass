@@ -8,6 +8,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.GridView;
 import android.widget.LinearLayout;
@@ -91,14 +92,19 @@ public class MainActivity extends Activity {
         root.addView(menuButton(), matchWrap());
         root.addView(dialogButton(), matchWrap());
 
-        // Both Android readers take a name from one of these two labels and now surface the
-        // other as `description` — uiautomator prefers content-desc, the accessibility service
-        // prefers text — so one control whose two labels differ is the positive control for it
-        // on both.
+        // Both readers name this by its visible text and surface the content-description as
+        // `description` — the positive control proving the two readers agree on precedence.
         Button described = new Button(this);
         described.setText("Save");
         described.setContentDescription("Save changes");
         root.addView(described, matchWrap());
+
+        // A hint and nothing else: no content description, and no resource name (this fixture has
+        // no resources file), so it stays unnamed. Through the on-device service its hint arrives
+        // as the description, which makes it the one control that renders desc= with no name.
+        EditText hinted = new EditText(this);
+        hinted.setHint("Search settings");
+        root.addView(hinted, matchWrap());
 
         ScrollView scroller = new ScrollView(this);
         scroller.addView(root);

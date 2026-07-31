@@ -16,6 +16,54 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
+  name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
+  *different* data — a recycled list row reusing the same view is the case this closes — is now
+  rejected as changed since the snapshot rather than written to. An editable element with no
+  content description and no resource id has no name at all, so role plus an 8px bounds match used
+  to be the whole fingerprint a write re-walked against. The value only discriminates where there
+  was one to capture: rows of *empty* fields share a role, a name, a rect and no value alike, so a
+  write can still land on the wrong one of those — re-snapshot before writing into a list that has
+  scrolled.
+
+### Changed
+- Both Android readers now name an element the same way. The same control used to answer
+  differently depending on which reader was running — `uiautomator` and the on-device
+  accessibility-service reader disagreed on which label became the `name` — so a `name:`
+  selector learned under one could silently miss under the other, with nothing to say why. A
+  control with both a visible label and a content description is now named by the visible
+  label, the one actually on screen: verified on device, the role fixture's button reads
+  `Button "Save" desc="Save changes"` through both readers, where the two strings used to be
+  swapped between them. An editable element is named by its content
+  description and never by what has been typed into it; the accessibility-service reader used
+  to name a filled text field by its own contents, so its name changed with the field's contents
+  from one snapshot read to the next.
+
+  An editable element with no content description — including an empty field named only by its
+  hint — now falls back to the leaf of its view resource id rather than staying unnamed: plain
+  text, not the package-qualified form Android reports, and shared by every other view built from
+  the same layout, so treat it as a label of last resort, not a selector to rely on.
+  Verified on device: Settings' search box reads `open_search_view_edit_text` identically from
+  both readers. The on-device companion separately carries the field's hint into its
+  `description`, so an agent sees `desc="Search settings"` there even when nothing names the field
+  at all — verified on the role fixture's added `EditText`, which has a hint and neither a content
+  description nor a resource id: it renders as `TextField desc="Search settings"` through the
+  companion. `uiautomator` cannot supply that description at all — its dump carries no hint
+  attribute — so a text field's `desc` is richer through the companion than through `uiautomator`.
+  Both the id fallback and the hint on the accessibility-service reader need the updated on-device
+  companion.
+
+  One selector detail changes with it, though nothing becomes unreachable. On the
+  accessibility-service reader an element that is not editable — a label, a button, a check box —
+  no longer reports a `value`; that reader used to copy the element's own text there as well as
+  into `name`. A `value_contains` filter aimed at such an element therefore stops matching, and
+  `glass_wait_for_element` waits out its timeout. Match on `name` instead: it is a substring
+  filter too, and that text was always in `name` as well, so every selector has an equivalent —
+  including `role:"Button"` with `name:"Submit"`, which reaches a Jetpack Compose button surfacing
+  as a clickable `Group` exactly as the `value_contains` form did. `uiautomator` never reported a
+  value there, so a selector written against that reader is unaffected.
+
 ### Added
 - Every tool parameter now carries a description in the advertised MCP schema, so an agent can
   read a parameter's meaning without inferring it from the name. The additions cover the
@@ -107,9 +155,7 @@ internal refactors, CI, or test-only changes.
   value; and the iOS reader reads the element's accessibility hint, falling back to the label an
   editable element's identifier displaced. On Android a description needs one node to carry two
   distinct labels and most controls carry only one, so expect `desc` to be absent on most Android
-  nodes. The two Android readers also disagree on which label is the name: `uiautomator` prefers
-  content-description, the on-device accessibility-service reader prefers text, so the same
-  control can report `name` and `desc` swapped depending on which reader is running.
+  nodes.
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
   (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is

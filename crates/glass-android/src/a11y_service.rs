@@ -8,12 +8,12 @@ use serde_json::{Value, json};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    TruncationLimit, WalkBudget, WalkLimits, normalize_description,
+    TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
-use crate::axmap::class_to_role;
+use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::Conn;
 
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
@@ -34,12 +34,22 @@ fn json_to_node(
 ) -> Result<AxNode> {
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
-    // No host-side filter: device agent drops empty text/desc. Were that to change,
-    // empty `text` would win the name. Filtering here would change name, so it stays
-    // device-side (key to selectors, set_value).
+    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+    // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
+    // `None` here; `labels` judges a blank one absent either way.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
-    let name = text.or(desc);
+    // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
+    // no version check is needed to stay compatible with it.
+    let resource_id = v.get("resource_id").and_then(Value::as_str);
+    let hint = v.get("hint").and_then(Value::as_str);
+    let (name, value, description) = labels(LabelInputs {
+        text,
+        desc,
+        resource_id,
+        hint,
+        editable: flag("editable"),
+    });
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
@@ -59,7 +69,6 @@ fn json_to_node(
             .clamp(0, i64::from(u32::MAX)) as u32
     };
     let (x, y, w, h) = (bi("x"), bi("y"), bu("w"), bu("h"));
-    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
     // pathologically deep or wide device tree cannot blow the stack or the token budget.
     // The child array is resolved before either bound is consulted: a childless node must
@@ -97,13 +106,10 @@ fn json_to_node(
         id: AxNodeId(0),
         role: class_to_role(cls),
         raw_role: cls.to_string(),
-        // name: the element's own text label, falling back to content-description.
-        // value: editable text content only (content-description is not user-entered text).
-        name: name.map(str::to_string),
-        // The content-description a `text` label displaced; with no `text` the desc IS the name.
-        // Hint and state-description stay unread — the device protocol carries neither.
-        description: desc.and_then(|d| normalize_description(d, name)),
-        value: text.map(str::to_string),
+        name,
+        // State-description stays unread — the device protocol doesn't carry it.
+        description,
+        value,
         states: AxStates {
             enabled: flag("enabled"),
             editable: flag("editable"),
@@ -223,24 +229,14 @@ impl Accessibility for ServiceA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        // Guard: re-snapshot and verify the ref still points at the same editable element
-        // (role+name+bounds) before acting — the same drift protection as AndroidA11y::set_value.
+        // Guard: re-snapshot and verify the ref still points at the same editable element before
+        // acting. Shared with `AndroidA11y::set_value`, so both readers refuse the same drift.
         let tree = {
             let mut t = self.snapshot(ctx)?;
             t.assign_ids();
             t
         };
-        let node = tree
-            .find(target.id)
-            .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-        if !target.matches(node.role, node.name.as_deref())
-            || !target.bounds_consistent(node.bounds, 8)
-        {
-            return Err(GlassError::AxElementChanged(target.id.0));
-        }
-        if !node.states.editable {
-            return Err(GlassError::AxElementNotEditable(target.id.0));
-        }
+        crate::a11y::editable_target(&tree, target)?;
         self.client.action(target.id.0, "set_text", Some(text))?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
@@ -250,10 +246,24 @@ impl Accessibility for ServiceA11y {
         loop {
             let mut after = self.snapshot(ctx)?;
             after.assign_ids();
-            let got = after.find(target.id).and_then(|n| n.value.clone());
+            let node = after.find(target.id);
+            let got = node.and_then(|n| n.value.clone());
             // An empty field reports no value (None), not Some(""), so compare against "".
             if got.as_deref().unwrap_or("") == text {
                 return Ok(());
+            }
+            // A field that has stopped reporting `editable` — a submit collapsing it to a display
+            // row, focus lost — also reports no value, which reads exactly like a write that never
+            // landed. Spending the rest of the budget to then blame the write would send the
+            // caller to clear a field that is already correct and to switch backends for nothing.
+            // `AndroidA11y`'s `verify_write` re-checks the same flag for the same reason.
+            if node.is_some_and(|n| !n.states.editable) {
+                return Err(GlassError::AccessibilityUnavailable(format!(
+                    "set_value on element {} was sent, but the element no longer reports itself \
+                     editable, so its value cannot be read back; re-snapshot to see what it holds \
+                     rather than retyping",
+                    target.id.0
+                )));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(GlassError::Backend(format!(
@@ -497,7 +507,7 @@ mod tests {
             "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
             "editable": false, "clickable": false, "enabled": true, "scrollable": false,
             "children": [
-                {"ref": 1, "class": "android.widget.EditText", "text": "Email",
+                {"ref": 1, "class": "android.widget.EditText", "text": "joe@x.com", "desc": "Email",
                  "bounds": {"x": 40, "y": 200, "w": 600, "h": 120},
                  "editable": true, "clickable": true, "enabled": true, "scrollable": false},
                 {"ref": 2, "class": "android.widget.Button", "desc": "Save",
@@ -510,7 +520,8 @@ mod tests {
         assert_eq!(t.count, 3);
         let email = t.find(AxNodeId(1)).unwrap();
         assert_eq!(email.role, AxRole::TextField);
-        assert_eq!(email.name.as_deref(), Some("Email"));
+        assert_eq!(email.name.as_deref(), Some("Email")); // editable: name follows desc, not text
+        assert_eq!(email.value.as_deref(), Some("joe@x.com"));
         assert!(email.states.editable);
         assert_eq!(email.bounds.unwrap().y, 100); // window-relative: 200 - win.y 100
         let save = t.find(AxNodeId(2)).unwrap();
@@ -676,7 +687,12 @@ mod tests {
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
     }
 
-    fn node_json(text: Option<&str>, desc: Option<&str>) -> Value {
+    fn node_json(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+    ) -> Value {
         let mut v = json!({
             "class": "android.widget.Button",
             "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
@@ -688,19 +704,43 @@ mod tests {
         if let Some(d) = desc {
             v["desc"] = json!(d);
         }
+        if let Some(r) = resource_id {
+            v["resource_id"] = json!(r);
+        }
+        if let Some(h) = hint {
+            v["hint"] = json!(h);
+        }
         v
     }
 
     fn mapped(text: Option<&str>, desc: Option<&str>) -> AxNode {
         let mut budget = WalkBudget::new();
-        json_to_node(&node_json(text, desc), &win(), 0, &mut budget).expect("maps")
+        json_to_node(&node_json(text, desc, None, None), &win(), 0, &mut budget).expect("maps")
     }
 
-    /// [`mapped`], for an editable field rather than a button.
+    /// [`mapped`], for an editable field; omits `resource_id`/`hint`, the shape an older
+    /// companion sends.
     fn mapped_editable(text: Option<&str>, desc: Option<&str>) -> AxNode {
-        let mut v = node_json(text, desc);
+        let mut v = node_json(text, desc, None, None);
         v["class"] = json!("android.widget.EditText");
         v["editable"] = json!(true);
+        let mut budget = WalkBudget::new();
+        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+    }
+
+    /// [`mapped_editable`], additionally setting `resource_id` and `hint`.
+    fn mapped_full(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+        editable: bool,
+    ) -> AxNode {
+        let mut v = node_json(text, desc, resource_id, hint);
+        if editable {
+            v["class"] = json!("android.widget.EditText");
+            v["editable"] = json!(true);
+        }
         let mut budget = WalkBudget::new();
         json_to_node(&v, &win(), 0, &mut budget).expect("maps")
     }
@@ -708,10 +748,13 @@ mod tests {
     #[test]
     fn the_content_description_a_text_displaced_becomes_the_description() {
         let node = mapped(Some("Save"), Some("Save changes"));
-        // `text` wins the name on this reader — the opposite of the uiautomator reader, which is
-        // glass#260 and is NOT changed here.
+        // Non-editable: `text` wins the name here too, unchanged by glass#260.
         assert_eq!(node.name.as_deref(), Some("Save"));
         assert_eq!(node.description.as_deref(), Some("Save changes"));
+        assert_eq!(
+            node.value, None,
+            "a Button's text is not user-entered content"
+        );
     }
 
     #[test]
@@ -735,11 +778,75 @@ mod tests {
     }
 
     #[test]
-    fn an_editable_nodes_desc_is_still_its_description() {
-        // Deliberately ungated, unlike the uiautomator reader: there the editable node's `text`
-        // is only the value, here it is the name too, so the displaced `desc` is the one label
-        // left with nowhere else to go.
+    fn an_editable_node_is_named_by_its_content_description_not_its_text() {
+        // This reader used to name an editable node by `text` too (see `labels`'s doc for why
+        // that breaks selectors).
         let node = mapped_editable(Some("joe@x.com"), Some("Email"));
-        assert_eq!(node.description.as_deref(), Some("Email"));
+        assert_eq!(node.name.as_deref(), Some("Email"));
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+        assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_desc_and_no_id_is_unnamed_not_named_by_its_contents() {
+        // The device omits the key entirely for a field with no content description, and
+        // `mapped_editable` omits `resource_id` too, so nothing is left to fall back to. Naming it
+        // by `text` would move the name — and the fingerprint `set_value` re-walks against — on
+        // every keystroke, so unnamed is the honest reading.
+        let node = mapped_editable(Some("joe@x.com"), None);
+        assert_eq!(node.name, None);
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+    }
+
+    #[test]
+    fn a_non_editable_nodes_text_is_its_name_and_not_also_its_value() {
+        // This reader used to copy a label into `value` too, so a Label reported the same
+        // string twice.
+        let node = mapped(Some("Settings"), None);
+        assert_eq!(node.name.as_deref(), Some("Settings"));
+        assert_eq!(node.value, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_desc_is_named_by_its_view_id() {
+        let node = mapped_full(
+            Some("joe@x.com"),
+            None,
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("email_field"));
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+    }
+
+    #[test]
+    fn an_editable_nodes_hint_becomes_its_description() {
+        let node = mapped_full(
+            None,
+            None,
+            Some("com.x:id/q"),
+            Some("Search settings"),
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("q"));
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+    }
+
+    #[test]
+    fn an_editable_nodes_name_is_the_desc_not_the_raw_resource_id() {
+        // The only fixture here with both `desc` and `resource_id` present, so it is what
+        // pins the precedence between them. (`LabelInputs`'s named fields, not this test, are
+        // what stop the call site transposing the two.) The older-companion path (neither key
+        // sent) needs no dedicated test — every fixture above that omits them already
+        // exercises it.
+        let node = mapped_full(
+            Some("joe@x.com"),
+            Some("Email"),
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("Email"));
     }
 }
