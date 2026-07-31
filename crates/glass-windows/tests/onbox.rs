@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
-    DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform,
-    PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    ChangeSignal, DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton,
+    Platform, PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
     description_census, description_census_report, role_histogram,
 };
 use glass_windows::WindowsPlatform;
@@ -1435,5 +1435,243 @@ fn onbox_role_histogram_probe() {
         described >= 1,
         "no probed app reported a single described node: either every app lost its HelpText, or \
          the reader stopped sourcing it"
+    );
+}
+
+/// The subscription must report a change a real UIA provider actually emitted — not merely
+/// establish itself. Sequential on purpose: subscribe, act, then wait. `set_value` on charmap's
+/// Edit field is the same change `onbox_a11y_set_value` already proves lands.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_subscription_reports_a_real_change() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+
+    // Before the first read, as the seam requires: a change landing between a read and the
+    // subscription is announced to nobody.
+    let mut signal = a11y
+        .subscribe_changes(&ctx)
+        .expect("UIA subscription must establish against charmap");
+
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
+    let mut field = None;
+    first_role(&tree.root, AxRole::TextField, &mut field);
+    let field = field.expect("charmap must expose a TextField (Edit)");
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+        value: field.value.clone(),
+    };
+    a11y.set_value(&ctx, &target, "GLASSEVENT")
+        .expect("set_value on the Edit field");
+
+    let verdict = signal.wait(Duration::from_secs(2));
+    let _ = p.stop_app();
+    assert_eq!(
+        verdict,
+        glass_core::ChangeWait::Changed,
+        "a ValueValue change on a real UIA provider must reach the signal"
+    );
+}
+
+/// The other half, and the one the saving depends on: nothing happening must read as `Quiet`,
+/// not as a change. A signal that reports `Changed` on an idle app costs a walk per interval —
+/// polling, with a subscription's price on top.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_subscription_is_quiet_on_an_idle_app() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+    let mut signal = a11y
+        .subscribe_changes(&ctx)
+        .expect("UIA subscription must establish against charmap");
+
+    let verdict = signal.wait(Duration::from_millis(800));
+    let _ = p.stop_app();
+    assert_eq!(
+        verdict,
+        glass_core::ChangeWait::Quiet,
+        "an untouched charmap must not report changes"
+    );
+}
+
+/// Counts the walks a session performs. Wall-clock cannot tell a wait that waited efficiently
+/// from one that walked slowly; only the count separates them.
+///
+/// Forwards every trait method. `subscribe_changes` has a default body, so a forgotten forward
+/// would compile and silently disable the thing this measures — hence the counter on it too.
+struct Counting<A> {
+    inner: A,
+    walks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<A: Accessibility> Accessibility for Counting<A> {
+    fn snapshot(&mut self, ctx: &AxContext) -> glass_core::Result<glass_core::AxTree> {
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.snapshot(ctx)
+    }
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        let s = self.inner.subscribe_changes(ctx);
+        if s.is_some() {
+            self.signals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        s
+    }
+    fn set_value(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        text: &str,
+    ) -> glass_core::Result<()> {
+        self.inner.set_value(ctx, target, text)
+    }
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> glass_core::Result<()> {
+        self.inner.invoke(ctx, target)
+    }
+}
+
+/// A `Glass` session whose reader counts walks and subscriptions.
+fn glass_counting() -> (
+    Glass,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let walks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (w, sg) = (walks.clone(), signals.clone());
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend {
+            platform: Box::new(WindowsPlatform::new()?),
+            accessibility: Some(Box::new(Counting {
+                inner: WindowsA11y::new(),
+                walks: w.clone(),
+                signals: sg.clone(),
+            })),
+        })
+    });
+    let dir = tempfile::tempdir().expect("tempdir for baseline store");
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    (
+        Glass::new(factory, "windows".into(), BaselineStore::new(root), 100),
+        walks,
+        signals,
+    )
+}
+
+/// The point of the subscription, measured against a real app: a wait for something that never
+/// happens must stop re-reading the tree. A UIA walk is the most expensive of any backend —
+/// 2360ms for 1500 nodes on the dogfood box — so this is where the saving is largest.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting();
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("no such element in charmap".into()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 3_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    // Logged: the number is the point of the change.
+    eprintln!("quiet 3s wait at 100ms: {walked} walks");
+    assert!(!out.matched, "the element must not exist");
+    // See `Counting`: without this the test could measure polling and pass.
+    assert!(subscribed > 0, "no subscription was established");
+    // One read at the start plus `QUIET_RUNS_BEFORE_REREAD`'s forced re-read about once a
+    // second. The same wait polling takes many more; a UIA walk is slow enough that the
+    // polling count is itself walk-bound rather than interval-bound.
+    assert!(
+        walked <= 5,
+        "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
+    );
+}
+
+/// The risk a subscription creates: a wait that no longer matches, because the signal suppressed
+/// the read that would have found the element. Sequential and assumption-free — the element is
+/// already on screen when the wait starts, so the wait must return on its first read.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_wait_with_a_signal_still_matches() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting();
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Read the label out of the tree rather than hardcoding one: charmap's button wording is a
+    // Windows-version detail, and this test is not about the wording.
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
+    let mut button = None;
+    first_role(&tree.root, AxRole::Button, &mut button);
+    let name = button
+        .and_then(|b| b.name.clone())
+        .expect("charmap exposes a named Button");
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some(name.clone()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 5_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    assert!(subscribed > 0, "no subscription was established");
+    assert!(
+        out.matched,
+        "a wait for {name:?}, already on screen, must match"
+    );
+    assert!(
+        walked <= 2,
+        "an already-satisfied wait took {walked} walks; it should return on the first read"
     );
 }
