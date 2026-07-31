@@ -243,9 +243,8 @@ fn role_histogram_probe() {
         platform.stop_app().expect("stop_app");
     }
 
-    // The census prints without a caveat now that this reader sources the field, so a reader
-    // regressed to `description: None` would print a plausible zero for every app and this probe
-    // would pass silently. The app list is the caller's, so this is a note, not a failure.
+    // Same rationale as the Android role-histogram probes' role_probe.rs: a silent zero is a
+    // note here, not a failure, since the app list is the caller's.
     if described == 0 {
         println!(
             "\nNOTE: no app in this run reported a single described node — either these apps \

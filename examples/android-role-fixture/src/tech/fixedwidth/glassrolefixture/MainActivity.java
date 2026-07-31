@@ -91,9 +91,10 @@ public class MainActivity extends Activity {
         root.addView(menuButton(), matchWrap());
         root.addView(dialogButton(), matchWrap());
 
-        // Both Android readers take a name from one of these two labels and drop the other —
-        // uiautomator prefers content-desc, the accessibility service prefers text — so one
-        // control whose two labels differ is the positive control for `description` on both.
+        // Both Android readers take a name from one of these two labels and now surface the
+        // other as `description` — uiautomator prefers content-desc, the accessibility service
+        // prefers text — so one control whose two labels differ is the positive control for it
+        // on both.
         Button described = new Button(this);
         described.setText("Save");
         described.setContentDescription("Save changes");

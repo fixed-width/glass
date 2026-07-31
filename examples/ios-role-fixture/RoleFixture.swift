@@ -67,17 +67,16 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
                 UIAction(title: "Menu item two") { _ in },
             ])
 
-        // idb's node schema carries a `help` key that glass reads nothing from. A hint is what
-        // UIKit would put behind it, so this control is what decides whether that key is a real
-        // description source or always null.
+        // idb reports UIKit's accessibilityHint under the node key `help`; the iOS reader maps
+        // that straight to `description`, and this control is what confirms it on device.
         let hintedButton = UIButton(type: .system)
         hintedButton.setTitle("hinted", for: .normal)
         hintedButton.accessibilityIdentifier = "the-hinted-button"
         hintedButton.accessibilityHint = "Saves and closes the sheet"
 
         // An editable element with BOTH an identifier and a label: the identifier becomes the
-        // node name and `AXValue` becomes the value, so the label is the one string this reader
-        // drops outright today.
+        // node name and `AXValue` becomes the value, so the label has nowhere left to go but
+        // `description`, which is what the iOS reader now recovers it as.
         let describedField = UITextField()
         describedField.borderStyle = .roundedRect
         describedField.text = "typed text"

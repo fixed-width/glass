@@ -157,8 +157,8 @@ fn map_node(
     let text = non_empty(attr("text"));
     let name = content_desc.or_else(|| if editable { None } else { text.clone() });
     // An editable node's `text` is its value, so it is already surfaced. A non-editable node's
-    // `text` is either the name (no content-desc — `normalize_description` drops that as a
-    // duplicate) or dropped outright, and the dropped case is what this recovers.
+    // `text` is either the name (no content-desc) or dropped outright, and the dropped case is
+    // what this recovers.
     let description = if editable {
         None
     } else {

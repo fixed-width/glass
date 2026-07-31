@@ -359,9 +359,8 @@ fn service_role_histogram_probe() {
 
     drop(platform);
     agents.shutdown();
-    // The census prints without a caveat now that this reader sources the field, so a reader
-    // regressed to `description: None` would print a plausible zero for every app and this probe
-    // would pass silently. The app list is the caller's, so this is a note, not a failure.
+    // Same rationale as `uiautomator_role_histogram_probe` above: a silent zero is a note here,
+    // not a failure, since the app list is the caller's.
     if described == 0 {
         println!(
             "\nNOTE: no app in this run reported a single described node — either these apps \

@@ -97,9 +97,8 @@ fn json_to_node(
         // name: the element's own text label, falling back to content-description.
         // value: editable text content only (content-description is not user-entered text).
         name: name.map(str::to_string),
-        // The content-description a `text` label displaced. With no `text` the desc IS the name,
-        // and `normalize_description` drops it there. Hint and state-description stay unread —
-        // the device protocol carries neither.
+        // The content-description a `text` label displaced; with no `text` the desc IS the name.
+        // Hint and state-description stay unread — the device protocol carries neither.
         description: desc.and_then(|d| normalize_description(d, name)),
         value: text.map(str::to_string),
         states: AxStates {
