@@ -34,9 +34,9 @@ fn json_to_node(
 ) -> Result<AxNode> {
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
-    // No emptiness filter, unlike the sibling readers: the device agent already drops an empty
-    // text/desc rather than sending it. Were that to change, an empty `text` would win the name
-    // as `Some("")` and strand the real label in `desc`.
+    // No emptiness filter, unlike the sibling readers: the device agent already drops empty
+    // text/desc, so a resurfaced empty `text` would win the name as `Some("")` and strand the
+    // real label in `desc`.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
     let name = text.or(desc);
