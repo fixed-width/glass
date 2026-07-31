@@ -69,7 +69,8 @@ pub fn class_to_role(class: &str) -> AxRole {
 }
 
 /// `com.example:id/search_src_text` → `search_src_text`. The package-qualified form is noise in an
-/// outline, and within one app's tree the leaf is what distinguishes one view from another.
+/// outline; the bare leaf is still not unique within an app's tree — see `labels`'s doc for why
+/// it is only a label of last resort.
 fn id_leaf(id: &str) -> String {
     id.rsplit('/').next().unwrap_or(id).to_string()
 }
@@ -244,10 +245,10 @@ fn map_node(
 ///
 /// A text field with no content description falls back to its resource id — not unique in a tree
 /// (ten rows from one layout can all carry `row_title`), so it is a label of last resort rather
-/// than an identifier. Only when both are absent does the node stay unnamed, leaving role plus an
-/// 8px bounds match as the whole fingerprint `set_value` re-walks against — weaker discrimination
-/// against an in-place replacement, a recycled list row, or a dialog reusing the rect.
-/// `json_to_node` errors on a node with no bounds, so that rect is always there to compare.
+/// than an identifier. Only when both are absent does the node stay unnamed; role, bounds, and —
+/// since `editable_target` also compares `AxTarget::value` — the field's own text are then the
+/// whole fingerprint `set_value` re-walks against. `json_to_node` errors on a node with no bounds,
+/// so that rect is always there to compare.
 ///
 /// The hint (Android's placeholder text for an empty field) becomes the `description`, never the
 /// `name` — `uiautomator` cannot see a hint at all, so a hint-derived name would exist on one
@@ -289,6 +290,8 @@ pub(crate) fn labels(
             description,
         );
     }
+    // No resource-id fallback here: giving every container a name too would stop
+    // `outline::is_scaffolding` collapsing them, inflating every snapshot.
     let name = text_label.or(desc_label);
     (
         name.map(str::to_string),

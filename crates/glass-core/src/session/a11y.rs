@@ -2807,10 +2807,9 @@ mod tests {
 
     #[test]
     fn set_value_invalidates_the_cached_value_after_a_failed_write() {
-        // Android types before it verifies (`typed_clear_landed`'s documented AVD false-failure:
-        // an emptied field reporting its placeholder), so a reported failure can still have
-        // changed the field. The stale pre-write value must not survive it, or a retry with no
-        // intervening snapshot would carry a value `editable_target` could reject as drift.
+        // The AVD false-failure `typed_clear_landed` documents (an emptied field reporting its
+        // placeholder) is why `Glass::set_value` invalidates rather than gates on failure — see
+        // its comment. This exercises that path through a real retry.
         let dir = tempfile::tempdir().unwrap();
         let baselines = dir.path().join("baselines");
         std::mem::forget(dir);

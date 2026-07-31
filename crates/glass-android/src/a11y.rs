@@ -230,9 +230,8 @@ impl Default for AndroidA11y {
 ///
 /// Both Android readers' `set_value` guards route through this — the check that stops a write
 /// landing on whatever inherited the id between the snapshot the caller read and the one the write
-/// acts on. A recycled `RecyclerView` row keeps role, name and rect unchanged and only its data
-/// differs, which is why a captured value is checked too. Pure (no device I/O), so it is testable
-/// without a device.
+/// acts on. A recycled `RecyclerView` row is the motivating case for comparing `value` too — see
+/// `AxTarget::value`'s doc. Pure (no device I/O), so it is testable without a device.
 pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
@@ -528,8 +527,8 @@ mod tests {
         t
     }
 
-    /// Like `tree`, but also holding `value` — the fingerprint a recycled row needs, since its
-    /// role, name and bounds are reused unchanged. Always at `BOUNDS`, always editable.
+    /// Like `tree`, but also holding `value` — see `editable_target`'s doc for why that's part of
+    /// the fingerprint too. Always at `BOUNDS`, always editable.
     fn tree_with_value(role: AxRole, name: Option<&str>, value: Option<&str>) -> AxTree {
         let mut t = tree(role, name, Some(BOUNDS), true);
         t.root.value = value.map(Into::into);
@@ -705,8 +704,7 @@ mod tests {
 
     #[test]
     fn a_target_whose_value_moved_is_rejected() {
-        // A recycled row reuses the view, so role, name and rect are all identical and only the
-        // data differs — the value is the one thing that can catch it.
+        // The recycled-row case `editable_target`'s doc names: role, name and rect match here too.
         let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Zara"));
         let target = AxTarget {
             id: AxNodeId(0),
@@ -723,8 +721,7 @@ mod tests {
 
     #[test]
     fn a_target_with_no_captured_value_still_passes() {
-        // A `None` at snapshot time says nothing about identity, so it must not gate. Without
-        // this, every element that had no value became un-writable.
+        // The `None`-must-not-gate case from the comment on `editable_target`'s value check.
         let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Alice"));
         let target = AxTarget {
             id: AxNodeId(0),
