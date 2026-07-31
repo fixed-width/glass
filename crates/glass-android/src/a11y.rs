@@ -236,13 +236,10 @@ pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result
     let node = tree
         .find(target.id)
         .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-    if !target.matches(node.role, node.name.as_deref()) || !target.bounds_consistent(node.bounds, 8)
+    if !target.matches(node.role, node.name.as_deref())
+        || !target.bounds_consistent(node.bounds, 8)
+        || !target.value_consistent(node.value.as_deref())
     {
-        return Err(GlassError::AxElementChanged(target.id.0));
-    }
-    // A captured `None` says nothing about identity and must not gate, or every element that
-    // never had a value becomes unwritable.
-    if target.value.is_some() && target.value.as_deref() != node.value.as_deref() {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
     if !node.states.editable {
@@ -731,6 +728,24 @@ mod tests {
             value: None,
         };
         assert!(editable_target(&tree, &target).is_ok());
+    }
+
+    #[test]
+    fn a_target_whose_value_vanished_is_rejected() {
+        // Android reports an emptied field as no value at all, so this is the shape a row that
+        // recycled from filled to empty arrives in — a real change, not a missing observation.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), None);
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(matches!(
+            editable_target(&tree, &target),
+            Err(GlassError::AxElementChanged(0))
+        ));
     }
 
     #[test]

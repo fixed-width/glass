@@ -635,11 +635,12 @@ pub struct AxContext {
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
-/// (pre-order index), the role/name the caller saw in the snapshot, and the
-/// element's window-relative bounds when known. The backend re-walks to the id
-/// and verifies role+name (and bounds, when present) so a stale id — or tree
-/// drift that lands a *different* same-role+name element on the id — errors
-/// rather than overwriting the wrong element.
+/// (pre-order index), the role/name the caller saw in the snapshot, the
+/// element's window-relative bounds when known, and the value it held. The
+/// backend re-walks to the id and verifies role+name (and bounds, when present;
+/// on Android the value too) so a stale id — or tree drift that lands a
+/// *different* same-role+name element on the id — errors rather than
+/// overwriting the wrong element.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxTarget {
     pub id: AxNodeId,
@@ -650,13 +651,13 @@ pub struct AxTarget {
     /// same-role+name element if the tree drifted, and that element sits
     /// elsewhere — see [`Self::bounds_consistent`].
     pub bounds: Option<AxRect>,
-    /// The element's value at snapshot time, when it had one. Captured on every backend; the
-    /// `set_value` path uses it to notice that a re-walk landed on a different element holding
-    /// different data — a recycled list row reuses the same view, so its role, name and rect are
-    /// all identical and only this differs.
+    /// The element's value at snapshot time, when it had one. Captured on every backend, but
+    /// compared only by Android's `set_value` guard (`editable_target`), where a recycled list
+    /// row reuses the same view — role, name and rect all identical, only this different. The
+    /// other backends carry it without reading it; see [`Self::value_consistent`].
     ///
-    /// After a write, the session cache patches this to the text that was requested — an exact
-    /// fact only on a typed-write backend (Android/iOS, verified by
+    /// After a successful write the session cache patches this to the text that was requested —
+    /// an exact fact only on a typed-write backend (Android/iOS, verified by
     /// `typed_text_landed`/`typed_clear_landed`). An atomic-write backend (Windows/macOS) may
     /// have reformatted the value instead (`read_back_confirms`), and Linux's AT-SPI writer
     /// doesn't read back at all, so on those a future consumer should treat this as a best
@@ -686,6 +687,15 @@ impl AxTarget {
                     && (i64::from(a.height) - i64::from(b.height)).abs() <= tol
             }
         }
+    }
+
+    /// Whether a reached element's value `got` is consistent with the value captured for this
+    /// target. `true` when none was captured: a captured `None` says the element held no value
+    /// then, not which element it was, so gating on it would make every element that never held
+    /// one unwritable. A live `None` against a captured value still rejects — Android reports an
+    /// emptied field as no value at all, which is a real change, not a missing observation.
+    pub fn value_consistent(&self, got: Option<&str>) -> bool {
+        self.value.is_none() || self.value.as_deref() == got
     }
 }
 
@@ -1511,6 +1521,27 @@ mod tests {
     }
 
     #[test]
+    fn ax_target_value_consistent_rejects_an_element_holding_other_data() {
+        let with_value = |value: Option<&str>| AxTarget {
+            id: AxNodeId(3),
+            role: AxRole::TextField,
+            name: None,
+            bounds: None,
+            value: value.map(Into::into),
+        };
+        let t = with_value(Some("Alice"));
+        assert!(t.value_consistent(Some("Alice")));
+        // A recycled row: same role, name and rect, different data → rejected.
+        assert!(!t.value_consistent(Some("Zara")));
+        // An emptied field reports no value at all, which is still a change.
+        assert!(!t.value_consistent(None));
+        // Nothing captured → nothing to verify, accept, or every element that never held a
+        // value would be unwritable.
+        assert!(with_value(None).value_consistent(Some("Alice")));
+        assert!(with_value(None).value_consistent(None));
+    }
+
+    #[test]
     fn clamped_center_is_in_bounds() {
         let r = AxRect {
             x: 10,
@@ -1795,10 +1826,17 @@ mod tests {
     fn find_mut_patches_the_node_in_place_without_touching_the_rest() {
         let mut t = sample_tree();
         t.assign_ids();
+        t.find_mut(AxNodeId(2)).unwrap().value = Some("sibling".into());
         t.find_mut(AxNodeId(1)).unwrap().value = Some("patched".into());
         assert_eq!(
             t.find(AxNodeId(1)).unwrap().value.as_deref(),
             Some("patched")
+        );
+        // "the rest": the sibling keeps its own value, so a patch reaching past the one id it was
+        // handed is caught rather than named away.
+        assert_eq!(
+            t.find(AxNodeId(2)).unwrap().value.as_deref(),
+            Some("sibling")
         );
         assert!(t.find_mut(AxNodeId(99)).is_none());
     }
