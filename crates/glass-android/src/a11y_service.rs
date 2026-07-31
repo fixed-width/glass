@@ -13,7 +13,7 @@ use glass_core::accessibility::{
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
-use crate::axmap::{class_to_role, labels};
+use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::Conn;
 
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
@@ -43,7 +43,13 @@ fn json_to_node(
     // no version check is needed to stay compatible with it.
     let resource_id = v.get("resource_id").and_then(Value::as_str);
     let hint = v.get("hint").and_then(Value::as_str);
-    let (name, value, description) = labels(text, desc, resource_id, hint, flag("editable"));
+    let (name, value, description) = labels(LabelInputs {
+        text,
+        desc,
+        resource_id,
+        hint,
+        editable: flag("editable"),
+    });
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
@@ -782,11 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn an_editable_node_with_no_desc_is_unnamed_not_named_by_its_contents() {
-        // The device omits the key entirely for a field with no content description. Falling
-        // back to `text` would name the field by what has been typed into it, moving the name —
-        // and the fingerprint `set_value` re-walks against — on every keystroke; unnamed is the
-        // honest reading.
+    fn an_editable_node_with_no_desc_and_no_id_is_unnamed_not_named_by_its_contents() {
+        // The device omits the key entirely for a field with no content description, and
+        // `mapped_editable` omits `resource_id` too, so nothing is left to fall back to. Naming it
+        // by `text` would move the name — and the fingerprint `set_value` re-walks against — on
+        // every keystroke, so unnamed is the honest reading.
         let node = mapped_editable(Some("joe@x.com"), None);
         assert_eq!(node.name, None);
         assert_eq!(node.value.as_deref(), Some("joe@x.com"));
@@ -829,9 +835,9 @@ mod tests {
 
     #[test]
     fn an_editable_nodes_name_is_the_desc_not_the_raw_resource_id() {
-        // Pins the `labels` call site's argument order: only this test has both `desc` and
-        // `resource_id` present, so a swap of the two would otherwise name the field by the
-        // unleafed id and nothing would catch it. The older-companion path (neither key
+        // The only fixture here with both `desc` and `resource_id` present, so it is what
+        // pins the precedence between them. (`LabelInputs`'s named fields, not this test, are
+        // what stop the call site transposing the two.) The older-companion path (neither key
         // sent) needs no dedicated test — every fixture above that omits them already
         // exercises it.
         let node = mapped_full(

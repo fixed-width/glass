@@ -69,10 +69,11 @@ pub fn class_to_role(class: &str) -> AxRole {
 }
 
 /// `com.example:id/search_src_text` → `search_src_text`. The package-qualified form is noise in an
-/// outline; the bare leaf is still not unique within an app's tree — see `labels`'s doc for why
-/// it is only a label of last resort.
-fn id_leaf(id: &str) -> String {
-    id.rsplit('/').next().unwrap_or(id).to_string()
+/// outline; the bare leaf is still not unique within an app's tree — see [`labels`]'s doc for why
+/// it is only a label of last resort. The leaf can be blank where the whole id was not
+/// (`com.x:id/`), so callers judge it after taking it, not before.
+fn id_leaf(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
 }
 
 /// Parse uiautomator `bounds="[l,t][r,b]"` (screen-absolute) into a window-relative `AxRect`.
@@ -163,14 +164,14 @@ fn map_node(
     let content_desc = non_empty(attr("content-desc"));
     let text = non_empty(attr("text"));
     let resource_id = non_empty(attr("resource-id"));
-    let (name, value, description) = labels(
-        text.as_deref(),
-        content_desc.as_deref(),
-        resource_id.as_deref(),
+    let (name, value, description) = labels(LabelInputs {
+        text: text.as_deref(),
+        desc: content_desc.as_deref(),
+        resource_id: resource_id.as_deref(),
         // A uiautomator dump carries no hint attribute — verified absent on API 34.
-        None,
+        hint: None,
         editable,
-    );
+    });
     let states = AxStates {
         focused: boolean("focused"),
         focusable: boolean("focusable"),
@@ -233,8 +234,27 @@ fn map_node(
     }
 }
 
-/// The three label fields, from the two labels Android exposes, the view's resource id, its
-/// hint, and whether the node is editable.
+/// What a reader read off one node, for [`labels`] to judge.
+///
+/// A struct rather than four interchangeable `Option<&str>` parameters: transposing two of those
+/// is not a type error, and the result is a plausible-looking *wrong* name (the unleafed id in the
+/// name slot) that no test outside a dedicated one would catch.
+pub(crate) struct LabelInputs<'a> {
+    /// The element's visible text — for an editable node, what the user typed.
+    pub(crate) text: Option<&'a str>,
+    /// Its content description.
+    pub(crate) desc: Option<&'a str>,
+    /// Its view resource id, package-qualified as the platform reports it.
+    pub(crate) resource_id: Option<&'a str>,
+    /// Its hint (placeholder text). Always `None` from `uiautomator`, whose dump carries no such
+    /// attribute.
+    pub(crate) hint: Option<&'a str>,
+    /// Whether the node is editable. The caller's to decide: the on-device service reads an
+    /// authoritative flag, while a `uiautomator` dump infers it from the widget class.
+    pub(crate) editable: bool,
+}
+
+/// The three label fields — name, value, description — from what a reader read off the node.
 ///
 /// Both Android readers route through this, so the precedence is one decision with one test suite
 /// rather than a per-reader choice that can drift apart — which is what it had done. The visible
@@ -257,29 +277,28 @@ fn map_node(
 /// A label, resource id, or hint with no non-whitespace content counts as absent. Left in place it
 /// would occupy the matchable `name` slot, where no `name:` selector reaches it and nothing falls
 /// back to the description — the judgement [`normalize_description`] already makes about its own
-/// candidate. Only the decision reads the trimmed form; a name that survives it is stored as the
-/// platform gave it.
-///
-/// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
-/// a `uiautomator` dump carries no such attribute and infers it from the widget class.
-pub(crate) fn labels(
-    text: Option<&str>,
-    desc: Option<&str>,
-    resource_id: Option<&str>,
-    hint: Option<&str>,
-    editable: bool,
-) -> (Option<String>, Option<String>, Option<String>) {
+/// candidate. The id is judged *after* its leaf is taken, so a `com.x:id/` with nothing behind the
+/// slash is absent too. Only the decision reads the trimmed form; a name that survives it is
+/// stored as the platform gave it.
+pub(crate) fn labels(inputs: LabelInputs<'_>) -> (Option<String>, Option<String>, Option<String>) {
     fn labelled(s: &&str) -> bool {
         !s.trim().is_empty()
     }
+    let LabelInputs {
+        text,
+        desc,
+        resource_id,
+        hint,
+        editable,
+    } = inputs;
     let text_label = text.filter(labelled);
     let desc_label = desc.filter(labelled);
     if editable {
         // Bound before the tuple: the hint is judged against the name that was actually chosen,
         // so a hint repeating it drops, exactly as a description does on the other arm.
         let name = desc_label
-            .map(str::to_string)
-            .or_else(|| resource_id.filter(labelled).map(id_leaf));
+            .or_else(|| resource_id.map(id_leaf).filter(labelled))
+            .map(str::to_string);
         let description = hint
             .filter(labelled)
             .and_then(|h| normalize_description(h, name.as_deref()));
@@ -658,10 +677,11 @@ mod tests {
     }
 
     #[test]
-    fn an_editable_node_with_an_empty_content_desc_is_unnamed_not_named_by_its_contents() {
-        // `content-desc=""` is what a device sends for a field with no description, and an
-        // unnamed field is the honest reading: naming it by `text` would move the name — and the
-        // fingerprint `set_value` re-walks against — on every keystroke.
+    fn an_editable_node_with_no_desc_and_no_id_is_unnamed_not_named_by_its_contents() {
+        // `content-desc=""` is what a device sends for a field with no description, and
+        // `edit_text_xml` emits no `resource-id`, so nothing is left to fall back to: naming it by
+        // `text` would move the name — and the fingerprint `set_value` re-walks against — on every
+        // keystroke, so unnamed is the honest reading.
         let xml = edit_text_xml("joe@x.com", "");
         let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
         let field = &tree.root.children[0];
@@ -929,10 +949,38 @@ mod tests {
                 None,
                 None,
             ),
+            // An id with nothing behind the slash: the leaf, not the qualified string, is what
+            // has to be non-blank, or `Some("")` takes the matchable name slot.
+            (
+                Some("wifi"),
+                None,
+                Some("com.x:id/"),
+                None,
+                true,
+                None,
+                Some("wifi"),
+                None,
+            ),
+            (
+                Some("wifi"),
+                None,
+                Some("com.x:id/   "),
+                None,
+                true,
+                None,
+                Some("wifi"),
+                None,
+            ),
         ];
         for &(text, desc, resource_id, hint, editable, name, value, description) in cases {
             assert_eq!(
-                labels(text, desc, resource_id, hint, editable),
+                labels(LabelInputs {
+                    text,
+                    desc,
+                    resource_id,
+                    hint,
+                    editable
+                }),
                 (
                     name.map(str::to_string),
                     value.map(str::to_string),
@@ -947,8 +995,17 @@ mod tests {
     fn an_editable_node_is_never_named_by_what_was_typed_into_it() {
         // The case the editable branch exists for (see `labels`'s doc): name must not track
         // the typed value.
-        let (before, _, _) = labels(Some("jo"), Some("Email"), None, None, true);
-        let (after, _, _) = labels(Some("joe@x.com"), Some("Email"), None, None, true);
+        let typed = |text| {
+            labels(LabelInputs {
+                text: Some(text),
+                desc: Some("Email"),
+                resource_id: None,
+                hint: None,
+                editable: true,
+            })
+        };
+        let (before, _, _) = typed("jo");
+        let (after, _, _) = typed("joe@x.com");
         assert_eq!(before, after);
         assert_eq!(before.as_deref(), Some("Email"));
     }
