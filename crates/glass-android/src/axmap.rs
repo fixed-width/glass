@@ -161,10 +161,12 @@ fn map_node(
     let editable = role == AxRole::TextField || boolean("password");
     let content_desc = non_empty(attr("content-desc"));
     let text = non_empty(attr("text"));
+    let resource_id = non_empty(attr("resource-id"));
     let (name, value, description) = labels(
         text.as_deref(),
         content_desc.as_deref(),
-        None,
+        resource_id.as_deref(),
+        // A uiautomator dump carries no hint attribute — verified absent on API 34.
         None,
         editable,
     );
@@ -673,6 +675,24 @@ mod tests {
         let field = &tree.root.children[0];
         assert_eq!(field.name.as_deref(), Some("Email"));
         assert_eq!(field.value, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_content_desc_is_named_by_its_view_id() {
+        let xml = concat!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+            "<node index=\"0\" text=\"wifi\" resource-id=\"com.android.settings:id/search_src_text\" ",
+            "class=\"android.widget.EditText\" content-desc=\"\" enabled=\"true\" focusable=\"true\" ",
+            "focused=\"false\" selected=\"false\" checkable=\"false\" checked=\"false\" ",
+            "password=\"false\" bounds=\"[0,0][100,50]\" />",
+            "</hierarchy>",
+        );
+        let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
+        let field = &tree.root.children[0];
+        assert_eq!(field.name.as_deref(), Some("search_src_text"));
+        assert_eq!(field.value.as_deref(), Some("wifi"));
+        // uiautomator carries no hint, so there is nothing to describe.
+        assert_eq!(field.description, None);
     }
 
     #[test]
