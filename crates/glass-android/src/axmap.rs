@@ -222,8 +222,9 @@ fn map_node(
 ///
 /// Both Android readers route through this, so the precedence is one decision with one test suite
 /// rather than a per-reader choice that can drift apart — which is what it had done. The visible
-/// text is the name; an editable node is the exception, because there the text is the user's
-/// content and the content description is the only label left.
+/// text is the name; an editable node is the exception, because its text is what the user typed —
+/// naming it by that text would move the name (and the role+name fingerprint) on every keystroke,
+/// so no `name:` selector could hold, and the content description is the only label left.
 ///
 /// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
 /// a `uiautomator` dump carries no such attribute and infers it from the widget class.
@@ -647,9 +648,8 @@ mod tests {
 
     #[test]
     fn an_editable_node_is_never_named_by_what_was_typed_into_it() {
-        // The case that decides the editable branch: `name` must not follow the content, or a
-        // `name:` selector cannot address a filled field and the role+name fingerprint moves
-        // every time the value does.
+        // The case the editable branch exists for (see `labels`'s doc): name must not track
+        // the typed value.
         let (before, _, _) = labels(Some("jo"), Some("Email"), true);
         let (after, _, _) = labels(Some("joe@x.com"), Some("Email"), true);
         assert_eq!(before, after);

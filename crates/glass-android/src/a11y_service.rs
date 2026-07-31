@@ -35,8 +35,9 @@ fn json_to_node(
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // No host-side filter: device agent drops empty text/desc, so this reader needs no
-    // non_empty like the uiautomator reader's XML dump.
+    // No host-side filter: device agent drops empty text/desc, so this reader skips the
+    // `non_empty` guard the uiautomator reader needs — were that to change, an empty `text`
+    // would win the name over `desc` on a non-editable node.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
     let (name, value, description) = labels(text, desc, flag("editable"));
@@ -736,8 +737,8 @@ mod tests {
 
     #[test]
     fn an_editable_node_is_named_by_its_content_description_not_its_text() {
-        // This reader used to name an editable node by `text`, so a filled field's name
-        // changed on every keystroke and could not be selected against.
+        // This reader used to name an editable node by `text` too (see `labels`'s doc for why
+        // that breaks selectors).
         let node = mapped_editable(Some("joe@x.com"), Some("Email"));
         assert_eq!(node.name.as_deref(), Some("Email"));
         assert_eq!(node.value.as_deref(), Some("joe@x.com"));
