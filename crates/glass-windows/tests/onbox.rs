@@ -1476,6 +1476,17 @@ fn onbox_a11y_subscription_reports_a_real_change() {
         bounds: field.bounds,
         value: field.value.clone(),
     };
+
+    // Discriminating, not just documenting: the channel is open and buffers one item from the
+    // moment of subscription, and the snapshot above is itself a full tree walk — so without this,
+    // a stray event the walk trips on its own subscription could pass the test on a signal that
+    // never actually saw `set_value`'s change.
+    assert_eq!(
+        signal.wait(Duration::from_millis(300)),
+        glass_core::ChangeWait::Quiet,
+        "no change should be pending yet — a real one hasn't been made"
+    );
+
     a11y.set_value(&ctx, &target, "GLASSEVENT")
         .expect("set_value on the Edit field");
 
@@ -1526,10 +1537,16 @@ fn onbox_a11y_subscription_is_quiet_on_an_idle_app() {
 ///
 /// Forwards every trait method. `subscribe_changes` has a default body, so a forgotten forward
 /// would compile and silently disable the thing this measures — hence the counter on it too.
+///
+/// `signal_enabled: false` makes `subscribe_changes` behave like a backend with no event stream
+/// at all — never calling `inner`, so no subscription thread is even started — which is the
+/// baseline [`onbox_a_signal_more_than_halves_a_quiet_walk_count`] compares the live subscription
+/// against: same app, same wait, the only variable is whether a signal was available to lean on.
 struct Counting<A> {
     inner: A,
     walks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     signals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signal_enabled: bool,
 }
 
 impl<A: Accessibility> Accessibility for Counting<A> {
@@ -1539,6 +1556,9 @@ impl<A: Accessibility> Accessibility for Counting<A> {
         self.inner.snapshot(ctx)
     }
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        if !self.signal_enabled {
+            return None;
+        }
         let s = self.inner.subscribe_changes(ctx);
         if s.is_some() {
             self.signals
@@ -1559,8 +1579,11 @@ impl<A: Accessibility> Accessibility for Counting<A> {
     }
 }
 
-/// A `Glass` session whose reader counts walks and subscriptions.
-fn glass_counting() -> (
+/// A `Glass` session whose reader counts walks and subscriptions. `signal_enabled` gates whether
+/// `subscribe_changes` ever hands back a working signal — see [`Counting`].
+fn glass_counting(
+    signal_enabled: bool,
+) -> (
     Glass,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1575,6 +1598,7 @@ fn glass_counting() -> (
                 inner: WindowsA11y::new(),
                 walks: w.clone(),
                 signals: sg.clone(),
+                signal_enabled,
             })),
         })
     });
@@ -1596,11 +1620,12 @@ fn glass_counting() -> (
 fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
-    let (mut glass, walks, signals) = glass_counting();
+    let (mut glass, walks, signals) = glass_counting(true);
     glass.start(&charmap_spec()).expect("start charmap");
     std::thread::sleep(Duration::from_millis(1500));
 
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some("no such element in charmap".into()),
@@ -1615,8 +1640,13 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
     let _ = glass.stop();
 
-    // Logged: the number is the point of the change.
-    eprintln!("quiet 3s wait at 100ms: {walked} walks");
+    // Logged AND saved: `eprintln!` alone is invisible on a pass through the schtasks-bounce
+    // harness (see `probe_role_histogram`'s doc on why it writes `.windows-artifacts` for the
+    // same reason) — save_report is what makes the number reproducible off-box, which is the
+    // entire point of a walk-count test.
+    let line = format!("quiet 3s wait at 100ms: {walked} walks\n");
+    eprint!("{line}");
+    save_report("onbox-walk-count-quiet-wait.txt", &line);
     assert!(!out.matched, "the element must not exist");
     // See `Counting`: without this the test could measure polling and pass.
     assert!(subscribed > 0, "no subscription was established");
@@ -1629,6 +1659,67 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     );
 }
 
+/// Finding 1(a): `walked <= 5` above bounds a number, not an improvement — a build that always
+/// walked 5 times regardless of the subscription would still pass it. This runs the identical 3s
+/// quiet wait through two sessions that differ in exactly one thing — whether `subscribe_changes`
+/// ever hands back a working signal (see [`Counting::signal_enabled`]) — and asserts the signalled
+/// run beats the polling one by a clear margin. That margin, not the raw walk count, is the number
+/// worth quoting as the saving.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+
+    // Local, not a file-level helper: the only two callers are the two arms below, and inlining it
+    // there would drown the one thing that differs between them (`signal_enabled`) in setup noise.
+    fn quiet_wait_walks(signal_enabled: bool) -> (usize, usize) {
+        let (mut glass, walks, signals) = glass_counting(signal_enabled);
+        glass.start(&charmap_spec()).expect("start charmap");
+        std::thread::sleep(Duration::from_millis(1500));
+
+        walks.store(0, std::sync::atomic::Ordering::Relaxed);
+        signals.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = glass
+            .wait_for_element(&glass_core::WaitElementParams {
+                name: Some("no such element in charmap".into()),
+                role: None,
+                value_contains: None,
+                condition: glass_core::ElementCondition::Appears,
+                interval_ms: 100,
+                timeout_ms: 3_000,
+            })
+            .expect("wait");
+        let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+        let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = glass.stop();
+        assert!(!out.matched, "the element must not exist");
+        (walked, subscribed)
+    }
+
+    let (with_signal, with_subs) = quiet_wait_walks(true);
+    let (without_signal, without_subs) = quiet_wait_walks(false);
+    assert!(
+        with_subs > 0,
+        "the signal-enabled run must have established a subscription"
+    );
+    assert_eq!(
+        without_subs, 0,
+        "the signal-disabled run must never report a subscription — otherwise this isn't \
+         measuring what it claims to"
+    );
+
+    let line =
+        format!("quiet 3s wait: with signal={with_signal} walks, without={without_signal} walks\n");
+    eprint!("{line}");
+    save_report("onbox-walk-count-comparison.txt", &line);
+    assert!(
+        with_signal * 2 < without_signal,
+        "a live subscription must more than halve the walk count: with={with_signal} \
+         without={without_signal}"
+    );
+}
+
 /// The risk a subscription creates: a wait that no longer matches, because the signal suppressed
 /// the read that would have found the element. Sequential and assumption-free — the element is
 /// already on screen when the wait starts, so the wait must return on its first read.
@@ -1637,7 +1728,7 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
 fn onbox_a_wait_with_a_signal_still_matches() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
-    let (mut glass, walks, signals) = glass_counting();
+    let (mut glass, walks, signals) = glass_counting(true);
     glass.start(&charmap_spec()).expect("start charmap");
     std::thread::sleep(Duration::from_millis(1500));
 
@@ -1651,6 +1742,7 @@ fn onbox_a_wait_with_a_signal_still_matches() {
         .expect("charmap exposes a named Button");
 
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some(name.clone()),
@@ -1673,5 +1765,143 @@ fn onbox_a_wait_with_a_signal_still_matches() {
     assert!(
         walked <= 2,
         "an already-satisfied wait took {walked} walks; it should return on the first read"
+    );
+}
+
+/// Pure Win32, independent of any `Platform`/`Glass` instance: the helper thread in
+/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] must share no state with the
+/// `Glass` session it acts on, so it finds the live charmap window itself rather than borrowing
+/// anything glass tracked.
+fn find_window_by_title(title: &str) -> Option<i64> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::{HSTRING, PCWSTR};
+    // SAFETY: reads a null-terminated title string and returns the matching top-level HWND (or
+    // an error, treated as "not found"); writes nothing.
+    unsafe { FindWindowW(PCWSTR::null(), &HSTRING::from(title)) }
+        .ok()
+        .map(|h| h.0 as i64)
+}
+
+/// Best-effort on-screen geometry for a raw HWND, via the plain window rect — good enough for
+/// `AxContext::window`, which this path only uses for bounds translation inside a snapshot, never
+/// for a click. Deliberately not `glass_windows`'s own DWM-extended `geometry_of`: that function is
+/// crate-private, and reaching for it would mean this "independent" thread borrowing glass's own
+/// window code rather than rediscovering the window on its own.
+fn window_rect_geometry(handle: i64) -> WindowGeometry {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let hwnd = windows::Win32::Foundation::HWND(handle as *mut std::ffi::c_void);
+    let mut rect = RECT::default();
+    // SAFETY: writes one RECT into our stack value; the HWND is only queried, never mutated. A
+    // stale/invalid handle just fails, and the zeroed default below is a harmless fallback.
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    WindowGeometry {
+        x: rect.left,
+        y: rect.top,
+        width: (rect.right - rect.left).max(0) as u32,
+        height: (rect.bottom - rect.top).max(0) as u32,
+    }
+}
+
+/// Finding 1(b): the tests above prove correctness without a late change
+/// (`onbox_a_wait_with_a_signal_still_matches`, already on screen) and cost without a match
+/// (the quiet-wait tests), but none of them ever drives `ChangeWait::Changed => true` inside
+/// `Glass::wait_for_element`'s poll loop (`session/wait.rs`) from a change nothing but a real UIA
+/// event produced — a build where the signal never actually delivered `Changed` into that loop
+/// passes all three. This closes it: the main thread blocks in `wait_for_element` for a control
+/// that does not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`, the
+/// target window found by an independent Win32 title lookup rather than anything the `Glass`
+/// session tracks, so no `Glass` state crosses threads — sleeps briefly, then actuates charmap's
+/// Advanced-view checkbox directly. Opening it reveals a "Search" [`AxRole::Button`] (confirmed by
+/// a one-off on-box probe: closed=26 nodes, open=37; "Search" was the one newly-appeared control
+/// with a name unique to itself, unlike the panel's other new controls, which repeat labels
+/// ("Character set", "Group by") that already exist elsewhere in charmap's tree).
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut glass = glass_windows_with_a11y();
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // charmap persists the Advanced-view checkbox's state across launches on this box, so
+    // normalize to closed first: the helper thread's job is to open it, and "Search" must not
+    // already be on screen when the timed wait below starts.
+    let tree = glass.a11y_snapshot(None).expect("initial snapshot");
+    let mut cb = None;
+    first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+    let cb = cb.expect("charmap exposes the Advanced-view CheckBox");
+    if cb.states.checked {
+        glass
+            .click_element(cb.id)
+            .expect("close advanced view to normalize to a known starting state");
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    let handle = find_window_by_title("Character Map")
+        .expect("an independent Win32 lookup must find the live charmap window");
+    let helper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        let mut a11y = WindowsA11y::new();
+        let ctx = AxContext {
+            pids: vec![],
+            window: window_rect_geometry(handle),
+            window_handle: Some(handle),
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        };
+        let tree = a11y.snapshot(&ctx).expect("helper thread's own snapshot");
+        let mut cb = None;
+        first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+        let cb = cb.expect("checkbox still present for the helper thread");
+        let target = AxTarget {
+            id: cb.id,
+            role: cb.role,
+            name: cb.name.clone(),
+            bounds: cb.bounds,
+            value: cb.value.clone(),
+        };
+        a11y.invoke(&ctx, &target)
+            .expect("helper thread opens advanced view");
+    });
+
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("Search".into()),
+            role: Some(AxRole::Button),
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 5_000,
+        })
+        .expect("wait");
+    helper.join().expect("helper thread must not panic");
+    let _ = glass.stop();
+
+    let line = format!(
+        "late-change wait: matched={} elapsed_ms={}\n",
+        out.matched, out.elapsed_ms
+    );
+    eprint!("{line}");
+    save_report("onbox-late-change-wait.txt", &line);
+    assert!(
+        out.matched,
+        "the Search button must appear once advanced view opens"
+    );
+    // Generous relative to the 5s timeout: a signal-woken wait should return in well under a
+    // second (the helper's own 700ms sleep plus one UIA walk). 3s leaves headroom for box load
+    // while still failing a wait that only ever woke via the timeout.
+    assert!(
+        out.elapsed_ms < 3_000,
+        "a wait woken by a real UIA change should return well inside the 5s timeout, took {}ms",
+        out.elapsed_ms
     );
 }
