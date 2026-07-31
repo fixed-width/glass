@@ -67,9 +67,26 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
                 UIAction(title: "Menu item two") { _ in },
             ])
 
+        // idb reports UIKit's accessibilityHint under the node key `help`; the iOS reader maps
+        // that straight to `description`, and this control is what confirms it on device.
+        let hintedButton = UIButton(type: .system)
+        hintedButton.setTitle("hinted", for: .normal)
+        hintedButton.accessibilityIdentifier = "the-hinted-button"
+        hintedButton.accessibilityHint = "Saves and closes the sheet"
+
+        // An editable element with BOTH an identifier and a label: the identifier becomes the
+        // node name and `AXValue` becomes the value, so the label has nowhere left to go but
+        // `description`, which is what the iOS reader now recovers it as.
+        let describedField = UITextField()
+        describedField.borderStyle = .roundedRect
+        describedField.text = "typed text"
+        describedField.accessibilityIdentifier = "the-described-field"
+        describedField.accessibilityLabel = "Search query"
+
         let stack = UIStackView(arrangedSubviews: [
             toggle,
-            segmented, stepper, progress, picker, sheetButton, alertButton, menuButton, table,
+            segmented, stepper, progress, picker, sheetButton, alertButton, menuButton,
+            hintedButton, describedField, table,
         ])
         stack.axis = .vertical
         stack.spacing = 8

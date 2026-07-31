@@ -244,6 +244,7 @@ fn uiautomator_role_histogram_probe() {
     let mut platform =
         AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach to a device");
     let mut violations = Vec::new();
+    let mut described = 0usize;
 
     for component in &targets {
         let window = platform
@@ -264,12 +265,11 @@ fn uiautomator_role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({component}): {e}"));
         tree.assign_ids();
         print_role_histogram(component, &tree);
-        // `Unsourced`: neither Android reader sources the field, so the count is 0 for
-        // every app — flip this when one reads the hint / state-description.
         print!(
             "{}",
-            description_census_report(component, &tree, DescriptionSourcing::Unsourced)
+            description_census_report(component, &tree, DescriptionSourcing::Sourced)
         );
+        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(component, &tree));
         violations.extend(mapped_class_violations(component, &tree));
 
@@ -278,6 +278,16 @@ fn uiautomator_role_histogram_probe() {
 
     drop(platform); // close the platform's agent connection (if any) before the registry
     agents.shutdown(); // never leak a launched agent
+    // The census prints without a caveat now that this reader sources the field, so a reader
+    // regressed to `description: None` would print a plausible zero for every app and this probe
+    // would pass silently. The app list is the caller's, so this is a note, not a failure.
+    if described == 0 {
+        println!(
+            "\nNOTE: no app in this run reported a single described node — either these apps \
+             give every element one label, or the reader stopped sourcing it (see the \
+             `description` binding in axmap::map_node / a11y_service::json_to_node)"
+        );
+    }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
@@ -315,6 +325,7 @@ fn service_role_histogram_probe() {
     let _restore = RestoreServiceState(&registry);
     let mut a11y = ServiceA11y::new(client, String::new());
     let mut violations = Vec::new();
+    let mut described = 0usize;
 
     for component in &targets {
         let window = platform
@@ -337,8 +348,9 @@ fn service_role_histogram_probe() {
         print_role_histogram(&label, &tree);
         print!(
             "{}",
-            description_census_report(&label, &tree, DescriptionSourcing::Unsourced)
+            description_census_report(&label, &tree, DescriptionSourcing::Sourced)
         );
+        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(&label, &tree));
         violations.extend(mapped_class_violations(&label, &tree));
 
@@ -347,6 +359,15 @@ fn service_role_histogram_probe() {
 
     drop(platform);
     agents.shutdown();
+    // Same rationale as `uiautomator_role_histogram_probe` above: a silent zero is a note here,
+    // not a failure, since the app list is the caller's.
+    if described == 0 {
+        println!(
+            "\nNOTE: no app in this run reported a single described node — either these apps \
+             give every element one label, or the reader stopped sourcing it (see the \
+             `description` binding in axmap::map_node / a11y_service::json_to_node)"
+        );
+    }
     // `_restore` puts the device's accessibility settings back as it drops, after this
     // assertion has decided the run — on the failing path as much as the passing one.
     assert!(violations.is_empty(), "{}", violations.join("\n"));

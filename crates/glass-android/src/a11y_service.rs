@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    TruncationLimit, WalkBudget, WalkLimits,
+    TruncationLimit, WalkBudget, WalkLimits, normalize_description,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -34,8 +34,12 @@ fn json_to_node(
 ) -> Result<AxNode> {
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
+    // No host-side filter: device agent drops empty text/desc. Were that to change,
+    // empty `text` would win the name. Filtering here would change name, so it stays
+    // device-side (key to selectors, set_value).
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
+    let name = text.or(desc);
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
@@ -95,11 +99,10 @@ fn json_to_node(
         raw_role: cls.to_string(),
         // name: the element's own text label, falling back to content-description.
         // value: editable text content only (content-description is not user-entered text).
-        name: text.or(desc).map(str::to_string),
-        // The content-description is Android's secondary label and is already read above as
-        // the `name` fallback; the unread ones are the node's hint and state-description,
-        // which the on-device service's node JSON does not carry.
-        description: None,
+        name: name.map(str::to_string),
+        // The content-description a `text` label displaced; with no `text` the desc IS the name.
+        // Hint and state-description stay unread — the device protocol carries neither.
+        description: desc.and_then(|d| normalize_description(d, name)),
         value: text.map(str::to_string),
         states: AxStates {
             enabled: flag("enabled"),
@@ -671,5 +674,72 @@ mod tests {
         let b = t.root.bounds.unwrap();
         assert_eq!((b.width, b.height), (0, 0)); // negative/zero w/h clamp to 0
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
+    }
+
+    fn node_json(text: Option<&str>, desc: Option<&str>) -> Value {
+        let mut v = json!({
+            "class": "android.widget.Button",
+            "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+            "enabled": true,
+        });
+        if let Some(t) = text {
+            v["text"] = json!(t);
+        }
+        if let Some(d) = desc {
+            v["desc"] = json!(d);
+        }
+        v
+    }
+
+    fn mapped(text: Option<&str>, desc: Option<&str>) -> AxNode {
+        let mut budget = WalkBudget::new();
+        json_to_node(&node_json(text, desc), &win(), 0, &mut budget).expect("maps")
+    }
+
+    /// [`mapped`], for an editable field rather than a button.
+    fn mapped_editable(text: Option<&str>, desc: Option<&str>) -> AxNode {
+        let mut v = node_json(text, desc);
+        v["class"] = json!("android.widget.EditText");
+        v["editable"] = json!(true);
+        let mut budget = WalkBudget::new();
+        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+    }
+
+    #[test]
+    fn the_content_description_a_text_displaced_becomes_the_description() {
+        let node = mapped(Some("Save"), Some("Save changes"));
+        // `text` wins the name on this reader — the opposite of the uiautomator reader, which is
+        // glass#260 and is NOT changed here.
+        assert_eq!(node.name.as_deref(), Some("Save"));
+        assert_eq!(node.description.as_deref(), Some("Save changes"));
+    }
+
+    #[test]
+    fn a_content_description_that_became_the_name_is_not_repeated() {
+        let node = mapped(None, Some("Bold"));
+        assert_eq!(node.name.as_deref(), Some("Bold"));
+        assert_eq!(
+            node.description, None,
+            "the desc IS the name here; printing it again would duplicate the label"
+        );
+    }
+
+    #[test]
+    fn a_desc_identical_to_the_text_is_not_a_description() {
+        assert_eq!(mapped(Some("Save"), Some("Save")).description, None);
+    }
+
+    #[test]
+    fn a_node_with_no_desc_has_no_description() {
+        assert_eq!(mapped(Some("Save"), None).description, None);
+    }
+
+    #[test]
+    fn an_editable_nodes_desc_is_still_its_description() {
+        // Deliberately ungated, unlike the uiautomator reader: there the editable node's `text`
+        // is only the value, here it is the name too, so the displaced `desc` is the one label
+        // left with nowhere else to go.
+        let node = mapped_editable(Some("joe@x.com"), Some("Email"));
+        assert_eq!(node.description.as_deref(), Some("Email"));
     }
 }

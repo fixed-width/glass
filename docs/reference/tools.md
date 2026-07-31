@@ -461,13 +461,27 @@ rides as an untrusted sibling text block, one line per element:
 `glass_click_element`. `desc="…"` carries a secondary label the platform exposes separately from
 the name — help or tooltip text, or the human-readable label where the name is a
 developer-assigned id. It appears only where glass's reader sources that label: the AT-SPI (Linux)
-reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, and the AX
-(macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name. The
-Android readers and the `idb` (iOS) reader do not read their platform's secondary label yet, so
-`desc` never appears there no matter what the app exposes. It is also omitted when the description
-duplicates the name. **`desc` is display-only: `glass_wait_for_element` and
-`glass_scroll_to_element` select on `name`, never on the description.** An element whose platform
-role glass has no mapping for renders as `Other(<native token>)` — e.g.
+reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, the AX
+(macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name, the
+Android readers read whichever of the element's text and content-description did not become the
+name or the value, and the `idb` (iOS) reader reads the element's hint, falling back to the label
+an editable element's identifier displaced. It is omitted when the description duplicates the name.
+**`desc` is display-only: `glass_wait_for_element` and `glass_scroll_to_element` select on `name`,
+never on the description.**
+
+On **Android** a description needs one node to carry both of its labels, and most controls carry
+only one — across four stock apps, only one node in roughly three hundred had both — so expect
+`desc` to be absent on most Android nodes, not routinely present. The other readers take it from a
+separate descriptor field, so there a node with a single label can still carry one.
+
+The two Android readers also disagree on which label becomes the `name`: `uiautomator` prefers the
+content-description, the on-device accessibility-service reader prefers the text, so the same
+control can report `name` and `desc` swapped depending on which reader is running. Because
+selection is on `name` only, a `name:` selector learned under one Android reader can silently miss
+under the other — re-read the snapshot after switching readers rather than carrying a selector
+across them.
+
+An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
 

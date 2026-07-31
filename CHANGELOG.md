@@ -101,9 +101,15 @@ internal refactors, CI, or test-only changes.
   rectangle now says what it is — and the `glass_a11y_marks` legend labels an unnamed element
   from it, spelled `desc="…"` there too. `glass_wait_for_element` and `glass_scroll_to_element`
   report it on the element they matched. It is display-only: both tools still select on `name`.
-  The Linux, Windows and macOS readers source the field — AT-SPI `Description`, UI Automation
-  `HelpText`, and AX `AXHelp` respectively. The Android and iOS readers do not read their
-  platform's secondary label yet, so `desc` does not appear there.
+  All five backends now source the field: the Linux, Windows and macOS readers read AT-SPI
+  `Description`, UI Automation `HelpText`, and AX `AXHelp` respectively; the two Android readers
+  read whichever of an element's text and content-description did not become the name or the
+  value; and the iOS reader reads the element's accessibility hint, falling back to the label an
+  editable element's identifier displaced. On Android a description needs one node to carry two
+  distinct labels and most controls carry only one, so expect `desc` to be absent on most Android
+  nodes. The two Android readers also disagree on which label is the name: `uiautomator` prefers
+  content-description, the on-device accessibility-service reader prefers text, so the same
+  control can report `name` and `desc` swapped depending on which reader is running.
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
   (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is

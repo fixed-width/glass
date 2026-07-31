@@ -193,6 +193,7 @@ fn role_histogram_probe() {
     let mut platform =
         IosPlatform::from_env(&registry).expect("from_env: resolve/boot a Simulator");
     let mut violations = Vec::new();
+    let mut described = 0usize;
 
     for target in targets {
         let spec = AppSpec {
@@ -228,12 +229,11 @@ fn role_histogram_probe() {
             .unwrap_or_else(|e| panic!("snapshot({target}): {e}"));
         tree.assign_ids();
         print_role_histogram(target, &tree);
-        // `Unsourced`: this reader leaves `description: None`, so the count is 0 for every
-        // app — flip this when it reads accessibilityHint.
         print!(
             "{}",
-            description_census_report(target, &tree, DescriptionSourcing::Unsourced)
+            description_census_report(target, &tree, DescriptionSourcing::Sourced)
         );
+        described += glass_core::description_census(&tree).described();
         violations.extend(thin_tree_violation(target, &tree));
         violations.extend(mapped_token_violations(target, &tree));
 
@@ -243,5 +243,14 @@ fn role_histogram_probe() {
         platform.stop_app().expect("stop_app");
     }
 
+    // Same rationale as the Android role-histogram probes' role_probe.rs: a silent zero is a
+    // note here, not a failure, since the app list is the caller's.
+    if described == 0 {
+        println!(
+            "\nNOTE: no app in this run reported a single described node — either these apps \
+             give every element one label, or the reader stopped sourcing it (see the \
+             `description` binding in axmap::map_node)"
+        );
+    }
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
