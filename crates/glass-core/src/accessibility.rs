@@ -553,6 +553,18 @@ impl AxTree {
         walk(&self.root, id)
     }
 
+    /// [`Self::find`], mutably — for patching a field of a cached node in place rather than
+    /// re-walking the whole tree.
+    pub fn find_mut(&mut self, id: AxNodeId) -> Option<&mut AxNode> {
+        fn walk(node: &mut AxNode, id: AxNodeId) -> Option<&mut AxNode> {
+            if node.id == id {
+                return Some(node);
+            }
+            node.children.iter_mut().find_map(|c| walk(c, id))
+        }
+        walk(&mut self.root, id)
+    }
+
     /// Render a compact indented outline, one line per node, in `outline::write_line`'s format —
     /// the single definition of it, shared with [`crate::outline::render_compact`]. This render
     /// differs only in keeping every node: nothing is collapsed.
@@ -1770,6 +1782,18 @@ mod tests {
         t.assign_ids();
         assert_eq!(t.find(AxNodeId(1)).unwrap().name.as_deref(), Some("Save"));
         assert!(t.find(AxNodeId(99)).is_none());
+    }
+
+    #[test]
+    fn find_mut_patches_the_node_in_place_without_touching_the_rest() {
+        let mut t = sample_tree();
+        t.assign_ids();
+        t.find_mut(AxNodeId(1)).unwrap().value = Some("patched".into());
+        assert_eq!(
+            t.find(AxNodeId(1)).unwrap().value.as_deref(),
+            Some("patched")
+        );
+        assert!(t.find_mut(AxNodeId(99)).is_none());
     }
 
     #[test]

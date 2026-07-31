@@ -446,6 +446,12 @@ impl Glass {
             .as_mut()
             .ok_or(GlassError::AxUnsupported)?
             .set_value(&ctx, &target, text)?;
+        // `Ok` means the write was read back and confirmed (#267/#272): the cache is corrected
+        // to a known fact, not a hoped one. Patch by id — re-snapshotting costs a whole walk
+        // for one field. Empty normalizes to `None`, matching a cleared field's read-back.
+        if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
+            node.value = (!text.is_empty()).then(|| text.to_string());
+        }
         s.pump();
         Ok(())
     }
@@ -2699,6 +2705,37 @@ mod tests {
             }
         );
         assert_eq!(calls[0].1, "hello");
+    }
+
+    #[test]
+    fn set_value_patches_last_ax_so_a_same_element_rewrite_is_not_rejected_as_drifted() {
+        // Without the patch, the second call's stale `target.value` ("orig") is rejected as
+        // drift by the fake's value-fingerprint guard. No intervening snapshot — that would
+        // refresh the cache and mask the bug.
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            raw_role: "text field".into(),
+            name: Some("Name".into()),
+            description: None,
+            value: Some("orig".into()),
+            states: AxStates {
+                editable: true,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 20,
+            }),
+            children: vec![],
+        };
+        let mut g = glass_with_a11y(FakePlatform::new(100, 100), AxTree::new(root));
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g.set_value(AxNodeId(0), "a").unwrap();
+        g.set_value(AxNodeId(0), "b").unwrap();
     }
 
     #[test]

@@ -355,6 +355,17 @@ impl Accessibility for FakeAccessibility {
         if self.set_fail {
             return Err(GlassError::AxElementNotEditable(target.id.0));
         }
+        // Models the value-fingerprint guard a real backend runs (`editable_target` in
+        // glass-android) — the only way to make a stale `last_ax` cache observable without a
+        // device.
+        if let Some(want) = &target.value
+            && self.tree.find(target.id).and_then(|n| n.value.as_deref()) != Some(want.as_str())
+        {
+            return Err(GlassError::AxElementChanged(target.id.0));
+        }
+        if let Some(node) = self.tree.find_mut(target.id) {
+            node.value = (!text.is_empty()).then(|| text.to_string());
+        }
         self.set_log
             .lock()
             .unwrap()

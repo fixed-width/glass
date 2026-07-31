@@ -225,18 +225,25 @@ impl Default for AndroidA11y {
 
 /// Re-resolve `target` in an already-numbered `tree` and return the node only if it is still the
 /// element that was addressed and still editable. Errors specifically when the target is gone
-/// (`AxElementNotFound`), has drifted in role/name/bounds (`AxElementChanged`), or is not editable
-/// (`AxElementNotEditable`).
+/// (`AxElementNotFound`), has drifted in role/name/bounds/value (`AxElementChanged`), or is not
+/// editable (`AxElementNotEditable`).
 ///
 /// Both Android readers' `set_value` guards route through this — the check that stops a write
 /// landing on whatever inherited the id between the snapshot the caller read and the one the write
-/// acts on. Pure (no device I/O), so it is testable without a device.
+/// acts on. A recycled `RecyclerView` row keeps role, name and rect unchanged and only its data
+/// differs, which is why a captured value is checked too. Pure (no device I/O), so it is testable
+/// without a device.
 pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
         .ok_or(GlassError::AxElementNotFound(target.id.0))?;
     if !target.matches(node.role, node.name.as_deref()) || !target.bounds_consistent(node.bounds, 8)
     {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    // A captured `None` says nothing about identity and must not gate, or every element that
+    // never had a value becomes unwritable.
+    if target.value.is_some() && target.value.as_deref() != node.value.as_deref() {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
     if !node.states.editable {
@@ -331,7 +338,9 @@ impl Accessibility for AndroidA11y {
 
 #[cfg(test)]
 mod tests {
-    use super::{dump_once, dump_until_ready, locate_editable_target, verify_write};
+    use super::{
+        dump_once, dump_until_ready, editable_target, locate_editable_target, verify_write,
+    };
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, Result, WindowGeometry};
     use std::time::Duration;
@@ -519,6 +528,15 @@ mod tests {
         t
     }
 
+    /// Like `tree`, but also holding `value` — the fingerprint a recycled row needs, since its
+    /// role, name and bounds are reused unchanged. Always at `BOUNDS`, always editable.
+    fn tree_with_value(role: AxRole, name: Option<&str>, value: Option<&str>) -> AxTree {
+        let mut t = tree(role, name, Some(BOUNDS), true);
+        t.root.value = value.map(Into::into);
+        t.assign_ids();
+        t
+    }
+
     fn target(id: u32, name: Option<&str>, bounds: Option<AxRect>) -> AxTarget {
         AxTarget {
             id: AxNodeId(id),
@@ -683,6 +701,39 @@ mod tests {
             locate_editable_target(&t, &target(0, Some("Search"), Some(moved)), &WIN),
             Err(GlassError::AxElementChanged(0))
         ));
+    }
+
+    #[test]
+    fn a_target_whose_value_moved_is_rejected() {
+        // A recycled row reuses the view, so role, name and rect are all identical and only the
+        // data differs — the value is the one thing that can catch it.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Zara"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(matches!(
+            editable_target(&tree, &target),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_with_no_captured_value_still_passes() {
+        // A `None` at snapshot time says nothing about identity, so it must not gate. Without
+        // this, every element that had no value became un-writable.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Alice"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: None,
+        };
+        assert!(editable_target(&tree, &target).is_ok());
     }
 
     #[test]
