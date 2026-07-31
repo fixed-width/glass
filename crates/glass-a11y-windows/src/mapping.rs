@@ -142,37 +142,71 @@ pub fn format_range_value(v: f64) -> String {
     format!("{v}")
 }
 
-/// The UIA property ids a change subscription registers for.
+/// A UIA property the change subscription registers for.
 ///
-/// Numeric for the same reason [`CONTROL_TYPES`] is: this module compiles on every host, and
-/// `uiautomation` is a `cfg(windows)` dependency. `events.rs` converts them to `UIProperty` and
-/// a test there pins the two lists together.
-pub const WATCHED_PROPERTY_IDS: &[u32] = &[
-    30005, // Name — the `name:` selector
-    30008, // HasKeyboardFocus
-    30010, // IsEnabled
-    30022, // IsOffscreen
-    30045, // ValueValue — the `value_contains:` selector
-    30070, // ExpandCollapseExpandCollapseState
-    30079, // SelectionItemIsSelected
-    30086, // ToggleToggleState
-];
+/// A closed set rather than raw ids, so the correspondence cannot rot: [`announcing_property`]
+/// must name one of these, and a condition needing a property the subscription does not register
+/// means adding a variant here — which fails to compile in `events.rs`'s conversion until it is
+/// registered there too. With a bare `u32` a new condition could name any number at all and
+/// nothing would notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchedProperty {
+    Name,
+    HasKeyboardFocus,
+    IsEnabled,
+    IsOffscreen,
+    Value,
+    ExpandCollapseState,
+    SelectionItemIsSelected,
+    ToggleState,
+}
 
-/// The UIA property whose change announces `condition`, or `None` where a structure change does.
+impl WatchedProperty {
+    /// Every variant, in the order the subscription registers them.
+    pub const ALL: [WatchedProperty; 8] = [
+        WatchedProperty::Name,
+        WatchedProperty::HasKeyboardFocus,
+        WatchedProperty::IsEnabled,
+        WatchedProperty::IsOffscreen,
+        WatchedProperty::Value,
+        WatchedProperty::ExpandCollapseState,
+        WatchedProperty::SelectionItemIsSelected,
+        WatchedProperty::ToggleState,
+    ];
+
+    /// The stable UIA property id. Numeric for the same reason [`CONTROL_TYPES`] is: this module
+    /// compiles on every host, and `uiautomation` is a `cfg(windows)` dependency.
+    pub const fn id(self) -> u32 {
+        match self {
+            WatchedProperty::Name => 30005,
+            WatchedProperty::HasKeyboardFocus => 30008,
+            WatchedProperty::IsEnabled => 30010,
+            WatchedProperty::IsOffscreen => 30022,
+            WatchedProperty::Value => 30045,
+            WatchedProperty::ExpandCollapseState => 30070,
+            WatchedProperty::SelectionItemIsSelected => 30079,
+            WatchedProperty::ToggleState => 30086,
+        }
+    }
+}
+
+/// The property whose change announces `condition`, or `None` where a structure change does.
 ///
 /// Exhaustive by construction: a new [`glass_core::ElementCondition`] fails to compile here. That
 /// is the enforcement — a condition nothing announces does not error, it just makes waits slow,
 /// which is the kind of regression that ships.
-pub const fn announcing_property(condition: glass_core::ElementCondition) -> Option<u32> {
+pub const fn announcing_property(
+    condition: glass_core::ElementCondition,
+) -> Option<WatchedProperty> {
     use glass_core::ElementCondition as C;
     match condition {
         C::Appears | C::Disappears => None,
-        C::Enabled | C::Disabled => Some(30010),
-        C::Checked | C::Unchecked => Some(30086),
-        C::Selected | C::Unselected => Some(30079),
-        C::Expanded | C::Collapsed => Some(30070),
-        C::Focused => Some(30008),
-        C::Visible | C::Hidden => Some(30022),
+        C::Enabled | C::Disabled => Some(WatchedProperty::IsEnabled),
+        C::Checked | C::Unchecked => Some(WatchedProperty::ToggleState),
+        C::Selected | C::Unselected => Some(WatchedProperty::SelectionItemIsSelected),
+        C::Expanded | C::Collapsed => Some(WatchedProperty::ExpandCollapseState),
+        C::Focused => Some(WatchedProperty::HasKeyboardFocus),
+        C::Visible | C::Hidden => Some(WatchedProperty::IsOffscreen),
     }
 }
 
@@ -416,23 +450,27 @@ mod tests {
     }
 
     #[test]
-    fn every_conditions_property_is_one_the_subscription_registers() {
-        for c in glass_core::ElementCondition::ALL {
-            if let Some(id) = announcing_property(c) {
-                assert!(
-                    WATCHED_PROPERTY_IDS.contains(&id),
-                    "{c:?} is announced by property {id}, which the subscription does not register"
-                );
-            }
-        }
+    fn every_watched_property_has_a_distinct_id() {
+        // The type stops a condition naming an unregistered property; only this stops two
+        // variants carrying the same id, which would silently drop one from the registration.
+        let ids: Vec<u32> = WatchedProperty::ALL.iter().map(|p| p.id()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ids.len(),
+            "two WatchedProperty variants share an id: {ids:?}"
+        );
     }
 
     #[test]
     fn the_selector_properties_are_registered_too() {
         // `name:` and `value_contains:` are selectors, not conditions, so no `ElementCondition`
-        // names them — but a wait matching on either still has to wake when they change.
-        assert!(WATCHED_PROPERTY_IDS.contains(&30005), "Name");
-        assert!(WATCHED_PROPERTY_IDS.contains(&30045), "ValueValue");
+        // names them — but a wait matching on either still has to wake when they change, and
+        // nothing in the type system ties a selector to a property the way a condition is tied.
+        assert!(WatchedProperty::ALL.contains(&WatchedProperty::Name));
+        assert!(WatchedProperty::ALL.contains(&WatchedProperty::Value));
     }
 
     #[test]

@@ -2445,7 +2445,7 @@ mod tests {
 
     #[test]
     fn all_lists_every_condition_exactly_once() {
-        let mut seen = [false; 13];
+        let mut seen = [false; ElementCondition::ALL.len()];
         for c in ElementCondition::ALL {
             let i = condition_index(c);
             assert!(!seen[i], "{c:?} appears twice in ElementCondition::ALL");
