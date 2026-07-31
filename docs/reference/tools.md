@@ -68,8 +68,10 @@ ids are in [Conventions](#conventions) above):
   `window_id` param — are `u64`, carrying the platform's own window handle.
 - **Input coordinates** — `x`/`y` (and `x1,y1,x2,y2`, and gesture `from`/`to`) on
   `glass_click`/`glass_move`/`glass_drag`/`glass_scroll`/`glass_gesture` — are signed `i32`,
-  window-relative. A negative value addresses a point off the window's top-left edge rather than
-  being rejected.
+  window-relative. The type is signed, but the accepted range is not: a point outside the window,
+  negative or past its width/height, is rejected with `CoordOutOfBounds` naming the window size,
+  before the backend sees it. For a drag or gesture, *every* endpoint is checked, so a partly
+  out-of-range path is refused rather than clipped.
 - **Region coordinates** — `region`/`stability_region`/the rects inside `ignore`
   (`x,y,width,height`), wherever a tool accepts one — are unsigned `u32`; they can never be
   negative.

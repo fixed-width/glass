@@ -104,6 +104,23 @@ mod tests {
     }
 
     #[test]
+    fn negative_pointer_coordinate_is_rejected() {
+        let mut g = glass_with(FakePlatform::new(10, 10));
+        g.start(&spec()).unwrap();
+        let err = g.pointer(&PointerEvent::Click {
+            x: -1,
+            y: 5,
+            button: crate::platform::MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        });
+        assert!(matches!(
+            err.unwrap_err(),
+            GlassError::CoordOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
     fn gesture_out_of_bounds_segment_is_rejected() {
         let mut g = glass_with(FakePlatform::new(100, 80));
         g.start(&spec()).unwrap();

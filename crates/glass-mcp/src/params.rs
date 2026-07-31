@@ -7,9 +7,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RegionArgs {
+    /// Left edge in pixels, window-relative — 0 is the window's left edge, not the screen's.
     pub x: u32,
+    /// Top edge in pixels, window-relative — 0 is the window's top edge, not the screen's.
     pub y: u32,
+    /// Width in pixels, extending right from `x`.
     pub width: u32,
+    /// Height in pixels, extending down from `y`.
     pub height: u32,
 }
 
@@ -72,6 +76,8 @@ pub struct StartArgs {
     /// An operator-set floor (`GLASS_SANDBOX_FLOOR`) may raise an omitted level, and
     /// refuses an explicit level requested below it.
     pub sandbox: Option<String>,
+    /// Working directory for both `build` and the launched app; omit to inherit the
+    /// server's own.
     pub cwd: Option<String>,
     /// Extra environment variables, as a `{ "KEY": "VALUE" }` object. They reach the launched app
     /// on the desktop backends and on `ios`; on `android` they configure the `build` command on
@@ -84,6 +90,8 @@ pub struct StartArgs {
     /// an unrelated process. Omit to take the first window owned by the launched
     /// process or a descendant it can follow.
     pub window_hint: Option<WindowHintArgs>,
+    /// How long to wait for the app's window to appear before failing the launch
+    /// (default 10000ms). Does not bound `build`.
     pub timeout_ms: Option<u64>,
     /// Spawn a private accessibility (AT-SPI) bus so `glass_a11y_snapshot` / `marks` /
     /// `set_value` / `click_element` / `wait_for_element` work against this app. **On by
@@ -99,9 +107,16 @@ pub struct StartArgs {
 pub struct WindowArgs {
     /// One of: "focus", "resize", "move", "geometry".
     pub op: String,
+    /// New left edge for `op: "move"`, required there and ignored otherwise. Screen
+    /// coordinates — the one place in this API that is not window-relative, since a
+    /// window cannot be positioned relative to itself.
     pub x: Option<i32>,
+    /// New top edge for `op: "move"`, required there and ignored otherwise. Screen
+    /// coordinates; see `x`.
     pub y: Option<i32>,
+    /// New width in pixels for `op: "resize"`, required there and ignored otherwise.
     pub width: Option<u32>,
+    /// New height in pixels for `op: "resize"`, required there and ignored otherwise.
     pub height: Option<u32>,
 }
 
@@ -161,10 +176,13 @@ pub struct A11ySnapshotArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClickArgs {
+    /// Click point x, window-relative — 0 is the window's left edge, not the screen's.
     pub x: i32,
+    /// Click point y, window-relative — 0 is the window's top edge, not the screen's.
     pub y: i32,
     /// "left" (default), "right", or "middle".
     pub button: Option<String>,
+    /// Consecutive clicks at this point (default 1); pass 2 for a double-click.
     pub count: Option<u32>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
@@ -172,16 +190,23 @@ pub struct ClickArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MoveArgs {
+    /// Destination x, window-relative — 0 is the window's left edge, not the screen's.
     pub x: i32,
+    /// Destination y, window-relative — 0 is the window's top edge, not the screen's.
     pub y: i32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DragArgs {
+    /// Press-point x, window-relative — 0 is the window's left edge, not the screen's.
     pub x1: i32,
+    /// Press-point y, window-relative — 0 is the window's top edge, not the screen's.
     pub y1: i32,
+    /// Release-point x, window-relative.
     pub x2: i32,
+    /// Release-point y, window-relative.
     pub y2: i32,
+    /// Button held for the drag: "left" (default), "right", or "middle".
     pub button: Option<String>,
     /// Modifier keys to hold during the action, e.g. ["ctrl"] or ["ctrl","shift"] for multi/range-select.
     pub modifiers: Option<Vec<String>>,
@@ -201,7 +226,9 @@ pub struct PointerArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PointArg {
+    /// Window-relative x — 0 is the window's left edge, not the screen's.
     pub x: i32,
+    /// Window-relative y — 0 is the window's top edge, not the screen's.
     pub y: i32,
 }
 
@@ -216,7 +243,10 @@ pub struct GestureArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScrollArgs {
+    /// Pointer x the wheel is aimed at, window-relative — apps scroll the container
+    /// under this point, so it selects which pane moves.
     pub x: i32,
+    /// Pointer y the wheel is aimed at, window-relative. See `x`.
     pub y: i32,
     /// Horizontal scroll in **wheel notches** (discrete clicks — small integers like 1–5, NOT
     /// pixels). Positive `dx` sends wheel-right, negative wheel-left; glass clicks `|dx|` times.
@@ -231,6 +261,9 @@ pub struct ScrollArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeArgs {
+    /// Text to type into whatever currently has keyboard focus — this tool does not
+    /// focus a field, so click or `glass_click_element` one first. Sent as synthetic
+    /// key events, not pasted, so an app's per-keystroke handlers run.
     pub text: String,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
     /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI
@@ -254,9 +287,17 @@ pub struct ClipboardSetArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WaitStableArgs {
+    /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
+    /// Consecutive unchanged frames required before the UI counts as settled
+    /// (default 3). Raise it for an app that pauses mid-animation.
     pub settle_frames: Option<u32>,
+    /// Per-channel difference (0–255) two frames may have and still count as
+    /// unchanged (default 0, exact match). Raise it for a backend with dithering
+    /// or compression noise.
     pub tolerance: Option<u8>,
+    /// Give up after this long (default 5000ms); returns `{settled:false}` rather
+    /// than erroring.
     pub timeout_ms: Option<u64>,
     /// Optional window-relative sub-rectangle for the returned frame.
     pub region: Option<RegionArgs>,
@@ -388,6 +429,9 @@ pub struct WaitForLogArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BaselineSaveArgs {
+    /// Name to file this baseline under, reused by `glass_diff` and
+    /// `glass_wait_for_region`. ASCII letters, digits, `-` and `_` only; saving over
+    /// an existing name replaces it without warning.
     pub name: String,
 }
 
@@ -409,6 +453,8 @@ pub struct CapabilitiesArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DiffArgs {
+    /// Name of a baseline saved by `glass_baseline_save`; an unsaved name errors
+    /// rather than reporting no change.
     pub name: String,
     /// `"perceptual"` (default) or `"exact"`.
     pub mode: Option<String>,
@@ -435,10 +481,16 @@ pub struct DiffArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsArgs {
+    /// Resume point — the `cursor` a previous call returned, to read only what has
+    /// been logged since. Omit to read from the oldest buffered line.
     pub cursor: Option<u64>,
+    /// Cap on lines returned (default 200); the returned `cursor` resumes at the
+    /// first line left unread, so a capped read is not a lost one.
     pub max_lines: Option<u32>,
     /// "stdout", "stderr", or "both" (default).
     pub stream: Option<String>,
+    /// Return only lines containing this substring (case-sensitive). Filtering
+    /// happens server-side, so it narrows what the cap applies to.
     pub contains: Option<String>,
 }
 
@@ -459,10 +511,18 @@ pub enum Action {
 /// A mid-sequence or terminal settle — the `wait_stable` knobs, no image/return.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SettleArgs {
+    /// How long to wait between capture ticks (default 100ms).
     pub interval_ms: Option<u64>,
+    /// Consecutive unchanged frames required before the UI counts as settled (default 3).
     pub settle_frames: Option<u32>,
+    /// Per-channel difference (0–255) two frames may have and still count as
+    /// unchanged (default 0, exact match).
     pub tolerance: Option<u8>,
+    /// Give up after this long (default 5000ms); the sequence continues rather than
+    /// failing.
     pub timeout_ms: Option<u64>,
+    /// Window-relative sub-rectangle to watch for settling; when set, changes outside
+    /// it are ignored.
     pub stability_region: Option<RegionArgs>,
     /// Window-relative rectangles to exclude from the settle comparison. Use for
     /// perpetually animating content — a blinking text caret, a clock, a
@@ -479,15 +539,25 @@ pub struct SettleArgs {
 /// `include_image`) returns an image.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ThenArgs {
+    /// Wait for the UI to stop changing first. Set this whenever `diff` or
+    /// `screenshot` follows, or they observe a half-drawn frame.
     pub settle: Option<SettleArgs>,
+    /// Compare against a saved baseline and return change stats as text.
     pub diff: Option<DiffArgs>,
+    /// Capture the window as an image — the only field here that always spends image
+    /// tokens; prefer `diff` when you just need to know whether something changed.
     pub screenshot: Option<ScreenshotArgs>,
 }
 
 /// Arguments for `glass_do`: an ordered, non-empty action sequence + optional observe.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DoArgs {
+    /// Actions to run in order; must be non-empty. Fail-fast — the first failing
+    /// action aborts the rest and reports its index, so a partial sequence may
+    /// already have landed.
     pub actions: Vec<Action>,
+    /// Optional observe run once after the last action, in the order settle → diff
+    /// → screenshot.
     pub then: Option<ThenArgs>,
 }
 

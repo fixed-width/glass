@@ -148,7 +148,12 @@ impl GlassServer {
     #[tool(
         description = "Stop the running app and end the session. The app is asked to close first, \
                        so it saves state and starts clean next time; one that will not close is \
-                       terminated, which takes a moment longer."
+                       terminated, which takes a moment longer. Ends everything session-scoped: \
+                       captured logs and a11y element ids are gone afterwards, so read what you \
+                       need first (saved baselines outlive it, until the server exits). There is \
+                       no resume — only glass_start runs the app again, as a fresh session. Not \
+                       needed between steps of a task; one session can be driven for as long as \
+                       you need it, and errors if no session is running."
     )]
     async fn glass_stop(&self) -> Result<CallToolResult, McpError> {
         self.run(tools::stop).await
@@ -203,7 +208,16 @@ impl GlassServer {
     }
 
     #[tool(
-        description = "Drag with a button held from (x1,y1) to (x2,y2) — window-relative coordinates. Optional modifiers held during the action, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for multi/range-select."
+        description = "Drag with a button held from (x1,y1) to (x2,y2) — window-relative \
+                       coordinates, so 0,0 is the window's top-left, not the screen's. Presses \
+                       at the start point, moves across in steps over `duration_ms`, and releases \
+                       at the end; the button is left (`button` overrides) and optional modifiers \
+                       are held throughout, e.g. [\"ctrl\"] or [\"ctrl\",\"shift\"] for \
+                       multi/range-select. Either endpoint outside the window is refused with an \
+                       error giving the window size, so a drag never lands somewhere you did not \
+                       aim. Use this for a single pointer — selecting text, moving an item, \
+                       resizing a pane; glass_gesture is the multi-touch equivalent (2+ pointers, \
+                       for pinch/rotate), and glass_click is the press-and-release-in-place case."
     )]
     async fn glass_drag(
         &self,
@@ -237,11 +251,21 @@ impl GlassServer {
         self.run(move |g| tools::gesture(g, &a)).await
     }
 
-    #[tool(description = "Type a string of text into the focused window. \
+    #[tool(
+        description = "Type a string of text into the focused window. Does not focus anything \
+                       itself — click the field first (glass_click_element, or glass_click), or \
+                       the text goes wherever focus already was. Sent as individual keystrokes, \
+                       not a paste, so per-key handlers, autocomplete and validation all run; a \
+                       newline in `text` does not press Return, so send that as a separate \
+                       glass_key. Prefer glass_set_value for a field the a11y tree exposes: it \
+                       addresses the field directly and reports whether the value landed, where \
+                       this types wherever the cursor already sits and cannot tell you what it \
+                       hit. \
                        Optional `return`: \"snapshot\" settles the UI then folds a fresh a11y \
                        tree into the result (and refreshes the snapshot cache); \"settle\" waits \
                        for the UI to stop changing (text-only); omit or \"none\" for no observe \
-                       (default).")]
+                       (default)."
+    )]
     async fn glass_type(
         &self,
         Parameters(a): Parameters<TypeArgs>,
@@ -249,7 +273,18 @@ impl GlassServer {
         self.run(move |g| tools::type_text(g, &a)).await
     }
 
-    #[tool(description = "Press a key chord like 'ctrl+s', 'Return', 'alt+F4'.")]
+    #[tool(
+        description = "Press a key chord like 'ctrl+s', 'Return', 'alt+F4'. One key with any \
+                       number of modifiers, joined by '+': the last token is the key, every \
+                       earlier one a modifier (ctrl, shift, alt, super — `cmd`, `win` and `meta` \
+                       are accepted names for super, and all of them are case-insensitive). The \
+                       key is a named key such as Return, Escape, Tab, Delete, an arrow or F1-F12, \
+                       or a single printable ASCII character. An unrecognised modifier or \
+                       key name is rejected with an error naming the token, so nothing is \
+                       half-pressed; modifiers are released again when the chord completes. Use \
+                       this for shortcuts and named keys — glass_type is for literal text and \
+                       cannot express either."
+    )]
     async fn glass_key(
         &self,
         Parameters(a): Parameters<KeyArgs>,
@@ -278,7 +313,17 @@ impl GlassServer {
         self.run(move |g| tools::clipboard_set(g, &a)).await
     }
 
-    #[tool(description = "Save the current frame as a named visual baseline.")]
+    #[tool(
+        description = "Save the current frame as a named visual baseline — a reference image \
+                       glass_diff and glass_wait_for_region later compare against, so you can ask \
+                       what changed without spending image tokens on a before-and-after pair. \
+                       Captures the whole window at call time (not a saved region), so settle the \
+                       UI first if something is still animating. Saving over an existing name \
+                       replaces it silently; baselines live outside the app under a per-server \
+                       directory and last until the server exits, surviving glass_stop. Use this \
+                       plus glass_diff to detect change; use glass_screenshot when you actually \
+                       need to look at the pixels."
+    )]
     async fn glass_baseline_save(
         &self,
         Parameters(a): Parameters<BaselineSaveArgs>,
@@ -453,7 +498,18 @@ impl GlassServer {
         self.run(tools::a11y_marks).await
     }
 
-    #[tool(description = "Read captured stdout/stderr log lines with a resumable cursor.")]
+    #[tool(
+        description = "Read captured stdout/stderr log lines with a resumable cursor. glass_start \
+                       captures the app's output from launch; this returns what has accumulated \
+                       and a `cursor` to pass back next time, so a loop reads each line once. \
+                       Returns immediately with whatever is there, including nothing at all — it \
+                       does not wait, so use glass_wait_for_log when you want to block until a \
+                       line appears (starting up, finishing work). Filter server-side with \
+                       `stream` and `contains` rather than reading everything and scanning it \
+                       yourself. The buffer keeps the most recent lines and drops the oldest, so \
+                       a chatty app can age out lines you never read; the lines are the app's own \
+                       output and are returned marked as untrusted."
+    )]
     async fn glass_logs(
         &self,
         Parameters(a): Parameters<LogsArgs>,
