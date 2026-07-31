@@ -226,6 +226,20 @@ fn map_node(
 /// naming it by that text would move the name (and the role+name fingerprint) on every keystroke,
 /// so no `name:` selector could hold, and the content description is the only label left.
 ///
+/// That exception trades one failure for a smaller one. A text field with no content description
+/// is now unnamed, so role plus an 8px bounds match is the whole fingerprint `set_value` re-walks
+/// against. It removes a false *rejection* — the old service-reader name moved whenever the field's
+/// contents did, so a write could be refused for drift that never happened — at the cost of weaker
+/// discrimination against an in-place replacement, a recycled list row or a dialog reusing the
+/// rect. The weaker case stays bounded: `json_to_node` errors on a node with no bounds, so there is
+/// always a rect to compare.
+///
+/// A label with no non-whitespace content counts as absent. Left in place it would occupy the
+/// matchable `name` slot, where no `name:` selector reaches it and nothing falls back to the
+/// description — the judgement [`normalize_description`] already makes about its own candidate.
+/// Only the decision reads the trimmed form; a name that survives it is stored as the platform
+/// gave it.
+///
 /// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
 /// a `uiautomator` dump carries no such attribute and infers it from the widget class.
 pub(crate) fn labels(
@@ -233,22 +247,32 @@ pub(crate) fn labels(
     desc: Option<&str>,
     editable: bool,
 ) -> (Option<String>, Option<String>, Option<String>) {
+    fn labelled(s: &&str) -> bool {
+        !s.trim().is_empty()
+    }
+    let text_label = text.filter(labelled);
+    let desc_label = desc.filter(labelled);
     if editable {
         return (
-            desc.map(str::to_string),
+            desc_label.map(str::to_string),
+            // Verbatim, unlike the labels: whitespace a user typed is content, not a blank label.
             text.map(str::to_string),
             // The text is already the value; repeating it would print the same string twice.
             None,
         );
     }
-    let name = text.or(desc);
+    let name = text_label.or(desc_label);
     (
         name.map(str::to_string),
         None,
-        desc.and_then(|d| normalize_description(d, name)),
+        desc_label.and_then(|d| normalize_description(d, name)),
     )
 }
 
+/// Absent attribute and empty attribute are the same thing to `uiautomator`, which emits
+/// `text=""` on every node that has none. Kept even though [`labels`] judges the *name* itself,
+/// because it is also what keeps an empty field's `value` `None` rather than `Some("")` — the
+/// shape `typed_clear_landed` and a `value_contains` filter both read.
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -572,6 +596,41 @@ mod tests {
         assert_eq!(label.description, None);
     }
 
+    /// A `<hierarchy>` of one `EditText` carrying `text` and `content-desc` verbatim — the
+    /// attributes are always present in a dump, so `""` is how the device says "absent".
+    fn edit_text_xml(text: &str, content_desc: &str) -> String {
+        format!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">\
+             <node index=\"0\" text=\"{text}\" class=\"android.widget.EditText\" \
+             content-desc=\"{content_desc}\" enabled=\"true\" focusable=\"true\" focused=\"true\" \
+             selected=\"false\" checkable=\"false\" checked=\"false\" password=\"false\" \
+             bounds=\"[0,0][100,50]\" /></hierarchy>"
+        )
+    }
+
+    #[test]
+    fn an_editable_node_with_an_empty_content_desc_is_unnamed_not_named_by_its_contents() {
+        // `content-desc=""` is what a device sends for a field with no description, and an
+        // unnamed field is the honest reading: naming it by `text` would move the name — and the
+        // fingerprint `set_value` re-walks against — on every keystroke.
+        let xml = edit_text_xml("joe@x.com", "");
+        let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
+        let field = &tree.root.children[0];
+        assert_eq!(field.name, None);
+        assert_eq!(field.value.as_deref(), Some("joe@x.com"));
+    }
+
+    #[test]
+    fn an_empty_editable_node_reports_no_value_rather_than_an_empty_one() {
+        // `typed_clear_landed` and a `value_contains` filter both read "empty" as no value at
+        // all, so `text=""` must not surface as `Some("")`.
+        let xml = edit_text_xml("", "Email");
+        let tree = build_tree(&xml, &win(), WalkLimits::DEFAULT).unwrap();
+        let field = &tree.root.children[0];
+        assert_eq!(field.name.as_deref(), Some("Email"));
+        assert_eq!(field.value, None);
+    }
+
     #[test]
     fn a_text_identical_to_the_content_desc_is_not_a_description() {
         let xml = concat!(
@@ -632,6 +691,21 @@ mod tests {
             // Neither label.
             (None, None, false, None, None, None),
             (None, None, true, None, None, None),
+            // A label of pure whitespace is no label: it must not take the name slot, where no
+            // `name:` selector could reach it and the description would never stand in.
+            (
+                Some(" "),
+                Some("Save changes"),
+                false,
+                Some("Save changes"),
+                None,
+                None,
+            ),
+            (Some(" "), None, false, None, None, None),
+            // The empty content-desc a device really sends for "no description". `Some("")` in
+            // the name slot is worse than `None`: it matches every other empty-named node.
+            (Some("hi"), Some(""), true, None, Some("hi"), None),
+            (Some("hi"), Some("  "), true, None, Some("hi"), None),
         ];
         for &(text, desc, editable, name, value, description) in cases {
             assert_eq!(

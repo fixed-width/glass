@@ -35,9 +35,8 @@ fn json_to_node(
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // No host-side filter: device agent drops empty text/desc, so this reader skips the
-    // `non_empty` guard the uiautomator reader needs — were that to change, an empty `text`
-    // would win the name over `desc` on a non-editable node.
+    // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
+    // `None` here; `labels` judges a blank one absent either way.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
     let (name, value, description) = labels(text, desc, flag("editable"));
@@ -743,6 +742,17 @@ mod tests {
         assert_eq!(node.name.as_deref(), Some("Email"));
         assert_eq!(node.value.as_deref(), Some("joe@x.com"));
         assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_desc_is_unnamed_not_named_by_its_contents() {
+        // The device omits the key entirely for a field with no content description. Falling
+        // back to `text` would name the field by what has been typed into it, moving the name —
+        // and the fingerprint `set_value` re-walks against — on every keystroke; unnamed is the
+        // honest reading.
+        let node = mapped_editable(Some("joe@x.com"), None);
+        assert_eq!(node.name, None);
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
     }
 
     #[test]
