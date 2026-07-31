@@ -386,6 +386,9 @@ impl Glass {
         // interface only moves the popup's *preview* selection, and the model commits
         // only on row activation (Enter/click). So drive it like a person does —
         // open it, keyboard-navigate to the option, and press Enter.
+        //
+        // No cache patch on this path: every `Ok` it returns either actuated nothing or followed
+        // an `a11y_resnapshot`, which replaces `last_ax` wholesale — a fresher fact than a patch.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
         }
@@ -421,6 +424,8 @@ impl Glass {
             if st.checked == want {
                 return Ok(()); // truthful no-op, no actuation
             }
+            // No cache patch here either, for the combo path's reason: the verify poll below
+            // re-snapshots, so `last_ax` holds the tree that observed the toggle.
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
             // Not event-gated, and cannot be: this branch runs only on a backend that frames a
             // switch as its whole row, which today is iOS alone — a reader with no event stream to
@@ -448,11 +453,15 @@ impl Glass {
             .ok_or(GlassError::AxUnsupported)?
             .set_value(&ctx, &target, text);
         if let Err(e) = result {
-            // A reported failure doesn't mean the field is unchanged — Android types before it
-            // verifies, so a partial type or the AVD's documented placeholder-on-clear can still
-            // have altered it. Invalidate (not gate) so a retry with no intervening snapshot
-            // isn't rejected as drift.
-            if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
+            // A failure after dispatch doesn't mean the field is unchanged — Android types before
+            // it verifies, so a partial type or the AVD's documented placeholder-on-clear can
+            // still have altered it. Invalidate (not gate) so a retry with no intervening snapshot
+            // isn't rejected as drift. A rejection from *before* dispatch keeps its value: that
+            // verdict is the guard working, and blanking the fingerprint would disarm it on the
+            // very retry it invites.
+            if e.set_value_may_have_written()
+                && let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id))
+            {
                 node.value = None;
             }
             return Err(e);
@@ -2718,52 +2727,59 @@ mod tests {
         assert_eq!(calls[0].1, "hello");
     }
 
+    /// A one-node tree whose root is an editable field holding `value` — the shape the cache
+    /// tests need, since `set_value` targets the node the snapshot cached.
+    fn editable_field_tree(value: Option<&str>) -> AxTree {
+        AxTree::new(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            raw_role: "text field".into(),
+            name: Some("Name".into()),
+            description: None,
+            value: value.map(Into::into),
+            states: AxStates {
+                editable: true,
+                ..Default::default()
+            },
+            bounds: Some(rect(0, 0, 50, 20)),
+            children: vec![],
+        })
+    }
+
+    /// A started, snapshotted session over `accessibility` — ready for the `set_value` call the
+    /// test is actually about.
+    fn glass_ready_for_set_value(accessibility: Box<dyn Accessibility + Send>) -> Glass {
+        let mut g = glass_with_backend(FakePlatform::new(100, 100), accessibility);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g
+    }
+
+    /// [`FakeAccessibility`] over `tree`, logging its writes to `set_log`.
+    fn logging_a11y(
+        tree: AxTree,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    ) -> FakeAccessibility {
+        FakeAccessibility {
+            tree,
+            set_log,
+            set_fail: false,
+            ctx_log: Arc::new(Mutex::new(None)),
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     #[test]
     fn set_value_patches_last_ax_so_a_retry_carries_the_written_value() {
         // Same mock harness as `set_value_passes_target_and_text_to_backend`: asserting on
         // `set_log` proves the cache patch directly. The real drift guard lives in
         // `editable_target` (glass-android), not here, so this doesn't reimplement it.
         let log = Arc::new(Mutex::new(Vec::new()));
-        let dir = tempfile::tempdir().unwrap();
-        let baselines = dir.path().join("baselines");
-        std::mem::forget(dir);
-        let root = AxNode {
-            id: AxNodeId(0),
-            role: AxRole::TextField,
-            raw_role: "text field".into(),
-            name: Some("Name".into()),
-            description: None,
-            value: Some("orig".into()),
-            states: AxStates {
-                editable: true,
-                ..Default::default()
-            },
-            bounds: Some(AxRect {
-                x: 0,
-                y: 0,
-                width: 50,
-                height: 20,
-            }),
-            children: vec![],
-        };
-        let mut held: Option<Backend> = Some(Backend {
-            platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FakeAccessibility {
-                tree: AxTree::new(root),
-                set_log: log.clone(),
-                set_fail: false,
-                ctx_log: Arc::new(Mutex::new(None)),
-                invoke_behavior: InvokeBehavior::Unsupported,
-                invoke_log: Arc::new(Mutex::new(Vec::new())),
-            })),
-        });
-        let factory: PlatformFactory = Box::new(move |_b| {
-            held.take()
-                .ok_or_else(|| GlassError::Backend("twice".into()))
-        });
-        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(baselines), 100);
-        g.start(&spec()).unwrap();
-        g.a11y_snapshot(None).unwrap();
+        let mut g = glass_ready_for_set_value(Box::new(logging_a11y(
+            editable_field_tree(Some("orig")),
+            log.clone(),
+        )));
 
         g.set_value(AxNodeId(0), "a").unwrap();
         g.set_value(AxNodeId(0), "b").unwrap(); // no intervening snapshot
@@ -2775,6 +2791,27 @@ mod tests {
             Some("a".into()),
             "the second call's target must carry what the first call wrote, not the pre-write \
              snapshot value"
+        );
+    }
+
+    #[test]
+    fn set_value_patches_a_cleared_field_to_no_value_at_all() {
+        // Android reports an emptied field as no value rather than `Some("")`, so caching the
+        // empty string after a successful clear would make `set_value(id, "")` then
+        // `set_value(id, "text")` — ordinary agent sequencing — look like drift on the second.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(logging_a11y(
+            editable_field_tree(Some("orig")),
+            log.clone(),
+        )));
+
+        g.set_value(AxNodeId(0), "").unwrap();
+        g.set_value(AxNodeId(0), "text").unwrap(); // no intervening snapshot
+
+        assert_eq!(
+            log.lock().unwrap()[1].0.value,
+            None,
+            "a cleared field caches as no value, the shape the reader would report"
         );
     }
 
@@ -2806,48 +2843,16 @@ mod tests {
     }
 
     #[test]
-    fn set_value_invalidates_the_cached_value_after_a_failed_write() {
-        // The AVD false-failure `typed_clear_landed` documents (an emptied field reporting its
-        // placeholder) is why `Glass::set_value` invalidates rather than gates on failure — see
-        // its comment. This exercises that path through a real retry.
-        let dir = tempfile::tempdir().unwrap();
-        let baselines = dir.path().join("baselines");
-        std::mem::forget(dir);
-        let root = AxNode {
-            id: AxNodeId(0),
-            role: AxRole::TextField,
-            raw_role: "text field".into(),
-            name: Some("Name".into()),
-            description: None,
-            value: Some("orig".into()),
-            states: AxStates {
-                editable: true,
-                ..Default::default()
-            },
-            bounds: Some(AxRect {
-                x: 0,
-                y: 0,
-                width: 50,
-                height: 20,
-            }),
-            children: vec![],
-        };
+    fn set_value_invalidates_the_cached_value_after_a_write_that_may_have_landed() {
+        // `AxValueNotApplied` is raised after the keystrokes went out — the AVD false-failure
+        // `typed_clear_landed` documents (an emptied field reporting its placeholder) is one — so
+        // the cached value is no longer a fact and must not gate the retry.
         let set_log = Arc::new(Mutex::new(Vec::new()));
-        let mut held: Option<Backend> = Some(Backend {
-            platform: Box::new(FakePlatform::new(100, 100)),
-            accessibility: Some(Box::new(FlakyOnceAccessibility {
-                tree: AxTree::new(root),
-                failed_once: false,
-                set_log: set_log.clone(),
-            })),
-        });
-        let factory: PlatformFactory = Box::new(move |_b| {
-            held.take()
-                .ok_or_else(|| GlassError::Backend("twice".into()))
-        });
-        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(baselines), 100);
-        g.start(&spec()).unwrap();
-        g.a11y_snapshot(None).unwrap();
+        let mut g = glass_ready_for_set_value(Box::new(FlakyOnceAccessibility {
+            tree: editable_field_tree(Some("orig")),
+            failed_once: false,
+            set_log: set_log.clone(),
+        }));
 
         assert!(
             g.set_value(AxNodeId(0), "a").is_err(),
@@ -2859,6 +2864,60 @@ mod tests {
             set_log.lock().unwrap()[0].0.value,
             None,
             "the retry's target must not carry the stale pre-failure value"
+        );
+    }
+
+    /// An `Accessibility` that guards its write on the target's value the way Android's
+    /// `editable_target` does — over the same [`AxTarget::value_consistent`], so this scripts the
+    /// guard rather than reimplementing it. `held` is what the live element reads.
+    struct GuardedAccessibility {
+        tree: AxTree,
+        held: Option<String>,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    }
+
+    impl Accessibility for GuardedAccessibility {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            Ok(self.tree.clone())
+        }
+        fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            if !target.value_consistent(self.held.as_deref()) {
+                return Err(GlassError::AxElementChanged(target.id.0));
+            }
+            self.held = Some(text.to_string());
+            self.set_log
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_rejected_before_dispatch_keeps_the_fingerprint_that_rejected_it() {
+        // The recycled-row case: the snapshot read "Alice", the row now holds "Zara", and the
+        // guard rejects. An agent retries without re-snapshotting — blanking the cached value on
+        // that rejection would send the retry in with no value to compare, skipping the guard and
+        // writing to the wrong row.
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(GuardedAccessibility {
+            tree: editable_field_tree(Some("Alice")),
+            held: Some("Zara".into()),
+            set_log: set_log.clone(),
+        }));
+
+        for attempt in ["first", "retry"] {
+            assert!(
+                matches!(
+                    g.set_value(AxNodeId(0), "x"),
+                    Err(GlassError::AxElementChanged(0))
+                ),
+                "the {attempt} must be rejected as drift"
+            );
+        }
+        assert!(
+            set_log.lock().unwrap().is_empty(),
+            "no write may land on the drifted row"
         );
     }
 

@@ -160,6 +160,28 @@ impl GlassError {
         )
     }
 
+    /// Whether a failed value-write may already have altered the element. False only for the
+    /// verdicts a backend reaches **before dispatching anything**: the id resolved to nothing
+    /// ([`GlassError::AxElementNotFound`]), the element on it was not the one addressed
+    /// ([`GlassError::AxElementChanged`]), or it cannot be written or tapped at all
+    /// ([`GlassError::AxElementNotEditable`], [`GlassError::AxElementNotClickable`]).
+    ///
+    /// Same "did anything dispatch?" split as [`Self::invoke_fallback_eligible`], with the
+    /// polarity flipped because the safe answer is the opposite one: the session drops its cached
+    /// value when this is true, so the wildcard must read "may have written" until a variant is
+    /// proven otherwise. Answering `false` for an error raised *after* the keystrokes went out
+    /// would leave the session fingerprinting the next write against a value the field no longer
+    /// holds.
+    pub fn set_value_may_have_written(&self) -> bool {
+        !matches!(
+            self,
+            GlassError::AxElementNotFound(_)
+                | GlassError::AxElementChanged(_)
+                | GlassError::AxElementNotEditable(_)
+                | GlassError::AxElementNotClickable(_)
+        )
+    }
+
     /// Runtime "this operation is unsupported on the active backend" error, worded
     /// consistently.
     ///
@@ -303,6 +325,29 @@ mod tests {
             GlassError::Backend("bus died".into()),
         ] {
             assert!(!e.invoke_fallback_eligible(), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_write_may_have_landed_unless_it_was_rejected_before_dispatch() {
+        // Rejected before anything was typed: the field still reads as the snapshot saw it.
+        for e in [
+            GlassError::AxElementNotFound(3),
+            GlassError::AxElementChanged(3),
+            GlassError::AxElementNotEditable(3),
+            GlassError::AxElementNotClickable(3),
+        ] {
+            assert!(!e.set_value_may_have_written(), "{e}");
+        }
+        // Everything else, including a post-write verdict, an ambiguous transport error, and any
+        // variant not named at all (the wildcard).
+        for e in [
+            GlassError::AxValueNotApplied(3),
+            GlassError::AccessibilityUnavailable("set_value timed out".into()),
+            GlassError::Backend("adb died".into()),
+            GlassError::Timeout(10),
+        ] {
+            assert!(e.set_value_may_have_written(), "{e}");
         }
     }
 
