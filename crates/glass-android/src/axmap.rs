@@ -827,10 +827,12 @@ mod tests {
                 None,
             ),
             // Editable, no content description: the resource id names it rather than nothing.
+            // Package-qualified, as the platform actually emits it: the leaf is the name, not
+            // the qualified string.
             (
                 Some("wifi"),
                 None,
-                Some("search_src_text"),
+                Some("com.android.settings:id/search_src_text"),
                 None,
                 true,
                 Some("search_src_text"),
@@ -841,7 +843,7 @@ mod tests {
             (
                 Some("wifi"),
                 Some("Email"),
-                Some("search_src_text"),
+                Some("com.android.settings:id/search_src_text"),
                 None,
                 true,
                 Some("Email"),
@@ -852,7 +854,7 @@ mod tests {
             (
                 Some("wifi"),
                 None,
-                Some("search_src_text"),
+                Some("com.android.settings:id/search_src_text"),
                 Some("Search settings"),
                 true,
                 Some("search_src_text"),
@@ -863,7 +865,7 @@ mod tests {
             (
                 None,
                 None,
-                Some("Search"),
+                Some("com.x:id/Search"),
                 Some("Search"),
                 true,
                 Some("Search"),
@@ -890,6 +892,18 @@ mod tests {
                 true,
                 None,
                 Some("wifi"),
+                None,
+            ),
+            // Non-editable with an id and no labels at all: the fallback is editable-only, so
+            // this stays unnamed rather than picking up the id.
+            (
+                None,
+                None,
+                Some("com.x:id/save_btn"),
+                None,
+                false,
+                None,
+                None,
                 None,
             ),
         ];
