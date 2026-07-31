@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use glass_core::{AxContext, ChangeSignal, ChangeWait};
 use uiautomation::events::{
@@ -42,7 +42,7 @@ const fn uia_property(p: WatchedProperty) -> UIProperty {
 
 /// The properties registered on the window. Built from [`WatchedProperty::ALL`] rather than
 /// listed again here, so there is no second list to fall out of step.
-fn watched() -> [UIProperty; 8] {
+fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
     WatchedProperty::ALL.map(uia_property)
 }
 
@@ -55,6 +55,15 @@ const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the pump sleeps before re-checking whether its signal still exists. Short enough that
 /// a dropped signal frees the thread and its registrations promptly, long enough not to spin.
 const SHUTDOWN_CHECK: Duration = Duration::from_millis(250);
+
+/// How often the pump confirms the registration is still delivering, by re-resolving the window.
+/// Far slower than `SHUTDOWN_CHECK` on purpose: this is a cross-process call against the app glass
+/// is driving, and running it at shutdown-check cadence would spend on liveness exactly the cost
+/// the subscription exists to avoid. Nothing else notices a dead registration — the app exiting,
+/// or destroying and recreating its top-level window, stops events without disconnecting either
+/// sender — so without this check `wait` would report `Quiet` for the caller's entire budget
+/// instead of `Unusable`, which licenses skipping a re-read of a tree that is actually changing.
+const LIVENESS_CHECK: Duration = Duration::from_secs(2);
 
 /// Both handlers report the same thing — that *something* changed — because that is all the wait
 /// needs; it re-reads the tree itself.
@@ -206,8 +215,21 @@ fn pump(
     }
     let _ = ready.send(true);
 
+    let mut last_liveness_check = Instant::now();
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(SHUTDOWN_CHECK);
+        if last_liveness_check.elapsed() < LIVENESS_CHECK {
+            continue;
+        }
+        last_liveness_check = Instant::now();
+        // Deliberately fails toward `Unusable`, not toward retrying: a transient read failure
+        // here costs the caller one resumed poll, exactly today's behaviour without a
+        // subscription at all. Reporting `Quiet` on the same failure would be silently wrong
+        // instead of merely conservative, so a failed probe ends the pump rather than being
+        // retried — the teardown below still runs on the way out.
+        if crate::reader::find_app_window(&automation, ctx).is_err() {
+            break;
+        }
     }
 
     let _ = automation.remove_structure_changed_event_handler(&window, &structure);
@@ -230,5 +252,93 @@ mod tests {
                 "{p:?} converts to a UIProperty with a different id"
             );
         }
+    }
+
+    /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
+    /// pins the case where that licence is actually earned: nothing arrived, and the signal is
+    /// still trustworthy.
+    #[test]
+    fn no_event_within_the_timeout_reports_quiet() {
+        let (_tx, rx) = sync_channel(1);
+        let mut changes = UiaChanges {
+            rx,
+            live: true,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Quiet);
+    }
+
+    /// A burst must cost the caller one re-read, not one per queued event — a control and its
+    /// text peer, say, firing together. The return value alone can't tell a drain from a channel
+    /// that only ever held one message, so this also asserts the channel is empty afterward.
+    #[test]
+    fn a_burst_of_events_reports_changed_once_and_leaves_the_channel_drained() {
+        // Capacity here is a test convenience for simulating several pending events at once;
+        // production bounds the real channel to 1 for an unrelated reason (backlog growth).
+        let (tx, rx) = sync_channel(4);
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        let mut changes = UiaChanges {
+            rx,
+            live: true,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Changed);
+        assert!(
+            changes.rx.try_recv().is_err(),
+            "a queued event survived the drain, so the next wait would re-report a stale change"
+        );
+    }
+
+    /// The subscription itself ended — the stream, not merely the app, went quiet — so the caller
+    /// must resume polling rather than trust a signal that can no longer speak.
+    #[test]
+    fn a_disconnected_channel_reports_unusable() {
+        let (tx, rx) = sync_channel::<()>(1);
+        drop(tx);
+        let mut changes = UiaChanges {
+            rx,
+            live: true,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            changes.wait(Duration::from_millis(20)),
+            ChangeWait::Unusable
+        );
+    }
+
+    /// `live` is the sticky half of the contract: once tripped, `wait` must return `Unusable`
+    /// without consulting the channel again — proven here by leaving a message the channel would
+    /// otherwise happily report as `Changed`.
+    #[test]
+    fn once_live_is_false_wait_reports_unusable_even_with_a_message_pending() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(()).unwrap();
+        let mut changes = UiaChanges {
+            rx,
+            live: false,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            changes.wait(Duration::from_millis(20)),
+            ChangeWait::Unusable
+        );
+    }
+
+    /// `running` is the only signal that tells the pump to stop and remove its registrations; if
+    /// `Drop` stopped setting it, the pump — and the registrations it holds on the target app's
+    /// UIA provider — would outlive every wait that created it.
+    #[test]
+    fn dropping_the_signal_clears_running() {
+        let (_tx, rx) = sync_channel(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let changes = UiaChanges {
+            rx,
+            live: true,
+            running: running.clone(),
+        };
+        drop(changes);
+        assert!(!running.load(Ordering::Relaxed));
     }
 }
