@@ -717,6 +717,16 @@ mod tests {
                 None,
             ),
             (Some(" "), None, false, None, None, None),
+            // Editable's value keeps whitespace: a caller can legitimately set a field to
+            // spaces, and read-back compares exactly.
+            (
+                Some("  "),
+                Some("Email"),
+                true,
+                Some("Email"),
+                Some("  "),
+                None,
+            ),
             // The empty content-desc a device really sends for "no description". `Some("")` in
             // the name slot is worse than `None`: it matches every other empty-named node.
             (Some("hi"), Some(""), true, None, Some("hi"), None),

@@ -229,9 +229,10 @@ no accessibility tree.
   `hidden`.
 - `value_contains` (string) — additionally require the matched element's value to contain this
   substring; not a standalone selector (`name` and/or `role` still required). Only an element that
-  reports a value can match one: on Android's on-device accessibility-service reader that is the
-  editable elements alone, so filter a label, button or check box there on `name` instead — a
-  `value_contains` against one waits out the whole timeout and returns `{matched:false}`.
+  reports a value can match one: on Android that is the editable elements alone (a change for the
+  on-device accessibility-service reader), so filter a label, button or check box there on `name`
+  instead — a `value_contains` against one waits out the whole timeout and returns
+  `{matched:false}`.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
