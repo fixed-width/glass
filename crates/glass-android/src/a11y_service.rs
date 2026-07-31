@@ -828,11 +828,19 @@ mod tests {
     }
 
     #[test]
-    fn a_node_from_an_older_companion_carries_neither_field() {
-        // The released APK sends neither key; mapping must succeed unchanged, not error.
-        let node = mapped_editable(Some("joe@x.com"), Some("Email"));
+    fn an_editable_nodes_name_is_the_desc_not_the_raw_resource_id() {
+        // Pins the `labels` call site's argument order: only this test has both `desc` and
+        // `resource_id` present, so a swap of the two would otherwise name the field by the
+        // unleafed id and nothing would catch it. The older-companion path (neither key
+        // sent) needs no dedicated test — every fixture above that omits them already
+        // exercises it.
+        let node = mapped_full(
+            Some("joe@x.com"),
+            Some("Email"),
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
         assert_eq!(node.name.as_deref(), Some("Email"));
-        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
-        assert_eq!(node.description, None);
     }
 }
