@@ -21,6 +21,7 @@
 //! backend — a known limitation.
 use glass_core::accessibility::{
     AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
+    normalize_description,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
@@ -192,18 +193,22 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
     let label = s("AXLabel");
     // Prefer the stable identifier for semantic addressing; fall back to the label.
     let name = uid.clone().or_else(|| label.clone());
-    // An editable element's value is its text content (`AXValue`). A non-editable
-    // element whose stable id displaced its visible label out of `name` surfaces that
-    // label as the value instead, so its text stays observable — e.g. a status line
-    // whose text flips (READY→TAPPED) lives in `AXLabel`, not `AXValue`. With no id the
-    // label already is the name, so there is nothing left to surface.
-    let value = if editable {
-        s("AXValue")
-    } else if uid.is_some() {
-        label
-    } else {
-        None
+    // Editable → value is `AXValue`; non-editable with a uid → the uid already displaced the
+    // label out of `name`, so the label becomes `value` instead (e.g. a status line's
+    // READY→TAPPED lives in `AXLabel`, never `AXValue`). Editable-with-a-uid is the mirror
+    // case: the label has nowhere to go but `description` (`orphan_label`). One `match`, not
+    // two sequential `if`s, so the compiler sees the label-moving arms are disjoint and skips
+    // a clone.
+    let (value, orphan_label) = match (editable, uid.is_some()) {
+        (true, true) => (s("AXValue"), label),
+        (true, false) => (s("AXValue"), None),
+        (false, true) => (label, None),
+        (false, false) => (None, None),
     };
+    // `help` is idb's key for the element's accessibility hint.
+    let description = s("help")
+        .or(orphan_label)
+        .and_then(|raw| normalize_description(&raw, name.as_deref()));
     // `checkable`/`checked` from the switch's AXValue (see `checkable_checked`). idb exposes no
     // per-element focus state, so `focused` stays false — a real limitation of this backend.
     let (checkable, checked) = checkable_checked(role, s("AXValue").as_deref());
@@ -256,10 +261,7 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
         role,
         raw_role: ax_type,
         name,
-        // `AXLabel` — the human label behind the stable `AXUniqueId` this reader prefers for
-        // `name`, exactly the split `AxNode::description` exists for — is already read above
-        // into `name` or `value`; `accessibilityHint` is the unread one.
-        description: None,
+        description,
         value,
         states,
         bounds,
@@ -290,6 +292,7 @@ mod tests {
     use glass_core::accessibility::{AxNode, AxRole};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/describe_nested.json");
+    const HINT_FIXTURE: &str = include_str!("../tests/fixtures/describe_hint.json");
 
     /// The fixture app runs full-screen on an iPhone 17 simulator: 402x874 logical
     /// points at ×3 backing scale => 1206x2622 pixels.
@@ -308,6 +311,12 @@ mod tests {
             build_tree(FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).expect("fixture must parse");
         tree.assign_ids();
         tree
+    }
+
+    /// The lone top-level element of a single-node JSON literal, built and id-assigned.
+    fn only_node(json: &str) -> AxNode {
+        let tree = build_tree(json, 1.0, &win(), WalkLimits::DEFAULT).unwrap();
+        tree.root.children[0].clone()
     }
 
     /// First node (pre-order) whose `name` equals `name`.
@@ -435,6 +444,76 @@ mod tests {
         let field = find_by_name(&tree.root, "inputField").expect("inputField present");
         assert_eq!(field.value.as_deref(), Some("type here"));
         assert!(field.states.editable);
+    }
+
+    #[test]
+    fn a_hint_becomes_the_description() {
+        let node = only_node(
+            r#"{"role":"AXButton","AXUniqueId":"bold","AXLabel":"Bold",
+                "help":"Makes the selection bold","frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.name.as_deref(), Some("bold"));
+        assert_eq!(
+            node.description.as_deref(),
+            Some("Makes the selection bold")
+        );
+    }
+
+    #[test]
+    fn an_editable_elements_displaced_label_becomes_the_description() {
+        // uid takes the name and AXValue takes the value, so the label has nowhere else to go.
+        let node = only_node(
+            r#"{"role":"AXTextField","AXUniqueId":"query","AXLabel":"Search query",
+                "AXValue":"typed text","frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.name.as_deref(), Some("query"));
+        assert_eq!(node.value.as_deref(), Some("typed text"));
+        assert_eq!(node.description.as_deref(), Some("Search query"));
+    }
+
+    #[test]
+    fn a_non_editable_elements_label_stays_the_value_and_is_not_repeated() {
+        // Already surfaced as `value` (the READY→TAPPED case); duplicating it into
+        // `description` would print it twice.
+        let node = only_node(
+            r#"{"role":"AXStaticText","AXUniqueId":"status","AXLabel":"READY",
+                "frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.value.as_deref(), Some("READY"));
+        assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn a_label_that_became_the_name_is_not_a_description() {
+        let node = only_node(
+            r#"{"role":"AXButton","AXLabel":"Tap Me","frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.name.as_deref(), Some("Tap Me"));
+        assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn a_hint_identical_to_the_name_is_not_a_description() {
+        // Would leak through as a duplicate without `normalize_description`.
+        let node = only_node(
+            r#"{"role":"AXButton","AXUniqueId":"ok","AXLabel":"OK",
+                "help":"ok","frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.name.as_deref(), Some("ok"));
+        assert_eq!(node.description, None);
+    }
+
+    #[test]
+    fn the_captured_simulator_tree_carries_a_description() {
+        // The fixture is a verbatim `idb ui describe-all` capture, so this asserts about the
+        // platform, not about a JSON literal written to agree with the reader.
+        let mut tree = build_tree(HINT_FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).unwrap();
+        tree.assign_ids();
+        let described: Vec<_> = glass_core::description_census(&tree).samples;
+        assert!(
+            !described.is_empty(),
+            "the captured tree carries no description: {described:?}"
+        );
     }
 
     #[test]
