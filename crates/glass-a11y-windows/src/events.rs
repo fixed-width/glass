@@ -52,17 +52,22 @@ fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
 /// a poll, not a hang.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long the pump sleeps before re-checking whether its signal still exists. Short enough that
-/// a dropped signal frees the thread and its registrations promptly, long enough not to spin.
+/// How long the pump sleeps before re-checking `running`. Bounds only the quiet case: a provider
+/// wedged mid-call has no clean cancellation, so it can stall both a shutdown and the teardown
+/// behind it past this cadence.
 const SHUTDOWN_CHECK: Duration = Duration::from_millis(250);
 
-/// How often the pump confirms the registration is still delivering, by re-resolving the window.
-/// Far slower than `SHUTDOWN_CHECK` on purpose: this is a cross-process call against the app glass
-/// is driving, and running it at shutdown-check cadence would spend on liveness exactly the cost
-/// the subscription exists to avoid. Nothing else notices a dead registration — the app exiting,
-/// or destroying and recreating its top-level window, stops events without disconnecting either
-/// sender — so without this check `wait` would report `Quiet` for the caller's entire budget
-/// instead of `Unusable`, which licenses skipping a re-read of a tree that is actually changing.
+/// How often the pump confirms a *quiet* registration is still delivering, by re-resolving the
+/// window. Far slower than `SHUTDOWN_CHECK` on purpose: this is a cross-process call into the
+/// target app's own UIA provider, and running it at shutdown-check cadence would spend on
+/// liveness exactly the cost the subscription exists to avoid — and would gate the shutdown-check
+/// promptness above behind a live call on every tick instead of one every couple of seconds.
+/// Nothing else notices a dead registration — the app exiting, or destroying and recreating its
+/// top-level window, stops events without disconnecting either sender — so without this check
+/// `wait` would report `Quiet` for the caller's entire budget instead of `Unusable`, which
+/// licenses skipping a re-read of a tree that is actually changing. A registration that has
+/// delivered recently skips this probe entirely (see `Notify::delivered`), so this cadence is
+/// only ever spent on a subscription that has actually gone quiet.
 const LIVENESS_CHECK: Duration = Duration::from_secs(2);
 
 /// Both handlers report the same thing — that *something* changed — because that is all the wait
@@ -71,7 +76,25 @@ const LIVENESS_CHECK: Duration = Duration::from_secs(2);
 /// A `UIElement` must never be sent through this channel. It is apartment-affine and these
 /// handlers run on UIA's RPC threads, not the pump's. Reporting *what* changed is the obvious
 /// improvement and the one that would break it.
-struct Notify(SyncSender<()>);
+struct Notify {
+    tx: SyncSender<()>,
+    /// Set whenever a handler fires, so the pump can skip a `LIVENESS_CHECK` probe against a
+    /// subscription that just proved itself alive. Relaxed is enough: this is a hint the pump
+    /// reads on its own cadence, and observing it late costs at most one skipped-then-redone
+    /// probe cycle, never a wrong answer.
+    delivered: Arc<AtomicBool>,
+}
+
+impl Notify {
+    /// Shared by both handler impls below, so `delivered` and `tx` stay in lockstep — a change
+    /// that reaches one and not the other would make the liveness probe distrust an app that is
+    /// actually still talking.
+    fn record_and_forward(&self) {
+        self.delivered.store(true, Ordering::Relaxed);
+        // A full channel already carries "something changed", so dropping this one loses nothing.
+        let _ = self.tx.try_send(());
+    }
+}
 
 impl CustomStructureChangedEventHandler for Notify {
     fn handle(
@@ -80,8 +103,7 @@ impl CustomStructureChangedEventHandler for Notify {
         _change_type: StructureChangeType,
         _runtime_id: Option<&[i32]>,
     ) -> uiautomation::Result<()> {
-        // A full channel already carries "something changed", so dropping this one loses nothing.
-        let _ = self.0.try_send(());
+        self.record_and_forward();
         Ok(())
     }
 }
@@ -93,7 +115,7 @@ impl CustomPropertyChangedEventHandler for Notify {
         _property: UIProperty,
         _new_value: Variant,
     ) -> uiautomation::Result<()> {
-        let _ = self.0.try_send(());
+        self.record_and_forward();
         Ok(())
     }
 }
@@ -189,7 +211,12 @@ fn pump(
         return;
     };
 
-    let structure: UIStructureChangeEventHandler = Notify(tx.clone()).into();
+    let delivered = Arc::new(AtomicBool::new(false));
+    let structure: UIStructureChangeEventHandler = Notify {
+        tx: tx.clone(),
+        delivered: delivered.clone(),
+    }
+    .into();
     if automation
         .add_structure_changed_event_handler(&window, TreeScope::Subtree, None, &structure)
         .is_err()
@@ -198,7 +225,11 @@ fn pump(
         return;
     }
 
-    let property: UIPropertyChangedEventHandler = Notify(tx).into();
+    let property: UIPropertyChangedEventHandler = Notify {
+        tx,
+        delivered: delivered.clone(),
+    }
+    .into();
     if automation
         .add_property_changed_event_handler(
             &window,
@@ -218,6 +249,13 @@ fn pump(
     let mut last_liveness_check = Instant::now();
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(SHUTDOWN_CHECK);
+        if delivered.swap(false, Ordering::Relaxed) {
+            // A handler fired since the last check, so the registration just proved itself
+            // alive — probing it now would be pure cost for zero information. Reset the
+            // cadence from here too, so a continuously busy app is never probed at all.
+            last_liveness_check = Instant::now();
+            continue;
+        }
         if last_liveness_check.elapsed() < LIVENESS_CHECK {
             continue;
         }
@@ -252,6 +290,23 @@ mod tests {
                 "{p:?} converts to a UIProperty with a different id"
             );
         }
+    }
+
+    /// The pump's skip decision (`delivered.swap` in its loop) needs a live registration on a
+    /// real COM thread to exercise, so it is not unit-testable here — only `Notify` itself is:
+    /// this pins that firing a handler both marks `delivered` (what lets the pump skip a probe)
+    /// and still forwards to `tx` (what `UiaChanges::wait` reads), so neither regresses alone.
+    #[test]
+    fn a_fired_handler_marks_delivered_and_still_forwards() {
+        let (tx, rx) = sync_channel(1);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let notify = Notify {
+            tx,
+            delivered: delivered.clone(),
+        };
+        notify.record_and_forward();
+        assert!(delivered.load(Ordering::Relaxed));
+        assert!(rx.try_recv().is_ok());
     }
 
     /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
