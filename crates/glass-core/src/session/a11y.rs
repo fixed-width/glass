@@ -442,13 +442,24 @@ impl Glass {
             };
         }
         let s = self.active_mut()?;
-        s.accessibility
+        let result = s
+            .accessibility
             .as_mut()
             .ok_or(GlassError::AxUnsupported)?
-            .set_value(&ctx, &target, text)?;
-        // `Ok` means the write was read back and confirmed (#267/#272): the cache is corrected
-        // to a known fact, not a hoped one. Patch by id — re-snapshotting costs a whole walk
-        // for one field. Empty normalizes to `None`, matching a cleared field's read-back.
+            .set_value(&ctx, &target, text);
+        if let Err(e) = result {
+            // A reported failure doesn't mean the field is unchanged — Android types before it
+            // verifies, so a partial type or the AVD's documented placeholder-on-clear can still
+            // have altered it. Invalidate (not gate) so a retry with no intervening snapshot
+            // isn't rejected as drift.
+            if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
+                node.value = None;
+            }
+            return Err(e);
+        }
+        // `Ok`'s guarantee varies by backend — see `AxTarget::value`'s doc — but patching to the
+        // requested text still beats leaving the pre-write value, which is definitely stale, not
+        // just possibly imprecise. Patch by id; a re-snapshot would cost a whole walk for one field.
         if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
             node.value = (!text.is_empty()).then(|| text.to_string());
         }
@@ -2708,10 +2719,14 @@ mod tests {
     }
 
     #[test]
-    fn set_value_patches_last_ax_so_a_same_element_rewrite_is_not_rejected_as_drifted() {
-        // Without the patch, the second call's stale `target.value` ("orig") is rejected as
-        // drift by the fake's value-fingerprint guard. No intervening snapshot — that would
-        // refresh the cache and mask the bug.
+    fn set_value_patches_last_ax_so_a_retry_carries_the_written_value() {
+        // Same mock harness as `set_value_passes_target_and_text_to_backend`: asserting on
+        // `set_log` proves the cache patch directly. The real drift guard lives in
+        // `editable_target` (glass-android), not here, so this doesn't reimplement it.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let baselines = dir.path().join("baselines");
+        std::mem::forget(dir);
         let root = AxNode {
             id: AxNodeId(0),
             role: AxRole::TextField,
@@ -2731,11 +2746,121 @@ mod tests {
             }),
             children: vec![],
         };
-        let mut g = glass_with_a11y(FakePlatform::new(100, 100), AxTree::new(root));
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(FakePlatform::new(100, 100)),
+            accessibility: Some(Box::new(FakeAccessibility {
+                tree: AxTree::new(root),
+                set_log: log.clone(),
+                set_fail: false,
+                ctx_log: Arc::new(Mutex::new(None)),
+                invoke_behavior: InvokeBehavior::Unsupported,
+                invoke_log: Arc::new(Mutex::new(Vec::new())),
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(baselines), 100);
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
+
         g.set_value(AxNodeId(0), "a").unwrap();
-        g.set_value(AxNodeId(0), "b").unwrap();
+        g.set_value(AxNodeId(0), "b").unwrap(); // no intervening snapshot
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].0.value,
+            Some("a".into()),
+            "the second call's target must carry what the first call wrote, not the pre-write \
+             snapshot value"
+        );
+    }
+
+    /// An `Accessibility` whose `set_value` fails the first call and succeeds every one after,
+    /// logging successful calls like `FakeAccessibility`. `FakeAccessibility::set_fail` is a
+    /// fixed knob, not a script, and this needs to vary across one session's two calls — kept
+    /// local since only one test needs it.
+    struct FlakyOnceAccessibility {
+        tree: AxTree,
+        failed_once: bool,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    }
+
+    impl Accessibility for FlakyOnceAccessibility {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            Ok(self.tree.clone())
+        }
+        fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(GlassError::AxValueNotApplied(target.id.0));
+            }
+            self.set_log
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn set_value_invalidates_the_cached_value_after_a_failed_write() {
+        // Android types before it verifies (`typed_clear_landed`'s documented AVD false-failure:
+        // an emptied field reporting its placeholder), so a reported failure can still have
+        // changed the field. The stale pre-write value must not survive it, or a retry with no
+        // intervening snapshot would carry a value `editable_target` could reject as drift.
+        let dir = tempfile::tempdir().unwrap();
+        let baselines = dir.path().join("baselines");
+        std::mem::forget(dir);
+        let root = AxNode {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            raw_role: "text field".into(),
+            name: Some("Name".into()),
+            description: None,
+            value: Some("orig".into()),
+            states: AxStates {
+                editable: true,
+                ..Default::default()
+            },
+            bounds: Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 20,
+            }),
+            children: vec![],
+        };
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut held: Option<Backend> = Some(Backend {
+            platform: Box::new(FakePlatform::new(100, 100)),
+            accessibility: Some(Box::new(FlakyOnceAccessibility {
+                tree: AxTree::new(root),
+                failed_once: false,
+                set_log: set_log.clone(),
+            })),
+        });
+        let factory: PlatformFactory = Box::new(move |_b| {
+            held.take()
+                .ok_or_else(|| GlassError::Backend("twice".into()))
+        });
+        let mut g = Glass::new(factory, "x11".into(), BaselineStore::new(baselines), 100);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+
+        assert!(
+            g.set_value(AxNodeId(0), "a").is_err(),
+            "first write is scripted to fail"
+        );
+        g.set_value(AxNodeId(0), "a").unwrap(); // retry, no intervening snapshot
+
+        assert_eq!(
+            set_log.lock().unwrap()[0].0.value,
+            None,
+            "the retry's target must not carry the stale pre-failure value"
+        );
     }
 
     #[test]

@@ -654,6 +654,13 @@ pub struct AxTarget {
     /// `set_value` path uses it to notice that a re-walk landed on a different element holding
     /// different data — a recycled list row reuses the same view, so its role, name and rect are
     /// all identical and only this differs.
+    ///
+    /// After a write, the session cache patches this to the text that was requested — an exact
+    /// fact only on a typed-write backend (Android/iOS, verified by
+    /// `typed_text_landed`/`typed_clear_landed`). An atomic-write backend (Windows/macOS) may
+    /// have reformatted the value instead (`read_back_confirms`), and Linux's AT-SPI writer
+    /// doesn't read back at all, so on those a future consumer should treat this as a best
+    /// available label, not a proven one.
     pub value: Option<String>,
 }
 

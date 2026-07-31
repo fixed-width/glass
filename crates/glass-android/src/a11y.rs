@@ -737,6 +737,22 @@ mod tests {
     }
 
     #[test]
+    fn a_target_whose_value_still_matches_passes() {
+        // Every other target helper here captures `None`, so "reject whenever a value was
+        // captured" would pass all of them too — this is the one case that actually needs the
+        // comparison, not just the presence check.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Alice"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(editable_target(&tree, &target).is_ok());
+    }
+
+    #[test]
     fn non_editable_target_is_element_not_editable() {
         let t = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), false);
         assert!(matches!(
