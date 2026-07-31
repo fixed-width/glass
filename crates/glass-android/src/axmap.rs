@@ -228,6 +228,37 @@ fn map_node(
     }
 }
 
+/// The three label fields, from the two labels Android exposes plus whether the node is editable.
+///
+/// Both Android readers route through this, so the precedence is one decision with one test suite
+/// rather than a per-reader choice that can drift apart — which is what it had done. The visible
+/// text is the name; an editable node is the exception, because there the text is the user's
+/// content and the content description is the only label left.
+///
+/// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
+/// a `uiautomator` dump carries no such attribute and infers it from the widget class.
+#[allow(dead_code)] // temporary: used only by tests until the next change wires up a caller
+pub(crate) fn labels(
+    text: Option<&str>,
+    desc: Option<&str>,
+    editable: bool,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if editable {
+        return (
+            desc.map(str::to_string),
+            text.map(str::to_string),
+            // The text is already the value; repeating it would print the same string twice.
+            None,
+        );
+    }
+    let name = text.or(desc);
+    (
+        name.map(str::to_string),
+        None,
+        desc.and_then(|d| normalize_description(d, name)),
+    )
+}
+
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None
@@ -563,6 +594,77 @@ mod tests {
         );
         let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
         assert_eq!(tree.root.children[0].description, None);
+    }
+
+    /// Every combination of the two labels and the editable flag, with the rule stated once.
+    /// `desc` differs from `text` except where the case is about them matching.
+    #[test]
+    #[expect(
+        clippy::type_complexity,
+        reason = "one-off table type, not worth naming"
+    )]
+    fn labels_follow_one_rule_for_both_readers() {
+        // (text, desc, editable) -> (name, value, description)
+        let cases: &[(
+            Option<&str>,
+            Option<&str>,
+            bool,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        )] = &[
+            // Non-editable: the visible text is the name, the content-description is the extra.
+            (
+                Some("Save"),
+                Some("Save changes"),
+                false,
+                Some("Save"),
+                None,
+                Some("Save changes"),
+            ),
+            // No text: the content-description IS the name, so it must not print twice.
+            (None, Some("Bold"), false, Some("Bold"), None, None),
+            // No content-description: nothing to add.
+            (Some("Settings"), None, false, Some("Settings"), None, None),
+            // Both, identical: one label, printed once.
+            (Some("Save"), Some("Save"), false, Some("Save"), None, None),
+            // Editable: the text is the user's content, so the description is the label.
+            (
+                Some("joe@x.com"),
+                Some("Email"),
+                true,
+                Some("Email"),
+                Some("joe@x.com"),
+                None,
+            ),
+            // Editable with no content-description: honestly unnamed, never named by its content.
+            (Some("joe@x.com"), None, true, None, Some("joe@x.com"), None),
+            // Neither label.
+            (None, None, false, None, None, None),
+            (None, None, true, None, None, None),
+        ];
+        for &(text, desc, editable, name, value, description) in cases {
+            assert_eq!(
+                labels(text, desc, editable),
+                (
+                    name.map(str::to_string),
+                    value.map(str::to_string),
+                    description.map(str::to_string)
+                ),
+                "labels({text:?}, {desc:?}, editable={editable})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_editable_node_is_never_named_by_what_was_typed_into_it() {
+        // The case that decides the editable branch: `name` must not follow the content, or a
+        // `name:` selector cannot address a filled field and the role+name fingerprint moves
+        // every time the value does.
+        let (before, _, _) = labels(Some("jo"), Some("Email"), true);
+        let (after, _, _) = labels(Some("joe@x.com"), Some("Email"), true);
+        assert_eq!(before, after);
+        assert_eq!(before.as_deref(), Some("Email"));
     }
 
     #[test]
