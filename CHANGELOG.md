@@ -24,6 +24,13 @@ internal refactors, CI, or test-only changes.
   behaviour a caller cannot see from the type — `glass_baseline_save` overwrites an existing
   name silently, `glass_type` types into whatever already has focus, and `glass_start`'s
   `timeout_ms` bounds waiting for the window, not the `build` step.
+- `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and `glass_logs`
+  now describe what they do to the app and when to reach for them rather than a sibling tool.
+  Each states the consequence a caller would otherwise learn by trial: `glass_type` does not
+  focus a field and a newline in its text does not press Return, `glass_drag` refuses a path
+  with any endpoint outside the window, `glass_stop` discards the captured logs and element ids,
+  `glass_baseline_save` replaces an existing name silently, and `glass_logs` returns whatever
+  has accumulated without waiting (`glass_wait_for_log` is the blocking one).
 
 ### Changed
 - On Linux, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
@@ -35,6 +42,9 @@ internal refactors, CI, or test-only changes.
   established or stops delivering.
 
 ### Fixed
+- The tool reference said a negative input coordinate addressed a point off the window's
+  top-left edge. It is rejected, like any other point outside the window, before the backend
+  sees it; the reference now says so and a test covers the negative case.
 - A switch now reports the same role on Windows, macOS, Android and iOS. `glass_a11y_snapshot`
   called one a `CheckBox` on iOS, and a `Button` or a `CheckBox` on macOS depending on which toolkit
   drew it, so a `role:"ToggleButton"` selector that worked on one machine silently matched nothing on
