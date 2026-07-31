@@ -142,6 +142,40 @@ pub fn format_range_value(v: f64) -> String {
     format!("{v}")
 }
 
+/// The UIA property ids a change subscription registers for.
+///
+/// Numeric for the same reason [`CONTROL_TYPES`] is: this module compiles on every host, and
+/// `uiautomation` is a `cfg(windows)` dependency. `events.rs` converts them to `UIProperty` and
+/// a test there pins the two lists together.
+pub const WATCHED_PROPERTY_IDS: &[u32] = &[
+    30005, // Name — the `name:` selector
+    30008, // HasKeyboardFocus
+    30010, // IsEnabled
+    30022, // IsOffscreen
+    30045, // ValueValue — the `value_contains:` selector
+    30070, // ExpandCollapseExpandCollapseState
+    30079, // SelectionItemIsSelected
+    30086, // ToggleToggleState
+];
+
+/// The UIA property whose change announces `condition`, or `None` where a structure change does.
+///
+/// Exhaustive by construction: a new [`glass_core::ElementCondition`] fails to compile here. That
+/// is the enforcement — a condition nothing announces does not error, it just makes waits slow,
+/// which is the kind of regression that ships.
+pub const fn announcing_property(condition: glass_core::ElementCondition) -> Option<u32> {
+    use glass_core::ElementCondition as C;
+    match condition {
+        C::Appears | C::Disappears => None,
+        C::Enabled | C::Disabled => Some(30010),
+        C::Checked | C::Unchecked => Some(30086),
+        C::Selected | C::Unselected => Some(30079),
+        C::Expanded | C::Collapsed => Some(30070),
+        C::Focused => Some(30008),
+        C::Visible | C::Hidden => Some(30022),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +413,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_conditions_property_is_one_the_subscription_registers() {
+        for c in glass_core::ElementCondition::ALL {
+            if let Some(id) = announcing_property(c) {
+                assert!(
+                    WATCHED_PROPERTY_IDS.contains(&id),
+                    "{c:?} is announced by property {id}, which the subscription does not register"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_selector_properties_are_registered_too() {
+        // `name:` and `value_contains:` are selectors, not conditions, so no `ElementCondition`
+        // names them — but a wait matching on either still has to wake when they change.
+        assert!(WATCHED_PROPERTY_IDS.contains(&30005), "Name");
+        assert!(WATCHED_PROPERTY_IDS.contains(&30045), "ValueValue");
+    }
+
+    #[test]
+    fn appearing_and_vanishing_are_structural_not_properties() {
+        // The structure-changed handler covers these; claiming a property for them would mean
+        // registering one that never fires for the case.
+        assert_eq!(
+            announcing_property(glass_core::ElementCondition::Appears),
+            None
+        );
+        assert_eq!(
+            announcing_property(glass_core::ElementCondition::Disappears),
+            None
+        );
     }
 }

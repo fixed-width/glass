@@ -842,6 +842,25 @@ pub enum ElementCondition {
 }
 
 impl ElementCondition {
+    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]; a backend that subscribes
+    /// to change notifications derives its registration list from this, so a condition absent
+    /// here would be one nothing announces.
+    pub const ALL: [ElementCondition; 13] = [
+        ElementCondition::Appears,
+        ElementCondition::Disappears,
+        ElementCondition::Enabled,
+        ElementCondition::Disabled,
+        ElementCondition::Checked,
+        ElementCondition::Unchecked,
+        ElementCondition::Selected,
+        ElementCondition::Unselected,
+        ElementCondition::Expanded,
+        ElementCondition::Collapsed,
+        ElementCondition::Focused,
+        ElementCondition::Visible,
+        ElementCondition::Hidden,
+    ];
+
     /// Parse from the condition name (case-insensitive). `None` for unknown.
     pub fn from_name(s: &str) -> Option<ElementCondition> {
         use ElementCondition::*;
@@ -2400,6 +2419,41 @@ mod tests {
         assert_eq!(
             normalize_description("save", Some("Save")),
             Some("save".to_string())
+        );
+    }
+
+    /// Adding an `ElementCondition` fails to compile in this match, and the array below must then
+    /// grow to match — which is the point: `ALL` is what the Windows subscription derives its
+    /// registration list from, so a condition missing from it would be silently unwaitable.
+    const fn condition_index(c: ElementCondition) -> usize {
+        match c {
+            ElementCondition::Appears => 0,
+            ElementCondition::Disappears => 1,
+            ElementCondition::Enabled => 2,
+            ElementCondition::Disabled => 3,
+            ElementCondition::Checked => 4,
+            ElementCondition::Unchecked => 5,
+            ElementCondition::Selected => 6,
+            ElementCondition::Unselected => 7,
+            ElementCondition::Expanded => 8,
+            ElementCondition::Collapsed => 9,
+            ElementCondition::Focused => 10,
+            ElementCondition::Visible => 11,
+            ElementCondition::Hidden => 12,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_condition_exactly_once() {
+        let mut seen = [false; 13];
+        for c in ElementCondition::ALL {
+            let i = condition_index(c);
+            assert!(!seen[i], "{c:?} appears twice in ElementCondition::ALL");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "ElementCondition::ALL is missing a condition"
         );
     }
 }
