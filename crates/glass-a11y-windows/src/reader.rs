@@ -120,7 +120,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
 /// `send_pointer`/`window` operate on — so it never enumerates the desktop or queries a peer app's
 /// UIA provider (a foreign provider that blocks cross-process calls on the worker thread could
 /// otherwise wedge the whole snapshot). `element_from_handle` touches only the target's provider.
-fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
+pub(crate) fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
     let handle = ctx.window_handle.ok_or_else(|| {
         GlassError::AccessibilityUnavailable(
             "no active window handle in the a11y context (the backend adopted no window)".into(),

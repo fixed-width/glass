@@ -10,7 +10,9 @@ publish = false
 glass-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-uiautomation = { version = "0.25", features = ["process"] }
+# `event` for the change subscription in `events.rs`; `uiautomation` gates its event handler
+# types behind it. No new crate, and it resolves against the existing lockfile.
+uiautomation = { version = "0.25", features = ["process", "event"] }
 
 [lints]
 workspace = true

@@ -7,6 +7,9 @@ pub mod doctor;
 pub mod mapping; // pure UIA->normalized mapping — cross-platform, host-tested
 
 #[cfg(windows)]
+mod events;
+
+#[cfg(windows)]
 mod reader;
 
 #[cfg(windows)]
