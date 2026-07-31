@@ -456,10 +456,9 @@ impl Glass {
             // A failure after dispatch doesn't mean the field is unchanged — Android types before
             // it verifies, so a partial type or the AVD's documented placeholder-on-clear can
             // still have altered it. Invalidate (not gate) so a retry with no intervening snapshot
-            // isn't rejected as drift. A rejection from *before* dispatch keeps its value: that
-            // verdict is the guard working, and blanking the fingerprint would disarm it on the
-            // very retry it invites.
-            if e.set_value_may_have_written()
+            // isn't rejected as drift; every other failure keeps its value, for the asymmetry
+            // `set_value_failed_after_writing` documents.
+            if e.set_value_failed_after_writing()
                 && let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id))
             {
                 node.value = None;
@@ -2919,6 +2918,63 @@ mod tests {
             set_log.lock().unwrap().is_empty(),
             "no write may land on the drifted row"
         );
+    }
+
+    /// [`GuardedAccessibility`] whose first call fails before dispatching anything — the shape of
+    /// Android's `set_value`, which re-snapshots and reaches for adb before it taps.
+    struct PreDispatchFailureThenGuarded {
+        first_failure: Option<GlassError>,
+        guarded: GuardedAccessibility,
+    }
+
+    impl Accessibility for PreDispatchFailureThenGuarded {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            self.guarded.snapshot(ctx)
+        }
+        fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            match self.first_failure.take() {
+                Some(e) => Err(e),
+                None => self.guarded.set_value(ctx, target, text),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pre_dispatch_transport_failure_keeps_the_value_that_guards_the_retry() {
+        // A not-ready `uiautomator dump` or an adb hiccup fails the guard's own re-snapshot, before
+        // anything is typed — as `Backend` or `AccessibilityUnavailable`, the same variants that
+        // post-dispatch failures use, so neither can be classified by variant. The captured value
+        // is still a fact here; blanking it would let the retry write to the recycled row.
+        for failure in [
+            GlassError::Backend("uiautomator dump not ready".into()),
+            GlassError::AccessibilityUnavailable("adb: device offline".into()),
+        ] {
+            let set_log = Arc::new(Mutex::new(Vec::new()));
+            let mut g = glass_ready_for_set_value(Box::new(PreDispatchFailureThenGuarded {
+                first_failure: Some(failure),
+                guarded: GuardedAccessibility {
+                    tree: editable_field_tree(Some("Alice")),
+                    held: Some("Zara".into()), // the row recycled under the snapshot
+                    set_log: set_log.clone(),
+                },
+            }));
+
+            assert!(
+                g.set_value(AxNodeId(0), "x").is_err(),
+                "first write is scripted to fail before dispatch"
+            );
+            assert!(
+                matches!(
+                    g.set_value(AxNodeId(0), "x"),
+                    Err(GlassError::AxElementChanged(0))
+                ),
+                "the retry must still be guarded by the captured value"
+            );
+            assert!(
+                set_log.lock().unwrap().is_empty(),
+                "no write may land on the drifted row"
+            );
+        }
     }
 
     #[test]

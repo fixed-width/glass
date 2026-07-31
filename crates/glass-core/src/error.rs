@@ -160,26 +160,23 @@ impl GlassError {
         )
     }
 
-    /// Whether a failed value-write may already have altered the element. False only for the
-    /// verdicts a backend reaches **before dispatching anything**: the id resolved to nothing
-    /// ([`GlassError::AxElementNotFound`]), the element on it was not the one addressed
-    /// ([`GlassError::AxElementChanged`]), or it cannot be written or tapped at all
-    /// ([`GlassError::AxElementNotEditable`], [`GlassError::AxElementNotClickable`]).
+    /// Whether a failed value-write is **proven** to have gone out before failing — the only case
+    /// where the session's captured value is stale and must be dropped. True for the read-back
+    /// verdict [`GlassError::AxValueNotApplied`], raised only after a write was dispatched; false
+    /// for everything else, including variants added later.
     ///
-    /// Same "did anything dispatch?" split as [`Self::invoke_fallback_eligible`], with the
-    /// polarity flipped because the safe answer is the opposite one: the session drops its cached
-    /// value when this is true, so the wildcard must read "may have written" until a variant is
-    /// proven otherwise. Answering `false` for an error raised *after* the keystrokes went out
-    /// would leave the session fingerprinting the next write against a value the field no longer
-    /// holds.
-    pub fn set_value_may_have_written(&self) -> bool {
-        !matches!(
-            self,
-            GlassError::AxElementNotFound(_)
-                | GlassError::AxElementChanged(_)
-                | GlassError::AxElementNotEditable(_)
-                | GlassError::AxElementNotClickable(_)
-        )
+    /// Same "did anything dispatch?" question as [`Self::invoke_fallback_eligible`], but decided by
+    /// an allowlist, because the two mistakes are not symmetric. Keeping the value can only make
+    /// the guard reject more — an `AxElementChanged` whose own message tells the caller to
+    /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
+    /// accepts is a write onto the wrong element, reported as `Ok`.
+    ///
+    /// Some verdicts cannot be classified at all: Android raises `Backend` and
+    /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
+    /// adb handshake fail the same way its post-write read-back does — so no variant-level split
+    /// separates them, and the recoverable answer has to win.
+    pub fn set_value_failed_after_writing(&self) -> bool {
+        matches!(self, GlassError::AxValueNotApplied(_))
     }
 
     /// Runtime "this operation is unsupported on the active backend" error, worded
@@ -329,25 +326,22 @@ mod tests {
     }
 
     #[test]
-    fn a_write_may_have_landed_unless_it_was_rejected_before_dispatch() {
-        // Rejected before anything was typed: the field still reads as the snapshot saw it.
+    fn only_a_proven_post_dispatch_verdict_invalidates_the_captured_value() {
+        // The read-back verdict is reached only after the write went out.
+        assert!(GlassError::AxValueNotApplied(3).set_value_failed_after_writing());
+        // Everything else keeps the captured value: the pre-dispatch rejections, the transport
+        // errors raised on either side of the dispatch, and any variant not named (the wildcard).
         for e in [
             GlassError::AxElementNotFound(3),
             GlassError::AxElementChanged(3),
             GlassError::AxElementNotEditable(3),
             GlassError::AxElementNotClickable(3),
-        ] {
-            assert!(!e.set_value_may_have_written(), "{e}");
-        }
-        // Everything else, including a post-write verdict, an ambiguous transport error, and any
-        // variant not named at all (the wildcard).
-        for e in [
-            GlassError::AxValueNotApplied(3),
-            GlassError::AccessibilityUnavailable("set_value timed out".into()),
+            GlassError::AxUnsupported,
+            GlassError::AccessibilityUnavailable("uiautomator dump not ready".into()),
             GlassError::Backend("adb died".into()),
             GlassError::Timeout(10),
         ] {
-            assert!(e.set_value_may_have_written(), "{e}");
+            assert!(!e.set_value_failed_after_writing(), "{e}");
         }
     }
 
