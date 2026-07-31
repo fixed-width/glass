@@ -480,18 +480,10 @@ only one — across four stock apps, only one node in roughly three hundred had 
 `desc` to be absent on most Android nodes, not routinely present. The other readers take it from a
 separate descriptor field, so there a node with a single label can still carry one.
 
-The on-device companion adds a second source of `desc` for an editable element: its hint
-(Android's placeholder text) becomes the description. That source is companion-only — a
-`uiautomator` dump carries no hint attribute at all, so `uiautomator` never supplies one — so a
-text field's `desc` is richer through the companion than through `uiautomator`. A field with a
-hint but no content description and no resource id has nothing left to name it, so it stays
-unnamed but described: verified rendering as `#35 TextField desc="Search settings"`, which
-`glass_a11y_marks` labels from that description (see below).
-
 Both Android readers name a control the same way: the visible text is the `name`, or the
 content-description where there is no text — except on an editable element, where the text is
-already the `value` and the content-description is the `name` instead — verified on device, a
-filled field's name does not change as its text changes, on either reader.
+already the `value` and the content-description is the `name` instead. A filled field's name does
+not change as its text changes, on either reader.
 
 One consequence of that rule: two controls that differ only in their content-description — "Save
 draft" and "Save and close", both reading `Save` on screen — now share a `name`, and a `name:`
@@ -500,18 +492,18 @@ controls read alike, address the one you want by its `id` from a snapshot.
 
 An editable element with no content description falls back to the leaf of its view resource id
 rather than staying unnamed — `open_search_view_edit_text`, not the package-qualified
-`com.android.settings:id/open_search_view_edit_text` — verified on the emulator (API 34): Settings'
-search box reads that name identically from both readers. Treat the id as a label of last resort: a
-resource id is not unique within a tree — ten rows built from one layout can all carry the same
-one — so it tells this element apart from unrelated ones, not from its own kind.
+`com.android.settings:id/open_search_view_edit_text`. Settings' search box, for example, reads that
+name identically from both readers. Treat the id as a label of last resort: a resource id is not
+unique within a tree — ten rows built from one layout can all carry the same one — so it tells
+this element apart from unrelated ones, not from its own kind.
 
-This id fallback opens a gap between the two readers for anyone still running a previously
-released on-device companion. `uiautomator` reads the resource id straight from its own dump, so
-it names such an element immediately; the old companion never sent a resource id, so the
-accessibility-service reader leaves the same element unnamed until the companion is updated. The
-trigger — editable, carries a resource id, no content description — is most stock text fields, not
-an exotic case. Nothing that matched before stops matching: this only adds a name where the
-service reader previously had none.
+The on-device companion adds a second source of `desc` for an editable element: its hint
+(Android's placeholder text) becomes the description. That source is companion-only — a
+`uiautomator` dump carries no hint attribute at all, so `uiautomator` never supplies one — so a
+text field's `desc` is richer through the companion than through `uiautomator`. A field with a
+hint but no content description and no resource id has nothing left to name it, so it stays
+unnamed but described, rendering as `#35 TextField desc="Search settings"`, which
+`glass_a11y_marks` labels from that description (see below).
 
 An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still

@@ -17,13 +17,12 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
-- `glass_set_value`, and the native-invoke path `glass_click_element` prefers before falling back
-  to a synthesized pointer click, now also fingerprint the target's value, not just its role, name
-  and bounds. A re-walk that lands on a same-role, same-name, same-rect element holding *different*
-  data — a recycled list row reusing the same view is the case this closes — is now rejected as
-  changed since the snapshot instead of being written to or actuated. The gap was widest on
-  Android: an editable element with no content description and no resource id has no name at all,
-  so role plus an 8px bounds match used to be the whole fingerprint a write re-walked against.
+- Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
+  name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
+  *different* data — a recycled list row reusing the same view is the case this closes — is now
+  rejected as changed since the snapshot rather than written to. An editable element with no
+  content description and no resource id has no name at all, so role plus an 8px bounds match used
+  to be the whole fingerprint a write re-walked against.
 
 ### Changed
 - Both Android readers now name an element the same way. The same control used to answer
@@ -49,14 +48,8 @@ internal refactors, CI, or test-only changes.
   description nor a resource id: it renders as `TextField desc="Search settings"` through the
   companion. `uiautomator` cannot supply that description at all — its dump carries no hint
   attribute — so a text field's `desc` is richer through the companion than through `uiautomator`.
-
-  The id fallback opens a gap of its own for anyone still running the companion released before
-  this change. `uiautomator` reads a resource id from its own dump and names such a field
-  immediately; the accessibility-service reader depends on the companion for one, and the old
-  companion never sent it, so it still leaves the field unnamed. The trigger — editable, carries a
-  resource id, no content description — is most stock text fields, not an edge case, and it
-  resolves once the companion is updated. Nothing that matched before stops matching: this only
-  adds a name where the service reader previously had none.
+  Both the id fallback and the hint on the accessibility-service reader need the updated on-device
+  companion.
 
   One loss remains, on the accessibility-service reader: an element that is not editable — a
   label, a button, a check box — no longer reports a `value`; that reader used to copy the
