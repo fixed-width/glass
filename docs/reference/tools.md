@@ -461,11 +461,14 @@ rides as an untrusted sibling text block, one line per element:
 `glass_click_element`. `desc="…"` carries a secondary label the platform exposes separately from
 the name — help or tooltip text, or the human-readable label where the name is a
 developer-assigned id. It appears only where glass's reader sources that label: the AT-SPI (Linux)
-reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, and the AX
-(macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name. The
-Android readers and the `idb` (iOS) reader do not read their platform's secondary label yet, so
-`desc` never appears there no matter what the app exposes. It is also omitted when the description
-duplicates the name. **`desc` is display-only: `glass_wait_for_element` and
+reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, the AX
+(macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name, the
+Android readers read whichever of the element's text and content-description did not become the
+name, and the `idb` (iOS) reader reads the element's hint, falling back to the label an editable
+element's identifier displaced. A description needs a node to carry both labels, and on Android
+most controls carry only one — across four stock apps, only one node in roughly three hundred had
+both — so expect `desc` absent on most nodes in most apps, not routinely present. It is omitted
+when the description duplicates the name. **`desc` is display-only: `glass_wait_for_element` and
 `glass_scroll_to_element` select on `name`, never on the description.** An element whose platform
 role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still

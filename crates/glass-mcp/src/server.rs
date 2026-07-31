@@ -418,11 +418,10 @@ impl GlassServer {
                        elements: role, name, description, window-relative bounds) as compact \
                        text — deterministic, low-token element addressing alongside \
                        screenshots. Each line is `#<id> <Role> \"<name>\" desc=\"<description>\" \
-                       (x,y wxh) [states]`. desc appears only where glass's reader for the \
-                       running backend sources the platform's secondary label — not all of \
-                       them do yet — and it differs from the name; it is display-only, since \
-                       glass_wait_for_element and glass_scroll_to_element select on name, not \
-                       description. Pass an #id to \
+                       (x,y wxh) [states]`. desc carries a second label the platform exposes \
+                       apart from the name, and appears only where one exists and differs from \
+                       the name; it is display-only, since glass_wait_for_element and \
+                       glass_scroll_to_element select on name, not description. Pass an #id to \
                        glass_click_element. Errors if the backend or app exposes no \
                        accessibility tree (e.g. a canvas/black-box app) — fall back to \
                        glass_screenshot then. Optional max_nodes: raise the element cap, or 0 \
