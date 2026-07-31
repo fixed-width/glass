@@ -205,10 +205,12 @@ fn map_node(n: &Value, scale: f64, depth: usize, budget: &mut WalkBudget) -> AxN
         (false, true) => (label, None),
         (false, false) => (None, None),
     };
-    // `help` is idb's key for the element's accessibility hint.
+    // `help` is idb's key for the element's accessibility hint. Each candidate normalizes on its
+    // own: picking first and normalizing after would let a hint rejected as a duplicate of the
+    // name take the displaced label down with it, losing the label from every field.
     let description = s("help")
-        .or(orphan_label)
-        .and_then(|raw| normalize_description(&raw, name.as_deref()));
+        .and_then(|hint| normalize_description(&hint, name.as_deref()))
+        .or_else(|| orphan_label.and_then(|label| normalize_description(&label, name.as_deref())));
     // `checkable`/`checked` from the switch's AXValue (see `checkable_checked`). idb exposes no
     // per-element focus state, so `focused` stays false — a real limitation of this backend.
     let (checkable, checked) = checkable_checked(role, s("AXValue").as_deref());
@@ -288,8 +290,8 @@ fn frame_to_rect(f: &Value, scale: f64) -> Option<AxRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::WindowGeometry;
     use glass_core::accessibility::{AxNode, AxRole};
+    use glass_core::{DescribedSample, WindowGeometry};
 
     const FIXTURE: &str = include_str!("../tests/fixtures/describe_nested.json");
     const HINT_FIXTURE: &str = include_str!("../tests/fixtures/describe_hint.json");
@@ -504,16 +506,82 @@ mod tests {
     }
 
     #[test]
-    fn the_captured_simulator_tree_carries_a_description() {
-        // The fixture is a verbatim `idb ui describe-all` capture, so this asserts about the
-        // platform, not about a JSON literal written to agree with the reader.
+    fn a_hint_rejected_as_a_duplicate_name_leaves_the_displaced_label_describing_the_node() {
+        // Editable + uid, so the label's only home is `description` — and the hint is dropped as
+        // a duplicate of the name. Normalizing before choosing would take the label with it and
+        // "Search query" would appear in no field at all.
+        let node = only_node(
+            r#"{"role":"AXTextField","AXUniqueId":"query","AXLabel":"Search query",
+                "AXValue":"typed text","help":"query",
+                "frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.description.as_deref(), Some("Search query"));
+    }
+
+    #[test]
+    fn a_hint_wins_over_a_displaced_label_when_a_node_carries_both() {
+        // Four distinct labels, so the assertion fails if the fallback order ever flips.
+        let node = only_node(
+            r#"{"role":"AXTextField","AXUniqueId":"query","AXLabel":"Search query",
+                "AXValue":"typed text","help":"Filters the list as you type",
+                "frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(
+            node.description.as_deref(),
+            Some("Filters the list as you type")
+        );
+    }
+
+    #[test]
+    fn a_hint_describes_a_node_that_carries_no_unique_id() {
+        // The commonest hint-bearing node in a real app: a plain button with a visible label and
+        // a hint, no developer-assigned identifier. The hint is not gated on the identifier the
+        // way `value` is.
+        let node = only_node(
+            r#"{"role":"AXButton","AXLabel":"Send","help":"Sends the message",
+                "frame":{"x":0,"y":0,"width":10,"height":10}}"#,
+        );
+        assert_eq!(node.name.as_deref(), Some("Send"));
+        assert_eq!(node.description.as_deref(), Some("Sends the message"));
+    }
+
+    /// Every described node of the captured tree. The fixture is a verbatim
+    /// `idb ui describe-all` capture, so what these assert is the platform's behaviour, not a
+    /// JSON literal written to agree with the reader.
+    fn captured_descriptions() -> Vec<DescribedSample> {
         let mut tree = build_tree(HINT_FIXTURE, SCALE, &win(), WalkLimits::DEFAULT).unwrap();
         tree.assign_ids();
-        let described: Vec<_> = glass_core::description_census(&tree).samples;
-        assert!(
-            !described.is_empty(),
-            "the captured tree carries no description: {described:?}"
+        glass_core::description_census(&tree).samples
+    }
+
+    /// The description the captured tree gives the node named `name`, if any.
+    fn captured_description(name: &str) -> Option<String> {
+        captured_descriptions()
+            .into_iter()
+            .find(|s| s.name.as_deref() == Some(name))
+            .map(|s| s.description)
+    }
+
+    #[test]
+    fn the_captured_hinted_button_is_described_by_its_hint() {
+        assert_eq!(
+            captured_description("the-hinted-button").as_deref(),
+            Some("Saves and closes the sheet")
         );
+    }
+
+    #[test]
+    fn the_captured_text_field_is_described_by_the_label_its_identifier_displaced() {
+        assert_eq!(
+            captured_description("the-described-field").as_deref(),
+            Some("Search query")
+        );
+    }
+
+    #[test]
+    fn the_captured_simulator_tree_describes_those_two_nodes_and_no_others() {
+        let described = captured_descriptions();
+        assert_eq!(described.len(), 2, "described nodes: {described:?}");
     }
 
     #[test]

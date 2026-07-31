@@ -308,7 +308,8 @@ pub struct AxNode {
     /// A secondary human label the platform exposes separately from `name`: help/tooltip text
     /// on desktop, or the human label where `name` is a developer-assigned id. Kept out of
     /// `name` because `name` is half the [`AxTarget`] fingerprint `set_value` re-walks against
-    /// and has to stay stable.
+    /// and has to stay stable. Assign it through [`normalize_description`], which is what drops
+    /// a blank label or one that only repeats `name`.
     pub description: Option<String>,
     pub value: Option<String>,
     pub states: AxStates,

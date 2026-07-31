@@ -34,6 +34,9 @@ fn json_to_node(
 ) -> Result<AxNode> {
     budget.visit();
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
+    // No emptiness filter, unlike the sibling readers: the device agent already drops an empty
+    // text/desc rather than sending it. Were that to change, an empty `text` would win the name
+    // as `Some("")` and strand the real label in `desc`.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
     let name = text.or(desc);
@@ -693,6 +696,15 @@ mod tests {
         json_to_node(&node_json(text, desc), &win(), 0, &mut budget).expect("maps")
     }
 
+    /// [`mapped`], for an editable field rather than a button.
+    fn mapped_editable(text: Option<&str>, desc: Option<&str>) -> AxNode {
+        let mut v = node_json(text, desc);
+        v["class"] = json!("android.widget.EditText");
+        v["editable"] = json!(true);
+        let mut budget = WalkBudget::new();
+        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+    }
+
     #[test]
     fn the_content_description_a_text_displaced_becomes_the_description() {
         let node = mapped(Some("Save"), Some("Save changes"));
@@ -720,5 +732,14 @@ mod tests {
     #[test]
     fn a_node_with_no_desc_has_no_description() {
         assert_eq!(mapped(Some("Save"), None).description, None);
+    }
+
+    #[test]
+    fn an_editable_nodes_desc_is_still_its_description() {
+        // Deliberately ungated, unlike the uiautomator reader: there the editable node's `text`
+        // is only the value, here it is the name too, so the displaced `desc` is the one label
+        // left with nowhere else to go.
+        let node = mapped_editable(Some("joe@x.com"), Some("Email"));
+        assert_eq!(node.description.as_deref(), Some("Email"));
     }
 }
