@@ -39,7 +39,11 @@ fn json_to_node(
     // `None` here; `labels` judges a blank one absent either way.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
-    let (name, value, description) = labels(text, desc, None, None, flag("editable"));
+    // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
+    // no version check is needed to stay compatible with it.
+    let resource_id = v.get("resource_id").and_then(Value::as_str);
+    let hint = v.get("hint").and_then(Value::as_str);
+    let (name, value, description) = labels(text, desc, resource_id, hint, flag("editable"));
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
@@ -97,7 +101,7 @@ fn json_to_node(
         role: class_to_role(cls),
         raw_role: cls.to_string(),
         name,
-        // Hint and state-description stay unread — the device protocol carries neither.
+        // State-description stays unread — the device protocol doesn't carry it.
         description,
         value,
         states: AxStates {
@@ -677,7 +681,12 @@ mod tests {
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
     }
 
-    fn node_json(text: Option<&str>, desc: Option<&str>) -> Value {
+    fn node_json(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+    ) -> Value {
         let mut v = json!({
             "class": "android.widget.Button",
             "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
@@ -689,19 +698,43 @@ mod tests {
         if let Some(d) = desc {
             v["desc"] = json!(d);
         }
+        if let Some(r) = resource_id {
+            v["resource_id"] = json!(r);
+        }
+        if let Some(h) = hint {
+            v["hint"] = json!(h);
+        }
         v
     }
 
     fn mapped(text: Option<&str>, desc: Option<&str>) -> AxNode {
         let mut budget = WalkBudget::new();
-        json_to_node(&node_json(text, desc), &win(), 0, &mut budget).expect("maps")
+        json_to_node(&node_json(text, desc, None, None), &win(), 0, &mut budget).expect("maps")
     }
 
-    /// [`mapped`], for an editable field rather than a button.
+    /// [`mapped`], for an editable field; omits `resource_id`/`hint`, the shape an older
+    /// companion sends.
     fn mapped_editable(text: Option<&str>, desc: Option<&str>) -> AxNode {
-        let mut v = node_json(text, desc);
+        let mut v = node_json(text, desc, None, None);
         v["class"] = json!("android.widget.EditText");
         v["editable"] = json!(true);
+        let mut budget = WalkBudget::new();
+        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+    }
+
+    /// [`mapped_editable`], additionally setting `resource_id` and `hint`.
+    fn mapped_full(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+        editable: bool,
+    ) -> AxNode {
+        let mut v = node_json(text, desc, resource_id, hint);
+        if editable {
+            v["class"] = json!("android.widget.EditText");
+            v["editable"] = json!(true);
+        }
         let mut budget = WalkBudget::new();
         json_to_node(&v, &win(), 0, &mut budget).expect("maps")
     }
@@ -766,5 +799,40 @@ mod tests {
         let node = mapped(Some("Settings"), None);
         assert_eq!(node.name.as_deref(), Some("Settings"));
         assert_eq!(node.value, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_desc_is_named_by_its_view_id() {
+        let node = mapped_full(
+            Some("joe@x.com"),
+            None,
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("email_field"));
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+    }
+
+    #[test]
+    fn an_editable_nodes_hint_becomes_its_description() {
+        let node = mapped_full(
+            None,
+            None,
+            Some("com.x:id/q"),
+            Some("Search settings"),
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("q"));
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+    }
+
+    #[test]
+    fn a_node_from_an_older_companion_carries_neither_field() {
+        // The released APK sends neither key; mapping must succeed unchanged, not error.
+        let node = mapped_editable(Some("joe@x.com"), Some("Email"));
+        assert_eq!(node.name.as_deref(), Some("Email"));
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+        assert_eq!(node.description, None);
     }
 }
