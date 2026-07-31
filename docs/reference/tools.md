@@ -474,12 +474,9 @@ only one — across four stock apps, only one node in roughly three hundred had 
 `desc` to be absent on most Android nodes, not routinely present. The other readers take it from a
 separate descriptor field, so there a node with a single label can still carry one.
 
-The two Android readers also disagree on which label becomes the `name`: `uiautomator` prefers the
-content-description, the on-device accessibility-service reader prefers the text, so the same
-control can report `name` and `desc` swapped depending on which reader is running. Because
-selection is on `name` only, a `name:` selector learned under one Android reader can silently miss
-under the other — re-read the snapshot after switching readers rather than carrying a selector
-across them.
+Both Android readers name a control the same way: the visible text is the `name`, except on an
+editable element, where the text is already the `value` and the content-description is the `name`
+instead.
 
 An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still

@@ -16,6 +16,26 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- Both Android readers now name an element the same way. The same control used to answer
+  differently depending on which reader was running — `uiautomator` and the on-device
+  accessibility-service reader disagreed on which label became the `name` — so a `name:`
+  selector learned under one could silently miss under the other, with nothing to say why. A
+  control with both a visible label and a content description is now named by the visible
+  label, the one actually on screen: verified on device, the role fixture's button reads
+  `Button "Save" desc="Save changes"` through both readers, where the two strings used to be
+  swapped between them. An editable element is named by its content
+  description and never by what has been typed into it; the accessibility-service reader used
+  to name a filled text field by its own contents, so its name changed on every keystroke.
+
+  One loss to know about: on the accessibility-service reader, an *empty* text field that has a
+  hint but no content description used to be named by that hint — Android reports a hint through
+  the same `text` attribute a filled field uses, so an empty field's hint arrived
+  indistinguishable from typed content — and it is now unnamed. That naming was never
+  dependable: it held only while the field was empty and became the typed content the moment
+  anything was entered, so it was not a stable selector either way. Carrying Android's hint as
+  its own field is the real fix, and is not part of this change.
+
 ### Added
 - Every tool parameter now carries a description in the advertised MCP schema, so an agent can
   read a parameter's meaning without inferring it from the name. The additions cover the
@@ -107,9 +127,7 @@ internal refactors, CI, or test-only changes.
   value; and the iOS reader reads the element's accessibility hint, falling back to the label an
   editable element's identifier displaced. On Android a description needs one node to carry two
   distinct labels and most controls carry only one, so expect `desc` to be absent on most Android
-  nodes. The two Android readers also disagree on which label is the name: `uiautomator` prefers
-  content-description, the on-device accessibility-service reader prefers text, so the same
-  control can report `name` and `desc` swapped depending on which reader is running.
+  nodes.
 - `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
   the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
   (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is
