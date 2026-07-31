@@ -2,6 +2,7 @@
 
 use glass_core::accessibility::{
     AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTree, TruncationLimit, WalkBudget, WalkLimits,
+    normalize_description,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 
@@ -155,6 +156,15 @@ fn map_node(
     let content_desc = non_empty(attr("content-desc"));
     let text = non_empty(attr("text"));
     let name = content_desc.or_else(|| if editable { None } else { text.clone() });
+    // An editable node's `text` is its value, so it is already surfaced. A non-editable node's
+    // `text` is either the name (no content-desc — `normalize_description` drops that as a
+    // duplicate) or dropped outright, and the dropped case is what this recovers.
+    let description = if editable {
+        None
+    } else {
+        text.as_deref()
+            .and_then(|t| normalize_description(t, name.as_deref()))
+    };
     let value = if editable { text } else { None };
     let states = AxStates {
         focused: boolean("focused"),
@@ -210,10 +220,7 @@ fn map_node(
         role,
         raw_role: class.to_string(),
         name,
-        // `content-desc` is Android's secondary label and is already read above as the
-        // preferred `name`; the hint and state-description are unread, and a `uiautomator`
-        // dump exposes neither as an attribute anyway.
-        description: None,
+        description,
         value,
         states,
         bounds: parse_bounds(attr("bounds"), window),
@@ -488,6 +495,74 @@ mod tests {
         assert_eq!(class_to_role("android.widget.LinearLayout"), AxRole::Group);
         assert_eq!(class_to_role("android.view.ViewGroup"), AxRole::Group);
         assert_eq!(class_to_role("com.example.CustomThing"), AxRole::Other);
+    }
+
+    /// A `<hierarchy>` of one non-editable Button carrying both labels, and one EditText
+    /// carrying both, so one parse covers the kept case and the already-surfaced case.
+    const BOTH_LABELS_XML: &str = concat!(
+        "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+        "<node index=\"0\" text=\"Save\" class=\"android.widget.Button\" ",
+        "content-desc=\"Save changes\" enabled=\"true\" focusable=\"true\" focused=\"false\" ",
+        "selected=\"false\" checkable=\"false\" checked=\"false\" password=\"false\" ",
+        "bounds=\"[0,0][100,50]\" />",
+        "<node index=\"1\" text=\"joe@x.com\" class=\"android.widget.EditText\" ",
+        "content-desc=\"Email\" enabled=\"true\" focusable=\"true\" focused=\"false\" ",
+        "selected=\"false\" checkable=\"false\" checked=\"false\" password=\"false\" ",
+        "bounds=\"[0,60][100,110]\" />",
+        "</hierarchy>",
+    );
+
+    #[test]
+    fn the_text_a_content_desc_displaced_becomes_the_description() {
+        let tree = build_tree(BOTH_LABELS_XML, &win(), WalkLimits::DEFAULT).unwrap();
+        let button = &tree.root.children[0];
+        // `content-desc` wins the name here (that precedence is glass#260's subject and is NOT
+        // changed by this test), so `text` is the label that would otherwise be dropped.
+        assert_eq!(button.name.as_deref(), Some("Save changes"));
+        assert_eq!(button.description.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn an_editable_nodes_text_stays_the_value_and_is_not_repeated_as_a_description() {
+        let tree = build_tree(BOTH_LABELS_XML, &win(), WalkLimits::DEFAULT).unwrap();
+        let field = &tree.root.children[1];
+        assert_eq!(field.name.as_deref(), Some("Email"));
+        assert_eq!(field.value.as_deref(), Some("joe@x.com"));
+        assert_eq!(
+            field.description, None,
+            "the text is already surfaced as the value; a description would print it twice"
+        );
+    }
+
+    #[test]
+    fn the_text_that_became_the_name_is_not_repeated_as_a_description() {
+        // No content-desc: `text` IS the name, so a description would be a duplicate label.
+        let xml = concat!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+            "<node index=\"0\" text=\"Settings\" class=\"android.widget.TextView\" ",
+            "content-desc=\"\" enabled=\"true\" focusable=\"false\" focused=\"false\" ",
+            "selected=\"false\" checkable=\"false\" checked=\"false\" password=\"false\" ",
+            "bounds=\"[0,0][100,50]\" />",
+            "</hierarchy>",
+        );
+        let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
+        let label = &tree.root.children[0];
+        assert_eq!(label.name.as_deref(), Some("Settings"));
+        assert_eq!(label.description, None);
+    }
+
+    #[test]
+    fn a_text_identical_to_the_content_desc_is_not_a_description() {
+        let xml = concat!(
+            "<?xml version='1.0'?><hierarchy rotation=\"0\">",
+            "<node index=\"0\" text=\"Save\" class=\"android.widget.Button\" ",
+            "content-desc=\"Save\" enabled=\"true\" focusable=\"true\" focused=\"false\" ",
+            "selected=\"false\" checkable=\"false\" checked=\"false\" password=\"false\" ",
+            "bounds=\"[0,0][100,50]\" />",
+            "</hierarchy>",
+        );
+        let tree = build_tree(xml, &win(), WalkLimits::DEFAULT).unwrap();
+        assert_eq!(tree.root.children[0].description, None);
     }
 
     #[test]
