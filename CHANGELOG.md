@@ -16,6 +16,15 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+- `glass_set_value`, and the native-invoke path `glass_click_element` prefers before falling back
+  to a synthesized pointer click, now also fingerprint the target's value, not just its role, name
+  and bounds. A re-walk that lands on a same-role, same-name, same-rect element holding *different*
+  data — a recycled list row reusing the same view is the case this closes — is now rejected as
+  changed since the snapshot instead of being written to or actuated. The gap was widest on
+  Android: an editable element with no content description and no resource id has no name at all,
+  so role plus an 8px bounds match used to be the whole fingerprint a write re-walked against.
+
 ### Changed
 - Both Android readers now name an element the same way. The same control used to answer
   differently depending on which reader was running — `uiautomator` and the on-device
@@ -29,18 +38,31 @@ internal refactors, CI, or test-only changes.
   to name a filled text field by its own contents, so its name changed with the field's contents
   from one snapshot read to the next.
 
-  Two losses to know about, both on the accessibility-service reader. An *empty* text field that
-  has a hint but no content description used to be named by that hint — Android reports a hint
-  through the same `text` attribute a filled field uses, so an empty field's hint arrived
-  indistinguishable from typed content — and it is now unnamed. That naming was never
-  dependable: it held only while the field was empty and became the typed content the moment
-  anything was entered, so it was not a stable selector either way. Carrying Android's hint as
-  its own field is a separate change, not part of this one.
+  An editable element with no content description — including an empty field named only by its
+  hint — now falls back to the leaf of its view resource id rather than staying unnamed: plain
+  text, not the package-qualified form Android reports, and shared by every other view built from
+  the same layout, so treat it as a label of last resort, not a selector to rely on.
+  Verified on device: Settings' search box reads `open_search_view_edit_text` identically from
+  both readers. The on-device companion separately carries the field's hint into its
+  `description`, so an agent sees `desc="Search settings"` there even when nothing names the field
+  at all — verified on the role fixture's added `EditText`, which has a hint and neither a content
+  description nor a resource id: it renders as `TextField desc="Search settings"` through the
+  companion. `uiautomator` cannot supply that description at all — its dump carries no hint
+  attribute — so a text field's `desc` is richer through the companion than through `uiautomator`.
 
-  And an element that is not editable — a label, a button, a check box — no longer reports a
-  `value`; that reader used to copy the element's own text there as well as into `name`. Since a
-  `value_contains` filter matches only an element that has a value, `value_contains` against a
-  non-editable element under this reader now never matches, so a `glass_wait_for_element` written
+  The id fallback opens a gap of its own for anyone still running the companion released before
+  this change. `uiautomator` reads a resource id from its own dump and names such a field
+  immediately; the accessibility-service reader depends on the companion for one, and the old
+  companion never sent it, so it still leaves the field unnamed. The trigger — editable, carries a
+  resource id, no content description — is most stock text fields, not an edge case, and it
+  resolves once the companion is updated. Nothing that matched before stops matching: this only
+  adds a name where the service reader previously had none.
+
+  One loss remains, on the accessibility-service reader: an element that is not editable — a
+  label, a button, a check box — no longer reports a `value`; that reader used to copy the
+  element's own text there as well as into `name`. Since a `value_contains` filter matches only an
+  element that has a value, `value_contains` against a non-editable element under this reader now
+  never matches, so a `glass_wait_for_element` written
   that way waits out its whole timeout and answers `{matched:false}`. Match those elements on
   `name` instead. It also retires an escape hatch worth naming: a Jetpack Compose button surfaces
   as a clickable `Group`, and `role:"Button"` plus `value_contains:"Submit"` used to reach it —
