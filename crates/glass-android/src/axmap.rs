@@ -68,6 +68,12 @@ pub fn class_to_role(class: &str) -> AxRole {
     AxRole::Other
 }
 
+/// `com.example:id/search_src_text` → `search_src_text`. The package-qualified form is noise in an
+/// outline, and within one app's tree the leaf is what distinguishes one view from another.
+fn id_leaf(id: &str) -> String {
+    id.rsplit('/').next().unwrap_or(id).to_string()
+}
+
 /// Parse uiautomator `bounds="[l,t][r,b]"` (screen-absolute) into a window-relative `AxRect`.
 pub fn parse_bounds(s: &str, window: &WindowGeometry) -> Option<AxRect> {
     let s = s.trim().strip_prefix('[')?;
@@ -155,7 +161,13 @@ fn map_node(
     let editable = role == AxRole::TextField || boolean("password");
     let content_desc = non_empty(attr("content-desc"));
     let text = non_empty(attr("text"));
-    let (name, value, description) = labels(text.as_deref(), content_desc.as_deref(), editable);
+    let (name, value, description) = labels(
+        text.as_deref(),
+        content_desc.as_deref(),
+        None,
+        None,
+        editable,
+    );
     let states = AxStates {
         focused: boolean("focused"),
         focusable: boolean("focusable"),
@@ -218,30 +230,40 @@ fn map_node(
     }
 }
 
-/// The three label fields, from the two labels Android exposes plus whether the node is editable.
+/// The three label fields, from the two labels Android exposes, the view's resource id, its
+/// hint, and whether the node is editable.
 ///
 /// Both Android readers route through this, so the precedence is one decision with one test suite
 /// rather than a per-reader choice that can drift apart — which is what it had done. The visible
 /// text is the name; an editable node is the exception, because its text is what the user typed —
 /// naming it by that text would move the name (and the role+name fingerprint) on every keystroke,
-/// so no `name:` selector could hold, and the content description is the only label left.
+/// so no `name:` selector could hold, and the content description — or, failing that, the
+/// resource id — is the label left.
 ///
-/// A text field with no content description is unnamed, so role plus an 8px bounds match is the
-/// whole fingerprint `set_value` re-walks against — weaker discrimination against an in-place
-/// replacement, a recycled list row, or a dialog reusing the rect. `json_to_node` errors on a node
-/// with no bounds, so that rect is always there to compare.
+/// A text field with no content description falls back to its resource id — not unique in a tree
+/// (ten rows from one layout can all carry `row_title`), so it is a label of last resort rather
+/// than an identifier. Only when both are absent does the node stay unnamed, leaving role plus an
+/// 8px bounds match as the whole fingerprint `set_value` re-walks against — weaker discrimination
+/// against an in-place replacement, a recycled list row, or a dialog reusing the rect.
+/// `json_to_node` errors on a node with no bounds, so that rect is always there to compare.
 ///
-/// A label with no non-whitespace content counts as absent. Left in place it would occupy the
-/// matchable `name` slot, where no `name:` selector reaches it and nothing falls back to the
-/// description — the judgement [`normalize_description`] already makes about its own candidate.
-/// Only the decision reads the trimmed form; a name that survives it is stored as the platform
-/// gave it.
+/// The hint (Android's placeholder text for an empty field) becomes the `description`, never the
+/// `name` — `uiautomator` cannot see a hint at all, so a hint-derived name would exist on one
+/// reader but not the other.
+///
+/// A label, resource id, or hint with no non-whitespace content counts as absent. Left in place it
+/// would occupy the matchable `name` slot, where no `name:` selector reaches it and nothing falls
+/// back to the description — the judgement [`normalize_description`] already makes about its own
+/// candidate. Only the decision reads the trimmed form; a name that survives it is stored as the
+/// platform gave it.
 ///
 /// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
 /// a `uiautomator` dump carries no such attribute and infers it from the widget class.
 pub(crate) fn labels(
     text: Option<&str>,
     desc: Option<&str>,
+    resource_id: Option<&str>,
+    hint: Option<&str>,
     editable: bool,
 ) -> (Option<String>, Option<String>, Option<String>) {
     fn labelled(s: &&str) -> bool {
@@ -250,12 +272,19 @@ pub(crate) fn labels(
     let text_label = text.filter(labelled);
     let desc_label = desc.filter(labelled);
     if editable {
+        // Bound before the tuple: the hint is judged against the name that was actually chosen,
+        // so a hint repeating it drops, exactly as a description does on the other arm.
+        let name = desc_label
+            .map(str::to_string)
+            .or_else(|| resource_id.filter(labelled).map(id_leaf));
+        let description = hint
+            .filter(labelled)
+            .and_then(|h| normalize_description(h, name.as_deref()));
         return (
-            desc_label.map(str::to_string),
+            name,
             // Verbatim, unlike the labels: whitespace a user typed is content, not a blank label.
             text.map(str::to_string),
-            // The text is already the value; repeating it would print the same string twice.
-            None,
+            description,
         );
     }
     let name = text_label.or(desc_label);
@@ -660,16 +689,19 @@ mod tests {
         assert_eq!(tree.root.children[0].description, None);
     }
 
-    /// Every combination of the two labels and the editable flag, with the rule stated once.
-    /// `desc` differs from `text` except where the case is about them matching.
+    /// Every combination of the two labels, the resource id, the hint, and the editable flag,
+    /// with the rule stated once. `desc` differs from `text` except where the case is about them
+    /// matching.
     #[test]
     #[expect(
         clippy::type_complexity,
         reason = "one-off table type, not worth naming"
     )]
     fn labels_follow_one_rule_for_both_readers() {
-        // (text, desc, editable) -> (name, value, description)
+        // (text, desc, resource_id, hint, editable) -> (name, value, description)
         let cases: &[(
+            Option<&str>,
+            Option<&str>,
             Option<&str>,
             Option<&str>,
             bool,
@@ -681,47 +713,92 @@ mod tests {
             (
                 Some("Save"),
                 Some("Save changes"),
+                None,
+                None,
                 false,
                 Some("Save"),
                 None,
                 Some("Save changes"),
             ),
             // No text: the content-description IS the name, so it must not print twice.
-            (None, Some("Bold"), false, Some("Bold"), None, None),
+            (
+                None,
+                Some("Bold"),
+                None,
+                None,
+                false,
+                Some("Bold"),
+                None,
+                None,
+            ),
             // No content-description: nothing to add.
-            (Some("Settings"), None, false, Some("Settings"), None, None),
+            (
+                Some("Settings"),
+                None,
+                None,
+                None,
+                false,
+                Some("Settings"),
+                None,
+                None,
+            ),
             // Both, identical: one label, printed once.
-            (Some("Save"), Some("Save"), false, Some("Save"), None, None),
+            (
+                Some("Save"),
+                Some("Save"),
+                None,
+                None,
+                false,
+                Some("Save"),
+                None,
+                None,
+            ),
             // Editable: the text is the user's content, so the description is the label.
             (
                 Some("joe@x.com"),
                 Some("Email"),
+                None,
+                None,
                 true,
                 Some("Email"),
                 Some("joe@x.com"),
                 None,
             ),
-            // Editable with no content-description: honestly unnamed, never named by its content.
-            (Some("joe@x.com"), None, true, None, Some("joe@x.com"), None),
+            // Editable with no content-description or resource id: honestly unnamed, never named
+            // by its content.
+            (
+                Some("joe@x.com"),
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some("joe@x.com"),
+                None,
+            ),
             // Neither label.
-            (None, None, false, None, None, None),
-            (None, None, true, None, None, None),
+            (None, None, None, None, false, None, None, None),
+            (None, None, None, None, true, None, None, None),
             // A label of pure whitespace is no label: it must not take the name slot, where no
             // `name:` selector could reach it and the description would never stand in.
             (
                 Some(" "),
                 Some("Save changes"),
+                None,
+                None,
                 false,
                 Some("Save changes"),
                 None,
                 None,
             ),
-            (Some(" "), None, false, None, None, None),
+            (Some(" "), None, None, None, false, None, None, None),
             // Editable's value keeps whitespace: a caller can legitimately set a field to
             // spaces, and read-back compares exactly.
             (
                 Some("  "),
                 Some("Email"),
+                None,
+                None,
                 true,
                 Some("Email"),
                 Some("  "),
@@ -729,18 +806,102 @@ mod tests {
             ),
             // The empty content-desc a device really sends for "no description". `Some("")` in
             // the name slot is worse than `None`: it matches every other empty-named node.
-            (Some("hi"), Some(""), true, None, Some("hi"), None),
-            (Some("hi"), Some("  "), true, None, Some("hi"), None),
+            (
+                Some("hi"),
+                Some(""),
+                None,
+                None,
+                true,
+                None,
+                Some("hi"),
+                None,
+            ),
+            (
+                Some("hi"),
+                Some("  "),
+                None,
+                None,
+                true,
+                None,
+                Some("hi"),
+                None,
+            ),
+            // Editable, no content description: the resource id names it rather than nothing.
+            (
+                Some("wifi"),
+                None,
+                Some("search_src_text"),
+                None,
+                true,
+                Some("search_src_text"),
+                Some("wifi"),
+                None,
+            ),
+            // A content description still wins the name; the id is only a fallback.
+            (
+                Some("wifi"),
+                Some("Email"),
+                Some("search_src_text"),
+                None,
+                true,
+                Some("Email"),
+                Some("wifi"),
+                None,
+            ),
+            // The hint is the description, and does not touch the name.
+            (
+                Some("wifi"),
+                None,
+                Some("search_src_text"),
+                Some("Search settings"),
+                true,
+                Some("search_src_text"),
+                Some("wifi"),
+                Some("Search settings"),
+            ),
+            // A hint equal to the name adds nothing.
+            (
+                None,
+                None,
+                Some("Search"),
+                Some("Search"),
+                true,
+                Some("Search"),
+                None,
+                None,
+            ),
+            // Non-editable is untouched by either new input.
+            (
+                Some("Save"),
+                Some("Save changes"),
+                Some("save_btn"),
+                Some("ignored"),
+                false,
+                Some("Save"),
+                None,
+                Some("Save changes"),
+            ),
+            // Neither label nor id: still honestly unnamed.
+            (
+                Some("wifi"),
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some("wifi"),
+                None,
+            ),
         ];
-        for &(text, desc, editable, name, value, description) in cases {
+        for &(text, desc, resource_id, hint, editable, name, value, description) in cases {
             assert_eq!(
-                labels(text, desc, editable),
+                labels(text, desc, resource_id, hint, editable),
                 (
                     name.map(str::to_string),
                     value.map(str::to_string),
                     description.map(str::to_string)
                 ),
-                "labels({text:?}, {desc:?}, editable={editable})"
+                "labels({text:?}, {desc:?}, {resource_id:?}, {hint:?}, editable={editable})"
             );
         }
     }
@@ -749,8 +910,8 @@ mod tests {
     fn an_editable_node_is_never_named_by_what_was_typed_into_it() {
         // The case the editable branch exists for (see `labels`'s doc): name must not track
         // the typed value.
-        let (before, _, _) = labels(Some("jo"), Some("Email"), true);
-        let (after, _, _) = labels(Some("joe@x.com"), Some("Email"), true);
+        let (before, _, _) = labels(Some("jo"), Some("Email"), None, None, true);
+        let (after, _, _) = labels(Some("joe@x.com"), Some("Email"), None, None, true);
         assert_eq!(before, after);
         assert_eq!(before.as_deref(), Some("Email"));
     }

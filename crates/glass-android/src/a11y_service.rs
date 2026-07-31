@@ -39,7 +39,7 @@ fn json_to_node(
     // `None` here; `labels` judges a blank one absent either way.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
-    let (name, value, description) = labels(text, desc, flag("editable"));
+    let (name, value, description) = labels(text, desc, None, None, flag("editable"));
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
