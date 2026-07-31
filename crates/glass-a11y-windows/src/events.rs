@@ -20,6 +20,8 @@ use uiautomation::events::{
 use uiautomation::types::{StructureChangeType, TreeScope, UIProperty};
 use uiautomation::variants::Variant;
 use uiautomation::{UIAutomation, UIElement};
+use windows::Win32::UI::Accessibility::IUIAutomation2;
+use windows::core::Interface;
 
 use crate::mapping::WatchedProperty;
 
@@ -52,9 +54,17 @@ fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
 /// a poll, not a hang.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long the pump sleeps before re-checking `running`. Bounds only the quiet case: a provider
-/// wedged mid-call has no clean cancellation, so it can stall both a shutdown and the teardown
-/// behind it past this cadence.
+/// The per-call limit `bound_transaction_timeout` sets on `automation`, in milliseconds (the unit
+/// `IUIAutomation2::SetTransactionTimeout` itself takes). Generous against the slowest measured
+/// call — registration's 38ms + 17ms on a 1500-node window is nowhere near it — and strictly below
+/// `SUBSCRIBE_TIMEOUT` (see the test pinning that), so a provider this slow fails the call it's
+/// waiting on rather than expiring the subscribe handshake first.
+const TRANSACTION_TIMEOUT_MS: u32 = 2_000;
+
+/// How long the pump sleeps before re-checking `running`. A dropped signal frees the thread and
+/// its registrations within this long, full stop: `bound_transaction_timeout` caps every
+/// cross-process call the loop makes at `TRANSACTION_TIMEOUT_MS`, so a wedged-but-alive provider
+/// can no longer hold the pump inside a call past that cap.
 const SHUTDOWN_CHECK: Duration = Duration::from_millis(250);
 
 /// How often the pump confirms a *quiet* registration is still delivering, by re-resolving the
@@ -190,6 +200,20 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     }
 }
 
+/// Bounds every cross-process call `automation` makes from here on — registration, the liveness
+/// probe, and both teardown calls — at `TRANSACTION_TIMEOUT_MS`. Without it a wedged-but-alive
+/// provider (busy, not exited) can hold the pump inside a synchronous COM call indefinitely,
+/// since such a call has no clean cancellation; `IUIAutomation2` is where UIA exposes the knob
+/// (Windows 8.1+, so this succeeds on anything glass supports).
+#[allow(unsafe_code)]
+fn bound_transaction_timeout(automation: &UIAutomation) -> windows::core::Result<()> {
+    let automation2: IUIAutomation2 = automation.as_ref().cast()?;
+    // SAFETY: `SetTransactionTimeout` sets a plain `u32` millisecond value with no other
+    // preconditions and no output to alias; `automation2` is a live `IUIAutomation2` — the
+    // `cast` above already validated the interface pointer via `QueryInterface`.
+    unsafe { automation2.SetTransactionTimeout(TRANSACTION_TIMEOUT_MS) }
+}
+
 /// Register both handlers on the window and hold them until the signal is dropped.
 ///
 /// Every early return either registered nothing or removes what it registered. A half-registered
@@ -206,6 +230,15 @@ fn pump(
         let _ = ready.send(false);
         return;
     };
+    // A failed cast or failed set is treated as a subscribe failure, the same as every other
+    // early exit here: proceeding unbounded would silently discard the one property this
+    // exists to add, and reporting failure only costs the caller a poll — the recoverable
+    // direction (see this function's own doc for why the cast can't actually fail on a
+    // supported OS).
+    if bound_transaction_timeout(&automation).is_err() {
+        let _ = ready.send(false);
+        return;
+    }
     let Ok(window) = crate::reader::find_app_window(&automation, ctx) else {
         let _ = ready.send(false);
         return;
@@ -290,6 +323,17 @@ mod tests {
                 "{p:?} converts to a UIProperty with a different id"
             );
         }
+    }
+
+    /// Inverted, a subscription against a slow-but-alive provider would fail at the (3s)
+    /// subscribe handshake instead of at the (2s) call it's waiting on — the wrong point to fail
+    /// at, since the handshake would then time out with no way to tell "never registered" apart
+    /// from "registering, just slowly". Compares the two constants directly, so — unlike every
+    /// other test here, which at least constructs a `UiaChanges` or `Notify` — it touches no type
+    /// this crate defines at all, though it still only compiles under this file's `cfg(windows)`.
+    #[test]
+    fn transaction_timeout_is_below_the_subscribe_timeout() {
+        assert!(Duration::from_millis(u64::from(TRANSACTION_TIMEOUT_MS)) < SUBSCRIBE_TIMEOUT);
     }
 
     /// The pump's skip decision (`delivered.swap` in its loop) needs a live registration on a

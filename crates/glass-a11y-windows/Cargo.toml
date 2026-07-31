@@ -13,6 +13,13 @@ glass-core.workspace = true
 # `event` for the change subscription in `events.rs`; `uiautomation` gates its event handler
 # types behind it. No new crate, and it resolves against the existing lockfile.
 uiautomation = { version = "0.25", features = ["process", "event"] }
+# `IUIAutomation2::SetTransactionTimeout`, to bound every cross-process call the subscription
+# makes (registration, the liveness probe, teardown) — `uiautomation` doesn't expose it, but
+# `UIAutomation: AsRef<IUIAutomation>` reaches the raw interface to cast up from. Already a
+# workspace dependency at this version (glass-windows, glass-clip-hook), and `uiautomation` itself
+# already requests `Win32_UI_Accessibility` transitively, so this is a dependency line, not a
+# feature or version change to the resolved graph.
+windows = { version = "0.62", features = ["Win32_UI_Accessibility"] }
 
 [lints]
 workspace = true

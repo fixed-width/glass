@@ -1059,6 +1059,7 @@ version = "0.0.0"
 dependencies = [
  "glass-core",
  "uiautomation",
+ "windows",
 ]
 
 [[package]]
