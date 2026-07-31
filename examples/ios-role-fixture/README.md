@@ -24,6 +24,8 @@ accessibility tree exposes, which may be narrower than what UIKit publishes to V
 | SwiftUI `List` | `AXGroup`; rows `AXStaticText`, section header `AXHeading` |
 | SwiftUI `Picker`, `.inline` | `AXHeading` plus one `AXButton` per option |
 | SwiftUI `Picker`, `.menu` | `AXPopUpButton` — a token glass does not map yet |
+| `UIButton` with an `accessibilityHint` | <what the `help` key held, or `help` null> |
+| `UITextField` with an identifier and a label | `AXTextField`; the label sits in `AXLabel` beside the id |
 
 ## Build and install
 

@@ -67,9 +67,27 @@ final class ControlsViewController: UIViewController, UITableViewDataSource, UIT
                 UIAction(title: "Menu item two") { _ in },
             ])
 
+        // idb's node schema carries a `help` key that glass reads nothing from. A hint is what
+        // UIKit would put behind it, so this control is what decides whether that key is a real
+        // description source or always null.
+        let hintedButton = UIButton(type: .system)
+        hintedButton.setTitle("hinted", for: .normal)
+        hintedButton.accessibilityIdentifier = "the-hinted-button"
+        hintedButton.accessibilityHint = "Saves and closes the sheet"
+
+        // An editable element with BOTH an identifier and a label: the identifier becomes the
+        // node name and `AXValue` becomes the value, so the label is the one string this reader
+        // drops outright today.
+        let describedField = UITextField()
+        describedField.borderStyle = .roundedRect
+        describedField.text = "typed text"
+        describedField.accessibilityIdentifier = "the-described-field"
+        describedField.accessibilityLabel = "Search query"
+
         let stack = UIStackView(arrangedSubviews: [
             toggle,
-            segmented, stepper, progress, picker, sheetButton, alertButton, menuButton, table,
+            segmented, stepper, progress, picker, sheetButton, alertButton, menuButton,
+            hintedButton, describedField, table,
         ])
         stack.axis = .vertical
         stack.spacing = 8
