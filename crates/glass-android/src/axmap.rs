@@ -155,17 +155,7 @@ fn map_node(
     let editable = role == AxRole::TextField || boolean("password");
     let content_desc = non_empty(attr("content-desc"));
     let text = non_empty(attr("text"));
-    let name = content_desc.or_else(|| if editable { None } else { text.clone() });
-    // An editable node's `text` is its value, so it is already surfaced. A non-editable node's
-    // `text` is either the name (no content-desc) or dropped outright, and the dropped case is
-    // what this recovers.
-    let description = if editable {
-        None
-    } else {
-        text.as_deref()
-            .and_then(|t| normalize_description(t, name.as_deref()))
-    };
-    let value = if editable { text } else { None };
+    let (name, value, description) = labels(text.as_deref(), content_desc.as_deref(), editable);
     let states = AxStates {
         focused: boolean("focused"),
         focusable: boolean("focusable"),
@@ -237,7 +227,6 @@ fn map_node(
 ///
 /// `editable` is the caller's to decide: the on-device service reads an authoritative flag, while
 /// a `uiautomator` dump carries no such attribute and infers it from the widget class.
-#[allow(dead_code)] // temporary: used only by tests until the next change wires up a caller
 pub(crate) fn labels(
     text: Option<&str>,
     desc: Option<&str>,
@@ -544,13 +533,13 @@ mod tests {
     );
 
     #[test]
-    fn the_text_a_content_desc_displaced_becomes_the_description() {
+    fn the_content_desc_a_visible_text_displaced_becomes_the_description() {
         let tree = build_tree(BOTH_LABELS_XML, &win(), WalkLimits::DEFAULT).unwrap();
         let button = &tree.root.children[0];
-        // `content-desc` wins the name here (that precedence is glass#260's subject and is NOT
-        // changed by this test), so `text` is the label that would otherwise be dropped.
-        assert_eq!(button.name.as_deref(), Some("Save changes"));
-        assert_eq!(button.description.as_deref(), Some("Save"));
+        // Visible text wins the name (glass#260); `content-desc` is the label that would
+        // otherwise be dropped.
+        assert_eq!(button.name.as_deref(), Some("Save"));
+        assert_eq!(button.description.as_deref(), Some("Save changes"));
     }
 
     #[test]
