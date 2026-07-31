@@ -20,8 +20,10 @@ guarantee. Re-run it rather than trusting it; the read step below prints the API
 | `PopupMenu` (button) | `android.widget.ListView`, entries `LinearLayout`/`RelativeLayout` |
 | `AlertDialog` (button) | `FrameLayout`/`LinearLayout` panels under `android:id/parentPanel` |
 | `Button` with `text` + a different `contentDescription` | `android.widget.Button`; both readers name it by its `text` and carry the `contentDescription` as `desc="…"` |
+| `EditText` with a hint, no `contentDescription`, no resource id | `android.widget.EditText`; unnamed, and through the on-device companion the hint is the description — read as `#35 TextField desc="Search settings"`, which `glass_a11y_marks` labels from that description. `uiautomator` sees no hint, so there it is unnamed and undescribed |
 
-The last two need a tap. Each opens as the topmost window, so dump it separately.
+`PopupMenu` and `AlertDialog` each need a tap. Each opens as the topmost window, so dump it
+separately.
 
 A subclass inherits the accessibility class name of the framework class it extends unless it
 overrides `getAccessibilityClassName()` — which is why the toolbar arrives as `ViewGroup`, and why

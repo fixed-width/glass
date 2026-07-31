@@ -202,6 +202,7 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
         role: field.role,
         name: field.name.clone(),
         bounds: field.bounds,
+        value: field.value.clone(),
     };
     a11y.set_value(&ctx, &target, "world")
         .expect("set_value: clear then type");

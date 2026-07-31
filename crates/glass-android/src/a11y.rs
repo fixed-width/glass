@@ -225,17 +225,20 @@ impl Default for AndroidA11y {
 
 /// Re-resolve `target` in an already-numbered `tree` and return the node only if it is still the
 /// element that was addressed and still editable. Errors specifically when the target is gone
-/// (`AxElementNotFound`), has drifted in role/name/bounds (`AxElementChanged`), or is not editable
-/// (`AxElementNotEditable`).
+/// (`AxElementNotFound`), has drifted in role/name/bounds/value (`AxElementChanged`), or is not
+/// editable (`AxElementNotEditable`).
 ///
 /// Both Android readers' `set_value` guards route through this — the check that stops a write
 /// landing on whatever inherited the id between the snapshot the caller read and the one the write
-/// acts on. Pure (no device I/O), so it is testable without a device.
+/// acts on. A recycled `RecyclerView` row is the motivating case for comparing `value` too — see
+/// `AxTarget::value`'s doc. Pure (no device I/O), so it is testable without a device.
 pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
         .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-    if !target.matches(node.role, node.name.as_deref()) || !target.bounds_consistent(node.bounds, 8)
+    if !target.matches(node.role, node.name.as_deref())
+        || !target.bounds_consistent(node.bounds, 8)
+        || !target.value_consistent(node.value.as_deref())
     {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
@@ -331,7 +334,9 @@ impl Accessibility for AndroidA11y {
 
 #[cfg(test)]
 mod tests {
-    use super::{dump_once, dump_until_ready, locate_editable_target, verify_write};
+    use super::{
+        dump_once, dump_until_ready, editable_target, locate_editable_target, verify_write,
+    };
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, Result, WindowGeometry};
     use std::time::Duration;
@@ -519,12 +524,22 @@ mod tests {
         t
     }
 
+    /// Like `tree`, but also holding `value` — see `editable_target`'s doc for why that's part of
+    /// the fingerprint too. Always at `BOUNDS`, always editable.
+    fn tree_with_value(role: AxRole, name: Option<&str>, value: Option<&str>) -> AxTree {
+        let mut t = tree(role, name, Some(BOUNDS), true);
+        t.root.value = value.map(Into::into);
+        t.assign_ids();
+        t
+    }
+
     fn target(id: u32, name: Option<&str>, bounds: Option<AxRect>) -> AxTarget {
         AxTarget {
             id: AxNodeId(id),
             role: AxRole::TextField,
             name: name.map(Into::into),
             bounds,
+            value: None,
         }
     }
 
@@ -682,6 +697,71 @@ mod tests {
             locate_editable_target(&t, &target(0, Some("Search"), Some(moved)), &WIN),
             Err(GlassError::AxElementChanged(0))
         ));
+    }
+
+    #[test]
+    fn a_target_whose_value_moved_is_rejected() {
+        // The recycled-row case `editable_target`'s doc names: role, name and rect match here too.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Zara"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(matches!(
+            editable_target(&tree, &target),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_with_no_captured_value_still_passes() {
+        // The `None`-must-not-gate case from the comment on `editable_target`'s value check.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Alice"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: None,
+        };
+        assert!(editable_target(&tree, &target).is_ok());
+    }
+
+    #[test]
+    fn a_target_whose_value_vanished_is_rejected() {
+        // Android reports an emptied field as no value at all, so this is the shape a row that
+        // recycled from filled to empty arrives in — a real change, not a missing observation.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), None);
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(matches!(
+            editable_target(&tree, &target),
+            Err(GlassError::AxElementChanged(0))
+        ));
+    }
+
+    #[test]
+    fn a_target_whose_value_still_matches_passes() {
+        // Every other target helper here captures `None`, so "reject whenever a value was
+        // captured" would pass all of them too — this is the one case that actually needs the
+        // comparison, not just the presence check.
+        let tree = tree_with_value(AxRole::TextField, Some("row_title"), Some("Alice"));
+        let target = AxTarget {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            name: Some("row_title".into()),
+            bounds: tree.root.bounds,
+            value: Some("Alice".into()),
+        };
+        assert!(editable_target(&tree, &target).is_ok());
     }
 
     #[test]

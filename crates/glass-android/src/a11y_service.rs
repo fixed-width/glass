@@ -13,7 +13,7 @@ use glass_core::accessibility::{
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
-use crate::axmap::{class_to_role, labels};
+use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::Conn;
 
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
@@ -39,7 +39,17 @@ fn json_to_node(
     // `None` here; `labels` judges a blank one absent either way.
     let text = v.get("text").and_then(Value::as_str);
     let desc = v.get("desc").and_then(Value::as_str);
-    let (name, value, description) = labels(text, desc, flag("editable"));
+    // Both keys are absent (not null) on an older companion; `get` returns `None` either way, so
+    // no version check is needed to stay compatible with it.
+    let resource_id = v.get("resource_id").and_then(Value::as_str);
+    let hint = v.get("hint").and_then(Value::as_str);
+    let (name, value, description) = labels(LabelInputs {
+        text,
+        desc,
+        resource_id,
+        hint,
+        editable: flag("editable"),
+    });
     let b = v
         .get("bounds")
         .ok_or_else(|| GlassError::AccessibilityUnavailable("node missing bounds".into()))?;
@@ -97,7 +107,7 @@ fn json_to_node(
         role: class_to_role(cls),
         raw_role: cls.to_string(),
         name,
-        // Hint and state-description stay unread — the device protocol carries neither.
+        // State-description stays unread — the device protocol doesn't carry it.
         description,
         value,
         states: AxStates {
@@ -677,7 +687,12 @@ mod tests {
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
     }
 
-    fn node_json(text: Option<&str>, desc: Option<&str>) -> Value {
+    fn node_json(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+    ) -> Value {
         let mut v = json!({
             "class": "android.widget.Button",
             "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
@@ -689,19 +704,43 @@ mod tests {
         if let Some(d) = desc {
             v["desc"] = json!(d);
         }
+        if let Some(r) = resource_id {
+            v["resource_id"] = json!(r);
+        }
+        if let Some(h) = hint {
+            v["hint"] = json!(h);
+        }
         v
     }
 
     fn mapped(text: Option<&str>, desc: Option<&str>) -> AxNode {
         let mut budget = WalkBudget::new();
-        json_to_node(&node_json(text, desc), &win(), 0, &mut budget).expect("maps")
+        json_to_node(&node_json(text, desc, None, None), &win(), 0, &mut budget).expect("maps")
     }
 
-    /// [`mapped`], for an editable field rather than a button.
+    /// [`mapped`], for an editable field; omits `resource_id`/`hint`, the shape an older
+    /// companion sends.
     fn mapped_editable(text: Option<&str>, desc: Option<&str>) -> AxNode {
-        let mut v = node_json(text, desc);
+        let mut v = node_json(text, desc, None, None);
         v["class"] = json!("android.widget.EditText");
         v["editable"] = json!(true);
+        let mut budget = WalkBudget::new();
+        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+    }
+
+    /// [`mapped_editable`], additionally setting `resource_id` and `hint`.
+    fn mapped_full(
+        text: Option<&str>,
+        desc: Option<&str>,
+        resource_id: Option<&str>,
+        hint: Option<&str>,
+        editable: bool,
+    ) -> AxNode {
+        let mut v = node_json(text, desc, resource_id, hint);
+        if editable {
+            v["class"] = json!("android.widget.EditText");
+            v["editable"] = json!(true);
+        }
         let mut budget = WalkBudget::new();
         json_to_node(&v, &win(), 0, &mut budget).expect("maps")
     }
@@ -749,11 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn an_editable_node_with_no_desc_is_unnamed_not_named_by_its_contents() {
-        // The device omits the key entirely for a field with no content description. Falling
-        // back to `text` would name the field by what has been typed into it, moving the name —
-        // and the fingerprint `set_value` re-walks against — on every keystroke; unnamed is the
-        // honest reading.
+    fn an_editable_node_with_no_desc_and_no_id_is_unnamed_not_named_by_its_contents() {
+        // The device omits the key entirely for a field with no content description, and
+        // `mapped_editable` omits `resource_id` too, so nothing is left to fall back to. Naming it
+        // by `text` would move the name — and the fingerprint `set_value` re-walks against — on
+        // every keystroke, so unnamed is the honest reading.
         let node = mapped_editable(Some("joe@x.com"), None);
         assert_eq!(node.name, None);
         assert_eq!(node.value.as_deref(), Some("joe@x.com"));
@@ -766,5 +805,48 @@ mod tests {
         let node = mapped(Some("Settings"), None);
         assert_eq!(node.name.as_deref(), Some("Settings"));
         assert_eq!(node.value, None);
+    }
+
+    #[test]
+    fn an_editable_node_with_no_desc_is_named_by_its_view_id() {
+        let node = mapped_full(
+            Some("joe@x.com"),
+            None,
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("email_field"));
+        assert_eq!(node.value.as_deref(), Some("joe@x.com"));
+    }
+
+    #[test]
+    fn an_editable_nodes_hint_becomes_its_description() {
+        let node = mapped_full(
+            None,
+            None,
+            Some("com.x:id/q"),
+            Some("Search settings"),
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("q"));
+        assert_eq!(node.description.as_deref(), Some("Search settings"));
+    }
+
+    #[test]
+    fn an_editable_nodes_name_is_the_desc_not_the_raw_resource_id() {
+        // The only fixture here with both `desc` and `resource_id` present, so it is what
+        // pins the precedence between them. (`LabelInputs`'s named fields, not this test, are
+        // what stop the call site transposing the two.) The older-companion path (neither key
+        // sent) needs no dedicated test — every fixture above that omits them already
+        // exercises it.
+        let node = mapped_full(
+            Some("joe@x.com"),
+            Some("Email"),
+            Some("com.x:id/email_field"),
+            None,
+            true,
+        );
+        assert_eq!(node.name.as_deref(), Some("Email"));
     }
 }

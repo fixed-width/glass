@@ -468,24 +468,44 @@ developer-assigned id. It appears only where glass's reader sources that label: 
 reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, the AX
 (macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name, the
 Android readers read whichever of the element's text and content-description did not become the
-name or the value, and the `idb` (iOS) reader reads the element's hint, falling back to the label
-an editable element's identifier displaced. It is omitted when the description duplicates the name.
+name or the value, the on-device companion additionally supplies an editable element's hint where
+that leaves it undescribed, and the `idb` (iOS) reader reads the element's hint, falling back to
+the label an editable element's identifier displaced. It is omitted when the description duplicates
+the name.
 **`desc` is display-only: `glass_wait_for_element` and `glass_scroll_to_element` select on `name`,
 never on the description.**
 
-On **Android** a description needs one node to carry both of its labels, and most controls carry
-only one — across four stock apps, only one node in roughly three hundred had both — so expect
-`desc` to be absent on most Android nodes, not routinely present. The other readers take it from a
-separate descriptor field, so there a node with a single label can still carry one.
+On **Android** a description drawn from the element's own two labels needs one node to carry both,
+and most controls carry only one — across four stock apps, only one node in roughly three hundred
+had both — so on a non-editable element expect `desc` to be absent, not routinely present. An
+editable element read through the on-device companion is the exception: its hint is a source of its
+own (below), needing no second label. The other readers take the description from a separate
+descriptor field, so there a node with a single label can still carry one.
 
 Both Android readers name a control the same way: the visible text is the `name`, or the
 content-description where there is no text — except on an editable element, where the text is
-already the `value` and the content-description is the `name` instead.
+already the `value` and the content-description is the `name` instead. A filled field's name does
+not change as its text changes, on either reader.
 
 One consequence of that rule: two controls that differ only in their content-description — "Save
 draft" and "Save and close", both reading `Save` on screen — now share a `name`, and a `name:`
 selector picks the first of them in tree order without reporting that a second matched. Where two
 controls read alike, address the one you want by its `id` from a snapshot.
+
+An editable element with no content description falls back to the leaf of its view resource id
+rather than staying unnamed — `open_search_view_edit_text`, not the package-qualified
+`com.android.settings:id/open_search_view_edit_text`. Settings' search box, for example, reads that
+name identically from both readers. Treat the id as a label of last resort: a resource id is not
+unique within a tree — ten rows built from one layout can all carry the same one — so it tells
+this element apart from unrelated ones, not from its own kind.
+
+The on-device companion adds a second source of `desc` for an editable element: its hint
+(Android's placeholder text) becomes the description. That source is companion-only — a
+`uiautomator` dump carries no hint attribute at all, so `uiautomator` never supplies one — so a
+text field's `desc` is richer through the companion than through `uiautomator`. A field with a
+hint but no content description and no resource id has nothing left to name it, so it stays
+unnamed but described, rendering as `#35 TextField desc="Search settings"`, which
+`glass_a11y_marks` labels from that description (see below).
 
 An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still

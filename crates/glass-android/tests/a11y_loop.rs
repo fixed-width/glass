@@ -130,6 +130,7 @@ fn set_value_reports_whether_the_write_landed() {
         role: field.role,
         name: field.name.clone(),
         bounds: field.bounds,
+        value: field.value.clone(),
     };
 
     // A write that lands: reported Ok, and the node at that id holds it afterwards.
@@ -161,6 +162,7 @@ fn set_value_reports_whether_the_write_landed() {
         role: field.role,
         name: field.name.clone(),
         bounds: field.bounds,
+        value: field.value.clone(),
     };
     match a11y.set_value(&ctx, &target, "") {
         Err(GlassError::AxValueNotApplied(_)) => {}
@@ -185,6 +187,7 @@ fn set_value_reports_whether_the_write_landed() {
         role: target.role,
         name: Some("not the field that is there".into()),
         bounds: target.bounds,
+        value: target.value.clone(),
     };
     match a11y.set_value(&ctx, &stale, "ignored") {
         Err(GlassError::AxElementChanged(_)) | Err(GlassError::AxElementNotFound(_)) => {}

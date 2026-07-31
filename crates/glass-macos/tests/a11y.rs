@@ -296,6 +296,7 @@ mod macos_main {
             role: note.role,
             name: note.name.clone(),
             bounds: note.bounds,
+            value: note.value.clone(),
         };
         try_expect(
             a11y.set_value(&ctx, &note_tgt, "world"),
@@ -326,6 +327,7 @@ mod macos_main {
             role: save.role,
             name: save.name.clone(),
             bounds: save.bounds,
+            value: save.value.clone(),
         };
         match a11y.set_value(&ctx, &save_tgt, "x") {
             Err(GlassError::AxElementNotEditable(_)) => {}
@@ -362,6 +364,7 @@ mod macos_main {
             role: status.role,
             name: status.name.clone(),
             bounds: status.bounds,
+            value: status.value.clone(),
         };
         match a11y.invoke(&ctx, &status_tgt) {
             Err(GlassError::AxActionUnavailable(_)) => {}

@@ -305,6 +305,7 @@ impl Glass {
                 role: node.role,
                 name: node.name.clone(),
                 bounds: node.bounds,
+                value: node.value.clone(),
             };
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
@@ -370,6 +371,7 @@ impl Glass {
                 role: node.role,
                 name: node.name.clone(),
                 bounds: node.bounds,
+                value: node.value.clone(),
             };
             let ctx = AxContext {
                 pids: s.platform.app_pids(),
@@ -384,6 +386,9 @@ impl Glass {
         // interface only moves the popup's *preview* selection, and the model commits
         // only on row activation (Enter/click). So drive it like a person does —
         // open it, keyboard-navigate to the option, and press Enter.
+        //
+        // No cache patch on this path: every `Ok` it returns either actuated nothing or followed
+        // an `a11y_resnapshot`, which replaces `last_ax` wholesale — a fresher fact than a patch.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
         }
@@ -419,6 +424,8 @@ impl Glass {
             if st.checked == want {
                 return Ok(()); // truthful no-op, no actuation
             }
+            // No cache patch here either, for the combo path's reason: the verify poll below
+            // re-snapshots, so `last_ax` holds the tree that observed the toggle.
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
             // Not event-gated, and cannot be: this branch runs only on a backend that frames a
             // switch as its whole row, which today is iOS alone — a reader with no event stream to
@@ -440,10 +447,30 @@ impl Glass {
             };
         }
         let s = self.active_mut()?;
-        s.accessibility
+        let result = s
+            .accessibility
             .as_mut()
             .ok_or(GlassError::AxUnsupported)?
-            .set_value(&ctx, &target, text)?;
+            .set_value(&ctx, &target, text);
+        if let Err(e) = result {
+            // A failure after dispatch doesn't mean the field is unchanged — Android types before
+            // it verifies, so a partial type or the AVD's documented placeholder-on-clear can
+            // still have altered it. Invalidate (not gate) so a retry with no intervening snapshot
+            // isn't rejected as drift; every other failure keeps its value, for the asymmetry
+            // `set_value_failed_after_writing` documents.
+            if e.set_value_failed_after_writing()
+                && let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id))
+            {
+                node.value = None;
+            }
+            return Err(e);
+        }
+        // `Ok`'s guarantee varies by backend — see `AxTarget::value`'s doc — but patching to the
+        // requested text still beats leaving the pre-write value, which is definitely stale, not
+        // just possibly imprecise. Patch by id; a re-snapshot would cost a whole walk for one field.
+        if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
+            node.value = (!text.is_empty()).then(|| text.to_string());
+        }
         s.pump();
         Ok(())
     }
@@ -2693,9 +2720,261 @@ mod tests {
                     width: 20,
                     height: 20
                 }),
+                value: None,
             }
         );
         assert_eq!(calls[0].1, "hello");
+    }
+
+    /// A one-node tree whose root is an editable field holding `value` — the shape the cache
+    /// tests need, since `set_value` targets the node the snapshot cached.
+    fn editable_field_tree(value: Option<&str>) -> AxTree {
+        AxTree::new(AxNode {
+            id: AxNodeId(0),
+            role: AxRole::TextField,
+            raw_role: "text field".into(),
+            name: Some("Name".into()),
+            description: None,
+            value: value.map(Into::into),
+            states: AxStates {
+                editable: true,
+                ..Default::default()
+            },
+            bounds: Some(rect(0, 0, 50, 20)),
+            children: vec![],
+        })
+    }
+
+    /// A started, snapshotted session over `accessibility` — ready for the `set_value` call the
+    /// test is actually about.
+    fn glass_ready_for_set_value(accessibility: Box<dyn Accessibility + Send>) -> Glass {
+        let mut g = glass_with_backend(FakePlatform::new(100, 100), accessibility);
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        g
+    }
+
+    /// [`FakeAccessibility`] over `tree`, logging its writes to `set_log`.
+    fn logging_a11y(
+        tree: AxTree,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    ) -> FakeAccessibility {
+        FakeAccessibility {
+            tree,
+            set_log,
+            set_fail: false,
+            ctx_log: Arc::new(Mutex::new(None)),
+            invoke_behavior: InvokeBehavior::Unsupported,
+            invoke_log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[test]
+    fn set_value_patches_last_ax_so_a_retry_carries_the_written_value() {
+        // Same mock harness as `set_value_passes_target_and_text_to_backend`: asserting on
+        // `set_log` proves the cache patch directly. The real drift guard lives in
+        // `editable_target` (glass-android), not here, so this doesn't reimplement it.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(logging_a11y(
+            editable_field_tree(Some("orig")),
+            log.clone(),
+        )));
+
+        g.set_value(AxNodeId(0), "a").unwrap();
+        g.set_value(AxNodeId(0), "b").unwrap(); // no intervening snapshot
+
+        let calls = log.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].0.value,
+            Some("a".into()),
+            "the second call's target must carry what the first call wrote, not the pre-write \
+             snapshot value"
+        );
+    }
+
+    #[test]
+    fn set_value_patches_a_cleared_field_to_no_value_at_all() {
+        // Android reports an emptied field as no value rather than `Some("")`, so caching the
+        // empty string after a successful clear would make `set_value(id, "")` then
+        // `set_value(id, "text")` — ordinary agent sequencing — look like drift on the second.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(logging_a11y(
+            editable_field_tree(Some("orig")),
+            log.clone(),
+        )));
+
+        g.set_value(AxNodeId(0), "").unwrap();
+        g.set_value(AxNodeId(0), "text").unwrap(); // no intervening snapshot
+
+        assert_eq!(
+            log.lock().unwrap()[1].0.value,
+            None,
+            "a cleared field caches as no value, the shape the reader would report"
+        );
+    }
+
+    /// An `Accessibility` whose `set_value` fails the first call and succeeds every one after,
+    /// logging successful calls like `FakeAccessibility`. `FakeAccessibility::set_fail` is a
+    /// fixed knob, not a script, and this needs to vary across one session's two calls — kept
+    /// local since only one test needs it.
+    struct FlakyOnceAccessibility {
+        tree: AxTree,
+        failed_once: bool,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    }
+
+    impl Accessibility for FlakyOnceAccessibility {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            Ok(self.tree.clone())
+        }
+        fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            if !self.failed_once {
+                self.failed_once = true;
+                return Err(GlassError::AxValueNotApplied(target.id.0));
+            }
+            self.set_log
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn set_value_invalidates_the_cached_value_after_a_write_that_may_have_landed() {
+        // `AxValueNotApplied` is raised after the keystrokes went out — the AVD false-failure
+        // `typed_clear_landed` documents (an emptied field reporting its placeholder) is one — so
+        // the cached value is no longer a fact and must not gate the retry.
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(FlakyOnceAccessibility {
+            tree: editable_field_tree(Some("orig")),
+            failed_once: false,
+            set_log: set_log.clone(),
+        }));
+
+        assert!(
+            g.set_value(AxNodeId(0), "a").is_err(),
+            "first write is scripted to fail"
+        );
+        g.set_value(AxNodeId(0), "a").unwrap(); // retry, no intervening snapshot
+
+        assert_eq!(
+            set_log.lock().unwrap()[0].0.value,
+            None,
+            "the retry's target must not carry the stale pre-failure value"
+        );
+    }
+
+    /// An `Accessibility` that guards its write on the target's value the way Android's
+    /// `editable_target` does — over the same [`AxTarget::value_consistent`], so this scripts the
+    /// guard rather than reimplementing it. `held` is what the live element reads.
+    struct GuardedAccessibility {
+        tree: AxTree,
+        held: Option<String>,
+        set_log: Arc<Mutex<Vec<(AxTarget, String)>>>,
+    }
+
+    impl Accessibility for GuardedAccessibility {
+        fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+            Ok(self.tree.clone())
+        }
+        fn set_value(&mut self, _ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            if !target.value_consistent(self.held.as_deref()) {
+                return Err(GlassError::AxElementChanged(target.id.0));
+            }
+            self.held = Some(text.to_string());
+            self.set_log
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_rejected_before_dispatch_keeps_the_fingerprint_that_rejected_it() {
+        // The recycled-row case: the snapshot read "Alice", the row now holds "Zara", and the
+        // guard rejects. An agent retries without re-snapshotting — blanking the cached value on
+        // that rejection would send the retry in with no value to compare, skipping the guard and
+        // writing to the wrong row.
+        let set_log = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_ready_for_set_value(Box::new(GuardedAccessibility {
+            tree: editable_field_tree(Some("Alice")),
+            held: Some("Zara".into()),
+            set_log: set_log.clone(),
+        }));
+
+        for attempt in ["first", "retry"] {
+            assert!(
+                matches!(
+                    g.set_value(AxNodeId(0), "x"),
+                    Err(GlassError::AxElementChanged(0))
+                ),
+                "the {attempt} must be rejected as drift"
+            );
+        }
+        assert!(
+            set_log.lock().unwrap().is_empty(),
+            "no write may land on the drifted row"
+        );
+    }
+
+    /// [`GuardedAccessibility`] whose first call fails before dispatching anything — the shape of
+    /// Android's `set_value`, which re-snapshots and reaches for adb before it taps.
+    struct PreDispatchFailureThenGuarded {
+        first_failure: Option<GlassError>,
+        guarded: GuardedAccessibility,
+    }
+
+    impl Accessibility for PreDispatchFailureThenGuarded {
+        fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+            self.guarded.snapshot(ctx)
+        }
+        fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
+            match self.first_failure.take() {
+                Some(e) => Err(e),
+                None => self.guarded.set_value(ctx, target, text),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pre_dispatch_transport_failure_keeps_the_value_that_guards_the_retry() {
+        // A not-ready `uiautomator dump` or an adb hiccup fails the guard's own re-snapshot, before
+        // anything is typed — as `Backend` or `AccessibilityUnavailable`, the same variants that
+        // post-dispatch failures use, so neither can be classified by variant. The captured value
+        // is still a fact here; blanking it would let the retry write to the recycled row.
+        for failure in [
+            GlassError::Backend("uiautomator dump not ready".into()),
+            GlassError::AccessibilityUnavailable("adb: device offline".into()),
+        ] {
+            let set_log = Arc::new(Mutex::new(Vec::new()));
+            let mut g = glass_ready_for_set_value(Box::new(PreDispatchFailureThenGuarded {
+                first_failure: Some(failure),
+                guarded: GuardedAccessibility {
+                    tree: editable_field_tree(Some("Alice")),
+                    held: Some("Zara".into()), // the row recycled under the snapshot
+                    set_log: set_log.clone(),
+                },
+            }));
+
+            assert!(
+                g.set_value(AxNodeId(0), "x").is_err(),
+                "first write is scripted to fail before dispatch"
+            );
+            assert!(
+                matches!(
+                    g.set_value(AxNodeId(0), "x"),
+                    Err(GlassError::AxElementChanged(0))
+                ),
+                "the retry must still be guarded by the captured value"
+            );
+            assert!(
+                set_log.lock().unwrap().is_empty(),
+                "no write may land on the drifted row"
+            );
+        }
     }
 
     #[test]
