@@ -23,6 +23,7 @@ use crate::clipboard_route::ClipboardRoute;
 use crate::coords;
 use crate::permissions;
 use crate::process::{self, ClipLaunch, LogSink};
+use crate::settle::{SettleStep, SettleTracker};
 
 /// Poll interval between discovery attempts in [`MacosPlatform::discover_window`] —
 /// matches `scwindow::find_window_for_pids`'s own poll cadence
@@ -38,6 +39,18 @@ const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// existed as of the last successful call, so this only needs to cover the ordinary
 /// query-round-trip latency, not a real "is the app even launching" wait.
 const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// How often to re-read an adopted window's geometry while waiting for it to stop changing, and
+/// how long to keep waiting. macOS reports a window's geometry while it is still opening, so the
+/// reading adoption captured is routinely a frame of the open animation (#263). A window that was
+/// never animating agrees on its second reading and costs one interval; the budget only binds an
+/// app whose window keeps moving.
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SETTLE_BUDGET: Duration = Duration::from_millis(500);
+/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`]: a settle poll that
+/// cannot find the window should give the loop its turn back, not spend the whole budget inside one
+/// lookup.
+const SETTLE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
 /// whether a `Move`/`Resize`'s read-back position/size actually matches what was requested
@@ -197,7 +210,9 @@ impl MacosPlatform {
     /// though `start_app` only reads `geometry` from it today — `send_pointer` does its own
     /// independent, fresh `scwindow::find_window_for_pids` resolution per call rather than
     /// reusing anything cached here (see its doc), so this return type is just the natural
-    /// shape of a `query_once_with_candidates` result, not evidence of caching elsewhere.
+    /// shape of a `query_once_with_candidates` result, not evidence of caching elsewhere. The
+    /// match's `geometry` is the settled one — [`Self::settle_window`] re-reads past the
+    /// adoption instant before this returns (#263).
     fn discover_window(
         child: &mut Child,
         pid: u32,
@@ -211,7 +226,7 @@ impl MacosPlatform {
             {
                 // Stderr-only diagnostic, no behaviour change — see adoption_log's module doc (#263).
                 eprintln!("{}", adoption_line(pid as i32, &candidates));
-                return Ok(m);
+                return Ok(Self::settle_window(pid as i32, m));
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Err(GlassError::AppExited(status.code())),
@@ -235,7 +250,8 @@ impl MacosPlatform {
     /// `ffi::launch_bundle`), so unlike [`discover_window`] there is no local `Child` handle
     /// (`std::process::Child`) to `try_wait` if the adopted app dies before its window
     /// appears; this loop only re-queries `scwindow::query_once_with_candidates` until
-    /// `timeout_ms` elapses.
+    /// `timeout_ms` elapses. Like [`discover_window`], the returned match's `geometry` is the
+    /// settled one, not the adoption-instant reading.
     fn discover_window_pid(pid: i32, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
@@ -243,13 +259,74 @@ impl MacosPlatform {
             if let Some((m, candidates)) = crate::scwindow::query_once_with_candidates(&[pid])? {
                 // Same adoption record as `discover_window` — see there (#263).
                 eprintln!("{}", adoption_line(pid, &candidates));
-                return Ok(m);
+                return Ok(Self::settle_window(pid, m));
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::Timeout(timeout_ms));
             }
             std::thread::sleep(DISCOVERY_POLL_INTERVAL);
         }
+    }
+
+    /// Re-read `adopted`'s geometry until two consecutive readings agree, and return the match
+    /// carrying that settled geometry.
+    ///
+    /// Adoption reads the window's geometry the moment it finds it, which on macOS is routinely
+    /// mid-open-animation — 10 of 12 cold launches measured on 2026-08-01 returned a geometry a few
+    /// pixels off the settled one, and the window `start_app` reports is what
+    /// `Glass::start_on_inner` hands the caller and caches as the session's geometry.
+    ///
+    /// Never fails the launch. A window that never stops changing (a clock, a video player, an
+    /// animating splash) would otherwise become unlaunchable, so an expired budget returns the
+    /// freshest reading and says so on stderr; likewise a resolve that fails mid-settle, where the
+    /// window was already confirmed present at adoption. Neither path is silent.
+    ///
+    /// Only *when* the geometry is read changes here. Which window was adopted is already decided
+    /// by the time this runs.
+    fn settle_window(
+        pid: i32,
+        adopted: crate::scwindow::WindowMatch,
+    ) -> crate::scwindow::WindowMatch {
+        let mut tracker = SettleTracker::new();
+        // The adoption reading is the sequence's first element: it is what a settled window has to
+        // agree with for the loop to exit after a single poll.
+        let _ = tracker.observe(adopted.geometry.clone());
+        let mut freshest = adopted;
+        let deadline = Instant::now() + SETTLE_BUDGET;
+        while Instant::now() < deadline {
+            std::thread::sleep(SETTLE_POLL_INTERVAL);
+            let next = match crate::scwindow::find_window_by_id(
+                freshest.window_id,
+                &[pid],
+                SETTLE_RESOLVE_TIMEOUT,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "glass-macos: window {} stopped resolving while settling ({e}); \
+                         reporting the last geometry read",
+                        freshest.window_id
+                    );
+                    return freshest;
+                }
+            };
+            let geometry = next.geometry.clone();
+            freshest = next;
+            if let SettleStep::Settled(_) = tracker.observe(geometry) {
+                return freshest;
+            }
+        }
+        eprintln!(
+            "glass-macos: window {} did not settle within {}ms; reporting {}x{} @({},{}), \
+             the last geometry read",
+            freshest.window_id,
+            SETTLE_BUDGET.as_millis(),
+            freshest.geometry.width,
+            freshest.geometry.height,
+            freshest.geometry.x,
+            freshest.geometry.y
+        );
+        freshest
     }
 
     /// Resolve the window `capture_frame`/`send_pointer`/`send_key` should target *this*
