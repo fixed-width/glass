@@ -66,7 +66,7 @@ impl Accessibility for LinuxA11y {
         }
     }
 
-    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let ctx = ctx.clone();
         let target = target.clone();
         let (tx, rx) = mpsc::channel();
@@ -74,7 +74,8 @@ impl Accessibility for LinuxA11y {
             let _ = tx.send(run_invoke(&ctx, &target));
         });
         match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(r) => r,
+            // This reader actuates the element it resolved, so it never substitutes another.
+            Ok(r) => r.map(|()| None),
             // The worker thread outlives this timeout, so the action may already have been
             // dispatched — say so. This error is NOT fallback-eligible (see
             // `GlassError::invoke_fallback_eligible`), so no pointer click is layered on top.

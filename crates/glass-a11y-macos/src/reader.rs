@@ -153,7 +153,7 @@ impl Accessibility for MacosA11y {
         }
     }
 
-    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let (window_el, scale) = resolve_window(ctx)?;
 
         // Start at 0, same numbering rationale as `set_value`. Unlike `set_value` (whose
@@ -184,7 +184,10 @@ impl Accessibility for MacosA11y {
         // generic press with no universal post-state to read back — a checkbox's AXValue, a
         // button's nothing, a menu item's opened menu — so there is nothing to confirm against.
         // Accepted parity gap: a control that accepts AXPress without acting reports success.
-        ffi::perform_action(&el, "AXPress").map_err(|e| GlassError::AxActionFailed(target.id.0, e))
+        // This reader actuates the element it resolved, so it never substitutes another.
+        ffi::perform_action(&el, "AXPress")
+            .map(|()| None)
+            .map_err(|e| GlassError::AxActionFailed(target.id.0, e))
     }
 }
 

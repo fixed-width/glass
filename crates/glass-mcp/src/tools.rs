@@ -403,6 +403,9 @@ pub fn click_element(glass: &mut Glass, a: &ClickElementArgs) -> ToolResult {
     if let Some(reason) = method.native_fallback() {
         result["native_fallback"] = serde_json::json!(reason);
     }
+    if let Some(actuated) = method.actuated() {
+        result["actuated_id"] = serde_json::json!(actuated.0);
+    }
     if let Some(o) = observed {
         result["observed"] = o;
     }
@@ -688,6 +691,8 @@ pub(crate) mod testutil {
         #[default]
         Unsupported,
         Ok,
+        /// The native action fired on a different element than the one named.
+        OkOnAnother(u32),
     }
 
     pub struct FakeAccessibility {
@@ -715,10 +720,11 @@ pub(crate) mod testutil {
                 .push((target.clone(), text.to_string()));
             Ok(())
         }
-        fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<()> {
+        fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
             match self.invoke_outcome {
                 InvokeOutcome::Unsupported => Err(GlassError::AxUnsupported),
-                InvokeOutcome::Ok => Ok(()),
+                InvokeOutcome::Ok => Ok(None),
+                InvokeOutcome::OkOnAnother(id) => Ok(Some(AxNodeId(id))),
             }
         }
     }
@@ -818,6 +824,21 @@ pub(crate) mod testutil {
     /// `click_element`'s native-action path (no pointer event, no fallback disclosed).
     pub fn glass_with_a11y_invoke_ok(platform: FakePlatform, tree: AxTree) -> Glass {
         glass_with_a11y_full(platform, tree, SetOutcome::Ok, InvokeOutcome::Ok)
+    }
+
+    /// [`glass_with_a11y_invoke_ok`] for a backend that actuates element `actuated` when
+    /// asked for another one.
+    pub fn glass_with_a11y_invoke_on_another(
+        platform: FakePlatform,
+        tree: AxTree,
+        actuated: u32,
+    ) -> Glass {
+        glass_with_a11y_full(
+            platform,
+            tree,
+            SetOutcome::Ok,
+            InvokeOutcome::OkOnAnother(actuated),
+        )
     }
 
     fn glass_with_a11y_full(
@@ -1586,6 +1607,67 @@ mod tests {
         assert!(
             v.get("native_fallback").is_none(),
             "no fallback key on the native-action path: {v}"
+        );
+    }
+
+    #[test]
+    fn click_element_names_the_element_it_actuated_instead() {
+        // The backend resolved the click onto a different element. Without this key the
+        // result cannot distinguish "clicked the label" from "clicked the row around it".
+        let mut g = glass_with_a11y_invoke_on_another(FakePlatform::new(100, 100), fake_tree(), 7);
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: None,
+            },
+        )
+        .unwrap();
+        let v = assert_envelope(&out, "glass_click_element");
+        assert_eq!(v["method"], json!("native-action"), "envelope: {v}");
+        assert_eq!(v["id"], json!(1), "envelope: {v}");
+        assert_eq!(v["actuated_id"], json!(7), "envelope: {v}");
+    }
+
+    #[test]
+    fn click_element_omits_actuated_id_when_the_target_itself_was_clicked() {
+        let mut g = glass_with_a11y_invoke_ok(FakePlatform::new(100, 100), fake_tree());
+        g.start(&AppSpec {
+            build: None,
+            run: vec!["x".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        })
+        .unwrap();
+        a11y_snapshot(&mut g, &A11ySnapshotArgs { max_nodes: None }).unwrap();
+        let out = click_element(
+            &mut g,
+            &ClickElementArgs {
+                id: 1,
+                return_: None,
+            },
+        )
+        .unwrap();
+        let v = assert_envelope(&out, "glass_click_element");
+        assert!(
+            v.get("actuated_id").is_none(),
+            "nothing was substituted: {v}"
         );
     }
 

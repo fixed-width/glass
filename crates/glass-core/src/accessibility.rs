@@ -773,6 +773,11 @@ pub trait Accessibility {
     /// (role+name, and bounds where its `set_value` does), then fires the
     /// action.
     ///
+    /// Returns the element the action actually fired on, when that is **not**
+    /// `target.id` — a backend whose toolkit carries a control's activation on an
+    /// ancestor of the node that carries its label actuates that ancestor, and the
+    /// caller reports the substitution. `None` means the target itself was actuated.
+    ///
     /// **Error contract.** The caller falls back to a synthetic pointer click for
     /// exactly two outcomes, both meaning *nothing was dispatched*:
     /// [`crate::GlassError::AxUnsupported`] (this backend has no invoke) and
@@ -787,7 +792,7 @@ pub trait Accessibility {
     /// coordinates too.
     ///
     /// Default: unsupported.
-    fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
         Err(crate::error::GlassError::AxUnsupported)
     }
 }
@@ -796,7 +801,9 @@ pub trait Accessibility {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickMethod {
     /// The platform's native accessibility action fired; no pointer was synthesized.
-    NativeAction,
+    /// `actuated` names the element the action fired on when it is not the one the
+    /// caller asked for, and is `None` when they are the same element.
+    NativeAction { actuated: Option<AxNodeId> },
     /// The synthetic pointer path ran; `native_fallback` says why the native
     /// action was not used (there is always a reason — invoke is attempted first).
     Pointer { native_fallback: String },
@@ -806,7 +813,7 @@ impl ClickMethod {
     /// Stable label for result payloads and the audit log.
     pub fn label(&self) -> &'static str {
         match self {
-            ClickMethod::NativeAction => "native-action",
+            ClickMethod::NativeAction { .. } => "native-action",
             ClickMethod::Pointer { .. } => "pointer",
         }
     }
@@ -814,8 +821,17 @@ impl ClickMethod {
     /// The fallback reason, when the pointer path ran.
     pub fn native_fallback(&self) -> Option<&str> {
         match self {
-            ClickMethod::NativeAction => None,
+            ClickMethod::NativeAction { .. } => None,
             ClickMethod::Pointer { native_fallback } => Some(native_fallback),
+        }
+    }
+
+    /// The element actuated in the caller's place, when the backend resolved the click
+    /// onto a different one. `None` when the element asked for is the element clicked.
+    pub fn actuated(&self) -> Option<AxNodeId> {
+        match self {
+            ClickMethod::NativeAction { actuated } => *actuated,
+            ClickMethod::Pointer { .. } => None,
         }
     }
 }
@@ -2383,13 +2399,28 @@ mod tests {
 
     #[test]
     fn click_method_labels_and_fallback_access() {
-        assert_eq!(ClickMethod::NativeAction.label(), "native-action");
-        assert_eq!(ClickMethod::NativeAction.native_fallback(), None);
+        let n = ClickMethod::NativeAction { actuated: None };
+        assert_eq!(n.label(), "native-action");
+        assert_eq!(n.native_fallback(), None);
+        assert_eq!(n.actuated(), None);
         let p = ClickMethod::Pointer {
             native_fallback: "reason".into(),
         };
         assert_eq!(p.label(), "pointer");
         assert_eq!(p.native_fallback(), Some("reason"));
+        assert_eq!(p.actuated(), None);
+    }
+
+    #[test]
+    fn a_native_action_on_a_substituted_element_reports_which_one() {
+        // The caller named #4 and the backend actuated the control enclosing it. Reporting
+        // only "native-action" would leave "I clicked the label" and "I clicked the row
+        // around it, which navigated away" indistinguishable afterwards.
+        let m = ClickMethod::NativeAction {
+            actuated: Some(AxNodeId(2)),
+        };
+        assert_eq!(m.actuated(), Some(AxNodeId(2)));
+        assert_eq!(m.label(), "native-action");
     }
 
     #[test]

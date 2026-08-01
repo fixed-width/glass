@@ -533,15 +533,19 @@ follow as siblings (the legend untrusted-wrapped), per the image ordering above.
 
 ### `glass_click_element`
 
-Click an element by its `#id` (clicks the center of its bounds, via the normal click path).
+Click an element by its `#id`. Tries the platform's native accessibility action first, falling back
+to a synthetic pointer click at the center of the element's bounds.
 
 - `id` (integer, **required**) — the `#id` from the latest snapshot.
 - `return` (string) — `"snapshot"` appends a fresh a11y outline as an untrusted sibling block (and
   refreshes the id cache), `"settle"` folds settle metadata into `result.observed`, or `"none"`
   (default) adds nothing.
 
-Returns `{id}` — the `#id` you clicked — plus `observed: {settled, saw_motion, observed_ms}` when
-`return:"settle"`.
+Returns `{id, method}` — the `#id` you clicked and which path ran (`native-action`/`pointer`) —
+plus `native_fallback` (why the pointer path was used) when it was, `actuated_id` when the native
+action fired on a different element than the one you named (a control whose label is a separate
+element, as in Jetpack Compose, resolves to the enclosing control), and
+`observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
 
 ### `glass_set_value`
 

@@ -334,7 +334,7 @@ impl Accessibility for ServiceA11y {
         }
     }
 
-    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let tree = {
             let mut t = self.snapshot(ctx)?;
             t.assign_ids();
@@ -347,7 +347,7 @@ impl Accessibility for ServiceA11y {
         if let Some(want) = plan.want_checked {
             self.wait_for_check(ctx, &plan, want)?;
         }
-        Ok(())
+        Ok(plan.substituted())
     }
 }
 
@@ -563,6 +563,13 @@ struct InvokePlan {
     actuated: Actuated,
     /// `Some(want)` when the actuated control must be read back reporting `checked == want`.
     want_checked: Option<bool>,
+}
+
+impl InvokePlan {
+    /// The actuated node, when it is not the one the caller named.
+    fn substituted(&self) -> Option<AxNodeId> {
+        (self.actuated.id != self.target).then_some(self.actuated.id)
+    }
 }
 
 /// Whether clicking a control of this role must move its `checked` state. A checkbox or a
@@ -1536,17 +1543,19 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_actuates_the_ancestor_the_climb_resolved_to() {
+    fn the_plan_actuates_the_climbed_ancestor_and_reports_the_substitution() {
         let t = built(&compose_like());
         let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
         assert_eq!(plan.actuated.id, AxNodeId(1));
+        assert_eq!(plan.substituted(), Some(AxNodeId(1)));
     }
 
     #[test]
-    fn a_target_that_can_act_is_its_own_actuator() {
+    fn a_target_actuated_in_its_own_right_substitutes_nothing() {
         let t = built(&nested_clickables());
         let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
         assert_eq!(plan.actuated.id, AxNodeId(2));
+        assert_eq!(plan.substituted(), None);
     }
 
     /// The compose fixture read back under `limits` — small caps make the walk report the
@@ -1738,8 +1747,10 @@ mod tests {
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let mut a = reader(port, std::time::Duration::ZERO);
         let t = built(&compose_like());
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+        let substituted = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
             .expect("clicks");
+        assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()]
@@ -1796,7 +1807,11 @@ mod tests {
         );
         let mut a = reader(port, std::time::Duration::ZERO);
         let t = built(&one_checkable("android.widget.CheckBox", false));
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(1)))
-            .expect("clicks");
+        assert_eq!(
+            a.invoke(&ctx(), &target_for(&t, AxNodeId(1)))
+                .expect("clicks"),
+            None,
+            "the target actuated itself, so nothing was substituted"
+        );
     }
 }

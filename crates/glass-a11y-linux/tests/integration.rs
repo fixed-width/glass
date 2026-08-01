@@ -46,7 +46,7 @@ impl<A: glass_core::Accessibility> glass_core::Accessibility for Counting<A> {
         &mut self,
         ctx: &glass_core::AxContext,
         target: &glass_core::AxTarget,
-    ) -> glass_core::Result<()> {
+    ) -> glass_core::Result<Option<glass_core::AxNodeId>> {
         self.inner.invoke(ctx, target)
     }
 }
@@ -585,7 +585,7 @@ fn click_element_native_invokes_gtk_switch() {
     let method = glass.click_element(switch.id).expect("click");
     assert_eq!(
         method,
-        glass_core::ClickMethod::NativeAction,
+        glass_core::ClickMethod::NativeAction { actuated: None },
         "a GTK Switch exposes an activation action; the native path must take it"
     );
     // The toolkit applies the action on its next main-loop pass — poll briefly.

@@ -295,6 +295,9 @@ pub(crate) enum InvokeBehavior {
     Unsupported,
     /// Native action fires and reports success.
     Succeed,
+    /// Native action fires on a different element than the one named — the shape of a
+    /// backend whose toolkit carries a control's activation on an ancestor of its label.
+    SucceedOnAnother(u32),
     /// Element exposes no activation action.
     NoAction,
     /// Action fired but the toolkit reported failure.
@@ -309,12 +312,16 @@ fn scripted_invoke(
     behavior: InvokeBehavior,
     log: &Arc<Mutex<Vec<AxTarget>>>,
     target: &AxTarget,
-) -> Result<()> {
+) -> Result<Option<AxNodeId>> {
     match behavior {
         InvokeBehavior::Unsupported => Err(GlassError::AxUnsupported),
         InvokeBehavior::Succeed => {
             log.lock().unwrap().push(target.clone());
-            Ok(())
+            Ok(None)
+        }
+        InvokeBehavior::SucceedOnAnother(actuated) => {
+            log.lock().unwrap().push(target.clone());
+            Ok(Some(AxNodeId(actuated)))
         }
         InvokeBehavior::NoAction => Err(GlassError::AxActionUnavailable(target.id.0)),
         InvokeBehavior::Fail => Err(GlassError::AxActionFailed(
@@ -361,7 +368,7 @@ impl Accessibility for FakeAccessibility {
             .push((target.clone(), text.to_string()));
         Ok(())
     }
-    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
@@ -577,7 +584,7 @@ impl Accessibility for SeqAccessibility {
     fn set_value(&mut self, _ctx: &AxContext, _t: &AxTarget, _s: &str) -> Result<()> {
         Ok(())
     }
-    fn invoke(&mut self, _ctx: &AxContext, target: &AxTarget) -> Result<()> {
+    fn invoke(&mut self, _ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         scripted_invoke(self.invoke_behavior, &self.invoke_log, target)
     }
 }

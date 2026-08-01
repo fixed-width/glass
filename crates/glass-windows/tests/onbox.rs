@@ -503,7 +503,7 @@ fn onbox_a11y_snapshot_and_click() {
     let method = glass.click_element(id).expect("click element by id");
     assert_eq!(
         method,
-        glass_core::ClickMethod::NativeAction,
+        glass_core::ClickMethod::NativeAction { actuated: None },
         "a Win32 Button publishes UIA InvokePattern; click_element must take the native path"
     );
     std::thread::sleep(Duration::from_millis(700));
@@ -547,7 +547,7 @@ fn onbox_a11y_native_toggle_checkbox() {
     let method = glass.click_element(id).expect("click element by id");
     assert_eq!(
         method,
-        glass_core::ClickMethod::NativeAction,
+        glass_core::ClickMethod::NativeAction { actuated: None },
         "charmap's Advanced-view checkbox publishes only UIA TogglePattern; click_element must \
          take the native path"
     );
@@ -1574,7 +1574,11 @@ impl<A: Accessibility> Accessibility for Counting<A> {
     ) -> glass_core::Result<()> {
         self.inner.set_value(ctx, target, text)
     }
-    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> glass_core::Result<()> {
+    fn invoke(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+    ) -> glass_core::Result<Option<glass_core::AxNodeId>> {
         self.inner.invoke(ctx, target)
     }
 }
