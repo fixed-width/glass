@@ -9,11 +9,10 @@ use super::*;
 /// wrong result rather than a slow one. This bounds that to added latency, one re-read per second
 /// no matter what the platform does or does not announce.
 ///
-/// Wall-clock, and deliberately not a count of quiet intervals: a count is a ceiling only in units
-/// of `interval_ms`, so it moves with the caller's interval and can sit past the caller's whole
-/// timeout. Ten intervals at the 200ms `glass_wait_for_element` default is two seconds — longer
-/// than many waits ever run, which made the ceiling unreachable for exactly the short waits that
-/// could least afford to answer from one stale read.
+/// Wall-clock, and deliberately not a count of quiet intervals: a count scales with the caller's
+/// `interval_ms` and can sit past the caller's whole timeout — ten at the 200ms
+/// `glass_wait_for_element` default is two seconds, which put the ceiling out of reach of exactly
+/// the short waits that could least afford one stale read.
 const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Parameters for [`Glass::wait_stable`].
@@ -1240,10 +1239,8 @@ mod tests {
 
     #[test]
     fn a_quiet_wait_walks_once_and_looks_again_at_the_deadline() {
-        // The point of the change: told nothing changed, the wait must not re-read the tree on the
-        // interval. The second walk is the deadline read — a wait may skip work whose answer it was
-        // told cannot have changed, but it may not answer "not matched" without looking once after
-        // the last thing it was told.
+        // The point of the change: told nothing changed, the wait must not re-read on the
+        // interval. The second walk is the deadline read — see `poll_until_with_pause`.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1337,9 +1334,9 @@ mod tests {
 
     #[test]
     fn a_long_quiet_wait_reads_anyway_now_and_then() {
-        // 2.5s spans two `REREAD_AFTER` ceilings, so two forced reads on top of the first and the
-        // one at the deadline. The interval is deliberately far smaller than the ceiling: a count
-        // of intervals would put the ceiling at 500ms here and read five times.
+        // 2.5s spans two `REREAD_AFTER` ceilings: two forced reads on top of the first and the
+        // deadline's. The interval is far smaller than the ceiling on purpose — a count of
+        // intervals would put it at 500ms here and read five times.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1359,11 +1356,9 @@ mod tests {
 
     #[test]
     fn a_wait_too_short_to_reach_the_ceiling_still_sees_an_unannounced_change() {
-        // The regression this fixes. A platform that declines to announce some change leaves the
-        // wait skipping every tick, and a wait whose whole budget is shorter than `REREAD_AFTER`
-        // never reaches the forced read — so before the deadline read it answered "not matched"
-        // from the single snapshot it took before the change happened. Not a slow answer: a wrong
-        // one, for an element that is on screen.
+        // The regression this fixes: a wait whose whole budget is shorter than `REREAD_AFTER`
+        // never reaches the forced read, so before the deadline read it answered from the single
+        // snapshot it took before the change happened — a wrong answer, for an element on screen.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             // Absent on the first read, present on every read after it.
@@ -1384,9 +1379,8 @@ mod tests {
 
     #[test]
     fn the_ceiling_is_wall_clock_so_a_wide_interval_does_not_push_it_out() {
-        // A count of quiet intervals scales the ceiling with the caller's interval: ten of the
-        // 200ms `glass_wait_for_element` default is two seconds. Wall-clock, the same wait sees an
-        // unannounced change inside one.
+        // Ten quiet intervals at the 200ms `glass_wait_for_element` default is a two-second
+        // ceiling; wall-clock, the same wait sees an unannounced change inside one.
         let (mut g, _walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled(), fake_tree_checked()],

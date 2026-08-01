@@ -59,12 +59,10 @@ pub fn poll_until_with_pause<T>(
             });
         }
         if start.elapsed().as_millis() as u64 >= timeout_ms {
-            // Never answer "not found" on information older than the last pause. A `pause` that
-            // skipped ticks did so because it was told nothing changed, and a caller told wrong —
-            // a platform that declines to announce some change — would otherwise have the loop
-            // report an element absent that has been on screen since before the last pause. One
-            // tick, at a deadline the wait has already spent, is what keeps a skipped tick a cost
-            // saving rather than a wrong answer.
+            // Never answer "not found" on information older than the last pause: a pause told
+            // "nothing changed" by a platform that declines to announce it would otherwise report
+            // an element absent that is on screen. One tick at an already-spent deadline keeps a
+            // skip a cost saving rather than a wrong answer.
             if !run_tick && let Some(v) = tick()? {
                 return Ok(PollOutcome {
                     value: Some(v),
@@ -109,11 +107,8 @@ mod tests {
 
     #[test]
     fn a_loop_that_skipped_its_ticks_looks_once_more_before_answering_no() {
-        // The whole point of a skipped tick is that the caller was *told* nothing changed. A
-        // caller that is told wrong — a platform that declines to announce a change — would
-        // otherwise have the loop report "not found" on information it has not refreshed since
-        // the last pause. One tick at the deadline is what keeps a skip a cost saving rather than
-        // a wrong answer.
+        // A pause told "nothing changed" by a platform that declines to announce it must not
+        // leave the loop answering from information it has not refreshed since.
         let mut ticks = 0;
         let out = poll_until_with_pause(
             1,
