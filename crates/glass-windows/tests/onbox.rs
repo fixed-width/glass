@@ -1651,11 +1651,12 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     assert!(!out.matched, "the element must not exist");
     // See `Counting`: without this the test could measure polling and pass.
     assert!(subscribed > 0, "no subscription was established");
-    // Four reads in a 3s wait, measured: one at the start, `REREAD_AFTER`'s forced re-reads at
-    // ~1s and ~2s, and one more at the deadline before answering "not found". The same wait
-    // without a signal walked 24 times (see `onbox_a_signal_more_than_halves_a_quiet_walk_count`),
-    // which is interval-paced rather than walk-bound — 24 reads in 3s is ~125ms a cycle, the 100ms
-    // interval plus charmap's own ~20ms walk.
+    // Four reads in a 3s wait, measured: one at the start, then `REREAD_AFTER`'s forced re-reads
+    // and the deadline read, whichever of those the timing lands on. The same wait without a
+    // signal walked 24 times (see `onbox_a_signal_more_than_halves_a_quiet_walk_count`) — 24 reads
+    // is 23 cycles, so ~130ms each: the 100ms interval plus charmap's own walk, interval-paced
+    // rather than walk-bound. The deadline read cannot add to that count, since a run with no
+    // signal ticks every interval and so never reaches the deadline having skipped one.
     assert!(
         walked <= 5,
         "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"

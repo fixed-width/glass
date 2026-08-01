@@ -842,10 +842,10 @@ pub enum ElementCondition {
 }
 
 impl ElementCondition {
-    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]. A backend that subscribes to
-    /// change notifications walks this array to decide what to subscribe to —
-    /// `glass-a11y-windows` builds the set of UIA properties it registers from it — so a condition
-    /// absent here is one no such backend can be woken by, with nothing to fail.
+    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]. `glass-a11y-windows` walks
+    /// this array to build the set of UIA properties it registers, so a condition absent here is
+    /// one that backend cannot be woken by, with nothing to fail. Not every subscribing backend
+    /// derives its subscription this way — the AT-SPI reader registers by event class instead.
     pub const ALL: [ElementCondition; 13] = [
         ElementCondition::Appears,
         ElementCondition::Disappears,

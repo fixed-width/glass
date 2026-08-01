@@ -363,8 +363,8 @@ fn register_handlers(
     registered
 }
 
-/// Hold the registrations open until the signal is dropped or the window stops resolving, with
-/// `alive` set for exactly that long and cleared before returning.
+/// Hold the registrations open until the signal is dropped or the window stops resolving, and
+/// clear `alive` before returning however that happens.
 ///
 /// Do not inline this back into the pump: `alive` has to be cleared *before* the caller's two
 /// `remove_*` calls, each a cross-process call bounded at `TRANSACTION_TIMEOUT_MS` that a `wait`
@@ -448,9 +448,6 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
-    /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
-    /// pins the case where that licence is actually earned: nothing arrived, and the signal is
-    /// still trustworthy.
     /// The registration order that costs the target application something: the structure handler
     /// is already in place when the property handler is refused, so it has to come back off before
     /// the pump gives up — the caller is told `false` and never comes back to remove it.
@@ -507,6 +504,9 @@ mod tests {
         }
     }
 
+    /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
+    /// pins the case where that licence is actually earned: nothing arrived, and the signal is
+    /// still trustworthy.
     #[test]
     fn no_event_within_the_timeout_reports_quiet() {
         let (_tx, rx) = sync_channel(1);
