@@ -223,9 +223,8 @@ impl Default for AndroidA11y {
     }
 }
 
-/// Find `target.id` and reject a tree that drifted under it. The guard half of
-/// [`editable_target`], shared with the service reader's `invoke`, which needs the same
-/// rejection without the editable check.
+/// Find `target.id` and reject a tree that drifted under it — shared by [`editable_target`]
+/// and the service reader's `invoke`, which needs the same rejection without the editable check.
 pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)

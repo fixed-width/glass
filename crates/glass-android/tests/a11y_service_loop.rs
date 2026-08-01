@@ -158,11 +158,9 @@ fn native_invoke_actuates_the_fixture() {
             .expect("counter is present")
     };
 
-    // Poll `read` (a `counter(&mut a11y)` call) until it differs from `before`, instead of
-    // sleeping a fixed settle time and reading once. `invoke` itself already refuses to
-    // guess this timing for a checkable target — `wait_for_flip` polls rather than assumes
-    // a fixed delay — so a non-checkable click's effect on the a11y tree is awaited the
-    // same way here rather than assumed. A timeout is a real failure, not a silent pass.
+    // Poll `read` until it changes instead of sleeping once — `invoke` only waits internally
+    // for a checkable target (`wait_for_flip`), so a plain click's effect on the tree is
+    // awaited here instead. A timeout is a real failure, not a silent pass.
     fn await_change(
         what: &str,
         before: &str,
@@ -185,9 +183,8 @@ fn native_invoke_actuates_the_fixture() {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
-    // Real headroom over the ~520-580ms this actuation was measured to take on-device — the
-    // poll returns as soon as the value changes, so a generous ceiling costs nothing when it
-    // does.
+    // Measured ~520-580ms on-device; generous is free since the poll returns as soon as the
+    // value changes.
     const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
     // An enabled classic button actuates.

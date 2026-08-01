@@ -172,9 +172,8 @@ impl ServiceClient {
         })
     }
 
-    /// Run a request, transparently reconnecting once if the socket dropped. The bool in the
-    /// error is `Conn::call`'s: true when the failure was transport rather than a refusal the
-    /// device sent back.
+    /// Run a request, transparently reconnecting once if the socket dropped. The bool is
+    /// `Conn::call`'s: true for a transport failure, false for a refusal the device sent back.
     fn call(&self, req: Value) -> std::result::Result<Value, (GlassError, bool)> {
         let mut conn = self.conn.lock().map_err(|_| {
             (
@@ -239,9 +238,9 @@ impl ServiceA11y {
         Self { client, package }
     }
 
-    /// Poll until `chosen`'s `checked` leaves `was`. A Compose recompose reaches the
-    /// accessibility tree a beat after the action, so an acknowledgement is not proof the
-    /// control flipped; `set_value` polls for the same reason.
+    /// Poll until `chosen`'s `checked` leaves `was` — a Compose recompose reaches the tree a
+    /// beat after the action, so acknowledgement is not proof; `set_value` polls for the same
+    /// reason.
     fn wait_for_flip(
         &mut self,
         ctx: &AxContext,
