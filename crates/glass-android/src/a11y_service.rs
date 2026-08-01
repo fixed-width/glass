@@ -597,7 +597,7 @@ fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
     // Fallback-eligible on purpose: nothing was dispatched, and the pointer path aims at this
     // tree's own bounds, which the id/`ref` skew does not touch. It must therefore stay below
     // both `enabled` refusals — reached first, it hands a disabled control to the pointer
-    // path; the climb above it only reads this tree.
+    // path.
     if let Some(t) = &tree.truncated
         && matches!(t.limit, TruncationLimit::Depth | TruncationLimit::Siblings)
     {

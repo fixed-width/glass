@@ -255,7 +255,7 @@ fn native_invoke_actuates_the_fixture() {
     // The platform reports the app up before the Compose hierarchy has published its
     // accessibility tree, and the label's bounds keep moving while the activity animates in —
     // `invoke` fingerprints bounds, so waiting for the label to merely exist yields
-    // `AxElementChanged`. Wait for two reads to agree.
+    // `AxElementChanged`.
     let deadline = std::time::Instant::now() + AWAIT_DEADLINE;
     let mut settled = None;
     loop {
