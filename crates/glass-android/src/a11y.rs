@@ -223,6 +223,22 @@ impl Default for AndroidA11y {
     }
 }
 
+/// Find `target.id` and reject a tree that drifted under it. The guard half of
+/// [`editable_target`], shared with the service reader's `invoke`, which needs the same
+/// rejection without the editable check.
+pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    let node = tree
+        .find(target.id)
+        .ok_or(GlassError::AxElementNotFound(target.id.0))?;
+    if !target.matches(node.role, node.name.as_deref())
+        || !target.bounds_consistent(node.bounds, 8)
+        || !target.value_consistent(node.value.as_deref())
+    {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    Ok(node)
+}
+
 /// Re-resolve `target` in an already-numbered `tree` and return the node only if it is still the
 /// element that was addressed and still editable. Errors specifically when the target is gone
 /// (`AxElementNotFound`), has drifted in role/name/bounds/value (`AxElementChanged`), or is not
@@ -233,15 +249,7 @@ impl Default for AndroidA11y {
 /// acts on. A recycled `RecyclerView` row is the motivating case for comparing `value` too — see
 /// `AxTarget::value`'s doc. Pure (no device I/O), so it is testable without a device.
 pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
-    let node = tree
-        .find(target.id)
-        .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-    if !target.matches(node.role, node.name.as_deref())
-        || !target.bounds_consistent(node.bounds, 8)
-        || !target.value_consistent(node.value.as_deref())
-    {
-        return Err(GlassError::AxElementChanged(target.id.0));
-    }
+    let node = fingerprinted(tree, target)?;
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }

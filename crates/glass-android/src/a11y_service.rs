@@ -471,6 +471,55 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
     }
 }
 
+/// The node an `invoke` should actuate on behalf of `target`.
+///
+/// A Compose button's label and its clickable node are different nodes: the touch-target
+/// carries no name and the named child carries no `ACTION_CLICK`. When the target itself
+/// advertises no click, climb to the nearest node that does and encloses it — the same node a
+/// tap at the target's centre would have been handled by.
+#[cfg_attr(not(test), allow(dead_code))]
+fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    crate::a11y::fingerprinted(tree, target)?;
+    let mut path = Vec::new();
+    if !path_to(&tree.root, target.id, &mut path) {
+        return Err(GlassError::AxElementNotFound(target.id.0));
+    }
+    let want = path.last().expect("path_to leaves the target last").bounds;
+    path.iter()
+        .rev()
+        .find(|n| n.states.focusable && (n.id == target.id || encloses(n.bounds, want)))
+        .copied()
+        .ok_or(GlassError::AxActionUnavailable(target.id.0))
+}
+
+/// The root-to-`id` path, inclusive of both ends. False when `id` is not in this subtree,
+/// leaving `out` as it was found.
+fn path_to<'a>(node: &'a AxNode, id: AxNodeId, out: &mut Vec<&'a AxNode>) -> bool {
+    out.push(node);
+    if node.id == id {
+        return true;
+    }
+    for c in &node.children {
+        if path_to(c, id, out) {
+            return true;
+        }
+    }
+    out.pop();
+    false
+}
+
+/// Whether `outer` fully contains `inner`. A node without bounds encloses nothing — the climb
+/// must not reach past a node whose geometry it cannot check.
+fn encloses(outer: Option<AxRect>, inner: Option<AxRect>) -> bool {
+    let (Some(o), Some(i)) = (outer, inner) else {
+        return false;
+    };
+    i64::from(o.x) <= i64::from(i.x)
+        && i64::from(o.y) <= i64::from(i.y)
+        && i64::from(o.x) + i64::from(o.width) >= i64::from(i.x) + i64::from(i.width)
+        && i64::from(o.y) + i64::from(o.height) >= i64::from(i.y) + i64::from(i.height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +897,113 @@ mod tests {
             true,
         );
         assert_eq!(node.name.as_deref(), Some("Email"));
+    }
+
+    /// A device tree shaped like Compose's: the clickable touch-target `View` carries no name,
+    /// and the label that names it is a child.
+    fn compose_like() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [
+                {"class": "android.view.View",
+                 "bounds": {"x": 60, "y": 480, "w": 210, "h": 130},
+                 "editable": false, "clickable": true, "enabled": true, "scrollable": false,
+                 "children": [
+                    {"class": "android.widget.TextView", "text": "Save",
+                     "bounds": {"x": 120, "y": 520, "w": 80, "h": 50},
+                     "editable": false, "clickable": false, "enabled": true, "scrollable": false}
+                 ]}
+            ]
+        })
+    }
+
+    fn built(v: &Value) -> AxTree {
+        let mut t = tree_from_json(v, &win(), WalkLimits::DEFAULT).expect("maps");
+        t.assign_ids();
+        t
+    }
+
+    /// The target a caller would hold after selecting `id` from `tree`.
+    fn target_for(tree: &AxTree, id: AxNodeId) -> AxTarget {
+        let n = tree.find(id).expect("node is in the tree");
+        AxTarget {
+            id,
+            role: n.role,
+            name: n.name.clone(),
+            bounds: n.bounds,
+            value: n.value.clone(),
+        }
+    }
+
+    #[test]
+    fn a_named_label_climbs_to_the_clickable_node_that_encloses_it() {
+        let t = built(&compose_like());
+        let label = target_for(&t, AxNodeId(2));
+        assert_eq!(label.name.as_deref(), Some("Save"));
+        assert_eq!(actuable_node(&t, &label).unwrap().id, AxNodeId(1));
+    }
+
+    #[test]
+    fn a_target_that_advertises_a_click_is_actuated_directly() {
+        let t = built(&compose_like());
+        let btn = target_for(&t, AxNodeId(1));
+        assert_eq!(actuable_node(&t, &btn).unwrap().id, AxNodeId(1));
+    }
+
+    #[test]
+    fn a_clickable_ancestor_that_does_not_enclose_the_target_is_not_climbed_to() {
+        // Same shape, but the clickable node's box sits beside its label rather than around
+        // it — the case where a tap at the label's centre would NOT have reached it.
+        let mut v = compose_like();
+        v["children"][0]["bounds"] = json!({"x": 600, "y": 480, "w": 210, "h": 130});
+        let t = built(&v);
+        let label = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &label),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
+
+    #[test]
+    fn a_path_with_no_clickable_node_reports_the_action_unavailable() {
+        let mut v = compose_like();
+        v["children"][0]["clickable"] = json!(false);
+        let t = built(&v);
+        let label = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &label),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
+
+    #[test]
+    fn action_unavailable_is_the_only_resolution_error_that_may_fall_back() {
+        let mut v = compose_like();
+        v["children"][0]["clickable"] = json!(false);
+        let t = built(&v);
+        let e = actuable_node(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        assert!(e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_target_whose_name_drifted_is_rejected_before_any_climb() {
+        let t = built(&compose_like());
+        let mut label = target_for(&t, AxNodeId(2));
+        label.name = Some("Send".into());
+        assert!(matches!(
+            actuable_node(&t, &label),
+            Err(GlassError::AxElementChanged(2))
+        ));
+    }
+
+    #[test]
+    fn a_drifted_target_must_not_fall_back_to_a_pointer_click() {
+        let t = built(&compose_like());
+        let mut label = target_for(&t, AxNodeId(2));
+        label.name = Some("Send".into());
+        let e = actuable_node(&t, &label).unwrap_err();
+        assert!(!e.invoke_fallback_eligible(), "{e}");
     }
 }
