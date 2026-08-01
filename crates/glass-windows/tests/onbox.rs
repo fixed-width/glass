@@ -2025,15 +2025,14 @@ fn winforms_fixture_spec() -> AppSpec {
 ///
 /// A WinForms control becoming enabled announces nothing, so this wait cannot be woken by an
 /// event — it can only be rescued by `QUIET_RUNS_BEFORE_REREAD`'s forced re-read. Both halves
-/// matter: that it still matches is the correctness claim, and that it took more than one walk
-/// to get there is what proves the match came from the fallback and not from a notification. If
-/// the second assertion ever starts failing, the bridge began announcing `IsEnabled` and the
-/// disclosure in `events.rs` and the changelog is stale.
+/// matter: that it still matches is the correctness claim; that it took more than one walk rules
+/// out the wait's first read as the source of the match.
 ///
-/// `walked > 1` only proves the match did not come from the wait's first read — an announced
-/// transition and a forced re-read land close enough together in walk count that this assertion
-/// cannot tell them apart. That WinForms never announces `IsEnabled` is established by the
-/// 2026-07-31 on-box probe, not by this test.
+/// `walked > 1` does not, on its own, prove no event fired — an announced transition and a forced
+/// re-read land close enough together in walk count that this assertion cannot tell them apart.
+/// That WinForms never announces `IsEnabled` comes from the 2026-07-31 on-box probe, not from
+/// this test. If this assertion starts failing, the bridge began announcing `IsEnabled` after
+/// all, and the disclosure in `events.rs` and the changelog is stale.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
