@@ -1641,9 +1641,9 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     let _ = glass.stop();
 
     // Logged AND saved: `eprintln!` alone is invisible on a pass through the schtasks-bounce
-    // harness (see `probe_role_histogram`'s doc on why it writes `.windows-artifacts` for the
-    // same reason) — save_report is what makes the number reproducible off-box, which is the
-    // entire point of a walk-count test.
+    // harness (see [`artifacts_dir`] for why that is, and why the file is the only way anything
+    // gets out) — save_report is what makes the number reproducible off-box, which is the entire
+    // point of a walk-count test.
     let line = format!("quiet 3s wait at 100ms: {walked} walks\n");
     eprint!("{line}");
     save_report("onbox-walk-count-quiet-wait.txt", &line);
@@ -1915,9 +1915,9 @@ impl Drop for RestoreAdvancedView {
 /// Neither assertion discriminates alone; each rules out a different broken build:
 /// - No subscription (`subscribe_changes` always `None`): every 100ms tick reads regardless, so the
 ///   change is caught at the next tick — same elapsed time, but roughly one walk per tick.
-/// - A subscription that never reports an event (always `Quiet`): `QUIET_RUNS_BEFORE_REREAD` forces
-///   a re-read every ~1000ms at `interval_ms=100`, so it cannot return before the next boundary —
-///   same low walk count, but ~2000ms at the earliest.
+/// - A subscription that never reports an event (always `Quiet`): `glass_core`'s `REREAD_AFTER`
+///   forces a re-read once a second, so it cannot return before the next boundary — same low walk
+///   count, but ~2000ms at the earliest.
 ///
 /// Hence the helper acts at ~1400ms, mid-way through the second forced-re-read window (boundaries
 /// ~1000ms and ~2000ms); acting near 700ms left too little margin against the first. Measured
@@ -2062,9 +2062,9 @@ fn winforms_fixture_spec() -> AppSpec {
 /// The documented cost of the `IsEnabled` gap, asserted rather than described.
 ///
 /// A WinForms control becoming enabled announces nothing, so this wait cannot be woken by an
-/// event — it can only be rescued by `QUIET_RUNS_BEFORE_REREAD`'s forced re-read. Both halves
-/// matter: that it still matches is the correctness claim; that it took more than one walk rules
-/// out the wait's first read as the source of the match.
+/// event — it can only be rescued by `glass_core`'s once-a-second forced re-read (`REREAD_AFTER`).
+/// Both halves matter: that it still matches is the correctness claim; that it took more than one
+/// walk rules out the wait's first read as the source of the match.
 ///
 /// `walked > 1` does not prove no event fired — an announced transition and a forced re-read land
 /// too close in walk count to tell apart. That WinForms never announces `IsEnabled` comes from the

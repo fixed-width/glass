@@ -58,7 +58,7 @@ impl Accessibility for WindowsA11y {
     }
 
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
-        // Unlike `snapshot`/`set_value`/`invoke` above there is no timeout wrapper: the
+        // Unlike `snapshot` above and `set_value`/`invoke` below there is no timeout wrapper: the
         // subscription's own thread is the long-lived one, and `subscribe` already bounds how
         // long it will wait for the registrations to land.
         crate::events::subscribe(ctx)
