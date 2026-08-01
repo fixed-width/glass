@@ -1613,8 +1613,9 @@ fn glass_counting(
 }
 
 /// The point of the subscription, measured against a real app: a wait for something that never
-/// happens must stop re-reading the tree. A UIA walk is the most expensive of any backend —
-/// 2360ms for 1500 nodes, measured on a Windows box — so this is where the saving is largest.
+/// happens must stop re-reading the tree. What a skipped read is worth scales with the window —
+/// charmap's tree is 26 nodes and walks in ~20ms, where a 1500-node window measured through this
+/// same reader took 2360ms — so the saving counted here is a floor, not a typical case.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
@@ -1650,9 +1651,11 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     assert!(!out.matched, "the element must not exist");
     // See `Counting`: without this the test could measure polling and pass.
     assert!(subscribed > 0, "no subscription was established");
-    // One read at the start plus `QUIET_RUNS_BEFORE_REREAD`'s forced re-read about once a
-    // second. The same wait polling takes many more; a UIA walk is slow enough that the
-    // polling count is itself walk-bound rather than interval-bound.
+    // Four reads in a 3s wait, measured: one at the start, `REREAD_AFTER`'s forced re-reads at
+    // ~1s and ~2s, and one more at the deadline before answering "not found". The same wait
+    // without a signal walked 24 times (see `onbox_a_signal_more_than_halves_a_quiet_walk_count`),
+    // which is interval-paced rather than walk-bound — 24 reads in 3s is ~125ms a cycle, the 100ms
+    // interval plus charmap's own ~20ms walk.
     assert!(
         walked <= 5,
         "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
@@ -1914,14 +1917,15 @@ impl Drop for RestoreAdvancedView {
 ///
 /// Neither assertion discriminates alone; each rules out a different broken build:
 /// - No subscription (`subscribe_changes` always `None`): every 100ms tick reads regardless, so the
-///   change is caught at the next tick — same elapsed time, but roughly one walk per tick.
+///   change is caught at the next tick — same elapsed time, but roughly one walk per tick, which is
+///   what polling costs on a window this small (see `onbox_a_quiet_wait_stops_re_walking_the_tree`).
 /// - A subscription that never reports an event (always `Quiet`): `glass_core`'s `REREAD_AFTER`
 ///   forces a re-read once a second, so it cannot return before the next boundary — same low walk
 ///   count, but ~2000ms at the earliest.
 ///
 /// Hence the helper acts at ~1400ms, mid-way through the second forced-re-read window (boundaries
 /// ~1000ms and ~2000ms); acting near 700ms left too little margin against the first. Measured
-/// on-box: `matched=true elapsed_ms=1500 walks=3` — the initial read, the ~1000ms forced re-read,
+/// on-box: `matched=true elapsed_ms=1501 walks=3` — the initial read, the ~1000ms forced re-read,
 /// and the read the event triggers.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]

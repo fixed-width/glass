@@ -843,10 +843,9 @@ pub enum ElementCondition {
 
 impl ElementCondition {
     /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]. A backend that subscribes to
-    /// change notifications keeps its own registration list rather than deriving one from this;
-    /// what walks this array is that backend's coverage test — `glass-a11y-windows`'s
-    /// `every_announced_property_is_registered` — so a condition absent here is one that check
-    /// silently skips.
+    /// change notifications walks this array to decide what to subscribe to —
+    /// `glass-a11y-windows` builds the set of UIA properties it registers from it — so a condition
+    /// absent here is one no such backend can be woken by, with nothing to fail.
     pub const ALL: [ElementCondition; 13] = [
         ElementCondition::Appears,
         ElementCondition::Disappears,

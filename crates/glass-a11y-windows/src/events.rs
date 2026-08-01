@@ -59,11 +59,11 @@ fn watched() -> Vec<UIProperty> {
         .filter_map(announcing_property)
         .chain(SELECTOR_PROPERTIES)
     {
-        // Duplicates are the rule here, not the exception — a condition and its inverse share an
-        // announcing property, and a selector property can announce a condition too — and they are
-        // not adjacent, so `Vec::dedup` would leave some behind. Order is not preserved for
-        // anything's sake: this is the set of properties to register, and nothing reads the order
-        // it is built in.
+        // A condition and its inverse are announced by the same property, so duplicates are
+        // routine. Membership rather than `Vec::dedup`, which drops only *adjacent* duplicates and
+        // would therefore depend on the order `ElementCondition::ALL` happens to list conditions
+        // in — an order nothing pins. Order does not matter here either way: this is the set of
+        // properties to register, and nothing reads the sequence it was built in.
         if !watched.contains(&p) {
             watched.push(p);
         }
