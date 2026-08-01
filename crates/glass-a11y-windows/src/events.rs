@@ -147,19 +147,29 @@ impl CustomPropertyChangedEventHandler for Notify {
     }
 }
 
+/// Whether the pump can still be heard from. Two states rather than a receiver plus a flag, so
+/// "ended, but still holding a channel to read" is a state that cannot be built.
+enum Signaling {
+    Live {
+        rx: Receiver<()>,
+        /// Set while the pump can still deliver, cleared on its way out (see [`ClearOnExit`]). A
+        /// dead pump does not reliably disconnect the channel — UIA holds both senders inside COM
+        /// objects until the two `remove_*` calls succeed, against a window that has usually just
+        /// stopped resolving — so this, not `RecvTimeoutError::Disconnected`, is what tells `wait`
+        /// the pump is gone.
+        alive: Arc<AtomicBool>,
+    },
+    Ended,
+}
+
 /// A [`ChangeSignal`] fed by UIA event handlers registered on a background thread.
 pub(crate) struct UiaChanges {
-    rx: Receiver<()>,
-    live: bool,
+    signaling: Signaling,
     /// Cleared on drop to stop the pump, which is what removes the registrations. Leaked, the
-    /// target app's provider keeps doing work for a subscription nobody holds.
+    /// target app's provider keeps doing work for a subscription nobody holds. Written by this,
+    /// the consumer side, and read by the pump — the opposite direction from `alive`, which is why
+    /// the two are separate flags and neither side reads the one it writes.
     running: Arc<AtomicBool>,
-    /// Set while the pump can still deliver, cleared on its way out (see [`ClearOnExit`]). A dead
-    /// pump does not reliably disconnect the channel — UIA holds both senders inside COM objects
-    /// until the two `remove_*` calls succeed, against a window that has usually just stopped
-    /// resolving — so this, not `RecvTimeoutError::Disconnected`, is what tells `wait` the pump is
-    /// gone.
-    alive: Arc<AtomicBool>,
 }
 
 impl Drop for UiaChanges {
@@ -170,25 +180,28 @@ impl Drop for UiaChanges {
 
 impl ChangeSignal for UiaChanges {
     fn wait(&mut self, timeout: Duration) -> ChangeWait {
-        // Read before the channel: once the pump has gone, a queued message is a stale change and
-        // the caller re-reads on `Unusable` anyway.
-        if !self.live || !self.alive.load(Ordering::Relaxed) {
-            self.live = false;
-            return ChangeWait::Unusable;
+        let outcome = match &self.signaling {
+            Signaling::Ended => ChangeWait::Unusable,
+            // `alive` before the channel: once the pump has gone, a queued message is a stale
+            // change and the caller re-reads on `Unusable` anyway.
+            Signaling::Live { alive, .. } if !alive.load(Ordering::Relaxed) => ChangeWait::Unusable,
+            Signaling::Live { rx, .. } => match rx.recv_timeout(timeout) {
+                Ok(()) => {
+                    // One logical change delivers several events — a control and its text peer, a
+                    // structure event alongside a property event. A burst is one reason to re-read.
+                    while rx.try_recv().is_ok() {}
+                    ChangeWait::Changed
+                }
+                Err(RecvTimeoutError::Timeout) => ChangeWait::Quiet,
+                Err(RecvTimeoutError::Disconnected) => ChangeWait::Unusable,
+            },
+        };
+        if outcome == ChangeWait::Unusable {
+            // Drops the receiver with it, so a signal that has answered `Unusable` once has
+            // nothing left to answer anything else from.
+            self.signaling = Signaling::Ended;
         }
-        match self.rx.recv_timeout(timeout) {
-            Ok(()) => {
-                // One logical change delivers several events — a control and its text peer, a
-                // structure event alongside a property event. A burst is one reason to re-read.
-                while self.rx.try_recv().is_ok() {}
-                ChangeWait::Changed
-            }
-            Err(RecvTimeoutError::Timeout) => ChangeWait::Quiet,
-            Err(RecvTimeoutError::Disconnected) => {
-                self.live = false;
-                ChangeWait::Unusable
-            }
-        }
+        outcome
     }
 }
 
@@ -209,10 +222,8 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     // moment it has a signal, and a change landing before registration would be lost.
     match ready_rx.recv_timeout(SUBSCRIBE_TIMEOUT) {
         Ok(true) => Some(Box::new(UiaChanges {
-            rx,
-            live: true,
+            signaling: Signaling::Live { rx, alive },
             running,
-            alive,
         })),
         // Including the timeout: the pump may still be starting, and nothing else would ever tell
         // it to stop.
@@ -399,15 +410,21 @@ mod tests {
     /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
     /// pins the case where that licence is actually earned: nothing arrived, and the signal is
     /// still trustworthy.
+    /// Builds the signal the way `subscribe` does, with the pump still running.
+    fn live_changes(rx: Receiver<()>) -> UiaChanges {
+        UiaChanges {
+            signaling: Signaling::Live {
+                rx,
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     #[test]
     fn no_event_within_the_timeout_reports_quiet() {
         let (_tx, rx) = sync_channel(1);
-        let mut changes = UiaChanges {
-            rx,
-            live: true,
-            running: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let mut changes = live_changes(rx);
         assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Quiet);
     }
 
@@ -422,15 +439,13 @@ mod tests {
         tx.send(()).unwrap();
         tx.send(()).unwrap();
         tx.send(()).unwrap();
-        let mut changes = UiaChanges {
-            rx,
-            live: true,
-            running: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let mut changes = live_changes(rx);
         assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Changed);
+        let Signaling::Live { rx, .. } = &changes.signaling else {
+            unreachable!("a delivered change leaves the signal live")
+        };
         assert!(
-            changes.rx.try_recv().is_err(),
+            rx.try_recv().is_err(),
             "a queued event survived the drain, so the next wait would re-report a stale change"
         );
     }
@@ -441,53 +456,29 @@ mod tests {
     fn a_disconnected_channel_reports_unusable() {
         let (tx, rx) = sync_channel::<()>(1);
         drop(tx);
-        let mut changes = UiaChanges {
-            rx,
-            live: true,
-            running: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let mut changes = live_changes(rx);
         assert_eq!(
             changes.wait(Duration::from_millis(20)),
             ChangeWait::Unusable
         );
     }
 
-    /// `live` is the sticky half of the contract: once tripped, `wait` must return `Unusable`
-    /// without consulting the channel again — proven here by leaving a message the channel would
-    /// otherwise happily report as `Changed`.
-    #[test]
-    fn once_live_is_false_wait_reports_unusable_even_with_a_message_pending() {
-        let (tx, rx) = sync_channel(1);
-        tx.send(()).unwrap();
-        let mut changes = UiaChanges {
-            rx,
-            live: false,
-            running: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(true)),
-        };
-        assert_eq!(
-            changes.wait(Duration::from_millis(20)),
-            ChangeWait::Unusable
-        );
-    }
-
-    /// The same shape for `alive`, which carries the opposite direction: the pump telling the
-    /// signal it has gone. It has to be read *before* the channel, because the channel is the
-    /// unreliable half here — UIA holds both senders inside the registered handlers, so a pump
-    /// that exited because its window stopped resolving can leave them undropped indefinitely,
-    /// and every `wait` would keep reporting `Quiet` for a subscription that will never deliver
-    /// again. A message left pending proves the check is not merely the `Disconnected` arm
-    /// wearing a different name.
+    /// `alive` carries the opposite direction to `running`: the pump telling the signal it has
+    /// gone. It has to be read *before* the channel, because the channel is the unreliable half
+    /// here — UIA holds both senders inside the registered handlers, so a pump that exited because
+    /// its window stopped resolving can leave them undropped indefinitely, and every `wait` would
+    /// keep reporting `Quiet` for a subscription that will never deliver again. A message left
+    /// pending proves the check is not merely the `Disconnected` arm wearing a different name.
     #[test]
     fn once_alive_is_cleared_wait_reports_unusable_even_with_a_message_pending() {
         let (tx, rx) = sync_channel(1);
         tx.send(()).unwrap();
         let mut changes = UiaChanges {
-            rx,
-            live: true,
+            signaling: Signaling::Live {
+                rx,
+                alive: Arc::new(AtomicBool::new(false)),
+            },
             running: Arc::new(AtomicBool::new(true)),
-            alive: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(
             changes.wait(Duration::from_millis(20)),
@@ -500,13 +491,10 @@ mod tests {
     /// UIA provider — would outlive every wait that created it.
     #[test]
     fn dropping_the_signal_clears_running() {
-        let (_tx, rx) = sync_channel(1);
         let running = Arc::new(AtomicBool::new(true));
         let changes = UiaChanges {
-            rx,
-            live: true,
+            signaling: Signaling::Ended,
             running: running.clone(),
-            alive: Arc::new(AtomicBool::new(true)),
         };
         drop(changes);
         assert!(!running.load(Ordering::Relaxed));
