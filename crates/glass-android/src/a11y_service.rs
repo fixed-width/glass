@@ -172,32 +172,44 @@ impl ServiceClient {
         })
     }
 
-    /// Run a request, transparently reconnecting once if the socket dropped.
-    /// Mirrors `AgentClient::call`: lock, try, reconnect on `(e, true)`, retry.
-    fn call(&self, req: Value) -> Result<Value> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| GlassError::Backend("a11y service client lock poisoned".into()))?;
+    /// Run a request, transparently reconnecting once if the socket dropped. The bool in the
+    /// error is `Conn::call`'s: true when the failure was transport rather than a refusal the
+    /// device sent back.
+    fn call(&self, req: Value) -> std::result::Result<Value, (GlassError, bool)> {
+        let mut conn = self.conn.lock().map_err(|_| {
+            (
+                GlassError::Backend("a11y service client lock poisoned".into()),
+                false,
+            )
+        })?;
         match conn.call(req.clone()) {
             Ok(v) => Ok(v),
-            Err((e, false)) => Err(e),
+            Err((e, false)) => Err((e, false)),
             Err((_, true)) => {
                 // The service's accept loop accepts a fresh connection after a drop.
-                *conn = Conn::open(self.port)?;
-                conn.call(req).map_err(|(e, _)| e)
+                *conn = Conn::open(self.port).map_err(|e| (e, true))?;
+                conn.call(req)
             }
         }
     }
 
     fn tree(&self, package: &str) -> Result<Value> {
-        let r = self.call(json!({"op": "tree", "package": package}))?;
+        let r = self
+            .call(json!({"op": "tree", "package": package}))
+            .map_err(|(e, _)| e)?;
         r.get("tree")
             .cloned()
             .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))
     }
 
-    fn action(&self, ref_id: u32, action: &str, text: Option<&str>) -> Result<()> {
+    /// [`Self::action`], keeping `call`'s transport flag for callers that must not retry a
+    /// possibly-dispatched action by another route.
+    fn action_result(
+        &self,
+        ref_id: u32,
+        action: &str,
+        text: Option<&str>,
+    ) -> std::result::Result<(), (GlassError, bool)> {
         let mut req = json!({"op": "action", "ref": ref_id, "action": action});
         if let Some(t) = text {
             req["text"] = json!(t);
@@ -205,8 +217,14 @@ impl ServiceClient {
         self.call(req).map(|_| ())
     }
 
+    fn action(&self, ref_id: u32, action: &str, text: Option<&str>) -> Result<()> {
+        self.action_result(ref_id, action, text).map_err(|(e, _)| e)
+    }
+
     pub fn ping(&self) -> Result<()> {
-        self.call(json!({"op": "ping"})).map(|_| ())
+        self.call(json!({"op": "ping"}))
+            .map(|_| ())
+            .map_err(|(e, _)| e)
     }
 }
 
@@ -275,6 +293,22 @@ impl Accessibility for ServiceA11y {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<()> {
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
+        let node = actuable_node(&tree, target)?;
+        let chosen = node.id;
+        if !node.states.enabled {
+            return Err(disabled_error(target.id.0, chosen));
+        }
+        self.client
+            .action_result(chosen.0, "click", None)
+            .map_err(|(e, transport)| action_error(target.id.0, &e, transport))
     }
 }
 
@@ -477,7 +511,6 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
 /// carries no name and the named child carries no `ACTION_CLICK`. When the target itself
 /// advertises no click, climb to the nearest node that does and encloses it — the same node a
 /// tap at the target's centre would have been handled by.
-#[cfg_attr(not(test), allow(dead_code))]
 fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     crate::a11y::fingerprinted(tree, target)?;
     let mut path = Vec::new();
@@ -518,6 +551,29 @@ fn encloses(outer: Option<AxRect>, inner: Option<AxRect>) -> bool {
         && i64::from(o.y) <= i64::from(i.y)
         && i64::from(o.x) + i64::from(o.width) >= i64::from(i.x) + i64::from(i.width)
         && i64::from(o.y) + i64::from(o.height) >= i64::from(i.y) + i64::from(i.height)
+}
+
+/// The error for a target the tree says is disabled. Deliberately not `AxActionUnavailable`:
+/// a pointer click would tap a control that cannot act and report success.
+fn disabled_error(target: u32, chosen: AxNodeId) -> GlassError {
+    GlassError::AxActionFailed(
+        target,
+        format!(
+            "element {} is disabled, so its click action was refused; no pointer click was \
+             synthesized on top of it",
+            chosen.0
+        ),
+    )
+}
+
+/// Map an `action` failure onto the invoke contract. Neither arm is fallback-eligible: a
+/// refusal may still have reached the toolkit, and a lost answer says nothing either way.
+fn action_error(target: u32, e: &GlassError, transport: bool) -> GlassError {
+    if transport {
+        GlassError::AccessibilityUnavailable(format!("a11y service action call failed: {e}"))
+    } else {
+        GlassError::AxActionFailed(target, e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1039,5 +1095,32 @@ mod tests {
             actuable_node(&t, &target),
             Err(GlassError::AxActionUnavailable(2))
         ));
+    }
+
+    #[test]
+    fn a_disabled_target_errors_instead_of_falling_back_to_a_pointer_click() {
+        let e = disabled_error(2, AxNodeId(1));
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(
+            e.to_string().contains("disabled"),
+            "the message must say why: {e}"
+        );
+    }
+
+    #[test]
+    fn a_device_refusal_is_not_fallback_eligible() {
+        // The device answered and refused. The call may have reached the toolkit, so a pointer
+        // click on top of it could actuate the control twice.
+        let inner = GlassError::Backend("agent: ACTION_CLICK refused".into());
+        let e = action_error(2, &inner, false);
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(e.to_string().contains("ACTION_CLICK refused"), "{e}");
+    }
+
+    #[test]
+    fn a_transport_failure_is_not_fallback_eligible_either() {
+        let inner = GlassError::Backend("agent write: broken pipe".into());
+        let e = action_error(2, &inner, true);
+        assert!(!e.invoke_fallback_eligible(), "{e}");
     }
 }
