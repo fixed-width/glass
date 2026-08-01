@@ -10,16 +10,11 @@ publish = false
 glass-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# `event` for the change subscription in `events.rs`; `uiautomation` gates its event handler
-# types behind it. No new crate, and it resolves against the existing lockfile.
+# `event` gates the event-handler types `events.rs` registers.
 uiautomation = { version = "0.25", features = ["process", "event"] }
-# `IUIAutomation2::SetTransactionTimeout`, to bound every cross-process call the subscription
-# makes (registration, the liveness probe, teardown). `uiautomation` exposes neither that
-# interface nor the `CUIAutomation8` coclass that implements it, so `events.rs` creates its own
-# automation object — hence `Win32_System_Com` for `CoInitializeEx`/`CoCreateInstance` alongside
-# `Win32_UI_Accessibility`. Already a workspace dependency at this version (glass-windows,
-# glass-clip-hook), and `uiautomation` itself already requests both of these features
-# transitively, so this is a dependency line, not a version change to the resolved graph.
+# For `IUIAutomation2::SetTransactionTimeout`, which bounds the subscription's cross-process
+# calls: `uiautomation` exposes neither that interface nor the `CUIAutomation8` coclass behind
+# it, so `events.rs` builds its own automation object — hence `Win32_System_Com` as well.
 windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com"] }
 
 [lints]

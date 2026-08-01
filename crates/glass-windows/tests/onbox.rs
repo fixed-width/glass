@@ -1614,7 +1614,7 @@ fn glass_counting(
 
 /// The point of the subscription, measured against a real app: a wait for something that never
 /// happens must stop re-reading the tree. A UIA walk is the most expensive of any backend —
-/// 2360ms for 1500 nodes on the dogfood box — so this is where the saving is largest.
+/// 2360ms for 1500 nodes, measured on a Windows box — so this is where the saving is largest.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
@@ -1659,9 +1659,9 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
     );
 }
 
-/// Finding 1(a): `walked <= 5` above bounds a number, not an improvement — a build that always
-/// walked 5 times regardless of the subscription would still pass it. This runs the identical 3s
-/// quiet wait through two sessions that differ in exactly one thing — whether `subscribe_changes`
+/// `walked <= 5` above bounds a number, not an improvement — a build that always walked 5 times
+/// regardless of the subscription would still pass it. This runs the identical 3s quiet wait
+/// through two sessions that differ in exactly one thing — whether `subscribe_changes`
 /// ever hands back a working signal (see [`Counting::signal_enabled`]) — and asserts the signalled
 /// run beats the polling one by a clear margin. That margin, not the raw walk count, is the number
 /// worth quoting as the saving.
@@ -1786,9 +1786,8 @@ fn find_window_by_title(title: &str) -> Option<i64> {
 /// The pid of the most recently started `charmap.exe` process, via a `Get-Process` shell-out (the
 /// same PowerShell-query pattern [`our_edge_count`] already uses elsewhere in this file) —
 /// independent of any `Glass`/`Platform` instance. "Most recent" rather than "the only one": if an
-/// earlier test leaked a `charmap.exe` (a documented, actively-checked-for risk in this file — see
-/// the on-box leak check in the branch's own verification steps), this test's own instance is still
-/// the newest by construction, since it was launched last.
+/// earlier test leaked a `charmap.exe` — a documented, actively-checked-for risk in this file —
+/// this test's own instance is still the newest by construction, since it was launched last.
 fn newest_charmap_pid() -> Option<u32> {
     let ps = "(Get-Process charmap -ErrorAction SilentlyContinue | \
               Sort-Object StartTime -Descending | Select-Object -First 1).Id";
@@ -1852,9 +1851,9 @@ fn window_rect_geometry(handle: i64) -> WindowGeometry {
     }
 }
 
-/// Finding 1(b): the tests above prove correctness without a late change
-/// (`onbox_a_wait_with_a_signal_still_matches`, already on screen) and cost without a match
-/// (the quiet-wait tests), but none of them ever drives `ChangeWait::Changed => true` inside
+/// The tests above prove correctness without a late change
+/// (`onbox_a_wait_with_a_signal_still_matches`, already on screen) and cost without a match (the
+/// quiet-wait tests), but none of them ever drives `ChangeWait::Changed => true` inside
 /// `Glass::wait_for_element`'s poll loop (`session/wait.rs`) from a change nothing but a real UIA
 /// event produced. This does: the main thread blocks in `wait_for_element` for a control that does
 /// not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`, the target window
@@ -2031,9 +2030,11 @@ fn winforms_fixture_spec() -> AppSpec {
 /// `walked > 1` does not, on its own, prove no event fired — an announced transition and a forced
 /// re-read land close enough together in walk count that this assertion cannot tell them apart.
 /// That WinForms never announces `IsEnabled` comes from the 2026-07-31 on-box probe, not from
-/// this test. If this assertion starts failing, the bridge began announcing `IsEnabled` after
-/// all, and the disclosure on `WatchedProperty::IsEnabled` (`glass-a11y-windows/src/mapping.rs`)
-/// and the changelog entry for it are both stale.
+/// this test. Nor does a failure say anything about the bridge: `walked > 1` fails only at
+/// `walked == 1`, meaning the wait's very first read already found `Save` enabled — the fixture's
+/// 4s flip landed before the wait began, so start-up overran the sleep above. That is a timing
+/// problem to fix here, not evidence either way: an announced transition would wake the wait at
+/// walk #2 and pass.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
@@ -2046,6 +2047,7 @@ fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
     std::thread::sleep(Duration::from_millis(1200));
 
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
     let out = glass
         .wait_for_element(&glass_core::WaitElementParams {
             name: Some("Save".into()),
@@ -2073,8 +2075,8 @@ fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
     );
     assert!(
         walked > 1,
-        "the wait matched in {walked} walk(s), so something woke it — the WinForms bridge is \
-         announcing IsEnabled after all, and the disclosure on WatchedProperty::IsEnabled is now \
-         wrong"
+        "the wait matched in its first read ({walked} walk), so Save was already enabled when it \
+         started — the fixture's flip beat the wait, and this run measured nothing about the \
+         fallback"
     );
 }

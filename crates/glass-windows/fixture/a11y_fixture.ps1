@@ -2,8 +2,8 @@
 #
 # WinForms deliberately: those controls reach UI Automation through the legacy MSAA bridge,
 # which raises structure and name changes but never IsEnabled. That is the provider whose
-# behaviour `onbox_a_wait_for_enabled_falls_back_to_the_forced_reread` pins. A WPF or AccessKit
-# fixture is a *native* UIA provider and would announce the transition, proving the opposite.
+# behaviour `onbox_a_wait_for_enabled_falls_back_to_the_forced_reread` pins. A WPF fixture is a
+# *native* UIA provider and does announce the transition, probed the same way — the opposite case.
 #
 # Interpreted on purpose — no build step, matching the Linux fixtures' .py and unlike the macOS
 # .swift, which needs swiftc. Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File <this>
