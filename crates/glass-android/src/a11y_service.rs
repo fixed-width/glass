@@ -195,14 +195,12 @@ impl ServiceClient {
     }
 
     /// Run a request that can be run twice without consequence, transparently reconnecting
-    /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the
-    /// write, so this covers the ordinary "the service rebound between calls" case.
+    /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
     fn call(&self, req: Value) -> std::result::Result<Value, CallFailure> {
         self.call_with(req, CallFailure::is_transport)
     }
 
-    /// [`Self::call`] for a side-effecting request: re-send only what provably never went
-    /// out, so a request whose answer was lost is reported rather than run a second time.
+    /// [`Self::call`] for a side-effecting request: re-send only what provably never went out.
     fn call_once_sent(&self, req: Value) -> std::result::Result<Value, CallFailure> {
         self.call_with(req, CallFailure::nothing_sent)
     }
@@ -217,14 +215,14 @@ impl ServiceClient {
     }
 
     /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
-    /// keeps its delivery classification so the caller can say what it does and does not know.
+    /// keeps its delivery classification.
     fn click(&self, ref_id: u32) -> std::result::Result<(), CallFailure> {
         self.call_once_sent(json!({"op": "action", "ref": ref_id, "action": "click"}))
             .map(|_| ())
     }
 
-    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent — the same text written
-    /// twice leaves the same field contents — so this takes the reconnecting path.
+    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
+    /// reconnecting path.
     fn set_text(&self, ref_id: u32, text: &str) -> Result<()> {
         self.call(json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}))
             .map(|_| ())
@@ -260,8 +258,8 @@ impl ServiceA11y {
     }
 
     /// Poll until the actuated control reports `checked == want`. The toolkit's UI update
-    /// reaches the accessibility tree a beat after the action, so an acknowledgement is not
-    /// proof; `set_value` polls for the same reason.
+    /// reaches the accessibility tree a beat after the action; `set_value` polls for the same
+    /// reason.
     fn wait_for_check(&mut self, ctx: &AxContext, plan: &InvokePlan, want: bool) -> Result<()> {
         let deadline = std::time::Instant::now() + self.check_timeout;
         loop {
@@ -544,9 +542,9 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
     }
 }
 
-/// One node's identity, captured when it is actuated so the state read back after the click
-/// can be confirmed to be that same control. An `AxNodeId` is a positional pre-order index
-/// re-derived per snapshot, so an id alone can resolve to a different node in the next tree.
+/// One node's identity, captured at actuation so a state read back after the click can be
+/// confirmed to be that same control. An `AxNodeId` is a positional pre-order index re-derived
+/// per snapshot, so an id alone can land on a different node in the next tree.
 #[derive(Debug)]
 struct Actuated {
     id: AxNodeId,
@@ -573,8 +571,8 @@ impl InvokePlan {
 }
 
 /// Whether clicking a control of this role must move its `checked` state. A checkbox or a
-/// switch toggles. A radio button or a tab selects, and clicking the one already selected
-/// leaves it selected — a correct no-op, not a click that failed.
+/// switch toggles; a radio button or a tab selects, and clicking the one already selected
+/// leaves it selected.
 fn toggles(role: AxRole) -> bool {
     matches!(role, AxRole::CheckBox | AxRole::ToggleButton)
 }
@@ -582,9 +580,8 @@ fn toggles(role: AxRole) -> bool {
 /// Decide what an `invoke` does with `target`: which node to actuate, and what the tree must
 /// show afterwards. Pure, so the decision is testable without a device.
 ///
-/// The order is load-bearing. The target's own fingerprint and `enabled` are read off the node
-/// the caller named, before the climb: a Compose control omits `ACTION_CLICK` while disabled,
-/// so a climb run first walks straight past it and actuates whatever encloses it.
+/// The order is load-bearing: a Compose control omits `ACTION_CLICK` while disabled, so a climb
+/// run before the target's own `enabled` check walks past it and actuates whatever encloses it.
 fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
     let node = crate::a11y::fingerprinted(tree, target)?;
     if !node.states.enabled {
@@ -592,11 +589,9 @@ fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
     }
     // Under these caps the kept nodes are no longer a pre-order prefix — the walk drops a
     // subtree and carries on with later siblings — so a host id no longer equals the device
-    // `ref` it would be sent as, and the click would dispatch to a different device node.
-    // `Nodes` stops the walk outright and keeps the prefix, so it stays actuable.
-    //
-    // Fallback-eligible on purpose: nothing has been dispatched, and the pointer path aims at
-    // this tree's own bounds, which the id/`ref` skew does not touch.
+    // `ref` it would be sent as. `Nodes` stops the walk outright and keeps the prefix.
+    // Fallback-eligible on purpose: nothing was dispatched, and the pointer path aims at this
+    // tree's own bounds, which the id/`ref` skew does not touch.
     if let Some(t) = &tree.truncated
         && matches!(t.limit, TruncationLimit::Depth | TruncationLimit::Siblings)
     {
@@ -633,10 +628,9 @@ enum CheckState {
 
 /// Read the actuated control's `checked` out of a tree taken after the click.
 ///
-/// The id alone is not enough to accept a state change by: it is positional, so a node the
-/// click added above the control shifts every later id, and `checked` reads `false` on any
-/// node that has no checked state at all — between them, an inert label sliding into the id
-/// reads as a flip.
+/// The id alone cannot accept a state change: it is positional, so a node the click added above
+/// the control shifts every later id, and `checked` reads `false` on any node with no checked
+/// state — between them, an inert label sliding into the id reads as a flip.
 fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
     match after.find(act.id) {
         Some(n) if n.states.checkable && n.role == act.role && n.name == act.name => {
@@ -650,9 +644,8 @@ fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
 ///
 /// A Compose button's label and its clickable node are different nodes: the touch-target
 /// carries no name and the named child carries no `ACTION_CLICK`. When the target itself
-/// advertises no click, climb to the nearest node that does and encloses it. Only the target's
-/// own ancestor chain is walked, so this is the node a tap at the target's centre would reach
-/// short of an overlapping sibling drawn above it.
+/// advertises no click, climb to the nearest node that does and encloses it. Only the ancestor
+/// chain is walked, so an overlapping sibling drawn above the target could still take a real tap.
 fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let mut path = Vec::new();
     if !path_to(&tree.root, target.id, &mut path) {
@@ -714,8 +707,8 @@ fn action_error(target: u32, f: CallFailure) -> GlassError {
         CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
             "the click on element {target} could not be sent: {e}"
         )),
-        // Non-fallback-eligible is not enough here: the message has to stop a human or an
-        // agent re-clicking by hand what may already have actuated.
+        // Non-fallback-eligible only stops glass re-clicking; the message has to stop a human
+        // or an agent doing it by hand.
         CallFailure::AnswerLost(e) => GlassError::AccessibilityUnavailable(format!(
             "the click on element {target} was sent but its result was lost ({e}); it may or \
              may not have actuated — re-snapshot to see the app's state rather than clicking \
@@ -1303,8 +1296,7 @@ mod tests {
         let e = action_error(2, CallFailure::AnswerLost(inner));
         assert!(matches!(e, GlassError::AccessibilityUnavailable(_)), "{e}");
         assert!(!e.invoke_fallback_eligible(), "{e}");
-        // Refusing to fall back is only half of it: the message has to stop a human or an
-        // agent clicking again by hand.
+        // Refusing to fall back is only half of it — the message has to stop a hand-retry.
         let m = e.to_string();
         assert!(m.contains("was sent"), "{m}");
         assert!(m.contains("may or may not have actuated"), "{m}");
@@ -1332,9 +1324,9 @@ mod tests {
 
     #[test]
     fn a_control_that_vanished_after_the_click_is_not_reported_as_never_moving() {
-        // A checkable row that navigates, a toggle in a dismissing dialog: the state was never
-        // read back at all, and "it stayed <was>" would be an actively wrong diagnosis of a
-        // click that worked — one that invites the retry that actuates twice.
+        // A checkable row that navigates, a toggle in a dismissing dialog: "it stayed <was>"
+        // would be a wrong diagnosis of a click that worked, inviting the retry that actuates
+        // twice.
         let act = actuated(1, AxRole::CheckBox, "Agree");
         let e = check_timeout(2, &act, true, CheckState::Gone);
         let m = e.to_string();
@@ -1375,9 +1367,9 @@ mod tests {
 
     #[test]
     fn a_node_that_inherited_the_id_does_not_count_as_the_flip() {
-        // The app rejected the change and showed an error line above the control, so the tree
-        // gained a node and every later id shifted. Id 1 is now an inert label, whose `checked`
-        // reads false on any node — which a bare `checked != was` reads as an unchecking.
+        // The app rejected the change and showed an error line above the control, so every
+        // later id shifted. Id 1 is now an inert label, whose `checked` reads false — which a
+        // bare `checked != was` reads as an unchecking.
         let after = after_tree(vec![
             json!({
                 "class": "android.widget.TextView", "text": "You must agree first",
@@ -1429,8 +1421,7 @@ mod tests {
 
     #[test]
     fn a_label_climbs_to_the_nearest_clickable_ancestor_not_the_outermost() {
-        // Both the card and the button enclose the label and both advertise a click. Climbing
-        // to the card actuates "open detail" where the caller asked for "delete".
+        // Climbing to the card actuates "open detail" where the caller asked for "delete".
         let t = built(&nested_clickables());
         let label = target_for(&t, AxNodeId(3));
         assert_eq!(label.name.as_deref(), Some("Delete"));
@@ -1441,9 +1432,9 @@ mod tests {
         );
     }
 
-    /// A disabled control that advertises no click of its own, inside a clickable card. This is
-    /// the Compose shape: the accessibility delegate omits `ACTION_CLICK` while a control is
-    /// disabled, so nothing but the node's own `enabled` flag says to refuse.
+    /// A disabled control that advertises no click of its own, inside a clickable card — the
+    /// Compose shape, where the delegate omits `ACTION_CLICK` while a control is disabled, so
+    /// nothing but the node's own `enabled` flag says to refuse.
     fn disabled_inside_a_clickable_card() -> Value {
         let mut v = nested_clickables();
         v["children"][0]["children"][0]["clickable"] = json!(false);
@@ -1503,8 +1494,8 @@ mod tests {
 
     #[test]
     fn re_clicking_a_selected_radio_button_asks_for_no_state_change() {
-        // A radio button that is already selected stays selected: the click is a correct no-op,
-        // so waiting for a flip would fail a click on a UI already in the requested state.
+        // A radio button already selected stays selected, so waiting for a flip fails a click
+        // on a UI already in the requested state.
         let t = selection_tree("android.widget.RadioButton", true);
         let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
         assert_eq!(plan.want_checked, None);
@@ -1568,9 +1559,8 @@ mod tests {
 
     #[test]
     fn a_depth_truncated_tree_does_not_actuate_natively() {
-        // The depth cap drops a node's children and carries on with later siblings, so the
-        // kept set is no longer a pre-order prefix and a host id no longer equals the device
-        // `ref` the click would be sent as.
+        // The depth cap drops a node's children and carries on with later siblings, so the kept
+        // set is no longer a pre-order prefix.
         let t = truncated_compose(WalkLimits {
             depth: 1,
             ..WalkLimits::DEFAULT
@@ -1579,7 +1569,7 @@ mod tests {
         let e = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap_err();
         assert!(matches!(e, GlassError::AxActionUnavailable(1)), "{e}");
         // Nothing was dispatched and the pointer path aims at this tree's own bounds, so the
-        // click still lands — as a disclosed pointer click.
+        // click still lands, disclosed as a pointer click.
         assert!(e.invoke_fallback_eligible(), "{e}");
     }
 
@@ -1611,8 +1601,8 @@ mod tests {
 
     #[test]
     fn a_node_capped_tree_still_actuates_natively() {
-        // The node cap stops the walk outright, so what it kept IS a pre-order prefix and every
-        // surviving id still equals its device `ref`.
+        // The node cap stops the walk outright, so every surviving id still equals its device
+        // `ref`.
         let t = truncated_compose(WalkLimits {
             nodes: 2,
             ..WalkLimits::DEFAULT
@@ -1693,9 +1683,9 @@ mod tests {
         (port, ops)
     }
 
-    /// A reader wired to a fake device. `check_timeout` is passed explicitly so a test that
-    /// must watch a state check time out does not wait out the production budget;
-    /// `Duration::ZERO` makes it read the tree back exactly once.
+    /// A reader wired to a fake device. `check_timeout` is passed explicitly so a test watching
+    /// a state check time out does not wait out the production budget; `Duration::ZERO` makes it
+    /// read the tree back exactly once.
     fn reader(port: u16, check_timeout: std::time::Duration) -> ServiceA11y {
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         let mut a = ServiceA11y::new(client, String::new());
@@ -1719,8 +1709,8 @@ mod tests {
 
     #[test]
     fn a_click_whose_answer_was_lost_is_not_re_sent() {
-        // The write landed and the response did not come back. Re-sending on a fresh socket —
-        // what a transparent reconnect does — dispatches a second ACTION_CLICK and reports one
+        // The write landed and the response did not come back. Re-sending on a fresh socket,
+        // as a transparent reconnect does, dispatches a second ACTION_CLICK and reports one
         // successful native click.
         let (port, ops) = fake_service(vec![compose_like()], OnAction::DropWithoutAnswering);
         let mut a = reader(port, std::time::Duration::ZERO);
@@ -1742,8 +1732,8 @@ mod tests {
 
     #[test]
     fn the_click_is_sent_to_the_node_the_climb_resolved_to() {
-        // Sending the caller's own id would click the label, which handles nothing — the climb
-        // would be decorative and every Compose click a no-op reported as success.
+        // Sending the caller's own id would click the label, which handles nothing — every
+        // Compose click a no-op reported as success.
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let mut a = reader(port, std::time::Duration::ZERO);
         let t = built(&compose_like());

@@ -208,9 +208,8 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                     if let Some(reason) = m.native_fallback() {
                         args["native_fallback"] = json!(reason);
                     }
-                    // Which object was actuated, when it is not the one the caller named:
-                    // "clicked the Save label" and "clicked the card around it, which
-                    // navigated away" are otherwise indistinguishable in the record.
+                    // Without this, "clicked the Save label" and "clicked the card around it,
+                    // which navigated away" are indistinguishable in the record.
                     if let Some(actuated) = m.actuated() {
                         args["actuated_id"] = json!(actuated.0);
                     }

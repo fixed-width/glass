@@ -13,16 +13,15 @@ use serde_json::{Value, json};
 /// The protocol version this client speaks (must match the agent's hello `proto`).
 pub(crate) const PROTO: i64 = 1;
 
-/// Why one [`Conn::call`] failed, and what it says about delivery. A side-effecting request
-/// may only be re-sent when nothing reached the device: `ACTION_CLICK` is not idempotent, so
-/// re-sending one whose answer was merely lost actuates the control twice.
+/// Why one [`Conn::call`] failed, and what it says about delivery. `ACTION_CLICK` is not
+/// idempotent, so re-sending one whose answer was merely lost actuates the control twice.
 pub(crate) enum CallFailure {
     /// The write failed, so the request never reached the device.
     NotSent(GlassError),
     /// The request went out and no answer came back; it may or may not have run.
     AnswerLost(GlassError),
-    /// The device answered — with a refusal, or with something this client could not read
-    /// as a success. Either way it ran what it was going to run.
+    /// The device answered — with a refusal, or with something this client could not read as
+    /// a success. Either way it ran what it was going to run.
     Refused(GlassError),
 }
 
@@ -44,8 +43,8 @@ impl CallFailure {
         matches!(self, CallFailure::NotSent(_))
     }
 
-    /// This classification carrying `e` instead — for a failure hit while recovering from
-    /// this one, which says no more about delivery than this one already did.
+    /// This classification carrying `e` instead: a failure hit while recovering from this one
+    /// says no more about delivery.
     pub(crate) fn with_error(&self, e: GlassError) -> CallFailure {
         match self {
             CallFailure::NotSent(_) => CallFailure::NotSent(e),

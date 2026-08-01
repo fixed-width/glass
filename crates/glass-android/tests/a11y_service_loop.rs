@@ -200,8 +200,8 @@ fn native_invoke_actuates_the_fixture() {
     let t = snap(&mut a11y);
     let row_node = by_desc(&t.root, "Row250").expect("Row250");
     let b = row_node.bounds.expect("the row reports bounds");
-    // Prove the premise rather than trusting the fixture: if the list shrank or the screen grew,
-    // this leg would silently become a second copy of the one above and still pass.
+    // If the list shrank or the screen grew, this leg would silently become a second copy of
+    // the one above and still pass.
     let window_h = i32::try_from(ctx.window.height).expect("window height fits an i32");
     let row_h = i32::try_from(b.height).expect("row height fits an i32");
     assert!(
@@ -253,7 +253,7 @@ fn native_invoke_actuates_the_fixture() {
     p.start_app(&spec("InvokeComposeFixtureActivity"))
         .expect("launch compose fixture");
     // The platform reports the app up before the Compose hierarchy has published its
-    // accessibility tree, so poll for the label instead of sleeping on a guess.
+    // accessibility tree.
     let deadline = std::time::Instant::now() + AWAIT_DEADLINE;
     let t = loop {
         let t = snap(&mut a11y);
