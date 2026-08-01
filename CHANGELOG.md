@@ -7,7 +7,10 @@ and glass adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!--
 Maintenance: add entries under [Unreleased] as user-facing changes merge to
-master. At release time, rename [Unreleased] to the new version with its UTC
+master, into the ### heading that already exists for their kind — one Added,
+one Changed, one Fixed per version, in that order. A branch that appends its
+own heading reads fine on its own and leaves the section with three of each
+once several have merged. At release time, rename [Unreleased] to the new version with its UTC
 release date (the GitHub release's `published_at` date, so the changelog matches
 the site's release list), add a fresh empty [Unreleased] above it, and update the compare links at the
 bottom. Keep entries user-facing — what changed for someone using glass — not
@@ -16,37 +19,67 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
-### Changed
-- On Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
-  Where UI Automation announces a property change, a wait for something that has not happened yet
-  now reads the tree when something changes instead of once per interval — measured on hardware at
-  `interval_ms: 100`, 4 walks for a 3-second wait where it previously took 24. It still re-reads
-  once a second regardless, and once more before reporting nothing found, so a change the platform
-  does not announce costs latency, not a wrong answer. That matters most for `condition: "enabled"`:
-  of the two providers measured, a WinForms app never announced a control becoming enabled and a
-  WPF one did. Every other backend polls exactly as before, and so does Windows if the subscription
-  cannot be established or stops delivering.
+### Added
+- The advertised MCP schema now documents what it did not. Every tool parameter carries a
+  description, and `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and
+  `glass_logs` describe what they do to the app rather than which sibling tool to prefer instead.
+  Between them they state the coordinate space (window-relative everywhere except `glass_window`'s
+  `move`, which positions the window on screen), the defaults for click count, drag/settle timing
+  and log paging, and the behaviour a caller cannot see from the type and would otherwise learn by
+  trial: `glass_type` does not focus a field and types into whatever already has focus, and a
+  newline in its text does not press Return; `glass_drag` refuses a path with any endpoint outside
+  the window; `glass_stop` discards the captured logs and element ids; `glass_baseline_save`
+  replaces an existing name silently; `glass_logs` returns whatever has accumulated without waiting
+  (`glass_wait_for_log` is the blocking one); and `glass_start`'s `timeout_ms` bounds waiting for
+  the window, not the `build` step.
+- Accessibility elements can now carry a second label. `glass_a11y_snapshot` renders it as
+  `desc="…"` after the name — an icon-only button that used to reach you as a role and a
+  rectangle now says what it is — and the `glass_a11y_marks` legend labels an unnamed element
+  from it, spelled `desc="…"` there too. `glass_wait_for_element` and `glass_scroll_to_element`
+  report it on the element they matched. It is display-only: both tools still select on `name`.
+  All five backends now source the field: the Linux, Windows and macOS readers read AT-SPI
+  `Description`, UI Automation `HelpText`, and AX `AXHelp` respectively; the two Android readers
+  read whichever of an element's text and content-description did not become the name or the
+  value; and the iOS reader reads the element's accessibility hint, falling back to the label an
+  editable element's identifier displaced. On Android a description needs one node to carry two
+  distinct labels and most controls carry only one, so expect `desc` to be absent on most Android
+  nodes.
+- `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
+  the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
+  (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is
+  selected by a flag can be driven.
+- `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
+  `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
+  fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
+  with guidance to use a `settle` action or the terminal `then` observe instead.
+- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
+  each platform backend can produce, and why a role is unavailable where it is. Two example apps
+  hold the controls its cells are decided from — one screen of stock `android.widget` controls in
+  [`examples/android-role-fixture/`](examples/android-role-fixture/) (builds without Gradle) and the
+  UIKit and SwiftUI equivalents in [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so
+  anyone can read the same trees back.
+- More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
+  and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
+  Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
+  hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
+  Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
+  as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
+- `glass_doctor` now returns structured data alongside its rendered `report` text: `sections`
+  (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
+  diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
+  of parsing prose. Purely additive: `report` is unchanged.
 
-### Fixed
-- A `glass_wait_for_element` shorter than a second could report an element absent that was on
-  screen. Where the platform announces changes, the wait skips reads it has been told are pointless
-  and reads anyway once a second in case it was told wrong — but that second was previously counted
-  in polling intervals rather than measured, so at the 200ms default it landed at two seconds, past
-  the end of many waits. Such a wait answered from the single read it took before the change it was
-  waiting for. It now reads once more before reporting nothing found, whatever its length, and the
-  once-a-second floor no longer moves with `interval_ms`. Affects every backend that can subscribe
-  to change notifications.
-- Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
-  name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
-  *different* data — a recycled list row reusing the same view is the case this closes — is now
-  rejected as changed since the snapshot rather than written to. An editable element with no
-  content description and no resource id has no name at all, so role plus an 8px bounds match used
-  to be the whole fingerprint a write re-walked against. The value only discriminates where there
-  was one to capture: rows of *empty* fields share a role, a name, a rect and no value alike, so a
-  write can still land on the wrong one of those — re-snapshot before writing into a list that has
-  scrolled.
-
 ### Changed
+- On Linux and Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on
+  a timer. Where the platform can say whether anything changed, a wait for something that has not
+  happened yet now reads the tree when something changes instead of once per interval — measured at
+  `interval_ms: 100`, 4 reads for a 3-second wait against the GTK test fixture where it previously
+  took 22, and 4 on Windows hardware where it previously took 24. It re-reads once a second
+  regardless, and once more before reporting nothing found, so a change the platform does not
+  announce costs latency, not a wrong answer. That matters most on Windows for
+  `condition: "enabled"`: of the two providers measured, a WinForms app never announced a control
+  becoming enabled and a WPF one did. Every other backend polls exactly as before, and so do these
+  two if the subscription cannot be established or stops delivering.
 - Both Android readers now name an element the same way. The same control used to answer
   differently depending on which reader was running — `uiautomator` and the on-device
   accessibility-service reader disagreed on which label became the `name` — so a `name:`
@@ -83,126 +116,7 @@ internal refactors, CI, or test-only changes.
   as a clickable `Group` exactly as the `value_contains` form did. `uiautomator` never reported a
   value there, so a selector written against that reader is unaffected.
 
-### Added
-- Every tool parameter now carries a description in the advertised MCP schema, so an agent can
-  read a parameter's meaning without inferring it from the name. The additions cover the
-  coordinate space (window-relative everywhere except `glass_window`'s `move`, which positions
-  the window on screen), the defaults for click count, drag/settle timing and log paging, and
-  behaviour a caller cannot see from the type — `glass_baseline_save` overwrites an existing
-  name silently, `glass_type` types into whatever already has focus, and `glass_start`'s
-  `timeout_ms` bounds waiting for the window, not the `build` step.
-- `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and `glass_logs`
-  now describe what they do to the app and when to reach for them rather than a sibling tool.
-  Each states the consequence a caller would otherwise learn by trial: `glass_type` does not
-  focus a field and a newline in its text does not press Return, `glass_drag` refuses a path
-  with any endpoint outside the window, `glass_stop` discards the captured logs and element ids,
-  `glass_baseline_save` replaces an existing name silently, and `glass_logs` returns whatever
-  has accumulated without waiting (`glass_wait_for_log` is the blocking one).
 
-### Changed
-- On Linux, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
-  Where the platform can say whether anything changed, a wait for something that has not happened
-  yet now reads the tree when something changes instead of once per interval — measured against the
-  GTK test fixture, 4 reads for a 3-second wait where it previously took 22. It re-reads once a
-  second regardless, and always once more before reporting nothing found, so a change the platform
-  does not announce costs latency, not a wrong answer.
-  Every other backend polls exactly as before, and so does Linux if the subscription cannot be
-  established or stops delivering.
-
-### Fixed
-- The tool reference said a negative input coordinate addressed a point off the window's
-  top-left edge. It is rejected, like any other point outside the window, before the backend
-  sees it; the reference now says so and a test covers the negative case.
-- A switch now reports the same role on Windows, macOS, Android and iOS. `glass_a11y_snapshot`
-  called one a `CheckBox` on iOS, and a `Button` or a `CheckBox` on macOS depending on which toolkit
-  drew it, so a `role:"ToggleButton"` selector that worked on one machine silently matched nothing on
-  another. Both now read the platform's switch marker and report `ToggleButton`. A macOS switch drawn
-  with AppKit also gains the checked state it never reported, so `condition:"checked"` works on it.
-
-  Two things to know. A `role:"CheckBox"` selector that used to match a switch on iOS or macOS no
-  longer does — match `ToggleButton`, or match by name. And Linux is unchanged and still differs: a
-  GTK4 switch is published over AT-SPI as a check box, indistinguishable from a real one, so it
-  arrives as `CheckBox` there.
-- `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
-  used to say the reader was available whatever the accessibility API was doing, so the one case you
-  need it for — the reader is not answering — showed green. It now reads one attribute off the
-  system-wide accessibility element and reports what happened, with the error code. macOS gives the
-  same code for several causes, so the line names the one that applies: not trusted, nobody logged in
-  at the console, assistive access switched off, or a binary that was never granted despite the
-  system reporting it as trusted — each with its own remedy. A logged-out console is a warning rather
-  than a failure, since it is not a broken install.
-- `glass doctor`'s iOS device line now reports which simulator glass would drive, by running the same
-  resolution `glass_start` runs. It listed how many were available and nothing more. Nothing booted
-  is fine and says so — glass boots one at start — and an iPad-only host is no longer reported as
-  having no device, since glass drives any iOS simulator. What is now reported as a failure is what
-  the start path will not fix for you: a `GLASS_IOS_UDID` that names a simulator which is not booted,
-  or is not on this host, or is not an iOS simulator at all (glass attaches to a pinned device
-  without booting or checking it, so every call would fail against it), and a `GLASS_IOS_DEVICE` that
-  matches nothing here — each with the remedy that fits. A device listing that cannot be read says
-  that, rather than reporting it as nothing booted.
-- `glass_set_value` now tells you when a write did not take on Android (without the on-device
-  accessibility service) and on the iOS Simulator. Those two backends tap the element, clear it and
-  type — and used to report success without ever looking again, so a tap that landed slightly off, a
-  field that rejected the input, or a dropped keystroke all came back as `ok`, and everything you
-  asserted afterwards was against a screen that never changed. They now read the element back and
-  require it to hold exactly what you asked for. A field that reformats what it is given (a phone
-  number becoming `(123) 456-7890`) is reported as not applied even though the text arrived: read the
-  element to see what it holds. Clearing a field is judged its own way — it has to read back empty —
-  so on a platform that reports an emptied field's placeholder as its text (Android does), a clear
-  that worked is also reported as not applied. Windows and macOS already read the value back, and
-  Android's on-device service reader already did too; the Linux reader still trusts the toolkit's own
-  answer.
-- An Android or iOS Simulator command that stops answering no longer hangs the tool it was
-  serving. Every one-shot call glass makes to `adb`, `emulator`, `xcrun simctl`, `plutil` or `ps`
-  now has a deadline sized for what that call does — a full accessibility dump gets longer than a
-  tap, an app install longer still, and waiting out a simulator boot longest of all — and a call
-  that exceeds it comes back as an error naming the operation, how long it waited, anything the
-  tool managed to say first, and what to try (for `adb`, `adb kill-server`). Log streaming is
-  unaffected: it is meant to run until you stop it.
-- A command that exits while something it started still holds its output pipe no longer returns
-  the partial output as though it were complete; it reports that the output may be truncated. A
-  short read of an accessibility or window dump used to parse as a smaller screen.
-
-### Added
-- Accessibility elements can now carry a second label. `glass_a11y_snapshot` renders it as
-  `desc="…"` after the name — an icon-only button that used to reach you as a role and a
-  rectangle now says what it is — and the `glass_a11y_marks` legend labels an unnamed element
-  from it, spelled `desc="…"` there too. `glass_wait_for_element` and `glass_scroll_to_element`
-  report it on the element they matched. It is display-only: both tools still select on `name`.
-  All five backends now source the field: the Linux, Windows and macOS readers read AT-SPI
-  `Description`, UI Automation `HelpText`, and AX `AXHelp` respectively; the two Android readers
-  read whichever of an element's text and content-description did not become the name or the
-  value; and the iOS reader reads the element's accessibility hint, falling back to the label an
-  editable element's identifier displaced. On Android a description needs one node to carry two
-  distinct labels and most controls carry only one, so expect `desc` to be absent on most Android
-  nodes.
-- `glass_start` on the iOS Simulator passes an app's launch arguments through: everything after
-  the `.app` path or bundle id in `run` reaches the app as its own arguments, joined
-  (`--tab=value`) and separated (`--tab value`) forms alike, so an app whose behaviour is
-  selected by a flag can be driven.
-- `glass_type` accepts an optional `return` observe (`"settle"` or `"snapshot"`), matching
-  `glass_click_element` and `glass_set_value` — type text and confirm the UI settled (or fold a
-  fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
-  with guidance to use a `settle` action or the terminal `then` observe instead.
-- [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
-  each platform backend can produce, and why a role is unavailable where it is.
-- Two example apps hold the controls that page's cells are decided from — one screen of stock
-  `android.widget` controls in [`examples/android-role-fixture/`](examples/android-role-fixture/)
-  (builds without Gradle) and the UIKit and SwiftUI equivalents in
-  [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so anyone can read the same trees
-  back.
-- More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
-  and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
-  Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
-  hierarchy and the `ViewPager` swipe-paged container; on iOS, content groups and headings.
-  Windows also distinguishes a button that can be toggled — a formatting bar's Bold or Italic —
-  as `ToggleButton`. `docs/reference/a11y-roles.md` lists what each platform can produce.
-- `glass_doctor` now returns structured data alongside its rendered `report` text: `sections`
-  (each check as `{name, status, detail, remedy?, remedy_action?}`, grouped under the section that
-  diagnoses it) and `overall`, the single verdict — `"ok"`/`"warn"`/`"fail"` — to branch on instead
-  of parsing prose. Purely additive: `report` is unchanged.
-
-### Changed
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
   Android launches an activity rather than a command line — `am start` takes intent extras, not
   program arguments — so anything beyond the `package/.Activity` component and an optional `.apk`
@@ -263,6 +177,77 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- A `glass_wait_for_element` shorter than a second could report an element absent that was on
+  screen. Where the platform announces changes, the wait skips reads it has been told are pointless
+  and reads anyway once a second in case it was told wrong — but that second was previously counted
+  in polling intervals rather than measured, so at the 200ms default it landed at two seconds, past
+  the end of many waits. Such a wait answered from the single read it took before the change it was
+  waiting for. It now reads once more before reporting nothing found, whatever its length, and the
+  once-a-second floor no longer moves with `interval_ms`. Affects every backend that can subscribe
+  to change notifications.
+- Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
+  name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
+  *different* data — a recycled list row reusing the same view is the case this closes — is now
+  rejected as changed since the snapshot rather than written to. An editable element with no
+  content description and no resource id has no name at all, so role plus an 8px bounds match used
+  to be the whole fingerprint a write re-walked against. The value only discriminates where there
+  was one to capture: rows of *empty* fields share a role, a name, a rect and no value alike, so a
+  write can still land on the wrong one of those — re-snapshot before writing into a list that has
+  scrolled.
+
+- The tool reference said a negative input coordinate addressed a point off the window's
+  top-left edge. It is rejected, like any other point outside the window, before the backend
+  sees it; the reference now says so and a test covers the negative case.
+- A switch now reports the same role on Windows, macOS, Android and iOS. `glass_a11y_snapshot`
+  called one a `CheckBox` on iOS, and a `Button` or a `CheckBox` on macOS depending on which toolkit
+  drew it, so a `role:"ToggleButton"` selector that worked on one machine silently matched nothing on
+  another. Both now read the platform's switch marker and report `ToggleButton`. A macOS switch drawn
+  with AppKit also gains the checked state it never reported, so `condition:"checked"` works on it.
+
+  Two things to know. A `role:"CheckBox"` selector that used to match a switch on iOS or macOS no
+  longer does — match `ToggleButton`, or match by name. And Linux is unchanged and still differs: a
+  GTK4 switch is published over AT-SPI as a check box, indistinguishable from a real one, so it
+  arrives as `CheckBox` there.
+- `glass doctor`'s macOS accessibility line now reports a real reading instead of assuming one. It
+  used to say the reader was available whatever the accessibility API was doing, so the one case you
+  need it for — the reader is not answering — showed green. It now reads one attribute off the
+  system-wide accessibility element and reports what happened, with the error code. macOS gives the
+  same code for several causes, so the line names the one that applies: not trusted, nobody logged in
+  at the console, assistive access switched off, or a binary that was never granted despite the
+  system reporting it as trusted — each with its own remedy. A logged-out console is a warning rather
+  than a failure, since it is not a broken install.
+- `glass doctor`'s iOS device line now reports which simulator glass would drive, by running the same
+  resolution `glass_start` runs. It listed how many were available and nothing more. Nothing booted
+  is fine and says so — glass boots one at start — and an iPad-only host is no longer reported as
+  having no device, since glass drives any iOS simulator. What is now reported as a failure is what
+  the start path will not fix for you: a `GLASS_IOS_UDID` that names a simulator which is not booted,
+  or is not on this host, or is not an iOS simulator at all (glass attaches to a pinned device
+  without booting or checking it, so every call would fail against it), and a `GLASS_IOS_DEVICE` that
+  matches nothing here — each with the remedy that fits. A device listing that cannot be read says
+  that, rather than reporting it as nothing booted.
+- `glass_set_value` now tells you when a write did not take on Android (without the on-device
+  accessibility service) and on the iOS Simulator. Those two backends tap the element, clear it and
+  type — and used to report success without ever looking again, so a tap that landed slightly off, a
+  field that rejected the input, or a dropped keystroke all came back as `ok`, and everything you
+  asserted afterwards was against a screen that never changed. They now read the element back and
+  require it to hold exactly what you asked for. A field that reformats what it is given (a phone
+  number becoming `(123) 456-7890`) is reported as not applied even though the text arrived: read the
+  element to see what it holds. Clearing a field is judged its own way — it has to read back empty —
+  so on a platform that reports an emptied field's placeholder as its text (Android does), a clear
+  that worked is also reported as not applied. Windows and macOS already read the value back, and
+  Android's on-device service reader already did too; the Linux reader still trusts the toolkit's own
+  answer.
+- An Android or iOS Simulator command that stops answering no longer hangs the tool it was
+  serving. Every one-shot call glass makes to `adb`, `emulator`, `xcrun simctl`, `plutil` or `ps`
+  now has a deadline sized for what that call does — a full accessibility dump gets longer than a
+  tap, an app install longer still, and waiting out a simulator boot longest of all — and a call
+  that exceeds it comes back as an error naming the operation, how long it waited, anything the
+  tool managed to say first, and what to try (for `adb`, `adb kill-server`). Log streaming is
+  unaffected: it is meant to run until you stop it.
+- A command that exits while something it started still holds its output pipe no longer returns
+  the partial output as though it were complete; it reports that the output may be truncated. A
+  short read of an accessibility or window dump used to parse as a smaller screen.
+
 - macOS: the release `.zip` and `.dmg` now carry a `README.md`, as every other platform's artifact
   already did. It covers the drag-to-`/Applications` install, the two permission grants (including
   that granting Screen Recording relaunches the app), and the `http://127.0.0.1:7300/` endpoint —
