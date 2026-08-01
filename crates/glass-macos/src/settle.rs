@@ -224,18 +224,24 @@ mod tests {
         assert_eq!(outcome, SettleOutcome::ReadFailed("window vanished"));
     }
 
-    /// Pins #263's "the predicate silently widened" review finding: `settle_by_polling` settles
-    /// purely on `T`'s `PartialEq`, so `T` itself is part of a caller's contract. `WindowMatch`
-    /// (the type an earlier revision of `settle_window` used as `T`) carries `geometry` — a
-    /// rounded pixel value — alongside `origin_pt`, the raw unrounded point origin `geometry` is
-    /// rounded from; two readings can agree on `geometry` while `origin_pt` keeps drifting inside
-    /// the same pixel forever. `Source` below mirrors just that shape: `pixel` is the value that
-    /// should decide settlement, `raw` stands in for a volatile field of the wider source data
-    /// that never repeats. A caller that narrows `T` to `pixel` alone settles despite `raw`'s
-    /// drift; this is the correction `settle_window` now applies (`T = WindowGeometry`, not
-    /// `WindowMatch`).
+    /// Pins #263's "the predicate silently widened" review finding, at the one seam that is
+    /// actually testable from Linux: `settle_by_polling` compares the *whole* value `read`
+    /// returns, via `T`'s ordinary `PartialEq` — nothing partial, nothing clever. This is exactly
+    /// why `settle_window` (in `backend.rs`, cfg-gated to macOS and unreachable from here) passes
+    /// `WindowGeometry` rather than the wider `WindowMatch`: `WindowMatch::origin_pt` is the raw
+    /// unrounded point origin `geometry` is rounded from, so it can drift forever inside an
+    /// already-settled pixel, and comparing the whole match — as an earlier revision of this
+    /// branch did — would make that drift block settling forever even though the geometry that
+    /// actually matters had already stopped changing. If `settle_by_polling`'s comparison were
+    /// ever narrowed to ignore part of `T` (a plausible "optimization"), a wide `T` like this one
+    /// would start settling despite an unmatched field still drifting, and this test would catch
+    /// it.
+    ///
+    /// `Source` stands in for `WindowMatch`: `pixel` is the field that should decide settlement
+    /// (like `geometry`), `raw` is a volatile field of the wider value that never repeats (like
+    /// `origin_pt`).
     #[test]
-    fn settling_ignores_drift_in_source_fields_outside_the_compared_value() {
+    fn a_wide_t_never_settles_while_any_of_its_fields_keeps_drifting() {
         #[derive(Clone, PartialEq)]
         struct Source {
             pixel: i32,
@@ -243,13 +249,20 @@ mod tests {
         }
 
         let mut raw = 0;
-        let (value, outcome) =
-            settle_by_polling(510, Duration::from_millis(50), Duration::ZERO, || {
+        let (_, outcome) = settle_by_polling(
+            Source { pixel: 510, raw },
+            Duration::from_millis(50),
+            Duration::ZERO,
+            || {
                 raw += 1;
-                let source = Source { pixel: 510, raw };
-                Ok::<i32, &str>(source.pixel)
-            });
-        assert_eq!(value, 510);
-        assert_eq!(outcome, SettleOutcome::Settled);
+                Ok::<Source, &str>(Source { pixel: 510, raw })
+            },
+        );
+        assert_eq!(
+            outcome,
+            SettleOutcome::BudgetExpired,
+            "pixel never changed, but raw never repeated either — comparing the whole Source \
+             must never settle"
+        );
     }
 }
