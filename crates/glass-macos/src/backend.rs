@@ -17,6 +17,7 @@ use glass_core::platform::{
 };
 use glass_core::{GlassError, Result};
 
+use crate::adoption_log::adoption_line;
 use crate::axwindow;
 use crate::clipboard_route::ClipboardRoute;
 use crate::coords;
@@ -205,7 +206,14 @@ impl MacosPlatform {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
-            if let Some(m) = crate::scwindow::query_once(&[pid as i32])? {
+            if let Some((m, candidates)) =
+                crate::scwindow::query_once_with_candidates(&[pid as i32])?
+            {
+                // Fail-closed dev-tool diagnostic (stderr only, no behaviour change): adoption
+                // takes the first on-screen window in framework order, and printed nothing
+                // about that choice — so a run that adopted a window the accessibility reader
+                // could not resolve left no record of what else was on offer (#263).
+                eprintln!("{}", adoption_line(pid as i32, &candidates));
                 return Ok(m);
             }
             match child.try_wait() {
@@ -234,7 +242,9 @@ impl MacosPlatform {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
-            if let Some(m) = crate::scwindow::query_once(&[pid])? {
+            if let Some((m, candidates)) = crate::scwindow::query_once_with_candidates(&[pid])? {
+                // Same adoption record as `discover_window` — see there (#263).
+                eprintln!("{}", adoption_line(pid, &candidates));
                 return Ok(m);
             }
             if Instant::now() >= deadline {

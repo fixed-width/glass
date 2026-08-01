@@ -47,6 +47,8 @@ use objc2_screen_capture_kit::{
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result, poll_until};
 
+use crate::adoption_log::CandidateWindow;
+
 /// A discovered on-screen window: enough to re-find or capture it later without holding
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
@@ -167,22 +169,36 @@ pub(crate) fn find_window_by_id(
     outcome.value.ok_or(GlassError::WindowNotFound)
 }
 
+/// Whether a scan should also collect a summary of every candidate it saw.
+///
+/// [`Candidates::Skip`] is the hot path (`capture_window`, `send_pointer`'s per-call
+/// re-resolution): stop at the first match, allocate nothing. [`Candidates::Collect`] is the
+/// once-per-session adoption path, which pays for a full pass so the adoption record can name
+/// what it chose between (#263).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Candidates {
+    Skip,
+    Collect,
+}
+
 /// Find the first on-screen `SCWindow` in `content.windows()` owned by one of `pids`,
-/// returning it alongside its owning pid. Shared by [`query_once`] (which extracts a
-/// [`WindowMatch`] snapshot from the match, since the window itself can't survive the
-/// completion handler's thread boundary — see the module doc) and
-/// `capture::capture_window` (which needs the live `SCWindow` itself, still inside the
-/// same completion-handler callback, to build an `SCContentFilter` from it). Keeping the
-/// filter loop here means the two call sites can't drift apart on what "the target
-/// window" means.
-pub(crate) fn find_on_screen_window(
+/// returning it alongside its owning pid — and, when `collect` is [`Candidates::Collect`], a
+/// summary of every such window in the same order, with the returned one marked adopted.
+///
+/// One loop for both modes so the hot lookup and the adoption record can never disagree about
+/// what "the target window" means — the same no-drift rule [`find_on_screen_window_by_id`]
+/// follows.
+pub(crate) fn scan_on_screen_windows(
     content: &SCShareableContent,
     pids: &[i32],
-) -> Option<(Retained<SCWindow>, i32)> {
+    collect: Candidates,
+) -> (Option<(Retained<SCWindow>, i32)>, Vec<CandidateWindow>) {
     // SAFETY: `windows` is a plain getter on a live `SCShareableContent`; no other
     // preconditions.
     let windows: Retained<NSArray<SCWindow>> = unsafe { content.windows() };
 
+    let mut found: Option<(Retained<SCWindow>, i32)> = None;
+    let mut candidates = Vec::new();
     for w in windows.iter() {
         // SAFETY: `w` is a live `SCWindow` yielded by the array (`NSArray::iter` hands
         // out a fresh, owned `Retained<SCWindow>` per element — see `ffi.rs`'s gotcha
@@ -198,11 +214,39 @@ pub(crate) fn find_on_screen_window(
         };
         // SAFETY: same as above — a plain property getter.
         let pid = unsafe { app.processID() };
-        if pids.contains(&pid) {
-            return Some((w, pid));
+        if !pids.contains(&pid) {
+            continue;
         }
+        let adopted = found.is_none();
+        if adopted {
+            found = Some((w.clone(), pid));
+        }
+        if collect == Candidates::Skip {
+            break;
+        }
+        // SAFETY: `w` is live; `title` is a plain property getter (same read
+        // `app_window_from` performs).
+        let title = unsafe { w.title() }.map(|t| t.to_string());
+        let (geometry, _scale, _origin_pt) = window_geometry_and_scale(&w);
+        candidates.push(CandidateWindow {
+            // SAFETY: `w` is live; a plain property getter.
+            window_id: unsafe { w.windowID() },
+            title,
+            geometry,
+            adopted,
+        });
     }
-    None
+    (found, candidates)
+}
+
+/// [`scan_on_screen_windows`] without the candidate summary — the per-call lookup
+/// `capture::capture_window` and `query_once` use. Shared by both so the two call sites can't
+/// drift apart on what "the target window" means.
+pub(crate) fn find_on_screen_window(
+    content: &SCShareableContent,
+    pids: &[i32],
+) -> Option<(Retained<SCWindow>, i32)> {
+    scan_on_screen_windows(content, pids, Candidates::Skip).0
 }
 
 /// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id` AND
@@ -474,6 +518,75 @@ pub(crate) fn query_once(pids: &[i32]) -> Result<Option<WindowMatch>> {
             "SCShareableContent completion handler was dropped without replying".into(),
         )),
     }
+}
+
+/// [`query_once`] for the adoption path: the same single `SCShareableContent` round trip, but
+/// returning the candidate summary alongside the match so `backend::discover_window` can record
+/// what it chose between (#263). No extra query — the candidates come out of the content the
+/// match was already found in.
+pub(crate) fn query_once_with_candidates(
+    pids: &[i32],
+) -> Result<Option<(WindowMatch, Vec<CandidateWindow>)>> {
+    let (tx, rx) = mpsc::channel::<CandidateQueryReply>();
+    let pids_owned: Vec<i32> = pids.to_vec();
+
+    // Same async-bridge discipline as `query_once`: the whole decision happens inside the
+    // callback and only plain owned data crosses the channel — never a `Retained<SCWindow>`
+    // (see module doc).
+    let block = RcBlock::new(
+        move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
+            if content_ptr.is_null() {
+                let err = crate::ffi::classify_null_result(
+                    err_ptr,
+                    "SCShareableContent completion handler returned null content and null error",
+                );
+                let _ = tx.send(CandidateQueryReply::Failed(err));
+                return;
+            }
+            // SAFETY: `content_ptr` was just checked non-null; the framework guarantees it
+            // points to a live `SCShareableContent` for the duration of this callback.
+            let content: &SCShareableContent = unsafe { &*content_ptr };
+
+            let (found, candidates) =
+                scan_on_screen_windows(content, &pids_owned, Candidates::Collect);
+            let Some((w, pid)) = found else {
+                let _ = tx.send(CandidateQueryReply::NotFound);
+                return;
+            };
+            let _ = tx.send(CandidateQueryReply::Found(
+                window_match_from(&w, pid),
+                candidates,
+            ));
+        },
+    );
+
+    // SAFETY: `block` matches
+    // `getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler`'s
+    // documented signature (`*mut SCShareableContent, *mut NSError`, per the generated
+    // binding) — identical to `query_once`'s call. No other preconditions.
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            true, true, &block,
+        );
+    }
+
+    match rx.recv_timeout(QUERY_TIMEOUT) {
+        Ok(CandidateQueryReply::Found(m, candidates)) => Ok(Some((m, candidates))),
+        Ok(CandidateQueryReply::NotFound) => Ok(None),
+        Ok(CandidateQueryReply::Failed(e)) => Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GlassError::Backend(
+            "SCShareableContent completion handler was dropped without replying".into(),
+        )),
+    }
+}
+
+/// [`query_once_with_candidates`]'s channel payload — [`QueryReply`] plus the candidate
+/// summary on the found arm.
+enum CandidateQueryReply {
+    Found(WindowMatch, Vec<CandidateWindow>),
+    NotFound,
+    Failed(GlassError),
 }
 
 /// [`find_window_by_id`]'s per-attempt round trip — identical shape to [`query_once`] (same
