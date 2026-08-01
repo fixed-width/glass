@@ -58,6 +58,14 @@ internal refactors, CI, or test-only changes.
   [`examples/android-role-fixture/`](examples/android-role-fixture/) (builds without Gradle) and the
   UIKit and SwiftUI equivalents in [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so
   anyone can read the same trees back.
+- `glass_click_element` now actuates through Android's accessibility action when the optional
+  on-device companion is installed, instead of always synthesizing a tap. It reaches controls a
+  tap cannot — an element scrolled far below the fold actuates in place — and the result's
+  `method` field reports `native-action` for those clicks. A control whose label is a separate
+  element from the control itself, as in Jetpack Compose, resolves to the enclosing control
+  that handles the tap. Clicking a disabled control is now an error rather than a tap that
+  silently does nothing, and a checkbox is only reported clicked once its state is observed to
+  change. The `uiautomator` reader and iOS still use the pointer path and say so.
 - More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
   and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
   Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
