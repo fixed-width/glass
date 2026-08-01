@@ -3,25 +3,27 @@
 //! on-screen window the app's pid actually owns, then reports whether the accessibility
 //! reader could resolve the adopted window at all.
 //!
-//! It exists because `scwindow::scan_on_screen_windows` (reached via `backend::discover_window`
-//! -> `scwindow::query_once_with_candidates` -> `scwindow::query_once_inner`) adopts the FIRST
+//! It exists because `scwindow::scan_on_screen_windows` (reached via
+//! `backend::discover_window_pid` -> `scwindow::query_once_with_candidates` ->
+//! `scwindow::query_once_inner`) adopts the FIRST
 //! on-screen `SCWindow` in `SCShareableContent` order owned by the target pid — no filter on
 //! layer, size or title, and no ordering guarantee from the framework. On 2026-07-29 one run
 //! adopted a `468x101` window that matches no `AXWindow` Calculator owns, and the runs either
 //! side of it adopted the real `230x408` window. This probe's job is to say what that window
 //! is, with its title, rather than leave the next reader guessing.
 //!
-//! **A `.app` bundle already running is adopted, not launched — read this before trusting a
-//! sweep.** `MacosPlatform::start_app`'s bundle branch hands off to `NSWorkspace`/
-//! LaunchServices: if an instance of the app is already running, that instance is adopted and
-//! raised rather than spawned fresh, and `stop_app` deliberately leaves a pre-existing adoptee
-//! running (glass only raised it, so it isn't glass's to kill — see `backend.rs`'s
-//! `Adopted`/`Disposition` doc). A sweep run against an app that's already open therefore
-//! re-adopts the SAME process every run, not N independent launches, and never re-tests a
-//! fresh-launch race. To probe cold launches, quit the target app completely before starting
-//! the sweep and again between sweeps; the per-run pid this probe prints, and the summary's
-//! distinct-pid count, are how to tell a cold-launch sweep from a re-adoption one after the
-//! fact.
+//! **Whether a `.app` bundle launches fresh or gets adopted depends on the path — read this before
+//! trusting a sweep.** Apple platform code (e.g. Calculator, this probe's own example) hands off
+//! straight to `NSWorkspace`/LaunchServices; a third-party bundle direct-spawns its inner
+//! executable first, reaching LaunchServices only if that spawn exits before a window appears
+//! (`start_bundle`'s doc). Either way, an instance already running at handoff is adopted and
+//! raised, not spawned fresh, and `stop_app` deliberately leaves a pre-existing adoptee running
+//! (glass only raised it, so it isn't glass's to kill — see `backend.rs`'s `Adopted`/`Disposition`
+//! doc). A sweep against an app that's already open can therefore re-adopt the SAME process every
+//! run, not N independent launches, and never re-test a fresh-launch race. To probe cold launches,
+//! quit the target app completely before starting the sweep and again between sweeps; the per-run
+//! pid this probe prints, and the summary's distinct-pid count, are how to tell a cold-launch sweep
+//! from a re-adoption one after the fact.
 //!
 //! Asserts nothing about which window is correct. It fails a run only when an app could not be
 //! launched or enumerated at all — a real breakage, distinct from an app exposing something
