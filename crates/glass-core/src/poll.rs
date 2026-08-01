@@ -129,6 +129,25 @@ mod tests {
     }
 
     #[test]
+    fn the_deadline_look_is_skipped_when_this_iteration_already_ticked() {
+        // The deadline read exists for information the loop has not refreshed. A loop that just
+        // ticked has, so reading again would bill every ordinary polling caller an extra tick for
+        // nothing.
+        let mut ticks = 0;
+        poll_until_with_pause(
+            0,
+            0, // one tick, then straight to the deadline
+            |_| true,
+            || {
+                ticks += 1;
+                Ok(None::<()>)
+            },
+        )
+        .unwrap();
+        assert_eq!(ticks, 1, "ticked again at a deadline it had just looked at");
+    }
+
+    #[test]
     fn a_pause_that_returns_early_still_honours_the_deadline() {
         // A signal that fires constantly must bound the loop, not spin it forever.
         let started = Instant::now();
