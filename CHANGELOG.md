@@ -20,21 +20,18 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Added
-- Every tool parameter now carries a description in the advertised MCP schema, so an agent can
-  read a parameter's meaning without inferring it from the name. The additions cover the
-  coordinate space (window-relative everywhere except `glass_window`'s `move`, which positions
-  the window on screen), the defaults for click count, drag/settle timing and log paging, and
-  behaviour a caller cannot see from the type — `glass_baseline_save` overwrites an existing
-  name silently, `glass_type` types into whatever already has focus, and `glass_start`'s
-  `timeout_ms` bounds waiting for the window, not the `build` step.
-- `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and `glass_logs`
-  now describe what they do to the app and when to reach for them rather than a sibling tool.
-  Each states the consequence a caller would otherwise learn by trial: `glass_type` does not
-  focus a field and a newline in its text does not press Return, `glass_drag` refuses a path
-  with any endpoint outside the window, `glass_stop` discards the captured logs and element ids,
-  `glass_baseline_save` replaces an existing name silently, and `glass_logs` returns whatever
-  has accumulated without waiting (`glass_wait_for_log` is the blocking one).
-
+- The advertised MCP schema now documents what it did not. Every tool parameter carries a
+  description, and `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and
+  `glass_logs` describe what they do to the app rather than which sibling tool to prefer instead.
+  Between them they state the coordinate space (window-relative everywhere except `glass_window`'s
+  `move`, which positions the window on screen), the defaults for click count, drag/settle timing
+  and log paging, and the behaviour a caller cannot see from the type and would otherwise learn by
+  trial: `glass_type` does not focus a field and types into whatever already has focus, and a
+  newline in its text does not press Return; `glass_drag` refuses a path with any endpoint outside
+  the window; `glass_stop` discards the captured logs and element ids; `glass_baseline_save`
+  replaces an existing name silently; `glass_logs` returns whatever has accumulated without waiting
+  (`glass_wait_for_log` is the blocking one); and `glass_start`'s `timeout_ms` bounds waiting for
+  the window, not the `build` step.
 - Accessibility elements can now carry a second label. `glass_a11y_snapshot` renders it as
   `desc="…"` after the name — an icon-only button that used to reach you as a role and a
   rectangle now says what it is — and the `glass_a11y_marks` legend labels an unnamed element
@@ -56,12 +53,11 @@ internal refactors, CI, or test-only changes.
   fresh accessibility tree) in one call. Inside a `glass_do` `type` action the field is rejected
   with guidance to use a `settle` action or the terminal `then` observe instead.
 - [docs/reference/a11y-roles.md](docs/reference/a11y-roles.md) documents which accessibility roles
-  each platform backend can produce, and why a role is unavailable where it is.
-- Two example apps hold the controls that page's cells are decided from — one screen of stock
-  `android.widget` controls in [`examples/android-role-fixture/`](examples/android-role-fixture/)
-  (builds without Gradle) and the UIKit and SwiftUI equivalents in
-  [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so anyone can read the same trees
-  back.
+  each platform backend can produce, and why a role is unavailable where it is. Two example apps
+  hold the controls its cells are decided from — one screen of stock `android.widget` controls in
+  [`examples/android-role-fixture/`](examples/android-role-fixture/) (builds without Gradle) and the
+  UIKit and SwiftUI equivalents in [`examples/ios-role-fixture/`](examples/ios-role-fixture/) — so
+  anyone can read the same trees back.
 - More elements report a real role instead of `Other`: on Windows, documents; on macOS, outlines
   and their rows, split views and their dividers, scroll areas, headings, and menu buttons; on
   Android, the AndroidX card container, the AppCompat linear layout, the view that hosts a Compose
@@ -74,16 +70,16 @@ internal refactors, CI, or test-only changes.
   of parsing prose. Purely additive: `report` is unchanged.
 
 ### Changed
-- On Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
-  Where UI Automation announces a property change, a wait for something that has not happened yet
-  now reads the tree when something changes instead of once per interval — measured on hardware at
-  `interval_ms: 100`, 4 walks for a 3-second wait where it previously took 24. It still re-reads
-  once a second regardless, and once more before reporting nothing found, so a change the platform
-  does not announce costs latency, not a wrong answer. That matters most for `condition: "enabled"`:
-  of the two providers measured, a WinForms app never announced a control becoming enabled and a
-  WPF one did. Every other backend polls exactly as before, and so does Windows if the subscription
-  cannot be established or stops delivering.
-
+- On Linux and Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on
+  a timer. Where the platform can say whether anything changed, a wait for something that has not
+  happened yet now reads the tree when something changes instead of once per interval — measured at
+  `interval_ms: 100`, 4 reads for a 3-second wait against the GTK test fixture where it previously
+  took 22, and 4 on Windows hardware where it previously took 24. It re-reads once a second
+  regardless, and once more before reporting nothing found, so a change the platform does not
+  announce costs latency, not a wrong answer. That matters most on Windows for
+  `condition: "enabled"`: of the two providers measured, a WinForms app never announced a control
+  becoming enabled and a WPF one did. Every other backend polls exactly as before, and so do these
+  two if the subscription cannot be established or stops delivering.
 - Both Android readers now name an element the same way. The same control used to answer
   differently depending on which reader was running — `uiautomator` and the on-device
   accessibility-service reader disagreed on which label became the `name` — so a `name:`
@@ -120,14 +116,6 @@ internal refactors, CI, or test-only changes.
   as a clickable `Group` exactly as the `value_contains` form did. `uiautomator` never reported a
   value there, so a selector written against that reader is unaffected.
 
-- On Linux, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
-  Where the platform can say whether anything changed, a wait for something that has not happened
-  yet now reads the tree when something changes instead of once per interval — measured against the
-  GTK test fixture, 4 reads for a 3-second wait where it previously took 22. It re-reads once a
-  second regardless, and always once more before reporting nothing found, so a change the platform
-  does not announce costs latency, not a wrong answer.
-  Every other backend polls exactly as before, and so does Linux if the subscription cannot be
-  established or stops delivering.
 
 - `glass_start` on Android now fails on a `run` element it cannot use, instead of ignoring it.
   Android launches an activity rather than a command line — `am start` takes intent extras, not
