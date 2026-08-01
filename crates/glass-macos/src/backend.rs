@@ -272,7 +272,7 @@ impl MacosPlatform {
     /// carrying that settled geometry.
     ///
     /// Adoption reads the window's geometry the moment it finds it, which on macOS is routinely
-    /// mid-open-animation — 10 of 12 cold launches measured on 2026-08-01 returned a geometry a few
+    /// mid-open-animation — 11 of 12 cold launches measured on 2026-08-01 returned a geometry a few
     /// pixels off the settled one, and the window `start_app` reports is what
     /// `Glass::start_on_inner` hands the caller and caches as the session's geometry.
     ///
