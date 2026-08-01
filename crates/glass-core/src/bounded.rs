@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -88,22 +89,26 @@ fn run_bounded_inner(
         .map_err(|e| GlassError::Backend(format!("{op}: failed to start: {e}")))?;
 
     // Written on its own thread: a child that answers without consuming its input would otherwise
-    // leave the parent blocked in `write` with the deadline out of reach. The outcome is shared
-    // back, because a payload that only partly landed is the same silent truncation as a partial
-    // read — `pbcopy` would report a clipboard it never fully received.
-    let wrote: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-    if let Some(bytes) = stdin
+    // leave the parent blocked in `write` with the deadline out of reach. The outcome comes back
+    // over a channel, because a payload that only partly landed is the same silent truncation as a
+    // partial read — `pbcopy` would report a clipboard it never fully received.
+    //
+    // A channel and not a shared cell: nothing joins this thread, so a cell says only what the
+    // writer had recorded by the time the parent happened to look, and "not yet recorded" is
+    // indistinguishable from "wrote everything". The receive below waits for an answer instead.
+    let stdin_len = stdin.as_ref().map_or(0, Vec::len);
+    let wrote = if let Some(bytes) = stdin
         && let Some(mut pipe) = child.stdin.take()
     {
-        let outcome = Arc::clone(&wrote);
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Err(e) = pipe.write_all(&bytes)
-                && let Ok(mut outcome) = outcome.lock()
-            {
-                *outcome = Some(e);
-            }
+            // `pipe` is owned here, so the write end closes when this returns however it returns.
+            let _ = tx.send(pipe.write_all(&bytes));
         });
-    }
+        Some(rx)
+    } else {
+        None
+    };
 
     let stdout = Pipe::drain(child.stdout.take());
     let stderr = Pipe::drain(child.stderr.take());
@@ -143,12 +148,34 @@ fn run_bounded_inner(
     // tolerant line scanner that would read a truncated dump as a shorter window list, and glass
     // would then report the wrong geometry. `Command::output` cannot produce this — it reads to EOF
     // — so failing here keeps the contract callers already had.
-    if let Ok(mut wrote) = wrote.lock()
-        && let Some(e) = wrote.take()
-    {
-        return Err(GlassError::Backend(format!(
-            "{op}: could not write all of its input ({e}), so it acted on a partial payload"
-        )));
+    //
+    // Bounded by the same `settled_by` as the pipes, and for the same reason: a grandchild holding
+    // the read end keeps the write blocked exactly as it keeps a drain from reaching EOF. A write
+    // still in flight when that expires is reported rather than waited out — the thread stays
+    // parked until the kernel releases it, which a blocking write offers no way to cancel, but the
+    // caller is told its payload's fate is unknown instead of being handed a success.
+    if let Some(rx) = wrote {
+        match rx.recv_timeout(settled_by.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(GlassError::Backend(format!(
+                    "{op}: could not write all of its input ({e}), so it acted on a partial payload"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(GlassError::Backend(format!(
+                    "{op}: exited, but had not finished writing its {stdin_len} bytes of input \
+                     {DRAIN_SETTLE:?} later (something it started may still hold the pipe), so it \
+                     may have acted on a partial payload"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(GlassError::Backend(format!(
+                    "{op}: the thread writing its input ended without reporting, so whether the \
+                     payload landed is unknown"
+                )));
+            }
+        }
     }
     if !out_done || !err_done {
         return Err(GlassError::Backend(format!(
@@ -519,6 +546,33 @@ mod tests {
         assert!(
             err.to_string().contains("partial payload"),
             "must say the input did not land: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_write_still_in_flight_when_the_child_exits_is_not_reported_as_landed() {
+        // The sibling test above races: the child exits, and whether the write thread has recorded
+        // its `EPIPE` by the time the parent looks is a matter of scheduling. This one removes the
+        // race. The child exits at once but leaves a grandchild holding the read end, so the write
+        // neither completes nor fails — it is still blocked, and the outcome the parent reads was
+        // never written by anyone. The grandchild's own stdout and stderr go to /dev/null, so both
+        // drains still reach EOF and what is under test is the write, not a held-open output pipe.
+        //
+        // `exec 3<&0` then `<&3` is load-bearing: POSIX gives a background job in a non-interactive
+        // shell its stdin from /dev/null *before* any explicit redirection, so a plain `sleep &`
+        // does not inherit the pipe and the write fails fast with `EPIPE` instead of hanging.
+        let err = run_bounded_with_stdin(
+            Command::new("/bin/sh")
+                .args(["-c", "exec 3<&0; sleep 2 <&3 >/dev/null 2>&1 & printf done"]),
+            Duration::from_secs(10),
+            "test:stdin-in-flight",
+            &vec![b'x'; 4 * 1024 * 1024],
+        )
+        .expect_err("a payload whose fate is unknown must not pass as landed");
+        assert!(
+            err.to_string().contains("had not finished writing"),
+            "must say the write never finished: {err}"
         );
     }
 
