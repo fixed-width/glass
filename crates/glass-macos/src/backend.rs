@@ -17,6 +17,7 @@ use glass_core::platform::{
 };
 use glass_core::{GlassError, Result};
 
+use crate::adoption_log::adoption_line;
 use crate::axwindow;
 use crate::clipboard_route::ClipboardRoute;
 use crate::coords;
@@ -184,19 +185,19 @@ impl MacosPlatform {
         Ok(())
     }
 
-    /// Poll for `child`'s window, alternating a single [`crate::scwindow::query_once`]
-    /// discovery attempt with `child.try_wait()` so a crashed launch fails fast with
-    /// [`GlassError::AppExited`] instead of riding out the whole `timeout_ms` budget
-    /// waiting for a window that will never appear — mirrors
-    /// `glass-x11/src/platform.rs`'s `discover_window`. Can't delegate this to
-    /// `scwindow::find_window_for_pids`: that helper owns its *entire* poll loop
-    /// internally, with no child handle to race against.
+    /// Poll for `child`'s window, alternating a single
+    /// [`crate::scwindow::query_once_with_candidates`] discovery attempt with
+    /// `child.try_wait()` so a crashed launch fails fast with [`GlassError::AppExited`]
+    /// instead of riding out the whole `timeout_ms` budget waiting for a window that will
+    /// never appear — mirrors `glass-x11/src/platform.rs`'s `discover_window`. Can't
+    /// delegate this to `scwindow::find_window_for_pids`: that helper owns its *entire*
+    /// poll loop internally, with no child handle to race against.
     ///
     /// Returns the whole [`crate::scwindow::WindowMatch`] (not just its `geometry`), even
     /// though `start_app` only reads `geometry` from it today — `send_pointer` does its own
     /// independent, fresh `scwindow::find_window_for_pids` resolution per call rather than
     /// reusing anything cached here (see its doc), so this return type is just the natural
-    /// shape of a `query_once` result, not evidence of caching elsewhere.
+    /// shape of a `query_once_with_candidates` result, not evidence of caching elsewhere.
     fn discover_window(
         child: &mut Child,
         pid: u32,
@@ -205,7 +206,11 @@ impl MacosPlatform {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
-            if let Some(m) = crate::scwindow::query_once(&[pid as i32])? {
+            if let Some((m, candidates)) =
+                crate::scwindow::query_once_with_candidates(&[pid as i32])?
+            {
+                // Stderr-only diagnostic, no behaviour change — see adoption_log's module doc (#263).
+                eprintln!("{}", adoption_line(pid as i32, &candidates));
                 return Ok(m);
             }
             match child.try_wait() {
@@ -229,12 +234,15 @@ impl MacosPlatform {
     /// already-running via `ffi::running_pid_for_bundle_id`, or just started via
     /// `ffi::launch_bundle`), so unlike [`discover_window`] there is no local `Child` handle
     /// (`std::process::Child`) to `try_wait` if the adopted app dies before its window
-    /// appears; this loop only re-queries `scwindow::query_once` until `timeout_ms` elapses.
+    /// appears; this loop only re-queries `scwindow::query_once_with_candidates` until
+    /// `timeout_ms` elapses.
     fn discover_window_pid(pid: i32, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
-            if let Some(m) = crate::scwindow::query_once(&[pid])? {
+            if let Some((m, candidates)) = crate::scwindow::query_once_with_candidates(&[pid])? {
+                // Same adoption record as `discover_window` — see there (#263).
+                eprintln!("{}", adoption_line(pid, &candidates));
                 return Ok(m);
             }
             if Instant::now() >= deadline {

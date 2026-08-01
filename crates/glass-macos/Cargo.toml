@@ -61,6 +61,17 @@ harness = false
 name = "role_probe"
 harness = false
 
+# Mac-gated window-adoption PROBE (crates/glass-macos/tests/window_adopt_probe.rs) — not a
+# pass/fail assertion test. Same harness=false main-thread requirement as the targets above
+# (`MacosPlatform::start_app` reaches AppKit's `ffi::app_kit_init()`). Launches the app named
+# by `GLASS_WINDOW_PROBE_APP` repeatedly and prints, per run, the window `start_app` adopted
+# beside every on-screen window the app's pid owns — the evidence needed to identify a window
+# adoption picked that the accessibility reader then could not resolve. With the variable
+# unset it prints what to set and exits 0. See that file's module doc.
+[[test]]
+name = "window_adopt_probe"
+harness = false
+
 [dependencies]
 glass-core.workspace = true
 plist = "1"

@@ -26,8 +26,14 @@ pub enum GlassError {
     )]
     SandboxedAppExited(Option<i32>),
 
+    /// No window matched. Two causes reach here and the error cannot tell them apart: the app
+    /// may not have opened its window yet, or the window glass is targeting is no longer one of
+    /// its windows — every backend's resolver hits the same ambiguous `Option`/lookup miss
+    /// (#263). On macOS the discriminating per-candidate detail is printed to stderr by the
+    /// resolver that failed; other backends have no equivalent diagnostic yet.
     #[error(
-        "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
+        "window not found — the app may not have opened its window yet, or the window glass is \
+         targeting is no longer one of its windows"
     )]
     WindowNotFound,
 
@@ -244,7 +250,8 @@ mod tests {
         );
         assert_eq!(
             GlassError::WindowNotFound.to_string(),
-            "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
+            "window not found — the app may not have opened its window yet, or the window glass \
+             is targeting is no longer one of its windows"
         );
     }
 
