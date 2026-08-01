@@ -147,7 +147,7 @@ pub fn format_range_value(v: f64) -> String {
 /// A closed set rather than raw ids, so [`announcing_property`] and [`SELECTOR_PROPERTIES`] can
 /// only name a property this enum carries; with a bare `u32` they could name any number at all.
 /// Carrying a variant is not what registers it: `events.rs` builds its registration list from
-/// those two declarations, and a variant neither of them names is registered nowhere.
+/// those two declarations, so a variant neither of them names is not registered at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchedProperty {
     Name,
@@ -159,12 +159,13 @@ pub enum WatchedProperty {
     /// re-read — latency, not a wrong answer.
     IsEnabled,
     IsOffscreen,
-    /// A node's `value` where it comes from `ValuePattern` — an editable control, a combo box.
+    /// A node's `value` where it comes from `ValuePattern`, which the reader reads for an Edit, a
+    /// ComboBox or a Document.
     Value,
     /// The other source of a node's `value`: the reader reads a ProgressBar/Slider/Spinner
-    /// position from `RangeValuePattern`, which announces its own property, so a
-    /// `value_contains` wait on one of those is woken by this and never by
-    /// [`Value`](WatchedProperty::Value).
+    /// position from `RangeValuePattern`, never from `ValuePattern`, and UIA reports a change to it
+    /// under a property id of its own — so a `value_contains` wait on one of those is woken by this
+    /// and never by [`Value`](WatchedProperty::Value).
     RangeValue,
     ExpandCollapseState,
     SelectionItemIsSelected,
