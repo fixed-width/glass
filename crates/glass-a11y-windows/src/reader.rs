@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, GlassError, Result,
-    TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
+    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal, GlassError,
+    Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -55,6 +55,13 @@ impl Accessibility for WindowsA11y {
                 "accessibility snapshot timed out (UIA not responding)".into(),
             )),
         }
+    }
+
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        // Unlike `snapshot` above and `set_value`/`invoke` below there is no timeout wrapper: the
+        // subscription's own thread is the long-lived one, and `subscribe` already bounds how
+        // long it will wait for the registrations to land.
+        crate::events::subscribe(ctx)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -120,7 +127,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
 /// `send_pointer`/`window` operate on — so it never enumerates the desktop or queries a peer app's
 /// UIA provider (a foreign provider that blocks cross-process calls on the worker thread could
 /// otherwise wedge the whole snapshot). `element_from_handle` touches only the target's provider.
-fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
+pub(crate) fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Result<UIElement> {
     let handle = ctx.window_handle.ok_or_else(|| {
         GlassError::AccessibilityUnavailable(
             "no active window handle in the a11y context (the backend adopted no window)".into(),

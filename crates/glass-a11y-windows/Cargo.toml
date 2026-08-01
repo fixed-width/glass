@@ -10,7 +10,12 @@ publish = false
 glass-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-uiautomation = { version = "0.25", features = ["process"] }
+# `event` gates the event-handler types `events.rs` registers.
+uiautomation = { version = "0.25", features = ["process", "event"] }
+# For `IUIAutomation2::SetTransactionTimeout`, which bounds the subscription's cross-process
+# calls: `uiautomation` exposes neither that interface nor the `CUIAutomation8` coclass behind
+# it, so `events.rs` builds its own automation object — hence `Win32_System_Com` as well.
+windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com"] }
 
 [lints]
 workspace = true

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
     Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
-    DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton, Platform,
-    PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
+    ChangeSignal, DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton,
+    Platform, PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
     description_census, description_census_report, role_histogram,
 };
 use glass_windows::WindowsPlatform;
@@ -1435,5 +1435,687 @@ fn onbox_role_histogram_probe() {
         described >= 1,
         "no probed app reported a single described node: either every app lost its HelpText, or \
          the reader stopped sourcing it"
+    );
+}
+
+/// The subscription must report a change a real UIA provider actually emitted — not merely
+/// establish itself. Sequential on purpose: subscribe, act, then wait. `set_value` on charmap's
+/// Edit field is the same change `onbox_a11y_set_value` already proves lands.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_subscription_reports_a_real_change() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+
+    // Before the first read, as the seam requires: a change landing between a read and the
+    // subscription is announced to nobody.
+    let mut signal = a11y
+        .subscribe_changes(&ctx)
+        .expect("UIA subscription must establish against charmap");
+
+    let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
+    let mut field = None;
+    first_role(&tree.root, AxRole::TextField, &mut field);
+    let field = field.expect("charmap must expose a TextField (Edit)");
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+        value: field.value.clone(),
+    };
+
+    // Discriminating, not just documenting: the channel is open and buffers one item from the
+    // moment of subscription, and the snapshot above is itself a full tree walk — so without this,
+    // a stray event the walk trips on its own subscription could pass the test on a signal that
+    // never actually saw `set_value`'s change.
+    assert_eq!(
+        signal.wait(Duration::from_millis(300)),
+        glass_core::ChangeWait::Quiet,
+        "no change should be pending yet — a real one hasn't been made"
+    );
+
+    a11y.set_value(&ctx, &target, "GLASSEVENT")
+        .expect("set_value on the Edit field");
+
+    let verdict = signal.wait(Duration::from_secs(2));
+    let _ = p.stop_app();
+    assert_eq!(
+        verdict,
+        glass_core::ChangeWait::Changed,
+        "a ValueValue change on a real UIA provider must reach the signal"
+    );
+}
+
+/// The other half, and the one the saving depends on: nothing happening must read as `Quiet`,
+/// not as a change. A signal that reports `Changed` on an idle app costs a walk per interval —
+/// polling, with a subscription's price on top.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a11y_subscription_is_quiet_on_an_idle_app() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
+    let geo = p.start_app(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let mut a11y = WindowsA11y::new();
+    let ctx = AxContext {
+        pids: p.app_pids(),
+        window: geo.clone(),
+        window_handle: p.active_window_handle(),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+    let mut signal = a11y
+        .subscribe_changes(&ctx)
+        .expect("UIA subscription must establish against charmap");
+
+    let verdict = signal.wait(Duration::from_millis(800));
+    let _ = p.stop_app();
+    assert_eq!(
+        verdict,
+        glass_core::ChangeWait::Quiet,
+        "an untouched charmap must not report changes"
+    );
+}
+
+/// Counts the walks a session performs. Wall-clock cannot tell a wait that waited efficiently
+/// from one that walked slowly; only the count separates them.
+///
+/// Forwards every trait method. `subscribe_changes` has a default body, so a forgotten forward
+/// would compile and silently disable the thing this measures — hence the counter on it too.
+///
+/// `signal_enabled: false` makes `subscribe_changes` behave like a backend with no event stream
+/// at all — never calling `inner`, so no subscription thread is even started — which is the
+/// baseline [`onbox_a_signal_more_than_halves_a_quiet_walk_count`] compares the live subscription
+/// against: same app, same wait, the only variable is whether a signal was available to lean on.
+struct Counting<A> {
+    inner: A,
+    walks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signals: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    signal_enabled: bool,
+}
+
+impl<A: Accessibility> Accessibility for Counting<A> {
+    fn snapshot(&mut self, ctx: &AxContext) -> glass_core::Result<glass_core::AxTree> {
+        self.walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.snapshot(ctx)
+    }
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        if !self.signal_enabled {
+            return None;
+        }
+        let s = self.inner.subscribe_changes(ctx);
+        if s.is_some() {
+            self.signals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        s
+    }
+    fn set_value(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        text: &str,
+    ) -> glass_core::Result<()> {
+        self.inner.set_value(ctx, target, text)
+    }
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> glass_core::Result<()> {
+        self.inner.invoke(ctx, target)
+    }
+}
+
+/// A `Glass` session whose reader counts walks and subscriptions. `signal_enabled` gates whether
+/// `subscribe_changes` ever hands back a working signal — see [`Counting`].
+fn glass_counting(
+    signal_enabled: bool,
+) -> (
+    Glass,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let walks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (w, sg) = (walks.clone(), signals.clone());
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend {
+            platform: Box::new(WindowsPlatform::new()?),
+            accessibility: Some(Box::new(Counting {
+                inner: WindowsA11y::new(),
+                walks: w.clone(),
+                signals: sg.clone(),
+                signal_enabled,
+            })),
+        })
+    });
+    let dir = tempfile::tempdir().expect("tempdir for baseline store");
+    let root = dir.path().join("baselines");
+    std::mem::forget(dir);
+    (
+        Glass::new(factory, "windows".into(), BaselineStore::new(root), 100),
+        walks,
+        signals,
+    )
+}
+
+/// The point of the subscription, measured against a real app: a wait for something that never
+/// happens must stop re-reading the tree. What a skipped read is worth scales with the window —
+/// charmap's tree is 26 nodes and walks in ~20ms, where a 1500-node window measured through this
+/// same reader took 2360ms — so the saving counted here is a floor, not a typical case.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting(true);
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("no such element in charmap".into()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 3_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    // Logged AND saved: `eprintln!` alone is invisible on a pass through the schtasks-bounce
+    // harness (see [`artifacts_dir`] for why that is, and why the file is the only way anything
+    // gets out) — save_report is what makes the number reproducible off-box, which is the entire
+    // point of a walk-count test.
+    let line = format!("quiet 3s wait at 100ms: {walked} walks\n");
+    eprint!("{line}");
+    save_report("onbox-walk-count-quiet-wait.txt", &line);
+    assert!(!out.matched, "the element must not exist");
+    // See `Counting`: without this the test could measure polling and pass.
+    assert!(subscribed > 0, "no subscription was established");
+    // Four reads in a 3s wait, measured: one at the start, then `REREAD_AFTER`'s forced re-reads
+    // and the deadline read, whichever of those the timing lands on. The same wait without a
+    // signal walked 24 times (see `onbox_a_signal_more_than_halves_a_quiet_walk_count`) — 24 reads
+    // is 23 cycles, so ~130ms each: the 100ms interval plus charmap's own walk, interval-paced
+    // rather than walk-bound. The deadline read cannot add to that count, since a run with no
+    // signal ticks every interval and so never reaches the deadline having skipped one.
+    assert!(
+        walked <= 5,
+        "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
+    );
+}
+
+/// `walked <= 5` above bounds a number, not an improvement — a build that always walked 5 times
+/// would pass it. This runs the identical 3s quiet wait through two sessions differing in exactly
+/// one thing, whether `subscribe_changes` hands back a working signal (see
+/// [`Counting::signal_enabled`]). That margin, not the raw walk count, is the saving worth
+/// quoting.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+
+    // Local, not a file-level helper: the only two callers are the two arms below, and inlining it
+    // there would drown the one thing that differs between them (`signal_enabled`) in setup noise.
+    fn quiet_wait_walks(signal_enabled: bool) -> (usize, usize) {
+        let (mut glass, walks, signals) = glass_counting(signal_enabled);
+        glass.start(&charmap_spec()).expect("start charmap");
+        std::thread::sleep(Duration::from_millis(1500));
+
+        walks.store(0, std::sync::atomic::Ordering::Relaxed);
+        signals.store(0, std::sync::atomic::Ordering::Relaxed);
+        let out = glass
+            .wait_for_element(&glass_core::WaitElementParams {
+                name: Some("no such element in charmap".into()),
+                role: None,
+                value_contains: None,
+                condition: glass_core::ElementCondition::Appears,
+                interval_ms: 100,
+                timeout_ms: 3_000,
+            })
+            .expect("wait");
+        let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+        let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = glass.stop();
+        assert!(!out.matched, "the element must not exist");
+        (walked, subscribed)
+    }
+
+    let (with_signal, with_subs) = quiet_wait_walks(true);
+    let (without_signal, without_subs) = quiet_wait_walks(false);
+    assert!(
+        with_subs > 0,
+        "the signal-enabled run must have established a subscription"
+    );
+    assert_eq!(
+        without_subs, 0,
+        "the signal-disabled run must never report a subscription — otherwise this isn't \
+         measuring what it claims to"
+    );
+
+    let line =
+        format!("quiet 3s wait: with signal={with_signal} walks, without={without_signal} walks\n");
+    eprint!("{line}");
+    save_report("onbox-walk-count-comparison.txt", &line);
+    assert!(
+        with_signal * 2 < without_signal,
+        "a live subscription must more than halve the walk count: with={with_signal} \
+         without={without_signal}"
+    );
+}
+
+/// A subscription establishes against a real app, and the wait still answers from its first read.
+///
+/// Deliberately *not* a test that a signal cannot suppress a match — a risk it cannot reach.
+/// `glass_core`'s poll loop ticks before it ever pauses (`run_tick` starts true in
+/// `poll_until_with_pause`), so no `ChangeSignal` is consulted before the first walk, and the
+/// element here is already on screen. What can still fail for a signal-related reason is the
+/// subscription never establishing. A change arriving *after* the first read is the real risk;
+/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] covers it.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_subscription_establishes_and_the_first_read_still_answers() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting(true);
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Read the label out of the tree rather than hardcoding one: charmap's button wording is a
+    // Windows-version detail, and this test is not about the wording.
+    let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
+    let mut button = None;
+    first_role(&tree.root, AxRole::Button, &mut button);
+    let name = button
+        .and_then(|b| b.name.clone())
+        .expect("charmap exposes a named Button");
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some(name.clone()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Appears,
+            interval_ms: 100,
+            timeout_ms: 5_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    assert!(subscribed > 0, "no subscription was established");
+    assert!(
+        out.matched,
+        "a wait for {name:?}, already on screen, must match"
+    );
+    assert!(
+        walked <= 2,
+        "an already-satisfied wait took {walked} walks; it should return on the first read"
+    );
+}
+
+/// Pure Win32, independent of any `Platform`/`Glass` instance: the helper thread in
+/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] must share no state with the
+/// `Glass` session it acts on, so it finds the live charmap window itself rather than borrowing
+/// anything glass tracked. Title alone, though: see [`find_charmap_window`] for why a caller
+/// needing the *right* charmap window uses that instead of this directly.
+fn find_window_by_title(title: &str) -> Option<i64> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::{HSTRING, PCWSTR};
+    // SAFETY: reads a null-terminated title string and returns the matching top-level HWND (or
+    // an error, treated as "not found"); writes nothing.
+    unsafe { FindWindowW(PCWSTR::null(), &HSTRING::from(title)) }
+        .ok()
+        .map(|h| h.0 as i64)
+}
+
+/// The pid of the most recently started `charmap.exe` process, via a `Get-Process` shell-out (the
+/// same PowerShell-query pattern [`our_edge_count`] already uses elsewhere in this file) —
+/// independent of any `Glass`/`Platform` instance. "Most recent" rather than "the only one": if an
+/// earlier test leaked a `charmap.exe` — a documented, actively-checked-for risk in this file —
+/// this test's own instance is still the newest by construction, since it was launched last.
+fn newest_charmap_pid() -> Option<u32> {
+    let ps = "(Get-Process charmap -ErrorAction SilentlyContinue | \
+              Sort-Object StartTime -Descending | Select-Object -First 1).Id";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Find the live "Character Map" window and verify it belongs to `expected_pid`, the charmap.exe
+/// this test started ([`newest_charmap_pid`]). [`find_window_by_title`] binds by title alone, so a
+/// stale charmap.exe left by an earlier test could win the lookup and the helper thread would
+/// toggle the wrong window — reaching the caller as an unexplained 5s timeout. Panics with both
+/// pids named instead.
+fn find_charmap_window(expected_pid: u32) -> i64 {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let handle = find_window_by_title("Character Map")
+        .expect("an independent Win32 lookup must find a live 'Character Map' window");
+    let hwnd = windows::Win32::Foundation::HWND(handle as *mut std::ffi::c_void);
+    let mut owner_pid = 0u32;
+    // SAFETY: writes the owning pid into our stack value; the HWND is only queried, never mutated.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid)) };
+    assert_eq!(
+        owner_pid, expected_pid,
+        "the 'Character Map' window found by title belongs to pid {owner_pid}, not {expected_pid} \
+         (the pid this test started) — a stale charmap.exe is likely still running from an earlier \
+         test"
+    );
+    handle
+}
+
+/// Best-effort on-screen geometry for a raw HWND, via the plain window rect — good enough for
+/// `AxContext::window`, which this path only uses for bounds translation inside a snapshot, never
+/// for a click. Deliberately not `glass_windows`'s own DWM-extended `geometry_of`: that function is
+/// crate-private, and reaching for it would mean this "independent" path borrowing glass's own
+/// window code rather than rediscovering the window on its own.
+fn window_rect_geometry(handle: i64) -> WindowGeometry {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let hwnd = windows::Win32::Foundation::HWND(handle as *mut std::ffi::c_void);
+    let mut rect = RECT::default();
+    // SAFETY: writes one RECT into our stack value; the HWND is only queried, never mutated. A
+    // stale/invalid handle just fails, and the zeroed default below is a harmless fallback.
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+    }
+    WindowGeometry {
+        x: rect.left,
+        y: rect.top,
+        width: (rect.right - rect.left).max(0) as u32,
+        height: (rect.bottom - rect.top).max(0) as u32,
+    }
+}
+
+/// The `AxContext` an independent UIA reader needs for a raw charmap HWND: no `Glass` state, just
+/// the window and its rect. Shared by the helper thread below and by [`RestoreAdvancedView`],
+/// which both act on the window without going through the `Glass` session under test.
+fn independent_ctx(handle: i64) -> AxContext {
+    AxContext {
+        pids: vec![],
+        window: window_rect_geometry(handle),
+        window_handle: Some(handle),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    }
+}
+
+/// Puts charmap's Advanced-view checkbox back in the state the test found it in, however the test
+/// ends.
+///
+/// charmap persists that checkbox across launches, so a run leaving it open adds an Edit to every
+/// later launch's tree — and two other tests in this file bind to the *first* `TextField`. Drives
+/// the window through its own UIA reader rather than the test's `Glass`, so it works while
+/// unwinding too; every step is best-effort because a panic inside a drop would abort the process
+/// and bury the failure that got us here.
+struct RestoreAdvancedView {
+    handle: i64,
+    was_checked: bool,
+}
+
+impl Drop for RestoreAdvancedView {
+    fn drop(&mut self) {
+        let ctx = independent_ctx(self.handle);
+        let mut a11y = WindowsA11y::new();
+        let Ok(tree) = a11y.snapshot(&ctx) else {
+            return;
+        };
+        let mut cb = None;
+        first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+        let Some(cb) = cb.filter(|cb| cb.states.checked != self.was_checked) else {
+            return;
+        };
+        let target = AxTarget {
+            id: cb.id,
+            role: cb.role,
+            name: cb.name.clone(),
+            bounds: cb.bounds,
+            value: cb.value.clone(),
+        };
+        let _ = a11y.invoke(&ctx, &target);
+    }
+}
+
+/// The only test that drives `ChangeWait::Changed => true` inside `Glass::wait_for_element`'s poll
+/// loop from a change nothing but a real UIA event produced. The main thread blocks waiting for a
+/// control that does not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`,
+/// the window pid-verified independently (see [`find_charmap_window`]), so no `Glass` state crosses
+/// threads — sleeps, then actuates charmap's Advanced-view checkbox. Opening it reveals a "Search"
+/// [`AxRole::Button`]: an on-box probe counted 26 nodes closed against 37 open, and "Search" was the
+/// only new control whose name is unique in the tree — the others repeat labels ("Character set",
+/// "Group by") that already appear elsewhere.
+///
+/// Neither assertion discriminates alone; each rules out a different broken build:
+/// - No subscription (`subscribe_changes` always `None`): every 100ms tick reads regardless, so the
+///   change is caught at the next tick — same elapsed time, but roughly one walk per tick, which is
+///   what polling costs on a window this small (see `onbox_a_quiet_wait_stops_re_walking_the_tree`).
+/// - A subscription that never reports an event (always `Quiet`): `glass_core`'s `REREAD_AFTER`
+///   forces a re-read once a second, so it cannot return before the next boundary — same low walk
+///   count, but ~2000ms at the earliest.
+///
+/// Hence the helper acts at ~1400ms, mid-way through the second forced-re-read window (boundaries
+/// ~1000ms and ~2000ms); acting near 700ms left too little margin against the first. Measured
+/// on-box: `matched=true elapsed_ms=1501 walks=3` — the initial read, the ~1000ms forced re-read,
+/// and the read the event triggers.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting(true);
+    glass.start(&charmap_spec()).expect("start charmap");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let pid = newest_charmap_pid().expect("must find the charmap.exe process this test started");
+    let handle = find_charmap_window(pid);
+
+    // charmap persists the Advanced-view checkbox across launches, so normalize to closed first:
+    // the helper thread's job is to open it, and "Search" must not already be on screen when the
+    // timed wait below starts. The guard puts it back — see [`RestoreAdvancedView`] for what a
+    // stray open Advanced view does to the tests that run after this one.
+    let tree = glass.a11y_snapshot(None).expect("initial snapshot");
+    let mut cb = None;
+    first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+    let cb = cb.expect("charmap exposes the Advanced-view CheckBox");
+    let restore = RestoreAdvancedView {
+        handle,
+        was_checked: cb.states.checked,
+    };
+    if cb.states.checked {
+        glass
+            .click_element(cb.id)
+            .expect("close advanced view to normalize to a known starting state");
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
+    let helper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1400));
+        let mut a11y = WindowsA11y::new();
+        let ctx = independent_ctx(handle);
+        let tree = a11y.snapshot(&ctx).expect("helper thread's own snapshot");
+        let mut cb = None;
+        first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+        let cb = cb.expect("checkbox still present for the helper thread");
+        let target = AxTarget {
+            id: cb.id,
+            role: cb.role,
+            name: cb.name.clone(),
+            bounds: cb.bounds,
+            value: cb.value.clone(),
+        };
+        a11y.invoke(&ctx, &target)
+            .expect("helper thread opens advanced view");
+    });
+
+    // Captured, not unwrapped, before the join: if `wait_for_element` errored, `.expect` below
+    // would panic and unwind — and with the helper still un-joined at that point, its `JoinHandle`
+    // would be dropped while the thread is still doing live Win32/UIA work against this window.
+    // `SERIAL` releases as soon as this test's guard drops on the panic, so the very next on-box
+    // test could start and race the orphaned helper. Joining before any panic-capable call closes
+    // that gap.
+    let wait_result = glass.wait_for_element(&glass_core::WaitElementParams {
+        name: Some("Search".into()),
+        role: Some(AxRole::Button),
+        value_contains: None,
+        condition: glass_core::ElementCondition::Appears,
+        interval_ms: 100,
+        timeout_ms: 5_000,
+    });
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let helper_result = helper.join();
+    // Explicitly before `stop`, which the guard's own drop would otherwise run after: restoring
+    // the checkbox means driving charmap's UI, and a stopped charmap has none. On a panic the
+    // guard drops first anyway, since it was declared after `glass`.
+    drop(restore);
+    let _ = glass.stop();
+
+    helper_result.expect("helper thread must not panic");
+    let out = wait_result.expect("wait");
+
+    let line = format!(
+        "late-change wait: matched={} elapsed_ms={} walks={}\n",
+        out.matched, out.elapsed_ms, walked
+    );
+    eprint!("{line}");
+    save_report("onbox-late-change-wait.txt", &line);
+    assert!(subscribed > 0, "no subscription was established");
+    assert!(
+        out.matched,
+        "the Search button must appear once advanced view opens"
+    );
+    // Rules out "no subscription at all" — see the doc comment above. A polling build would walk
+    // roughly once per 100ms tick over ~1.4s (~14); a working signal walks only the initial read,
+    // the ~1000ms forced re-read, and the event itself (~3, matching the quiet-wait tests' count).
+    assert!(
+        walked <= 7,
+        "the wait walked {walked} times reaching the change; a live subscription should keep this \
+         near the quiet-wait tests' count (~3), not polling's (~14)"
+    );
+    // Rules out "subscribed but always Quiet" — see the doc comment above. That build cannot answer
+    // before the next forced-re-read boundary at ~2000ms; a working signal answers near the
+    // helper's own 1400ms action instant plus one walk.
+    assert!(
+        out.elapsed_ms < 1_800,
+        "a wait woken by a real UIA change should return near the helper's ~1400ms action instant \
+         (measured on-box: 1500ms), well before the ~2000ms forced-re-read boundary an \
+         always-Quiet signal would need; took {}ms",
+        out.elapsed_ms
+    );
+}
+
+/// The WinForms fixture, whose "Save" button becomes enabled 4s after launch.
+fn winforms_fixture_spec() -> AppSpec {
+    let script = repo_root().join("crates/glass-windows/fixture/a11y_fixture.ps1");
+    AppSpec {
+        build: None,
+        run: vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.to_string_lossy().into_owned(),
+        ],
+        cwd: None,
+        env: vec![],
+        // The hint matters here in a way it does not for Notepad: the window belongs to
+        // `powershell.exe`, so pid-set membership alone would also match a console window.
+        window_hint: Some(WindowHint {
+            title: Some("glass a11y fixture".into()),
+            class: None,
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
+/// The documented cost of the `IsEnabled` gap, asserted rather than described.
+///
+/// A WinForms control becoming enabled announces nothing, so this wait cannot be woken by an
+/// event — it can only be rescued by `glass_core`'s once-a-second forced re-read (`REREAD_AFTER`).
+/// Both halves matter: that it still matches is the correctness claim; that it took more than one
+/// walk rules out the wait's first read as the source of the match.
+///
+/// `walked > 1` does not prove no event fired — an announced transition and a forced re-read land
+/// too close in walk count to tell apart. That WinForms never announces `IsEnabled` comes from the
+/// on-box probe, not from this test. A failure says nothing about the bridge either: `walked > 1`
+/// fails only at `walked == 1`, meaning the fixture's 4s flip landed before the wait began, which
+/// is a timing problem here — an announced transition would wake the wait at walk #2 and pass.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting(true);
+    glass
+        .start(&winforms_fixture_spec())
+        .expect("start fixture");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("Save".into()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Enabled,
+            interval_ms: 100,
+            timeout_ms: 10_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    eprintln!("wait for Save to enable: {walked} walks");
+    save_report(
+        "onbox-wait-for-enabled-reread.txt",
+        &format!("wait for Save to enable: {walked} walks\n"),
+    );
+    assert!(subscribed > 0, "no subscription was established");
+    assert!(
+        out.matched,
+        "the forced re-read must still find Save enabled; the subscription must not be able to \
+         make a wait miss a change the platform declined to announce"
+    );
+    assert!(
+        walked > 1,
+        "the wait matched in its first read ({walked} walk), so Save was already enabled when it \
+         started — the fixture's flip beat the wait, and this run measured nothing about the \
+         fallback"
     );
 }

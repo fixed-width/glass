@@ -842,6 +842,26 @@ pub enum ElementCondition {
 }
 
 impl ElementCondition {
+    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]. `glass-a11y-windows` walks
+    /// this array to build the set of UIA properties it registers, so a condition absent here is
+    /// one that backend cannot be woken by, with nothing to fail. Not every subscribing backend
+    /// derives its subscription this way — the AT-SPI reader registers by event class instead.
+    pub const ALL: [ElementCondition; 13] = [
+        ElementCondition::Appears,
+        ElementCondition::Disappears,
+        ElementCondition::Enabled,
+        ElementCondition::Disabled,
+        ElementCondition::Checked,
+        ElementCondition::Unchecked,
+        ElementCondition::Selected,
+        ElementCondition::Unselected,
+        ElementCondition::Expanded,
+        ElementCondition::Collapsed,
+        ElementCondition::Focused,
+        ElementCondition::Visible,
+        ElementCondition::Hidden,
+    ];
+
     /// Parse from the condition name (case-insensitive). `None` for unknown.
     pub fn from_name(s: &str) -> Option<ElementCondition> {
         use ElementCondition::*;
@@ -2400,6 +2420,48 @@ mod tests {
         assert_eq!(
             normalize_description("save", Some("Save")),
             Some("save".to_string())
+        );
+    }
+
+    /// One slot per `ElementCondition`. Deliberately not `ElementCondition::ALL.len()`: sizing the
+    /// check off the array under test lets an entry dropped from the *end* shrink the check along
+    /// with it and pass.
+    const CONDITION_COUNT: usize = 13;
+
+    /// Adding an `ElementCondition` fails to compile in this match, which is where it is given its
+    /// slot in [`ElementCondition::ALL`]. The test below then catches an entry dropped from that
+    /// array or listed twice; nothing can force a *new* condition into it, since no test can
+    /// enumerate an enum. That is worth care because `ALL` is what the Windows a11y crate's
+    /// coverage test iterates, so a condition missing from it is one that check silently skips.
+    const fn condition_index(c: ElementCondition) -> usize {
+        match c {
+            ElementCondition::Appears => 0,
+            ElementCondition::Disappears => 1,
+            ElementCondition::Enabled => 2,
+            ElementCondition::Disabled => 3,
+            ElementCondition::Checked => 4,
+            ElementCondition::Unchecked => 5,
+            ElementCondition::Selected => 6,
+            ElementCondition::Unselected => 7,
+            ElementCondition::Expanded => 8,
+            ElementCondition::Collapsed => 9,
+            ElementCondition::Focused => 10,
+            ElementCondition::Visible => 11,
+            ElementCondition::Hidden => 12,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_condition_exactly_once() {
+        let mut seen = [false; CONDITION_COUNT];
+        for c in ElementCondition::ALL {
+            let i = condition_index(c);
+            assert!(!seen[i], "{c:?} appears twice in ElementCondition::ALL");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "ElementCondition::ALL is missing a condition"
         );
     }
 }

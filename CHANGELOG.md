@@ -16,6 +16,17 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- On Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
+  Where UI Automation announces a property change, a wait for something that has not happened yet
+  now reads the tree when something changes instead of once per interval — measured on hardware at
+  `interval_ms: 100`, 4 walks for a 3-second wait where it previously took 24. It still re-reads
+  once a second regardless, and once more before reporting nothing found, so a change the platform
+  does not announce costs latency, not a wrong answer. That matters most for `condition: "enabled"`:
+  of the two providers measured, a WinForms app never announced a control becoming enabled and a
+  WPF one did. Every other backend polls exactly as before, and so does Windows if the subscription
+  cannot be established or stops delivering.
+
 ### Fixed
 - A `glass_wait_for_element` shorter than a second could report an element absent that was on
   screen. Where the platform announces changes, the wait skips reads it has been told are pointless
@@ -24,7 +35,7 @@ internal refactors, CI, or test-only changes.
   the end of many waits. Such a wait answered from the single read it took before the change it was
   waiting for. It now reads once more before reporting nothing found, whatever its length, and the
   once-a-second floor no longer moves with `interval_ms`. Affects every backend that can subscribe
-  to change notifications, which today is Linux.
+  to change notifications.
 - Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
   name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
   *different* data — a recycled list row reusing the same view is the case this closes — is now
