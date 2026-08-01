@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
-use glass_core::{AxContext, ChangeSignal, ChangeWait};
+use glass_core::{AxContext, ChangeSignal, ChangeWait, ElementCondition};
 use uiautomation::events::{
     CustomPropertyChangedEventHandler, CustomStructureChangedEventHandler,
     UIPropertyChangedEventHandler, UIStructureChangeEventHandler,
@@ -24,13 +24,14 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Accessibility::{CUIAutomation8, IUIAutomation, IUIAutomation2};
 
-use crate::mapping::WatchedProperty;
+use crate::mapping::{SELECTOR_PROPERTIES, WatchedProperty, announcing_property};
 
 /// The one place [`WatchedProperty`] becomes a `uiautomation` type.
 ///
-/// Exhaustive, so a new `WatchedProperty` fails to compile here — but an arm is not a
-/// registration: the subscription asks for [`WatchedProperty::ALL`], kept in step with the
-/// conditions by `mapping.rs`'s `every_announced_property_is_registered`.
+/// Exhaustive, so a new `WatchedProperty` fails to compile here. An arm names the property that
+/// actually gets registered whenever [`watched`] reaches it, so a mis-paired arm registers the
+/// wrong property; `each_watched_property_converts_to_the_uia_property_with_its_id` is what
+/// catches that.
 const fn uia_property(p: WatchedProperty) -> UIProperty {
     match p {
         WatchedProperty::Name => UIProperty::Name,
@@ -38,16 +39,36 @@ const fn uia_property(p: WatchedProperty) -> UIProperty {
         WatchedProperty::IsEnabled => UIProperty::IsEnabled,
         WatchedProperty::IsOffscreen => UIProperty::IsOffscreen,
         WatchedProperty::Value => UIProperty::ValueValue,
+        WatchedProperty::RangeValue => UIProperty::RangeValueValue,
         WatchedProperty::ExpandCollapseState => UIProperty::ExpandCollapseExpandCollapseState,
         WatchedProperty::SelectionItemIsSelected => UIProperty::SelectionItemIsSelected,
         WatchedProperty::ToggleState => UIProperty::ToggleToggleState,
     }
 }
 
-/// The whole of what this subscription asks UIA for. [`WatchedProperty::ALL`] is hand-written;
-/// see its doc for what keeps it complete.
-fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
-    WatchedProperty::ALL.map(uia_property)
+/// The whole of what this subscription asks UIA for: the property announcing each
+/// [`ElementCondition`], plus the properties selectors match on ([`SELECTOR_PROPERTIES`]).
+///
+/// Derived rather than hand-listed, so `mapping.rs`'s declarations are the thing that decides what
+/// is registered — a condition whose announcing property is wrong now registers the wrong
+/// property, rather than being a claim no code reads.
+fn watched() -> Vec<UIProperty> {
+    let mut watched: Vec<WatchedProperty> = Vec::new();
+    for p in ElementCondition::ALL
+        .into_iter()
+        .filter_map(announcing_property)
+        .chain(SELECTOR_PROPERTIES)
+    {
+        // Duplicates are the rule here, not the exception — a condition and its inverse share an
+        // announcing property, and a selector property can announce a condition too — and they are
+        // not adjacent, so `Vec::dedup` would leave some behind. Order is not preserved for
+        // anything's sake: this is the set of properties to register, and nothing reads the order
+        // it is built in.
+        if !watched.contains(&p) {
+            watched.push(p);
+        }
+    }
+    watched.into_iter().map(uia_property).collect()
 }
 
 /// How long to wait for the pump to establish both registrations, which cost 38ms + 17ms on a

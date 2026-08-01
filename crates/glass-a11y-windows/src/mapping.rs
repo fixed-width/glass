@@ -142,12 +142,12 @@ pub fn format_range_value(v: f64) -> String {
     format!("{v}")
 }
 
-/// A UIA property the change subscription registers for.
+/// A UIA property the change subscription can register for.
 ///
-/// A closed set rather than raw ids, so [`announcing_property`] can only name a property this enum
-/// carries; with a bare `u32` it could name any number at all. Having a variant is not enough,
-/// though: it also needs a `UIProperty` arm in `events.rs`, which the compiler requires, and an
-/// entry in [`ALL`](WatchedProperty::ALL), which is the list actually registered.
+/// A closed set rather than raw ids, so [`announcing_property`] and [`SELECTOR_PROPERTIES`] can
+/// only name a property this enum carries; with a bare `u32` they could name any number at all.
+/// Carrying a variant is not what registers it: `events.rs` builds its registration list from
+/// those two declarations, and a variant neither of them names is registered nowhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchedProperty {
     Name,
@@ -155,37 +155,47 @@ pub enum WatchedProperty {
     /// Registered even though the WinForms controls probed on-box never sent it, reaching UI
     /// Automation through the legacy MSAA bridge; a WPF window probed the same way does announce
     /// it, so removing the registration would break the provider it already works for. Where it is
-    /// not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
-    /// `QUIET_RUNS_BEFORE_REREAD` forced re-read — latency, not a wrong answer.
+    /// not sent, a `condition: "enabled"` wait falls back to `glass_core`'s once-a-second forced
+    /// re-read — latency, not a wrong answer.
     IsEnabled,
     IsOffscreen,
+    /// A node's `value` where it comes from `ValuePattern` — an editable control, a combo box.
     Value,
+    /// The other source of a node's `value`: the reader reads a ProgressBar/Slider/Spinner
+    /// position from `RangeValuePattern`, which announces its own property, so a
+    /// `value_contains` wait on one of those is woken by this and never by
+    /// [`Value`](WatchedProperty::Value).
+    RangeValue,
     ExpandCollapseState,
     SelectionItemIsSelected,
     ToggleState,
 }
 
 impl WatchedProperty {
-    /// Every variant, in the order the subscription registers them.
+    /// Every variant, for the tests that cross-check this enum against UIA's own property ids.
     ///
-    /// Hand-written, and nothing makes a new variant appear here. Two tests carry that weight:
-    /// `all_lists_every_watched_property_exactly_once` catches an entry dropped or listed twice,
-    /// and `every_announced_property_is_registered` catches a condition announced by a property
-    /// this array omits. A variant no condition names and this array omits is caught by neither,
-    /// and costs nothing, since nothing else reads it.
-    pub const ALL: [WatchedProperty; 8] = [
+    /// Not the registration list — `events.rs` derives that from [`announcing_property`] and
+    /// [`SELECTOR_PROPERTIES`] — and nothing reads its order. Hand-written, and nothing makes a new
+    /// variant appear here, so `all_lists_every_watched_property_exactly_once` catches an entry
+    /// dropped or listed twice; a variant missing from it is one those cross-checks silently stop
+    /// covering.
+    pub const ALL: [WatchedProperty; 9] = [
         WatchedProperty::Name,
         WatchedProperty::HasKeyboardFocus,
         WatchedProperty::IsEnabled,
         WatchedProperty::IsOffscreen,
         WatchedProperty::Value,
+        WatchedProperty::RangeValue,
         WatchedProperty::ExpandCollapseState,
         WatchedProperty::SelectionItemIsSelected,
         WatchedProperty::ToggleState,
     ];
 
-    /// The stable UIA property id. Numeric for the same reason [`CONTROL_TYPES`] is: this module
-    /// compiles on every host, and `uiautomation` is a `cfg(windows)` dependency.
+    /// The stable UIA property id, transcribed here independently of `events.rs`'s `UIProperty`
+    /// arms. Nothing calls this at run time: its only consumers are the tests that pair the two
+    /// tables against each other (see `every_watched_property_has_a_distinct_id`). Numeric for the
+    /// same reason [`CONTROL_TYPES`] is: this module compiles on every host, and `uiautomation` is
+    /// a `cfg(windows)` dependency.
     pub const fn id(self) -> u32 {
         match self {
             WatchedProperty::Name => 30005,
@@ -193,6 +203,7 @@ impl WatchedProperty {
             WatchedProperty::IsEnabled => 30010,
             WatchedProperty::IsOffscreen => 30022,
             WatchedProperty::Value => 30045,
+            WatchedProperty::RangeValue => 30047,
             WatchedProperty::ExpandCollapseState => 30070,
             WatchedProperty::SelectionItemIsSelected => 30079,
             WatchedProperty::ToggleState => 30086,
@@ -200,14 +211,27 @@ impl WatchedProperty {
     }
 }
 
+/// The properties a *selector* matches on, which no [`glass_core::ElementCondition`] names.
+///
+/// `name:` matches the element's name, and `value_contains:` its value — which the reader reads
+/// from either the Value or the RangeValue pattern depending on the control, hence two value
+/// properties (see [`RangeValue`](WatchedProperty::RangeValue)). A wait filtered on one of these
+/// still has to wake when it changes, so `events.rs` registers these alongside the properties
+/// [`announcing_property`] names.
+pub const SELECTOR_PROPERTIES: [WatchedProperty; 3] = [
+    WatchedProperty::Name,
+    WatchedProperty::Value,
+    WatchedProperty::RangeValue,
+];
+
 /// The property whose change announces `condition`, or `None` where a structure change does.
 ///
 /// Exhaustive, so a new [`glass_core::ElementCondition`] fails to compile here rather than quietly
-/// answering `None`. The compiler stops there; that the property named is one the subscription
-/// registers is checked by `every_announced_property_is_registered`. Nothing calls this at run
-/// time — the subscription registers [`WatchedProperty::ALL`] wholesale — so it declares the
-/// correspondence for that check to verify, and getting it wrong only makes a wait slow, which is
-/// the kind of regression that ships.
+/// answering `None`. This is half of what the subscription registers — `events.rs` walks every
+/// condition through this function and adds [`SELECTOR_PROPERTIES`] — so an arm naming the wrong
+/// property registers the wrong property, and waits on that condition then fall back to
+/// `glass_core`'s forced re-read: slow rather than wrong, which is the kind of regression that
+/// ships.
 pub const fn announcing_property(
     condition: glass_core::ElementCondition,
 ) -> Option<WatchedProperty> {
@@ -464,8 +488,10 @@ mod tests {
 
     #[test]
     fn every_watched_property_has_a_distinct_id() {
-        // Only this stops two variants carrying the same id, which would silently drop one from
-        // the registration — the ids are hand-written and the type says nothing about them.
+        // `id()` feeds no registration; it exists to be a second, independent transcription of the
+        // ids `events.rs`'s `uia_property` arms name, which is the only thing that makes the
+        // pairing check there discriminating. Two variants sharing an id would let a swapped arm
+        // satisfy that check — and the ids are hand-written, so nothing else would notice.
         let ids: Vec<u32> = WatchedProperty::ALL.iter().map(|p| p.id()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -480,7 +506,7 @@ mod tests {
     /// One slot per [`WatchedProperty`] variant. Deliberately not `WatchedProperty::ALL.len()`:
     /// sizing the check off the array under test lets an entry dropped from the *end* shrink the
     /// check along with it and pass.
-    const WATCHED_COUNT: usize = 8;
+    const WATCHED_COUNT: usize = 9;
 
     /// Adding a [`WatchedProperty`] fails to compile in this match, which forces a decision about
     /// where it sits in [`WatchedProperty::ALL`]. Mirrors `glass_core`'s `condition_index`.
@@ -491,17 +517,18 @@ mod tests {
             WatchedProperty::IsEnabled => 2,
             WatchedProperty::IsOffscreen => 3,
             WatchedProperty::Value => 4,
-            WatchedProperty::ExpandCollapseState => 5,
-            WatchedProperty::SelectionItemIsSelected => 6,
-            WatchedProperty::ToggleState => 7,
+            WatchedProperty::RangeValue => 5,
+            WatchedProperty::ExpandCollapseState => 6,
+            WatchedProperty::SelectionItemIsSelected => 7,
+            WatchedProperty::ToggleState => 8,
         }
     }
 
     #[test]
     fn all_lists_every_watched_property_exactly_once() {
-        // `ALL` is the list `events.rs` hands UIA, and it is hand-written: an entry dropped from
-        // it is a property no wait can be woken by, and an entry listed twice registers one
-        // property twice while hiding whichever entry it displaced.
+        // `ALL` is what drives the id cross-checks below, and it is hand-written: a variant
+        // dropped from it is a variant those checks silently stop covering, and one listed twice
+        // hides whichever entry it displaced.
         let mut seen = [false; WATCHED_COUNT];
         for p in WatchedProperty::ALL {
             let i = watched_index(p);
@@ -515,27 +542,16 @@ mod tests {
     }
 
     #[test]
-    fn every_announced_property_is_registered() {
-        // Nothing in the type system joins `announcing_property` to `WatchedProperty::ALL`: a
-        // condition can name a property the subscription never asks UIA for, and every wait on
-        // that condition then falls back to the forced re-read forever, with nothing failing.
-        for c in glass_core::ElementCondition::ALL {
-            if let Some(p) = announcing_property(c) {
-                assert!(
-                    WatchedProperty::ALL.contains(&p),
-                    "{c:?} is announced by {p:?}, which the subscription never registers"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_selector_properties_are_registered_too() {
+    fn the_selector_properties_cover_name_and_both_value_sources() {
         // `name:` and `value_contains:` are selectors, not conditions, so no `ElementCondition`
-        // names them — but a wait matching on either still has to wake when they change, and
-        // nothing in the type system ties a selector to a property the way a condition is tied.
-        assert!(WatchedProperty::ALL.contains(&WatchedProperty::Name));
-        assert!(WatchedProperty::ALL.contains(&WatchedProperty::Value));
+        // names them: `SELECTOR_PROPERTIES` is the hand-written half of what `events.rs`
+        // registers, and only this says what belongs in it. Two value properties, not one,
+        // because the reader has two sources for a node's `value` — `ValuePattern` for an
+        // editable control, `RangeValuePattern` for a ProgressBar/Slider/Spinner — and
+        // `value_contains` matches whichever one the element carries.
+        assert!(SELECTOR_PROPERTIES.contains(&WatchedProperty::Name));
+        assert!(SELECTOR_PROPERTIES.contains(&WatchedProperty::Value));
+        assert!(SELECTOR_PROPERTIES.contains(&WatchedProperty::RangeValue));
     }
 
     #[test]
