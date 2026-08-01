@@ -1724,13 +1724,12 @@ fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
 
 /// A subscription establishes against a real app, and the wait still answers from its first read.
 ///
-/// Deliberately *not* a test that a signal cannot suppress a match, which is a risk it cannot
-/// reach: `glass_core`'s poll loop ticks before it ever pauses (`run_tick` starts true in
-/// `poll_until_with_pause`), so no `ChangeSignal` is consulted before the first walk — and the
-/// element here is already on screen when the wait starts, so that unconditional walk is what
-/// matches. What can fail for a signal-related reason is the subscription never establishing.
-/// A change arriving *after* the first read is the real risk, and
-/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] is what covers it.
+/// Deliberately *not* a test that a signal cannot suppress a match — a risk it cannot reach.
+/// `glass_core`'s poll loop ticks before it ever pauses (`run_tick` starts true in
+/// `poll_until_with_pause`), so no `ChangeSignal` is consulted before the first walk, and the
+/// element here is already on screen. What can still fail for a signal-related reason is the
+/// subscription never establishing. A change arriving *after* the first read is the real risk;
+/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] covers it.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_subscription_establishes_and_the_first_read_still_answers() {
@@ -1872,12 +1871,11 @@ fn independent_ctx(handle: i64) -> AxContext {
 /// Puts charmap's Advanced-view checkbox back in the state the test found it in, however the test
 /// ends.
 ///
-/// charmap persists that checkbox across launches, so a run that leaves it open changes what every
-/// later charmap launch's tree holds: an open Advanced view adds an Edit, and two other tests in
-/// this file bind to the *first* `TextField` in the tree. Drives the window through its own UIA
-/// reader rather than the test's `Glass`, so it also works while unwinding from a panic — and
-/// every step is best-effort for the same reason: a restore that panicked during a drop would
-/// abort the process and bury the failure that got us here.
+/// charmap persists that checkbox across launches, so a run leaving it open adds an Edit to every
+/// later launch's tree — and two other tests in this file bind to the *first* `TextField`. Drives
+/// the window through its own UIA reader rather than the test's `Glass`, so it works while
+/// unwinding too; every step is best-effort because a panic inside a drop would abort the process
+/// and bury the failure that got us here.
 struct RestoreAdvancedView {
     handle: i64,
     was_checked: bool,

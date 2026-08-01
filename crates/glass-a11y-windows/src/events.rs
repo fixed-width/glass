@@ -59,11 +59,10 @@ fn watched() -> Vec<UIProperty> {
         .filter_map(announcing_property)
         .chain(SELECTOR_PROPERTIES)
     {
-        // A condition and its inverse are announced by the same property, so duplicates are
-        // routine. Membership rather than `Vec::dedup`, which drops only *adjacent* duplicates and
-        // would therefore depend on the order `ElementCondition::ALL` happens to list conditions
-        // in — an order nothing pins. Order does not matter here either way: this is the set of
-        // properties to register, and nothing reads the sequence it was built in.
+        // A condition and its inverse share a property, so duplicates are routine. Membership
+        // rather than `Vec::dedup`, which drops only *adjacent* ones and would depend on the order
+        // `ElementCondition::ALL` happens to list conditions in. This is a set to register with;
+        // nothing reads the sequence it was built in.
         if !watched.contains(&p) {
             watched.push(p);
         }
@@ -550,12 +549,9 @@ mod tests {
         );
     }
 
-    /// `alive` carries the opposite direction to `running`: the pump telling the signal it has
-    /// gone. It has to be read *before* the channel, because the channel is the unreliable half
-    /// here — UIA holds both senders inside the registered handlers, so a pump that exited because
-    /// its window stopped resolving can leave them undropped indefinitely, and every `wait` would
-    /// keep reporting `Quiet` for a subscription that will never deliver again. A message left
-    /// pending proves the check is not merely the `Disconnected` arm wearing a different name.
+    /// A message left pending is what proves this check is not merely the `Disconnected` arm
+    /// wearing a different name — see `Signaling::alive` for why the channel is the unreliable
+    /// half.
     #[test]
     fn once_alive_is_cleared_wait_reports_unusable_even_with_a_message_pending() {
         let (tx, rx) = sync_channel(1);

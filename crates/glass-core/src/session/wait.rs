@@ -396,11 +396,10 @@ impl Glass {
         let mut signal = (params.interval_ms > 0)
             .then(|| self.subscribe_a11y_changes())
             .flatten();
-        // Subscribing costs a round-trip of its own, and it is the caller's budget it spends, so
-        // the poll loop gets what is left rather than the whole of it. That bounds the polling, not
-        // the call: a reader bounds its own handshake in seconds, and by the time this line runs
-        // that time is already gone — a wait told to give up after 500ms can return later than
-        // that, and `elapsed_ms`, measured from before the subscribe, reports it.
+        // Subscribing spends the caller's budget, so the poll loop gets what is left. That bounds
+        // the polling, not the call: a reader bounds its own handshake in seconds, so a wait told
+        // to give up after 500ms can return later than that. `elapsed_ms` is measured from before
+        // the subscribe and reports it.
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
