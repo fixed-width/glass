@@ -842,9 +842,11 @@ pub enum ElementCondition {
 }
 
 impl ElementCondition {
-    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]; a backend that subscribes
-    /// to change notifications derives its registration list from this, so a condition absent
-    /// here would be one nothing announces.
+    /// Every condition a wait can be given. Mirrors [`AxRole::ALL`]. A backend that subscribes to
+    /// change notifications keeps its own registration list rather than deriving one from this;
+    /// what walks this array is that backend's coverage test — `glass-a11y-windows`'s
+    /// `every_announced_property_is_registered` — so a condition absent here is one that check
+    /// silently skips.
     pub const ALL: [ElementCondition; 13] = [
         ElementCondition::Appears,
         ElementCondition::Disappears,
@@ -2422,9 +2424,16 @@ mod tests {
         );
     }
 
-    /// Adding an `ElementCondition` fails to compile in this match, and the array below must then
-    /// grow to match — which is the point: `ALL` is what the Windows subscription derives its
-    /// registration list from, so a condition missing from it would be silently unwaitable.
+    /// One slot per `ElementCondition`. Deliberately not `ElementCondition::ALL.len()`: sizing the
+    /// check off the array under test lets an entry dropped from the *end* shrink the check along
+    /// with it and pass.
+    const CONDITION_COUNT: usize = 13;
+
+    /// Adding an `ElementCondition` fails to compile in this match, which is where it is given its
+    /// slot in [`ElementCondition::ALL`]. The test below then catches an entry dropped from that
+    /// array or listed twice; nothing can force a *new* condition into it, since no test can
+    /// enumerate an enum. That is worth care because `ALL` is what the Windows a11y crate's
+    /// coverage test iterates, so a condition missing from it is one that check silently skips.
     const fn condition_index(c: ElementCondition) -> usize {
         match c {
             ElementCondition::Appears => 0,
@@ -2445,7 +2454,7 @@ mod tests {
 
     #[test]
     fn all_lists_every_condition_exactly_once() {
-        let mut seen = [false; ElementCondition::ALL.len()];
+        let mut seen = [false; CONDITION_COUNT];
         for c in ElementCondition::ALL {
             let i = condition_index(c);
             assert!(!seen[i], "{c:?} appears twice in ElementCondition::ALL");

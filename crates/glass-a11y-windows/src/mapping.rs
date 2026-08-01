@@ -144,20 +144,21 @@ pub fn format_range_value(v: f64) -> String {
 
 /// A UIA property the change subscription registers for.
 ///
-/// A closed set rather than raw ids, so the correspondence cannot rot: [`announcing_property`]
-/// must name one of these, and a condition needing a property the subscription does not register
-/// means adding a variant here — which fails to compile in `events.rs`'s conversion until it is
-/// registered there too. With a bare `u32` a new condition could name any number at all and
-/// nothing would notice.
+/// A closed set rather than raw ids, so [`announcing_property`] can only name a property this
+/// enum has a variant for; with a bare `u32` it could name any number at all and nothing would
+/// notice. Two further things have to hold, and having a variant is neither of them: the variant
+/// needs a `UIProperty` arm in `events.rs`, which the compiler requires because that match is
+/// exhaustive, and it needs an entry in [`ALL`](WatchedProperty::ALL), which is the list actually
+/// registered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchedProperty {
     Name,
     HasKeyboardFocus,
-    /// Registered even though a WinForms app never sends it: those controls reach UI Automation
-    /// through the legacy MSAA bridge, which announces structure and name changes but not this
-    /// one. A native provider (WPF, and anything built on AccessKit) does announce it, so
-    /// removing the registration to tidy up for WinForms would break the apps it already works
-    /// for. Where it is not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
+    /// Registered even though the WinForms controls probed on-box never sent it: those reach UI
+    /// Automation through the legacy MSAA bridge, which announced structure and name changes but
+    /// not this one. A WPF window, probed the same way, does announce it — so removing the
+    /// registration to tidy up for WinForms would break the provider it already works for. Where
+    /// it is not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
     /// `QUIET_RUNS_BEFORE_REREAD` forced re-read — latency, not a wrong answer.
     IsEnabled,
     IsOffscreen,
@@ -169,6 +170,12 @@ pub enum WatchedProperty {
 
 impl WatchedProperty {
     /// Every variant, in the order the subscription registers them.
+    ///
+    /// Hand-written, and nothing makes a new variant appear here. Two tests carry that weight:
+    /// `all_lists_every_watched_property_exactly_once` catches an entry dropped or listed twice,
+    /// and `every_announced_property_is_registered` catches a condition announced by a property
+    /// this array does not carry. A new variant that no condition names and this array omits is
+    /// caught by neither — and costs nothing, since nothing else reads it.
     pub const ALL: [WatchedProperty; 8] = [
         WatchedProperty::Name,
         WatchedProperty::HasKeyboardFocus,
@@ -198,9 +205,13 @@ impl WatchedProperty {
 
 /// The property whose change announces `condition`, or `None` where a structure change does.
 ///
-/// Exhaustive by construction: a new [`glass_core::ElementCondition`] fails to compile here. That
-/// is the enforcement — a condition nothing announces does not error, it just makes waits slow,
-/// which is the kind of regression that ships.
+/// Exhaustive, so a new [`glass_core::ElementCondition`] fails to compile here rather than
+/// quietly answering `None`. The compiler stops there: that the property named is one the
+/// subscription registers is checked by `every_announced_property_is_registered`, because
+/// [`WatchedProperty::ALL`] is a hand-written array. Nothing calls this at run time — the
+/// subscription registers `ALL` wholesale — so it declares the correspondence for that check to
+/// verify. Getting it wrong raises no error at run time either: the wait falls back to the forced
+/// re-read and merely gets slow, which is the kind of regression that ships.
 pub const fn announcing_property(
     condition: glass_core::ElementCondition,
 ) -> Option<WatchedProperty> {
@@ -457,8 +468,8 @@ mod tests {
 
     #[test]
     fn every_watched_property_has_a_distinct_id() {
-        // The type stops a condition naming an unregistered property; only this stops two
-        // variants carrying the same id, which would silently drop one from the registration.
+        // Only this stops two variants carrying the same id, which would silently drop one from
+        // the registration — the ids are hand-written and the type says nothing about them.
         let ids: Vec<u32> = WatchedProperty::ALL.iter().map(|p| p.id()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -468,6 +479,58 @@ mod tests {
             ids.len(),
             "two WatchedProperty variants share an id: {ids:?}"
         );
+    }
+
+    /// One slot per [`WatchedProperty`] variant. Deliberately not `WatchedProperty::ALL.len()`:
+    /// sizing the check off the array under test lets an entry dropped from the *end* shrink the
+    /// check along with it and pass.
+    const WATCHED_COUNT: usize = 8;
+
+    /// Adding a [`WatchedProperty`] fails to compile in this match, which forces a decision about
+    /// where it sits in [`WatchedProperty::ALL`]. Mirrors `glass_core`'s `condition_index`.
+    const fn watched_index(p: WatchedProperty) -> usize {
+        match p {
+            WatchedProperty::Name => 0,
+            WatchedProperty::HasKeyboardFocus => 1,
+            WatchedProperty::IsEnabled => 2,
+            WatchedProperty::IsOffscreen => 3,
+            WatchedProperty::Value => 4,
+            WatchedProperty::ExpandCollapseState => 5,
+            WatchedProperty::SelectionItemIsSelected => 6,
+            WatchedProperty::ToggleState => 7,
+        }
+    }
+
+    #[test]
+    fn all_lists_every_watched_property_exactly_once() {
+        // `ALL` is the list `events.rs` hands UIA, and it is hand-written: an entry dropped from
+        // it is a property no wait can be woken by, and an entry listed twice registers one
+        // property twice while hiding whichever entry it displaced.
+        let mut seen = [false; WATCHED_COUNT];
+        for p in WatchedProperty::ALL {
+            let i = watched_index(p);
+            assert!(!seen[i], "{p:?} appears twice in WatchedProperty::ALL");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "WatchedProperty::ALL is missing a variant"
+        );
+    }
+
+    #[test]
+    fn every_announced_property_is_registered() {
+        // Nothing in the type system joins `announcing_property` to `WatchedProperty::ALL`: a
+        // condition can name a property the subscription never asks UIA for, and every wait on
+        // that condition then falls back to the forced re-read forever, with nothing failing.
+        for c in glass_core::ElementCondition::ALL {
+            if let Some(p) = announcing_property(c) {
+                assert!(
+                    WatchedProperty::ALL.contains(&p),
+                    "{c:?} is announced by {p:?}, which the subscription never registers"
+                );
+            }
+        }
     }
 
     #[test]
