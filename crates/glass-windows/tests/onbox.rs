@@ -1719,12 +1719,18 @@ fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
     );
 }
 
-/// The risk a subscription creates: a wait that no longer matches, because the signal suppressed
-/// the read that would have found the element. Sequential and assumption-free — the element is
-/// already on screen when the wait starts, so the wait must return on its first read.
+/// A subscription establishes against a real app, and the wait still answers from its first read.
+///
+/// Deliberately *not* a test that a signal cannot suppress a match, which is a risk it cannot
+/// reach: `glass_core`'s poll loop ticks before it ever pauses (`run_tick` starts true in
+/// `poll_until_with_pause`), so no `ChangeSignal` is consulted before the first walk — and the
+/// element here is already on screen when the wait starts, so that unconditional walk is what
+/// matches. What can fail for a signal-related reason is the subscription never establishing.
+/// A change arriving *after* the first read is the real risk, and
+/// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] is what covers it.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
-fn onbox_a_wait_with_a_signal_still_matches() {
+fn onbox_a_subscription_establishes_and_the_first_read_still_answers() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
     let (mut glass, walks, signals) = glass_counting(true);
@@ -1822,7 +1828,7 @@ fn find_charmap_window(expected_pid: u32) -> i64 {
 /// Best-effort on-screen geometry for a raw HWND, via the plain window rect — good enough for
 /// `AxContext::window`, which this path only uses for bounds translation inside a snapshot, never
 /// for a click. Deliberately not `glass_windows`'s own DWM-extended `geometry_of`: that function is
-/// crate-private, and reaching for it would mean this "independent" thread borrowing glass's own
+/// crate-private, and reaching for it would mean this "independent" path borrowing glass's own
 /// window code rather than rediscovering the window on its own.
 fn window_rect_geometry(handle: i64) -> WindowGeometry {
     use windows::Win32::Foundation::RECT;
@@ -1844,6 +1850,56 @@ fn window_rect_geometry(handle: i64) -> WindowGeometry {
         y: rect.top,
         width: (rect.right - rect.left).max(0) as u32,
         height: (rect.bottom - rect.top).max(0) as u32,
+    }
+}
+
+/// The `AxContext` an independent UIA reader needs for a raw charmap HWND: no `Glass` state, just
+/// the window and its rect. Shared by the helper thread below and by [`RestoreAdvancedView`],
+/// which both act on the window without going through the `Glass` session under test.
+fn independent_ctx(handle: i64) -> AxContext {
+    AxContext {
+        pids: vec![],
+        window: window_rect_geometry(handle),
+        window_handle: Some(handle),
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    }
+}
+
+/// Puts charmap's Advanced-view checkbox back in the state the test found it in, however the test
+/// ends.
+///
+/// charmap persists that checkbox across launches, so a run that leaves it open changes what every
+/// later charmap launch's tree holds: an open Advanced view adds an Edit, and two other tests in
+/// this file bind to the *first* `TextField` in the tree. Drives the window through its own UIA
+/// reader rather than the test's `Glass`, so it also works while unwinding from a panic — and
+/// every step is best-effort for the same reason: a restore that panicked during a drop would
+/// abort the process and bury the failure that got us here.
+struct RestoreAdvancedView {
+    handle: i64,
+    was_checked: bool,
+}
+
+impl Drop for RestoreAdvancedView {
+    fn drop(&mut self) {
+        let ctx = independent_ctx(self.handle);
+        let mut a11y = WindowsA11y::new();
+        let Ok(tree) = a11y.snapshot(&ctx) else {
+            return;
+        };
+        let mut cb = None;
+        first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
+        let Some(cb) = cb.filter(|cb| cb.states.checked != self.was_checked) else {
+            return;
+        };
+        let target = AxTarget {
+            id: cb.id,
+            role: cb.role,
+            name: cb.name.clone(),
+            bounds: cb.bounds,
+            value: cb.value.clone(),
+        };
+        let _ = a11y.invoke(&ctx, &target);
     }
 }
 
@@ -1876,13 +1932,21 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
     glass.start(&charmap_spec()).expect("start charmap");
     std::thread::sleep(Duration::from_millis(1500));
 
-    // charmap persists the Advanced-view checkbox's state across launches on this box, so
-    // normalize to closed first: the helper thread's job is to open it, and "Search" must not
-    // already be on screen when the timed wait below starts.
+    let pid = newest_charmap_pid().expect("must find the charmap.exe process this test started");
+    let handle = find_charmap_window(pid);
+
+    // charmap persists the Advanced-view checkbox across launches, so normalize to closed first:
+    // the helper thread's job is to open it, and "Search" must not already be on screen when the
+    // timed wait below starts. The guard puts it back — see [`RestoreAdvancedView`] for what a
+    // stray open Advanced view does to the tests that run after this one.
     let tree = glass.a11y_snapshot(None).expect("initial snapshot");
     let mut cb = None;
     first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
     let cb = cb.expect("charmap exposes the Advanced-view CheckBox");
+    let restore = RestoreAdvancedView {
+        handle,
+        was_checked: cb.states.checked,
+    };
     if cb.states.checked {
         glass
             .click_element(cb.id)
@@ -1890,21 +1954,12 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    let pid = newest_charmap_pid().expect("must find the charmap.exe process this test started");
-    let handle = find_charmap_window(pid);
-
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
     signals.store(0, std::sync::atomic::Ordering::Relaxed);
     let helper = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1400));
         let mut a11y = WindowsA11y::new();
-        let ctx = AxContext {
-            pids: vec![],
-            window: window_rect_geometry(handle),
-            window_handle: Some(handle),
-            a11y_bus_addr: None,
-            limits: WalkLimits::DEFAULT,
-        };
+        let ctx = independent_ctx(handle);
         let tree = a11y.snapshot(&ctx).expect("helper thread's own snapshot");
         let mut cb = None;
         first_role_with_bounds(&tree.root, AxRole::CheckBox, &mut cb);
@@ -1937,6 +1992,10 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
     let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
     let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
     let helper_result = helper.join();
+    // Explicitly before `stop`, which the guard's own drop would otherwise run after: restoring
+    // the checkbox means driving charmap's UI, and a stopped charmap has none. On a panic the
+    // guard drops first anyway, since it was declared after `glass`.
+    drop(restore);
     let _ = glass.stop();
 
     helper_result.expect("helper thread must not panic");

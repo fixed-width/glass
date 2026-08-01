@@ -39,8 +39,6 @@ $timer.Interval = 1000
 $timer.Add_Tick({
     $script:tick++
     if ($script:tick -eq $EnableAfterSec) {
-      # Flushed so a test can correlate the flip with its own timeline.
-      Write-Host "FIXTURE_SAVE_ENABLED"
       $save.Enabled = $true
     }
   })
