@@ -253,20 +253,25 @@ fn native_invoke_actuates_the_fixture() {
     p.start_app(&spec("InvokeComposeFixtureActivity"))
         .expect("launch compose fixture");
     // The platform reports the app up before the Compose hierarchy has published its
-    // accessibility tree.
+    // accessibility tree, and the label's bounds keep moving while the activity animates in —
+    // `invoke` fingerprints bounds, so waiting for the label to merely exist yields
+    // `AxElementChanged`. Wait for two reads to agree.
     let deadline = std::time::Instant::now() + AWAIT_DEADLINE;
-    let t = loop {
-        let t = snap(&mut a11y);
-        if by_desc(&t.root, "Save").is_some() {
-            break t;
+    let mut settled = None;
+    loop {
+        let bounds = by_desc(&snap(&mut a11y).root, "Save").and_then(|n| n.bounds);
+        if bounds.is_some() && bounds == settled {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the compose fixture never published a Save label"
+            "the compose fixture never settled on a Save label"
         );
+        settled = bounds;
         std::thread::sleep(std::time::Duration::from_millis(150));
-    };
+    }
     let before = counter(&mut a11y);
+    let t = snap(&mut a11y);
     let save_label = by_desc(&t.root, "Save").expect("Save label");
     let actuated = a11y
         .invoke(&ctx, &target(save_label))
