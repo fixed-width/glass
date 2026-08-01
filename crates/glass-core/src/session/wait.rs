@@ -2,13 +2,19 @@
 //! and the wait/scroll parameter and outcome types.
 use super::*;
 
-/// How many "nothing changed" answers to accept before reading the tree anyway.
+/// How long to go on a signal's word alone before reading the tree anyway.
 ///
 /// A signal reports the change classes it subscribed to, from the senders it resolved; anything
 /// outside that would otherwise let a wait answer "not matched" without ever looking again — a
-/// wrong result rather than a slow one. This bounds that to added latency: at the default 100ms
-/// interval, one re-read per second no matter what the platform does or does not announce.
-const QUIET_RUNS_BEFORE_REREAD: u32 = 10;
+/// wrong result rather than a slow one. This bounds that to added latency, one re-read per second
+/// no matter what the platform does or does not announce.
+///
+/// Wall-clock, and deliberately not a count of quiet intervals: a count is a ceiling only in units
+/// of `interval_ms`, so it moves with the caller's interval and can sit past the caller's whole
+/// timeout. Ten intervals at the 200ms `glass_wait_for_element` default is two seconds — longer
+/// than many waits ever run, which made the ceiling unreachable for exactly the short waits that
+/// could least afford to answer from one stale read.
+const REREAD_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Parameters for [`Glass::wait_stable`].
 #[derive(Clone, Debug)]
@@ -397,7 +403,8 @@ impl Glass {
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
-        let mut quiet_budget = QUIET_RUNS_BEFORE_REREAD;
+        // Starts now rather than at the first read: the first tick follows immediately.
+        let mut last_read = std::time::Instant::now();
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
@@ -406,16 +413,8 @@ impl Glass {
                 let read_now = match signal.as_mut() {
                     Some(s) => match s.wait(d) {
                         ChangeWait::Changed => true,
-                        // Read anyway now and then — see `QUIET_RUNS_BEFORE_REREAD`.
-                        ChangeWait::Quiet => {
-                            quiet_budget = quiet_budget.saturating_sub(1);
-                            if quiet_budget == 0 {
-                                quiet_budget = QUIET_RUNS_BEFORE_REREAD;
-                                true
-                            } else {
-                                false
-                            }
-                        }
+                        // Read anyway now and then — see `REREAD_AFTER`.
+                        ChangeWait::Quiet => last_read.elapsed() >= REREAD_AFTER,
                         // See `ChangeWait`: an unusable signal must not read as a quiet one.
                         ChangeWait::Unusable => {
                             signal = None;
@@ -424,6 +423,9 @@ impl Glass {
                     },
                     None => true,
                 };
+                if read_now {
+                    last_read = std::time::Instant::now();
+                }
                 // One interval between reads, whatever woke us. A chatty app (spinner, clock,
                 // progress bar) would otherwise drive back-to-back walks with no gap, hammering the
                 // same bus the app is trying to serve — and a signal that returns early without
@@ -1237,8 +1239,11 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_wait_walks_once() {
-        // The point of the change: told nothing changed, the wait must not re-read the tree.
+    fn a_quiet_wait_walks_once_and_looks_again_at_the_deadline() {
+        // The point of the change: told nothing changed, the wait must not re-read the tree on the
+        // interval. The second walk is the deadline read — a wait may skip work whose answer it was
+        // told cannot have changed, but it may not answer "not matched" without looking once after
+        // the last thing it was told.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1249,7 +1254,11 @@ mod tests {
         let o = g.wait_for_element(&never_matches(20, 120)).unwrap();
 
         assert!(!o.matched);
-        assert_eq!(walks.load(Ordering::Relaxed), 1, "a quiet wait re-walked");
+        assert_eq!(
+            walks.load(Ordering::Relaxed),
+            2,
+            "a quiet wait re-walked on the interval"
+        );
     }
 
     #[test]
@@ -1328,8 +1337,9 @@ mod tests {
 
     #[test]
     fn a_long_quiet_wait_reads_anyway_now_and_then() {
-        // 25 intervals is two `QUIET_RUNS_BEFORE_REREAD` ceilings, so two forced reads on top of
-        // the first.
+        // 2.5s spans two `REREAD_AFTER` ceilings, so two forced reads on top of the first and the
+        // one at the deadline. The interval is deliberately far smaller than the ceiling: a count
+        // of intervals would put the ceiling at 500ms here and read five times.
         let (mut g, walks) = glass_with_a11y_counted(
             FakePlatform::new(100, 100),
             vec![fake_tree_enabled()],
@@ -1337,13 +1347,60 @@ mod tests {
         );
         g.start(&spec()).unwrap();
 
-        let o = g.wait_for_element(&never_matches(10, 250)).unwrap();
+        let o = g.wait_for_element(&never_matches(50, 2_500)).unwrap();
 
         assert!(!o.matched);
         let n = walks.load(Ordering::Relaxed);
         assert!(
-            (2..=5).contains(&n),
-            "a quiet 250ms wait at a 10ms interval read {n} times; the ceiling is not firing"
+            (3..=6).contains(&n),
+            "a quiet 2.5s wait at a 50ms interval read {n} times; the ceiling is not firing"
+        );
+    }
+
+    #[test]
+    fn a_wait_too_short_to_reach_the_ceiling_still_sees_an_unannounced_change() {
+        // The regression this fixes. A platform that declines to announce some change leaves the
+        // wait skipping every tick, and a wait whose whole budget is shorter than `REREAD_AFTER`
+        // never reaches the forced read — so before the deadline read it answered "not matched"
+        // from the single snapshot it took before the change happened. Not a slow answer: a wrong
+        // one, for an element that is on screen.
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            // Absent on the first read, present on every read after it.
+            vec![fake_tree_enabled(), fake_tree_checked()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        // 600ms at a 200ms interval: three intervals, and no ceiling inside the budget.
+        let o = g.wait_for_element(&never_matches(200, 600)).unwrap();
+
+        assert!(
+            o.matched,
+            "answered from one stale read after {} walks",
+            walks.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn the_ceiling_is_wall_clock_so_a_wide_interval_does_not_push_it_out() {
+        // A count of quiet intervals scales the ceiling with the caller's interval: ten of the
+        // 200ms `glass_wait_for_element` default is two seconds. Wall-clock, the same wait sees an
+        // unannounced change inside one.
+        let (mut g, _walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled(), fake_tree_checked()],
+            Some(|| Box::new(NeverSignals) as Box<dyn ChangeSignal>),
+        );
+        g.start(&spec()).unwrap();
+
+        let o = g.wait_for_element(&never_matches(200, 5_000)).unwrap();
+
+        assert!(o.matched);
+        assert!(
+            o.elapsed_ms < 1_500,
+            "took {}ms; an interval-counted ceiling would land near 2000",
+            o.elapsed_ms
         );
     }
 

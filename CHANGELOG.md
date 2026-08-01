@@ -17,6 +17,14 @@ internal refactors, CI, or test-only changes.
 ## [Unreleased]
 
 ### Fixed
+- A `glass_wait_for_element` shorter than a second could report an element absent that was on
+  screen. Where the platform announces changes, the wait skips reads it has been told are pointless
+  and reads anyway once a second in case it was told wrong — but that second was previously counted
+  in polling intervals rather than measured, so at the 200ms default it landed at two seconds, past
+  the end of many waits. Such a wait answered from the single read it took before the change it was
+  waiting for. It now reads once more before reporting nothing found, whatever its length, and the
+  once-a-second floor no longer moves with `interval_ms`. Affects every backend that can subscribe
+  to change notifications, which today is Linux.
 - Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
   name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
   *different* data — a recycled list row reusing the same view is the case this closes — is now
@@ -84,8 +92,9 @@ internal refactors, CI, or test-only changes.
 - On Linux, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
   Where the platform can say whether anything changed, a wait for something that has not happened
   yet now reads the tree when something changes instead of once per interval — measured against the
-  GTK test fixture, 3 reads for a 3-second wait where it previously took 22. It re-reads about once
-  a second regardless, so a change the platform does not announce costs latency, not a wrong answer.
+  GTK test fixture, 4 reads for a 3-second wait where it previously took 22. It re-reads once a
+  second regardless, and always once more before reporting nothing found, so a change the platform
+  does not announce costs latency, not a wrong answer.
   Every other backend polls exactly as before, and so does Linux if the subscription cannot be
   established or stops delivering.
 

@@ -59,6 +59,18 @@ pub fn poll_until_with_pause<T>(
             });
         }
         if start.elapsed().as_millis() as u64 >= timeout_ms {
+            // Never answer "not found" on information older than the last pause. A `pause` that
+            // skipped ticks did so because it was told nothing changed, and a caller told wrong —
+            // a platform that declines to announce some change — would otherwise have the loop
+            // report an element absent that has been on screen since before the last pause. One
+            // tick, at a deadline the wait has already spent, is what keeps a skipped tick a cost
+            // saving rather than a wrong answer.
+            if !run_tick && let Some(v) = tick()? {
+                return Ok(PollOutcome {
+                    value: Some(v),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                });
+            }
             return Ok(PollOutcome {
                 value: None,
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -93,6 +105,32 @@ mod tests {
         // Two unsatisfied ticks, so two pauses — and no sleep of the loop's own, which is what
         // lets a caller wake on an event instead of waiting out an interval.
         assert_eq!(paused.get(), 2);
+    }
+
+    #[test]
+    fn a_loop_that_skipped_its_ticks_looks_once_more_before_answering_no() {
+        // The whole point of a skipped tick is that the caller was *told* nothing changed. A
+        // caller that is told wrong — a platform that declines to announce a change — would
+        // otherwise have the loop report "not found" on information it has not refreshed since
+        // the last pause. One tick at the deadline is what keeps a skip a cost saving rather than
+        // a wrong answer.
+        let mut ticks = 0;
+        let out = poll_until_with_pause(
+            1,
+            30,
+            |_| false, // "nothing changed" — every time, and wrongly
+            || {
+                ticks += 1;
+                // Absent on the first look, present from then on: the change the pause hid.
+                Ok(if ticks > 1 { Some(7) } else { None })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.value,
+            Some(7),
+            "answered from information older than the last pause"
+        );
     }
 
     #[test]

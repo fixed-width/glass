@@ -414,6 +414,19 @@ pub(crate) fn fake_tree_enabled() -> AxTree {
     t
 }
 
+/// [`fake_tree_enabled`] with the button also checked, so a wait on `ElementCondition::Checked`
+/// matches this tree and not that one — the pair is how a test stages a change mid-wait.
+pub(crate) fn fake_tree_checked() -> AxTree {
+    let mut t = fake_tree();
+    t.root.children[0].states = AxStates {
+        enabled: true,
+        checkable: true,
+        checked: true,
+        ..Default::default()
+    };
+    t
+}
+
 pub(crate) fn window_info(id: u64, geometry: WindowGeometry, active: bool) -> WindowInfo {
     WindowInfo {
         id: WindowId(id),
