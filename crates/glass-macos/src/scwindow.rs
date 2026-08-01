@@ -241,15 +241,15 @@ pub(crate) fn scan_on_screen_windows(
     (found, candidates)
 }
 
-/// [`scan_on_screen_windows`] without the candidate summary — the per-call lookup
-/// `capture::capture_window` and `query_once` use. Shared by both so the two call sites can't
-/// drift apart on what "the target window" means.
+/// [`scan_on_screen_windows`] without the candidate summary — `capture::capture_window`'s
+/// per-call lookup (its only caller: `query_once` no longer goes through this function,
+/// it reaches [`scan_on_screen_windows`] directly via `query_once_inner`).
 ///
 /// Returns the live `Retained<SCWindow>` itself, against the module's normal "never a
 /// `Retained<SCWindow>`" rule (see the module doc): `capture::capture_window` needs exactly
 /// that, still inside the same completion-handler callback, to build an `SCContentFilter`
-/// from it. `query_once` immediately converts its half of the result to a [`WindowMatch`]
-/// snapshot via [`window_match_from`] instead of holding onto it.
+/// from it. `query_once_inner` converts its own [`scan_on_screen_windows`] result to a
+/// [`WindowMatch`] snapshot via [`window_match_from`] instead of holding onto it.
 pub(crate) fn find_on_screen_window(
     content: &SCShareableContent,
     pids: &[i32],
@@ -260,8 +260,9 @@ pub(crate) fn find_on_screen_window(
 /// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id` AND
 /// `owningApplication().processID() ∈ pids`, returning it alongside its owning pid. The
 /// `find_window_by_id`-side counterpart of [`find_on_screen_window`] (which filters by
-/// owning pid alone instead of a specific window + pid set): same on-screen filter as
-/// [`scan_on_screen_windows`]'s loop, so the lookups can't drift on what "on-screen" means.
+/// owning pid alone instead of a specific window + pid set): its own copy of the same
+/// on-screen filter shape as [`scan_on_screen_windows`]'s loop, not a shared call — keeping
+/// the two in sync on what "on-screen" means is a discipline, not something enforced.
 /// The `pids` check (final-review fix 1) is load-bearing, not defensive: `windowID` alone
 /// is not scoped to any particular app, so without it this would match *any* on-screen
 /// window system-wide, letting a stale/foreign `CGWindowID` silently resolve to someone
