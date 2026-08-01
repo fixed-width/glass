@@ -1993,3 +1993,87 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
         out.elapsed_ms
     );
 }
+
+/// The WinForms fixture, whose "Save" button becomes enabled 4s after launch.
+fn winforms_fixture_spec() -> AppSpec {
+    let script = repo_root().join("crates/glass-windows/fixture/a11y_fixture.ps1");
+    AppSpec {
+        build: None,
+        run: vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.to_string_lossy().into_owned(),
+        ],
+        cwd: None,
+        env: vec![],
+        // The hint matters here in a way it does not for Notepad: the window belongs to
+        // `powershell.exe`, so pid-set membership alone would also match a console window.
+        window_hint: Some(WindowHint {
+            title: Some("glass a11y fixture".into()),
+            class: None,
+        }),
+        timeout_ms: 15_000,
+        sandbox: glass_core::SandboxLevel::Off,
+        a11y: false,
+    }
+}
+
+/// The documented cost of the `IsEnabled` gap, asserted rather than described.
+///
+/// A WinForms control becoming enabled announces nothing, so this wait cannot be woken by an
+/// event — it can only be rescued by `QUIET_RUNS_BEFORE_REREAD`'s forced re-read. Both halves
+/// matter: that it still matches is the correctness claim, and that it took more than one walk
+/// to get there is what proves the match came from the fallback and not from a notification. If
+/// the second assertion ever starts failing, the bridge began announcing `IsEnabled` and the
+/// disclosure in `events.rs` and the changelog is stale.
+///
+/// `walked > 1` only proves the match did not come from the wait's first read — an announced
+/// transition and a forced re-read land close enough together in walk count that this assertion
+/// cannot tell them apart. That WinForms never announces `IsEnabled` is established by the
+/// 2026-07-31 on-box probe, not by this test.
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session"]
+fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    let (mut glass, walks, signals) = glass_counting(true);
+    glass
+        .start(&winforms_fixture_spec())
+        .expect("start fixture");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    let out = glass
+        .wait_for_element(&glass_core::WaitElementParams {
+            name: Some("Save".into()),
+            role: None,
+            value_contains: None,
+            condition: glass_core::ElementCondition::Enabled,
+            interval_ms: 100,
+            timeout_ms: 10_000,
+        })
+        .expect("wait");
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = glass.stop();
+
+    eprintln!("wait for Save to enable: {walked} walks");
+    save_report(
+        "onbox-wait-for-enabled-reread.txt",
+        &format!("wait for Save to enable: {walked} walks\n"),
+    );
+    assert!(subscribed > 0, "no subscription was established");
+    assert!(
+        out.matched,
+        "the forced re-read must still find Save enabled; the subscription must not be able to \
+         make a wait miss a change the platform declined to announce"
+    );
+    assert!(
+        walked > 1,
+        "the wait matched in {walked} walk(s), so something woke it — the WinForms bridge is \
+         announcing IsEnabled after all, and the disclosure in events.rs is now wrong"
+    );
+}
