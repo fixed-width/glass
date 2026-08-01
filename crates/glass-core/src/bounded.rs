@@ -94,8 +94,8 @@ fn run_bounded_inner(
     // partial read — `pbcopy` would report a clipboard it never fully received.
     //
     // A channel and not a shared cell: nothing joins this thread, so a cell says only what the
-    // writer had recorded by the time the parent happened to look, and "not yet recorded" is
-    // indistinguishable from "wrote everything". The receive below waits for an answer instead.
+    // writer had recorded when the parent looked, and "not yet recorded" reads the same as "wrote
+    // everything".
     let stdin_len = stdin.as_ref().map_or(0, Vec::len);
     let wrote = if let Some(bytes) = stdin
         && let Some(mut pipe) = child.stdin.take()
@@ -151,9 +151,8 @@ fn run_bounded_inner(
     //
     // Bounded by the same `settled_by` as the pipes, and for the same reason: a grandchild holding
     // the read end keeps the write blocked exactly as it keeps a drain from reaching EOF. A write
-    // still in flight when that expires is reported rather than waited out — the thread stays
-    // parked until the kernel releases it, which a blocking write offers no way to cancel, but the
-    // caller is told its payload's fate is unknown instead of being handed a success.
+    // still in flight when that expires is reported rather than waited out; the thread stays parked
+    // until the kernel releases it, which a blocking write offers no way to cancel.
     if let Some(rx) = wrote {
         match rx.recv_timeout(settled_by.saturating_duration_since(Instant::now())) {
             Ok(Ok(())) => {}
@@ -552,12 +551,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_write_still_in_flight_when_the_child_exits_is_not_reported_as_landed() {
-        // The sibling test above races: the child exits, and whether the write thread has recorded
-        // its `EPIPE` by the time the parent looks is a matter of scheduling. This one removes the
-        // race. The child exits at once but leaves a grandchild holding the read end, so the write
-        // neither completes nor fails — it is still blocked, and the outcome the parent reads was
-        // never written by anyone. The grandchild's own stdout and stderr go to /dev/null, so both
-        // drains still reach EOF and what is under test is the write, not a held-open output pipe.
+        // The sibling test above races: whether the write thread has recorded its `EPIPE` when the
+        // parent looks is a matter of scheduling. Here the child exits at once but leaves a
+        // grandchild holding the read end, so the write is still blocked and no outcome has been
+        // written by anyone. The grandchild's stdout and stderr go to /dev/null, so both drains
+        // reach EOF and what is under test is the write, not a held-open output pipe.
         //
         // `exec 3<&0` then `<&3` is load-bearing: POSIX gives a background job in a non-interactive
         // shell its stdin from /dev/null *before* any explicit redirection, so a plain `sleep &`
