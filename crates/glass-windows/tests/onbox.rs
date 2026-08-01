@@ -1771,7 +1771,8 @@ fn onbox_a_wait_with_a_signal_still_matches() {
 /// Pure Win32, independent of any `Platform`/`Glass` instance: the helper thread in
 /// [`onbox_a_wait_wakes_on_a_late_change_from_another_thread`] must share no state with the
 /// `Glass` session it acts on, so it finds the live charmap window itself rather than borrowing
-/// anything glass tracked.
+/// anything glass tracked. Title alone, though: see [`find_charmap_window`] for why a caller
+/// needing the *right* charmap window uses that instead of this directly.
 fn find_window_by_title(title: &str) -> Option<i64> {
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     use windows::core::{HSTRING, PCWSTR};
@@ -1780,6 +1781,47 @@ fn find_window_by_title(title: &str) -> Option<i64> {
     unsafe { FindWindowW(PCWSTR::null(), &HSTRING::from(title)) }
         .ok()
         .map(|h| h.0 as i64)
+}
+
+/// The pid of the most recently started `charmap.exe` process, via a `Get-Process` shell-out (the
+/// same PowerShell-query pattern [`our_edge_count`] already uses elsewhere in this file) —
+/// independent of any `Glass`/`Platform` instance. "Most recent" rather than "the only one": if an
+/// earlier test leaked a `charmap.exe` (a documented, actively-checked-for risk in this file — see
+/// the on-box leak check in the branch's own verification steps), this test's own instance is still
+/// the newest by construction, since it was launched last.
+fn newest_charmap_pid() -> Option<u32> {
+    let ps = "(Get-Process charmap -ErrorAction SilentlyContinue | \
+              Sort-Object StartTime -Descending | Select-Object -First 1).Id";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Find the live "Character Map" window AND verify it belongs to `expected_pid` — the pid of the
+/// charmap.exe this test itself started ([`newest_charmap_pid`]), obtained independently of
+/// `Glass`. [`find_window_by_title`] alone binds by title only, exactly like glass's own discovery
+/// does NOT (glass adopts by pid-set/handle); a stale charmap.exe left behind by an earlier test
+/// could otherwise win the title lookup, and the helper thread would toggle the wrong window's
+/// checkbox — read by the main thread's `wait_for_element` as a plain 5s timeout, with nothing in
+/// the failure pointing at a leaked process as the cause. Panics with the mismatched pids named,
+/// rather than let that failure mode reach the caller as an unexplained timeout.
+fn find_charmap_window(expected_pid: u32) -> i64 {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let handle = find_window_by_title("Character Map")
+        .expect("an independent Win32 lookup must find a live 'Character Map' window");
+    let hwnd = windows::Win32::Foundation::HWND(handle as *mut std::ffi::c_void);
+    let mut owner_pid = 0u32;
+    // SAFETY: writes the owning pid into our stack value; the HWND is only queried, never mutated.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid)) };
+    assert_eq!(
+        owner_pid, expected_pid,
+        "the 'Character Map' window found by title belongs to pid {owner_pid}, not {expected_pid} \
+         (the pid this test started) — a stale charmap.exe is likely still running from an earlier \
+         test"
+    );
+    handle
 }
 
 /// Best-effort on-screen geometry for a raw HWND, via the plain window rect — good enough for
@@ -1814,21 +1856,44 @@ fn window_rect_geometry(handle: i64) -> WindowGeometry {
 /// (`onbox_a_wait_with_a_signal_still_matches`, already on screen) and cost without a match
 /// (the quiet-wait tests), but none of them ever drives `ChangeWait::Changed => true` inside
 /// `Glass::wait_for_element`'s poll loop (`session/wait.rs`) from a change nothing but a real UIA
-/// event produced — a build where the signal never actually delivered `Changed` into that loop
-/// passes all three. This closes it: the main thread blocks in `wait_for_element` for a control
-/// that does not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`, the
-/// target window found by an independent Win32 title lookup rather than anything the `Glass`
-/// session tracks, so no `Glass` state crosses threads — sleeps briefly, then actuates charmap's
-/// Advanced-view checkbox directly. Opening it reveals a "Search" [`AxRole::Button`] (confirmed by
-/// a one-off on-box probe: closed=26 nodes, open=37; "Search" was the one newly-appeared control
-/// with a name unique to itself, unlike the panel's other new controls, which repeat labels
-/// ("Character set", "Group by") that already exist elsewhere in charmap's tree).
+/// event produced. This does: the main thread blocks in `wait_for_element` for a control that does
+/// not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`, the target window
+/// found and pid-verified independently of the `Glass` session (see [`find_charmap_window`]), so no
+/// `Glass` state crosses threads — sleeps, then actuates charmap's Advanced-view checkbox directly.
+/// Opening it reveals a "Search" [`AxRole::Button`] (confirmed by a one-off on-box probe: closed=26
+/// nodes, open=37; "Search" was the one newly-appeared control with a name unique to itself, unlike
+/// the panel's other new controls, which repeat labels — "Character set", "Group by" — that already
+/// exist elsewhere in charmap's tree).
+///
+/// `elapsed_ms` alone does NOT discriminate a working signal from a broken one, and neither does
+/// the walk count alone — each rules out a different broken build:
+/// - No subscription at all (`subscribe_changes` always `None`): every 100ms tick reads regardless
+///   (`wait.rs`'s `None => true` arm), so the change would still be caught at the very next tick —
+///   indistinguishable from a working signal on elapsed time alone, but it walks on EVERY tick
+///   instead of only the initial read + the periodic forced re-reads.
+/// - A subscription that never reports a real event (always `Quiet`): `QUIET_RUNS_BEFORE_REREAD`
+///   (`session/wait.rs`) forces a re-read every ~1000ms at this test's `interval_ms=100`, so the
+///   change would still be caught at the next forced-re-read boundary — indistinguishable from a
+///   working signal on walk count alone (both are low), but it cannot possibly return before that
+///   boundary.
+///
+/// So the helper acts at ~1400ms — the middle of the SECOND forced-re-read window (boundaries at
+/// ~1000ms and ~2000ms), not the first: acting near 700ms (as an earlier version of this test did)
+/// put a real-signal result close enough to the first boundary (~1000ms) to leave little margin.
+/// Measured on-box with the helper acting at 1400ms: `matched=true elapsed_ms=1500 walks=3` — 3
+/// walks (the initial read, the ~1000ms forced re-read, and the read the event itself triggers,
+/// matching the quiet-wait tests' own count) and 1500ms elapsed, comfortably below the ~2000ms
+/// floor an always-`Quiet` build would need to reach the same tick and comfortably above what a
+/// no-subscription build's own elapsed time would look like (indistinguishable from this on elapsed
+/// alone, but reached across roughly one walk per 100ms tick — an order of magnitude more). The two
+/// asserts below bound walks between those two shapes and elapsed below the ~2000ms floor —
+/// together, not separately, they rule out both.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     dpi_aware_once();
-    let mut glass = glass_windows_with_a11y();
+    let (mut glass, walks, signals) = glass_counting(true);
     glass.start(&charmap_spec()).expect("start charmap");
     std::thread::sleep(Duration::from_millis(1500));
 
@@ -1846,10 +1911,13 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    let handle = find_window_by_title("Character Map")
-        .expect("an independent Win32 lookup must find the live charmap window");
+    let pid = newest_charmap_pid().expect("must find the charmap.exe process this test started");
+    let handle = find_charmap_window(pid);
+
+    walks.store(0, std::sync::atomic::Ordering::Relaxed);
+    signals.store(0, std::sync::atomic::Ordering::Relaxed);
     let helper = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(700));
+        std::thread::sleep(Duration::from_millis(1400));
         let mut a11y = WindowsA11y::new();
         let ctx = AxContext {
             pids: vec![],
@@ -1873,35 +1941,55 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
             .expect("helper thread opens advanced view");
     });
 
-    let out = glass
-        .wait_for_element(&glass_core::WaitElementParams {
-            name: Some("Search".into()),
-            role: Some(AxRole::Button),
-            value_contains: None,
-            condition: glass_core::ElementCondition::Appears,
-            interval_ms: 100,
-            timeout_ms: 5_000,
-        })
-        .expect("wait");
-    helper.join().expect("helper thread must not panic");
+    // Captured, not unwrapped, before the join: if `wait_for_element` errored, `.expect` below
+    // would panic and unwind — and with the helper still un-joined at that point, its `JoinHandle`
+    // would be dropped while the thread is still doing live Win32/UIA work against this window.
+    // `SERIAL` releases as soon as this test's guard drops on the panic, so the very next on-box
+    // test could start and race the orphaned helper. Joining before any panic-capable call closes
+    // that gap.
+    let wait_result = glass.wait_for_element(&glass_core::WaitElementParams {
+        name: Some("Search".into()),
+        role: Some(AxRole::Button),
+        value_contains: None,
+        condition: glass_core::ElementCondition::Appears,
+        interval_ms: 100,
+        timeout_ms: 5_000,
+    });
+    let walked = walks.load(std::sync::atomic::Ordering::Relaxed);
+    let subscribed = signals.load(std::sync::atomic::Ordering::Relaxed);
+    let helper_result = helper.join();
     let _ = glass.stop();
 
+    helper_result.expect("helper thread must not panic");
+    let out = wait_result.expect("wait");
+
     let line = format!(
-        "late-change wait: matched={} elapsed_ms={}\n",
-        out.matched, out.elapsed_ms
+        "late-change wait: matched={} elapsed_ms={} walks={}\n",
+        out.matched, out.elapsed_ms, walked
     );
     eprint!("{line}");
     save_report("onbox-late-change-wait.txt", &line);
+    assert!(subscribed > 0, "no subscription was established");
     assert!(
         out.matched,
         "the Search button must appear once advanced view opens"
     );
-    // Generous relative to the 5s timeout: a signal-woken wait should return in well under a
-    // second (the helper's own 700ms sleep plus one UIA walk). 3s leaves headroom for box load
-    // while still failing a wait that only ever woke via the timeout.
+    // Rules out "no subscription at all" — see the doc comment above. A polling build would walk
+    // roughly once per 100ms tick over ~1.4s (~14); a working signal walks only the initial read,
+    // the ~1000ms forced re-read, and the event itself (~3, matching the quiet-wait tests' count).
     assert!(
-        out.elapsed_ms < 3_000,
-        "a wait woken by a real UIA change should return well inside the 5s timeout, took {}ms",
+        walked <= 7,
+        "the wait walked {walked} times reaching the change; a live subscription should keep this \
+         near the quiet-wait tests' count (~3), not polling's (~14)"
+    );
+    // Rules out "subscribed but always Quiet" — see the doc comment above. That build cannot answer
+    // before the next forced-re-read boundary at ~2000ms; a working signal answers near the
+    // helper's own 1400ms action instant plus one walk.
+    assert!(
+        out.elapsed_ms < 1_800,
+        "a wait woken by a real UIA change should return near the helper's ~1400ms action instant \
+         (measured on-box: 1500ms), well before the ~2000ms forced-re-read boundary an \
+         always-Quiet signal would need; took {}ms",
         out.elapsed_ms
     );
 }
