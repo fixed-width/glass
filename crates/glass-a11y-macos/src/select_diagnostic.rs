@@ -84,8 +84,7 @@ mod tests {
 
     /// The line that cost an hour on 2026-07-29: a locked screen hands back the *application*
     /// element where a window belongs, and `AXSize` fails `kAXErrorAttributeUnsupported`
-    /// (-25205). Both facts have to survive into the diagnostic, or the log reads as a glass
-    /// regression. The error text here is the raw string `select_window` builds from
+    /// (-25205). The error text here is the raw string `select_window` builds from
     /// `ffi::ax_err`; in production it arrives via `GlassError::Backend`'s `Display`, so the
     /// live line carries an extra `"backend error: "` prefix
     /// (`role=AXApplication <AXSize unreadable: backend error: AXSize: AX call failed
@@ -161,8 +160,7 @@ mod tests {
         );
     }
 
-    /// The `AXPosition` branch drops its error today exactly like the `AXSize` one; it gets the
-    /// same treatment, or the fix only half-lands.
+    /// `PositionUnreadable` needs the same AXError-preserving treatment as `SizeUnreadable`.
     #[test]
     fn an_unreadable_position_keeps_the_ax_error() {
         let line = candidate_line(

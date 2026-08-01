@@ -98,8 +98,6 @@ mod tests {
         );
     }
 
-    /// The ordinary case still prints — an adoption that was never ambiguous is exactly the
-    /// baseline a later ambiguous one is read against.
     #[test]
     fn a_single_candidate_still_renders() {
         let line = adoption_line(7, &[candidate(101, Some("Calculator"), 230, 408, true)]);

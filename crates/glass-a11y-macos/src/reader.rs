@@ -248,9 +248,8 @@ fn select_window(
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
-        // Read first, so a candidate that fails every subsequent read still names what it is:
-        // a withheld tree hands back an `AXApplication` where a window belongs, and that fact
-        // is what identifies the condition (#263).
+        // Read first, so a candidate that fails every subsequent read still names what it is
+        // (#263) — see the doc comment above for why that matters.
         let role = ffi::attribute_string(w, attr::ROLE);
         let role = role.as_deref();
         let (ax_w, ax_h) = match ffi::ax_size(w) {

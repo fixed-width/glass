@@ -28,8 +28,7 @@ pub enum GlassError {
 
     /// No window matched. Two causes reach here and the error cannot tell them apart: the app
     /// genuinely has not opened its window yet, or it has, and the window glass adopted is not
-    /// one of them (#263). Naming only the first sent a real investigation down a timing-race
-    /// path for an hour. The per-candidate detail that does discriminate is printed to stderr
+    /// one of them (#263). The per-candidate detail that does discriminate is printed to stderr
     /// by the resolver that failed.
     #[error(
         "window not found — the app has no window matching the expected geometry; it may not \
