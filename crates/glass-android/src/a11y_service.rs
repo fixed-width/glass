@@ -1006,4 +1006,38 @@ mod tests {
         let e = actuable_node(&t, &label).unwrap_err();
         assert!(!e.invoke_fallback_eligible(), "{e}");
     }
+
+    /// Two siblings under the root: the first is clickable and its bounds happen to enclose
+    /// the second, but it does not contain the target in its subtree; the target is the second
+    /// sibling, with no clickable node anywhere in its real ancestry (root nor itself).
+    fn target_follows_a_rejected_clickable_sibling() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [
+                {"class": "android.view.View",
+                 "bounds": {"x": 0, "y": 200, "w": 1080, "h": 2000},
+                 "editable": false, "clickable": true, "enabled": true, "scrollable": false,
+                 "children": []},
+                {"class": "android.widget.TextView", "text": "Save",
+                 "bounds": {"x": 40, "y": 1220, "w": 200, "h": 60},
+                 "editable": false, "clickable": false, "enabled": true, "scrollable": false}
+            ]
+        })
+    }
+
+    /// Pins `path_to`'s backtrack: without `out.pop()` restoring the accumulator after the
+    /// first (rejected) sibling, the reverse walk in `actuable_node` would still see that
+    /// sibling's clickable node — whose bounds do enclose the target — as if it were on the
+    /// target's real path, and wrongly return it instead of reporting no actuator exists.
+    #[test]
+    fn a_rejected_earlier_sibling_is_popped_before_trying_the_target_sibling() {
+        let t = built(&target_follows_a_rejected_clickable_sibling());
+        let target = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &target),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
 }
