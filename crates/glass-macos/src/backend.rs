@@ -290,6 +290,14 @@ impl MacosPlatform {
     /// mid-settle, where the window was already confirmed present at adoption. Neither path is
     /// silent.
     ///
+    /// Settles on `geometry` alone, not the whole [`crate::scwindow::WindowMatch`] — `geometry`
+    /// is rounded-to-pixel (`(v * scale).round()`), but `WindowMatch::origin_pt` is the raw
+    /// unrounded point origin it was rounded from, so two readings can agree on `geometry` while
+    /// `origin_pt` keeps drifting inside the same pixel. Comparing the whole match would make
+    /// that drift block settling forever for a window whose on-screen geometry had already
+    /// stopped changing (#263 review). The closure captures every other field of the freshest
+    /// successful read in `freshest` as it goes, so the returned match still carries them.
+    ///
     /// Only *when* the geometry is read changes here. Which window was adopted is already decided
     /// by the time this runs.
     fn settle_window(
@@ -297,10 +305,27 @@ impl MacosPlatform {
         adopted: crate::scwindow::WindowMatch,
     ) -> crate::scwindow::WindowMatch {
         let window_id = adopted.window_id;
-        let (freshest, outcome) =
-            settle_by_polling(adopted, SETTLE_BUDGET, SETTLE_POLL_INTERVAL, || {
-                crate::scwindow::find_window_by_id(window_id, &[pid], SETTLE_RESOLVE_TIMEOUT)
+        let seed_geometry = adopted.geometry.clone();
+        let mut freshest = adopted;
+        let (geometry, outcome) =
+            settle_by_polling(seed_geometry, SETTLE_BUDGET, SETTLE_POLL_INTERVAL, || {
+                // `.map`, not `?`: `?` asks for `E: From<GlassError>` and leaves `E` itself
+                // unconstrained (`settle_by_polling`'s `E` is otherwise only ever produced, never
+                // consumed), which `rustc` can't resolve on its own. `.map` keeps the `Result`'s
+                // error type exactly `GlassError`, pinning `E` without a turbofish.
+                crate::scwindow::find_window_by_id(window_id, &[pid], SETTLE_RESOLVE_TIMEOUT).map(
+                    |m| {
+                        let geometry = m.geometry.clone();
+                        freshest = m;
+                        geometry
+                    },
+                )
             });
+        // `freshest.geometry` already equals `geometry` on every path (both come from the same
+        // read, or neither read ever succeeded and both are still the seed) — stated explicitly
+        // rather than relied upon, and it's what makes `geometry` itself worth naming instead of
+        // discarding.
+        freshest.geometry = geometry;
         match outcome {
             SettleOutcome::Settled => {}
             SettleOutcome::ReadFailed(e) => eprintln!(

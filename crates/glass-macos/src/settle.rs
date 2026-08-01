@@ -63,6 +63,12 @@ pub enum SettleOutcome<E> {
 /// Poll `read` every `interval`, seeded with `seed` as the first reading, until two consecutive
 /// readings agree or `budget` elapses. Returns the freshest reading obtained — `seed` itself if
 /// `read` never succeeded — paired with how the poll ended.
+///
+/// `interval` throttles `read`: a value that never settles is called roughly `budget / interval`
+/// times, so `Duration::ZERO` (or another interval far below `read`'s own cost) busy-spins for
+/// the whole budget rather than pacing the polls — fine for a test with a cheap, instant `read`,
+/// but not the shape a real caller wants. The one production caller today (macOS's
+/// `settle_window`, #263) uses 25ms.
 pub fn settle_by_polling<T, E>(
     seed: T,
     budget: Duration,
@@ -181,7 +187,7 @@ mod tests {
     fn a_never_repeating_reader_reports_budget_expiry_with_the_freshest_value() {
         let next_value = Cell::new(0);
         let (value, outcome) =
-            settle_by_polling(-1, Duration::from_millis(2), Duration::ZERO, || {
+            settle_by_polling(-1, Duration::from_millis(50), Duration::ZERO, || {
                 next_value.set(next_value.get() + 1);
                 Ok::<i32, &str>(next_value.get())
             });
@@ -216,5 +222,34 @@ mod tests {
         );
         assert_eq!(value, 5);
         assert_eq!(outcome, SettleOutcome::ReadFailed("window vanished"));
+    }
+
+    /// Pins #263's "the predicate silently widened" review finding: `settle_by_polling` settles
+    /// purely on `T`'s `PartialEq`, so `T` itself is part of a caller's contract. `WindowMatch`
+    /// (the type an earlier revision of `settle_window` used as `T`) carries `geometry` — a
+    /// rounded pixel value — alongside `origin_pt`, the raw unrounded point origin `geometry` is
+    /// rounded from; two readings can agree on `geometry` while `origin_pt` keeps drifting inside
+    /// the same pixel forever. `Source` below mirrors just that shape: `pixel` is the value that
+    /// should decide settlement, `raw` stands in for a volatile field of the wider source data
+    /// that never repeats. A caller that narrows `T` to `pixel` alone settles despite `raw`'s
+    /// drift; this is the correction `settle_window` now applies (`T = WindowGeometry`, not
+    /// `WindowMatch`).
+    #[test]
+    fn settling_ignores_drift_in_source_fields_outside_the_compared_value() {
+        #[derive(Clone, PartialEq)]
+        struct Source {
+            pixel: i32,
+            raw: i64,
+        }
+
+        let mut raw = 0;
+        let (value, outcome) =
+            settle_by_polling(510, Duration::from_millis(50), Duration::ZERO, || {
+                raw += 1;
+                let source = Source { pixel: 510, raw };
+                Ok::<i32, &str>(source.pixel)
+            });
+        assert_eq!(value, 510);
+        assert_eq!(outcome, SettleOutcome::Settled);
     }
 }
