@@ -1,7 +1,8 @@
-//! Live a11y-service round-trip. Ignored; run with a booted AVD + the built APK:
-//!   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
-//!   GLASS_ANDROID_A11Y_APK=$HOME/git-sources/fw/glass-android-agent/a11y/build/outputs/apk/debug/a11y-debug.apk \
-//!   GLASS_ANDROID_FIXTURE_APK=$HOME/git-sources/fw/glass-android-agent/fixture-compose/build/outputs/apk/debug/fixture-compose-debug.apk \
+//! Live a11y-service round-trip. Ignored; run with a booted AVD + the built APKs (both come from
+//! the glass-android-agent repo: `./gradlew :a11y:assembleDebug :fixture-compose:assembleDebug`):
+//!   GLASS_ADB=/path/to/platform-tools/adb \
+//!   GLASS_ANDROID_A11Y_APK=/path/to/a11y-debug.apk \
+//!   GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 //!     cargo test -p glass-android --test a11y_service_loop -- --ignored --nocapture
 
 use glass_android::{
@@ -85,11 +86,7 @@ fn a11y_service_snapshot_and_actions() {
     // and no forward (don't snapshot immediately — the unbind is async, ~1s; mirror the agent_loop leak check).
 }
 
-/// Native invoke against the fixture. Ignored; run with a booted AVD:
-///   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
-///   GLASS_ANDROID_A11Y_APK=.../a11y-debug.apk \
-///   GLASS_ANDROID_FIXTURE_APK=.../fixture-compose-debug.apk \
-///     cargo test -p glass-android --test a11y_service_loop -- --ignored --nocapture
+/// Native invoke against the fixture. Ignored; same environment as the test above.
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 fn native_invoke_actuates_the_fixture() {
@@ -183,8 +180,7 @@ fn native_invoke_actuates_the_fixture() {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
-    // Measured ~520-580ms on-device; generous is free since the poll returns as soon as the
-    // value changes.
+    // Generous is free: the poll returns as soon as the value changes.
     const AWAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
     // An enabled classic button actuates.
@@ -193,17 +189,27 @@ fn native_invoke_actuates_the_fixture() {
     let save = target(by_desc(&t.root, "SaveBtn").expect("SaveBtn"));
     a11y.invoke(&ctx, &save)
         .expect("native invoke on an enabled button");
-    let after = await_change(
+    await_change(
         "the enabled button's click to register",
         &before,
         AWAIT_DEADLINE,
         || counter(&mut a11y),
     );
-    assert_ne!(after, before, "the click must actuate");
 
     // A row far below the fold actuates — the case a pointer tap cannot serve.
     let t = snap(&mut a11y);
-    let row = target(by_desc(&t.root, "Row250").expect("Row250"));
+    let row_node = by_desc(&t.root, "Row250").expect("Row250");
+    let b = row_node.bounds.expect("the row reports bounds");
+    // Prove the premise rather than trusting the fixture: if the list shrank or the screen grew,
+    // this leg would silently become a second copy of the one above and still pass.
+    let window_h = i32::try_from(ctx.window.height).expect("window height fits an i32");
+    let row_h = i32::try_from(b.height).expect("row height fits an i32");
+    assert!(
+        b.y >= window_h || b.y + row_h <= 0,
+        "Row250 must lie outside the window for this leg to be about a control a tap cannot \
+         reach; bounds {b:?}, window height {window_h}"
+    );
+    let row = target(row_node);
     let before = counter(&mut a11y);
     a11y.invoke(&ctx, &row).expect("native invoke off-screen");
     let after = await_change(
@@ -212,7 +218,6 @@ fn native_invoke_actuates_the_fixture() {
         AWAIT_DEADLINE,
         || counter(&mut a11y),
     );
-    assert_ne!(after, before, "an off-screen row must actuate");
     assert!(
         after.contains("row=250"),
         "the RIGHT row must actuate, got {after}"
@@ -247,21 +252,42 @@ fn native_invoke_actuates_the_fixture() {
     // Compose: the label is not the clickable node, so this exercises the climb.
     p.start_app(&spec("InvokeComposeFixtureActivity"))
         .expect("launch compose fixture");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // The platform reports the app up before the Compose hierarchy has published its
+    // accessibility tree, so poll for the label instead of sleeping on a guess.
+    let deadline = std::time::Instant::now() + AWAIT_DEADLINE;
+    let t = loop {
+        let t = snap(&mut a11y);
+        if by_desc(&t.root, "Save").is_some() {
+            break t;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the compose fixture never published a Save label"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    };
     let before = counter(&mut a11y);
-    let t = snap(&mut a11y);
-    let save = target(by_desc(&t.root, "Save").expect("Save label"));
-    a11y.invoke(&ctx, &save)
-        .expect("native invoke via the ancestor climb");
-    let after = await_change(
+    let save_label = by_desc(&t.root, "Save").expect("Save label");
+    let actuated = a11y
+        .invoke(&ctx, &target(save_label))
+        .expect("native invoke via the ancestor climb")
+        .expect("the climb actuated another node, and the result must name it");
+    assert_ne!(
+        actuated, save_label.id,
+        "the disclosed node is the one that handled the click, not the label asked for"
+    );
+    await_change(
         "the climb's click to reach a clickable node",
         &before,
         AWAIT_DEADLINE,
         || counter(&mut a11y),
     );
-    assert_ne!(after, before, "the climb must reach a clickable node");
 
     reg.shutdown();
     p.stop_app().ok();
     drop(p);
+    // The fixture is glass's to install and glass's to remove: leaving it installed lets device
+    // state accumulate across runs.
+    adb.run(["uninstall", "com.fixedwidth.glassfixture"]).ok();
+    agents.shutdown();
 }
