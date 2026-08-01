@@ -53,12 +53,13 @@ use crate::adoption_log::CandidateWindow;
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
 // `geometry`/`scale`/`origin_pt` are read by `start_app` (via `backend.rs::discover_window`
-// -> `query_once`) and by `send_pointer`/`capture_frame`/`send_key` (via `backend.rs`'s
-// per-call `find_window_for_pids`/`find_window_by_id` resolution); `window_id` is read by
-// `start_app` too (to seed `MacosPlatform::active_window`, Plan 4 Task 1). `pid` is read by
-// `send_pointer`/`send_key` (via `resolve_active_window`'s per-call resolution) as the
-// CGEvent focus/AX-scoping target, and by every `find_window_by_id` call site's
-// pid-scoping check (Plan 4 final-review fix 1) — every field is read somewhere.
+// -> `query_once_with_candidates`) and by `send_pointer`/`capture_frame`/`send_key` (via
+// `backend.rs`'s per-call `find_window_for_pids`/`find_window_by_id` resolution);
+// `window_id` is read by `start_app` too (to seed `MacosPlatform::active_window`, Plan 4
+// Task 1). `pid` is read by `send_pointer`/`send_key` (via `resolve_active_window`'s
+// per-call resolution) as the CGEvent focus/AX-scoping target, and by every
+// `find_window_by_id` call site's pid-scoping check (Plan 4 final-review fix 1) — every
+// field is read somewhere.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowMatch {
     /// The owning process's pid — one of the `pids` passed to `find_window_for_pids`.
@@ -116,9 +117,9 @@ pub(crate) struct AppWindow {
 /// matching window appears before `timeout` elapses.
 ///
 /// `MacosPlatform::start_app` still can't use this directly: it runs its own poll loop
-/// (`backend.rs::discover_window`) that alternates a single `query_once` attempt with
-/// `child.try_wait()` so a crashed launch fails fast with `AppExited`, and this function's
-/// self-contained `poll_until` has no child handle to race against. But
+/// (`backend.rs::discover_window`) that alternates a single `query_once_with_candidates`
+/// attempt with `child.try_wait()` so a crashed launch fails fast with `AppExited`, and
+/// this function's self-contained `poll_until` has no child handle to race against. But
 /// `MacosPlatform::send_pointer` does call this directly on every invocation, to
 /// re-resolve the window's current geometry/scale/origin fresh (the window may have moved
 /// or resized since `start_app`, or since the previous `send_pointer` call) — there's no
@@ -252,16 +253,17 @@ pub(crate) fn find_on_screen_window(
 /// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id` AND
 /// `owningApplication().processID() ∈ pids`, returning it alongside its owning pid. The
 /// `find_window_by_id`-side counterpart of [`find_on_screen_window`] (which filters by
-/// owning pid alone instead of a specific window + pid set): same on-screen filter, same
-/// iteration, so the two lookups can't drift on what "on-screen" means. The `pids` check
-/// (final-review fix 1) is load-bearing, not defensive: `windowID` alone is not scoped to
-/// any particular app, so without it this would match *any* on-screen window system-wide,
-/// letting a stale/foreign `CGWindowID` silently resolve to someone else's window — see
-/// [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] (which then builds a
-/// [`WindowMatch`] snapshot via [`window_match_from`], the same builder [`query_once`] uses)
-/// and by `capture::capture_window_by_id` (which, like `capture_window`, needs the live
-/// `SCWindow` itself, still inside the same completion-handler callback, to build an
-/// `SCContentFilter` — see [`find_on_screen_window`]'s doc).
+/// owning pid alone instead of a specific window + pid set): same on-screen filter as
+/// [`scan_on_screen_windows`]'s loop, so the lookups can't drift on what "on-screen" means.
+/// The `pids` check (final-review fix 1) is load-bearing, not defensive: `windowID` alone
+/// is not scoped to any particular app, so without it this would match *any* on-screen
+/// window system-wide, letting a stale/foreign `CGWindowID` silently resolve to someone
+/// else's window — see [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] (which
+/// then builds a [`WindowMatch`] snapshot via [`window_match_from`], the same builder
+/// [`query_once`] uses) and by `capture::capture_window_by_id` (which, like
+/// `capture_window`, needs the live `SCWindow` itself, still inside the same
+/// completion-handler callback, to build an `SCContentFilter` — see
+/// [`find_on_screen_window`]'s doc).
 pub(crate) fn find_on_screen_window_by_id(
     content: &SCShareableContent,
     window_id: u32,
@@ -273,7 +275,7 @@ pub(crate) fn find_on_screen_window_by_id(
 
     for w in windows.iter() {
         // SAFETY: `w` is a live `SCWindow` yielded by the array; these are plain property
-        // getters with no other preconditions — see `find_on_screen_window`'s identical
+        // getters with no other preconditions — see `scan_on_screen_windows`'s identical
         // SAFETY notes.
         if !unsafe { w.isOnScreen() } {
             continue;
@@ -299,11 +301,11 @@ pub(crate) fn find_on_screen_window_by_id(
 /// Derive a window's pixel geometry, `SCContentFilter` point-to-pixel scale, and POINT
 /// origin from a live `SCWindow` — the `SCContentFilter`/`pointPixelScale`/`contentRect` ->
 /// pixel-`WindowGeometry` conversion `capture::capture_window` also performs for the frame
-/// it produces. Factored out so [`window_match_from`] and [`app_window_from`] can't drift
-/// on how a window becomes a pixel geometry.
+/// it produces. Factored out so [`window_match_from`], [`app_window_from`], and
+/// [`scan_on_screen_windows`] can't drift on how a window becomes a pixel geometry.
 fn window_geometry_and_scale(w: &SCWindow) -> (WindowGeometry, f64, (f64, f64)) {
     // SAFETY: `w` is a live `SCWindow` passed in by a caller that just resolved it from a
-    // live `SCShareableContent.windows()` array (see `find_on_screen_window`/
+    // live `SCShareableContent.windows()` array (see `scan_on_screen_windows`/
     // `find_on_screen_window_by_id`/[`list_app_windows`]); `capture.rs` uses this same
     // initializer on the same kind of live `SCWindow` — no other preconditions.
     let filter =
@@ -323,8 +325,8 @@ fn window_geometry_and_scale(w: &SCWindow) -> (WindowGeometry, f64, (f64, f64)) 
 }
 
 /// Build a [`WindowMatch`] snapshot from a live `SCWindow` + its owning `pid`. Factored out
-/// so [`query_once`] and [`query_once_by_id`] can't drift on how a match becomes a
-/// `WindowMatch`.
+/// so [`query_once`], [`query_once_with_candidates`], and [`query_once_by_id`] can't drift
+/// on how a match becomes a `WindowMatch`.
 fn window_match_from(w: &SCWindow, pid: i32) -> WindowMatch {
     // SAFETY: `w` is live (see `window_geometry_and_scale`'s identical note); a plain
     // property getter with no other preconditions.
@@ -411,7 +413,7 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
             let mut found = Vec::new();
             for w in windows.iter() {
                 // SAFETY: `w` is a live `SCWindow` yielded by the array; plain property
-                // getters with no other preconditions — see `find_on_screen_window`'s
+                // getters with no other preconditions — see `scan_on_screen_windows`'s
                 // identical notes.
                 if !unsafe { w.isOnScreen() } {
                     continue;
@@ -454,13 +456,13 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
     }
 }
 
-/// Cap on a single [`query_once`] attempt's wait for its `SCShareableContent` completion
-/// handler. A query resolves in well under a second in the spike's observations, so this
-/// is a wedged-handler backstop, not normal latency; kept small (rather than the old 5s)
-/// so it can't itself eat much of the outer poll loop's `timeout_ms`/deadline budget on a
-/// single bad tick — that budget is owned by the caller (`find_window_for_pids`'s
-/// `poll_until`, or `backend.rs::discover_window`'s own loop), which retries (or times
-/// out) regardless of this cap.
+/// Cap on a single [`query_once`]/[`query_once_with_candidates`] attempt's wait for its
+/// `SCShareableContent` completion handler. A query resolves in well under a second in the
+/// spike's observations, so this is a wedged-handler backstop, not normal latency; kept
+/// small (rather than the old 5s) so it can't itself eat much of the outer poll loop's
+/// `timeout_ms`/deadline budget on a single bad tick — that budget is owned by the caller
+/// (`find_window_for_pids`'s `poll_until`, or `backend.rs::discover_window`'s own loop),
+/// which retries (or times out) regardless of this cap.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One `SCShareableContent` round trip via the `RcBlock` -> `mpsc` bridge (`ffi.rs`'s
