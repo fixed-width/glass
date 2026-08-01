@@ -27,6 +27,7 @@ use objc2_core_foundation::CFRetained;
 
 use crate::ffi::{self, attr};
 use crate::mapping::{self, AxStateFacts};
+use crate::select_diagnostic::{CandidateOutcome, candidate_line};
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -236,7 +237,10 @@ fn resolve_window(ctx: &AxContext) -> Result<(CFRetained<AXUIElement>, f64)> {
 /// [`POSITION_TOLERANCE_PX`] of `win`'s origin AND its height is consistent with that scale
 /// (within [`HEIGHT_CONSISTENCY_SLACK_PX`]). Among candidates, the closest origin wins.
 /// `None` when nothing matches (fail closed); logs each candidate's geometry to stderr in
-/// that case so a `WindowNotFound` is diagnosable without re-instrumenting.
+/// that case so a `WindowNotFound` is diagnosable without re-instrumenting — each line also
+/// carries the candidate's role and the `AXError` behind any failed read ([`candidate_line`]),
+/// so a withheld tree (e.g. a locked screen handing back an `AXApplication`) is distinguishable
+/// from a genuine geometry mismatch.
 fn select_window(
     windows: &[CFRetained<AXUIElement>],
     win: &WindowGeometry,
@@ -244,35 +248,68 @@ fn select_window(
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
-        let Ok((ax_w, ax_h)) = ffi::ax_size(w) else {
-            diagnostics.push("<AXSize unreadable>".into());
-            continue;
+        // Read first, so a candidate that fails every subsequent read still names what it is:
+        // a withheld tree hands back an `AXApplication` where a window belongs, and that fact
+        // is what identifies the condition (#263).
+        let role = ffi::attribute_string(w, attr::ROLE);
+        let role = role.as_deref();
+        let (ax_w, ax_h) = match ffi::ax_size(w) {
+            Ok(size) => size,
+            Err(e) => {
+                diagnostics.push(candidate_line(
+                    role,
+                    &CandidateOutcome::SizeUnreadable(e.to_string()),
+                ));
+                continue;
+            }
         };
         if ax_w <= 0.0 || ax_h <= 0.0 {
-            diagnostics.push(format!("ax_w={ax_w} ax_h={ax_h} <non-positive size>"));
+            diagnostics.push(candidate_line(
+                role,
+                &CandidateOutcome::NonPositiveSize { ax_w, ax_h },
+            ));
             continue;
         }
         // macOS backing scale is always an integer; snap out the border/content-vs-frame
         // inset noise in the raw width ratio (see doc comment above).
         let scale = (win.width as f64 / ax_w).round().max(1.0);
         if !scale.is_finite() || scale <= 0.0 {
-            diagnostics.push(format!(
-                "ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>"
+            diagnostics.push(candidate_line(
+                role,
+                &CandidateOutcome::InvalidScale { ax_w, ax_h, scale },
             ));
             continue;
         }
-        let Ok((ax_x, ax_y)) = ffi::ax_position(w) else {
-            diagnostics.push(format!(
-                "ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable>"
-            ));
-            continue;
+        let (ax_x, ax_y) = match ffi::ax_position(w) {
+            Ok(pos) => pos,
+            Err(e) => {
+                diagnostics.push(candidate_line(
+                    role,
+                    &CandidateOutcome::PositionUnreadable {
+                        ax_w,
+                        ax_h,
+                        scale,
+                        error: e.to_string(),
+                    },
+                ));
+                continue;
+            }
         };
         // Cast to `i64` before subtracting so `.abs()` can never wrap (`i32::MIN.abs()`
         // panics) — the same no-overflow discipline `axwindow::within_tolerance` follows.
         let dx = ((ax_x * scale).round() as i64 - i64::from(win.x)).abs();
         let dy = ((ax_y * scale).round() as i64 - i64::from(win.y)).abs();
-        diagnostics.push(format!(
-            "ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}"
+        diagnostics.push(candidate_line(
+            role,
+            &CandidateOutcome::Measured {
+                ax_x,
+                ax_y,
+                ax_w,
+                ax_h,
+                scale,
+                dx,
+                dy,
+            },
         ));
         if dx > POSITION_TOLERANCE_PX || dy > POSITION_TOLERANCE_PX {
             continue;
