@@ -26,8 +26,14 @@ pub enum GlassError {
     )]
     SandboxedAppExited(Option<i32>),
 
+    /// No window matched. Two causes reach here and the error cannot tell them apart: the app
+    /// genuinely has not opened its window yet, or it has, and the window glass adopted is not
+    /// one of them (#263). Naming only the first sent a real investigation down a timing-race
+    /// path for an hour. The per-candidate detail that does discriminate is printed to stderr
+    /// by the resolver that failed.
     #[error(
-        "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
+        "window not found — the app has no window matching the expected geometry; it may not \
+         have opened its window yet, or the window it opened is not the one glass adopted"
     )]
     WindowNotFound,
 
@@ -244,7 +250,8 @@ mod tests {
         );
         assert_eq!(
             GlassError::WindowNotFound.to_string(),
-            "window not found — the target app may not have opened its window yet; wait for it to appear and retry"
+            "window not found — the app has no window matching the expected geometry; it may not \
+             have opened its window yet, or the window it opened is not the one glass adopted"
         );
     }
 
