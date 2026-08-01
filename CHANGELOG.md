@@ -367,9 +367,10 @@ internal refactors, CI, or test-only changes.
   an internal size limit was returned as though it were complete, so a missing element was
   indistinguishable from one that does not exist. All backends now share the same limits and
   disclose when one is reached.
-- macOS: `select_window`'s no-match diagnostic now names each candidate's `AXRole` and the raw
-  `AXError` behind a failed read, and window adoption records which window it took out of what.
-  `WindowNotFound` no longer asserts a timing cause it cannot know.
+- macOS: when the accessibility tree can't resolve the window glass adopted, the diagnostic
+  it prints now names each candidate's `AXRole` and the raw `AXError` behind a failed read, and
+  window adoption itself now records which on-screen window it took out of what else was
+  available. `WindowNotFound` no longer asserts a timing cause it cannot know.
 
 ## [1.1.0] - 2026-07-23
 

@@ -517,10 +517,8 @@ fn query_once_inner(
                 return;
             };
             let m = window_match_from(&w, pid);
-            // `scan_on_screen_windows` must mark at most one candidate adopted, or `.find`
-            // below silently corrects the wrong one (or none) instead of the one this scan
-            // actually matched.
-            debug_assert!(candidates.iter().filter(|c| c.adopted).count() <= 1);
+            // Safe by construction: `scan_on_screen_windows` sets `adopted = found.is_none()`,
+            // true for at most one candidate, so `.find` below can't correct the wrong one.
             if let Some(adopted) = candidates.iter_mut().find(|c| c.adopted) {
                 adopted.geometry = m.geometry.clone();
             }

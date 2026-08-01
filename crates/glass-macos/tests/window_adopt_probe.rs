@@ -3,12 +3,25 @@
 //! on-screen window the app's pid actually owns, then reports whether the accessibility
 //! reader could resolve the adopted window at all.
 //!
-//! It exists because `scwindow::find_on_screen_window` adopts the FIRST on-screen `SCWindow`
-//! in `SCShareableContent` order owned by the target pid — no filter on layer, size or title,
-//! and no ordering guarantee from the framework. On 2026-07-29 one run adopted a `468x101`
-//! window that matches no `AXWindow` Calculator owns, and the runs either side of it adopted
-//! the real `230x408` window. This probe's job is to say what that window is, with its title,
-//! rather than leave the next reader guessing.
+//! It exists because `scwindow::scan_on_screen_windows` (reached via `backend::discover_window`
+//! -> `scwindow::query_once_with_candidates` -> `scwindow::query_once_inner`) adopts the FIRST
+//! on-screen `SCWindow` in `SCShareableContent` order owned by the target pid — no filter on
+//! layer, size or title, and no ordering guarantee from the framework. On 2026-07-29 one run
+//! adopted a `468x101` window that matches no `AXWindow` Calculator owns, and the runs either
+//! side of it adopted the real `230x408` window. This probe's job is to say what that window
+//! is, with its title, rather than leave the next reader guessing.
+//!
+//! **A `.app` bundle already running is adopted, not launched — read this before trusting a
+//! sweep.** `MacosPlatform::start_app`'s bundle branch hands off to `NSWorkspace`/
+//! LaunchServices: if an instance of the app is already running, that instance is adopted and
+//! raised rather than spawned fresh, and `stop_app` deliberately leaves a pre-existing adoptee
+//! running (glass only raised it, so it isn't glass's to kill — see `backend.rs`'s
+//! `Adopted`/`Disposition` doc). A sweep run against an app that's already open therefore
+//! re-adopts the SAME process every run, not N independent launches, and never re-tests a
+//! fresh-launch race. To probe cold launches, quit the target app completely before starting
+//! the sweep and again between sweeps; the per-run pid this probe prints, and the summary's
+//! distinct-pid count, are how to tell a cold-launch sweep from a re-adoption one after the
+//! fact.
 //!
 //! Asserts nothing about which window is correct. It fails a run only when an app could not be
 //! launched or enumerated at all — a real breakage, distinct from an app exposing something
@@ -110,11 +123,20 @@ mod macos_main {
         }
     }
 
-    /// One launch/enumerate/stop cycle. `Ok(true)` means the adopted geometry matched at least
-    /// one window the app's pid actually owns during the enumeration window; `Ok(false)` is the
-    /// condition this probe hunts. `Err` is a real breakage — the app would not launch, or its
-    /// windows could not be enumerated at all.
-    fn probe_once(run0: &str, run_index: usize) -> Result<bool, String> {
+    /// One run's outcome: whether the adopted geometry matched a window the app's pid actually
+    /// owns, whether the accessibility reader could resolve the adopted window at all (#263's
+    /// actual symptom), and the pid `start_app` reported — needed to tell a cold launch from a
+    /// re-adoption of an already-running process (see the module doc's caveat).
+    struct RunOutcome {
+        matched: bool,
+        snapshot_ok: bool,
+        pid: Option<u32>,
+    }
+
+    /// One launch/enumerate/stop cycle. `Err` is a real breakage — the app would not launch, or
+    /// its windows could not be enumerated at all — distinct from either field of `RunOutcome`
+    /// being the unwelcome value, which is a finding, not a probe failure.
+    fn probe_once(run0: &str, run_index: usize) -> Result<RunOutcome, String> {
         let mut platform =
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new(): {e}"))?;
 
@@ -133,7 +155,12 @@ mod macos_main {
             let adopted = platform
                 .start_app(&spec)
                 .map_err(|e| format!("start_app({run0}): {e}"))?;
+            let pid = platform.app_pids().first().copied();
             println!("\n===== run {run_index} =====");
+            println!(
+                "pid: {}",
+                pid.map_or_else(|| "?".to_string(), |p| p.to_string())
+            );
             println!("adopted: {adopted:?}");
 
             let mut matched = false;
@@ -169,15 +196,25 @@ mod macos_main {
                 // not tree size — cap at 1 node instead of paying for the full tree.
                 limits: WalkLimits::from_max_nodes(Some(1)),
             };
-            match MacosA11y::new().snapshot(&ctx) {
-                Ok(_) => println!("  snapshot: ok"),
-                Err(e) => println!("  snapshot: FAILED: {e}"),
-            }
+            let snapshot_ok = match MacosA11y::new().snapshot(&ctx) {
+                Ok(_) => {
+                    println!("  snapshot: ok");
+                    true
+                }
+                Err(e) => {
+                    println!("  snapshot: FAILED: {e}");
+                    false
+                }
+            };
 
             if !matched {
                 println!("  VERDICT: adopted geometry matched NO window owned by this pid");
             }
-            Ok(matched)
+            Ok(RunOutcome {
+                matched,
+                snapshot_ok,
+                pid,
+            })
         })
     }
 
@@ -200,11 +237,20 @@ mod macos_main {
             .unwrap_or(DEFAULT_RUNS);
 
         let mut mismatches = 0usize;
+        let mut snapshot_failures = 0usize;
+        let mut pids_seen = std::collections::HashSet::new();
         let mut failures = Vec::new();
         for run_index in 1..=runs {
             match probe_once(&run0, run_index) {
-                Ok(true) => {}
-                Ok(false) => mismatches += 1,
+                Ok(outcome) => {
+                    if !outcome.matched {
+                        mismatches += 1;
+                    }
+                    if !outcome.snapshot_ok {
+                        snapshot_failures += 1;
+                    }
+                    pids_seen.extend(outcome.pid);
+                }
                 Err(e) => failures.push(format!("run {run_index}: {e}")),
             }
         }
@@ -212,7 +258,15 @@ mod macos_main {
         if !failures.is_empty() {
             fail(failures.join("\n\n"));
         }
-        println!("\n{mismatches} of {runs} run(s) adopted a geometry matching no listed window");
+        // Both counts and the distinct-pid tally live in one line so a `0 of N` mismatch count
+        // can never be read alone — see the module doc: a low distinct-pid count means most of
+        // `runs` re-adopted the same already-running process rather than launching fresh.
+        println!(
+            "\n{mismatches} of {runs} run(s) adopted a geometry matching no listed window; \
+             {snapshot_failures} of {runs} run(s) failed the accessibility snapshot; \
+             {} distinct pid(s) seen across {runs} run(s)",
+            pids_seen.len()
+        );
         println!("WINDOW_ADOPT_PROBE_PASS");
         std::process::exit(0);
     }

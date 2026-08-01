@@ -8,9 +8,8 @@
 //! candidate's role, because a withheld tree hands back an `AXApplication` where a window
 //! belongs, and the raw `AXError` behind a failed read, which names a genuine AX failure in one
 //! line. `ffi::copy_attribute` classifies `kAXErrorAttributeUnsupported`/`kAXErrorNoValue` as an
-//! absent attribute rather than a failure, so the 2026-07-29 incident's actual code (-25205)
-//! never reaches a diagnostic line — that case is identified by role alone (see
-//! `SizeUnreadable`'s test below).
+//! absent attribute rather than a failure, so that code (-25205) never reaches a diagnostic
+//! line — that case is identified by role alone (see `SizeUnreadable`'s test below).
 
 /// What reading one `AXWindow` candidate produced — one variant per point at which
 /// `select_window` gives up on a candidate, plus the fully-measured case.
@@ -84,21 +83,25 @@ pub fn candidate_line(role: Option<&str>, outcome: &CandidateOutcome) -> String 
 mod tests {
     use super::{CandidateOutcome, candidate_line};
 
-    /// The line that cost an hour on 2026-07-29: a locked screen hands back the *application*
-    /// element where a window belongs, and `AXSize` fails `kAXErrorAttributeUnsupported`
-    /// (-25205). `ffi::copy_attribute` classifies that code as an absent attribute rather than
-    /// a failure, so the message it produces is "attribute not present" with no error code —
-    /// role is what actually identifies this case, not the AXError text (contrast
-    /// `an_unreadable_position_keeps_the_ax_error` below, whose fixture is a genuine failure).
+    /// A locked screen hands back the *application* element where a window belongs, and
+    /// `AXSize` fails `kAXErrorAttributeUnsupported` (-25205). `ffi::copy_attribute` classifies
+    /// that code as an absent attribute rather than a failure, so the message it produces is
+    /// "attribute not present" with no error code — role is what actually identifies this
+    /// case, not the AXError text (contrast `an_unreadable_position_keeps_the_ax_error` below,
+    /// whose fixture is a genuine failure). The fixture carries the `"backend error: "` prefix
+    /// `GlassError::Backend`'s `Display` adds — `select_window` builds this string via
+    /// `e.to_string()` on the `GlassError` `ffi::ax_size` returns, not the inner message alone.
     #[test]
     fn an_unreadable_size_from_a_withheld_tree_keeps_the_role_not_an_ax_error_code() {
         let line = candidate_line(
             Some("AXApplication"),
-            &CandidateOutcome::SizeUnreadable("AXSize: attribute not present".into()),
+            &CandidateOutcome::SizeUnreadable(
+                "backend error: AXSize: attribute not present".into(),
+            ),
         );
         assert_eq!(
             line,
-            "role=AXApplication <AXSize unreadable: AXSize: attribute not present>"
+            "role=AXApplication <AXSize unreadable: backend error: AXSize: attribute not present>"
         );
     }
 
@@ -182,10 +185,10 @@ mod tests {
         );
     }
 
-    /// `PositionUnreadable`'s error text is threaded through the same way `SizeUnreadable`'s is.
-    /// This fixture (-25204, `kAXErrorCannotComplete`) is a genuine failure, not an
-    /// absent-attribute one, so unlike the `SizeUnreadable` test above, its AXError code does
-    /// survive into the line.
+    /// `PositionUnreadable`'s error text is threaded through the same way `SizeUnreadable`'s is,
+    /// `"backend error: "` prefix included. This fixture (-25204, `kAXErrorCannotComplete`) is a
+    /// genuine failure, not an absent-attribute one, so unlike the `SizeUnreadable` test above,
+    /// its AXError code does survive into the line.
     #[test]
     fn an_unreadable_position_keeps_the_ax_error() {
         let line = candidate_line(
@@ -194,13 +197,13 @@ mod tests {
                 ax_w: 230.0,
                 ax_h: 408.0,
                 scale: 2.0,
-                error: "AXPosition: AX call failed (AXError -25204)".into(),
+                error: "backend error: AXPosition: AX call failed (AXError -25204)".into(),
             },
         );
         assert_eq!(
             line,
-            "role=AXWindow ax_w=230 ax_h=408 scale=2 <AXPosition unreadable: AXPosition: AX call \
-             failed (AXError -25204)>"
+            "role=AXWindow ax_w=230 ax_h=408 scale=2 <AXPosition unreadable: backend error: \
+             AXPosition: AX call failed (AXError -25204)>"
         );
     }
 }

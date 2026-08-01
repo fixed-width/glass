@@ -330,7 +330,7 @@ fn select_window(
         // exactly how close (or not) each candidate came.
         eprintln!(
             "glass-a11y-macos: select_window found no match for ctx.window={win:?}; candidates: [{}]",
-            diagnostics.join(", ")
+            diagnostics.join("; ")
         );
     }
     best.map(|(_, w, scale)| (w, scale))
