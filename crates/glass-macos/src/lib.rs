@@ -2,7 +2,8 @@
 //! rendered onto a `CGVirtualDisplay`).
 //!
 //! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`],
-//! [`shim_path`]) is crate-level and unit-tested on any host; the OS-touching
+//! [`shim_path`], [`bundle`], [`adoption_log`]) is crate-level and unit-tested on any host;
+//! the OS-touching
 //! modules and the `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off macOS
 //! the crate exposes only the pure modules and the [`capabilities`] map (whose `accessibility`
 //! cell is live; every other cell is constant).

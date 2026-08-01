@@ -151,7 +151,9 @@ mod macos_main {
                     println!("    {}{tag}", render_window(w));
                 }
                 matched |= windows.iter().any(|w| w.geometry == adopted);
-                std::thread::sleep(ENUMERATION_GAP);
+                if enumeration + 1 < ENUMERATIONS {
+                    std::thread::sleep(ENUMERATION_GAP);
+                }
             }
 
             // The symptom the issue reports: whether the reader can resolve the window the
@@ -162,7 +164,9 @@ mod macos_main {
                 window: adopted,
                 window_handle: None,
                 a11y_bus_addr: None,
-                limits: WalkLimits::from_max_nodes(Some(0)),
+                // Only Ok/Err is read below, and that outcome turns on root window resolution,
+                // not tree size — cap at 1 node instead of paying for the full tree.
+                limits: WalkLimits::from_max_nodes(Some(1)),
             };
             match MacosA11y::new().snapshot(&ctx) {
                 Ok(_) => println!("  snapshot: ok"),

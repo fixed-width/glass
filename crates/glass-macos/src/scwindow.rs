@@ -268,7 +268,7 @@ pub(crate) fn find_on_screen_window(
 /// window system-wide, letting a stale/foreign `CGWindowID` silently resolve to someone
 /// else's window — see [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] (which
 /// then builds a [`WindowMatch`] snapshot via [`window_match_from`], the same builder
-/// [`query_once`] uses) and by `capture::capture_window_by_id` (which, like
+/// `query_once_inner` uses) and by `capture::capture_window_by_id` (which, like
 /// `capture_window`, needs the live `SCWindow` itself, still inside the same
 /// completion-handler callback, to build an `SCContentFilter` — see
 /// [`find_on_screen_window`]'s doc).
