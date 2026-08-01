@@ -5,15 +5,24 @@
 //!   GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 //!     cargo test -p glass-android --test a11y_service_loop -- --ignored --nocapture
 
+use std::sync::Mutex;
+
 use glass_android::{
     A11yServiceRegistry, AgentRegistry, AndroidPlatform, EmulatorRegistry, ServiceA11y,
 };
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel, WindowGeometry};
 
+/// Serialize the two tests below: the on-device accessibility service accepts one connection
+/// at a time, and both tests drive whichever activity is currently foreground, so running them
+/// concurrently makes each retarget the other's window. Poison-tolerant so a panicking test
+/// does not wedge the other.
+static DEVICE: Mutex<()> = Mutex::new(());
+
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK"]
 fn a11y_service_snapshot_and_actions() {
+    let _device = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
     let apk = std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
     // Resolve the device the same way production does, and reuse its serial-bound adb (the
     // `resolved_adb()` accessor) — no bespoke test helper. Launch Settings for an active window.
@@ -90,6 +99,7 @@ fn a11y_service_snapshot_and_actions() {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ADB + GLASS_ANDROID_A11Y_APK + GLASS_ANDROID_FIXTURE_APK"]
 fn native_invoke_actuates_the_fixture() {
+    let _device = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
     let apk = std::env::var("GLASS_ANDROID_A11Y_APK").expect("set GLASS_ANDROID_A11Y_APK");
     let fixture =
         std::env::var("GLASS_ANDROID_FIXTURE_APK").expect("set GLASS_ANDROID_FIXTURE_APK");
