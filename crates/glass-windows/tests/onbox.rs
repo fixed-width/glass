@@ -1660,11 +1660,10 @@ fn onbox_a_quiet_wait_stops_re_walking_the_tree() {
 }
 
 /// `walked <= 5` above bounds a number, not an improvement — a build that always walked 5 times
-/// regardless of the subscription would still pass it. This runs the identical 3s quiet wait
-/// through two sessions that differ in exactly one thing — whether `subscribe_changes`
-/// ever hands back a working signal (see [`Counting::signal_enabled`]) — and asserts the signalled
-/// run beats the polling one by a clear margin. That margin, not the raw walk count, is the number
-/// worth quoting as the saving.
+/// would pass it. This runs the identical 3s quiet wait through two sessions differing in exactly
+/// one thing, whether `subscribe_changes` hands back a working signal (see
+/// [`Counting::signal_enabled`]). That margin, not the raw walk count, is the saving worth
+/// quoting.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_signal_more_than_halves_a_quiet_walk_count() {
@@ -1798,14 +1797,11 @@ fn newest_charmap_pid() -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-/// Find the live "Character Map" window AND verify it belongs to `expected_pid` — the pid of the
-/// charmap.exe this test itself started ([`newest_charmap_pid`]), obtained independently of
-/// `Glass`. [`find_window_by_title`] alone binds by title only, exactly like glass's own discovery
-/// does NOT (glass adopts by pid-set/handle); a stale charmap.exe left behind by an earlier test
-/// could otherwise win the title lookup, and the helper thread would toggle the wrong window's
-/// checkbox — read by the main thread's `wait_for_element` as a plain 5s timeout, with nothing in
-/// the failure pointing at a leaked process as the cause. Panics with the mismatched pids named,
-/// rather than let that failure mode reach the caller as an unexplained timeout.
+/// Find the live "Character Map" window and verify it belongs to `expected_pid`, the charmap.exe
+/// this test started ([`newest_charmap_pid`]). [`find_window_by_title`] binds by title alone, so a
+/// stale charmap.exe left by an earlier test could win the lookup and the helper thread would
+/// toggle the wrong window — reaching the caller as an unexplained 5s timeout. Panics with both
+/// pids named instead.
 fn find_charmap_window(expected_pid: u32) -> i64 {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     let handle = find_window_by_title("Character Map")
@@ -1851,42 +1847,26 @@ fn window_rect_geometry(handle: i64) -> WindowGeometry {
     }
 }
 
-/// The tests above prove correctness without a late change
-/// (`onbox_a_wait_with_a_signal_still_matches`, already on screen) and cost without a match (the
-/// quiet-wait tests), but none of them ever drives `ChangeWait::Changed => true` inside
-/// `Glass::wait_for_element`'s poll loop (`session/wait.rs`) from a change nothing but a real UIA
-/// event produced. This does: the main thread blocks in `wait_for_element` for a control that does
-/// not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`, the target window
-/// found and pid-verified independently of the `Glass` session (see [`find_charmap_window`]), so no
-/// `Glass` state crosses threads — sleeps, then actuates charmap's Advanced-view checkbox directly.
-/// Opening it reveals a "Search" [`AxRole::Button`] (confirmed by a one-off on-box probe: closed=26
-/// nodes, open=37; "Search" was the one newly-appeared control with a name unique to itself, unlike
-/// the panel's other new controls, which repeat labels — "Character set", "Group by" — that already
-/// exist elsewhere in charmap's tree).
+/// The only test that drives `ChangeWait::Changed => true` inside `Glass::wait_for_element`'s poll
+/// loop from a change nothing but a real UIA event produced. The main thread blocks waiting for a
+/// control that does not exist yet; a helper thread — its own `WindowsA11y`, its own `AxContext`,
+/// the window pid-verified independently (see [`find_charmap_window`]), so no `Glass` state crosses
+/// threads — sleeps, then actuates charmap's Advanced-view checkbox. Opening it reveals a "Search"
+/// [`AxRole::Button`]: an on-box probe counted 26 nodes closed against 37 open, and "Search" was the
+/// only new control whose name is unique in the tree — the others repeat labels ("Character set",
+/// "Group by") that already appear elsewhere.
 ///
-/// `elapsed_ms` alone does NOT discriminate a working signal from a broken one, and neither does
-/// the walk count alone — each rules out a different broken build:
-/// - No subscription at all (`subscribe_changes` always `None`): every 100ms tick reads regardless
-///   (`wait.rs`'s `None => true` arm), so the change would still be caught at the very next tick —
-///   indistinguishable from a working signal on elapsed time alone, but it walks on EVERY tick
-///   instead of only the initial read + the periodic forced re-reads.
-/// - A subscription that never reports a real event (always `Quiet`): `QUIET_RUNS_BEFORE_REREAD`
-///   (`session/wait.rs`) forces a re-read every ~1000ms at this test's `interval_ms=100`, so the
-///   change would still be caught at the next forced-re-read boundary — indistinguishable from a
-///   working signal on walk count alone (both are low), but it cannot possibly return before that
-///   boundary.
+/// Neither assertion discriminates alone; each rules out a different broken build:
+/// - No subscription (`subscribe_changes` always `None`): every 100ms tick reads regardless, so the
+///   change is caught at the next tick — same elapsed time, but roughly one walk per tick.
+/// - A subscription that never reports an event (always `Quiet`): `QUIET_RUNS_BEFORE_REREAD` forces
+///   a re-read every ~1000ms at `interval_ms=100`, so it cannot return before the next boundary —
+///   same low walk count, but ~2000ms at the earliest.
 ///
-/// So the helper acts at ~1400ms — the middle of the SECOND forced-re-read window (boundaries at
-/// ~1000ms and ~2000ms), not the first: acting near 700ms (as an earlier version of this test did)
-/// put a real-signal result close enough to the first boundary (~1000ms) to leave little margin.
-/// Measured on-box with the helper acting at 1400ms: `matched=true elapsed_ms=1500 walks=3` — 3
-/// walks (the initial read, the ~1000ms forced re-read, and the read the event itself triggers,
-/// matching the quiet-wait tests' own count) and 1500ms elapsed, comfortably below the ~2000ms
-/// floor an always-`Quiet` build would need to reach the same tick and comfortably above what a
-/// no-subscription build's own elapsed time would look like (indistinguishable from this on elapsed
-/// alone, but reached across roughly one walk per 100ms tick — an order of magnitude more). The two
-/// asserts below bound walks between those two shapes and elapsed below the ~2000ms floor —
-/// together, not separately, they rule out both.
+/// Hence the helper acts at ~1400ms, mid-way through the second forced-re-read window (boundaries
+/// ~1000ms and ~2000ms); acting near 700ms left too little margin against the first. Measured
+/// on-box: `matched=true elapsed_ms=1500 walks=3` — the initial read, the ~1000ms forced re-read,
+/// and the read the event triggers.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
@@ -2027,14 +2007,11 @@ fn winforms_fixture_spec() -> AppSpec {
 /// matter: that it still matches is the correctness claim; that it took more than one walk rules
 /// out the wait's first read as the source of the match.
 ///
-/// `walked > 1` does not, on its own, prove no event fired — an announced transition and a forced
-/// re-read land close enough together in walk count that this assertion cannot tell them apart.
-/// That WinForms never announces `IsEnabled` comes from the 2026-07-31 on-box probe, not from
-/// this test. Nor does a failure say anything about the bridge: `walked > 1` fails only at
-/// `walked == 1`, meaning the wait's very first read already found `Save` enabled — the fixture's
-/// 4s flip landed before the wait began, so start-up overran the sleep above. That is a timing
-/// problem to fix here, not evidence either way: an announced transition would wake the wait at
-/// walk #2 and pass.
+/// `walked > 1` does not prove no event fired — an announced transition and a forced re-read land
+/// too close in walk count to tell apart. That WinForms never announces `IsEnabled` comes from the
+/// on-box probe, not from this test. A failure says nothing about the bridge either: `walked > 1`
+/// fails only at `walked == 1`, meaning the fixture's 4s flip landed before the wait began, which
+/// is a timing problem here — an announced transition would wake the wait at walk #2 and pass.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {

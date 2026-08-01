@@ -1,11 +1,10 @@
 //! UI Automation change notifications, so a wait stops re-walking a tree that has not changed.
 //!
-//! A subscription owns its thread for its whole life. The reader spawns a thread per snapshot and
-//! lets it die; a registration cannot work that way, because it belongs to the COM apartment the
-//! thread initialized and has to outlive any single read.
+//! A registration belongs to the COM apartment its thread initialized, so the pump thread outlives
+//! any single read — unlike the reader's per-snapshot threads.
 //!
-//! Handlers are invoked by UIA on its own RPC threads, not this one — which is why nothing but a
-//! unit crosses the channel (see [`Notify`]).
+//! Handlers run on UIA's own RPC threads, which is why nothing but a unit crosses the channel
+//! (see [`Notify`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,10 +28,9 @@ use crate::mapping::WatchedProperty;
 
 /// The one place [`WatchedProperty`] becomes a `uiautomation` type.
 ///
-/// Exhaustive: a new `WatchedProperty` fails to compile here until it is given a UIA property.
-/// That is all the compiler settles — an arm here is not a registration. What the subscription
-/// actually asks UIA for is [`WatchedProperty::ALL`] (see [`watched`]), and keeping *that* in step
-/// with the conditions is a test's job (`mapping.rs`'s `every_announced_property_is_registered`).
+/// Exhaustive, so a new `WatchedProperty` fails to compile here — but an arm is not a
+/// registration: the subscription asks for [`WatchedProperty::ALL`], kept in step with the
+/// conditions by `mapping.rs`'s `every_announced_property_is_registered`.
 const fn uia_property(p: WatchedProperty) -> UIProperty {
     match p {
         WatchedProperty::Name => UIProperty::Name,
@@ -46,71 +44,57 @@ const fn uia_property(p: WatchedProperty) -> UIProperty {
     }
 }
 
-/// The properties registered on the window — the whole of what this subscription asks UIA for.
-/// Built from [`WatchedProperty::ALL`] rather than listed again, so this function cannot drift
-/// from it. `ALL` is itself hand-written; see its doc for what keeps it complete.
+/// The whole of what this subscription asks UIA for. [`WatchedProperty::ALL`] is hand-written;
+/// see its doc for what keeps it complete.
 fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
     WatchedProperty::ALL.map(uia_property)
 }
 
-/// How long to wait for the pump to establish both registrations. Registration cost scales with
-/// tree size — measured 38ms + 17ms on a 1500-node window — and it is the *caller's* wait budget
-/// being spent, so this is bounded generously but never unbounded: failing to subscribe must cost
-/// a poll, not a hang. It is a caller-visible ceiling, and a wider one than the Linux reader's 2s:
-/// against a provider that never finishes registering, a `wait_for_element` given `timeout_ms:
-/// 500` returns in about 3s, not 500ms.
+/// How long to wait for the pump to establish both registrations, which cost 38ms + 17ms on a
+/// 1500-node window and scale with tree size. Spent from the caller's budget, so it is a visible
+/// ceiling and a wider one than the Linux reader's 2s: against a provider that never finishes
+/// registering, `timeout_ms: 500` returns in about 3s.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The per-call limit `bounded_automation` sets, in milliseconds (the unit
-/// `IUIAutomation2::SetTransactionTimeout` itself takes). UIA's default, measured on a Windows
-/// box, is 20000ms, so this is a deliberate 10x tightening — still generous against the slowest
-/// measured call, registration's 38ms + 17ms on a 1500-node window. It bounds one call, not the
-/// whole prelude: `subscribe`'s handshake makes up to three, so three slow-but-succeeding calls
-/// can still expire `SUBSCRIBE_TIMEOUT` first. That case is benign — `subscribe` returns `None`
-/// and the pump, seeing `running == false`, tears down.
+/// The per-call limit `bounded_automation` sets, in the milliseconds
+/// `IUIAutomation2::SetTransactionTimeout` takes. UIA's default is 20000ms, measured on a Windows
+/// box. It bounds one call, not the prelude: `subscribe`'s handshake makes up to three, so three
+/// slow-but-succeeding calls can still expire `SUBSCRIBE_TIMEOUT` first, which is benign.
 const TRANSACTION_TIMEOUT_MS: u32 = 2_000;
 
 /// How long the pump sleeps between `running` checks — a cadence, not the shutdown bound. A
-/// dropped signal is *observed* within this long plus at most one bounded liveness probe, and
-/// teardown then makes two more bounded calls, so shutdown is bounded by that sum
-/// (`SHUTDOWN_CHECK` + 3 × `TRANSACTION_TIMEOUT_MS` at worst), not by this constant alone.
+/// dropped signal is observed within this long plus at most one bounded liveness probe, and
+/// teardown makes two more, so shutdown is bounded by `SHUTDOWN_CHECK` + 3 ×
+/// `TRANSACTION_TIMEOUT_MS` at worst.
 const SHUTDOWN_CHECK: Duration = Duration::from_millis(250);
 
-/// How often the pump confirms a *quiet* registration is still delivering, by re-resolving the
-/// window. Far slower than `SHUTDOWN_CHECK` on purpose: this is a cross-process call into the
-/// target app's own UIA provider, and running it at shutdown-check cadence would spend on
-/// liveness exactly the cost the subscription exists to avoid — and would gate the shutdown-check
-/// promptness above behind a live call on every tick instead of one every couple of seconds.
-/// Nothing else notices a dead registration — the app exiting, or destroying and recreating its
-/// top-level window, stops events without disconnecting either sender — so without this check
-/// `wait` would report `Quiet` for the caller's entire budget instead of `Unusable`, which
-/// licenses skipping a re-read of a tree that is actually changing. A failed probe ends the pump,
-/// and what reaches `wait` is the pump clearing `alive` on its way out, not the senders: UIA holds
-/// those inside the registered handlers until both `remove_*` calls succeed, which is least likely
-/// exactly when the window has stopped resolving. A registration that has delivered recently skips
-/// this probe entirely (see `Notify::delivered`), so this cadence is only ever spent on a
-/// subscription that has actually gone quiet.
+/// How often the pump confirms a *quiet* registration still delivers, by re-resolving the window.
+/// Far slower than `SHUTDOWN_CHECK` because it is a cross-process call into the target app's own
+/// UIA provider. Nothing else notices a dead registration: the app exiting, or destroying and
+/// recreating its top-level window, stops events without disconnecting either sender, so `wait`
+/// would report `Quiet` for the caller's entire budget instead of `Unusable`. What reaches `wait`
+/// is the pump clearing `alive` on its way out, not the senders — UIA holds those inside the
+/// registered handlers until both `remove_*` calls succeed, which is least likely exactly when the
+/// window has stopped resolving. A registration that delivered recently skips the probe entirely
+/// (see `Notify::delivered`).
 const LIVENESS_CHECK: Duration = Duration::from_secs(2);
 
-/// Both handlers report the same thing — that *something* changed — because that is all the wait
-/// needs; it re-reads the tree itself.
+/// Both handlers report only that *something* changed; the wait re-reads the tree itself.
 ///
-/// A `UIElement` must never be sent through this channel. It is apartment-affine and these
-/// handlers run on UIA's RPC threads, not the pump's. Reporting *what* changed is the obvious
-/// improvement and the one that would break it.
+/// A `UIElement` must never be sent through this channel — it is apartment-affine and these
+/// handlers run on UIA's RPC threads. Reporting *what* changed is the obvious improvement and the
+/// one that would break it.
 struct Notify {
     tx: SyncSender<()>,
-    /// Set whenever a handler fires, so the pump can skip a `LIVENESS_CHECK` probe against a
-    /// subscription that just proved itself alive. Relaxed is enough: this is a hint the pump
-    /// reads on its own cadence, and observing it late costs at most one skipped-then-redone
+    /// Set whenever a handler fires, so the pump skips a `LIVENESS_CHECK` probe against a
+    /// subscription that just proved itself alive. Relaxed suffices — observing it late costs one
     /// probe cycle, never a wrong answer.
     delivered: Arc<AtomicBool>,
 }
 
 impl Notify {
-    /// Shared by both handler impls below, so `delivered` and `tx` stay in lockstep — a change
-    /// that reaches one and not the other would make the liveness probe distrust an app that is
-    /// actually still talking.
+    /// Shared by both handler impls so `delivered` and `tx` stay in lockstep — updating one alone
+    /// would make the liveness probe distrust an app that is still talking.
     fn record_and_forward(&self) {
         self.delivered.store(true, Ordering::Relaxed);
         // A full channel already carries "something changed", so dropping this one loses nothing.
@@ -146,15 +130,14 @@ impl CustomPropertyChangedEventHandler for Notify {
 pub(crate) struct UiaChanges {
     rx: Receiver<()>,
     live: bool,
-    /// Cleared on drop to stop the pump, which is what removes the registrations. Without it the
-    /// target app's UIA provider keeps doing work for a subscription nobody holds — degrading the
-    /// app being driven and glass's own walks through it.
+    /// Cleared on drop to stop the pump, which is what removes the registrations. Leaked, the
+    /// target app's provider keeps doing work for a subscription nobody holds.
     running: Arc<AtomicBool>,
-    /// The other direction: set while the pump can still deliver, cleared by the pump on its way
-    /// out (see [`ClearOnExit`]). A dead pump does not reliably disconnect the channel — both
-    /// senders live inside COM objects UIA holds until the two `remove_*` calls succeed, and those
-    /// calls run against a window that has usually just stopped resolving — so this, not
-    /// `RecvTimeoutError::Disconnected`, is what makes "the pump is gone" reach `wait`.
+    /// Set while the pump can still deliver, cleared on its way out (see [`ClearOnExit`]). A dead
+    /// pump does not reliably disconnect the channel — UIA holds both senders inside COM objects
+    /// until the two `remove_*` calls succeed, against a window that has usually just stopped
+    /// resolving — so this, not `RecvTimeoutError::Disconnected`, is what tells `wait` the pump is
+    /// gone.
     alive: Arc<AtomicBool>,
 }
 
@@ -166,18 +149,16 @@ impl Drop for UiaChanges {
 
 impl ChangeSignal for UiaChanges {
     fn wait(&mut self, timeout: Duration) -> ChangeWait {
-        // `alive` is read like `live`, before the channel: once the pump has gone there is nothing
-        // left to deliver, and a message still queued behind it is a change already stale — the
-        // caller re-reads on `Unusable` anyway, so nothing is lost by not reporting it.
+        // Read before the channel: once the pump has gone, a queued message is a stale change and
+        // the caller re-reads on `Unusable` anyway.
         if !self.live || !self.alive.load(Ordering::Relaxed) {
             self.live = false;
             return ChangeWait::Unusable;
         }
         match self.rx.recv_timeout(timeout) {
             Ok(()) => {
-                // One logical change delivers several events — a control and its text peer, and a
-                // structure event alongside a property event for one insertion. Drain: a burst is
-                // one reason to re-read, not one re-read each.
+                // One logical change delivers several events — a control and its text peer, a
+                // structure event alongside a property event. A burst is one reason to re-read.
                 while self.rx.try_recv().is_ok() {}
                 ChangeWait::Changed
             }
@@ -194,8 +175,8 @@ impl ChangeSignal for UiaChanges {
 /// established — the caller then polls exactly as it did before.
 pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     let ctx = ctx.clone();
-    // Capacity 1: the receiver only needs to learn that *something* changed, and a full channel
-    // already says that, so a chatty app cannot grow a backlog here.
+    // Capacity 1: a full channel already says "something changed", so a chatty app grows no
+    // backlog here.
     let (tx, rx) = sync_channel(1);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
@@ -222,17 +203,15 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
 }
 
 /// Creates the automation object the pump uses, bounding every cross-process call made through it
-/// — registration, the liveness probe, both teardown calls — at `TRANSACTION_TIMEOUT_MS`. Without
-/// that bound a wedged-but-alive provider (busy, not exited) can hold the pump inside a
+/// at `TRANSACTION_TIMEOUT_MS`. Unbounded, a wedged-but-alive provider holds the pump inside a
 /// synchronous COM call indefinitely, since such a call has no clean cancellation.
 ///
-/// The bound belongs to the object, not to the thread, so the pump must use *this* object for
-/// everything. It cannot come from `UIAutomation::new()`: that creates a `CUIAutomation` instance,
-/// and only the separate `CUIAutomation8` coclass implements `IUIAutomation2`, the interface
-/// carrying the knob (Windows 8.1+, so it exists everywhere glass runs). Casting the former to it
-/// fails with `E_NOINTERFACE`, measured on a Windows box. COM is initialized here rather than by
-/// calling `UIAutomation::new()` for its `CoInitializeEx` side effect, which would leave a second,
-/// unbounded automation object with nothing to do.
+/// The bound belongs to the object, so the pump must use *this* one for everything. It cannot come
+/// from `UIAutomation::new()`: that creates a `CUIAutomation` instance, and only the separate
+/// `CUIAutomation8` coclass implements `IUIAutomation2`, which carries the knob (Windows 8.1+).
+/// Casting the former to it fails with `E_NOINTERFACE`, measured on a Windows box. COM is
+/// initialized here rather than via `UIAutomation::new()`'s side effect, which would leave a
+/// second, unbounded automation object with nothing to do.
 #[allow(unsafe_code)]
 fn bounded_automation() -> windows::core::Result<UIAutomation> {
     // SAFETY: `CoInitializeEx` must run on this thread before `CoCreateInstance`, which this
@@ -276,11 +255,10 @@ fn pump(
     // Whichever way this function ends — a failed prelude, a dropped signal, a failed liveness
     // probe, a panic — `wait` learns the pump is gone. Dropped explicitly before teardown below.
     let alive = ClearOnExit(alive);
-    // Initializes COM (MTA) on this thread, which the registrations below belong to. It is also
-    // the only automation object this function may use: the transaction bound lives on the object,
-    // so a call made through any other one is unbounded. Failing to build it is a subscribe
-    // failure like every other early exit here — that costs the caller a resumed poll, where
-    // continuing unbounded would silently drop the one property this exists to add.
+    // Initializes COM (MTA) on this thread and is the only automation object this function may
+    // use — the transaction bound lives on the object, so a call through any other is unbounded.
+    // Failing to build it is a subscribe failure like every other early exit: that costs the caller
+    // a resumed poll, where continuing unbounded would drop the property this exists to add.
     let Ok(automation) = bounded_automation() else {
         let _ = ready.send(false);
         return;
@@ -329,9 +307,8 @@ fn pump(
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(SHUTDOWN_CHECK);
         if delivered.swap(false, Ordering::Relaxed) {
-            // A handler fired since the last check, so the registration just proved itself
-            // alive — probing it now would be pure cost for zero information. Reset the
-            // cadence from here too, so a continuously busy app is never probed at all.
+            // A handler fired since the last check, so the registration just proved itself alive.
+            // Resetting the cadence here means a continuously busy app is never probed at all.
             last_liveness_check = Instant::now();
             continue;
         }
@@ -339,11 +316,9 @@ fn pump(
             continue;
         }
         last_liveness_check = Instant::now();
-        // Deliberately fails toward `Unusable`, not toward retrying: a transient read failure
-        // here costs the caller one resumed poll, exactly today's behaviour without a
-        // subscription at all. Reporting `Quiet` on the same failure would be silently wrong
-        // instead of merely conservative, so a failed probe ends the pump rather than being
-        // retried — the teardown below still runs on the way out.
+        // Fails toward `Unusable`, not toward retrying: a transient read failure costs the caller
+        // one resumed poll, where reporting `Quiet` on it would be silently wrong. Teardown below
+        // still runs on the way out.
         if crate::reader::find_app_window(&automation, ctx).is_err() {
             break;
         }

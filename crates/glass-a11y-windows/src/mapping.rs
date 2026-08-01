@@ -144,21 +144,18 @@ pub fn format_range_value(v: f64) -> String {
 
 /// A UIA property the change subscription registers for.
 ///
-/// A closed set rather than raw ids, so [`announcing_property`] can only name a property this
-/// enum has a variant for; with a bare `u32` it could name any number at all and nothing would
-/// notice. Two further things have to hold, and having a variant is neither of them: the variant
-/// needs a `UIProperty` arm in `events.rs`, which the compiler requires because that match is
-/// exhaustive, and it needs an entry in [`ALL`](WatchedProperty::ALL), which is the list actually
-/// registered.
+/// A closed set rather than raw ids, so [`announcing_property`] can only name a property this enum
+/// carries; with a bare `u32` it could name any number at all. Having a variant is not enough,
+/// though: it also needs a `UIProperty` arm in `events.rs`, which the compiler requires, and an
+/// entry in [`ALL`](WatchedProperty::ALL), which is the list actually registered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchedProperty {
     Name,
     HasKeyboardFocus,
-    /// Registered even though the WinForms controls probed on-box never sent it: those reach UI
-    /// Automation through the legacy MSAA bridge, which announced structure and name changes but
-    /// not this one. A WPF window, probed the same way, does announce it — so removing the
-    /// registration to tidy up for WinForms would break the provider it already works for. Where
-    /// it is not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
+    /// Registered even though the WinForms controls probed on-box never sent it, reaching UI
+    /// Automation through the legacy MSAA bridge; a WPF window probed the same way does announce
+    /// it, so removing the registration would break the provider it already works for. Where it is
+    /// not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
     /// `QUIET_RUNS_BEFORE_REREAD` forced re-read — latency, not a wrong answer.
     IsEnabled,
     IsOffscreen,
@@ -174,8 +171,8 @@ impl WatchedProperty {
     /// Hand-written, and nothing makes a new variant appear here. Two tests carry that weight:
     /// `all_lists_every_watched_property_exactly_once` catches an entry dropped or listed twice,
     /// and `every_announced_property_is_registered` catches a condition announced by a property
-    /// this array does not carry. A new variant that no condition names and this array omits is
-    /// caught by neither — and costs nothing, since nothing else reads it.
+    /// this array omits. A variant no condition names and this array omits is caught by neither,
+    /// and costs nothing, since nothing else reads it.
     pub const ALL: [WatchedProperty; 8] = [
         WatchedProperty::Name,
         WatchedProperty::HasKeyboardFocus,
@@ -205,13 +202,12 @@ impl WatchedProperty {
 
 /// The property whose change announces `condition`, or `None` where a structure change does.
 ///
-/// Exhaustive, so a new [`glass_core::ElementCondition`] fails to compile here rather than
-/// quietly answering `None`. The compiler stops there: that the property named is one the
-/// subscription registers is checked by `every_announced_property_is_registered`, because
-/// [`WatchedProperty::ALL`] is a hand-written array. Nothing calls this at run time — the
-/// subscription registers `ALL` wholesale — so it declares the correspondence for that check to
-/// verify. Getting it wrong raises no error at run time either: the wait falls back to the forced
-/// re-read and merely gets slow, which is the kind of regression that ships.
+/// Exhaustive, so a new [`glass_core::ElementCondition`] fails to compile here rather than quietly
+/// answering `None`. The compiler stops there; that the property named is one the subscription
+/// registers is checked by `every_announced_property_is_registered`. Nothing calls this at run
+/// time — the subscription registers [`WatchedProperty::ALL`] wholesale — so it declares the
+/// correspondence for that check to verify, and getting it wrong only makes a wait slow, which is
+/// the kind of regression that ships.
 pub const fn announcing_property(
     condition: glass_core::ElementCondition,
 ) -> Option<WatchedProperty> {
