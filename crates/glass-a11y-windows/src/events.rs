@@ -29,8 +29,10 @@ use crate::mapping::WatchedProperty;
 
 /// The one place [`WatchedProperty`] becomes a `uiautomation` type.
 ///
-/// Exhaustive: a new `WatchedProperty` fails to compile here until it is given a UIA property to
-/// register, which is what stops a condition naming a property the subscription never asks for.
+/// Exhaustive: a new `WatchedProperty` fails to compile here until it is given a UIA property.
+/// That is all the compiler settles — an arm here is not a registration. What the subscription
+/// actually asks UIA for is [`WatchedProperty::ALL`] (see [`watched`]), and keeping *that* in step
+/// with the conditions is a test's job (`mapping.rs`'s `every_announced_property_is_registered`).
 const fn uia_property(p: WatchedProperty) -> UIProperty {
     match p {
         WatchedProperty::Name => UIProperty::Name,
@@ -44,8 +46,9 @@ const fn uia_property(p: WatchedProperty) -> UIProperty {
     }
 }
 
-/// The properties registered on the window. Built from [`WatchedProperty::ALL`] rather than
-/// listed again here, so there is no second list to fall out of step.
+/// The properties registered on the window — the whole of what this subscription asks UIA for.
+/// Built from [`WatchedProperty::ALL`] rather than listed again, so this function cannot drift
+/// from it. `ALL` is itself hand-written; see its doc for what keeps it complete.
 fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
     WatchedProperty::ALL.map(uia_property)
 }
@@ -53,7 +56,9 @@ fn watched() -> [UIProperty; WatchedProperty::ALL.len()] {
 /// How long to wait for the pump to establish both registrations. Registration cost scales with
 /// tree size — measured 38ms + 17ms on a 1500-node window — and it is the *caller's* wait budget
 /// being spent, so this is bounded generously but never unbounded: failing to subscribe must cost
-/// a poll, not a hang.
+/// a poll, not a hang. It is a caller-visible ceiling, and a wider one than the Linux reader's 2s:
+/// against a provider that never finishes registering, a `wait_for_element` given `timeout_ms:
+/// 500` returns in about 3s, not 500ms.
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The per-call limit `bounded_automation` sets, in milliseconds (the unit
@@ -79,9 +84,12 @@ const SHUTDOWN_CHECK: Duration = Duration::from_millis(250);
 /// Nothing else notices a dead registration — the app exiting, or destroying and recreating its
 /// top-level window, stops events without disconnecting either sender — so without this check
 /// `wait` would report `Quiet` for the caller's entire budget instead of `Unusable`, which
-/// licenses skipping a re-read of a tree that is actually changing. A registration that has
-/// delivered recently skips this probe entirely (see `Notify::delivered`), so this cadence is
-/// only ever spent on a subscription that has actually gone quiet.
+/// licenses skipping a re-read of a tree that is actually changing. A failed probe ends the pump,
+/// and what reaches `wait` is the pump clearing `alive` on its way out, not the senders: UIA holds
+/// those inside the registered handlers until both `remove_*` calls succeed, which is least likely
+/// exactly when the window has stopped resolving. A registration that has delivered recently skips
+/// this probe entirely (see `Notify::delivered`), so this cadence is only ever spent on a
+/// subscription that has actually gone quiet.
 const LIVENESS_CHECK: Duration = Duration::from_secs(2);
 
 /// Both handlers report the same thing — that *something* changed — because that is all the wait
@@ -142,6 +150,12 @@ pub(crate) struct UiaChanges {
     /// target app's UIA provider keeps doing work for a subscription nobody holds — degrading the
     /// app being driven and glass's own walks through it.
     running: Arc<AtomicBool>,
+    /// The other direction: set while the pump can still deliver, cleared by the pump on its way
+    /// out (see [`ClearOnExit`]). A dead pump does not reliably disconnect the channel — both
+    /// senders live inside COM objects UIA holds until the two `remove_*` calls succeed, and those
+    /// calls run against a window that has usually just stopped resolving — so this, not
+    /// `RecvTimeoutError::Disconnected`, is what makes "the pump is gone" reach `wait`.
+    alive: Arc<AtomicBool>,
 }
 
 impl Drop for UiaChanges {
@@ -152,7 +166,11 @@ impl Drop for UiaChanges {
 
 impl ChangeSignal for UiaChanges {
     fn wait(&mut self, timeout: Duration) -> ChangeWait {
-        if !self.live {
+        // `alive` is read like `live`, before the channel: once the pump has gone there is nothing
+        // left to deliver, and a message still queued behind it is a change already stale — the
+        // caller re-reads on `Unusable` anyway, so nothing is lost by not reporting it.
+        if !self.live || !self.alive.load(Ordering::Relaxed) {
+            self.live = false;
             return ChangeWait::Unusable;
         }
         match self.rx.recv_timeout(timeout) {
@@ -181,8 +199,10 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
     let (tx, rx) = sync_channel(1);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
+    let alive = Arc::new(AtomicBool::new(true));
     let pump_running = running.clone();
-    std::thread::spawn(move || pump(&ctx, tx, &ready_tx, &pump_running));
+    let pump_alive = alive.clone();
+    std::thread::spawn(move || pump(&ctx, tx, &ready_tx, &pump_running, &pump_alive));
     // Wait for the registrations to be in place before returning: the caller reads the tree the
     // moment it has a signal, and a change landing before registration would be lost.
     match ready_rx.recv_timeout(SUBSCRIBE_TIMEOUT) {
@@ -190,6 +210,7 @@ pub(crate) fn subscribe(ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
             rx,
             live: true,
             running,
+            alive,
         })),
         // Including the timeout: the pump may still be starting, and nothing else would ever tell
         // it to stop.
@@ -231,6 +252,15 @@ fn bounded_automation() -> windows::core::Result<UIAutomation> {
     Ok(UIAutomation::from(IUIAutomation::from(automation)))
 }
 
+/// Clears an `AtomicBool` however its scope ends: an early return, a normal one, or a panic.
+struct ClearOnExit<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Register both handlers on the window and hold them until the signal is dropped.
 ///
 /// Every early return either registered nothing or removes what it registered. A half-registered
@@ -241,7 +271,11 @@ fn pump(
     tx: SyncSender<()>,
     ready: &std::sync::mpsc::Sender<bool>,
     running: &AtomicBool,
+    alive: &AtomicBool,
 ) {
+    // Whichever way this function ends — a failed prelude, a dropped signal, a failed liveness
+    // probe, a panic — `wait` learns the pump is gone. Dropped explicitly before teardown below.
+    let alive = ClearOnExit(alive);
     // Initializes COM (MTA) on this thread, which the registrations below belong to. It is also
     // the only automation object this function may use: the transaction bound lives on the object,
     // so a call made through any other one is unbounded. Failing to build it is a subscribe
@@ -315,6 +349,9 @@ fn pump(
         }
     }
 
+    // Before the removes, not after: each is a cross-process call bounded at seconds, and a `wait`
+    // running through that window must already read `Unusable` rather than `Quiet`.
+    drop(alive);
     let _ = automation.remove_structure_changed_event_handler(&window, &structure);
     let _ = automation.remove_property_changed_event_handler(&window, &property);
 }
@@ -373,6 +410,7 @@ mod tests {
             rx,
             live: true,
             running: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
         };
         assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Quiet);
     }
@@ -392,6 +430,7 @@ mod tests {
             rx,
             live: true,
             running: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
         };
         assert_eq!(changes.wait(Duration::from_millis(20)), ChangeWait::Changed);
         assert!(
@@ -410,6 +449,7 @@ mod tests {
             rx,
             live: true,
             running: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
         };
         assert_eq!(
             changes.wait(Duration::from_millis(20)),
@@ -428,6 +468,30 @@ mod tests {
             rx,
             live: false,
             running: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            changes.wait(Duration::from_millis(20)),
+            ChangeWait::Unusable
+        );
+    }
+
+    /// The same shape for `alive`, which carries the opposite direction: the pump telling the
+    /// signal it has gone. It has to be read *before* the channel, because the channel is the
+    /// unreliable half here — UIA holds both senders inside the registered handlers, so a pump
+    /// that exited because its window stopped resolving can leave them undropped indefinitely,
+    /// and every `wait` would keep reporting `Quiet` for a subscription that will never deliver
+    /// again. A message left pending proves the check is not merely the `Disconnected` arm
+    /// wearing a different name.
+    #[test]
+    fn once_alive_is_cleared_wait_reports_unusable_even_with_a_message_pending() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(()).unwrap();
+        let mut changes = UiaChanges {
+            rx,
+            live: true,
+            running: Arc::new(AtomicBool::new(true)),
+            alive: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(
             changes.wait(Duration::from_millis(20)),
@@ -446,6 +510,7 @@ mod tests {
             rx,
             live: true,
             running: running.clone(),
+            alive: Arc::new(AtomicBool::new(true)),
         };
         drop(changes);
         assert!(!running.load(Ordering::Relaxed));
