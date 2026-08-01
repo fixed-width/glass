@@ -547,7 +547,7 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
 /// One node's identity, captured when it is actuated so the state read back after the click
 /// can be confirmed to be that same control. An `AxNodeId` is a positional pre-order index
 /// re-derived per snapshot, so an id alone can resolve to a different node in the next tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Actuated {
     id: AxNodeId,
     role: AxRole,
@@ -555,7 +555,7 @@ struct Actuated {
 }
 
 /// What an `invoke` must do, decided from one tree before any device I/O.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct InvokePlan {
     /// The element the caller named.
     target: AxNodeId,
