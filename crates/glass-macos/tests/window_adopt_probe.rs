@@ -53,11 +53,12 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        Accessibility, AppSpec, AxContext, Platform, SandboxLevel, WalkLimits, WindowInfo,
+        Accessibility, AppSpec, AxContext, Platform, SandboxLevel, WalkLimits, WindowGeometry,
+        WindowInfo, WindowOp,
     };
     use glass_macos::MacosPlatform;
 
@@ -78,6 +79,15 @@ mod macos_main {
     /// vanishes) a beat after adoption is still caught — the transient this probe is looking for.
     const ENUMERATIONS: usize = 6;
     const ENUMERATION_GAP: Duration = Duration::from_millis(250);
+
+    /// How often, and for how long, to re-read the adopted window's geometry immediately after
+    /// `start_app` returns. macOS reports a window's geometry while it is still opening, so the
+    /// value adoption captured can be a frame of that animation; sampling densely is how the shape
+    /// of the animation becomes visible rather than inferred. 10ms is a floor, not a guarantee —
+    /// each sample is a real `SCShareableContent` round trip, so the printed offsets are what
+    /// actually happened.
+    const EARLY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+    const EARLY_SAMPLE_WINDOW: Duration = Duration::from_millis(300);
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
     /// libtest to format a panic for us). Mirrors the sibling integration tests.
@@ -135,6 +145,56 @@ mod macos_main {
         pid: Option<u32>,
     }
 
+    /// Re-read the adopted window's geometry every [`EARLY_SAMPLE_INTERVAL`] for
+    /// [`EARLY_SAMPLE_WINDOW`], printing each reading that differs from the one before it, with
+    /// the offset from when sampling began.
+    ///
+    /// Only distinct readings are printed: a settled window produces one line, and an animating
+    /// one produces the shape of its animation instead of thirty identical rows.
+    fn print_early_samples(platform: &mut MacosPlatform, adopted: &WindowGeometry) {
+        let started = Instant::now();
+        let mut last: Option<WindowGeometry> = None;
+        let mut samples = 0usize;
+        println!(
+            "  early samples (adopted: {}x{} @({},{})):",
+            adopted.width, adopted.height, adopted.x, adopted.y
+        );
+        while started.elapsed() < EARLY_SAMPLE_WINDOW {
+            match platform.window(&WindowOp::Geometry) {
+                Ok(g) => {
+                    samples += 1;
+                    if last.as_ref() != Some(&g) {
+                        println!(
+                            "    t+{:>4}ms  {}x{} @({},{})",
+                            started.elapsed().as_millis(),
+                            g.width,
+                            g.height,
+                            g.x,
+                            g.y
+                        );
+                        last = Some(g);
+                    }
+                }
+                // Never fatal: a read that fails mid-animation is itself worth seeing, and this
+                // is a probe, not a gate.
+                Err(e) => println!(
+                    "    t+{:>4}ms  read failed: {e}",
+                    started.elapsed().as_millis()
+                ),
+            }
+            std::thread::sleep(EARLY_SAMPLE_INTERVAL);
+        }
+        let settled_matches_adopted = last.as_ref() == Some(adopted);
+        println!(
+            "    {samples} sample(s); final reading {} the adopted geometry",
+            if settled_matches_adopted {
+                "MATCHES"
+            } else {
+                "DIFFERS from"
+            }
+        );
+    }
+
     /// One launch/enumerate/stop cycle. `Err` is a real breakage — the app would not launch, or
     /// its windows could not be enumerated at all — distinct from either field of `RunOutcome`
     /// being the unwelcome value, which is a finding, not a probe failure.
@@ -164,6 +224,7 @@ mod macos_main {
                 pid.map_or_else(|| "?".to_string(), |p| p.to_string())
             );
             println!("adopted: {adopted:?}");
+            print_early_samples(platform, &adopted);
 
             let mut matched = false;
             for enumeration in 0..ENUMERATIONS {
