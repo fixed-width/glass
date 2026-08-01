@@ -284,9 +284,6 @@ fn pump(
     running: &AtomicBool,
     alive: &AtomicBool,
 ) {
-    // Whichever way this function ends — a failed prelude, a dropped signal, a failed liveness
-    // probe, a panic — `wait` learns the pump is gone. Dropped explicitly before teardown below.
-    let alive = ClearOnExit(alive);
     // Initializes COM (MTA) on this thread and is the only automation object this function may
     // use — the transaction bound lives on the object, so a call through any other is unbounded.
     // Failing to build it is a subscribe failure like every other early exit: that costs the caller
@@ -306,35 +303,86 @@ fn pump(
         delivered: delivered.clone(),
     }
     .into();
-    if automation
-        .add_structure_changed_event_handler(&window, TreeScope::Subtree, None, &structure)
-        .is_err()
-    {
-        let _ = ready.send(false);
-        return;
-    }
-
     let property: UIPropertyChangedEventHandler = Notify {
         tx,
         delivered: delivered.clone(),
     }
     .into();
-    if automation
-        .add_property_changed_event_handler(
-            &window,
-            TreeScope::Subtree,
-            None,
-            &property,
-            &watched(),
-        )
-        .is_err()
-    {
-        let _ = automation.remove_structure_changed_event_handler(&window, &structure);
-        let _ = ready.send(false);
+    // Nothing is registered unless this returns true, and nothing stays registered if it does not.
+    if !register_handlers(
+        ready,
+        || {
+            automation
+                .add_structure_changed_event_handler(&window, TreeScope::Subtree, None, &structure)
+                .is_ok()
+        },
+        || {
+            automation
+                .add_property_changed_event_handler(
+                    &window,
+                    TreeScope::Subtree,
+                    None,
+                    &property,
+                    &watched(),
+                )
+                .is_ok()
+        },
+        || {
+            let _ = automation.remove_structure_changed_event_handler(&window, &structure);
+        },
+    ) {
         return;
     }
-    let _ = ready.send(true);
 
+    run_until_stopped(&automation, ctx, running, alive, &delivered);
+    let _ = automation.remove_structure_changed_event_handler(&window, &structure);
+    let _ = automation.remove_property_changed_event_handler(&window, &property);
+}
+
+/// Add both handlers, remove the first if the second is refused, and answer `ready` with the
+/// outcome. `true` means both are registered and the caller owns removing them.
+///
+/// The COM calls arrive as closures so that ordering can be exercised without a provider: the
+/// half-registered case — structure handler in place, property handler refused — is the one that
+/// would leave the target application carrying a handler nobody will ever remove, and it is out of
+/// reach of any test that needs a real window.
+fn register_handlers(
+    ready: &std::sync::mpsc::Sender<bool>,
+    add_structure: impl FnOnce() -> bool,
+    add_property: impl FnOnce() -> bool,
+    remove_structure: impl FnOnce(),
+) -> bool {
+    let registered = if !add_structure() {
+        false
+    } else if !add_property() {
+        remove_structure();
+        false
+    } else {
+        true
+    };
+    let _ = ready.send(registered);
+    registered
+}
+
+/// Hold the registrations open until the signal is dropped or the window stops resolving, with
+/// `alive` set for exactly that long and cleared before returning.
+///
+/// Do not inline this back into the pump: `alive` has to be cleared *before* the caller's two
+/// `remove_*` calls, each a cross-process call bounded at `TRANSACTION_TIMEOUT_MS` that a `wait`
+/// must read as `Unusable` rather than `Quiet`. Written inline, that ordering rested on a single
+/// `drop(alive)` line whose deletion still compiled and broke nothing any test could see. The
+/// Linux pump is split from its loop for the same class of reason (see `glass-a11y-linux`'s
+/// `forward`).
+fn run_until_stopped(
+    automation: &UIAutomation,
+    ctx: &AxContext,
+    running: &AtomicBool,
+    alive: &AtomicBool,
+    delivered: &AtomicBool,
+) {
+    // However this function ends — a dropped signal, a failed liveness probe, a panic — `wait`
+    // learns the pump is gone, and learns it before the caller tears the registrations down.
+    let _alive = ClearOnExit(alive);
     let mut last_liveness_check = Instant::now();
     while running.load(Ordering::Relaxed) {
         std::thread::sleep(SHUTDOWN_CHECK);
@@ -349,18 +397,12 @@ fn pump(
         }
         last_liveness_check = Instant::now();
         // Fails toward `Unusable`, not toward retrying: a transient read failure costs the caller
-        // one resumed poll, where reporting `Quiet` on it would be silently wrong. Teardown below
-        // still runs on the way out.
-        if crate::reader::find_app_window(&automation, ctx).is_err() {
+        // one resumed poll, where reporting `Quiet` on it would be silently wrong. The caller's
+        // teardown still runs on the way out.
+        if crate::reader::find_app_window(automation, ctx).is_err() {
             break;
         }
     }
-
-    // Before the removes, not after: each is a cross-process call bounded at seconds, and a `wait`
-    // running through that window must already read `Unusable` rather than `Quiet`.
-    drop(alive);
-    let _ = automation.remove_structure_changed_event_handler(&window, &structure);
-    let _ = automation.remove_property_changed_event_handler(&window, &property);
 }
 
 #[cfg(test)]
@@ -410,6 +452,51 @@ mod tests {
     /// `Quiet` is what licenses a caller to skip re-reading the tree (see `ChangeWait`) — this
     /// pins the case where that licence is actually earned: nothing arrived, and the signal is
     /// still trustworthy.
+    /// The registration order that costs the target application something: the structure handler
+    /// is already in place when the property handler is refused, so it has to come back off before
+    /// the pump gives up — the caller is told `false` and never comes back to remove it.
+    #[test]
+    fn a_refused_property_handler_takes_the_structure_handler_back_off() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let removes = std::cell::Cell::new(0);
+        let registered = register_handlers(
+            &ready_tx,
+            || true,
+            || false,
+            || removes.set(removes.get() + 1),
+        );
+        assert!(!registered);
+        assert_eq!(
+            removes.get(),
+            1,
+            "the registered structure handler was left on the target application"
+        );
+        assert_eq!(ready_rx.try_recv(), Ok(false));
+    }
+
+    /// The other two shapes, so the remove above is not simply unconditional: nothing to take off
+    /// when the structure handler is what failed, and nothing taken off when both succeed.
+    #[test]
+    fn nothing_is_removed_unless_exactly_one_handler_registered() {
+        let removes = std::cell::Cell::new(0);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        assert!(!register_handlers(
+            &ready_tx,
+            || false,
+            || unreachable!("the property handler must not be added after a failed structure add"),
+            || removes.set(removes.get() + 1),
+        ));
+        assert_eq!(ready_rx.try_recv(), Ok(false));
+        assert!(register_handlers(
+            &ready_tx,
+            || true,
+            || true,
+            || removes.set(removes.get() + 1),
+        ));
+        assert_eq!(ready_rx.try_recv(), Ok(true));
+        assert_eq!(removes.get(), 0);
+    }
+
     /// Builds the signal the way `subscribe` does, with the pump still running.
     fn live_changes(rx: Receiver<()>) -> UiaChanges {
         UiaChanges {
