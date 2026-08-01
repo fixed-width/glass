@@ -2032,7 +2032,8 @@ fn winforms_fixture_spec() -> AppSpec {
 /// re-read land close enough together in walk count that this assertion cannot tell them apart.
 /// That WinForms never announces `IsEnabled` comes from the 2026-07-31 on-box probe, not from
 /// this test. If this assertion starts failing, the bridge began announcing `IsEnabled` after
-/// all, and the disclosure in `events.rs` and the changelog is stale.
+/// all, and the disclosure on `WatchedProperty::IsEnabled` (`glass-a11y-windows/src/mapping.rs`)
+/// and the changelog entry for it are both stale.
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session"]
 fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
@@ -2073,6 +2074,7 @@ fn onbox_a_wait_for_enabled_falls_back_to_the_forced_reread() {
     assert!(
         walked > 1,
         "the wait matched in {walked} walk(s), so something woke it — the WinForms bridge is \
-         announcing IsEnabled after all, and the disclosure in events.rs is now wrong"
+         announcing IsEnabled after all, and the disclosure on WatchedProperty::IsEnabled is now \
+         wrong"
     );
 }

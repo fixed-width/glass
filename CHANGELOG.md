@@ -16,6 +16,16 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Changed
+- On Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on a timer.
+  Where UI Automation announces a property change, a wait for something that has not happened yet
+  now reads the tree when something changes instead of once per interval — measured on hardware, 3
+  walks for a 3-second wait where it previously took 22. It re-reads about once a second regardless,
+  so a change the platform does not announce costs latency, not a wrong answer — which matters most
+  for `condition: "enabled"`, because a WinForms app reaches UI Automation through the legacy MSAA
+  bridge, which never announces a control becoming enabled. Every other backend polls exactly as
+  before, and so does Windows if the subscription cannot be established or stops delivering.
+
 ### Fixed
 - A `glass_wait_for_element` shorter than a second could report an element absent that was on
   screen. Where the platform announces changes, the wait skips reads it has been told are pointless

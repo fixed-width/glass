@@ -153,6 +153,12 @@ pub fn format_range_value(v: f64) -> String {
 pub enum WatchedProperty {
     Name,
     HasKeyboardFocus,
+    /// Registered even though a WinForms app never sends it: those controls reach UI Automation
+    /// through the legacy MSAA bridge, which announces structure and name changes but not this
+    /// one. A native provider (WPF, and anything built on AccessKit) does announce it, so
+    /// removing the registration to tidy up for WinForms would break the apps it already works
+    /// for. Where it is not sent, a `condition: "enabled"` wait falls back to `glass_core`'s
+    /// `QUIET_RUNS_BEFORE_REREAD` forced re-read — latency, not a wrong answer.
     IsEnabled,
     IsOffscreen,
     Value,
