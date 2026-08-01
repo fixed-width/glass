@@ -1,4 +1,5 @@
-//! Rendering for the diagnostic `backend::discover_window` prints when it adopts a window.
+//! Rendering for the diagnostic `backend::discover_window`/`discover_window_pid` print when
+//! they adopt a window.
 //!
 //! Adoption takes the FIRST on-screen `SCWindow` in `SCShareableContent` order owned by the
 //! target pid, and printed nothing about that choice — so a run that adopted a window the
@@ -105,6 +106,18 @@ mod tests {
             line,
             "glass-macos: pid 7 had 1 on-screen window(s) at adoption (first in \
              SCShareableContent order wins): ADOPTED id=101 \"Calculator\" 230x408 @(480,404)"
+        );
+    }
+
+    /// A title is rendered with `{:?}` rather than `{}` so an embedded quote can't be confused
+    /// with the format's own delimiters or the `"; "` join between candidates.
+    #[test]
+    fn a_title_with_a_quote_is_escaped() {
+        let line = adoption_line(7, &[candidate(101, Some("App \"Beta\""), 230, 408, true)]);
+        assert_eq!(
+            line,
+            "glass-macos: pid 7 had 1 on-screen window(s) at adoption (first in \
+             SCShareableContent order wins): ADOPTED id=101 \"App \\\"Beta\\\"\" 230x408 @(480,404)"
         );
     }
 

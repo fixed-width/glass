@@ -172,10 +172,12 @@ pub(crate) fn find_window_by_id(
 
 /// Whether a scan should also collect a summary of every candidate it saw.
 ///
-/// [`Candidates::Skip`] is the hot path (`capture_window`, `send_pointer`'s per-call
-/// re-resolution): stop at the first match, allocate nothing. [`Candidates::Collect`] is the
-/// once-per-session adoption path, which pays for a full pass so the adoption record can name
-/// what it chose between (#263).
+/// [`Candidates::Skip`] stops at the first match and allocates nothing — `capture_window`'s
+/// and `find_window_for_pids`'s fallback, reached only while `active_window` is unset; once a
+/// session has adopted a window, `capture_frame`/`resolve_active_window` resolve by id via
+/// `find_window_by_id` instead, a separate loop this enum doesn't touch. [`Candidates::Collect`]
+/// is the once-per-session adoption path, which pays for a full pass so the adoption record can
+/// name what it chose between (#263).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Candidates {
     Skip,
@@ -241,15 +243,11 @@ pub(crate) fn scan_on_screen_windows(
     (found, candidates)
 }
 
-/// [`scan_on_screen_windows`] without the candidate summary — `capture::capture_window`'s
-/// per-call lookup (its only caller: `query_once` no longer goes through this function,
-/// it reaches [`scan_on_screen_windows`] directly via `query_once_inner`).
-///
-/// Returns the live `Retained<SCWindow>` itself, against the module's normal "never a
-/// `Retained<SCWindow>`" rule (see the module doc): `capture::capture_window` needs exactly
-/// that, still inside the same completion-handler callback, to build an `SCContentFilter`
-/// from it. `query_once_inner` converts its own [`scan_on_screen_windows`] result to a
-/// [`WindowMatch`] snapshot via [`window_match_from`] instead of holding onto it.
+/// [`scan_on_screen_windows`] without the candidate summary, for `capture::capture_window`'s
+/// per-call lookup (its only caller). Returns the live `Retained<SCWindow>` itself, against
+/// the module's normal "never a `Retained<SCWindow>`" rule (see the module doc):
+/// `capture::capture_window` needs exactly that, still inside the same completion-handler
+/// callback, to build an `SCContentFilter` from it.
 pub(crate) fn find_on_screen_window(
     content: &SCShareableContent,
     pids: &[i32],
@@ -519,6 +517,10 @@ fn query_once_inner(
                 return;
             };
             let m = window_match_from(&w, pid);
+            // `scan_on_screen_windows` must mark at most one candidate adopted, or `.find`
+            // below silently corrects the wrong one (or none) instead of the one this scan
+            // actually matched.
+            debug_assert!(candidates.iter().filter(|c| c.adopted).count() <= 1);
             if let Some(adopted) = candidates.iter_mut().find(|c| c.adopted) {
                 adopted.geometry = m.geometry.clone();
             }
@@ -653,5 +655,11 @@ mod tests {
     fn list_reply_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<ListReply>();
+    }
+
+    #[test]
+    fn candidate_query_reply_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CandidateQueryReply>();
     }
 }

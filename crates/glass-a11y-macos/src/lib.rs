@@ -2,7 +2,7 @@
 
 // FFI backend: the AXUIElement reader needs `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
-// `mapping` module stays `unsafe`-free by convention.
+// modules (`doctor`, `mapping`, `select_diagnostic`) stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
 
 pub mod doctor; // pure probe->Check mapping (cross-platform) + the macOS-only AX probe
@@ -11,7 +11,7 @@ pub mod select_diagnostic; // pure select_window candidate-line rendering — cr
 
 // The cfg(macos) AXUIElement reader: `ffi` holds every `unsafe` AX read primitive, `reader`
 // the `unsafe`-free root selection + pre-order walk behind glass-core's `Accessibility`
-// seam. Both are gated off non-macOS, where only the pure `mapping` module above compiles.
+// seam. Both are gated off non-macOS, where only the pure modules above compile.
 #[cfg(target_os = "macos")]
 mod ffi;
 #[cfg(target_os = "macos")]

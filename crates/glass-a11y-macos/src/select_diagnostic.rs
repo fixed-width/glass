@@ -6,15 +6,19 @@
 //!
 //! The fields are chosen from what a real failure needed and did not have (#263): the
 //! candidate's role, because a withheld tree hands back an `AXApplication` where a window
-//! belongs, and the raw `AXError` behind a failed read, because -25205 names that condition in
-//! one line.
+//! belongs, and the raw `AXError` behind a failed read, which names a genuine AX failure in one
+//! line. `ffi::copy_attribute` classifies `kAXErrorAttributeUnsupported`/`kAXErrorNoValue` as an
+//! absent attribute rather than a failure, so the 2026-07-29 incident's actual code (-25205)
+//! never reaches a diagnostic line — that case is identified by role alone (see
+//! `SizeUnreadable`'s test below).
 
 /// What reading one `AXWindow` candidate produced — one variant per point at which
 /// `select_window` gives up on a candidate, plus the fully-measured case.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CandidateOutcome {
-    /// `AXSize` could not be read. Carries the error's own text, which names the `AXError`
-    /// code (see `ffi::ax_err`).
+    /// `AXSize` could not be read. Carries the error's own text — the `AXError` code for a
+    /// genuine failure (see `ffi::ax_err`), or "attribute not present" with no code for the
+    /// absent-attribute case `ffi::copy_attribute` intercepts before `ax_err` runs.
     SizeUnreadable(String),
     /// `AXSize` read back a zero or negative dimension.
     NonPositiveSize { ax_w: f64, ax_h: f64 },
@@ -41,18 +45,17 @@ pub enum CandidateOutcome {
 }
 
 /// One candidate's diagnostic line. `role` is the candidate's `AXRole`, rendered `?` when it
-/// could not be read — never omitted, so every line has the same leading field to grep for.
+/// could not be read — never omitted, so every line has the same leading field to grep for
+/// (structurally: every arm below builds `detail` only, and `role={role}` is prepended once).
 pub fn candidate_line(role: Option<&str>, outcome: &CandidateOutcome) -> String {
     let role = role.unwrap_or("?");
-    match outcome {
-        CandidateOutcome::SizeUnreadable(error) => {
-            format!("role={role} <AXSize unreadable: {error}>")
-        }
+    let detail = match outcome {
+        CandidateOutcome::SizeUnreadable(error) => format!("<AXSize unreadable: {error}>"),
         CandidateOutcome::NonPositiveSize { ax_w, ax_h } => {
-            format!("role={role} ax_w={ax_w} ax_h={ax_h} <non-positive size>")
+            format!("ax_w={ax_w} ax_h={ax_h} <non-positive size>")
         }
         CandidateOutcome::InvalidScale { ax_w, ax_h, scale } => {
-            format!("role={role} ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>")
+            format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <invalid scale>")
         }
         CandidateOutcome::PositionUnreadable {
             ax_w,
@@ -60,9 +63,7 @@ pub fn candidate_line(role: Option<&str>, outcome: &CandidateOutcome) -> String 
             scale,
             error,
         } => {
-            format!(
-                "role={role} ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable: {error}>"
-            )
+            format!("ax_w={ax_w} ax_h={ax_h} scale={scale} <AXPosition unreadable: {error}>")
         }
         CandidateOutcome::Measured {
             ax_x,
@@ -73,9 +74,10 @@ pub fn candidate_line(role: Option<&str>, outcome: &CandidateOutcome) -> String 
             dx,
             dy,
         } => {
-            format!("role={role} ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}")
+            format!("ax=({ax_x}, {ax_y}, {ax_w}, {ax_h}) scale={scale} dx={dx} dy={dy}")
         }
-    }
+    };
+    format!("role={role} {detail}")
 }
 
 #[cfg(test)]
@@ -84,20 +86,19 @@ mod tests {
 
     /// The line that cost an hour on 2026-07-29: a locked screen hands back the *application*
     /// element where a window belongs, and `AXSize` fails `kAXErrorAttributeUnsupported`
-    /// (-25205). The error text here is the raw string `select_window` builds from
-    /// `ffi::ax_err`; in production it arrives via `GlassError::Backend`'s `Display`, so the
-    /// live line carries an extra `"backend error: "` prefix
-    /// (`role=AXApplication <AXSize unreadable: backend error: AXSize: AX call failed
-    /// (AXError -25205)>`) — this test only pins the part `candidate_line` itself controls.
+    /// (-25205). `ffi::copy_attribute` classifies that code as an absent attribute rather than
+    /// a failure, so the message it produces is "attribute not present" with no error code —
+    /// role is what actually identifies this case, not the AXError text (contrast
+    /// `an_unreadable_position_keeps_the_ax_error` below, whose fixture is a genuine failure).
     #[test]
-    fn an_unreadable_size_keeps_the_role_and_the_ax_error() {
+    fn an_unreadable_size_from_a_withheld_tree_keeps_the_role_not_an_ax_error_code() {
         let line = candidate_line(
             Some("AXApplication"),
-            &CandidateOutcome::SizeUnreadable("AXSize: AX call failed (AXError -25205)".into()),
+            &CandidateOutcome::SizeUnreadable("AXSize: attribute not present".into()),
         );
         assert_eq!(
             line,
-            "role=AXApplication <AXSize unreadable: AXSize: AX call failed (AXError -25205)>"
+            "role=AXApplication <AXSize unreadable: AXSize: attribute not present>"
         );
     }
 
@@ -144,6 +145,8 @@ mod tests {
         assert_eq!(line, "role=AXWindow ax_w=0 ax_h=12 <non-positive size>");
     }
 
+    /// `candidate_line` renders whatever `scale` it's given; it doesn't distinguish which kind
+    /// of non-finite value `select_window` could actually produce (see the test below for that).
     #[test]
     fn an_invalid_scale_says_so() {
         let line = candidate_line(
@@ -160,7 +163,29 @@ mod tests {
         );
     }
 
-    /// `PositionUnreadable` needs the same AXError-preserving treatment as `SizeUnreadable`.
+    /// The non-finite value `select_window` can actually produce: `.max(1.0)` resolves a NaN
+    /// dividend away (`f64::NAN.max(1.0) == 1.0`), so only an `ax_w` near zero — overflowing
+    /// the division to `Infinity` — reaches `InvalidScale`, never `NaN`.
+    #[test]
+    fn an_invalid_scale_from_a_near_zero_width_says_so() {
+        let line = candidate_line(
+            Some("AXWindow"),
+            &CandidateOutcome::InvalidScale {
+                ax_w: 230.0,
+                ax_h: 408.0,
+                scale: f64::INFINITY,
+            },
+        );
+        assert_eq!(
+            line,
+            "role=AXWindow ax_w=230 ax_h=408 scale=inf <invalid scale>"
+        );
+    }
+
+    /// `PositionUnreadable`'s error text is threaded through the same way `SizeUnreadable`'s is.
+    /// This fixture (-25204, `kAXErrorCannotComplete`) is a genuine failure, not an
+    /// absent-attribute one, so unlike the `SizeUnreadable` test above, its AXError code does
+    /// survive into the line.
     #[test]
     fn an_unreadable_position_keeps_the_ax_error() {
         let line = candidate_line(

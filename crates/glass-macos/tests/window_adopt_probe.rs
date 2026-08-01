@@ -59,8 +59,8 @@ mod macos_main {
     const DEFAULT_RUNS: usize = 30;
 
     /// How many times to re-enumerate the app's windows after `start_app` returns, and the
-    /// gap between enumerations. Spread across ~1.5s so a window that appears (or vanishes) a
-    /// beat after adoption is still caught — the transient this probe is looking for.
+    /// gap between enumerations. Spread across ~1.25s (5 gaps) so a window that appears (or
+    /// vanishes) a beat after adoption is still caught — the transient this probe is looking for.
     const ENUMERATIONS: usize = 6;
     const ENUMERATION_GAP: Duration = Duration::from_millis(250);
 
@@ -141,16 +141,17 @@ mod macos_main {
                 let windows = platform
                     .list_windows()
                     .map_err(|e| format!("list_windows({run0}): {e}"))?;
-                println!("  t+{}ms: {} window(s)", enumeration * 250, windows.len());
+                println!(
+                    "  t+{}ms: {} window(s)",
+                    enumeration as u128 * ENUMERATION_GAP.as_millis(),
+                    windows.len()
+                );
                 for w in &windows {
-                    let tag = if w.geometry == adopted {
-                        "  == ADOPTED"
-                    } else {
-                        ""
-                    };
+                    let is_adopted = w.geometry == adopted;
+                    matched |= is_adopted;
+                    let tag = if is_adopted { "  == ADOPTED" } else { "" };
                     println!("    {}{tag}", render_window(w));
                 }
-                matched |= windows.iter().any(|w| w.geometry == adopted);
                 if enumeration + 1 < ENUMERATIONS {
                     std::thread::sleep(ENUMERATION_GAP);
                 }
