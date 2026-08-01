@@ -23,7 +23,7 @@ use crate::clipboard_route::ClipboardRoute;
 use crate::coords;
 use crate::permissions;
 use crate::process::{self, ClipLaunch, LogSink};
-use crate::settle::{SettleStep, SettleTracker};
+use crate::settle::{SettleOutcome, settle_by_polling};
 
 /// Poll interval between discovery attempts in [`MacosPlatform::discover_window`] —
 /// matches `scwindow::find_window_for_pids`'s own poll cadence
@@ -42,14 +42,19 @@ const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// How often to re-read an adopted window's geometry while waiting for it to stop changing, and
 /// how long to keep waiting. macOS reports a window's geometry while it is still opening, so the
-/// reading adoption captured is routinely a frame of the open animation (#263). A window that was
-/// never animating agrees on its second reading and costs one interval; the budget only binds an
-/// app whose window keeps moving.
+/// reading adoption captured is routinely a frame of the open animation (#263). A window that had
+/// already stopped moving needs only one more round trip to confirm it — a `SETTLE_POLL_INTERVAL`
+/// sleep plus one `SCShareableContent` query, ~70-125ms as measured on this branch — but that was
+/// the minority case: 11 of 12 cold launches measured here were still moving at adoption and paid
+/// a second round trip (~140-250ms) before settling. The budget bounds a window that never stops
+/// moving at all (a clock, a video player, an animating splash).
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SETTLE_BUDGET: Duration = Duration::from_millis(500);
-/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`]: a settle poll that
-/// cannot find the window should give the loop its turn back, not spend the whole budget inside one
-/// lookup.
+/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`]: a settle poll
+/// that cannot find the window ends the settle attempt outright rather than retrying (see
+/// [`crate::settle::settle_by_polling`]'s `ReadFailed` handling), so this only bounds how long
+/// that one lookup burns before giving up — not the whole `SETTLE_BUDGET`, which it is
+/// deliberately kept far below.
 const SETTLE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
@@ -276,10 +281,14 @@ impl MacosPlatform {
     /// pixels off the settled one, and the window `start_app` reports is what
     /// `Glass::start_on_inner` hands the caller and caches as the session's geometry.
     ///
-    /// Never fails the launch. A window that never stops changing (a clock, a video player, an
-    /// animating splash) would otherwise become unlaunchable, so an expired budget returns the
-    /// freshest reading and says so on stderr; likewise a resolve that fails mid-settle, where the
-    /// window was already confirmed present at adoption. Neither path is silent.
+    /// Thin glue over [`settle_by_polling`]: this only builds the per-poll re-resolution closure
+    /// (fixed to `adopted`'s `window_id`/`pid`, since a re-resolved match always carries the same
+    /// two — `find_window_by_id` is what pins them) and turns its [`SettleOutcome`] into the
+    /// stderr disclosure. Never fails the launch: a window that never stops changing (a clock, a
+    /// video player, an animating splash) would otherwise become unlaunchable, so a budget expiry
+    /// reports the freshest reading rather than an error, and likewise a resolve that fails
+    /// mid-settle, where the window was already confirmed present at adoption. Neither path is
+    /// silent.
     ///
     /// Only *when* the geometry is read changes here. Which window was adopted is already decided
     /// by the time this runs.
@@ -287,45 +296,29 @@ impl MacosPlatform {
         pid: i32,
         adopted: crate::scwindow::WindowMatch,
     ) -> crate::scwindow::WindowMatch {
-        let mut tracker = SettleTracker::new();
-        // The adoption reading is the sequence's first element: it is what a settled window has to
-        // agree with for the loop to exit after a single poll.
-        let _ = tracker.observe(adopted.geometry.clone());
-        let mut freshest = adopted;
-        let deadline = Instant::now() + SETTLE_BUDGET;
-        while Instant::now() < deadline {
-            std::thread::sleep(SETTLE_POLL_INTERVAL);
-            let next = match crate::scwindow::find_window_by_id(
+        let window_id = adopted.window_id;
+        let (freshest, outcome) =
+            settle_by_polling(adopted, SETTLE_BUDGET, SETTLE_POLL_INTERVAL, || {
+                crate::scwindow::find_window_by_id(window_id, &[pid], SETTLE_RESOLVE_TIMEOUT)
+            });
+        match outcome {
+            SettleOutcome::Settled => {}
+            SettleOutcome::ReadFailed(e) => eprintln!(
+                "glass-macos: window {} stopped resolving while settling ({e}); reporting the \
+                 last geometry read",
+                freshest.window_id
+            ),
+            SettleOutcome::BudgetExpired => eprintln!(
+                "glass-macos: window {} did not settle within {}ms; reporting {}x{} @({},{}), \
+                 the last geometry read",
                 freshest.window_id,
-                &[pid],
-                SETTLE_RESOLVE_TIMEOUT,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!(
-                        "glass-macos: window {} stopped resolving while settling ({e}); \
-                         reporting the last geometry read",
-                        freshest.window_id
-                    );
-                    return freshest;
-                }
-            };
-            let geometry = next.geometry.clone();
-            freshest = next;
-            if let SettleStep::Settled(_) = tracker.observe(geometry) {
-                return freshest;
-            }
+                SETTLE_BUDGET.as_millis(),
+                freshest.geometry.width,
+                freshest.geometry.height,
+                freshest.geometry.x,
+                freshest.geometry.y
+            ),
         }
-        eprintln!(
-            "glass-macos: window {} did not settle within {}ms; reporting {}x{} @({},{}), \
-             the last geometry read",
-            freshest.window_id,
-            SETTLE_BUDGET.as_millis(),
-            freshest.geometry.width,
-            freshest.geometry.height,
-            freshest.geometry.x,
-            freshest.geometry.y
-        );
         freshest
     }
 
