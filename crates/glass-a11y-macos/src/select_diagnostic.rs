@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Rendering for the per-candidate diagnostic `reader::select_window` prints when no `AXWindow`
 //! matched the geometry the display backend reported. Separate from `reader` (which is
 //! `#[cfg(target_os = "macos")]` and needs a live `AXUIElement`) so the format that has to
@@ -84,7 +85,11 @@ mod tests {
     /// The line that cost an hour on 2026-07-29: a locked screen hands back the *application*
     /// element where a window belongs, and `AXSize` fails `kAXErrorAttributeUnsupported`
     /// (-25205). Both facts have to survive into the diagnostic, or the log reads as a glass
-    /// regression.
+    /// regression. The error text here is the raw string `select_window` builds from
+    /// `ffi::ax_err`; in production it arrives via `GlassError::Backend`'s `Display`, so the
+    /// live line carries an extra `"backend error: "` prefix
+    /// (`role=AXApplication <AXSize unreadable: backend error: AXSize: AX call failed
+    /// (AXError -25205)>`) — this test only pins the part `candidate_line` itself controls.
     #[test]
     fn an_unreadable_size_keeps_the_role_and_the_ax_error() {
         let line = candidate_line(
