@@ -35,7 +35,7 @@ internal refactors, CI, or test-only changes.
   the end of many waits. Such a wait answered from the single read it took before the change it was
   waiting for. It now reads once more before reporting nothing found, whatever its length, and the
   once-a-second floor no longer moves with `interval_ms`. Affects every backend that can subscribe
-  to change notifications, which today is Linux.
+  to change notifications.
 - Android's `set_value` now refuses a write whose target has drifted in value, not just in role,
   name or bounds. A re-walk that lands on a same-role, same-name, same-rect element holding
   *different* data — a recycled list row reusing the same view is the case this closes — is now
