@@ -587,19 +587,21 @@ fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
     if !node.states.enabled {
         return Err(disabled_error(target.id.0, target.id));
     }
+    let chosen = actuable_node(tree, target)?;
+    if !chosen.states.enabled {
+        return Err(disabled_error(target.id.0, chosen.id));
+    }
     // Under these caps the kept nodes are no longer a pre-order prefix — the walk drops a
     // subtree and carries on with later siblings — so a host id no longer equals the device
     // `ref` it would be sent as. `Nodes` stops the walk outright and keeps the prefix.
     // Fallback-eligible on purpose: nothing was dispatched, and the pointer path aims at this
-    // tree's own bounds, which the id/`ref` skew does not touch.
+    // tree's own bounds, which the id/`ref` skew does not touch. It must therefore stay below
+    // both `enabled` refusals — reached first, it hands a disabled control to the pointer
+    // path; the climb above it only reads this tree.
     if let Some(t) = &tree.truncated
         && matches!(t.limit, TruncationLimit::Depth | TruncationLimit::Siblings)
     {
         return Err(GlassError::AxActionUnavailable(target.id.0));
-    }
-    let chosen = actuable_node(tree, target)?;
-    if !chosen.states.enabled {
-        return Err(disabled_error(target.id.0, chosen.id));
     }
     let want = if toggles(chosen.role) {
         !chosen.states.checked
@@ -1461,6 +1463,38 @@ mod tests {
         v["children"][0]["children"][0]["clickable"] = json!(false);
         v["children"][0]["enabled"] = json!(false);
         let t = built(&v);
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
+        assert!(e.to_string().contains("element 1 is disabled"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_disabled_control_is_refused_before_a_truncated_tree_can_fall_back() {
+        // Same shape as the test above, in a truncated tree. `AxActionUnavailable` is
+        // fallback-eligible, so a truncation guard reached before the climb's `enabled` check
+        // taps the disabled control's centre and reports ok.
+        let mut v = nested_clickables();
+        v["children"][0]["children"][0]["clickable"] = json!(false);
+        v["children"][0]["enabled"] = json!(false);
+        v["children"].as_array_mut().expect("root children").push(
+            json!({"class": "android.widget.TextView", "text": "Cancel",
+                         "bounds": {"x": 40, "y": 800, "w": 200, "h": 60},
+                         "clickable": false, "enabled": true}),
+        );
+        let mut t = tree_from_json(
+            &v,
+            &win(),
+            WalkLimits {
+                siblings: 1,
+                ..WalkLimits::DEFAULT
+            },
+        )
+        .expect("maps");
+        t.assign_ids();
+        assert_eq!(
+            t.truncated.map(|x| x.limit),
+            Some(TruncationLimit::Siblings)
+        );
         let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
         assert!(e.to_string().contains("element 1 is disabled"), "{e}");
         assert!(!e.invoke_fallback_eligible(), "{e}");
