@@ -238,6 +238,30 @@ impl ServiceA11y {
     pub fn new(client: ServiceClient, package: String) -> Self {
         Self { client, package }
     }
+
+    /// Poll until `chosen`'s `checked` leaves `was`. A Compose recompose reaches the
+    /// accessibility tree a beat after the action, so an acknowledgement is not proof the
+    /// control flipped; `set_value` polls for the same reason.
+    fn wait_for_flip(
+        &mut self,
+        ctx: &AxContext,
+        target: u32,
+        chosen: AxNodeId,
+        was: bool,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut after = self.snapshot(ctx)?;
+            after.assign_ids();
+            if after.find(chosen).is_some_and(|n| n.states.checked != was) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(flip_timeout(target, chosen, was));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
 }
 
 impl Accessibility for ServiceA11y {
@@ -306,9 +330,14 @@ impl Accessibility for ServiceA11y {
         if !node.states.enabled {
             return Err(disabled_error(target.id.0, chosen));
         }
+        let (checkable, was) = (node.states.checkable, node.states.checked);
         self.client
             .action_result(chosen.0, "click", None)
-            .map_err(|(e, transport)| action_error(target.id.0, &e, transport))
+            .map_err(|(e, transport)| action_error(target.id.0, &e, transport))?;
+        if checkable {
+            return self.wait_for_flip(ctx, target.id.0, chosen, was);
+        }
+        Ok(())
     }
 }
 
@@ -574,6 +603,18 @@ fn action_error(target: u32, e: &GlassError, transport: bool) -> GlassError {
     } else {
         GlassError::AxActionFailed(target, e.to_string())
     }
+}
+
+/// The error for a toggle whose action was acknowledged but whose state never moved.
+fn flip_timeout(target: u32, chosen: AxNodeId, was: bool) -> GlassError {
+    GlassError::AxActionFailed(
+        target,
+        format!(
+            "the click action on element {} was accepted but its checked state stayed {was}; \
+             the control did not toggle",
+            chosen.0
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -1122,5 +1163,14 @@ mod tests {
         let inner = GlassError::Backend("agent write: broken pipe".into());
         let e = action_error(2, &inner, true);
         assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_toggle_that_never_flipped_is_a_failure_not_a_missing_action() {
+        let e = flip_timeout(2, AxNodeId(1), false);
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        // The distinction that matters to a caller: the action WAS accepted.
+        assert!(e.to_string().contains("accepted"), "{e}");
+        assert!(e.to_string().contains("did not toggle"), "{e}");
     }
 }
