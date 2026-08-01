@@ -59,6 +59,16 @@ pub fn poll_until_with_pause<T>(
             });
         }
         if start.elapsed().as_millis() as u64 >= timeout_ms {
+            // Never answer "not found" on information older than the last pause: a pause told
+            // "nothing changed" by a platform that declines to announce it would otherwise report
+            // an element absent that is on screen. One tick at an already-spent deadline keeps a
+            // skip a cost saving rather than a wrong answer.
+            if !run_tick && let Some(v) = tick()? {
+                return Ok(PollOutcome {
+                    value: Some(v),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                });
+            }
             return Ok(PollOutcome {
                 value: None,
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -93,6 +103,48 @@ mod tests {
         // Two unsatisfied ticks, so two pauses — and no sleep of the loop's own, which is what
         // lets a caller wake on an event instead of waiting out an interval.
         assert_eq!(paused.get(), 2);
+    }
+
+    #[test]
+    fn a_loop_that_skipped_its_ticks_looks_once_more_before_answering_no() {
+        // A pause told "nothing changed" by a platform that declines to announce it must not
+        // leave the loop answering from information it has not refreshed since.
+        let mut ticks = 0;
+        let out = poll_until_with_pause(
+            1,
+            30,
+            |_| false, // "nothing changed" — every time, and wrongly
+            || {
+                ticks += 1;
+                // Absent on the first look, present from then on: the change the pause hid.
+                Ok(if ticks > 1 { Some(7) } else { None })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out.value,
+            Some(7),
+            "answered from information older than the last pause"
+        );
+    }
+
+    #[test]
+    fn the_deadline_look_is_skipped_when_this_iteration_already_ticked() {
+        // The deadline read exists for information the loop has not refreshed. A loop that just
+        // ticked has, so reading again would bill every ordinary polling caller an extra tick for
+        // nothing.
+        let mut ticks = 0;
+        poll_until_with_pause(
+            0,
+            0, // one tick, then straight to the deadline
+            |_| true,
+            || {
+                ticks += 1;
+                Ok(None::<()>)
+            },
+        )
+        .unwrap();
+        assert_eq!(ticks, 1, "ticked again at a deadline it had just looked at");
     }
 
     #[test]
