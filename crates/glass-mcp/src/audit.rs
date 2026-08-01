@@ -208,6 +208,11 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                     if let Some(reason) = m.native_fallback() {
                         args["native_fallback"] = json!(reason);
                     }
+                    // Without this, "clicked the Save label" and "clicked the card around it,
+                    // which navigated away" are indistinguishable in the record.
+                    if let Some(actuated) = m.actuated() {
+                        args["actuated_id"] = json!(actuated.0);
+                    }
                     args
                 }
                 None => json!({}),
@@ -684,7 +689,7 @@ mod tests {
     fn click_element_native_action_records_no_fallback_reason() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
-        let method = ClickMethod::NativeAction;
+        let method = ClickMethod::NativeAction { actuated: None };
         s.record(
             &Actuation::ClickElement {
                 element: click_el(),
@@ -700,6 +705,27 @@ mod tests {
             r["args"].get("native_fallback").is_none(),
             "nothing fell back: {r}"
         );
+    }
+
+    #[test]
+    fn click_element_records_the_element_actuated_in_the_targets_place() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
+        let method = ClickMethod::NativeAction {
+            actuated: Some(glass_core::AxNodeId(7)),
+        };
+        s.record(
+            &Actuation::ClickElement {
+                element: click_el(),
+                method: Some(&method),
+            },
+            &ActuationContext::default(),
+            &ok(),
+            Duration::from_millis(1),
+        );
+        let r = &lines(&buf)[0];
+        assert_eq!(r["args"]["actuated_id"], 7, "{r}");
+        assert_eq!(r["target"]["element"]["id"], click_el().id, "{r}");
     }
 
     #[test]

@@ -140,7 +140,9 @@ pub struct ClickElementArgs {
     /// one (works even when the element is occluded or scrolled off-screen), falling
     /// back to a synthetic pointer click at the element's center; the result's
     /// `method` field says which path ran, and `native_fallback` says why when the
-    /// pointer path was used.
+    /// pointer path was used. Where a control's label is a separate element from the
+    /// control itself, the native action fires on the enclosing control and the
+    /// result carries `actuated_id` — the element actually clicked.
     pub id: u32,
     /// Optional observe folded into the result: "snapshot" (wait for the UI to settle, then
     /// fold a fresh a11y tree, also refreshing the snapshot cache), "settle" (wait for the UI

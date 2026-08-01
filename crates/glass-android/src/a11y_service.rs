@@ -14,7 +14,7 @@ use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
 
 use crate::axmap::{LabelInputs, class_to_role, labels};
-use crate::conn::Conn;
+use crate::conn::{CallFailure, Conn};
 
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
 /// window-relative. Ids are left `AxNodeId(0)`; the core's `AxTree::assign_ids` numbers them
@@ -172,53 +172,108 @@ impl ServiceClient {
         })
     }
 
-    /// Run a request, transparently reconnecting once if the socket dropped.
-    /// Mirrors `AgentClient::call`: lock, try, reconnect on `(e, true)`, retry.
-    fn call(&self, req: Value) -> Result<Value> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| GlassError::Backend("a11y service client lock poisoned".into()))?;
+    /// Run a request, reconnecting once and re-sending when `resend` accepts the failure.
+    fn call_with(
+        &self,
+        req: Value,
+        resend: fn(&CallFailure) -> bool,
+    ) -> std::result::Result<Value, CallFailure> {
+        let mut conn = self.conn.lock().map_err(|_| {
+            CallFailure::NotSent(GlassError::Backend(
+                "a11y service client lock poisoned".into(),
+            ))
+        })?;
         match conn.call(req.clone()) {
             Ok(v) => Ok(v),
-            Err((e, false)) => Err(e),
-            Err((_, true)) => {
+            Err(f) if resend(&f) => {
                 // The service's accept loop accepts a fresh connection after a drop.
-                *conn = Conn::open(self.port)?;
-                conn.call(req).map_err(|(e, _)| e)
+                *conn = Conn::open(self.port).map_err(|e| f.with_error(e))?;
+                conn.call(req)
             }
+            Err(f) => Err(f),
         }
     }
 
+    /// Run a request that can be run twice without consequence, transparently reconnecting
+    /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
+    fn call(&self, req: Value) -> std::result::Result<Value, CallFailure> {
+        self.call_with(req, CallFailure::is_transport)
+    }
+
+    /// [`Self::call`] for a side-effecting request: re-send only what provably never went out.
+    fn call_once_sent(&self, req: Value) -> std::result::Result<Value, CallFailure> {
+        self.call_with(req, CallFailure::nothing_sent)
+    }
+
     fn tree(&self, package: &str) -> Result<Value> {
-        let r = self.call(json!({"op": "tree", "package": package}))?;
+        let r = self
+            .call(json!({"op": "tree", "package": package}))
+            .map_err(CallFailure::into_error)?;
         r.get("tree")
             .cloned()
             .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))
     }
 
-    fn action(&self, ref_id: u32, action: &str, text: Option<&str>) -> Result<()> {
-        let mut req = json!({"op": "action", "ref": ref_id, "action": action});
-        if let Some(t) = text {
-            req["text"] = json!(t);
-        }
-        self.call(req).map(|_| ())
+    /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
+    /// keeps its delivery classification.
+    fn click(&self, ref_id: u32) -> std::result::Result<(), CallFailure> {
+        self.call_once_sent(json!({"op": "action", "ref": ref_id, "action": "click"}))
+            .map(|_| ())
+    }
+
+    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
+    /// reconnecting path.
+    fn set_text(&self, ref_id: u32, text: &str) -> Result<()> {
+        self.call(json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}))
+            .map(|_| ())
+            .map_err(CallFailure::into_error)
     }
 
     pub fn ping(&self) -> Result<()> {
-        self.call(json!({"op": "ping"})).map(|_| ())
+        self.call(json!({"op": "ping"}))
+            .map(|_| ())
+            .map_err(CallFailure::into_error)
     }
 }
+
+/// How long `invoke` waits for an actuated control's `checked` state to reach the tree.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// The Accessibility reader backed by the on-device service. `package` is the target app.
 pub struct ServiceA11y {
     client: ServiceClient,
     package: String,
+    /// How long [`Self::wait_for_check`] polls; [`CHECK_TIMEOUT`] outside tests.
+    check_timeout: std::time::Duration,
 }
 
 impl ServiceA11y {
     pub fn new(client: ServiceClient, package: String) -> Self {
-        Self { client, package }
+        Self {
+            client,
+            package,
+            check_timeout: CHECK_TIMEOUT,
+        }
+    }
+
+    /// Poll until the actuated control reports `checked == want`. The toolkit's UI update
+    /// reaches the accessibility tree a beat after the action; `set_value` polls for the same
+    /// reason.
+    fn wait_for_check(&mut self, ctx: &AxContext, plan: &InvokePlan, want: bool) -> Result<()> {
+        let deadline = std::time::Instant::now() + self.check_timeout;
+        loop {
+            let mut after = self.snapshot(ctx)?;
+            after.assign_ids();
+            let seen = check_state(&after, &plan.actuated);
+            if seen == CheckState::Reached(want) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(check_timeout(plan.target.0, &plan.actuated, want, seen));
+            }
+            std::thread::sleep(CHECK_POLL);
+        }
     }
 }
 
@@ -237,7 +292,7 @@ impl Accessibility for ServiceA11y {
             t
         };
         crate::a11y::editable_target(&tree, target)?;
-        self.client.action(target.id.0, "set_text", Some(text))?;
+        self.client.set_text(target.id.0, text)?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -275,6 +330,22 @@ impl Accessibility for ServiceA11y {
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
+    }
+
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
+        let plan = invoke_plan(&tree, target)?;
+        self.client
+            .click(plan.actuated.id.0)
+            .map_err(|f| action_error(target.id.0, f))?;
+        if let Some(want) = plan.want_checked {
+            self.wait_for_check(ctx, &plan, want)?;
+        }
+        Ok(plan.substituted())
     }
 }
 
@@ -471,11 +542,209 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
     }
 }
 
+/// One node's identity, captured at actuation so a state read back after the click can be
+/// confirmed to be that same control. An `AxNodeId` is a positional pre-order index re-derived
+/// per snapshot, so an id alone can land on a different node in the next tree.
+#[derive(Debug)]
+struct Actuated {
+    id: AxNodeId,
+    role: AxRole,
+    name: Option<String>,
+}
+
+/// What an `invoke` must do, decided from one tree before any device I/O.
+#[derive(Debug)]
+struct InvokePlan {
+    /// The element the caller named.
+    target: AxNodeId,
+    /// The node the click is sent to — the target, or the control the climb resolved to.
+    actuated: Actuated,
+    /// `Some(want)` when the actuated control must be read back reporting `checked == want`.
+    want_checked: Option<bool>,
+}
+
+impl InvokePlan {
+    /// The actuated node, when it is not the one the caller named.
+    fn substituted(&self) -> Option<AxNodeId> {
+        (self.actuated.id != self.target).then_some(self.actuated.id)
+    }
+}
+
+/// Whether clicking a control of this role must move its `checked` state. A checkbox or a
+/// switch toggles; a radio button or a tab selects, and clicking the one already selected
+/// leaves it selected.
+fn toggles(role: AxRole) -> bool {
+    matches!(role, AxRole::CheckBox | AxRole::ToggleButton)
+}
+
+/// Decide what an `invoke` does with `target`: which node to actuate, and what the tree must
+/// show afterwards. Pure, so the decision is testable without a device.
+///
+/// The order is load-bearing: a Compose control omits `ACTION_CLICK` while disabled, so a climb
+/// run before the target's own `enabled` check walks past it and actuates whatever encloses it.
+fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
+    let node = crate::a11y::fingerprinted(tree, target)?;
+    if !node.states.enabled {
+        return Err(disabled_error(target.id.0, target.id));
+    }
+    let chosen = actuable_node(tree, target)?;
+    if !chosen.states.enabled {
+        return Err(disabled_error(target.id.0, chosen.id));
+    }
+    // Under these caps the kept nodes are no longer a pre-order prefix — the walk drops a
+    // subtree and carries on with later siblings — so a host id no longer equals the device
+    // `ref` it would be sent as. `Nodes` stops the walk outright and keeps the prefix.
+    // Fallback-eligible on purpose: nothing was dispatched, and the pointer path aims at this
+    // tree's own bounds, which the id/`ref` skew does not touch. It must therefore stay below
+    // both `enabled` refusals — reached first, it hands a disabled control to the pointer
+    // path.
+    if let Some(t) = &tree.truncated
+        && matches!(t.limit, TruncationLimit::Depth | TruncationLimit::Siblings)
+    {
+        return Err(GlassError::AxActionUnavailable(target.id.0));
+    }
+    let want = if toggles(chosen.role) {
+        !chosen.states.checked
+    } else {
+        true
+    };
+    Ok(InvokePlan {
+        target: target.id,
+        actuated: Actuated {
+            id: chosen.id,
+            role: chosen.role,
+            name: chosen.name.clone(),
+        },
+        want_checked: (chosen.states.checkable && want != chosen.states.checked).then_some(want),
+    })
+}
+
+/// What a tree read after the click says about the actuated control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckState {
+    /// The control is still there, reporting this `checked`.
+    Reached(bool),
+    /// The id no longer resolves to the checkable control that was actuated.
+    Gone,
+}
+
+/// Read the actuated control's `checked` out of a tree taken after the click.
+///
+/// The id alone cannot accept a state change: it is positional, so a node the click added above
+/// the control shifts every later id, and `checked` reads `false` on any node with no checked
+/// state — between them, an inert label sliding into the id reads as a flip.
+fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
+    match after.find(act.id) {
+        Some(n) if n.states.checkable && n.role == act.role && n.name == act.name => {
+            CheckState::Reached(n.states.checked)
+        }
+        _ => CheckState::Gone,
+    }
+}
+
+/// The node an `invoke` should actuate on behalf of `target`.
+///
+/// A Compose button's label and its clickable node are different nodes: the touch-target
+/// carries no name and the named child carries no `ACTION_CLICK`. When the target itself
+/// advertises no click, climb to the nearest node that does and encloses it. Only the ancestor
+/// chain is walked, so an overlapping sibling drawn above the target could still take a real tap.
+fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    let mut path = Vec::new();
+    if !path_to(&tree.root, target.id, &mut path) {
+        return Err(GlassError::AxElementNotFound(target.id.0));
+    }
+    let want = path.last().expect("path_to leaves the target last").bounds;
+    path.iter()
+        .rev()
+        .find(|n| n.states.focusable && (n.id == target.id || encloses(n.bounds, want)))
+        .copied()
+        .ok_or(GlassError::AxActionUnavailable(target.id.0))
+}
+
+/// The root-to-`id` path, inclusive of both ends. False when `id` is not in this subtree,
+/// leaving `out` as it was found.
+fn path_to<'a>(node: &'a AxNode, id: AxNodeId, out: &mut Vec<&'a AxNode>) -> bool {
+    out.push(node);
+    if node.id == id {
+        return true;
+    }
+    for c in &node.children {
+        if path_to(c, id, out) {
+            return true;
+        }
+    }
+    out.pop();
+    false
+}
+
+/// Whether `outer` fully contains `inner`. A node without bounds encloses nothing — the climb
+/// must not reach past a node whose geometry it cannot check.
+fn encloses(outer: Option<AxRect>, inner: Option<AxRect>) -> bool {
+    let (Some(o), Some(i)) = (outer, inner) else {
+        return false;
+    };
+    i64::from(o.x) <= i64::from(i.x)
+        && i64::from(o.y) <= i64::from(i.y)
+        && i64::from(o.x) + i64::from(o.width) >= i64::from(i.x) + i64::from(i.width)
+        && i64::from(o.y) + i64::from(o.height) >= i64::from(i.y) + i64::from(i.height)
+}
+
+/// The error for a control the tree says is disabled. Deliberately not `AxActionUnavailable`:
+/// a pointer click would tap a control that cannot act and report success.
+fn disabled_error(target: u32, disabled: AxNodeId) -> GlassError {
+    GlassError::AxActionFailed(
+        target,
+        format!(
+            "element {} is disabled, so its click action was refused; no pointer click was \
+             synthesized on top of it",
+            disabled.0
+        ),
+    )
+}
+
+/// Map a click failure onto the invoke contract. No arm is fallback-eligible: a refusal may
+/// still have reached the toolkit, and a lost answer says nothing either way.
+fn action_error(target: u32, f: CallFailure) -> GlassError {
+    match f {
+        CallFailure::NotSent(e) => GlassError::AccessibilityUnavailable(format!(
+            "the click on element {target} could not be sent: {e}"
+        )),
+        // Non-fallback-eligible only stops glass re-clicking; the message has to stop a human
+        // or an agent doing it by hand.
+        CallFailure::AnswerLost(e) => GlassError::AccessibilityUnavailable(format!(
+            "the click on element {target} was sent but its result was lost ({e}); it may or \
+             may not have actuated — re-snapshot to see the app's state rather than clicking \
+             again"
+        )),
+        CallFailure::Refused(e) => GlassError::AxActionFailed(target, e.to_string()),
+    }
+}
+
+/// The error for a control whose click was accepted but whose state never reached `want`.
+fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> GlassError {
+    let id = act.id.0;
+    let detail = match seen {
+        CheckState::Reached(state) => format!(
+            "its checked state stayed {state} instead of becoming {want}; the control did not \
+             take the click"
+        ),
+        CheckState::Gone => "it is no longer the control that was clicked, so the click could \
+             not be confirmed; a control that disappears or is replaced after an accepted click \
+             has usually acted — re-snapshot to see the app's state rather than clicking again"
+            .to_string(),
+    };
+    GlassError::AxActionFailed(
+        target,
+        format!("the click action on element {id} was accepted but {detail}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use glass_core::accessibility::AxRole;
     use serde_json::json;
+    use std::io::{BufRead, Write};
 
     fn win() -> WindowGeometry {
         WindowGeometry {
@@ -848,5 +1117,725 @@ mod tests {
             true,
         );
         assert_eq!(node.name.as_deref(), Some("Email"));
+    }
+
+    /// A device tree shaped like Compose's: the clickable touch-target `View` carries no name,
+    /// and the label that names it is a child.
+    fn compose_like() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [
+                {"class": "android.view.View",
+                 "bounds": {"x": 60, "y": 480, "w": 210, "h": 130},
+                 "editable": false, "clickable": true, "enabled": true, "scrollable": false,
+                 "children": [
+                    {"class": "android.widget.TextView", "text": "Save",
+                     "bounds": {"x": 120, "y": 520, "w": 80, "h": 50},
+                     "editable": false, "clickable": false, "enabled": true, "scrollable": false}
+                 ]}
+            ]
+        })
+    }
+
+    fn built(v: &Value) -> AxTree {
+        let mut t = tree_from_json(v, &win(), WalkLimits::DEFAULT).expect("maps");
+        t.assign_ids();
+        t
+    }
+
+    /// The target a caller would hold after selecting `id` from `tree`.
+    fn target_for(tree: &AxTree, id: AxNodeId) -> AxTarget {
+        let n = tree.find(id).expect("node is in the tree");
+        AxTarget {
+            id,
+            role: n.role,
+            name: n.name.clone(),
+            bounds: n.bounds,
+            value: n.value.clone(),
+        }
+    }
+
+    #[test]
+    fn a_named_label_climbs_to_the_clickable_node_that_encloses_it() {
+        let t = built(&compose_like());
+        let label = target_for(&t, AxNodeId(2));
+        assert_eq!(label.name.as_deref(), Some("Save"));
+        assert_eq!(actuable_node(&t, &label).unwrap().id, AxNodeId(1));
+    }
+
+    #[test]
+    fn a_target_that_advertises_a_click_is_actuated_directly() {
+        // Inside a clickable card, so "the target itself" is distinguishable from "something
+        // enclosing it that also advertises a click".
+        let t = built(&nested_clickables());
+        let btn = target_for(&t, AxNodeId(2));
+        assert_eq!(actuable_node(&t, &btn).unwrap().id, AxNodeId(2));
+    }
+
+    #[test]
+    fn a_clickable_ancestor_that_does_not_enclose_the_target_is_not_climbed_to() {
+        // Same shape, but the clickable node's box sits beside its label rather than around
+        // it — the case where a tap at the label's centre would NOT have reached it.
+        let mut v = compose_like();
+        v["children"][0]["bounds"] = json!({"x": 600, "y": 480, "w": 210, "h": 130});
+        let t = built(&v);
+        let label = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &label),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
+
+    #[test]
+    fn a_path_with_no_clickable_node_reports_the_action_unavailable() {
+        let mut v = compose_like();
+        v["children"][0]["clickable"] = json!(false);
+        let t = built(&v);
+        let label = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &label),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
+
+    #[test]
+    fn action_unavailable_is_the_only_resolution_error_that_may_fall_back() {
+        let mut v = compose_like();
+        v["children"][0]["clickable"] = json!(false);
+        let t = built(&v);
+        let e = actuable_node(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        assert!(e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_target_whose_name_drifted_is_rejected_before_any_climb() {
+        let t = built(&compose_like());
+        let mut label = target_for(&t, AxNodeId(2));
+        label.name = Some("Send".into());
+        assert!(matches!(
+            invoke_plan(&t, &label),
+            Err(GlassError::AxElementChanged(2))
+        ));
+    }
+
+    #[test]
+    fn a_drifted_target_must_not_fall_back_to_a_pointer_click() {
+        let t = built(&compose_like());
+        let mut label = target_for(&t, AxNodeId(2));
+        label.name = Some("Send".into());
+        let e = invoke_plan(&t, &label).unwrap_err();
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    /// Two siblings under the root: the first is clickable and its bounds happen to enclose
+    /// the second, but it does not contain the target in its subtree; the target is the second
+    /// sibling, with no clickable node anywhere in its real ancestry (root nor itself).
+    fn target_follows_a_rejected_clickable_sibling() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [
+                {"class": "android.view.View",
+                 "bounds": {"x": 0, "y": 200, "w": 1080, "h": 2000},
+                 "editable": false, "clickable": true, "enabled": true, "scrollable": false,
+                 "children": []},
+                {"class": "android.widget.TextView", "text": "Save",
+                 "bounds": {"x": 40, "y": 1220, "w": 200, "h": 60},
+                 "editable": false, "clickable": false, "enabled": true, "scrollable": false}
+            ]
+        })
+    }
+
+    /// Pins `path_to`'s backtrack: without `out.pop()` restoring the accumulator after the
+    /// first (rejected) sibling, the reverse walk in `actuable_node` would still see that
+    /// sibling's clickable node — whose bounds do enclose the target — as if it were on the
+    /// target's real path, and wrongly return it instead of reporting no actuator exists.
+    #[test]
+    fn a_rejected_earlier_sibling_is_popped_before_trying_the_target_sibling() {
+        let t = built(&target_follows_a_rejected_clickable_sibling());
+        let target = target_for(&t, AxNodeId(2));
+        assert!(matches!(
+            actuable_node(&t, &target),
+            Err(GlassError::AxActionUnavailable(2))
+        ));
+    }
+
+    #[test]
+    fn a_disabled_target_errors_instead_of_falling_back_to_a_pointer_click() {
+        let e = disabled_error(2, AxNodeId(1));
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(
+            e.to_string().contains("disabled"),
+            "the message must say why: {e}"
+        );
+    }
+
+    #[test]
+    fn a_device_refusal_is_a_failed_action_not_a_lost_answer() {
+        // The device answered and refused. The call may have reached the toolkit, so a pointer
+        // click on top of it could actuate the control twice.
+        let inner = GlassError::Backend("agent: ACTION_CLICK refused".into());
+        let e = action_error(2, CallFailure::Refused(inner));
+        assert!(matches!(e, GlassError::AxActionFailed(2, _)), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(e.to_string().contains("ACTION_CLICK refused"), "{e}");
+    }
+
+    #[test]
+    fn a_click_that_never_went_out_is_a_transport_error_not_a_refusal() {
+        let inner = GlassError::Backend("agent write: broken pipe".into());
+        let e = action_error(2, CallFailure::NotSent(inner));
+        assert!(matches!(e, GlassError::AccessibilityUnavailable(_)), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_click_whose_answer_was_lost_says_it_may_already_have_actuated() {
+        let inner = GlassError::Backend("agent closed the connection".into());
+        let e = action_error(2, CallFailure::AnswerLost(inner));
+        assert!(matches!(e, GlassError::AccessibilityUnavailable(_)), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        // Refusing to fall back is only half of it — the message has to stop a hand-retry.
+        let m = e.to_string();
+        assert!(m.contains("was sent"), "{m}");
+        assert!(m.contains("may or may not have actuated"), "{m}");
+        assert!(m.contains("re-snapshot"), "{m}");
+    }
+
+    fn actuated(id: u32, role: AxRole, name: &str) -> Actuated {
+        Actuated {
+            id: AxNodeId(id),
+            role,
+            name: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn a_toggle_that_never_flipped_is_a_failure_not_a_missing_action() {
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        let e = check_timeout(2, &act, true, CheckState::Reached(false));
+        assert!(matches!(e, GlassError::AxActionFailed(2, _)), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        // The distinction that matters to a caller: the action WAS accepted.
+        assert!(e.to_string().contains("accepted"), "{e}");
+        assert!(e.to_string().contains("stayed false"), "{e}");
+    }
+
+    #[test]
+    fn a_control_that_vanished_after_the_click_is_not_reported_as_never_moving() {
+        // A checkable row that navigates, a toggle in a dismissing dialog: "it stayed <was>"
+        // would be a wrong diagnosis of a click that worked, inviting the retry that actuates
+        // twice.
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        let e = check_timeout(2, &act, true, CheckState::Gone);
+        let m = e.to_string();
+        assert!(!m.contains("stayed"), "no state was read to report: {m}");
+        assert!(m.contains("has usually acted"), "{m}");
+        assert!(m.contains("re-snapshot"), "{m}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    /// A tree taken after the click, holding `nodes` under the root.
+    fn after_tree(nodes: Vec<Value>) -> AxTree {
+        built(&json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "enabled": true,
+            "children": nodes
+        }))
+    }
+
+    fn checkable_json(class: &str, name: &str, checked: bool) -> Value {
+        json!({
+            "class": class, "text": name,
+            "bounds": {"x": 40, "y": 200, "w": 200, "h": 100},
+            "clickable": true, "enabled": true, "checkable": true, "checked": checked
+        })
+    }
+
+    #[test]
+    fn the_actuated_control_reports_the_state_it_reads_back() {
+        let after = after_tree(vec![checkable_json(
+            "android.widget.CheckBox",
+            "Agree",
+            true,
+        )]);
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(check_state(&after, &act), CheckState::Reached(true));
+    }
+
+    #[test]
+    fn a_node_that_inherited_the_id_does_not_count_as_the_flip() {
+        // The app rejected the change and showed an error line above the control, so every
+        // later id shifted. Id 1 is now an inert label, whose `checked` reads false — which a
+        // bare `checked != was` reads as an unchecking.
+        let after = after_tree(vec![
+            json!({
+                "class": "android.widget.TextView", "text": "You must agree first",
+                "bounds": {"x": 40, "y": 150, "w": 400, "h": 40}, "enabled": true
+            }),
+            checkable_json("android.widget.CheckBox", "Agree", true),
+        ]);
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(check_state(&after, &act), CheckState::Gone);
+    }
+
+    #[test]
+    fn a_different_control_at_the_same_id_does_not_count_as_the_flip() {
+        // Same id, still checkable, still a CheckBox — only the name says it is a different
+        // control, which is exactly the case a bare id match cannot see.
+        let after = after_tree(vec![checkable_json(
+            "android.widget.CheckBox",
+            "Subscribe",
+            false,
+        )]);
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(check_state(&after, &act), CheckState::Gone);
+    }
+
+    /// A clickable card wrapping a clickable button wrapping its label — nested clickables are
+    /// the Android norm (a row that opens a detail view, holding a button that deletes).
+    fn nested_clickables() -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "clickable": false, "enabled": true,
+            "children": [
+                {"class": "androidx.cardview.widget.CardView",
+                 "bounds": {"x": 40, "y": 400, "w": 900, "h": 300},
+                 "clickable": true, "enabled": true,
+                 "children": [
+                    {"class": "android.widget.Button",
+                     "bounds": {"x": 60, "y": 440, "w": 300, "h": 120},
+                     "clickable": true, "enabled": true,
+                     "children": [
+                        {"class": "android.widget.TextView", "text": "Delete",
+                         "bounds": {"x": 80, "y": 470, "w": 100, "h": 50},
+                         "clickable": false, "enabled": true}
+                     ]}
+                 ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_label_climbs_to_the_nearest_clickable_ancestor_not_the_outermost() {
+        // Climbing to the card actuates "open detail" where the caller asked for "delete".
+        let t = built(&nested_clickables());
+        let label = target_for(&t, AxNodeId(3));
+        assert_eq!(label.name.as_deref(), Some("Delete"));
+        assert_eq!(
+            actuable_node(&t, &label).unwrap().id,
+            AxNodeId(2),
+            "the enclosing Button, not the Card around it"
+        );
+    }
+
+    /// A disabled control that advertises no click of its own, inside a clickable card — the
+    /// Compose shape, where the delegate omits `ACTION_CLICK` while a control is disabled, so
+    /// nothing but the node's own `enabled` flag says to refuse.
+    fn disabled_inside_a_clickable_card() -> Value {
+        let mut v = nested_clickables();
+        v["children"][0]["children"][0]["clickable"] = json!(false);
+        v["children"][0]["children"][0]["enabled"] = json!(false);
+        v
+    }
+
+    #[test]
+    fn a_disabled_target_is_refused_even_when_something_around_it_is_clickable() {
+        let t = built(&disabled_inside_a_clickable_card());
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        assert!(matches!(e, GlassError::AxActionFailed(2, _)), "{e}");
+        assert!(e.to_string().contains("disabled"), "{e}");
+        assert!(
+            !e.invoke_fallback_eligible(),
+            "a pointer click would tap a control that cannot act: {e}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_control_the_climb_resolved_to_is_refused_as_well() {
+        // The target itself is fine; what would actually be actuated is not.
+        let mut v = nested_clickables();
+        v["children"][0]["children"][0]["clickable"] = json!(false);
+        v["children"][0]["enabled"] = json!(false);
+        let t = built(&v);
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
+        assert!(e.to_string().contains("element 1 is disabled"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_disabled_control_is_refused_before_a_truncated_tree_can_fall_back() {
+        // Same shape as the test above, in a truncated tree. `AxActionUnavailable` is
+        // fallback-eligible, so a truncation guard reached before the climb's `enabled` check
+        // taps the disabled control's centre and reports ok.
+        let mut v = nested_clickables();
+        v["children"][0]["children"][0]["clickable"] = json!(false);
+        v["children"][0]["enabled"] = json!(false);
+        v["children"].as_array_mut().expect("root children").push(
+            json!({"class": "android.widget.TextView", "text": "Cancel",
+                         "bounds": {"x": 40, "y": 800, "w": 200, "h": 60},
+                         "clickable": false, "enabled": true}),
+        );
+        let mut t = tree_from_json(
+            &v,
+            &win(),
+            WalkLimits {
+                siblings: 1,
+                ..WalkLimits::DEFAULT
+            },
+        )
+        .expect("maps");
+        t.assign_ids();
+        assert_eq!(
+            t.truncated.map(|x| x.limit),
+            Some(TruncationLimit::Siblings)
+        );
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
+        assert!(e.to_string().contains("element 1 is disabled"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_disabled_target_with_nothing_clickable_around_it_is_refused_too() {
+        // With no clickable ancestor the climb ends in `AxActionUnavailable`, which IS
+        // fallback-eligible — so reaching it taps the disabled control's centre and reports ok.
+        let mut v = disabled_inside_a_clickable_card();
+        v["children"][0]["clickable"] = json!(false);
+        let t = built(&v);
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap_err();
+        assert!(e.to_string().contains("disabled"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+    }
+
+    /// A device tree whose only child is a checkable control of `class`, in `checked` state.
+    fn one_checkable(class: &str, checked: bool) -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "enabled": true,
+            "children": [checkable_json(class, "Agree", checked)]
+        })
+    }
+
+    fn selection_tree(class: &str, checked: bool) -> AxTree {
+        built(&one_checkable(class, checked))
+    }
+
+    #[test]
+    fn re_clicking_a_selected_radio_button_asks_for_no_state_change() {
+        // A radio button already selected stays selected, so waiting for a flip fails a click
+        // on a UI already in the requested state.
+        let t = selection_tree("android.widget.RadioButton", true);
+        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+        assert_eq!(plan.want_checked, None);
+    }
+
+    #[test]
+    fn clicking_an_unselected_radio_button_asks_for_it_to_end_selected() {
+        let t = selection_tree("android.widget.RadioButton", false);
+        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+        assert_eq!(plan.want_checked, Some(true));
+    }
+
+    #[test]
+    fn clicking_a_checkbox_asks_for_its_state_to_move_either_way() {
+        for was in [false, true] {
+            let t = selection_tree("android.widget.CheckBox", was);
+            let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+            assert_eq!(plan.want_checked, Some(!was), "checked was {was}");
+        }
+    }
+
+    #[test]
+    fn clicking_a_switch_asks_for_its_state_to_move_either_way() {
+        for was in [false, true] {
+            let t = selection_tree("android.widget.Switch", was);
+            let plan = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap();
+            assert_eq!(plan.want_checked, Some(!was), "checked was {was}");
+        }
+    }
+
+    #[test]
+    fn a_plain_button_has_no_state_to_wait_for() {
+        let t = built(&compose_like());
+        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        assert_eq!(plan.want_checked, None);
+    }
+
+    #[test]
+    fn the_plan_actuates_the_climbed_ancestor_and_reports_the_substitution() {
+        let t = built(&compose_like());
+        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        assert_eq!(plan.actuated.id, AxNodeId(1));
+        assert_eq!(plan.substituted(), Some(AxNodeId(1)));
+    }
+
+    #[test]
+    fn a_target_actuated_in_its_own_right_substitutes_nothing() {
+        let t = built(&nested_clickables());
+        let plan = invoke_plan(&t, &target_for(&t, AxNodeId(2))).unwrap();
+        assert_eq!(plan.actuated.id, AxNodeId(2));
+        assert_eq!(plan.substituted(), None);
+    }
+
+    /// The compose fixture read back under `limits` — small caps make the walk report the
+    /// truncation a huge device tree would.
+    fn truncated_compose(limits: WalkLimits) -> AxTree {
+        let mut t = tree_from_json(&compose_like(), &win(), limits).expect("maps");
+        t.assign_ids();
+        t
+    }
+
+    #[test]
+    fn a_depth_truncated_tree_does_not_actuate_natively() {
+        // The depth cap drops a node's children and carries on with later siblings, so the kept
+        // set is no longer a pre-order prefix.
+        let t = truncated_compose(WalkLimits {
+            depth: 1,
+            ..WalkLimits::DEFAULT
+        });
+        assert_eq!(t.truncated.map(|x| x.limit), Some(TruncationLimit::Depth));
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap_err();
+        assert!(matches!(e, GlassError::AxActionUnavailable(1)), "{e}");
+        // Nothing was dispatched and the pointer path aims at this tree's own bounds, so the
+        // click still lands, disclosed as a pointer click.
+        assert!(e.invoke_fallback_eligible(), "{e}");
+    }
+
+    #[test]
+    fn a_sibling_truncated_tree_does_not_actuate_natively() {
+        let mut v = compose_like();
+        v["children"].as_array_mut().unwrap().push(
+            json!({"class": "android.widget.TextView", "text": "Cancel",
+                         "bounds": {"x": 60, "y": 700, "w": 210, "h": 130},
+                         "clickable": false, "enabled": true}),
+        );
+        let mut t = tree_from_json(
+            &v,
+            &win(),
+            WalkLimits {
+                siblings: 1,
+                ..WalkLimits::DEFAULT
+            },
+        )
+        .expect("maps");
+        t.assign_ids();
+        assert_eq!(
+            t.truncated.map(|x| x.limit),
+            Some(TruncationLimit::Siblings)
+        );
+        let e = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap_err();
+        assert!(matches!(e, GlassError::AxActionUnavailable(1)), "{e}");
+    }
+
+    #[test]
+    fn a_node_capped_tree_still_actuates_natively() {
+        // The node cap stops the walk outright, so every surviving id still equals its device
+        // `ref`.
+        let t = truncated_compose(WalkLimits {
+            nodes: 2,
+            ..WalkLimits::DEFAULT
+        });
+        assert_eq!(t.truncated.map(|x| x.limit), Some(TruncationLimit::Nodes));
+        assert_eq!(
+            invoke_plan(&t, &target_for(&t, AxNodeId(1)))
+                .unwrap()
+                .actuated
+                .id,
+            AxNodeId(1)
+        );
+    }
+
+    /// How the fake device answers an `action` request.
+    #[derive(Clone, Copy)]
+    enum OnAction {
+        Ok,
+        /// Read the request, then drop the socket without answering — the shape of an answer
+        /// lost to a read timeout, a rebinding service or a reset `adb forward` tunnel.
+        DropWithoutAnswering,
+    }
+
+    /// A fake on-device service on a local TCP listener: serves `tree` from a script (the last
+    /// entry repeating) and records every request, tagged with the connection it arrived on so
+    /// a re-send after a reconnect is visible in the log.
+    fn fake_service(trees: Vec<Value>, on_action: OnAction) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&ops);
+        std::thread::spawn(move || {
+            let mut conn = 0;
+            let mut served = 0usize;
+            while let Ok((sock, _)) = listener.accept() {
+                conn += 1;
+                let Ok(mut w) = sock.try_clone() else { break };
+                let mut r = std::io::BufReader::new(sock);
+                if writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
+                    .and_then(|()| w.flush())
+                    .is_err()
+                {
+                    break;
+                }
+                loop {
+                    let mut line = String::new();
+                    if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                        break;
+                    }
+                    let req: Value = serde_json::from_str(&line).expect("request is json");
+                    let id = req["id"].clone();
+                    let reply = match req["op"].as_str().unwrap_or_default() {
+                        "tree" => {
+                            log.lock().unwrap().push(format!("conn{conn}:tree"));
+                            let t = trees[served.min(trees.len() - 1)].clone();
+                            served += 1;
+                            json!({"id": id, "ok": true, "tree": t})
+                        }
+                        "action" => {
+                            log.lock().unwrap().push(format!(
+                                "conn{conn}:{} ref={}",
+                                req["action"].as_str().unwrap_or_default(),
+                                req["ref"]
+                            ));
+                            match on_action {
+                                OnAction::Ok => json!({"id": id, "ok": true}),
+                                OnAction::DropWithoutAnswering => break,
+                            }
+                        }
+                        _ => json!({"id": id, "ok": true}),
+                    };
+                    if writeln!(w, "{reply}").and_then(|()| w.flush()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (port, ops)
+    }
+
+    /// A reader wired to a fake device. `check_timeout` is passed explicitly so a test watching
+    /// a state check time out does not wait out the production budget; `Duration::ZERO` makes it
+    /// read the tree back exactly once.
+    fn reader(port: u16, check_timeout: std::time::Duration) -> ServiceA11y {
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, String::new());
+        a.check_timeout = check_timeout;
+        a
+    }
+
+    fn ctx() -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: win(),
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        }
+    }
+
+    fn ops_of(ops: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        ops.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_click_whose_answer_was_lost_is_not_re_sent() {
+        // The write landed and the response did not come back. Re-sending on a fresh socket,
+        // as a transparent reconnect does, dispatches a second ACTION_CLICK and reports one
+        // successful native click.
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::DropWithoutAnswering);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&compose_like());
+        let e = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+            .expect_err("a lost answer is not a success");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert!(
+            e.to_string().contains("may or may not have actuated"),
+            "{e}"
+        );
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
+            "exactly one click frame, on the one connection"
+        );
+    }
+
+    #[test]
+    fn the_click_is_sent_to_the_node_the_climb_resolved_to() {
+        // Sending the caller's own id would click the label, which handles nothing — every
+        // Compose click a no-op reported as success.
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&compose_like());
+        let substituted = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+            .expect("clicks");
+        assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_disabled_target_sends_no_click_at_all() {
+        let json = disabled_inside_a_clickable_card();
+        let (port, ops) = fake_service(vec![json.clone()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&json);
+        let e = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+            .expect_err("a disabled control must not report success");
+        assert!(e.to_string().contains("disabled"), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "the refusal must happen before anything is dispatched"
+        );
+    }
+
+    #[test]
+    fn a_toggle_whose_state_never_moves_is_reported_failed() {
+        let stuck = one_checkable("android.widget.CheckBox", false);
+        let (port, ops) = fake_service(vec![stuck.clone()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&stuck);
+        let e = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(1)))
+            .expect_err("an acknowledged action that changed nothing is not a click");
+        assert!(e.to_string().contains("accepted"), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string(),
+                "conn1:tree".to_string()
+            ],
+            "the click went out and the state was read back"
+        );
+    }
+
+    #[test]
+    fn a_toggle_that_flips_is_reported_clicked() {
+        let (port, _) = fake_service(
+            vec![
+                one_checkable("android.widget.CheckBox", false),
+                one_checkable("android.widget.CheckBox", true),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&one_checkable("android.widget.CheckBox", false));
+        assert_eq!(
+            a.invoke(&ctx(), &target_for(&t, AxNodeId(1)))
+                .expect("clicks"),
+            None,
+            "the target actuated itself, so nothing was substituted"
+        );
     }
 }

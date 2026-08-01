@@ -439,8 +439,10 @@ impl GlassServer {
                        platform's native accessibility action when the element exposes one — \
                        works even when it's occluded or scrolled off-screen — else falls back \
                        to a synthetic pointer click at the center of its bounds; the result's \
-                       `method` field says which path ran, and `native_fallback` says why when \
-                       the pointer path was used). If the element actually \
+                       `method` field says which path ran, `native_fallback` says why when \
+                       the pointer path was used, and `actuated_id` names the element actually \
+                       clicked when a control's label is a separate element from the control \
+                       itself). If the element actually \
                        renders in a popover owned by a different window than the active one \
                        (e.g. an open dropdown's option row), the click is automatically routed \
                        into that popover window and the previously-active window is restored \

@@ -10,7 +10,7 @@ use glass_core::{GlassError, Result};
 use serde_json::{Value, json};
 
 use crate::adb::Adb;
-use crate::conn::Conn;
+use crate::conn::{CallFailure, Conn};
 
 /// One absolute-display point in a pointer path (the agent's gesture element).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +42,12 @@ impl AgentClient {
             .map_err(|_| GlassError::Backend("agent client lock poisoned".into()))?;
         match conn.call(req.clone()) {
             Ok(v) => Ok(v),
-            Err((e, false)) => Err(e),
-            Err((_, true)) => {
+            Err(f) if f.is_transport() => {
                 // The agent's accept loop accepts a fresh connection after a drop.
                 *conn = Conn::open(self.port)?;
-                conn.call(req).map_err(|(e, _)| e)
+                conn.call(req).map_err(CallFailure::into_error)
             }
+            Err(f) => Err(f.into_error()),
         }
     }
 

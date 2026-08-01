@@ -67,16 +67,24 @@ text, so routine checks between screenshots cost no vision tokens. Why the loop 
 [the build → see → interact → debug loop](docs/explanation/the-loop.md).
 
 `glass_click_element` tries the platform's native accessibility action first — AT-SPI `Action` on
-Linux, UI Automation patterns on Windows, `AXPress` on macOS — which actuates elements
-that are occluded or scrolled off-screen and, on macOS, without moving the cursor. Not every
-control exposes one (some toolkit checkbuttons expose no action even on a backend that otherwise
-supports it), so the click falls back to a synthetic pointer click at the element's center when it
-doesn't. iOS and Android always use the pointer path today. The result's `method` field
-(`native-action`/`pointer`) says which path actually ran for that click, with `native_fallback`
-explaining why when it fell back — the source of truth per click, not the backend alone. On those
-three backends the native attempt re-checks the element against the live tree, so a click whose
-element no longer matches errors instead of clicking stale coordinates; the pointer-only iOS and
-Android paths have no such live check.
+Linux, UI Automation patterns on Windows, `AXPress` on macOS, and `ACTION_CLICK` on Android when
+the optional on-device accessibility companion is installed — which actuates elements that are
+occluded or scrolled off-screen and, on macOS, without moving the cursor. Not every control
+exposes one (some toolkit checkbuttons expose no action even on a backend that otherwise
+supports it), so the click falls back to a synthetic pointer click at the element's center when
+it doesn't. Where a control's label is a separate element from the control itself, as in Jetpack
+Compose, Android resolves to the enclosing control that would have handled the tap. iOS and
+Android's companion-free `uiautomator` reader always use the pointer path. The result's `method`
+field (`native-action`/`pointer`) says which path actually ran for that click, with
+`native_fallback` explaining why when it fell back — the source of truth per click, not the
+backend alone — and `actuated_id` naming the element actually clicked when it isn't the one you
+named. On the backends that attempt it, the native path re-checks the element against
+the live tree, so a click whose element no longer matches errors instead of clicking stale
+coordinates; the pointer-only paths have no such live check.
+
+Clicking a control the tree reports **disabled** is an error on the native path, not a tap that
+silently does nothing — a contract change if you were relying on a click that lands on a greyed-out
+button and reports success.
 
 ## Install at a glance
 

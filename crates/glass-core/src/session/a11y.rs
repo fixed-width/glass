@@ -166,7 +166,7 @@ impl Glass {
         // propagates, because clicking on top of a native action that may still land would
         // actuate the control twice while the result claimed only "pointer" ran.
         let native_fallback = match self.try_native_invoke(id) {
-            Ok(()) => return Ok(ClickMethod::NativeAction),
+            Ok(actuated) => return Ok(ClickMethod::NativeAction { actuated }),
             Err(e) if !e.invoke_fallback_eligible() => return Err(e),
             Err(e) => native_fallback_reason(&e),
         };
@@ -272,8 +272,8 @@ impl Glass {
 
     /// One native-invoke attempt: the same fingerprint + context assembly as
     /// `set_value_inner` (over freshly re-read window geometry — see below), then the
-    /// backend's `invoke`.
-    fn try_native_invoke(&mut self, id: AxNodeId) -> Result<()> {
+    /// backend's `invoke`. Passes on the element the backend actuated when it is not `id`.
+    fn try_native_invoke(&mut self, id: AxNodeId) -> Result<Option<AxNodeId>> {
         {
             let s = self.active_mut()?;
             // Reader-presence check up front (mirrors `snapshot_at_current_limits`) so
@@ -317,12 +317,13 @@ impl Glass {
             (target, ctx)
         };
         let s = self.active_mut()?;
-        s.accessibility
+        let actuated = s
+            .accessibility
             .as_mut()
             .ok_or(GlassError::AxUnsupported)?
             .invoke(&ctx, &target)?;
         s.pump();
-        Ok(())
+        Ok(actuated)
     }
 
     /// Set the value/text of element `id` (from the latest `a11y_snapshot`) via the
@@ -1595,7 +1596,7 @@ mod tests {
 
         assert_eq!(
             g.click_element(AxNodeId(1)).unwrap(),
-            ClickMethod::NativeAction
+            ClickMethod::NativeAction { actuated: None }
         );
 
         assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
@@ -1676,7 +1677,7 @@ mod tests {
         g.start(&spec()).unwrap();
         g.a11y_snapshot(None).unwrap();
         let method = g.click_element(AxNodeId(1)).unwrap();
-        assert_eq!(method, ClickMethod::NativeAction);
+        assert_eq!(method, ClickMethod::NativeAction { actuated: None });
         assert!(
             clicks.lock().unwrap().is_empty(),
             "no pointer event on the native path"
@@ -1689,6 +1690,26 @@ mod tests {
         assert!(
             log[0].bounds.is_some(),
             "fingerprint carries the snapshot bounds"
+        );
+    }
+
+    #[test]
+    fn click_element_carries_the_element_the_backend_actuated_instead() {
+        // A backend whose toolkit carries the activation on an ancestor of the label clicks
+        // that ancestor. The method has to say so, or the click and its audit record read as
+        // if the caller's own element was the one that fired.
+        let (mut g, _) = glass_with_a11y_invoke(
+            FakePlatform::new(100, 100),
+            fake_tree(),
+            InvokeBehavior::SucceedOnAnother(9),
+        );
+        g.start(&spec()).unwrap();
+        g.a11y_snapshot(None).unwrap();
+        assert_eq!(
+            g.click_element(AxNodeId(1)).unwrap(),
+            ClickMethod::NativeAction {
+                actuated: Some(AxNodeId(9))
+            }
         );
     }
 
@@ -1788,7 +1809,7 @@ mod tests {
         g.a11y_snapshot(None).unwrap();
         assert_eq!(
             g.click_element(AxNodeId(2)).unwrap(),
-            ClickMethod::NativeAction
+            ClickMethod::NativeAction { actuated: None }
         );
     }
 
@@ -2251,7 +2272,7 @@ mod tests {
 
         assert_eq!(
             g.click_element(globex_id).unwrap(),
-            ClickMethod::NativeAction
+            ClickMethod::NativeAction { actuated: None }
         );
 
         assert_eq!(invoke_log.lock().unwrap().len(), 1, "the native path ran");
