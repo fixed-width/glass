@@ -342,8 +342,20 @@ mod tests {
 
         // Built by running a real timeout rather than typed here: the gate keys on wording that
         // `glass-core` owns, so a fixture repeating that wording could not notice it drifting.
+        //
+        // `ping` stands in for `sleep` on Windows (no `/bin/sh` there) — it paces one echo per
+        // second even when transmission fails, so it reliably outlives the 200ms budget.
+        #[cfg(unix)]
+        let mut hang = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        hang.args(["-c", "sleep 30"]);
+        #[cfg(windows)]
+        let mut hang = std::process::Command::new("ping");
+        #[cfg(windows)]
+        hang.args(["-n", "31", "127.0.0.1"]);
+
         let real_timeout = glass_core::run_bounded(
-            std::process::Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            &mut hang,
             std::time::Duration::from_millis(200),
             "adb:shell",
         )

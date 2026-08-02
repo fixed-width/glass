@@ -1,8 +1,12 @@
-//! Pure, portable launch-target *resolution* atoms shared by glass's per-OS sandbox crates
+//! Launch-target *resolution* atoms shared by glass's per-OS sandbox crates
 //! (`glass-sandbox-linux`, `glass-sandbox-macos`). No OS-specific containment logic lives here —
 //! only "given a program + args + cwd, what absolute host paths does the launch actually touch,
 //! resolved the way the child is exec'd." Each backend applies its OWN exposure guard/emit on top.
-//! std-only; builds on every target so a `--workspace` build never breaks.
+//!
+//! Unix-only, because both consumers are: bwrap and Seatbelt have no Windows counterpart. Gating
+//! the crate is what lets `is_absolute()` and the execute-bit check mean what they say — compiled
+//! for Windows, `/a/b` reads as relative and the mode check has nothing to test.
+#![cfg(unix)]
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
@@ -36,20 +40,12 @@ pub fn resolve_on_path_in(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
 }
 
 /// Whether `p` is (or resolves through symlinks to) a regular file that is executable — `execvp`'s
-/// "is this runnable" test. The execute-bit check is a Unix concept (mode `& 0o111`); on non-unix
-/// hosts (where glass has no Seatbelt/bwrap sandbox) it degrades to "is a regular file" so the
-/// crate still compiles as a `--workspace` member.
-#[cfg(unix)]
+/// "is this runnable" test.
 pub(crate) fn is_executable_file(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn is_executable_file(p: &Path) -> bool {
-    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Best-effort path canonicalization that never panics on a nonexistent path: the resolved path,
@@ -71,9 +67,7 @@ pub fn dir_of(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsStr;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -90,7 +84,6 @@ mod tests {
         assert_eq!(abs_token(Path::new("x/y"), None), None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_finds_first_executable_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -104,7 +97,6 @@ mod tests {
     /// Pins the documented "first `$PATH` entry wins" contract (`execvp` semantics): with two
     /// directories on `$PATH`, each holding an executable of the SAME name, the match from the
     /// FIRST directory must be returned, not merely any match.
-    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_returns_the_first_match() {
         let first = tempfile::tempdir().unwrap();
@@ -122,7 +114,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_skips_non_executable_and_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -156,7 +147,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn is_executable_file_true_for_exec_false_for_dir_and_plain() {
         let dir = tempfile::tempdir().unwrap();

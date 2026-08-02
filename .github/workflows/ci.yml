@@ -220,16 +220,12 @@ jobs:
         with:
           workspaces: .
       # The Linux-only and unix-only crates gate themselves (#293), so --workspace
-      # resolves here for build/clippy. cargo test stays scoped for now — this same
-      # `-p` list is what hid 19 pre-existing Windows-path-semantics failures in
-      # glass-android, glass-sandbox-core and glass-sandbox-macos (POSIX-style
-      # absolute-path assertions that don't hold on Windows), tracked in #299.
-      # Every other crate's tests are platform-independent and already covered by
-      # the Linux job's `cargo test --workspace`; once #299 lands, drop this list
-      # and go --workspace here too.
+      # resolves here. Keep all three steps --workspace: a hand-maintained `-p` list
+      # stops compiling what it omits, so it hides the very failures that argue for
+      # keeping it (#299 found 19 across three crates that way).
       - run: cargo build  --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test   -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --locked
+      - run: cargo test   --workspace --locked
 
   coverage:
     name: coverage (report-only)

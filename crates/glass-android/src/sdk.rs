@@ -232,6 +232,37 @@ mod tests {
         assert_eq!(resolve_adb(&get, &|_| true).bin(), "/custom/adb");
     }
 
+    // One variant per OS: a single HOME-based fixture would silently no-op on Windows,
+    // which keys its default location off LOCALAPPDATA, not HOME.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn adb_from_discovered_sdk() {
+        let get = getter(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]);
+        let root = Path::new(r"C:\Users\u\AppData\Local")
+            .join("Android")
+            .join("Sdk");
+        let bin = root.join("platform-tools").join(adb_exe());
+        let exists = |p: &Path| p == root.as_path() || p == bin.as_path();
+        match resolve_adb(&get, &exists) {
+            AdbResolution::Sdk { bin: got, .. } => assert_eq!(got, bin.to_string_lossy()),
+            other => panic!("expected Sdk, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adb_from_discovered_sdk() {
+        let get = getter(&[("HOME", "/home/u")]);
+        let root = PathBuf::from("/home/u/Library/Android/sdk");
+        let bin = root.join("platform-tools").join(adb_exe());
+        let exists = |p: &Path| p == root.as_path() || p == bin.as_path();
+        match resolve_adb(&get, &exists) {
+            AdbResolution::Sdk { bin: got, .. } => assert_eq!(got, bin.to_string_lossy()),
+            other => panic!("expected Sdk, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn adb_from_discovered_sdk() {
         let get = getter(&[("HOME", "/home/u")]);
@@ -270,6 +301,35 @@ mod tests {
         assert!(d.contains("discovered"), "got {d}");
     }
 
+    // One variant per OS, same reason as `adb_from_discovered_sdk` above: `sdk_search_trail`
+    // also reads through `default_locations`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn trail_lists_env_then_defaults() {
+        let get = getter(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]);
+        let t = sdk_search_trail(&get);
+        assert_eq!(&t[0], "ANDROID_SDK_ROOT");
+        assert_eq!(&t[1], "ANDROID_HOME");
+        assert!(
+            t.iter().any(|s| s.contains("Android") && s.contains("Sdk")),
+            "trail: {t:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trail_lists_env_then_defaults() {
+        let get = getter(&[("HOME", "/home/u")]);
+        let t = sdk_search_trail(&get);
+        assert_eq!(&t[0], "ANDROID_SDK_ROOT");
+        assert_eq!(&t[1], "ANDROID_HOME");
+        assert!(
+            t.iter().any(|s| s.contains("Library/Android")),
+            "trail: {t:?}"
+        );
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn trail_lists_env_then_defaults() {
         let get = getter(&[("HOME", "/home/u")]);
@@ -306,7 +366,13 @@ mod tests {
             &get,
             &exists,
         );
-        assert_eq!(r.as_deref(), Some("/data/glass/glass-agent.jar"));
+        // Joined rather than a POSIX literal: `resolve_artifact` builds the path with `Path::join`,
+        // which uses `\` on Windows.
+        let want = PathBuf::from("/data/glass")
+            .join("glass-agent.jar")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(r.as_deref(), Some(want.as_str()));
     }
 
     #[test]
