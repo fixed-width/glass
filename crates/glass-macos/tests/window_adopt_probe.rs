@@ -137,12 +137,14 @@ mod macos_main {
 
     /// One run's outcome: whether the adopted geometry matched a window the app's pid actually
     /// owns, whether the accessibility reader could resolve the adopted window at all (#263's
-    /// actual symptom), and the pid `start_app` reported — needed to tell a cold launch from a
-    /// re-adoption of an already-running process (see the module doc's caveat).
+    /// actual symptom), the pid `start_app` reported — needed to tell a cold launch from a
+    /// re-adoption of an already-running process (see the module doc's caveat) — and how long
+    /// `start_app` itself took, the actual cost of the settle loop this probe exists to justify.
     struct RunOutcome {
         matched: bool,
         snapshot_ok: bool,
         pid: Option<u32>,
+        start_app: Duration,
     }
 
     /// Re-read the adopted window's geometry every [`EARLY_SAMPLE_INTERVAL`] for
@@ -214,15 +216,18 @@ mod macos_main {
         };
 
         with_stop_app(&mut platform, run0, |platform| {
+            let start_app_began = Instant::now();
             let adopted = platform
                 .start_app(&spec)
                 .map_err(|e| format!("start_app({run0}): {e}"))?;
+            let start_app_elapsed = start_app_began.elapsed();
             let pid = platform.app_pids().first().copied();
             println!("\n===== run {run_index} =====");
             println!(
                 "pid: {}",
                 pid.map_or_else(|| "?".to_string(), |p| p.to_string())
             );
+            println!("start_app: {}ms", start_app_elapsed.as_millis());
             println!("adopted: {adopted:?}");
             print_early_samples(platform, &adopted);
 
@@ -277,6 +282,7 @@ mod macos_main {
                 matched,
                 snapshot_ok,
                 pid,
+                start_app: start_app_elapsed,
             })
         })
     }
@@ -302,6 +308,7 @@ mod macos_main {
         let mut mismatches = 0usize;
         let mut snapshot_failures = 0usize;
         let mut pids_seen = std::collections::HashSet::new();
+        let mut start_app_durations = Vec::new();
         let mut failures = Vec::new();
         for run_index in 1..=runs {
             match probe_once(&run0, run_index) {
@@ -313,6 +320,7 @@ mod macos_main {
                         snapshot_failures += 1;
                     }
                     pids_seen.extend(outcome.pid);
+                    start_app_durations.push(outcome.start_app);
                 }
                 Err(e) => failures.push(format!("run {run_index}: {e}")),
             }
@@ -329,6 +337,32 @@ mod macos_main {
              {snapshot_failures} of {runs} run(s) failed the accessibility snapshot; \
              {} distinct pid(s) seen across {runs} run(s)",
             pids_seen.len()
+        );
+        // The settle loop's wall-clock cost, measured rather than derived from its own
+        // parameters. `start_app_durations` has one entry per successful run — the `fail()`
+        // above exits before reaching here if any run errored — so the division below never
+        // sees a zero-length vec.
+        let min = start_app_durations
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or_default();
+        let max = start_app_durations
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or_default();
+        let mean_ms = start_app_durations
+            .iter()
+            .map(Duration::as_secs_f64)
+            .sum::<f64>()
+            * 1000.0
+            / start_app_durations.len() as f64;
+        println!(
+            "start_app latency: min {}ms, max {}ms, mean {mean_ms:.1}ms across {} run(s)",
+            min.as_millis(),
+            max.as_millis(),
+            start_app_durations.len()
         );
         println!("WINDOW_ADOPT_PROBE_PASS");
         std::process::exit(0);
