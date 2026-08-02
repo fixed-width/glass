@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use glass_core::{AppSpec, Check, CheckStatus, GlassError, Result, SandboxLevel};
-use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path_in};
+use glass_sandbox_unix::{abs_token, canon, dir_of, resolve_on_path_in};
 
 /// App-level environment that makes GUI toolkits present frames without X11 MIT-SHM. glass's
 /// containment breaks shared-memory rendering on the headless display: `wrap_argv` passes
