@@ -11,7 +11,7 @@ publish.workspace = true
 [lib]
 bench = false
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 glass-core.workspace = true
 # The desktop-a11y capability signal (AT-SPI launcher present) lives with the a11y reader
 # and its doctor. This backend->a11y-reader direction mirrors glass-windows -> glass-a11y-windows
@@ -34,7 +34,7 @@ x11rb.workspace = true
 tempfile.workspace = true
 rustix.workspace = true
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 criterion = { workspace = true }
 
 [[bench]]

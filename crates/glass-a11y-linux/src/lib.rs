@@ -3,6 +3,8 @@
 //! per-OS `Accessibility` seam (orthogonal to the display `Platform` seam); the
 //! same impl serves both the X11 and Wayland display backends.
 
+#![cfg(target_os = "linux")]
+
 mod events;
 mod mapping;
 mod reader;

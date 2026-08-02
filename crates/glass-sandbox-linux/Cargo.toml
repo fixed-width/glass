@@ -6,11 +6,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 glass-core.workspace = true
 glass-sandbox-core.workspace = true
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile.workspace = true
 
 [lints]

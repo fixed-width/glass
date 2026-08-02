@@ -15,6 +15,8 @@
 //! bubblewrap). The Windows peer (`descendant_pids`, Toolhelp-based) lives with
 //! the Windows backend for the same reason — the OS APIs can't share an impl.
 
+#![cfg(target_os = "linux")]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read};
 use std::process::Child;

@@ -1,5 +1,7 @@
 //! glass-x11: the Linux/X11 `glass_core::Platform` backend.
 
+#![cfg(target_os = "linux")]
+
 // Modules are added task-by-task.
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};

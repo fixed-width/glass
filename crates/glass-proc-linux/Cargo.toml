@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 rustix.workspace = true
 
 [lints]

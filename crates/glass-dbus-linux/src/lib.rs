@@ -4,6 +4,8 @@
 //! `at-spi-bus-launcher`, and resolves the a11y-bus address; reaps both on `Drop` (mirrors
 //! `glass-x11`'s `Xvfb`).
 
+#![cfg(target_os = "linux")]
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
