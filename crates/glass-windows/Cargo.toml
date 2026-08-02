@@ -28,8 +28,9 @@ windows = { version = "0.62", features = [
   "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp",
   # clipboard: CF_UNICODETEXT global memory clipboard
   "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole",
-  # doctor: session (RemoteDesktop), WGC support probe, true build via RtlGetVersion
-  "Win32_System_RemoteDesktop", "Graphics_Capture",
+  # doctor: session (RemoteDesktop), WGC support probe, true build via RtlGetVersion.
+  # Win32_System_Com is for the WGC probe's own apartment — see `gather_wgc`.
+  "Win32_System_RemoteDesktop", "Graphics_Capture", "Win32_System_Com",
   "Wdk_System_SystemServices", "Win32_System_SystemInformation",
   # private clipboard: host named-pipe server + scoped security descriptor
   "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO",
