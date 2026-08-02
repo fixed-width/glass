@@ -307,8 +307,9 @@ mod tests {
         };
         assert_eq!(resolve_emulator_bin(&env, &|_| true), "/custom/emulator");
 
-        // Built the same way `resolve_emulator_bin` builds it, so this pins the host-correct
-        // separator and `.exe` suffix rather than a POSIX literal.
+        // Shares `emulator_exe()` with the code under test, so this pins root selection and the
+        // `emulator/` segment but NOT the leaf name — `emulator_exe_carries_the_platform_suffix`
+        // does that.
         let want_bin = |root: &str| {
             std::path::PathBuf::from(root)
                 .join("emulator")
@@ -333,8 +334,18 @@ mod tests {
         assert_eq!(resolve_emulator_bin(&env, &|_| false), "emulator");
     }
 
-    // Default install locations are OS-specific (Linux paths here); gate so the
-    // cross-platform CI (incl. the Windows job) doesn't run this assertion.
+    /// Pins the leaf name directly: every other assertion builds its expectation with
+    /// `emulator_exe()` itself, so none of them can falsify the suffix.
+    #[test]
+    fn emulator_exe_carries_the_platform_suffix() {
+        #[cfg(windows)]
+        assert_eq!(emulator_exe(), "emulator.exe");
+        #[cfg(not(windows))]
+        assert_eq!(emulator_exe(), "emulator");
+    }
+
+    // One variant per OS: the Windows arm keys off LOCALAPPDATA, so a HOME-only fixture finds
+    // nothing and passes while proving nothing.
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn emulator_from_discovered_default_sdk() {
@@ -347,6 +358,36 @@ mod tests {
         assert_eq!(
             resolve_emulator_bin(&env, &exists),
             "/home/u/android-sdk/emulator/emulator"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn emulator_from_discovered_default_sdk() {
+        let env = |k: &str| match k {
+            "LOCALAPPDATA" => Some(r"C:\Users\u\AppData\Local".to_string()),
+            _ => None,
+        };
+        let root = r"C:\Users\u\AppData\Local\Android\Sdk";
+        let exists = |p: &std::path::Path| p == std::path::Path::new(root);
+        assert_eq!(
+            resolve_emulator_bin(&env, &exists),
+            format!(r"{root}\emulator\emulator.exe")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emulator_from_discovered_default_sdk() {
+        let env = |k: &str| match k {
+            "HOME" => Some("/Users/u".to_string()),
+            _ => None,
+        };
+        let root = "/Users/u/Library/Android/sdk";
+        let exists = |p: &std::path::Path| p == std::path::Path::new(root);
+        assert_eq!(
+            resolve_emulator_bin(&env, &exists),
+            format!("{root}/emulator/emulator")
         );
     }
 
