@@ -191,6 +191,13 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- An Android accessibility read can no longer answer with a tree captured before the interaction it
+  was asked about. Every read wrote to one file on the device, and a read that ends at its deadline
+  ends the local `adb` client only — the `uiautomator dump` it started keeps running on the device
+  and writes that file whenever it finishes. A later read could find that write in place of its own
+  and return it, with no error, moments after a timeout the caller had already recovered from: a
+  tree that parses cleanly and that nothing marks as old. Each read now dumps to a file of its own,
+  so a dump nobody is waiting for has nothing to answer, and removes that file once it has read it.
 - An Android accessibility read now keeps the deadline it promises. One `uiautomator dump` is three
   adb calls, and each carried a timeout of its own, so a snapshot against a slow or wedged device
   could run about 50 seconds — well past the `glass_wait_for_element` that asked for it, which
@@ -294,9 +301,9 @@ internal refactors, CI, or test-only changes.
   `glass_start` waits for — several seconds before `uiautomator` can produce a dump, so the first
   snapshot now waits for it (up to 30s, once per session; later snapshots do not wait). When a dump
   genuinely fails, the error names the dump and quotes its own reason —
-  `uiautomator dump did not write /sdcard/glass_dump.xml: ERROR: null root node returned by
+  `uiautomator dump did not write /sdcard/glass_dump_<id>.xml: ERROR: null root node returned by
   UiTestAutomationBridge.` — where it used to report the unrelated read of the file the dump had
-  never written (`cat: /sdcard/glass_dump.xml: No such file or directory`). `glass_doctor --deep`
+  never written (`cat: ...: No such file or directory`). `glass_doctor --deep`
   keeps its single attempt, so it still reports whether the device can dump right now.
 - Linux (`backend: "wayland"`): glass now recovers a window an X11 app opened that the compositor
   never surfaced. Under load, a window the app maps can reach the compositor's Xwayland server and
