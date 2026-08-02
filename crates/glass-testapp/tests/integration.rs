@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end X11 tests. These are `#[ignore]`d so the default `cargo test`
 //! stays green without a display; run them via `scripts/test-x11.sh`.
 

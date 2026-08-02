@@ -12,10 +12,6 @@ x11rb.workspace = true
 [dev-dependencies]
 glass-core.workspace = true
 tempfile.workspace = true
-glass-x11 = { path = "../glass-x11" }
-glass-wayland.workspace = true
-# Teardown tests assert against the shared close/reap graces rather than restating them.
-glass-proc-linux = { path = "../glass-proc-linux" }
 x11rb.workspace = true
 # Network pixel-over-HTTP e2e (tests/network.rs). `glass-mcp`'s `network`
 # feature is default-on. rmcp client transport is generic over the HTTP client;
@@ -28,6 +24,12 @@ tokio = { version = "1", features = ["full"] }
 base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glass-x11 = { path = "../glass-x11" }
+glass-wayland.workspace = true
+# Teardown tests assert against the shared close/reap graces rather than restating them.
+glass-proc-linux = { path = "../glass-proc-linux" }
 
 [lints]
 workspace = true

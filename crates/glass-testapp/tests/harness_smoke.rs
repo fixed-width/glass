@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Smoke test for the Xvfb harness itself. #[ignore]d so the default
 //! `cargo test` stays green without a display; run via scripts/test-x11.sh.
 

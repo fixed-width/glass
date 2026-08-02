@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end Wayland-backend tests. `#[ignore]`d; run via
 //! `scripts/test-wayland.sh` (which skips if no glass-discoverable sway >=1.12).
 

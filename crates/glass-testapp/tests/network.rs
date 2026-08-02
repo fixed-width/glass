@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end: drive glass-mcp over HTTP against the testapp under Xvfb. `#[ignore]d`;
 //! run via `./scripts/test-x11.sh network_screenshot_over_http`.
 

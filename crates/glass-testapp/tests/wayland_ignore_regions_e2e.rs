@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end: the Wayland-backend twin of `ignore_regions_e2e.rs` — same assertion, same real
 //! glass-mcp server over HTTP, against sway/Xwayland instead of Xvfb (no private display setup
 //! needed here; `WaylandPlatform` manages its own compositor). The diff/settle path is shared

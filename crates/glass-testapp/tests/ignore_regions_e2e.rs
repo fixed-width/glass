@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! End-to-end: drive glass-mcp over HTTP (the real MCP tool schema, not glass-core's library
 //! API — see `common::mcp_ignore` for why) against a `--blink`ing glass-testapp under Xvfb, to
 //! prove `ignore` regions work through the whole stack: parameter parsing, coordinate mapping,

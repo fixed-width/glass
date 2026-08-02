@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Host-conformance: prove glass's host-facing MCP surface on BOTH transports
 //! (a spawned stdio child + an in-process HTTP server), the way a real MCP host
 //! consumes it. Each path asserts: `initialize` negotiates a protocol version,

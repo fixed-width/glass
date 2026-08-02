@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! MEASUREMENT, not an assertion: how often does Wayland's `start_app` return a geometry that
 //! disagrees with a geometry re-read immediately afterwards? Whether Wayland races the launch
 //! geometry the way the macOS backend does (#263) decides whether the settle belongs here too

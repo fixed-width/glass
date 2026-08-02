@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! GTK4/GPU-toolkit apps render (not black) under containment on the headless X11 display —
 //! proof that glass injects software-render env defaults for sandboxed launches. `#[ignore]d`
 //! (needs Xvfb + python3-gi/GTK 4); run via `./scripts/test-x11.sh`.
