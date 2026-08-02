@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use glass_core::{GlassError, Result, TIMED_OUT, run_bounded};
+use glass_core::{GlassError, Result, TIMED_OUT, run_bounded, run_bounded_until};
 
 /// What an adb invocation is doing, which is what decides how long it may take.
 ///
@@ -12,8 +12,10 @@ use glass_core::{GlassError, Result, TIMED_OUT, run_bounded};
 /// that fires on a loaded-but-working device is worse than the hang it replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdbOp {
-    /// `uiautomator dump`, and the `cat` that reads the tree it wrote — the two halves of one
-    /// snapshot, so they share a deadline rather than the read-back inheriting a tap's.
+    /// `uiautomator dump`, and the `cat` that reads the tree it wrote — two steps of one snapshot,
+    /// so they share a deadline rather than the read-back inheriting a tap's. That deadline bounds
+    /// the whole snapshot: `a11y::attempt_deadline` runs all three of its steps inside this budget,
+    /// including the stale-file removal, which classifies as [`AdbOp::Shell`].
     Dump,
     /// `exec-out screencap` — encodes a full-resolution frame.
     Screencap,
@@ -30,7 +32,8 @@ pub enum AdbOp {
 }
 
 impl AdbOp {
-    /// The deadline for this kind of call.
+    /// The deadline for this kind of call, and — where a caller passes one to
+    /// [`Adb::run_streams_until`] — the ceiling a call gets rather than the deadline itself.
     pub fn budget(self) -> Duration {
         match self {
             Self::Dump => Duration::from_secs(20),
@@ -115,18 +118,22 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let out = self.output(args)?;
+        let out = self.output(args, None)?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Run adb capturing stdout *and* stderr. For a command whose exit status does not
-    /// signal success — `uiautomator dump` exits 0 when it fails, and explains itself on
-    /// stderr — the caller has to judge the outcome from the streams itself.
-    pub fn run_streams<'a, I>(&self, args: I) -> Result<(String, String)>
+    /// Run adb capturing stdout *and* stderr, as one step of a sequence that answers as a whole.
+    ///
+    /// Two streams because a command whose exit status does not signal success — `uiautomator dump`
+    /// exits 0 when it fails, and explains itself on stderr — leaves the caller to judge the outcome
+    /// from the streams itself. The call gets its operation's budget or what is left of `deadline`,
+    /// whichever is nearer, so the steps of one dump cannot together cost the sum of their
+    /// budgets.
+    pub fn run_streams_until<'a, I>(&self, args: I, deadline: Instant) -> Result<(String, String)>
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let out = self.output(args)?;
+        let out = self.output(args, Some(deadline))?;
         Ok((
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -138,12 +145,13 @@ impl Adb {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        Ok(self.output(args)?.stdout)
+        Ok(self.output(args, None)?.stdout)
     }
 
     /// Run adb and return the completed process, erroring on spawn failure or non-zero
-    /// exit so every caller reports those two the same way.
-    fn output<'a, I>(&self, args: I) -> Result<Output>
+    /// exit so every caller reports those two the same way. `deadline` is the outer bound of a
+    /// multi-call sequence, where there is one.
+    fn output<'a, I>(&self, args: I, deadline: Option<Instant>) -> Result<Output>
     where
         I: IntoIterator<Item = &'a str>,
     {
@@ -154,7 +162,11 @@ impl Adb {
         cmd.args(&argv);
         // A wedged adb server answers nothing at all, and the fix is one command — so the remedy
         // rides in the error the caller sees rather than in a log line nobody reads.
-        let out = run_bounded(&mut cmd, op.budget(), op.label()).map_err(with_adb_hint)?;
+        let out = match deadline {
+            Some(d) => run_bounded_until(&mut cmd, op.budget(), d, op.label()),
+            None => run_bounded(&mut cmd, op.budget(), op.label()),
+        }
+        .map_err(with_adb_hint)?;
         if out.status.success() {
             Ok(out)
         } else {
@@ -250,6 +262,32 @@ mod tests {
         // connection wedged behind it.
         let devices = adb.run(["devices"]).expect("adb usable after a timeout");
         assert!(devices.contains("List of devices"), "{devices}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deadline_handed_to_adb_reaches_the_process_that_runs() {
+        // The wiring the fix rests on: `output` must pass the deadline to the bounded runner, not
+        // merely accept one. `/bin/sh` stands in for adb, and `AdbOp::Shell`'s 10s budget is what
+        // this call would otherwise wait out.
+        let adb = Adb {
+            bin: "/bin/sh".to_string(),
+            serial: None,
+        };
+        let started = std::time::Instant::now();
+        let err = adb
+            .run_streams_until(
+                ["-c", "sleep 30"],
+                std::time::Instant::now() + Duration::from_millis(300),
+            )
+            .expect_err("a step must not outlive the deadline it serves");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} — the deadline never reached the process",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains(TIMED_OUT), "{err}");
     }
 
     #[test]

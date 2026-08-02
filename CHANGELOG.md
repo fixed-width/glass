@@ -191,6 +191,13 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- An Android accessibility read now keeps the deadline it promises. One `uiautomator dump` is three
+  adb calls, and each carried a timeout of its own, so a snapshot against a slow or wedged device
+  could run about 50 seconds — well past the `glass_wait_for_element` that asked for it, which
+  re-reads the tree on every tick of its own timeout. The three calls now share one snapshot's
+  20-second deadline, and the wait between retries on a device that cannot serve a dump yet counts
+  inside the retry budget instead of extending it. A read that runs out of that time is reported as
+  the timeout it is, rather than as a `uiautomator dump` that wrote no tree.
 - On macOS, `glass_start` now reports a window's settled geometry rather than a frame of its
   opening animation. It used to return whatever geometry it read the instant it found the newly
   launched window; measured across cold launches, that geometry disagreed with the window's
