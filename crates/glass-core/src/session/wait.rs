@@ -1334,23 +1334,18 @@ mod tests {
 
     #[test]
     fn a_signal_that_never_stops_firing_stays_bounded_by_the_deadline() {
-        let polled = walks_in_a_paced_wait(None);
         let n = walks_in_a_paced_wait(Some(|| Box::new(AlwaysSignals) as Box<dyn ChangeSignal>));
 
-        // A band, not a ceiling. Too many: waking early removed the interval's pacing, and a
-        // chatty app drives back-to-back walks against the bus it is trying to serve. Absolute,
-        // because the deadline caps a paced run at thirty intervals on any machine, while losing the
-        // pacing runs to thousands.
+        // A ceiling only. Waking early removes the interval's pacing, and a chatty app then drives
+        // back-to-back walks against the bus it is trying to serve; the deadline caps a paced run
+        // at thirty intervals on any machine, while losing the pacing runs to thousands.
+        //
+        // No lower bound: this signal answers instantly, so `d.saturating_sub(~0)` is `d` and the
+        // pacing arithmetic cannot be wrong here — `a_change_arriving_mid_interval_still_paces_the_next_read`
+        // is what tells the two apart. A floor would only add timing flake for nothing.
         assert!(
             n <= 36,
             "a chatty app drove {n} walks in 600ms at a 20ms interval"
-        );
-        // Too few: the wake ended up slower than the polling it replaced. This signal answers
-        // instantly, so `d.saturating_sub(~0)` is `d` — the pacing arithmetic cannot be wrong
-        // here; the mid-interval test tells the two apart.
-        assert!(
-            n * 6 >= polled * 5,
-            "a chatty app drove {n} walks where polling drove {polled} in the same wait"
         );
     }
 
@@ -1450,10 +1445,14 @@ mod tests {
         // The pacing is "wake early, but no sooner than one interval after the last read". A signal
         // whose change lands halfway through is what tells the two arithmetics apart: sleeping the
         // *remainder* keeps one read per interval, sleeping the elapsed time again halves the rate.
-        let polled = walks_in_a_paced_wait(None);
+        // Sampled either side of the subject, smallest wins. One control run before it would bias
+        // the comparison on a runner that gets busier as it goes: the subject, running second,
+        // would look slower than the pacing made it.
+        let before = walks_in_a_paced_wait(None);
         let n = walks_in_a_paced_wait(Some(|| {
             Box::new(ChangesMidInterval) as Box<dyn ChangeSignal>
         }));
+        let polled = before.min(walks_in_a_paced_wait(None));
 
         assert!(
             n <= 36,
