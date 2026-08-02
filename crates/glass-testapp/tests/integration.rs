@@ -2001,6 +2001,10 @@ fn geometry_settle_measurement() {
     const RUNS: usize = 20;
     let mut disagreed = 0usize;
     let xvfb = Xvfb::start();
+    // Xvfb resets (and briefly refuses new connections) when its last client disconnects; kept
+    // alive for the whole measurement so the per-run connect/drop below never takes the display
+    // to zero clients and races that reset.
+    let _keepalive = X11Platform::connect(Some(&xvfb.display)).expect("keepalive connect");
     for run in 1..=RUNS {
         // One `Xvfb` for the whole measurement, a fresh platform + launch per run — the fixture is
         // a plain executable, so every iteration is a genuine cold launch.
