@@ -29,10 +29,11 @@ tokio-stream.workspace = true
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
-# Deliberately not target-gated: `[target.'cfg(...)'.build-dependencies]` is evaluated
-# against the host, not the compile target, so a `cfg(unix)` table here would not drop
-# these when cross-compiling to Windows from a unix host (confirmed by testing it).
-# build.rs skips codegen off-unix via `CARGO_CFG_UNIX` instead.
+# Deliberately not target-gated: build.rs references these crates unconditionally, so
+# they must resolve on every host, Windows included — gating this table would break a
+# native Windows build (`[target.'cfg(...)'.build-dependencies]` is host-keyed, so on a
+# Windows host a `cfg(unix)` table here would drop them there too). build.rs skips the
+# codegen itself off-unix via `CARGO_CFG_UNIX` instead.
 [build-dependencies]
 tonic-prost-build.workspace = true
 protox.workspace = true
