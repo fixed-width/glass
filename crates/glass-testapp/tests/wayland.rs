@@ -1,7 +1,7 @@
-#![cfg(target_os = "linux")]
 //! End-to-end Wayland-backend tests. `#[ignore]`d; run via
 //! `scripts/test-wayland.sh` (which skips if no glass-discoverable sway >=1.12).
 
+#![cfg(target_os = "linux")]
 // Two tests set `PATH` on the process to force a launch failure that has no other seam.
 // `env::set_var` is `unsafe` from edition 2024 on (it races concurrent env readers);
 // `scripts/test-wayland.sh` runs this suite with `--test-threads=1`, so there are none.

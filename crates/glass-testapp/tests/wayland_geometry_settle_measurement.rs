@@ -1,4 +1,3 @@
-#![cfg(target_os = "linux")]
 //! MEASUREMENT, not an assertion: how often does Wayland's `start_app` return a geometry that
 //! disagrees with a geometry re-read immediately afterwards? Whether Wayland races the launch
 //! geometry the way the macOS backend does (#263) decides whether the settle belongs here too
@@ -7,6 +6,8 @@
 //! Its own test target — not `tests/wayland.rs`, which `scripts/test-wayland.sh` runs on every
 //! CI job — so this measurement's 20 extra cold launches + sway spawns per run don't ride along
 //! with output CI discards. Run via `scripts/wayland-geometry-settle-measurement.sh`.
+
+#![cfg(target_os = "linux")]
 
 use glass_core::{AppSpec, Platform, WindowOp};
 use glass_wayland::WaylandPlatform;

@@ -1,8 +1,8 @@
-#![cfg(target_os = "linux")]
 //! End-to-end: measure the cost of glass's verification loop by driving one fixed task two
 //! ways against glass-fixture-egui over the real MCP path. `#[ignore]`d; run via
 //! `./scripts/verification-cost.sh`. See docs/how-to/verification-cost.md.
 
+#![cfg(target_os = "linux")]
 // One `unsafe { env::set_var }` for pre-spawn GLASS_DISPLAY setup (see SAFETY note),
 // same opt-out as ignore_regions_e2e.rs / network.rs.
 #![allow(unsafe_code)]

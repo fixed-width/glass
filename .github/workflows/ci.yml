@@ -177,11 +177,18 @@ jobs:
       - run: cargo build  --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: ./scripts/test-macos.sh
-      # Compile/link gate for the harness=false `a11y` on-box integration test
-      # (crates/glass-macos/tests/a11y.rs) and its Swift fixture — proves both build against
-      # this runner's SDK without attempting the granted run (needs the Accessibility/Screen
-      # Recording TCC grants and a WindowServer session the runner doesn't have; that
-      # happens out-of-band — see the script's own comments and docs/how-to/build-from-source.md).
+      # glass-mcp, glass-a11y-macos and glass-sandbox-macos carry cfg(target_os = "macos")
+      # unit tests (e.g. glass-a11y-macos::reader's set_value_took, glass-mcp::doctor's
+      # backend-resolution tests). None of their test targets is harness = false (unlike
+      # glass-macos above), so `cargo test -p` on them runs ungranted exactly as it did
+      # before #293 — this is still the only job that compiles and runs that code at all.
+      - run: cargo test -p glass-mcp -p glass-a11y-macos -p glass-sandbox-macos --locked
+      # Builds the Swift fixture (crates/glass-macos/fixture/a11y_fixture.swift) — the one
+      # thing `cargo build --workspace --all-targets` above doesn't reach — and re-links the
+      # harness=false `a11y` integration test (crates/glass-macos/tests/a11y.rs) as a belt-
+      # and-braces check, without attempting the granted run (needs the Accessibility/Screen
+      # Recording TCC grants and a WindowServer session the runner doesn't have; that happens
+      # out-of-band — see the script's own comments and docs/how-to/build-from-source.md).
       - run: ./scripts/test-macos-a11y.sh
       - name: glass-mcp doctor sees the macos backend (TCC grants are absent on the runner)
         # `doctor` exits non-zero without the Screen Recording/Accessibility grants, which
@@ -211,7 +218,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # --workspace can't be used: glass-wayland/glass-testapp are Unix-only. Scope to
+      # --workspace can't be used: glass-ios is Unix-only (unconditional std::os::unix /
+      # Permissions::from_mode use) and ungated, unlike the Linux backends (#293). Scope to
       # the Windows crate closure with an explicit -p list (a future Unix-only crate
       # won't get silently pulled, unlike --exclude). --all-targets compiles the
       # glass-windows examples natively.

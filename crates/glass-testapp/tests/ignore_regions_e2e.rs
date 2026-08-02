@@ -1,10 +1,10 @@
-#![cfg(target_os = "linux")]
 //! End-to-end: drive glass-mcp over HTTP (the real MCP tool schema, not glass-core's library
 //! API — see `common::mcp_ignore` for why) against a `--blink`ing glass-testapp under Xvfb, to
 //! prove `ignore` regions work through the whole stack: parameter parsing, coordinate mapping,
 //! and the settle/diff logic together. `#[ignore]`d; run via
 //! `./scripts/test-x11.sh blink_region_settles_with_ignore_and_masks_diff`.
 
+#![cfg(target_os = "linux")]
 // This test needs one `unsafe { env::set_var }` for pre-spawn setup (see the `// SAFETY:` note
 // below), so it opts out of the workspace `unsafe_code = "deny"` — same as network.rs.
 #![allow(unsafe_code)]

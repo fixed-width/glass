@@ -1,4 +1,3 @@
-#![cfg(target_os = "linux")]
 //! MEASUREMENT, not an assertion: how often does X11's `start_app` return a geometry that
 //! disagrees with a geometry re-read immediately afterwards? Whether X11 races the launch
 //! geometry the way the macOS backend does (#263) decides whether the settle belongs here too
@@ -7,6 +6,8 @@
 //! Its own test target — not `tests/integration.rs`, which `scripts/test-x11.sh` runs on every
 //! CI job — so this measurement's 20 extra cold launches per run don't ride along with output CI
 //! discards. Run via `scripts/x11-geometry-settle-measurement.sh`.
+
+#![cfg(target_os = "linux")]
 
 mod common;
 
