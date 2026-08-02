@@ -308,10 +308,18 @@ fn gather_session() -> SessionKind {
 }
 
 /// Whether Windows.Graphics.Capture is usable on this system (the real capability gate).
+///
+/// Probed once per process. `IsSupported` activates a WinRT runtime class on the calling thread,
+/// and activating it concurrently from several threads faults with `STATUS_ACCESS_VIOLATION` —
+/// `cargo test --workspace` on Windows crashed the `glass-mcp` test binary about half the time,
+/// libtest giving each test its own thread. The answer is a fixed property of the machine, so
+/// caching is also the honest shape: nothing here can change while the process runs.
 #[cfg(windows)]
 fn gather_wgc() -> bool {
+    use std::sync::OnceLock;
     use windows::Graphics::Capture::GraphicsCaptureSession;
-    GraphicsCaptureSession::IsSupported().unwrap_or(false)
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| GraphicsCaptureSession::IsSupported().unwrap_or(false))
 }
 
 /// Port of the validated PMv2 probe: classify the thread's DPI-awareness context.
