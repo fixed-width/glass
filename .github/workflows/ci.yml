@@ -155,10 +155,10 @@ jobs:
   macos:
     name: macOS (build · clippy · test)
     runs-on: macos-14   # arm64 hosted runner
-    # This is the only place cfg(target_os = "macos") code gets built + linted — the Linux
-    # job can't compile it. Capture/input integration tests are #[ignore]d (need a granted,
-    # WindowServer-connected TCC context) and run on-box; the runner covers pure +
-    # macOS unit tests.
+    # This is the only place cfg(target_os = "macos") code gets built + linted + tested — the
+    # Linux job can't compile it. The capture/input/windows/a11y/bundle_launch integration
+    # targets are harness = false and hard-fail without a granted, WindowServer-connected TCC
+    # context, so they run on-box only; the runner covers pure macOS unit tests.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain + components from
@@ -170,10 +170,11 @@ jobs:
           workspaces: .
       # The Linux-only crates gate themselves off macOS (#293), so --workspace resolves
       # here now: a workspace-wide build + lint gate, with the gated crates compiling to
-      # nothing. No `cargo test --workspace` here — glass-macos's `harness = false`
-      # integration targets (capture, input, windows, a11y, bundle_launch) hard-fail
-      # without the TCC grants this runner doesn't have; ./scripts/test-macos.sh below
-      # runs `--lib` instead.
+      # nothing. No `cargo test --workspace` here — five of glass-macos's seven
+      # `harness = false` integration targets (capture, input, windows, a11y, bundle_launch)
+      # hard-fail without the TCC grants this runner doesn't have (the other two, role_probe
+      # and window_adopt_probe, exit 0 unconfigured); ./scripts/test-macos.sh below runs
+      # `--lib` instead.
       - run: cargo build  --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: ./scripts/test-macos.sh
