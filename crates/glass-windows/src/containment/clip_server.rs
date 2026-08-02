@@ -3,7 +3,7 @@
 //! One server per contained app: a thread runs an accept loop on `\\.\pipe\glass-clip-<box>`
 //! with a security descriptor scoped to the current user (the box runs at user integrity under
 //! `KeepTokenIntegrity=y`). Each connection carries one length-prefixed [`proto`] request, which
-//! we [`PrivateClipboard::apply`] and answer. The boxed `glass_clip_hook` DLL is the client.
+//! we [`PrivateClipboard::apply`] and answer. The boxed `glass_clip_shim_windows` DLL is the client.
 //! Sandboxie's `OpenPipePath` lets the box reach this host pipe (always applied).
 
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glass_clip_hook::proto::{self, Request, Response};
-use glass_clip_hook::store::PrivateClipboard;
+use glass_clip_shim_windows::proto::{self, Request, Response};
+use glass_clip_shim_windows::store::PrivateClipboard;
 use glass_core::{GlassError, Result};
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};

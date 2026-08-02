@@ -160,10 +160,17 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
         secret: false,
     },
     EnvVarDoc {
+        name: "GLASS_CLIP_SHIM_DLL",
+        scope: EnvScope::Windows,
+        purpose: "Path to the private-clipboard shim DLL (glass_clip_shim_windows.dll) injected into a Sandboxie-boxed app",
+        default: "next to glass-mcp, else Layer-2 (DLL) clipboard isolation is unavailable",
+        secret: false,
+    },
+    EnvVarDoc {
         name: "GLASS_CLIP_HOOK_DLL",
         scope: EnvScope::Windows,
-        purpose: "Path to the private-clipboard hook DLL (glass_clip_hook.dll) injected into a Sandboxie-boxed app",
-        default: "next to glass-mcp, else Layer-2 (DLL) clipboard isolation is unavailable",
+        purpose: "Deprecated spelling of GLASS_CLIP_SHIM_DLL, still honoured; set the latter instead",
+        default: "unset — used only when GLASS_CLIP_SHIM_DLL is unset",
         secret: false,
     },
     EnvVarDoc {
@@ -344,7 +351,7 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // operator-facing override.
     "GLASS_CLIP_PASTEBOARD",
     // Clipboard-hook pipe name: glass sets this in the generated Sandboxie launch.cmd
-    // (glass-windows) for glass-clip-hook's injected DLL to read; not an operator override.
+    // (glass-windows) for glass-clip-shim-windows's injected DLL to read; not an operator override.
     "GLASS_CLIP_PIPE",
     // Forces a test-only AX-geometry fallback path (glass-macos/src/axwindow.rs); read only to
     // exercise that path in an integration test, not a supported way to configure glass.
@@ -519,6 +526,7 @@ mod tests {
             "GLASS_ATSPI_LAUNCHER",
             "GLASS_WIN_SANDBOX_PROVIDER",
             "GLASS_SANDBOXIE_DIR",
+            "GLASS_CLIP_SHIM_DLL",
             "GLASS_CLIP_HOOK_DLL",
             "GLASS_TYPE_DWELL_MS",
             "GLASS_ADB",
@@ -600,7 +608,9 @@ mod tests {
         assert!(idx("GLASS_CLIP_SHIM_DYLIB") < idx("GLASS_TOKEN"));
         // adjacency within the windows group
         assert!(idx("GLASS_WIN_SANDBOX_PROVIDER") < idx("GLASS_SANDBOXIE_DIR"));
-        assert!(idx("GLASS_SANDBOXIE_DIR") < idx("GLASS_CLIP_HOOK_DLL"));
+        assert!(idx("GLASS_SANDBOXIE_DIR") < idx("GLASS_CLIP_SHIM_DLL"));
+        // the deprecated spelling is listed, and directly after the one that supersedes it
+        assert!(idx("GLASS_CLIP_SHIM_DLL") < idx("Deprecated spelling of GLASS_CLIP_SHIM_DLL"));
     }
 
     #[test]

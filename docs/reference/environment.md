@@ -35,7 +35,8 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
-| `GLASS_CLIP_HOOK_DLL` | Private-clipboard hook DLL (`glass_clip_hook.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
+| `GLASS_CLIP_SHIM_DLL` | Private-clipboard shim DLL (`glass_clip_shim_windows.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
+| `GLASS_CLIP_HOOK_DLL` | Deprecated spelling of `GLASS_CLIP_SHIM_DLL`, still honoured; set the latter instead | unset — used only when `GLASS_CLIP_SHIM_DLL` is unset | Windows |
 
 `default` and `strict` are fail-closed; the levels and per-OS mechanisms are explained in
 [explanation/containment.md](../explanation/containment.md).

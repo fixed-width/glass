@@ -13,7 +13,7 @@ bench = false
 
 [dependencies]
 glass-core.workspace = true
-glass-clip-hook = { path = "../glass-clip-hook" }
+glass-clip-shim-windows = { path = "../glass-clip-shim-windows" }
 # The desktop-a11y capability signal (UI Automation creatable) reuses the a11y reader's own
 # `probe_uia`. Cross-platform dep: the crate's Windows-only bits are cfg(windows)-gated, so it
 # compiles on the Linux host where `capabilities()` is unit-tested.

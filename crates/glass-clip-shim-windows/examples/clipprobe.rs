@@ -8,14 +8,14 @@
 //! hook intercepts them and serves the private store — so a correct `READBACK` proves interception.
 //! Deliberately uses the raw user32 path (not OLE / .NET `Clipboard`), which is exactly what the
 //! v1 hook detours. Windows-only; a no-op elsewhere so non-Windows builds stay green.
-//!   cargo build -p glass-clip-hook --release --example clipprobe
+//!   cargo build -p glass-clip-shim-windows --release --example clipprobe
 
 // On-box FFI probe: opts out of the workspace `unsafe_code = "deny"` (each `unsafe` site is
 // `// SAFETY:`-documented).
 #![allow(unsafe_code)]
 
 #[cfg(windows)]
-use glass_clip_hook::{HGlobalLock, OwnedHGlobal};
+use glass_clip_shim_windows::{HGlobalLock, OwnedHGlobal};
 
 #[cfg(windows)]
 fn main() {

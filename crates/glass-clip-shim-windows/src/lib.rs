@@ -1,10 +1,14 @@
-//! glass private-clipboard shim.
+//! glass private-clipboard shim for Windows — the Sandboxie counterpart to
+//! `glass-clip-shim-macos`, which does the same job by swizzling `NSPasteboard`.
 //!
-//! Two faces: (1) an injected **DLL** (`cdylib`) loaded into the Sandboxie-boxed app via
-//! `InjectDll64=`, which detours the user32 clipboard APIs and proxies them to a host store
-//! over a named pipe; (2) a pure **library** (`rlib`) exposing the wire [`proto`]col and the
-//! host-side [`store`], reused by `glass-windows`. Only [`hook`] is Win32 — the rest is pure
-//! and unit-tested on any host.
+//! Two faces, unlike the macOS shim: (1) an injected **DLL** (`cdylib`) loaded into the
+//! Sandboxie-boxed app via `InjectDll64=`, which detours the user32 clipboard APIs and proxies
+//! them to a host store over a named pipe; (2) a pure **library** (`rlib`) exposing the wire
+//! [`proto`]col and the host-side [`store`], reused by `glass-windows`. The macOS shim needs no
+//! rlib face because its host-side routing lives in `glass-macos::clipboard_route`; here the
+//! protocol is shared with the host, so it stays with the code that defines it.
+//!
+//! Only [`hook`] is Win32 — the rest is pure and unit-tested on any host.
 
 // FFI backend: the Win32 hook needs `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure

@@ -149,16 +149,50 @@ pub(crate) fn clip_pipe_name(box_name: &str) -> String {
     format!("glass-clip-{box_name}")
 }
 
-/// Resolve the injected hook DLL.
+/// The injected shim DLL's filename, and the name it shipped under before the crate was renamed
+/// from `glass-clip-hook`. An installed glass predating the rename has the old file next to the
+/// binary, so resolution accepts it.
+pub(crate) const SHIM_DLL: &str = "glass_clip_shim_windows.dll";
+pub(crate) const LEGACY_SHIM_DLL: &str = "glass_clip_hook.dll";
+
+/// The env var naming the shim DLL, and its pre-rename spelling.
+pub(crate) const SHIM_DLL_ENV: &str = "GLASS_CLIP_SHIM_DLL";
+pub(crate) const LEGACY_SHIM_DLL_ENV: &str = "GLASS_CLIP_HOOK_DLL";
+
+/// The shim-DLL path from the environment: [`SHIM_DLL_ENV`], else the deprecated
+/// [`LEGACY_SHIM_DLL_ENV`]. An empty value is ignored so `set GLASS_CLIP_SHIM_DLL=` doesn't
+/// resolve to `""` and mask the legacy var.
+pub(crate) fn shim_dll_env(get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    get(SHIM_DLL_ENV)
+        .filter(|s| !s.is_empty())
+        .or_else(|| get(LEGACY_SHIM_DLL_ENV).filter(|s| !s.is_empty()))
+}
+
+/// Resolve the injected shim DLL.
 ///
-/// Precedence: explicit (`GLASS_CLIP_HOOK_DLL`) > `<exe_dir>/glass_clip_hook.dll` > `None`
-/// (Layer-2 unavailable — Layer-1-only). Mirrors `sandboxie_dir`'s precedence, but returns
-/// `Option`: a missing DLL must NOT fail the launch (clipboard isn't core to running the app).
-pub(crate) fn hook_dll_path(explicit: Option<&str>, exe_dir: Option<&str>) -> Option<String> {
+/// Precedence: explicit (env) > `<exe_dir>/glass_clip_shim_windows.dll` > the legacy
+/// `<exe_dir>/glass_clip_hook.dll` > the current name again. Mirrors `sandboxie_dir`'s
+/// precedence, but returns `Option`: a missing DLL must NOT fail the launch (clipboard isn't core
+/// to running the app). When neither file is present it reports the CURRENT name, so the
+/// "not found" the user reads names the file they should install.
+pub(crate) fn shim_dll_path(
+    explicit: Option<&str>,
+    exe_dir: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
     if let Some(e) = explicit {
         return Some(e.to_string());
     }
-    exe_dir.map(|d| format!("{d}/glass_clip_hook.dll"))
+    let dir = exe_dir?;
+    let current = format!("{dir}/{SHIM_DLL}");
+    if exists(Path::new(&current)) {
+        return Some(current);
+    }
+    let legacy = format!("{dir}/{LEGACY_SHIM_DLL}");
+    if exists(Path::new(&legacy)) {
+        return Some(legacy);
+    }
+    Some(current)
 }
 
 /// The Layer-2 SbieIni `(key,value)` lines: inject the hook DLL into every boxed process and let
@@ -395,25 +429,83 @@ mod tests {
     }
 
     #[test]
-    fn hook_dll_path_precedence() {
+    fn shim_dll_path_precedence() {
         // explicit env wins; else beside the exe; else None (Layer-2 unavailable).
+        let none = |_: &Path| false;
         assert_eq!(
-            hook_dll_path(Some("X.dll"), Some("/exe/dir")),
+            shim_dll_path(Some("X.dll"), Some("/exe/dir"), &none),
             Some("X.dll".to_string())
         );
+        let all = |_: &Path| true;
         assert_eq!(
-            hook_dll_path(None, Some("/exe/dir")),
-            Some("/exe/dir/glass_clip_hook.dll".to_string())
+            shim_dll_path(None, Some("/exe/dir"), &all),
+            Some("/exe/dir/glass_clip_shim_windows.dll".to_string())
         );
-        assert_eq!(hook_dll_path(None, None), None);
+        assert_eq!(shim_dll_path(None, None, &all), None);
+    }
+
+    /// An install predating the `glass-clip-hook` rename has only the old DLL beside the binary;
+    /// resolution must find it rather than reporting the new name as missing.
+    #[test]
+    fn shim_dll_path_falls_back_to_the_legacy_dll_name() {
+        let only_legacy = |p: &Path| p.to_string_lossy().ends_with(LEGACY_SHIM_DLL);
+        assert_eq!(
+            shim_dll_path(None, Some("/exe/dir"), &only_legacy),
+            Some(format!("/exe/dir/{LEGACY_SHIM_DLL}"))
+        );
+    }
+
+    /// With both present the current name wins, so a stale DLL left behind by an upgrade never
+    /// shadows the one that shipped with this build.
+    #[test]
+    fn shim_dll_path_prefers_the_current_name_over_the_legacy_one() {
+        let both = |_: &Path| true;
+        assert_eq!(
+            shim_dll_path(None, Some("/exe/dir"), &both),
+            Some(format!("/exe/dir/{SHIM_DLL}"))
+        );
+    }
+
+    /// Neither present: report the CURRENT name, so the error the user reads names the file to
+    /// install rather than the retired one.
+    #[test]
+    fn shim_dll_path_reports_the_current_name_when_neither_exists() {
+        let none = |_: &Path| false;
+        assert_eq!(
+            shim_dll_path(None, Some("/exe/dir"), &none),
+            Some(format!("/exe/dir/{SHIM_DLL}"))
+        );
+    }
+
+    #[test]
+    fn shim_dll_env_prefers_current_var_then_falls_back() {
+        let both = |k: &str| match k {
+            SHIM_DLL_ENV => Some("new.dll".to_string()),
+            LEGACY_SHIM_DLL_ENV => Some("old.dll".to_string()),
+            _ => None,
+        };
+        assert_eq!(shim_dll_env(&both), Some("new.dll".to_string()));
+
+        let legacy_only = |k: &str| (k == LEGACY_SHIM_DLL_ENV).then(|| "old.dll".to_string());
+        assert_eq!(shim_dll_env(&legacy_only), Some("old.dll".to_string()));
+
+        // An empty current var must not mask the legacy one.
+        let empty_current = |k: &str| match k {
+            SHIM_DLL_ENV => Some(String::new()),
+            LEGACY_SHIM_DLL_ENV => Some("old.dll".to_string()),
+            _ => None,
+        };
+        assert_eq!(shim_dll_env(&empty_current), Some("old.dll".to_string()));
+
+        assert_eq!(shim_dll_env(&|_| None), None);
     }
 
     #[test]
     fn layer2_box_lines_inject_and_open_pipe() {
-        let lines = clip_layer2_lines("glass_7", "C:\\g\\glass_clip_hook.dll");
+        let lines = clip_layer2_lines("glass_7", "C:\\g\\glass_clip_shim_windows.dll");
         assert!(lines.contains(&(
             "InjectDll64".to_string(),
-            "C:\\g\\glass_clip_hook.dll".to_string()
+            "C:\\g\\glass_clip_shim_windows.dll".to_string()
         )));
         assert!(lines.contains(&(
             "OpenPipePath".to_string(),

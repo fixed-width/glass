@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use glass_clip_hook::store::PrivateClipboard;
+use glass_clip_shim_windows::store::PrivateClipboard;
 use glass_core::logbuf::Stream;
 use glass_core::{AppSpec, GlassError, Result, SandboxLevel};
 
@@ -144,10 +144,8 @@ impl Sandboxie {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
-        let dll = config::hook_dll_path(
-            std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(),
-            exe_dir.as_deref(),
-        )?;
+        let env = config::shim_dll_env(&|k| std::env::var(k).ok());
+        let dll = config::shim_dll_path(env.as_deref(), exe_dir.as_deref(), &|p| p.exists())?;
         if !Path::new(&dll).exists() {
             crate::disclose_clip_disabled(&dll);
             return None;
