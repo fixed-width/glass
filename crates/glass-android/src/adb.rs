@@ -201,7 +201,7 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 #[cfg(test)]
 mod tests {
     use super::{Adb, AdbOp, build_argv, with_adb_hint};
-    use glass_core::GlassError;
+    use glass_core::{GlassError, TIMED_OUT};
     use std::time::Duration;
 
     /// Live proof that a wedged adb call ends instead of hanging. Ignored by default:
@@ -360,6 +360,12 @@ mod tests {
             "adb:shell",
         )
         .expect_err("must time out");
+        // A spawn failure is also an Err: it sails past `expect_err`, then fails the hint
+        // assertion below, blaming `with_adb_hint` for a missing binary.
+        assert!(
+            real_timeout.to_string().contains(TIMED_OUT),
+            "expected a timeout, got: {real_timeout}"
+        );
         let timeout = with_adb_hint(real_timeout);
         assert!(timeout.to_string().contains("adb kill-server"), "{timeout}");
         // Extending the message must not wrap one Backend in another: Display prints its prefix

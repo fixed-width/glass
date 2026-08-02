@@ -310,8 +310,10 @@ mod tests {
         let t = sdk_search_trail(&get);
         assert_eq!(&t[0], "ANDROID_SDK_ROOT");
         assert_eq!(&t[1], "ANDROID_HOME");
-        assert!(
-            t.iter().any(|s| s.contains("Android") && s.contains("Sdk")),
+        // The exact path, not a `contains` pair: `Android` and `Sdk` both appearing also holds
+        // for `…\Sdk\Android`.
+        assert_eq!(
+            &t[2], r"C:\Users\u\AppData\Local\Android\Sdk",
             "trail: {t:?}"
         );
     }
@@ -323,10 +325,7 @@ mod tests {
         let t = sdk_search_trail(&get);
         assert_eq!(&t[0], "ANDROID_SDK_ROOT");
         assert_eq!(&t[1], "ANDROID_HOME");
-        assert!(
-            t.iter().any(|s| s.contains("Library/Android")),
-            "trail: {t:?}"
-        );
+        assert_eq!(&t[2], "/home/u/Library/Android/sdk", "trail: {t:?}");
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -404,6 +403,18 @@ mod tests {
         assert_eq!(r.as_deref(), Some("/explicit/missing.jar"));
     }
 
+    /// Pins the leaf name directly: the other assertions build their expectation with
+    /// `adb_exe()`, so none can catch it returning the wrong name.
+    #[test]
+    fn adb_exe_carries_the_platform_suffix() {
+        #[cfg(windows)]
+        assert_eq!(adb_exe(), "adb.exe");
+        #[cfg(not(windows))]
+        assert_eq!(adb_exe(), "adb");
+    }
+
+    // One variant per OS: the Windows arm reads APPDATA/LOCALAPPDATA, vars no Linux run can
+    // exercise.
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn data_dirs_prefer_xdg_then_home() {
@@ -413,6 +424,32 @@ mod tests {
         assert_eq!(
             artifact_data_dirs(&get2)[0],
             PathBuf::from("/home/u/.local/share/glass")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn data_dirs_list_appdata_then_localappdata() {
+        let get = getter(&[
+            ("APPDATA", r"C:\Users\u\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\u\AppData\Local"),
+        ]);
+        let d = artifact_data_dirs(&get);
+        assert_eq!(d[0], PathBuf::from(r"C:\Users\u\AppData\Roaming\glass"));
+        assert_eq!(d[1], PathBuf::from(r"C:\Users\u\AppData\Local\glass"));
+
+        // HOME is not a Windows source — set alone it yields nothing, the silent no-op a
+        // HOME-only fixture passed through.
+        assert!(artifact_data_dirs(&getter(&[("HOME", r"C:\Users\u")])).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn data_dirs_use_application_support() {
+        let get = getter(&[("HOME", "/Users/u")]);
+        assert_eq!(
+            artifact_data_dirs(&get)[0],
+            PathBuf::from("/Users/u/Library/Application Support/glass")
         );
     }
 
@@ -435,14 +472,34 @@ mod tests {
         assert_eq!(r.source, SdkSource::Env("ANDROID_HOME"));
     }
 
-    // Default install locations are OS-specific (Linux paths here); gate so the
-    // cross-platform CI (incl. the Windows job) doesn't run this assertion.
+    // One variant per OS: the Windows arm keys off LOCALAPPDATA, so a HOME-only fixture finds
+    // nothing and passes while proving nothing.
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn discovers_default_location_with_no_env() {
         let get = getter(&[("HOME", "/home/u")]);
         let r = resolve_sdk_root(&get, &|p| p == Path::new("/home/u/android-sdk")).unwrap();
         assert_eq!(r.path, PathBuf::from("/home/u/android-sdk"));
+        assert_eq!(r.source, SdkSource::Default);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn discovers_default_location_with_no_env() {
+        let get = getter(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]);
+        let want = Path::new(r"C:\Users\u\AppData\Local\Android\Sdk");
+        let r = resolve_sdk_root(&get, &|p| p == want).unwrap();
+        assert_eq!(r.path, want.to_path_buf());
+        assert_eq!(r.source, SdkSource::Default);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn discovers_default_location_with_no_env() {
+        let get = getter(&[("HOME", "/Users/u")]);
+        let want = Path::new("/Users/u/Library/Android/sdk");
+        let r = resolve_sdk_root(&get, &|p| p == want).unwrap();
+        assert_eq!(r.path, want.to_path_buf());
         assert_eq!(r.source, SdkSource::Default);
     }
 
