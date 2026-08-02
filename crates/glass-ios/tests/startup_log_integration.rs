@@ -27,6 +27,8 @@
 //! so it exercises the race the fix closes. `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` select the
 //! Simulator the same way they do for `glass-mcp`; see `docs/how-to/setup-ios.md`.
 
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use glass_core::{AppSpec, Platform, SandboxLevel};

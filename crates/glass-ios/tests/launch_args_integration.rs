@@ -20,6 +20,8 @@
 //! A separate variable from `GLASS_IOS_APP` on purpose: the sibling integration tests drive
 //! `examples/ios-fixture/`, which has no launch-argument surface to check.
 
+#![cfg(unix)]
+
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTree, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};

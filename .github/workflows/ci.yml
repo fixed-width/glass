@@ -219,13 +219,16 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # --workspace can't be used: glass-ios is Unix-only (unconditional std::os::unix /
-      # Permissions::from_mode use) and ungated, unlike the Linux backends (#293). Scope to
-      # the Windows crate closure with an explicit -p list (a future Unix-only crate
-      # won't get silently pulled, unlike --exclude). --all-targets compiles the
-      # glass-windows examples natively.
-      - run: cargo build  -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked
-      - run: cargo clippy -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked -- -D warnings
+      # The Linux-only and unix-only crates gate themselves (#293), so --workspace
+      # resolves here for build/clippy. cargo test stays scoped for now — this same
+      # `-p` list is what hid 19 pre-existing Windows-path-semantics failures in
+      # glass-android, glass-sandbox-core and glass-sandbox-macos (POSIX-style
+      # absolute-path assertions that don't hold on Windows), tracked in #299.
+      # Every other crate's tests are platform-independent and already covered by
+      # the Linux job's `cargo test --workspace`; once #299 lands, drop this list
+      # and go --workspace here too.
+      - run: cargo build  --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test   -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --locked
 
   coverage:

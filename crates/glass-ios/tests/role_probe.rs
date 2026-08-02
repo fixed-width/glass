@@ -25,6 +25,8 @@
 //! With `GLASS_A11Y_PROBE_APPS` unset (or set but empty) it prints what to set and passes
 //! without probing, so a run that did not ask for this never fails because of it.
 
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader

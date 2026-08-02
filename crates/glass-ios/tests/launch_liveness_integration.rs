@@ -26,6 +26,8 @@
 //!   cargo test -p glass-ios --test launch_liveness_integration -- --ignored --test-threads=1
 //! ```
 
+#![cfg(unix)]
+
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 

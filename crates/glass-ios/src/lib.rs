@@ -1,11 +1,16 @@
 //! iOS Simulator backend for glass: drives native apps over `xcrun simctl`.
 //!
-//! macOS-only in practice (the tools are Apple's), but the code links nothing
-//! platform-specific — it shells out. The Simulator is the isolation boundary,
-//! so there is no sandbox machinery here. The backend drives input (tap, type,
-//! swipe, scroll) and reads the accessibility tree via `idb_companion`;
-//! multi-touch gestures are unsupported — `idb`'s raw-touch primitive is
-//! single-contact, with no general N-finger primitive to drive them.
+//! macOS-only in practice — `xcrun simctl` and `idb_companion` are both Apple
+//! tools, and the accessibility/input transport is a Unix-domain-socket gRPC
+//! client to `idb_companion`, so the crate is `cfg(unix)`-gated and compiles
+//! to nothing off unix. Gated to `unix` rather than macOS so the crate's pure
+//! logic still compiles and unit-tests on the free Linux runner.
+//! The Simulator is the isolation boundary, so there is no sandbox machinery
+//! here. The backend drives input (tap, type, swipe, scroll) and reads the
+//! accessibility tree via `idb_companion`; multi-touch gestures are
+//! unsupported — `idb`'s raw-touch primitive is single-contact, with no
+//! general N-finger primitive to drive them.
+#![cfg(unix)]
 #![forbid(unsafe_code)]
 
 mod a11y;

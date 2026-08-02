@@ -19,6 +19,8 @@
 //! / `GLASS_SIMULATOR_KEEP` (all optional) select and manage the Simulator the same way they do
 //! for `glass-mcp`; see `docs/how-to/setup-ios.md`.
 
+#![cfg(unix)]
+
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};
 

@@ -26,6 +26,8 @@
 //! `echoLabel` (mirrors the field's text, or `(empty)`) — see
 //! `examples/ios-fixture/README.md`.
 
+#![cfg(unix)]
+
 use std::time::Duration;
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
