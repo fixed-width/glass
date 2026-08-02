@@ -84,8 +84,10 @@ mod macos_main {
     /// `start_app` returns. macOS reports a window's geometry while it is still opening, so the
     /// value adoption captured can be a frame of that animation; sampling densely is how the shape
     /// of the animation becomes visible rather than inferred. 10ms is a floor, not a guarantee —
-    /// each sample is a real `SCShareableContent` round trip, so the printed offsets are what
-    /// actually happened.
+    /// each sample is a real round trip (`platform.window(&WindowOp::Geometry)`, an AX read — the
+    /// same reader #263's actual symptom was about, not the `SCShareableContent` path
+    /// `start_app`/`settle_window` themselves poll), so the printed offsets are what actually
+    /// happened.
     const EARLY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
     const EARLY_SAMPLE_WINDOW: Duration = Duration::from_millis(300);
 
@@ -140,9 +142,10 @@ mod macos_main {
     /// actual symptom), the pid `start_app` reported — needed to tell a cold launch from a
     /// re-adoption of an already-running process (see the module doc's caveat) — and how long
     /// `start_app` itself took: its total end-to-end wall clock (process launch through
-    /// LaunchServices, first-window creation, `MacosPlatform::new`'s AX/Screen-Recording
-    /// preflight, window discovery, and the settle), launch-dominated rather than the settle's
-    /// own increment — isolating that would need an A/B sweep against a build without it.
+    /// LaunchServices, first-window creation, window discovery, and the settle — `MacosPlatform`
+    /// is already constructed by the time this timer starts, so its own AX/Screen-Recording
+    /// preflight is not part of it), launch-dominated rather than the settle's own increment —
+    /// isolating that would need an A/B sweep against a build without it.
     struct RunOutcome {
         matched: bool,
         snapshot_ok: bool,
@@ -156,6 +159,11 @@ mod macos_main {
     ///
     /// Only distinct readings are printed: a settled window produces one line, and an animating
     /// one produces the shape of its animation instead of thirty identical rows.
+    ///
+    /// The final "MATCHES / DIFFERS from the adopted geometry" line compares an AX-sourced
+    /// reading against `adopted` (SCShareableContent-sourced) — a small, non-animation offset
+    /// between those two readers is possible (see `axwindow.rs`'s `FALLBACK_TOLERANCE_PX`), so a
+    /// `DIFFERS` here is corroborating evidence, not on its own proof that the window kept moving.
     fn print_early_samples(platform: &mut MacosPlatform, adopted: &WindowGeometry) {
         let started = Instant::now();
         let mut last: Option<WindowGeometry> = None;

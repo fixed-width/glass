@@ -2,10 +2,10 @@
 //! rendered onto a `CGVirtualDisplay`).
 //!
 //! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`],
-//! [`shim_path`], [`bundle`], [`adoption_log`]) is crate-level and unit-tested on any host; the
-//! OS-touching modules and the `MacosPlatform` impl are gated `#[cfg(target_os = "macos")]`. Off
-//! macOS the crate exposes only the pure modules and the [`capabilities`] map (whose
-//! `accessibility` cell is live; every other cell is constant).
+//! [`shim_path`], [`bundle`], [`adoption_log`], [`settle`]) is crate-level and unit-tested on
+//! any host; the OS-touching modules and the `MacosPlatform` impl are gated
+//! `#[cfg(target_os = "macos")]`. Off macOS the crate exposes only the pure modules and the
+//! [`capabilities`] map (whose `accessibility` cell is live; every other cell is constant).
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
 // `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure

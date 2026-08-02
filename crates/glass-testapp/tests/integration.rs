@@ -1996,7 +1996,7 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
 /// same way decides whether the settle belongs in this backend too or stays macOS-local. Asserts
 /// only that the launches succeeded; the rate is for a human to read.
 #[test]
-#[ignore = "measurement; run via scripts/test-x11.sh geometry_settle_measurement"]
+#[ignore = "measurement; run via scripts/test-x11.sh geometry_settle_measurement --nocapture"]
 fn geometry_settle_measurement() {
     const RUNS: usize = 20;
     let mut disagreed = 0usize;

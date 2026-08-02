@@ -50,11 +50,13 @@ const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// moving at all (a clock, a video player, an animating splash).
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SETTLE_BUDGET: Duration = Duration::from_millis(500);
-/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`]: a settle poll
-/// that cannot find the window ends the settle attempt outright rather than retrying (see
-/// [`crate::settle::settle_by_polling`]'s `ReadFailed` handling), so this only bounds how long
-/// that one lookup burns before giving up — not the whole `SETTLE_BUDGET`, which it is
-/// deliberately kept far below.
+/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`] (a tenth of it):
+/// a settle poll that cannot find the window ends the settle attempt outright rather than
+/// retrying (see [`crate::settle::settle_by_polling`]'s `ReadFailed` handling), so this only
+/// bounds how long that one lookup burns before giving up. `settle_by_polling` checks its
+/// deadline only between reads, never mid-read, so `SETTLE_BUDGET` is a soft cap: a resolve
+/// that runs close to this full timeout right before the deadline can push actual elapsed time
+/// past `SETTLE_BUDGET` by nearly as much.
 const SETTLE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
@@ -278,12 +280,12 @@ impl MacosPlatform {
     ///
     /// Adoption reads the window's geometry the moment it finds it, which on macOS is routinely
     /// mid-open-animation — 11 of 12 cold launches measured on 2026-08-01 returned a geometry a few
-    /// pixels off the settled one, and the window `start_app` reports is what
+    /// pixels off the settled one, and the geometry `start_app` reports for it is what
     /// `Glass::start_on_inner` hands the caller and caches as the session's geometry.
     ///
     /// Thin glue over [`settle_by_polling`]: this only builds the per-poll re-resolution closure
-    /// (fixed to `adopted`'s `window_id`/`pid`, since a re-resolved match always carries the same
-    /// two — `find_window_by_id` is what pins them) and turns its [`SettleOutcome`] into the
+    /// (fixed to `window_id` and `pid`, since a re-resolved match always carries the same two —
+    /// `find_window_by_id` is what pins them) and turns its [`SettleOutcome`] into the
     /// stderr disclosure. Never fails the launch: a window that never stops changing (a clock, a
     /// video player, an animating splash) would otherwise become unlaunchable, so a budget expiry
     /// reports the freshest reading rather than an error, and likewise a resolve that fails
@@ -329,9 +331,13 @@ impl MacosPlatform {
         match outcome {
             SettleOutcome::Settled => {}
             SettleOutcome::ReadFailed(e) => eprintln!(
-                "glass-macos: window {} stopped resolving while settling ({e}); reporting the \
-                 last geometry read",
-                freshest.window_id
+                "glass-macos: window {} stopped resolving while settling ({e}); reporting {}x{} \
+                 @({},{}), the last geometry read",
+                freshest.window_id,
+                freshest.geometry.width,
+                freshest.geometry.height,
+                freshest.geometry.x,
+                freshest.geometry.y
             ),
             SettleOutcome::BudgetExpired => eprintln!(
                 "glass-macos: window {} did not settle within {}ms; reporting {}x{} @({},{}), \

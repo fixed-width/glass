@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! When a value read repeatedly has stopped changing.
 //!
 //! macOS reports a window's geometry while the window is still opening, so the reading taken at
@@ -8,11 +7,13 @@
 //! one reading. Kept generic and out of the `#[cfg(target_os = "macos")]` modules so the rule is
 //! unit-tested on any host, and so `glass-core` could adopt it if the other backends turn out to
 //! race the same way.
+#![forbid(unsafe_code)]
 
 use std::time::{Duration, Instant};
 
 /// What one more reading tells the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
 pub enum SettleStep<T> {
     /// This reading matched the one before it. Stop polling; this is the value.
     Settled(T),
@@ -27,9 +28,17 @@ pub enum SettleStep<T> {
 /// not the likely one. On the macOS backend that motivated this (#263), it was the minority
 /// outcome: 1 of 12 measured cold launches were already stable at adoption; the other 11 needed
 /// further polling before settling.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SettleTracker<T> {
     previous: Option<T>,
+}
+
+// Hand-written rather than `#[derive(Default)]`: the derive adds a `T: Default` bound to the
+// impl even though `Option<T>` needs none — `previous` defaults to `None` for any `T`.
+impl<T> Default for SettleTracker<T> {
+    fn default() -> Self {
+        Self { previous: None }
+    }
 }
 
 impl<T: Clone + PartialEq> SettleTracker<T> {
@@ -39,11 +48,15 @@ impl<T: Clone + PartialEq> SettleTracker<T> {
 
     /// Record `reading` and report whether it settles the sequence.
     pub fn observe(&mut self, reading: T) -> SettleStep<T> {
-        let settled = self.previous.as_ref() == Some(&reading);
-        self.previous = Some(reading.clone());
-        if settled {
-            SettleStep::Settled(reading)
+        // The clone only happens on the `Settled` path, where the caller needs `reading` back
+        // by value *and* `self.previous` needs to keep its own copy; `Continue` carries no
+        // payload, so that path moves `reading` straight into `self.previous` instead.
+        if self.previous.as_ref() == Some(&reading) {
+            let settled = reading.clone();
+            self.previous = Some(reading);
+            SettleStep::Settled(settled)
         } else {
+            self.previous = Some(reading);
             SettleStep::Continue
         }
     }
@@ -51,6 +64,7 @@ impl<T: Clone + PartialEq> SettleTracker<T> {
 
 /// How a [`settle_by_polling`] call ended.
 #[derive(Debug, PartialEq)]
+#[must_use]
 pub enum SettleOutcome<E> {
     /// Two consecutive readings agreed before `budget` elapsed.
     Settled,
@@ -64,11 +78,20 @@ pub enum SettleOutcome<E> {
 /// readings agree or `budget` elapses. Returns the freshest reading obtained — `seed` itself if
 /// `read` never succeeded — paired with how the poll ended.
 ///
-/// `interval` throttles `read`: a value that never settles is called roughly `budget / interval`
-/// times, so `Duration::ZERO` (or another interval far below `read`'s own cost) busy-spins for
-/// the whole budget rather than pacing the polls — fine for a test with a cheap, instant `read`,
-/// but not the shape a real caller wants. The one production caller today (macOS's
-/// `settle_window`, #263) uses 25ms.
+/// `interval` throttles `read`: a value that never settles is called roughly
+/// `budget / (interval + read's own cost)` times — `interval` alone only bounds the count when
+/// `read` is cheap relative to it, which is true of the tests below (an instant closure) but not
+/// of a real `read` that does I/O. `Duration::ZERO` busy-spins between calls rather than pacing
+/// them — fine for a test with a cheap, instant `read`, but not the shape a real caller wants.
+/// The one production caller today (macOS's `settle_window`, #263) uses 25ms, well under its
+/// own `read`'s cost (a live query), so pacing there comes mostly from the query itself.
+///
+/// `T`'s `PartialEq` decides settlement on the *whole* value — pick a `T` that carries only the
+/// fields that should hold the loop open while they change. A `T` with an extra field that never
+/// repeats (an unrounded coordinate a rounded one was derived from, say) never settles, even once
+/// the fields that actually matter have stopped moving; see the caller-side regression this was
+/// built to close, `settle_window` (`backend.rs`, #263), and this module's own
+/// `a_wide_t_never_settles_while_any_of_its_fields_keeps_drifting` test.
 pub fn settle_by_polling<T, E>(
     seed: T,
     budget: Duration,
@@ -117,7 +140,7 @@ mod tests {
     #[test]
     fn two_equal_readings_settle() {
         let mut t = SettleTracker::new();
-        t.observe(10);
+        let _ = t.observe(10);
         assert_eq!(t.observe(10), SettleStep::Settled(10));
     }
 
@@ -146,8 +169,8 @@ mod tests {
     #[test]
     fn agreement_is_with_the_immediate_predecessor_only() {
         let mut t = SettleTracker::new();
-        t.observe(10);
-        t.observe(20);
+        let _ = t.observe(10);
+        let _ = t.observe(20);
         assert_eq!(t.observe(10), SettleStep::Continue);
     }
 
@@ -224,22 +247,28 @@ mod tests {
         assert_eq!(outcome, SettleOutcome::ReadFailed("window vanished"));
     }
 
-    /// Pins #263's "the predicate silently widened" review finding, at the one seam that is
-    /// actually testable from Linux: `settle_by_polling` compares the *whole* value `read`
-    /// returns, via `T`'s ordinary `PartialEq` — nothing partial, nothing clever. This is exactly
-    /// why `settle_window` (in `backend.rs`, cfg-gated to macOS and unreachable from here) passes
-    /// `WindowGeometry` rather than the wider `WindowMatch`: `WindowMatch::origin_pt` is the raw
-    /// unrounded point origin `geometry` is rounded from, so it can drift forever inside an
-    /// already-settled pixel, and comparing the whole match — as an earlier revision of this
-    /// branch did — would make that drift block settling forever even though the geometry that
-    /// actually matters had already stopped changing. If `settle_by_polling`'s comparison were
-    /// ever narrowed to ignore part of `T` (a plausible "optimization"), a wide `T` like this one
-    /// would start settling despite an unmatched field still drifting, and this test would catch
-    /// it.
-    ///
-    /// `Source` stands in for `WindowMatch`: `pixel` is the field that should decide settlement
-    /// (like `geometry`), `raw` is a volatile field of the wider value that never repeats (like
-    /// `origin_pt`).
+    /// A `read` that fails on its very first call — before any reading past the seed ever
+    /// succeeded — must report the seed itself, per `settle_by_polling`'s own doc ("seed itself
+    /// if `read` never succeeded"). The previous failure test only proves a *later* failure keeps
+    /// the last good reading; this covers the zero-successes case that doc separately promises.
+    #[test]
+    fn a_read_failure_on_the_first_poll_reports_the_seed() {
+        let (value, outcome) =
+            settle_by_polling(42, Duration::from_millis(50), Duration::ZERO, || {
+                Err::<i32, _>("window vanished")
+            });
+        assert_eq!(
+            value, 42,
+            "must report the seed when no read ever succeeded"
+        );
+        assert_eq!(outcome, SettleOutcome::ReadFailed("window vanished"));
+    }
+
+    /// Pins #263's "the predicate silently widened" finding: `settle_by_polling` must compare
+    /// the *whole* `T` via ordinary `PartialEq`, not just a chosen field. `Source` stands in for
+    /// `WindowMatch`: `pixel` is the field that should decide settlement (like `geometry`), `raw`
+    /// is a volatile field that never repeats (like the raw `origin_pt` a rounded `geometry` is
+    /// derived from) — comparing only `pixel` would let this settle despite `raw` still drifting.
     #[test]
     fn a_wide_t_never_settles_while_any_of_its_fields_keeps_drifting() {
         #[derive(Clone, PartialEq)]
