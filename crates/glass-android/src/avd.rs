@@ -307,23 +307,27 @@ mod tests {
         };
         assert_eq!(resolve_emulator_bin(&env, &|_| true), "/custom/emulator");
 
+        // Built the same way `resolve_emulator_bin` builds it, so this pins the host-correct
+        // separator and `.exe` suffix rather than a POSIX literal.
+        let want_bin = |root: &str| {
+            std::path::PathBuf::from(root)
+                .join("emulator")
+                .join(emulator_exe())
+                .to_string_lossy()
+                .into_owned()
+        };
+
         let env = |k: &str| match k {
             "ANDROID_SDK_ROOT" => Some("/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(
-            resolve_emulator_bin(&env, &|_| true),
-            "/sdk/emulator/emulator"
-        );
+        assert_eq!(resolve_emulator_bin(&env, &|_| true), want_bin("/sdk"));
 
         let env = |k: &str| match k {
             "ANDROID_HOME" => Some("/home/sdk".to_string()),
             _ => None,
         };
-        assert_eq!(
-            resolve_emulator_bin(&env, &|_| true),
-            "/home/sdk/emulator/emulator"
-        );
+        assert_eq!(resolve_emulator_bin(&env, &|_| true), want_bin("/home/sdk"));
 
         let env = |_: &str| None;
         assert_eq!(resolve_emulator_bin(&env, &|_| false), "emulator");

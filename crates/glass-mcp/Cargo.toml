@@ -19,9 +19,6 @@ network = [
 [dependencies]
 glass-android.workspace = true
 glass-core.workspace = true
-# Not for sandboxing: `smoke`'s target-app probe reuses its `$PATH` resolver, which already
-# has execvp's semantics (executable regular file, first match wins).
-glass-sandbox-core.workspace = true
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

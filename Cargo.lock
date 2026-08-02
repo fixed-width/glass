@@ -1172,7 +1172,6 @@ dependencies = [
  "glass-dbus-linux",
  "glass-ios",
  "glass-macos",
- "glass-sandbox-core",
  "glass-sandbox-linux",
  "glass-sandbox-macos",
  "glass-wayland",
