@@ -82,14 +82,17 @@ mod macos_main {
     const ENUMERATIONS: usize = 6;
     const ENUMERATION_GAP: Duration = Duration::from_millis(250);
 
-    /// How often, and for how long, to re-read the adopted window's geometry immediately after
-    /// `start_app` returns. macOS reports a window's geometry while it is still opening, so the
-    /// value adoption captured can be a frame of that animation; sampling densely is how the shape
-    /// of the animation becomes visible rather than inferred. 10ms is a floor, not a guarantee —
-    /// each sample is a real round trip (`platform.window(&WindowOp::Geometry)`, an AX read — the
-    /// same reader #263's actual symptom was about, not the `SCShareableContent` path
-    /// `start_app`/`settle_window` themselves poll), so the printed offsets are what actually
-    /// happened.
+    /// How often, and for how long, to re-read the adopted window's geometry once the first
+    /// enumeration pass has run (see `ENUMERATIONS`) — so sampling starts one `list_windows` round
+    /// trip after `start_app` returns, not at zero. macOS reports a window's geometry while it is
+    /// still opening, so the value adoption captured can be a frame of that animation; sampling
+    /// densely is how the shape of the animation becomes visible rather than inferred. 10ms is a
+    /// floor, not a guarantee — each sample is a real round trip
+    /// (`platform.window(&WindowOp::Geometry)`, an AX read — the same reader #263's actual symptom
+    /// was about, not the `SCShareableContent` path `start_app`/`settle_window` themselves poll),
+    /// so the printed offsets are what actually happened. Those offsets are relative to sampling's
+    /// own start; the enumeration series prints `t+` from `start_app`'s return, so the two blocks'
+    /// timestamps share a format but not an origin.
     const EARLY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
     const EARLY_SAMPLE_WINDOW: Duration = Duration::from_millis(300);
 
