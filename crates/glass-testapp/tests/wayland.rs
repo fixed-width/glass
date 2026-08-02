@@ -1011,3 +1011,31 @@ fn wayland_build_step_runs_before_launch() {
 
 // (Build-step network containment tests removed: the build step is unsandboxed by design —
 // only the launched run is contained.)
+
+/// MEASUREMENT, not an assertion: how often does `start_app`'s returned geometry disagree with a
+/// geometry re-read immediately afterwards?
+///
+/// macOS returns a mid-open-animation reading on most cold launches (#263). Whether Wayland races
+/// the same way decides whether the settle belongs in this backend too or stays macOS-local.
+/// Asserts only that the launches succeeded; the rate is for a human to read.
+#[test]
+#[ignore = "measurement; run via scripts/test-wayland.sh geometry_settle_measurement"]
+fn geometry_settle_measurement() {
+    use glass_core::WindowOp;
+
+    const RUNS: usize = 20;
+    let mut disagreed = 0usize;
+    for run in 1..=RUNS {
+        // A fresh sway compositor + platform + launch per run — the fixture is a plain
+        // executable, so every iteration is a genuine cold launch.
+        let mut p = WaylandPlatform::new().expect("new");
+        let adopted = start(&mut p, &spec(vec![TESTAPP.to_string()], APP_TIMEOUT_MS));
+        let reread = p.window(&WindowOp::Geometry).expect("window(Geometry)");
+        if reread != adopted {
+            disagreed += 1;
+            println!("run {run}: adopted {adopted:?} != re-read {reread:?}");
+        }
+        p.stop_app().expect("stop_app");
+    }
+    println!("wayland geometry_settle_measurement: {disagreed} of {RUNS} launches disagreed");
+}
