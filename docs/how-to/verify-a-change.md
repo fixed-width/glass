@@ -63,17 +63,20 @@ Three things to know before trusting the result:
 ```bash
 rustup target add x86_64-apple-darwin
 
-cargo clippy --target x86_64-apple-darwin \
-  -p glass-macos -p glass-a11y-macos -p glass-sandbox-macos -p glass-clip-shim-macos \
-  --all-targets --locked -- -D warnings
+cargo clippy --target x86_64-apple-darwin --workspace --lib --locked -- -D warnings
 ```
 
 This compiles the `cfg(target_os = "macos")` modules for real — a type error inside one fails the
 command from Linux.
 
-- **`--workspace` does not work for this target.** `criterion`, a dev-dependency of `glass-core`,
-  pulls `alloca`, whose build script passes `-arch` and `-mmacosx-version-min` to the host `cc`.
-  Scope with `-p` to the crates you touched.
+- **`--lib` is what makes it work, and it is not the same reason the macOS CI job uses `--lib`.**
+  Here it is because `--lib` does not build dev-dependencies: `--all-targets` pulls `criterion`,
+  which depends unconditionally on `alloca`, whose build script compiles C — and cross-compiling
+  that runs the *host* `cc` with `-arch` and `-mmacosx-version-min`, which Linux `gcc` rejects.
+  Building it would need a darwin cross-toolchain such as osxcross.
+- To include tests and benches for one crate, scope with `-p`:
+  `cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets -- -D warnings` works,
+  because `glass-macos` does not dev-depend on `criterion`.
 - **You cannot link or run.** That needs the macOS SDK and a Mac. For anything past type-checking,
   push and let the macOS CI job run it, or run it on a Mac.
 
