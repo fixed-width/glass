@@ -168,18 +168,15 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # The Linux-only crates gate themselves off macOS (#293), so --workspace resolves
-      # here now: a workspace-wide build + lint gate, with the gated crates compiling to
-      # nothing. No `cargo test --workspace` here — five of glass-macos's seven
-      # `harness = false` integration targets (capture, input, windows, a11y, bundle_launch)
-      # hard-fail without the TCC grants this runner doesn't have (the other two, role_probe
-      # and window_adopt_probe, exit 0 unconfigured); ./scripts/test-macos.sh below runs
-      # `--lib` instead.
+      # The Linux-only crates gate themselves off macOS (#293), so --workspace resolves here.
       - run: cargo build  --workspace --all-targets --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Also builds the sandbox probe and the injected clip shim, which the tests need. Its own
+      # `-p glass-macos --lib` run is repeated by the workspace step below — kept because this
+      # script is the standalone entry point on a dev box, where nothing else runs them.
       - run: ./scripts/test-macos.sh
       # `--lib` rather than plain `--workspace`: it excludes the harness = false integration
-      # targets above, which need the TCC grants this runner lacks.
+      # targets, which need the TCC grants this runner lacks.
       - run: cargo test --workspace --lib --locked
       # Builds the Swift fixture (crates/glass-macos/fixture/a11y_fixture.swift) — the one
       # thing `cargo build --workspace --all-targets` above doesn't reach — and re-links the
