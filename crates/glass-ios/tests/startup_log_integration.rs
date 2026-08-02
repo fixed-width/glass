@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! On-box proof for glass-ios #136: a log line an app emits at launch — before its first
 //! frame — is captured.
 //!
@@ -27,6 +26,8 @@
 //! The marker MUST be emitted at the app's earliest launch point (not a delayed `onAppear`),
 //! so it exercises the race the fix closes. `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE` select the
 //! Simulator the same way they do for `glass-mcp`; see `docs/how-to/setup-ios.md`.
+
+#![cfg(unix)]
 
 use std::time::Duration;
 

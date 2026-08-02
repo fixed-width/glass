@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! On-box smoke test for the iOS Simulator backend: launches a real `.app` on a booted
 //! Simulator and drives it through `glass_core::Platform`'s core surface — start, capture,
 //! clipboard round-trip, stop — exactly the sequence `glass_start`/`glass_screenshot`/
@@ -19,6 +18,8 @@
 //! it itself — no separate `simctl install` step is required. `GLASS_IOS_UDID` / `GLASS_IOS_DEVICE`
 //! / `GLASS_SIMULATOR_KEEP` (all optional) select and manage the Simulator the same way they do
 //! for `glass-mcp`; see `docs/how-to/setup-ios.md`.
+
+#![cfg(unix)]
 
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};

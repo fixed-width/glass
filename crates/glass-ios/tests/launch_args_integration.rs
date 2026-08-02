@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! End-to-end proof that `AppSpec::run`'s tail reaches the launched app.
 //!
 //! `run[1..]` is documented as the program's arguments, and every desktop backend spawns them
@@ -20,6 +19,8 @@
 //!
 //! A separate variable from `GLASS_IOS_APP` on purpose: the sibling integration tests drive
 //! `examples/ios-fixture/`, which has no launch-argument surface to check.
+
+#![cfg(unix)]
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTree, WalkLimits};
 use glass_core::{AppSpec, Platform, SandboxLevel};

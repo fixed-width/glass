@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! End-to-end proof that an app which dies on launch is reported as failed, not started.
 //!
 //! `simctl launch` exits 0 as soon as launchd has spawned the process, so a backend that trusts
@@ -26,6 +25,8 @@
 //! GLASS_IOS_ROLE_FIXTURE="$PWD/examples/ios-role-fixture/build/RoleFixture.app" \
 //!   cargo test -p glass-ios --test launch_liveness_integration -- --ignored --test-threads=1
 //! ```
+
+#![cfg(unix)]
 
 use glass_core::{AppSpec, Platform, SandboxLevel};
 use glass_ios::{IosPlatform, SimulatorRegistry};

@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! The launch-liveness check on the observe-only path — no `idb_companion`, so no scale
 //! discovery, so the least work between the launch and the check.
 //!
@@ -18,6 +17,7 @@
 //!   cargo test -p glass-ios --test launch_liveness_observe_only_integration -- --ignored
 //! ```
 
+#![cfg(unix)]
 // `env::set_var` is `unsafe` from edition 2024 on (it races concurrent env readers). This binary
 // holds exactly one test, so nothing else in the process reads the environment while it is set.
 // The site carries a `// SAFETY:` note; the file opts out of `unsafe_code = "deny"`. Mirrors

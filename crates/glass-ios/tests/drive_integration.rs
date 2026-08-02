@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! End-to-end drive test for the iOS Simulator backend's input + accessibility.
 //!
 //! Launches a real fixture app on a booted Simulator and drives it through the public
@@ -26,6 +25,8 @@
 //! READY, flips to TAPPED when the button is tapped), `tapButton`, `inputField`, and
 //! `echoLabel` (mirrors the field's text, or `(empty)`) — see
 //! `examples/ios-fixture/README.md`.
+
+#![cfg(unix)]
 
 use std::time::Duration;
 
