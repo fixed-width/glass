@@ -87,6 +87,7 @@ impl Accessibility for MacosA11y {
         let root = walk(&window_el, &ctx.window, scale, 0, &mut budget);
         let mut tree = AxTree::new(root);
         tree.truncated = budget.truncation();
+        tree.unreadable = budget.unreadable();
         // Ids/count are assigned by `glass-core` (`AxTree::assign_ids`) so numbering is
         // identical across OS backends.
         Ok(tree)
@@ -475,12 +476,13 @@ fn walk(
     // `AXChildren`) node and only `Err` for a *real* AX read failure. Degrade a real
     // failure to "no children" so one broken node can't fail the whole snapshot — but log
     // it (mirroring `select_window`'s no-match diagnostic) so the dropped subtree is
-    // observable, never silent. This is a different condition from a bound firing (below),
-    // and already reports itself via the log line, so it never touches `budget`.
+    // observable, never silent. Counted on `budget` as well — the log serves whoever reads
+    // stderr, the count reaches the agent.
     //
     // Resolved before the gate below: a childless node must never be reported truncated
     // for declining to explore a list that was already empty.
     let child_els = ffi::children(el).unwrap_or_else(|err| {
+        budget.note_unreadable();
         eprintln!(
             "glass-a11y-macos: walk: AXChildren read failed for role={raw_role:?} \
              bounds={bounds:?}: {err}; treating as no children"
@@ -580,7 +582,15 @@ fn find_nth(
     budget.visit();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
-    let child_els = ffi::children(&el).unwrap_or_default();
+    // Counted and logged exactly as `walk` does — the same failure was diagnosable in one
+    // traversal and invisible in the other.
+    let child_els = ffi::children(&el).unwrap_or_else(|err| {
+        budget.note_unreadable();
+        eprintln!(
+            "glass-a11y-macos: find_nth: AXChildren read failed: {err}; treating as no children"
+        );
+        Vec::new()
+    });
     // Same gap as `walk`: gated on the raw `child_els`, before `should_skip` runs. A node whose
     // children are all skipped, reached once the budget is spent, still records a truncation
     // though nothing real was declined — left as-is for the same reason: pre-filtering means
