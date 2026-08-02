@@ -72,6 +72,15 @@ harness = false
 name = "window_adopt_probe"
 harness = false
 
+# Test-only fixture for process::tests' SandboxLevel::Default tests (crates/glass-macos/
+# src/process.rs): unlike /bin/sh — an Apple platform binary, arm64e-only on Apple Silicon —
+# any Rust-compiled binary is plain arm64, so DYLD_INSERT_LIBRARIES clip-shim injection can
+# actually load into it instead of dyld aborting on the arch mismatch. See
+# src/bin/sandbox_probe.rs and process.rs's `sandbox_probe_path`.
+[[bin]]
+name = "glass-macos-sandbox-probe"
+path = "src/bin/sandbox_probe.rs"
+
 [dependencies]
 glass-core.workspace = true
 plist = "1"

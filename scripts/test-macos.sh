@@ -12,6 +12,14 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
+# process::tests' SandboxLevel::Default tests spawn this fixture (see src/bin/sandbox_probe.rs);
+# `cargo test -p glass-macos --lib` below does NOT build sibling `[[bin]]` targets on its own
+# (only `--lib`-selected targets), so build it explicitly rather than relying on an earlier,
+# separate `cargo build --workspace` step having happened to build it first — that exact kind
+# of incidental ordering is what let those two tests run for years without ever spawning a
+# binary the injected clip shim could actually load into (see process.rs's spawn doc).
+cargo build -p glass-macos --bin glass-macos-sandbox-probe
+
 # Pure + macOS unit tests only (`--lib`), minus the `#[ignore]`d ones that need a window
 # server (GLASS_MACOS_ONBOX below runs those). `crates/glass-macos/tests/capture.rs` is now a
 # real `[[test]]` target (see Cargo.toml), so a plain `cargo test -p glass-macos` with no
