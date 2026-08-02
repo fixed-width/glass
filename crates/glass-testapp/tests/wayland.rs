@@ -1011,3 +1011,9 @@ fn wayland_build_step_runs_before_launch() {
 
 // (Build-step network containment tests removed: the build step is unsandboxed by design —
 // only the launched run is contained.)
+
+// geometry_settle_measurement (the #263 Wayland launch-race measurement) lives in its own test
+// target, tests/wayland_geometry_settle_measurement.rs, run via
+// scripts/wayland-geometry-settle-measurement.sh — not part of this file, so its 20 cold
+// launches + sway spawns per run don't ride along with every scripts/test-wayland.sh (and so
+// every CI) invocation.

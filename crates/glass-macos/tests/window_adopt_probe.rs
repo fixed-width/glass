@@ -53,11 +53,12 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos_main {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        Accessibility, AppSpec, AxContext, Platform, SandboxLevel, WalkLimits, WindowInfo,
+        Accessibility, AppSpec, AxContext, Platform, SandboxLevel, WalkLimits, WindowGeometry,
+        WindowInfo, WindowOp,
     };
     use glass_macos::MacosPlatform;
 
@@ -73,11 +74,24 @@ mod macos_main {
     const PROBE_RUNS_VAR: &str = "GLASS_WINDOW_PROBE_RUNS";
     const DEFAULT_RUNS: usize = 30;
 
-    /// How many times to re-enumerate the app's windows after `start_app` returns, and the
-    /// gap between enumerations. Spread across ~1.25s (5 gaps) so a window that appears (or
-    /// vanishes) a beat after adoption is still caught — the transient this probe is looking for.
+    /// How many times to re-enumerate the app's windows after `start_app` returns, and the gap
+    /// between enumerations. The first pass runs immediately, before early sampling begins (see
+    /// `EARLY_SAMPLE_WINDOW`) — previously, a transient that appeared and vanished in that gap
+    /// was never enumerated. The remaining `ENUMERATIONS - 1` passes run after early sampling
+    /// ends, `ENUMERATION_GAP` apart, so a transient a beat later is still caught too.
     const ENUMERATIONS: usize = 6;
     const ENUMERATION_GAP: Duration = Duration::from_millis(250);
+
+    /// How often, and for how long, to re-read the adopted window's geometry immediately after
+    /// `start_app` returns. macOS reports a window's geometry while it is still opening, so the
+    /// value adoption captured can be a frame of that animation; sampling densely is how the shape
+    /// of the animation becomes visible rather than inferred. 10ms is a floor, not a guarantee —
+    /// each sample is a real round trip (`platform.window(&WindowOp::Geometry)`, an AX read — the
+    /// same reader #263's actual symptom was about, not the `SCShareableContent` path
+    /// `start_app`/`settle_window` themselves poll), so the printed offsets are what actually
+    /// happened.
+    const EARLY_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+    const EARLY_SAMPLE_WINDOW: Duration = Duration::from_millis(300);
 
     /// Print a clear failure message and exit non-zero — the `harness = false` contract (no
     /// libtest to format a panic for us). Mirrors the sibling integration tests.
@@ -127,12 +141,101 @@ mod macos_main {
 
     /// One run's outcome: whether the adopted geometry matched a window the app's pid actually
     /// owns, whether the accessibility reader could resolve the adopted window at all (#263's
-    /// actual symptom), and the pid `start_app` reported — needed to tell a cold launch from a
-    /// re-adoption of an already-running process (see the module doc's caveat).
+    /// actual symptom), the pid `start_app` reported — needed to tell a cold launch from a
+    /// re-adoption of an already-running process (see the module doc's caveat) — and how long
+    /// `start_app` itself took: its total end-to-end wall clock (process launch through
+    /// LaunchServices, first-window creation, window discovery, and the settle — `MacosPlatform`
+    /// is already constructed by the time this timer starts, so its own AX/Screen-Recording
+    /// preflight is not part of it), launch-dominated rather than the settle's own increment —
+    /// isolating that would need an A/B sweep against a build without it.
     struct RunOutcome {
         matched: bool,
         snapshot_ok: bool,
         pid: Option<u32>,
+        start_app: Duration,
+    }
+
+    /// Re-read the adopted window's geometry every [`EARLY_SAMPLE_INTERVAL`] for
+    /// [`EARLY_SAMPLE_WINDOW`], printing each reading that differs from the one before it, with
+    /// the offset from when sampling began.
+    ///
+    /// Only distinct readings are printed: a settled window produces one line, and an animating
+    /// one produces the shape of its animation instead of thirty identical rows.
+    ///
+    /// The final "MATCHES / DIFFERS from the adopted geometry" line compares an AX-sourced
+    /// reading against `adopted` (SCShareableContent-sourced) — a small, non-animation offset
+    /// between those two readers is possible (see `axwindow.rs`'s `FALLBACK_TOLERANCE_PX`), so a
+    /// `DIFFERS` here is corroborating evidence, not on its own proof that the window kept moving.
+    fn print_early_samples(platform: &mut MacosPlatform, adopted: &WindowGeometry) {
+        let started = Instant::now();
+        let mut last: Option<WindowGeometry> = None;
+        let mut samples = 0usize;
+        println!(
+            "  early samples (adopted: {}x{} @({},{})):",
+            adopted.width, adopted.height, adopted.x, adopted.y
+        );
+        while started.elapsed() < EARLY_SAMPLE_WINDOW {
+            match platform.window(&WindowOp::Geometry) {
+                Ok(g) => {
+                    samples += 1;
+                    if last.as_ref() != Some(&g) {
+                        println!(
+                            "    t+{:>4}ms  {}x{} @({},{})",
+                            started.elapsed().as_millis(),
+                            g.width,
+                            g.height,
+                            g.x,
+                            g.y
+                        );
+                        last = Some(g);
+                    }
+                }
+                // Never fatal: a read that fails mid-animation is itself worth seeing, and this
+                // is a probe, not a gate.
+                Err(e) => println!(
+                    "    t+{:>4}ms  read failed: {e}",
+                    started.elapsed().as_millis()
+                ),
+            }
+            std::thread::sleep(EARLY_SAMPLE_INTERVAL);
+        }
+        let settled_matches_adopted = last.as_ref() == Some(adopted);
+        println!(
+            "    {samples} sample(s); final reading {} the adopted geometry",
+            if settled_matches_adopted {
+                "MATCHES"
+            } else {
+                "DIFFERS from"
+            }
+        );
+    }
+
+    /// One `list_windows()` call, printed as one line labeled by real elapsed time since
+    /// `series_start`, not by call index — [`print_early_samples`] runs between the first and
+    /// later calls, so an index-derived label understated every call after it by that window's
+    /// real duration.
+    fn enumerate_once(
+        platform: &mut MacosPlatform,
+        run0: &str,
+        adopted: &WindowGeometry,
+        series_start: Instant,
+        matched: &mut bool,
+    ) -> Result<(), String> {
+        let windows = platform
+            .list_windows()
+            .map_err(|e| format!("list_windows({run0}): {e}"))?;
+        println!(
+            "  t+{}ms: {} window(s)",
+            series_start.elapsed().as_millis(),
+            windows.len()
+        );
+        for w in &windows {
+            let is_adopted = &w.geometry == adopted;
+            *matched |= is_adopted;
+            let tag = if is_adopted { "  == ADOPTED" } else { "" };
+            println!("    {}{tag}", render_window(w));
+        }
+        Ok(())
     }
 
     /// One launch/enumerate/stop cycle. `Err` is a real breakage — the app would not launch, or
@@ -154,36 +257,33 @@ mod macos_main {
         };
 
         with_stop_app(&mut platform, run0, |platform| {
+            let start_app_began = Instant::now();
             let adopted = platform
                 .start_app(&spec)
                 .map_err(|e| format!("start_app({run0}): {e}"))?;
+            let start_app_elapsed = start_app_began.elapsed();
             let pid = platform.app_pids().first().copied();
             println!("\n===== run {run_index} =====");
             println!(
                 "pid: {}",
                 pid.map_or_else(|| "?".to_string(), |p| p.to_string())
             );
+            println!("start_app: {}ms", start_app_elapsed.as_millis());
             println!("adopted: {adopted:?}");
 
+            // t+0 for the enumeration series below — captured at `start_app`'s return, not
+            // derived from a loop index.
+            let series_start = Instant::now();
             let mut matched = false;
-            for enumeration in 0..ENUMERATIONS {
-                let windows = platform
-                    .list_windows()
-                    .map_err(|e| format!("list_windows({run0}): {e}"))?;
-                println!(
-                    "  t+{}ms: {} window(s)",
-                    enumeration as u128 * ENUMERATION_GAP.as_millis(),
-                    windows.len()
-                );
-                for w in &windows {
-                    let is_adopted = w.geometry == adopted;
-                    matched |= is_adopted;
-                    let tag = if is_adopted { "  == ADOPTED" } else { "" };
-                    println!("    {}{tag}", render_window(w));
-                }
-                if enumeration + 1 < ENUMERATIONS {
-                    std::thread::sleep(ENUMERATION_GAP);
-                }
+            // Ahead of early sampling — see `ENUMERATIONS`'s doc for why this pass has to come
+            // first.
+            enumerate_once(platform, run0, &adopted, series_start, &mut matched)?;
+
+            print_early_samples(platform, &adopted);
+
+            for _ in 1..ENUMERATIONS {
+                std::thread::sleep(ENUMERATION_GAP);
+                enumerate_once(platform, run0, &adopted, series_start, &mut matched)?;
             }
 
             // The symptom the issue reports: whether the reader can resolve the window the
@@ -216,6 +316,7 @@ mod macos_main {
                 matched,
                 snapshot_ok,
                 pid,
+                start_app: start_app_elapsed,
             })
         })
     }
@@ -241,6 +342,7 @@ mod macos_main {
         let mut mismatches = 0usize;
         let mut snapshot_failures = 0usize;
         let mut pids_seen = std::collections::HashSet::new();
+        let mut start_app_durations = Vec::new();
         let mut failures = Vec::new();
         for run_index in 1..=runs {
             match probe_once(&run0, run_index) {
@@ -252,6 +354,7 @@ mod macos_main {
                         snapshot_failures += 1;
                     }
                     pids_seen.extend(outcome.pid);
+                    start_app_durations.push(outcome.start_app);
                 }
                 Err(e) => failures.push(format!("run {run_index}: {e}")),
             }
@@ -268,6 +371,33 @@ mod macos_main {
              {snapshot_failures} of {runs} run(s) failed the accessibility snapshot; \
              {} distinct pid(s) seen across {runs} run(s)",
             pids_seen.len()
+        );
+        // `start_app`'s total end-to-end wall clock, launch-dominated — not the settle loop's
+        // own increment; that would need an A/B sweep against a build without it.
+        // `start_app_durations` has one entry per successful run — the `fail()` above exits
+        // before reaching here if any run errored — so the division below never sees a
+        // zero-length vec.
+        let min = start_app_durations
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or_default();
+        let max = start_app_durations
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or_default();
+        let mean_ms = start_app_durations
+            .iter()
+            .map(Duration::as_secs_f64)
+            .sum::<f64>()
+            * 1000.0
+            / start_app_durations.len() as f64;
+        println!(
+            "start_app latency: min {}ms, max {}ms, mean {mean_ms:.1}ms across {} run(s)",
+            min.as_millis(),
+            max.as_millis(),
+            start_app_durations.len()
         );
         println!("WINDOW_ADOPT_PROBE_PASS");
         std::process::exit(0);

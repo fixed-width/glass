@@ -191,6 +191,13 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- On macOS, `glass_start` now reports a window's settled geometry rather than a frame of its
+  opening animation. It used to return whatever geometry it read the instant it found the newly
+  launched window; measured across cold launches, that geometry disagreed with the window's
+  settled size in 11 of 12 runs. It now waits for two consecutive readings to agree before
+  returning. X11 and Wayland were measured against a fixed-size test fixture with no opening
+  animation and didn't race this way there, so the fix stays macOS-only; Windows, Android and iOS
+  were not measured.
 - A `glass_wait_for_element` shorter than a second could report an element absent that was on
   screen. Where the platform announces changes, the wait skips reads it has been told are pointless
   and reads anyway once a second in case it was told wrong — but that second was previously counted

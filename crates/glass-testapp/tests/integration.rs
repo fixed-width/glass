@@ -1988,3 +1988,8 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     );
     p.stop_app().unwrap();
 }
+
+// geometry_settle_measurement (the #263 X11 launch-race measurement) lives in its own test
+// target, tests/x11_geometry_settle_measurement.rs, run via
+// scripts/x11-geometry-settle-measurement.sh — not part of this file, so its 20 cold launches
+// per run don't ride along with every scripts/test-x11.sh (and so every CI) invocation.
