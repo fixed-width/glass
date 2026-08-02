@@ -71,7 +71,9 @@ pub fn dir_of(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsStr;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -88,6 +90,7 @@ mod tests {
         assert_eq!(abs_token(Path::new("x/y"), None), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_finds_first_executable_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -101,6 +104,7 @@ mod tests {
     /// Pins the documented "first `$PATH` entry wins" contract (`execvp` semantics): with two
     /// directories on `$PATH`, each holding an executable of the SAME name, the match from the
     /// FIRST directory must be returned, not merely any match.
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_returns_the_first_match() {
         let first = tempfile::tempdir().unwrap();
@@ -118,6 +122,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_on_path_in_skips_non_executable_and_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -151,6 +156,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_executable_file_true_for_exec_false_for_dir_and_plain() {
         let dir = tempfile::tempdir().unwrap();
