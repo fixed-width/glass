@@ -309,17 +309,42 @@ fn gather_session() -> SessionKind {
 
 /// Whether Windows.Graphics.Capture is usable on this system (the real capability gate).
 ///
-/// Probed once per process. `IsSupported` activates a WinRT runtime class on the calling thread,
-/// and activating it concurrently from several threads faults with `STATUS_ACCESS_VIOLATION` —
-/// `cargo test --workspace` on Windows crashed the `glass-mcp` test binary about half the time,
-/// libtest giving each test its own thread. The answer is a fixed property of the machine, so
-/// caching is also the honest shape: nothing here can change while the process runs.
+/// Probed once, on a thread this function owns. `IsSupported` activates a WinRT runtime class on
+/// whatever thread calls it, and doing that on a borrowed thread that later exits faults with
+/// `STATUS_ACCESS_VIOLATION`: `cargo test --workspace` on Windows crashed the `glass-mcp` test
+/// binary about half the time, libtest giving each test its own short-lived thread. Caching alone
+/// does not fix it — one activation on a borrowed thread is enough — so the apartment is
+/// initialized and torn down here, on a thread whose lifetime is bounded by the `join` below.
 #[cfg(windows)]
 fn gather_wgc() -> bool {
     use std::sync::OnceLock;
-    use windows::Graphics::Capture::GraphicsCaptureSession;
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| GraphicsCaptureSession::IsSupported().unwrap_or(false))
+    *SUPPORTED.get_or_init(probe_wgc)
+}
+
+/// The WGC probe, on its own COM-initialized thread. Separate from [`gather_wgc`] so the caching
+/// and the apartment handling read apart.
+#[cfg(windows)]
+fn probe_wgc() -> bool {
+    use windows::Graphics::Capture::GraphicsCaptureSession;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    std::thread::spawn(|| {
+        // SAFETY: takes only scalars and borrows nothing. The thread it initializes is created
+        // here and joined below, so the apartment cannot outlive its pairing with the
+        // `CoUninitialize`.
+        let entered = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // Safe: `IsSupported` is a WinRT projection, not an FFI call.
+        let supported = GraphicsCaptureSession::IsSupported().unwrap_or(false);
+        if entered.is_ok() {
+            // SAFETY: balances the `CoInitializeEx` above on this same thread. Gated on
+            // `is_ok`, so it runs for S_OK and S_FALSE but never for `RPC_E_CHANGED_MODE`,
+            // where this thread entered no apartment to leave.
+            unsafe { CoUninitialize() };
+        }
+        supported
+    })
+    .join()
+    .unwrap_or(false)
 }
 
 /// Port of the validated PMv2 probe: classify the thread's DPI-awareness context.
