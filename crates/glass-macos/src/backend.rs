@@ -42,12 +42,15 @@ const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// How often to re-read an adopted window's geometry while waiting for it to stop changing, and
 /// how long to keep waiting. macOS reports a window's geometry while it is still opening, so the
-/// reading adoption captured is routinely a frame of the open animation (#263). A window that had
-/// already stopped moving needs only one more round trip to confirm it — a `SETTLE_POLL_INTERVAL`
-/// sleep plus one `SCShareableContent` query, ~70-125ms as measured on this branch — but that was
-/// the minority case: 11 of 12 cold launches measured here were still moving at adoption and paid
-/// a second round trip (~140-250ms) before settling. The budget bounds a window that never stops
-/// moving at all (a clock, a video player, an animating splash).
+/// reading adoption captured is routinely a frame of the open animation (#263). `settle_window`'s
+/// own read is an `SCShareableContent` query; its per-call cost was never isolated here — that
+/// would need an A/B against a build without the settle. The only measured number available is a
+/// different reader's: the probe's dense early-sampling loop (`tests/window_adopt_probe.rs`)
+/// clocked `platform.window(&WindowOp::Geometry)`, an AX read, at ~45-100ms per call. Adding
+/// `SETTLE_POLL_INTERVAL` gives ~70-125ms as arithmetic, not a measurement of this path. A window
+/// still moving at adoption needs at least one further poll before two consecutive readings can
+/// agree — 11 of the 12 cold launches measured for #263 fell into that case. The budget bounds a
+/// window that never stops moving at all (a clock, a video player, an animating splash).
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SETTLE_BUDGET: Duration = Duration::from_millis(500);
 /// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`] (a tenth of it):
@@ -323,10 +326,7 @@ impl MacosPlatform {
                     },
                 )
             });
-        // `freshest.geometry` already equals `geometry` on every path (both come from the same
-        // read, or neither read ever succeeded and both are still the seed) — stated explicitly
-        // rather than relied upon, and it's what makes `geometry` itself worth naming instead of
-        // discarding.
+        // No-op on every path: `geometry` and `freshest.geometry` always come from the same read.
         freshest.geometry = geometry;
         match outcome {
             SettleOutcome::Settled => {}

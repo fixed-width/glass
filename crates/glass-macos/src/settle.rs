@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// What one more reading tells the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
-pub enum SettleStep<T> {
+pub(crate) enum SettleStep<T> {
     /// This reading matched the one before it. Stop polling; this is the value.
     Settled(T),
     /// No agreement yet. Poll again, until the caller's own budget runs out.
@@ -26,10 +26,10 @@ pub enum SettleStep<T> {
 /// Two samples rather than three or a fixed duration: a value that was already stable when first
 /// read needs only one more reading to confirm it — the cheapest path through this loop, though
 /// not the likely one. On the macOS backend that motivated this (#263), it was the minority
-/// outcome: 1 of 12 measured cold launches were already stable at adoption; the other 11 needed
+/// outcome: 1 of 12 measured cold launches was already stable at adoption; the other 11 needed
 /// further polling before settling.
 #[derive(Clone, Debug)]
-pub struct SettleTracker<T> {
+pub(crate) struct SettleTracker<T> {
     previous: Option<T>,
 }
 
@@ -42,12 +42,12 @@ impl<T> Default for SettleTracker<T> {
 }
 
 impl<T: Clone + PartialEq> SettleTracker<T> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { previous: None }
     }
 
     /// Record `reading` and report whether it settles the sequence.
-    pub fn observe(&mut self, reading: T) -> SettleStep<T> {
+    pub(crate) fn observe(&mut self, reading: T) -> SettleStep<T> {
         // The clone only happens on the `Settled` path, where the caller needs `reading` back
         // by value *and* `self.previous` needs to keep its own copy; `Continue` carries no
         // payload, so that path moves `reading` straight into `self.previous` instead.

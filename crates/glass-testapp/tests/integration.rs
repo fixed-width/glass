@@ -10,7 +10,7 @@
 mod common;
 
 use common::Xvfb;
-use glass_core::{AppSpec, Platform, WindowOp};
+use glass_core::{AppSpec, Platform};
 use glass_x11::X11Platform;
 
 const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
@@ -1989,33 +1989,7 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     p.stop_app().unwrap();
 }
 
-/// MEASUREMENT, not an assertion: how often does `start_app`'s returned geometry disagree with a
-/// geometry re-read immediately afterwards?
-///
-/// macOS returns a mid-open-animation reading on most cold launches (#263). Whether X11 races the
-/// same way decides whether the settle belongs in this backend too or stays macOS-local. Asserts
-/// only that the launches succeeded; the rate is for a human to read.
-#[test]
-#[ignore = "measurement; run via scripts/test-x11.sh geometry_settle_measurement --nocapture"]
-fn geometry_settle_measurement() {
-    const RUNS: usize = 20;
-    let mut disagreed = 0usize;
-    let xvfb = Xvfb::start();
-    // Xvfb resets (and briefly refuses new connections) when its last client disconnects; kept
-    // alive for the whole measurement so the per-run connect/drop below never takes the display
-    // to zero clients and races that reset.
-    let _keepalive = X11Platform::connect(Some(&xvfb.display)).expect("keepalive connect");
-    for run in 1..=RUNS {
-        // One `Xvfb` for the whole measurement, a fresh platform + launch per run — the fixture is
-        // a plain executable, so every iteration is a genuine cold launch.
-        let mut p = X11Platform::connect(Some(&xvfb.display)).expect("connect");
-        let adopted = p.start_app(&app_spec()).expect("start_app");
-        let reread = p.window(&WindowOp::Geometry).expect("window(Geometry)");
-        if reread != adopted {
-            disagreed += 1;
-            println!("run {run}: adopted {adopted:?} != re-read {reread:?}");
-        }
-        p.stop_app().expect("stop_app");
-    }
-    println!("x11 geometry_settle_measurement: {disagreed} of {RUNS} launches disagreed");
-}
+// geometry_settle_measurement (the #263 X11 launch-race measurement) lives in its own test
+// target, tests/x11_geometry_settle_measurement.rs, run via
+// scripts/x11-geometry-settle-measurement.sh — not part of this file, so its 20 cold launches
+// per run don't ride along with every scripts/test-x11.sh (and so every CI) invocation.
