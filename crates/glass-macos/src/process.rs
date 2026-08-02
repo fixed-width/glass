@@ -479,7 +479,8 @@ mod tests {
         assert!(
             probe.is_file(),
             "{probe:?} not built; run `cargo build -p glass-macos --bin {PROBE_BIN_NAME}` \
-             first (scripts/test-macos.sh does this automatically)"
+             (matching this run's profile, e.g. add --release) first — \
+             scripts/test-macos.sh does this automatically"
         );
         probe
     }
@@ -556,8 +557,16 @@ mod tests {
             ("SECRET_PATH".to_string(), secret.to_string()),
         ];
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(&denied, logs.clone())
+        let (mut child, clip) = spawn(&denied, logs.clone())
             .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
+        // The probe is a plain, unsigned arm64 binary — always injectable — so a `None` here
+        // means the shim never resolved (most likely `glass-clip-shim-macos` wasn't built; see
+        // scripts/test-macos.sh), not that containment itself is untested. Assert it explicitly
+        // rather than letting the containment checks below pass without exercising injection.
+        assert!(
+            clip.is_some(),
+            "clip shim was not injected into the sandboxed probe; is glass-clip-shim-macos built?"
+        );
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
         let out: Vec<String> = logs
@@ -624,12 +633,19 @@ mod tests {
         launch.cwd = Some(std::env::temp_dir());
 
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
+        let (mut child, clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
             panic!(
                 "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
                  succeed: {e}"
             )
         });
+        // See default_sandbox_runs_but_contains_filesystem's identical assertion: the copied
+        // probe is always injectable, so `None` means the shim never resolved, not that the
+        // reachability behaviour below is untested.
+        assert!(
+            clip.is_some(),
+            "clip shim was not injected into the sandboxed probe; is glass-clip-shim-macos built?"
+        );
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
 

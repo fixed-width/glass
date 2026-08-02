@@ -12,13 +12,23 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
-# process::tests' SandboxLevel::Default tests spawn this fixture (see src/bin/sandbox_probe.rs);
-# `cargo test -p glass-macos --lib` below does NOT build sibling `[[bin]]` targets on its own
-# (only `--lib`-selected targets), so build it explicitly rather than relying on an earlier,
-# separate `cargo build --workspace` step having happened to build it first — that exact kind
-# of incidental ordering is what let those two tests run for years without ever spawning a
-# binary the injected clip shim could actually load into (see process.rs's spawn doc).
+# process::tests' SandboxLevel::Default tests (landed 2026-07-01) spawn this fixture and assert
+# the clip shim (injection support added 2026-07-02) was actually injected into it — see
+# src/bin/sandbox_probe.rs and process.rs's spawn doc. Neither the fixture nor the shim is a
+# Cargo dependency of glass-macos, so `cargo test -p glass-macos --lib` below builds neither on
+# its own: build both explicitly rather than relying on an earlier, separate `cargo build
+# --workspace` step having happened to build them first. That exact incidental ordering — the
+# shim dylib not existing when a scoped `-p glass-macos` test run built nothing else — is what
+# let the tests pass for about a month (2026-07-02 until this fix) without the shim ever
+# resolving, so injection was silently skipped every time.
+#
+# Two separate invocations, not one `-p glass-macos --bin ... -p glass-clip-shim-macos`: a
+# `--bin NAME` filter applies across every `-p` package in the same command, and
+# glass-clip-shim-macos has no bin target named `glass-macos-sandbox-probe` — combined, cargo
+# silently builds nothing for it rather than erroring (verified: 0.04s, no `Compiling` line, no
+# dylib on disk afterward).
 cargo build -p glass-macos --bin glass-macos-sandbox-probe
+cargo build -p glass-clip-shim-macos
 
 # Pure + macOS unit tests only (`--lib`), minus the `#[ignore]`d ones that need a window
 # server (GLASS_MACOS_ONBOX below runs those). `crates/glass-macos/tests/capture.rs` is now a

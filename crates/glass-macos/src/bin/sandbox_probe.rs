@@ -1,9 +1,13 @@
 //! Test-only fixture spawned by `process::tests`' `SandboxLevel::Default` tests (see
-//! `process.rs`'s `sandbox_probe_path`) in place of `/bin/sh`: an Apple platform binary like
-//! `/bin/sh` ships arm64e-only on Apple Silicon, so the arm64 clip shim those tests exercise
-//! can't be `DYLD_INSERT_LIBRARIES`-injected into it (dyld aborts on the arch mismatch before
-//! the process runs at all). Any Rust-compiled binary is plain arm64, so this one loads it
-//! fine, letting the tests exercise the real injection path instead of dodging it.
+//! `process.rs`'s `sandbox_probe_path`) in place of `/bin/sh`. `/bin/sh` is Apple platform
+//! code, and dyld treats that specially in two ways observed directly on different macOS
+//! versions: CI (macos-14) hard-aborts the child on an arm64/arm64e architecture mismatch when
+//! it attempts to inject the arm64 clip shim into arm64e `/bin/sh`; a newer host (Darwin 25.5)
+//! instead silently drops every `DYLD_*` env var for platform code before even attempting the
+//! load, so injection never happens at all. A plain cargo-built binary sidesteps both: it isn't
+//! restricted platform code, so `DYLD_INSERT_LIBRARIES` is honored, and it's built for whatever
+//! architecture this cargo invocation targets, matching the shim by construction — not just
+//! "arm64", so this also works on an Intel Mac.
 //!
 //! Two flags, repeatable, processed in argv order; a bad read never aborts the process (matches
 //! the `cat ... && echo ... || echo ...` shell one-liner this replaces):
@@ -17,8 +21,6 @@
 //! DENIES — putting it in argv would re-allow the very thing under test. Env vars aren't argv,
 //! so `spec.env` can carry the real paths without tripping that logic.
 
-use std::io::Write;
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -27,30 +29,32 @@ fn main() {
             "--print" => {
                 let line = args
                     .get(i + 1)
-                    .unwrap_or_else(|| panic!("sandbox-probe: --print needs a LINE argument"));
+                    .expect("sandbox-probe: --print needs a LINE argument");
                 println!("{line}");
                 i += 2;
             }
             "--read-env" => {
                 let var = args
                     .get(i + 1)
-                    .unwrap_or_else(|| panic!("sandbox-probe: --read-env needs a VAR argument"));
+                    .expect("sandbox-probe: --read-env needs a VAR argument");
                 let ok = args
                     .get(i + 2)
-                    .unwrap_or_else(|| panic!("sandbox-probe: --read-env needs an OK marker"));
+                    .expect("sandbox-probe: --read-env needs an OK marker");
                 let fail = args
                     .get(i + 3)
-                    .unwrap_or_else(|| panic!("sandbox-probe: --read-env needs a FAIL marker"));
+                    .expect("sandbox-probe: --read-env needs a FAIL marker");
                 let path = std::env::var(var)
                     .unwrap_or_else(|_| panic!("sandbox-probe: env var {var} is not set"));
-                match std::fs::read(path) {
-                    Ok(_) => println!("{ok}"),
-                    Err(_) => println!("{fail}"),
+                // `File::open` alone trips the same Seatbelt read check as a full read, without
+                // pulling in a multi-megabyte file like `/usr/lib/dyld` just to discard it.
+                if std::fs::File::open(path).is_ok() {
+                    println!("{ok}");
+                } else {
+                    println!("{fail}");
                 }
                 i += 4;
             }
             other => panic!("sandbox-probe: unrecognized argument {other:?}"),
         }
     }
-    let _ = std::io::stdout().flush();
 }
