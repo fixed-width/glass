@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end drive test for the iOS Simulator backend's input + accessibility.
 //!
 //! Launches a real fixture app on a booted Simulator and drives it through the public

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The launch-liveness check on the observe-only path — no `idb_companion`, so no scale
 //! discovery, so the least work between the launch and the check.
 //!

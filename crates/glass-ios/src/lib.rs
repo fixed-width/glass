@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! iOS Simulator backend for glass: drives native apps over `xcrun simctl`.
 //!
 //! macOS-only in practice (the tools are Apple's), but the code links nothing

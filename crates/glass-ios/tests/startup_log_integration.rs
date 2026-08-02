@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! On-box proof for glass-ios #136: a log line an app emits at launch — before its first
 //! frame — is captured.
 //!

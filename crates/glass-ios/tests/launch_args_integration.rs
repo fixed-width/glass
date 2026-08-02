@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end proof that `AppSpec::run`'s tail reaches the launched app.
 //!
 //! `run[1..]` is documented as the program's arguments, and every desktop backend spawns them

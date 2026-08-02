@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Role-histogram PROBE for the iOS half of the accessibility role-parity work — not a
 //! pass/fail assertion test. Launches whatever apps `GLASS_A11Y_PROBE_APPS` names (a
 //! comma-separated list of bundle ids or `.app` paths — exactly what `AppSpec::run`'s first

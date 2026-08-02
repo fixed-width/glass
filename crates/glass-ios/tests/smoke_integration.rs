@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! On-box smoke test for the iOS Simulator backend: launches a real `.app` on a booted
 //! Simulator and drives it through `glass_core::Platform`'s core surface — start, capture,
 //! clipboard round-trip, stop — exactly the sequence `glass_start`/`glass_screenshot`/

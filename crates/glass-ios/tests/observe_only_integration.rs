@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! On-box test that the iOS Simulator backend degrades gracefully when `idb_companion`
 //! is unavailable: capture / logs / clipboard keep working (observe-only), while input
 //! and the accessibility tree report a clear `Unsupported` rather than a hard start-up
