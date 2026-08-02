@@ -219,13 +219,13 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # --workspace can't be used: glass-ios is Unix-only (unconditional std::os::unix /
-      # Permissions::from_mode use) and ungated, unlike the Linux backends (#293). Scope to
-      # the Windows crate closure with an explicit -p list (a future Unix-only crate
-      # won't get silently pulled, unlike --exclude). --all-targets compiles the
-      # glass-windows examples natively.
-      - run: cargo build  -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked
-      - run: cargo clippy -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --all-targets --locked -- -D warnings
+      # The Linux-only and unix-only crates gate themselves (#293), so --workspace
+      # resolves here for build/clippy. cargo test stays scoped: glass-android,
+      # glass-sandbox-core and glass-sandbox-macos assert on POSIX-style absolute
+      # paths that don't hold under Windows path semantics — pre-existing, unrelated
+      # to the gating above.
+      - run: cargo build  --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test   -p glass-core -p glass-windows -p glass-a11y-windows -p glass-mcp --locked
 
   coverage:
