@@ -12,8 +12,10 @@ use glass_core::{GlassError, Result, TIMED_OUT, run_bounded, run_bounded_until};
 /// that fires on a loaded-but-working device is worse than the hang it replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdbOp {
-    /// `uiautomator dump`, and the `cat` that reads the tree it wrote — the two halves of one
-    /// snapshot, so they share a deadline rather than the read-back inheriting a tap's.
+    /// `uiautomator dump`, and the `cat` that reads the tree it wrote — two steps of one snapshot,
+    /// so they share a deadline rather than the read-back inheriting a tap's. That deadline bounds
+    /// the whole snapshot: `a11y::attempt_deadline` runs all three of its steps inside this budget,
+    /// including the stale-file removal, which classifies as [`AdbOp::Shell`].
     Dump,
     /// `exec-out screencap` — encodes a full-resolution frame.
     Screencap,
@@ -30,7 +32,8 @@ pub enum AdbOp {
 }
 
 impl AdbOp {
-    /// The deadline for this kind of call.
+    /// The deadline for this kind of call, and — where a caller passes one to
+    /// [`Adb::run_streams_until`] — the ceiling a call gets rather than the deadline itself.
     pub fn budget(self) -> Duration {
         match self {
             Self::Dump => Duration::from_secs(20),
@@ -259,6 +262,32 @@ mod tests {
         // connection wedged behind it.
         let devices = adb.run(["devices"]).expect("adb usable after a timeout");
         assert!(devices.contains("List of devices"), "{devices}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deadline_handed_to_adb_reaches_the_process_that_runs() {
+        // The wiring the whole fix rests on: `output` must pass the deadline to the bounded runner,
+        // not merely accept one. `/bin/sh` stands in for adb — `AdbOp::Shell`'s 10s budget is what
+        // this call would otherwise wait out.
+        let adb = Adb {
+            bin: "/bin/sh".to_string(),
+            serial: None,
+        };
+        let started = std::time::Instant::now();
+        let err = adb
+            .run_streams_until(
+                ["-c", "sleep 30"],
+                std::time::Instant::now() + Duration::from_millis(300),
+            )
+            .expect_err("a step must not outlive the deadline it serves");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?} — the deadline never reached the process",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains(TIMED_OUT), "{err}");
     }
 
     #[test]

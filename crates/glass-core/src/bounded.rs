@@ -19,6 +19,11 @@ use crate::{GlassError, Result};
 /// does not own — `glass-android` offers `adb kill-server` for a timeout and for nothing else.
 pub const TIMED_OUT: &str = "no answer within";
 
+/// The phrase an error carries when a call was never started, because the deadline it serves was
+/// already spent. Deliberately not [`TIMED_OUT`]: nothing was asked, so nothing failed to answer,
+/// and the remedies for a wedged tool do not apply.
+pub const NOT_STARTED: &str = "was not started";
+
 /// Longest gap between checks on a child that has not exited yet. The wait starts far tighter and
 /// backs off to this, so a one-shot that answers in a millisecond is not billed a full tick and a
 /// long wait settles to one wakeup every 20ms.
@@ -56,13 +61,15 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
     run_bounded_inner(cmd, budget, op, None)
 }
 
-/// [`run_bounded`], but never outliving `deadline` — the bound of the larger call this one serves.
+/// [`run_bounded`], but waiting no later than `deadline` — the bound of the larger call this one
+/// serves. Killing and draining a child still runs after that, as it does for a plain budget.
 ///
 /// Several calls can answer one request: one `uiautomator dump` is a remove, a dump and a read.
 /// Each carrying only its own budget makes the sequence cost their sum, so the caller's deadline
 /// travels down and each step gets whichever bound is nearer. A step with nothing left is not
 /// started at all — its outcome is already decided, and spawning it would cost a process and the
-/// wait to kill it.
+/// wait to kill it. That step's error says [`NOT_STARTED`] rather than [`TIMED_OUT`], so a caller
+/// does not answer it with a remedy for a tool that never ran.
 pub fn run_bounded_until(
     cmd: &mut Command,
     budget: Duration,
@@ -72,7 +79,8 @@ pub fn run_bounded_until(
     let budget = budget_within(budget, deadline, Instant::now());
     if budget.is_zero() {
         return Err(GlassError::Backend(format!(
-            "{op}: {TIMED_OUT} the time left of the deadline it serves, so it was not started"
+            "{op}: the deadline it shares with the rest of the call was already spent, so it \
+             {NOT_STARTED}"
         )));
     }
     run_bounded_inner(cmd, budget, op, None)
@@ -786,24 +794,43 @@ mod tests {
     #[cfg(unix)]
     fn a_call_with_no_time_left_is_not_started_at_all() {
         // Spawning a child only to kill it at once costs a process and a wait; the failure is
-        // already decided. Proven by side effect — the command creates a file if it ever runs.
-        let marker =
-            std::env::temp_dir().join(format!("glass-spent-deadline-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
+        // already decided. The wording is what proves it: spawning would time out at 0ns and say
+        // so, which is a different sentence and one a caller answers differently.
+        let started = Instant::now();
         let err = run_bounded_until(
-            Command::new("/bin/sh").args(["-c", &format!("touch '{}'", marker.display())]),
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_secs(20),
             Instant::now(),
             "test:spent-deadline",
         )
         .expect_err("a call with no time left must fail rather than run");
         assert!(
-            !marker.exists(),
-            "the command ran despite having no time left"
+            started.elapsed() < Duration::from_millis(200),
+            "spawning and killing a doomed child takes longer than this: {:?}",
+            started.elapsed()
         );
         let msg = err.to_string();
         assert!(msg.contains("test:spent-deadline"), "{msg}");
-        assert!(msg.contains(TIMED_OUT), "{msg}");
+        assert!(msg.contains(NOT_STARTED), "{msg}");
+        // Nothing was asked, so nothing failed to answer — and `with_adb_hint` and its kind key on
+        // this phrase to offer remedies for a wedged tool.
+        assert!(!msg.contains(TIMED_OUT), "{msg}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_command_that_finishes_inside_both_bounds_returns_its_output() {
+        // The deadline-taking runner has the same contract as the plain one on the way out: the
+        // output is returned, and a non-zero exit is the caller's to judge, not a failure here.
+        let out = run_bounded_until(
+            Command::new("/bin/sh").args(["-c", "printf ready; exit 3"]),
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(10),
+            "test:until-fast",
+        )
+        .expect("a fast command yields its Output");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ready");
+        assert_eq!(out.status.code(), Some(3));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
-    typed_text_landed,
+    GlassError, KeyEvent, MouseButton, NOT_STARTED, PointerEvent, Result, TIMED_OUT,
+    WindowGeometry, typed_clear_landed, typed_text_landed,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -21,8 +21,9 @@ const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
 /// dump: a device reaches `sys.boot_completed` — all the platform waits for before
 /// reporting the app up — several seconds before the dump can serve one. Later snapshots
 /// must not wait, or a caller like `wait_for_element`, which runs a snapshot per tick
-/// inside its own budget, would be held long past it. This is time spent *retrying*; what
-/// one attempt may take is [`attempt_deadline`], and a snapshot can cost both.
+/// inside its own budget, would be held long past it. This is time spent *retrying*; one
+/// attempt costs `AdbOp::Dump`'s budget on top of it (see [`attempt_deadline`]), which a
+/// warmed snapshot pays too.
 const DUMP_READY_TIMEOUT_MS: u64 = 30_000;
 const DUMP_POLL_INTERVAL_MS: u64 = 1_000;
 
@@ -41,8 +42,9 @@ pub(crate) fn adb_runner(
 /// must be done by.
 ///
 /// The three share [`AdbOp::Dump`]'s budget, which is what that budget already describes: one
-/// snapshot. A step carrying its own instead let an attempt cost the sum of all three, which is
-/// more than any caller's deadline had allowed for.
+/// snapshot. The removal classifies as `AdbOp::Shell` and keeps its own 10s ceiling within that.
+/// A step carrying only its own budget let an attempt cost the sum of all three — 50s, against the
+/// 10s a `glass_wait_for_element` asks for by default and re-snapshots inside.
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
 }
@@ -62,14 +64,27 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, path: &str, deadline: Instant) 
         // The dump explained itself on stderr: that is why there is no file, and it names
         // the dump rather than the read that came up empty. Its stdout is never the reason
         // — it carries only the success line.
-        Err(_) if !stderr.trim().is_empty() => Err(GlassError::AccessibilityUnavailable(format!(
-            "uiautomator dump did not write {path}: {}",
-            stderr.trim()
-        ))),
+        Err(e) if !stderr.trim().is_empty() && !bound_fired(&e) => {
+            Err(GlassError::AccessibilityUnavailable(format!(
+                "uiautomator dump did not write {path}: {}",
+                stderr.trim()
+            )))
+        }
         // A dump that said nothing leaves the read as the only evidence, and a read that
         // fails on its own is about the device rather than a dump yet to become possible.
         Err(e) => Err(e),
     }
+}
+
+/// Whether an error is the attempt's own deadline firing rather than the device answering.
+///
+/// A read that ran out of the attempt's time never reached the device, so it is no evidence about
+/// the dump: substituting the dump's stderr for it would report a tree nobody looked for as one the
+/// dump failed to write, and — since that substitution is retryable — would keep retrying a device
+/// that had answered. Matched on the phrases `glass_core` publishes for exactly this.
+fn bound_fired(e: &GlassError) -> bool {
+    let msg = e.to_string();
+    msg.contains(TIMED_OUT) || msg.contains(NOT_STARTED)
 }
 
 /// Dump, retrying while `uiautomator` reports it cannot serve one yet, up to `budget`.
@@ -77,10 +92,9 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, path: &str, deadline: Instant) 
 /// Only that one failure resolves by waiting: an adb or device error is returned at once,
 /// so a device that has gone away is not retried for the whole budget.
 ///
-/// Returns within `budget` plus one [`attempt_deadline`]: `budget` bounds the retrying, and the
-/// last attempt it starts still has a whole dump to make. A caller that must not be held longer
-/// than that — `wait_for_element` re-snapshots inside a budget of its own — sizes `budget` knowing
-/// the attempt is on top of it.
+/// Returns within `budget` plus one attempt — `AdbOp::Dump`'s budget, per [`attempt_deadline`].
+/// `budget` bounds the retrying, waits between attempts included, and the last attempt it starts
+/// still has a whole dump to make.
 fn dump_until_ready(
     run: &mut AdbRunner<'_>,
     path: &str,
@@ -93,10 +107,13 @@ fn dump_until_ready(
             Ok(xml) => return Ok(xml),
             Err(e) => {
                 let retryable = matches!(e, GlassError::AccessibilityUnavailable(_));
-                if !retryable || Instant::now() >= retry_until {
+                let left = retry_until.saturating_duration_since(Instant::now());
+                if !retryable || left.is_zero() {
                     return Err(e);
                 }
-                std::thread::sleep(interval);
+                // Clamped, so the attempt this wait leads to still starts inside `budget` — an
+                // unclamped wait would put a whole further attempt past it.
+                std::thread::sleep(interval.min(left));
             }
         }
     }
@@ -167,9 +184,10 @@ const VERIFY_ATTEMPTS: usize = 3;
 const VERIFY_SETTLE_MS: u64 = 300;
 
 /// Readiness budget for one post-write read-back. Do NOT reuse [`DUMP_READY_TIMEOUT_MS`] here: that
-/// is the once-per-session cold-boot budget, and at [`VERIFY_ATTEMPTS`] attempts it would let a
-/// routine write hold the single-threaded tool loop for a minute and a half. What this waits out is
-/// an IME animation, which takes hundreds of milliseconds.
+/// is the once-per-session cold-boot budget, and each read-back also pays for the attempt it ends
+/// with, so at [`VERIFY_ATTEMPTS`] attempts it would let a routine write hold the single-threaded
+/// tool loop for two and a half minutes. What this waits out is an IME animation, which takes
+/// hundreds of milliseconds.
 const VERIFY_READY_BUDGET_MS: u64 = 2_000;
 
 /// Reads the active window's accessibility tree via `uiautomator`.
@@ -500,8 +518,7 @@ mod tests {
             seen[0] >= started + AdbOp::Dump.budget(),
             "an attempt must get a whole dump's worth, not what is left of the loop's budget"
         );
-        // Slack for the test's own work between `started` and the attempt; far short of the 50s an
-        // attempt cost when each step carried its own budget.
+        // Slack for the test's own work between `started` and the attempt.
         assert!(
             seen[0] <= started + AdbOp::Dump.budget() + Duration::from_secs(1),
             "an attempt must not be allowed the sum of its steps' budgets"
@@ -509,17 +526,20 @@ mod tests {
     }
 
     #[test]
-    fn a_retried_attempt_gets_a_fresh_deadline_inside_the_loops_whole_promise() {
-        let ready_budget = Duration::from_secs(5);
+    fn a_retried_attempt_gets_a_fresh_deadline() {
         let mut seen: Vec<Instant> = Vec::new();
         let mut cold = fake(1);
         let mut run = |argv: &[&str], deadline: Instant| -> Result<(String, String)> {
             seen.push(deadline);
             cold(argv, deadline)
         };
-        let started = Instant::now();
-        let xml = dump_until_ready(&mut run, PATH, ready_budget, Duration::from_millis(1))
-            .expect("the second attempt succeeds");
+        let xml = dump_until_ready(
+            &mut run,
+            PATH,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .expect("the second attempt succeeds");
 
         assert_eq!(xml, XML);
         assert_eq!(seen.len(), 6, "two attempts of three adb calls");
@@ -527,12 +547,82 @@ mod tests {
             seen[3] > seen[0],
             "a retry must be given its own deadline, not the spent remains of the first attempt's"
         );
-        // What the loop can now promise a caller: the time it may spend retrying, plus the one
-        // attempt that retry starts.
-        let ceiling = started + ready_budget + AdbOp::Dump.budget();
+    }
+
+    #[test]
+    fn the_wait_between_attempts_cannot_push_one_past_the_retry_budget() {
+        // The loop's whole promise — retry budget plus one attempt — with an interval far longer
+        // than the budget, which is where an unclamped wait would spend a further 2s and then start
+        // an attempt licensed to run 20s past the ceiling.
+        let budget = Duration::from_millis(50);
+        let mut seen: Vec<Instant> = Vec::new();
+        let mut cold = fake(usize::MAX);
+        let mut run = |argv: &[&str], deadline: Instant| -> Result<(String, String)> {
+            seen.push(deadline);
+            cold(argv, deadline)
+        };
+        let started = Instant::now();
+        dump_until_ready(&mut run, PATH, budget, Duration::from_secs(2))
+            .expect_err("a device that never becomes ready");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the wait ran past the budget it was supposed to fit inside: {:?}",
+            started.elapsed()
+        );
+        // Slack for the scheduler: a sleep clamped to the budget still wakes a little after it.
+        let ceiling = started + budget + AdbOp::Dump.budget() + Duration::from_millis(250);
         assert!(
             seen.iter().all(|d| *d <= ceiling),
             "no call may outlive the loop's budget plus one attempt"
+        );
+    }
+
+    #[test]
+    fn a_read_that_ran_out_of_the_attempts_time_is_not_reported_as_a_dump_that_wrote_nothing() {
+        // Sharing one deadline across the three steps is what makes this reachable: the read no
+        // longer gets a fresh budget, so an earlier slow step can leave it none. Blaming the dump's
+        // stderr for it would report a tree nobody looked for as one the dump failed to write —
+        // and, being retryable, would go on retrying a device that had answered.
+        //
+        // The error is the one `glass_core` really produces for a spent deadline, not a fixture
+        // repeating wording this crate does not own. Nothing is spawned on that path, so it needs
+        // no real command.
+        let spent = glass_core::run_bounded_until(
+            &mut std::process::Command::new("adb"),
+            Duration::from_secs(10),
+            Instant::now(),
+            "adb:uiautomator dump",
+        )
+        .expect_err("a spent deadline starts nothing")
+        .to_string();
+
+        let mut attempts = 0;
+        let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "uiautomator", "dump", _] => {
+                    attempts += 1;
+                    Ok((String::new(), format!("{NOT_READY}\n")))
+                }
+                ["shell", "cat", _] => Err(GlassError::Backend(spent.clone())),
+                _ => Ok((String::new(), String::new())),
+            }
+        };
+        let e =
+            dump_until_ready(&mut run, PATH, Duration::from_secs(30), Duration::ZERO).unwrap_err();
+
+        let msg = e.to_string();
+        assert!(
+            msg.contains(glass_core::NOT_STARTED),
+            "the step that ran out of time must be the one reported: {msg}"
+        );
+        assert!(
+            !msg.contains("did not write"),
+            "a read that never ran is no evidence about the dump: {msg}"
+        );
+        assert_eq!(
+            attempts, 1,
+            "an attempt that ran out of time is not a device that is not ready yet"
         );
     }
 
