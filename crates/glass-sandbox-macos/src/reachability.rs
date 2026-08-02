@@ -231,6 +231,7 @@ mod tests {
     // 6. Symlink program: literal dir AND resolved-target dir both re-allowed.
     // REAL: exercises push_reallows's dual-dir (literal + resolved target) dedup logic.
     // -------------------------------------------------------------------------
+    #[cfg(unix)]
     #[test]
     fn symlink_program_reallows_literal_and_target_dirs() {
         let bindir_root = tempfile::tempdir().unwrap();
