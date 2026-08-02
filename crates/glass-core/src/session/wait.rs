@@ -1227,6 +1227,27 @@ mod tests {
     }
 
     /// A condition the fixed fake tree never satisfies, so the wait runs its full budget.
+    /// Walks driven by one 600ms wait at a 20ms interval under `signal`.
+    ///
+    /// `None` gives the control the two pacing tests compare against: a backend with no event
+    /// stream re-walks every interval, so the count is what this machine manages now. A fixed
+    /// number cannot — a runner whose 20ms sleeps land at 50ms fits a third as many in.
+    ///
+    /// 600ms rather than the 200ms the deadline needs: the comparison is between two runs, so it
+    /// carries both their jitter, and +/-1 walk is 25% of a four-sample run but 3% of a thirty-
+    /// sample one.
+    fn walks_in_a_paced_wait(signal: Option<fn() -> Box<dyn ChangeSignal>>) -> usize {
+        let (mut g, walks) = glass_with_a11y_counted(
+            FakePlatform::new(100, 100),
+            vec![fake_tree_enabled()],
+            signal,
+        );
+        g.start(&spec()).unwrap();
+        let o = g.wait_for_element(&never_matches(20, 600)).unwrap();
+        assert!(!o.matched);
+        walks.load(Ordering::Relaxed)
+    }
+
     fn never_matches(interval_ms: u64, timeout_ms: u64) -> WaitElementParams {
         WaitElementParams {
             name: Some("Save".into()),
@@ -1313,23 +1334,23 @@ mod tests {
 
     #[test]
     fn a_signal_that_never_stops_firing_stays_bounded_by_the_deadline() {
-        let (mut g, walks) = glass_with_a11y_counted(
-            FakePlatform::new(100, 100),
-            vec![fake_tree_enabled()],
-            Some(|| Box::new(AlwaysSignals) as Box<dyn ChangeSignal>),
-        );
-        g.start(&spec()).unwrap();
+        let polled = walks_in_a_paced_wait(None);
+        let n = walks_in_a_paced_wait(Some(|| Box::new(AlwaysSignals) as Box<dyn ChangeSignal>));
 
-        let o = g.wait_for_element(&never_matches(20, 200)).unwrap();
-
-        assert!(!o.matched);
-        let n = walks.load(Ordering::Relaxed);
         // A band, not a ceiling. Too many: waking early removed the interval's pacing, and a
-        // chatty app drives back-to-back walks against the bus it is trying to serve. Too few: the
-        // pacing over-sleeps, making the wake slower than the polling it replaced.
+        // chatty app drives back-to-back walks against the bus it is trying to serve. Absolute,
+        // because the deadline caps a paced run at thirty intervals on any machine, while losing the
+        // pacing runs to thousands.
         assert!(
-            (7..=12).contains(&n),
-            "a chatty app drove {n} walks in 200ms at a 20ms interval"
+            n <= 36,
+            "a chatty app drove {n} walks in 600ms at a 20ms interval"
+        );
+        // Too few: the wake ended up slower than the polling it replaced. This signal answers
+        // instantly, so `d.saturating_sub(~0)` is `d` — the pacing arithmetic cannot be wrong
+        // here; the mid-interval test tells the two apart.
+        assert!(
+            n * 6 >= polled * 5,
+            "a chatty app drove {n} walks where polling drove {polled} in the same wait"
         );
     }
 
@@ -1429,20 +1450,20 @@ mod tests {
         // The pacing is "wake early, but no sooner than one interval after the last read". A signal
         // whose change lands halfway through is what tells the two arithmetics apart: sleeping the
         // *remainder* keeps one read per interval, sleeping the elapsed time again halves the rate.
-        let (mut g, walks) = glass_with_a11y_counted(
-            FakePlatform::new(100, 100),
-            vec![fake_tree_enabled()],
-            Some(|| Box::new(ChangesMidInterval) as Box<dyn ChangeSignal>),
-        );
-        g.start(&spec()).unwrap();
+        let polled = walks_in_a_paced_wait(None);
+        let n = walks_in_a_paced_wait(Some(|| {
+            Box::new(ChangesMidInterval) as Box<dyn ChangeSignal>
+        }));
 
-        let o = g.wait_for_element(&never_matches(20, 200)).unwrap();
-
-        assert!(!o.matched);
-        let n = walks.load(Ordering::Relaxed);
         assert!(
-            (7..=12).contains(&n),
-            "a mid-interval change drove {n} walks in 200ms at a 20ms interval"
+            n <= 36,
+            "a mid-interval change drove {n} walks in 600ms at a 20ms interval"
+        );
+        // Sleeping the elapsed time again rather than the remainder costs a third of the rate:
+        // 10ms of signal wait, then a full 20ms instead of the 10ms remaining.
+        assert!(
+            n * 6 >= polled * 5,
+            "a mid-interval change drove {n} walks where polling drove {polled} in the same wait"
         );
     }
 
