@@ -181,6 +181,7 @@ async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
     let root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
+    tree.unreadable = budget.unreadable();
     tree.assign_ids();
     Ok(tree)
 }
@@ -328,6 +329,8 @@ async fn find_nth(
             break;
         }
         let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+            // Counted in `walk` too, so the two traversals report the same drop.
+            budget.note_unreadable();
             continue;
         };
         if let Some(found) = Box::pin(find_nth(
@@ -447,6 +450,7 @@ async fn walk(
                 break;
             }
             let Ok(child) = child_ref.as_accessible_proxy(conn).await else {
+                budget.note_unreadable();
                 continue;
             };
             children.push(Box::pin(walk(&child, conn, depth + 1, budget)).await?);

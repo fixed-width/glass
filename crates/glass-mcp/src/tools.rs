@@ -289,6 +289,16 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
     })
 }
 
+/// Every disclosure a snapshot owes the agent about elements it does not show: the truncation
+/// steer, and the unreadable-subtree notice. Two blocks rather than one because a tree can hit a
+/// bound, lose a subtree to a failed child read, or both, and the recourse differs.
+fn a11y_partial_steers(tree: &glass_core::AxTree) -> Vec<String> {
+    [a11y_truncation_steer(tree), tree.unreadable_notice()]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
     let tree = glass
         .a11y_snapshot(a.max_nodes.map(|n| n as usize))
@@ -306,9 +316,7 @@ pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
     if let Some(hint) = tree.empty_guidance() {
         contents.push(OutContent::Text(hint.to_string()));
     }
-    if let Some(steer) = a11y_truncation_steer(&tree) {
-        contents.push(OutContent::Text(steer));
-    }
+    contents.extend(a11y_partial_steers(&tree).into_iter().map(OutContent::Text));
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
         serde_json::json!({}),
@@ -383,9 +391,7 @@ fn resolve_return(
             if let Some(hint) = tree.empty_guidance() {
                 extra.push(OutContent::Text(hint.to_string()));
             }
-            if let Some(steer) = a11y_truncation_steer(&tree) {
-                extra.push(OutContent::Text(steer));
-            }
+            extra.extend(a11y_partial_steers(&tree).into_iter().map(OutContent::Text));
             Ok((None, extra))
         }
         Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),

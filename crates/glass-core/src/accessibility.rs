@@ -441,6 +441,7 @@ impl Truncation {
 pub struct WalkBudget {
     count: usize,
     truncated: Option<Truncation>,
+    unreadable: usize,
     limits: WalkLimits,
 }
 
@@ -455,6 +456,7 @@ impl WalkBudget {
         WalkBudget {
             count: 0,
             truncated: None,
+            unreadable: 0,
             limits,
         }
     }
@@ -481,6 +483,20 @@ impl WalkBudget {
     /// Whether `depth` has reached the nesting bound (so children must not be walked).
     pub fn depth_exhausted(&self, depth: usize) -> bool {
         depth >= self.limits.depth
+    }
+
+    /// Record a subtree dropped because the platform refused to read a child.
+    ///
+    /// Distinct from [`WalkBudget::hit`]: a bound is a limit glass chose and can raise, while
+    /// this is the walk wanting to continue and being unable to. Call it wherever a child read
+    /// errors and the traversal skips on.
+    pub fn note_unreadable(&mut self) {
+        self.unreadable += 1;
+    }
+
+    /// How many subtrees were dropped because a child read failed.
+    pub fn unreadable(&self) -> usize {
+        self.unreadable
     }
 
     /// Record that a bound stopped the walk. Only the FIRST hit is kept: it is the cause,
@@ -514,6 +530,9 @@ pub struct AxTree {
     /// `Some` when the backend stopped walking early — see [`Truncation`]. `None` means the
     /// tree is complete.
     pub truncated: Option<Truncation>,
+    /// Subtrees dropped because a child read failed. Independent of [`AxTree::truncated`]: a
+    /// tree can hit no bound at all and still be missing elements this way.
+    pub unreadable: usize,
 }
 
 impl AxTree {
@@ -524,6 +543,7 @@ impl AxTree {
             root,
             count: 0,
             truncated: None,
+            unreadable: 0,
         }
     }
 
@@ -591,6 +611,27 @@ impl AxTree {
     /// envelope the app-derived outline is wrapped in. `None` when the tree is complete.
     pub fn truncation_notice(&self) -> Option<String> {
         self.truncated.map(|t| t.notice())
+    }
+
+    /// Disclosure for subtrees the platform refused to read. Separate from
+    /// [`AxTree::truncation_notice`] because the recourse differs: a bound is raisable and
+    /// deterministic, whereas a failed child read is usually an element that went away
+    /// mid-walk, so retrying is worth a try where widening a cap is not.
+    ///
+    /// Without this, such a tree renders exactly like one that genuinely had nothing there,
+    /// and an agent concludes the element does not exist.
+    pub fn unreadable_notice(&self) -> Option<String> {
+        (self.unreadable > 0).then(|| {
+            let (n, s) = (self.unreadable, if self.unreadable == 1 { "" } else { "s" });
+            format!(
+                "… {n} subtree{s} could not be read and {} missing from this outline. Those \
+                 elements are NOT shown and cannot be addressed by id. The read usually fails \
+                 because the element went away mid-walk, so a fresh glass_a11y_snapshot may \
+                 show them; otherwise drive that area by pixels: glass_screenshot, then \
+                 glass_click at x,y.",
+                if self.unreadable == 1 { "is" } else { "are" },
+            )
+        })
     }
 
     /// Guidance to surface when a snapshot exposes nothing to address — only the window
@@ -2299,6 +2340,59 @@ mod tests {
         assert!(
             b.depth_exhausted(MAX_DEPTH),
             "the depth safety rail is preserved under a lifted node cap"
+        );
+    }
+
+    #[test]
+    fn a_complete_tree_discloses_nothing() {
+        let t = AxTree::new(leaf(AxRole::Window, "w"));
+        assert_eq!(t.unreadable_notice(), None);
+        assert_eq!(t.truncation_notice(), None);
+    }
+
+    /// The bug this exists for — see [`AxTree::unreadable_notice`].
+    #[test]
+    fn an_unreadable_subtree_is_disclosed_even_when_no_bound_was_hit() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unreadable = 1;
+        assert_eq!(t.truncated, None, "no bound fired");
+        let n = t
+            .unreadable_notice()
+            .expect("an unreadable subtree must disclose");
+        assert!(n.contains("1 subtree"), "{n}");
+        assert!(n.contains("cannot be addressed by id"), "{n}");
+        assert!(
+            n.contains("glass_a11y_snapshot"),
+            "retry is the recourse here: {n}"
+        );
+    }
+
+    /// Singular and plural both read as English, since the count is agent-facing text.
+    #[test]
+    fn the_unreadable_notice_agrees_in_number() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.unreadable = 1;
+        let one = t.unreadable_notice().unwrap();
+        assert!(one.contains("1 subtree could not be read and is"), "{one}");
+        t.unreadable = 3;
+        let many = t.unreadable_notice().unwrap();
+        assert!(
+            many.contains("3 subtrees could not be read and are"),
+            "{many}"
+        );
+    }
+
+    #[test]
+    fn the_budget_counts_each_unreadable_subtree_separately_from_bounds() {
+        let mut b = WalkBudget::new();
+        assert_eq!(b.unreadable(), 0);
+        b.note_unreadable();
+        b.note_unreadable();
+        assert_eq!(b.unreadable(), 2);
+        assert_eq!(
+            b.truncation(),
+            None,
+            "an unreadable read is not a bound hit"
         );
     }
 

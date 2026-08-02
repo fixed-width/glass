@@ -119,6 +119,7 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     let root_node = walk(&walker, &window, origin, 0, &mut budget)?;
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
+    tree.unreadable = budget.unreadable();
     tree.assign_ids();
     Ok(tree)
 }
@@ -137,6 +138,23 @@ pub(crate) fn find_app_window(automation: &UIAutomation, ctx: &AxContext) -> Res
     automation
         .element_from_handle(Handle::from(handle as isize))
         .map_err(uia_err)
+}
+
+/// A tree-walker step's result, with a genuine read failure counted on `budget`.
+///
+/// UIA reports "there is no such element" as `S_OK` with a NULL out-param, which `windows-rs`
+/// cannot build an interface from — so absence arrives as an `Err` too. It is separable because
+/// that error's code reaches us as **zero** (`windows_result::Error::code` maps its internal
+/// empty-error sentinel back to `HRESULT(0)`), while a real failure carries a negative HRESULT,
+/// and `uiautomation::Error::result` is `Some` only for a negative code. A plain `.ok()` collapses
+/// the two, which is what let a dropped subtree read as an empty one.
+fn step(r: uiautomation::Result<UIElement>, budget: &mut WalkBudget) -> Option<UIElement> {
+    r.inspect_err(|e| {
+        if e.result().is_some() {
+            budget.note_unreadable();
+        }
+    })
+    .ok()
 }
 
 /// Recursively build a normalized node, bounded by [`WalkBudget`] (node count, nesting depth,
@@ -165,7 +183,7 @@ fn walk(
     let mut children = Vec::new();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
-    let first_child = walker.get_first_child(el).ok();
+    let first_child = step(walker.get_first_child(el), budget);
     // Tests only whether a first child exists, before `is_offscreen` filters it. A node whose
     // children are all offscreen, reached once the budget is spent, still records a truncation
     // though nothing real was declined. Pre-filtering would mean walking the whole
@@ -192,7 +210,7 @@ fn walk(
             if !c.is_offscreen().unwrap_or(false) {
                 children.push(walk(walker, &c, origin, depth + 1, budget)?);
             }
-            child = walker.get_next_sibling(&c).ok();
+            child = step(walker.get_next_sibling(&c), budget);
         }
     }
 
@@ -543,7 +561,7 @@ fn find_nth(
     budget.visit();
     // Resolved before the gate: a childless node must never be reported truncated for
     // declining to explore a list that was already empty.
-    let first_child = walker.get_first_child(el).ok();
+    let first_child = step(walker.get_first_child(el), budget);
     // Same gap as `walk`: only tests whether a first child exists, before `is_offscreen` runs.
     // A node whose children are all offscreen, reached once the budget is spent, still records
     // a truncation though nothing real was declined — left as-is for the same reason: it would
@@ -570,7 +588,7 @@ fn find_nth(
         {
             return Some(found);
         }
-        child = walker.get_next_sibling(&c).ok();
+        child = step(walker.get_next_sibling(&c), budget);
     }
     None
 }
@@ -579,6 +597,31 @@ fn find_nth(
 mod tests {
     use super::*;
     use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,
+    /// every leaf in every snapshot would report an unreadable subtree. Builds the error
+    /// directly rather than driving a walker, so it needs no COM.
+    #[test]
+    fn an_absent_child_is_not_counted_as_unreadable() {
+        let mut budget = WalkBudget::new();
+        // Zero is what the real chain yields for an absent child — see `step`.
+        let absent = uiautomation::Error::new(0, "no such element");
+        assert!(step(Err(absent), &mut budget).is_none());
+        assert_eq!(
+            budget.unreadable(),
+            0,
+            "S_OK with a null out-param means no such element, not a failed read"
+        );
+    }
+
+    #[test]
+    fn a_failed_child_read_is_counted_as_unreadable() {
+        let mut budget = WalkBudget::new();
+        // UIA_E_ELEMENTNOTAVAILABLE — a real failure, negative like every HRESULT error.
+        let failed = uiautomation::Error::new(-2147220991, "element not available");
+        assert!(step(Err(failed), &mut budget).is_none());
+        assert_eq!(budget.unreadable(), 1);
+    }
 
     #[test]
     fn below_the_caps_children_may_be_explored_and_nothing_is_recorded() {
