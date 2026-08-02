@@ -72,6 +72,16 @@ harness = false
 name = "window_adopt_probe"
 harness = false
 
+# Test-only fixture for process::tests' SandboxLevel::Default tests (crates/glass-macos/
+# src/process.rs), spawned in place of /bin/sh: dyld treats Apple platform code specially in
+# ways that defeat DYLD_INSERT_LIBRARIES clip-shim injection into it — an arch-mismatch abort
+# on CI, a silent DYLD_* strip on a newer macOS (see src/bin/sandbox_probe.rs's doc for both).
+# A plain cargo-built binary is neither restricted platform code nor arch-mismatched with the
+# shim. See process.rs's `sandbox_probe_path`.
+[[bin]]
+name = "glass-macos-sandbox-probe"
+path = "src/bin/sandbox_probe.rs"
+
 [dependencies]
 glass-core.workspace = true
 plist = "1"

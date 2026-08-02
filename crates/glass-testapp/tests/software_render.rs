@@ -2,6 +2,8 @@
 //! proof that glass injects software-render env defaults for sandboxed launches. `#[ignore]d`
 //! (needs Xvfb + python3-gi/GTK 4); run via `./scripts/test-x11.sh`.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use std::process::Command;

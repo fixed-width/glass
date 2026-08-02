@@ -10,6 +10,7 @@
 //! `./scripts/test-x11.sh stdio_host_can` (the bare file name `host_conformance`
 //! is not a test name and matches nothing).
 
+#![cfg(target_os = "linux")]
 // The HTTP path needs one `unsafe { env::set_var }` for pre-spawn setup (mirrors
 // tests/network.rs); opt out of the workspace `unsafe_code = "deny"`.
 #![allow(unsafe_code)]

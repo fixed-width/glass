@@ -7,6 +7,8 @@
 //! CI job — so this measurement's 20 extra cold launches per run don't ride along with output CI
 //! discards. Run via `scripts/x11-geometry-settle-measurement.sh`.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use common::Xvfb;

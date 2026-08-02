@@ -457,6 +457,34 @@ mod tests {
         Arc::new(Mutex::new(Vec::new()))
     }
 
+    /// Path to the `glass-macos-sandbox-probe` fixture (see `src/bin/sandbox_probe.rs`) that
+    /// the `SandboxLevel::Default` tests below spawn in place of `/bin/sh`. Located the same
+    /// way `shim_dylib_path_with` locates the clip shim: `cargo test`'s own binary lives at
+    /// `target/<profile>/deps/<hash>`, one directory below where `cargo build --all-targets`
+    /// places a plain `[[bin]]` target's unhashed copy. `scripts/test-macos.sh` builds this
+    /// fixture first, so it's never missing under the sanctioned entry point. Panics (never
+    /// skips) if it somehow still is — these tests must not silently pass without exercising
+    /// the containment they assert.
+    fn sandbox_probe_path() -> PathBuf {
+        const PROBE_BIN_NAME: &str = "glass-macos-sandbox-probe";
+        let exe_dir = std::env::current_exe()
+            .expect("read current_exe")
+            .parent()
+            .expect("current_exe has a parent dir")
+            .to_path_buf();
+        let probe = exe_dir
+            .parent()
+            .expect("exe_dir has a parent dir")
+            .join(PROBE_BIN_NAME);
+        assert!(
+            probe.is_file(),
+            "{probe:?} not built; run `cargo build -p glass-macos --bin {PROBE_BIN_NAME}` \
+             (matching this run's profile, e.g. add --release) first — \
+             scripts/test-macos.sh does this automatically"
+        );
+        probe
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn default_sandbox_runs_but_contains_filesystem() {
@@ -468,7 +496,7 @@ mod tests {
         //
         // Both the probe and the secret are files that provably exist (rather than relying on a
         // fixed name like `.ssh/known_hosts`, which may not exist on a fresh CI runner) so a
-        // `cat` failure can only mean the sandbox denied it, never that the path was absent.
+        // failed read can only mean the sandbox denied it, never that the path was absent.
         let home = std::env::var("HOME").expect("HOME must be set");
         let proj =
             std::path::Path::new(&home).join(format!("glass-sbx-cwd-{}", std::process::id()));
@@ -494,20 +522,51 @@ mod tests {
             secret: secret_path.clone(),
             proj: proj.clone(),
         };
-        let proj_str = proj.to_str().expect("project path is valid UTF-8");
+        let probe_str = probe_path.to_str().expect("probe path is valid UTF-8");
         let secret = secret_path.to_str().expect("secret path is valid UTF-8");
-        let shell_cmd = format!(
-            "cat /usr/lib/dyld >/dev/null 2>&1 && echo SYS_OK; \
-             cat \"{proj_str}/probe\" >/dev/null 2>&1 && echo CWD_OK; \
-             cat \"{secret}\" >/dev/null 2>&1 && echo HOME_READABLE || echo HOME_DENIED",
-        );
+        let probe_bin = sandbox_probe_path();
+        let probe_bin_str = probe_bin
+            .to_str()
+            .expect("sandbox-probe path is valid UTF-8");
+        // The paths ride in `env`, not argv: `launch_reallows` re-allows any `run[1..]` token
+        // that is itself an absolute, existing path (a launched script's own path argument), and
+        // `SECRET_PATH` is exactly the path this test proves is denied — naming it in argv would
+        // re-allow it and the assertion below would pass for the wrong reason.
+        let run = [
+            probe_bin_str,
+            "--read-env",
+            "SYS_PATH",
+            "SYS_OK",
+            "SYS_DENIED",
+            "--read-env",
+            "CWD_PATH",
+            "CWD_OK",
+            "CWD_DENIED",
+            "--read-env",
+            "SECRET_PATH",
+            "HOME_READABLE",
+            "HOME_DENIED",
+        ];
 
-        let mut denied = spec(&["/bin/sh", "-c", shell_cmd.as_str()]);
+        let mut denied = spec(&run);
         denied.sandbox = SandboxLevel::Default;
         denied.cwd = Some(proj.clone());
+        denied.env = vec![
+            ("SYS_PATH".to_string(), "/usr/lib/dyld".to_string()),
+            ("CWD_PATH".to_string(), probe_str.to_string()),
+            ("SECRET_PATH".to_string(), secret.to_string()),
+        ];
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(&denied, logs.clone())
+        let (mut child, clip) = spawn(&denied, logs.clone())
             .unwrap_or_else(|e| panic!("sandboxed spawn should succeed: {e}"));
+        // The probe is a plain, unsigned arm64 binary — always injectable — so a `None` here
+        // means the shim never resolved (most likely `glass-clip-shim-macos` wasn't built; see
+        // scripts/test-macos.sh), not that containment itself is untested. Assert it explicitly
+        // rather than letting the containment checks below pass without exercising injection.
+        assert!(
+            clip.is_some(),
+            "clip shim was not injected into the sandboxed probe; is glass-clip-shim-macos built?"
+        );
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
         let out: Vec<String> = logs
@@ -544,18 +603,18 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn default_sandbox_reaches_launch_target_under_home_when_cwd_is_elsewhere() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = std::env::var("HOME").expect("HOME must be set");
-        let script_dir =
+        let target_dir =
             std::path::Path::new(&home).join(format!("glass-sbx-target-{}", std::process::id()));
-        std::fs::create_dir_all(&script_dir).expect("create script dir under $HOME");
-        let script_path = script_dir.join("run.sh");
+        std::fs::create_dir_all(&target_dir).expect("create target dir under $HOME");
+        // A copy of the probe binary itself, not a `#!/bin/sh` script: the interpreter named by
+        // a shebang is what actually gets exec'd and injected into, so a script would hit the
+        // same arm64e mismatch `sandbox_probe_path`'s doc comment describes for `/bin/sh`.
+        // `fs::copy` preserves the source's executable bit, so no `chmod` is needed here.
+        let target_path = target_dir.join("glass-macos-sandbox-probe");
+        std::fs::copy(sandbox_probe_path(), &target_path)
+            .expect("copy sandbox-probe fixture under $HOME");
         let sentinel = format!("GLASS_SBX_SENTINEL_{}", std::process::id());
-        std::fs::write(&script_path, format!("#!/bin/sh\necho {sentinel}\n"))
-            .expect("write script under $HOME");
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x script");
 
         // Drop guard so the dir under $HOME is removed even if an assertion below panics.
         struct Cleanup(std::path::PathBuf);
@@ -564,22 +623,29 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let _cleanup = Cleanup(script_dir.clone());
+        let _cleanup = Cleanup(target_dir.clone());
 
-        let script_str = script_path.to_str().expect("script path is valid UTF-8");
-        let mut launch = spec(&[script_str]);
+        let target_str = target_path.to_str().expect("target path is valid UTF-8");
+        let mut launch = spec(&[target_str, "--print", sentinel.as_str()]);
         launch.sandbox = SandboxLevel::Default;
         // Deliberately OUTSIDE $HOME: proves the launch target is reachable via its OWN
         // re-allow, not merely because it happens to sit under a reallowed cwd.
         launch.cwd = Some(std::env::temp_dir());
 
         let logs = empty_sink();
-        let (mut child, _clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
+        let (mut child, clip) = spawn(&launch, logs.clone()).unwrap_or_else(|e| {
             panic!(
                 "sandboxed spawn of a launch target under $HOME (cwd outside $HOME) should \
                  succeed: {e}"
             )
         });
+        // See default_sandbox_runs_but_contains_filesystem's identical assertion: the copied
+        // probe is always injectable, so `None` means the shim never resolved, not that the
+        // reachability behaviour below is untested.
+        assert!(
+            clip.is_some(),
+            "clip shim was not injected into the sandboxed probe; is glass-clip-shim-macos built?"
+        );
         child.wait().expect("wait");
         std::thread::sleep(Duration::from_millis(100));
 

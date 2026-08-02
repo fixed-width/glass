@@ -2,6 +2,7 @@
 //! production `glass_x11::Xvfb` so there is one implementation; this wrapper just
 //! supplies the test screen size and panics on failure (what tests expect).
 
+#![cfg(target_os = "linux")]
 #![allow(dead_code)]
 
 use std::ops::Deref;

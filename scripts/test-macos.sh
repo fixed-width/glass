@@ -12,6 +12,18 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
+# process::tests' SandboxLevel::Default tests spawn this fixture and assert the clip shim was
+# actually injected — see src/bin/sandbox_probe.rs and process.rs's spawn doc. Neither is a
+# Cargo dependency of glass-macos, so a scoped `cargo test -p glass-macos --lib` builds neither
+# on its own: build both explicitly, not relying on an earlier `cargo build --workspace` step
+# having happened first.
+#
+# Two separate invocations: a `--bin NAME` filter applies across every `-p` package in the same
+# command, and glass-clip-shim-macos has no bin named `glass-macos-sandbox-probe` — combined,
+# cargo silently builds nothing for it instead of erroring (verified: 0.04s, no dylib produced).
+cargo build -p glass-macos --bin glass-macos-sandbox-probe
+cargo build -p glass-clip-shim-macos
+
 # Pure + macOS unit tests only (`--lib`), minus the `#[ignore]`d ones that need a window
 # server (GLASS_MACOS_ONBOX below runs those). `crates/glass-macos/tests/capture.rs` is now a
 # real `[[test]]` target (see Cargo.toml), so a plain `cargo test -p glass-macos` with no

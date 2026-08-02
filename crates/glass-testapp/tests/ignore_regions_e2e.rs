@@ -4,6 +4,7 @@
 //! and the settle/diff logic together. `#[ignore]`d; run via
 //! `./scripts/test-x11.sh blink_region_settles_with_ignore_and_masks_diff`.
 
+#![cfg(target_os = "linux")]
 // This test needs one `unsafe { env::set_var }` for pre-spawn setup (see the `// SAFETY:` note
 // below), so it opts out of the workspace `unsafe_code = "deny"` — same as network.rs.
 #![allow(unsafe_code)]

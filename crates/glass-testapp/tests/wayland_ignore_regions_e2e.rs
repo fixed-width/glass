@@ -5,6 +5,8 @@
 //! not the mask. `#[ignore]`d; run via
 //! `./scripts/test-wayland.sh blink_region_settles_with_ignore_and_masks_diff`.
 
+#![cfg(target_os = "linux")]
+
 mod common;
 
 use common::mcp_ignore::assert_blink_region_e2e;

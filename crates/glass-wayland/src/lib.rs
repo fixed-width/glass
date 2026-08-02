@@ -1,6 +1,8 @@
 //! glass-wayland: the Linux/Wayland `Platform` backend (wlroots protocols,
 //! per-session headless `sway` compositor).
 
+#![cfg(target_os = "linux")]
+
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod clipboard;

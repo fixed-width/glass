@@ -6,14 +6,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 glass-core.workspace = true
 atspi.workspace = true
 atspi-common.workspace = true
 zbus.workspace = true
 tokio.workspace = true
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 glass-x11 = { path = "../glass-x11" }
 glass-wayland = { path = "../glass-wayland" }
 tempfile.workspace = true

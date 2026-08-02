@@ -155,12 +155,10 @@ jobs:
   macos:
     name: macOS (build · clippy · test)
     runs-on: macos-14   # arm64 hosted runner
-    # Only the glass-macos crate is Mac-specific; the rest of the workspace already
-    # builds/tests on the Linux `check` job. This is the only place the
-    # cfg(target_os = "macos") code gets built + linted + tested — the Linux job can't
-    # compile it. Capture/input integration tests are #[ignore]d (need a granted,
-    # WindowServer-connected TCC context) and run on-box; the runner covers pure +
-    # macOS unit tests.
+    # This is the only place cfg(target_os = "macos") code gets built + linted + tested — the
+    # Linux job can't compile it. The capture/input/windows/a11y/bundle_launch integration
+    # targets are harness = false and hard-fail without a granted, WindowServer-connected TCC
+    # context, so they run on-box only; the runner covers pure macOS unit tests.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustup auto-installs the pinned toolchain + components from
@@ -170,54 +168,29 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      - run: cargo build  -p glass-macos --locked
-      - run: cargo clippy -p glass-macos --all-targets --locked -- -D warnings
+      # The Linux-only crates gate themselves off macOS (#293), so --workspace resolves
+      # here now: a workspace-wide build + lint gate, with the gated crates compiling to
+      # nothing. No `cargo test --workspace` here — five of glass-macos's seven
+      # `harness = false` integration targets (capture, input, windows, a11y, bundle_launch)
+      # hard-fail without the TCC grants this runner doesn't have (the other two, role_probe
+      # and window_adopt_probe, exit 0 unconfigured); ./scripts/test-macos.sh below runs
+      # `--lib` instead.
+      - run: cargo build  --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: ./scripts/test-macos.sh
-      # glass-a11y-macos is the standalone AXUIElement accessibility reader glass-mcp wires
-      # into the macOS backend (make_platform, doctor's "accessibility (macos)" section).
-      # Its pure `mapping` module has no cfg(macos) gate and already builds + unit-tests on
-      # the Linux `check` job's `cargo build/test --workspace` legs; this is the only job
-      # that can build/lint/test the cfg(target_os = "macos") `ffi`/`reader` modules
-      # underneath it (the AXUIElement snapshot/set_value implementation, incl. `reader`'s
-      # `set_value_took` unit tests, which are compiled out everywhere else).
-      - run: cargo build  -p glass-a11y-macos --locked
-      - run: cargo clippy -p glass-a11y-macos --all-targets --locked -- -D warnings
-      - run: cargo test   -p glass-a11y-macos --locked
-      # glass-sandbox-macos is the Seatbelt (sandbox_init) process-containment crate. Its
-      # pure `build_profile` SBPL generator has no cfg(macos) gate and already builds +
-      # unit-tests on the Linux `check` job's `cargo build/test --workspace` legs; this is
-      # the only job that can build/lint/test the cfg(target_os = "macos") `ffi`/`doctor`
-      # modules underneath it. The `glass-macos` `--lib` containment test that actually
-      # spawns a contained process runs via `./scripts/test-macos.sh` above.
-      - run: cargo build  -p glass-sandbox-macos --locked
-      - run: cargo clippy -p glass-sandbox-macos --all-targets --locked -- -D warnings
-      - run: cargo test   -p glass-sandbox-macos --locked
-      # glass-clip-shim-macos is the DYLD_INSERT_LIBRARIES cdylib that swizzles
-      # +[NSPasteboard generalPasteboard] inside a contained app process. It's cdylib-only
-      # (crate-type = ["cdylib"], no rlib), so there's nothing for `cargo test` to run here —
-      # the pure routing logic it's driven by lives in glass-macos::clipboard_route, which
-      # has no cfg(macos) gate and already unit-tests on the Linux `check` job's `cargo test
-      # --workspace` leg. This is the only job that can build/lint the swizzle itself.
-      - run: cargo build  -p glass-clip-shim-macos --all-targets --locked
-      - run: cargo clippy -p glass-clip-shim-macos --all-targets --locked -- -D warnings
-      # Compile/link gate for the harness=false `a11y` on-box integration test
-      # (crates/glass-macos/tests/a11y.rs) and its Swift fixture — proves both build against
-      # this runner's SDK without attempting the granted run (needs the Accessibility/Screen
-      # Recording TCC grants and a WindowServer session the runner doesn't have; that
-      # happens out-of-band — see the script's own comments and docs/how-to/build-from-source.md).
+      # glass-mcp, glass-a11y-macos and glass-sandbox-macos carry cfg(target_os = "macos")
+      # unit tests (e.g. glass-a11y-macos::reader's set_value_took, glass-mcp::doctor's
+      # backend-resolution tests). None of their test targets is harness = false (unlike
+      # glass-macos above), so `cargo test -p` on them runs ungranted exactly as it did
+      # before #293 — this is still the only job that compiles and runs that code at all.
+      - run: cargo test -p glass-mcp -p glass-a11y-macos -p glass-sandbox-macos --locked
+      # Builds the Swift fixture (crates/glass-macos/fixture/a11y_fixture.swift) — the one
+      # thing `cargo build --workspace --all-targets` above doesn't reach — and re-links the
+      # harness=false `a11y` integration test (crates/glass-macos/tests/a11y.rs) as a belt-
+      # and-braces check, without attempting the granted run (needs the Accessibility/Screen
+      # Recording TCC grants and a WindowServer session the runner doesn't have; that happens
+      # out-of-band — see the script's own comments and docs/how-to/build-from-source.md).
       - run: ./scripts/test-macos-a11y.sh
-      # glass-mcp is the shipped binary; only this job can build/lint/test/run its
-      # cfg(target_os = "macos") wiring (Cargo.toml's macos dep, lib.rs's "macos" backend
-      # arm + default_backend). `cargo test` here is what actually executes the grants-free
-      # unit tests behind #[cfg(target_os = "macos")] (e.g. doctor's session-state /
-      # backend-resolution tests) — Linux/Windows compile that code out entirely, so this is
-      # the only job that runs it. Capture/input tools still need a granted,
-      # WindowServer-connected session the runner doesn't have, so those stay at
-      # build/lint/headless-boot — the granted checks run on-box (see
-      # docs/how-to/build-from-source.md).
-      - run: cargo build  -p glass-mcp --locked
-      - run: cargo clippy -p glass-mcp --all-targets --locked -- -D warnings
-      - run: cargo test   -p glass-mcp --locked
       - name: glass-mcp doctor sees the macos backend (TCC grants are absent on the runner)
         # `doctor` exits non-zero without the Screen Recording/Accessibility grants, which
         # the runner never has — expected, and NOT gated here (a hard exit-code gate would
@@ -246,7 +219,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
-      # --workspace can't be used: glass-wayland/glass-testapp are Unix-only. Scope to
+      # --workspace can't be used: glass-ios is Unix-only (unconditional std::os::unix /
+      # Permissions::from_mode use) and ungated, unlike the Linux backends (#293). Scope to
       # the Windows crate closure with an explicit -p list (a future Unix-only crate
       # won't get silently pulled, unlike --exclude). --all-targets compiles the
       # glass-windows examples natively.

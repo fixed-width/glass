@@ -7,6 +7,8 @@
 //! CI job — so this measurement's 20 extra cold launches + sway spawns per run don't ride along
 //! with output CI discards. Run via `scripts/wayland-geometry-settle-measurement.sh`.
 
+#![cfg(target_os = "linux")]
+
 use glass_core::{AppSpec, Platform, WindowOp};
 use glass_wayland::WaylandPlatform;
 
