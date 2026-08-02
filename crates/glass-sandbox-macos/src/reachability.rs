@@ -1,12 +1,12 @@
 //! Compute the Seatbelt re-allows that make a sandboxed launch's OWN target reachable under the
 //! `/Users` read-deny, without re-exposing home. Resolution is shared with the Linux backend
-//! (`glass-sandbox-core`); only the emit differs: a safe directory becomes a `(subpath …)`
+//! (`glass-sandbox-unix`); only the emit differs: a safe directory becomes a `(subpath …)`
 //! re-allow (ro_binds), a file directly under a bare home root becomes a single-file `(literal …)`
 //! re-allow (ro_files), and a target that IS a home root or above contributes nothing.
 
 use std::path::{Path, PathBuf};
 
-use glass_sandbox_core::{abs_token, canon, dir_of, resolve_on_path};
+use glass_sandbox_unix::{abs_token, canon, dir_of, resolve_on_path};
 
 use crate::profile::{is_home_root_or_above, is_safe_reallow, under_users};
 

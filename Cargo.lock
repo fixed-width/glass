@@ -1200,18 +1200,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "glass-sandbox-core"
-version = "0.0.0"
-dependencies = [
- "tempfile",
-]
-
-[[package]]
 name = "glass-sandbox-linux"
 version = "0.0.0"
 dependencies = [
  "glass-core",
- "glass-sandbox-core",
+ "glass-sandbox-unix",
  "tempfile",
 ]
 
@@ -1220,7 +1213,14 @@ name = "glass-sandbox-macos"
 version = "0.0.0"
 dependencies = [
  "glass-core",
- "glass-sandbox-core",
+ "glass-sandbox-unix",
+ "tempfile",
+]
+
+[[package]]
+name = "glass-sandbox-unix"
+version = "0.0.0"
+dependencies = [
  "tempfile",
 ]
 

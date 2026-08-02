@@ -1,11 +1,11 @@
-//! Launch-target *resolution* atoms shared by glass's per-OS sandbox crates
-//! (`glass-sandbox-linux`, `glass-sandbox-macos`). No OS-specific containment logic lives here —
-//! only "given a program + args + cwd, what absolute host paths does the launch actually touch,
-//! resolved the way the child is exec'd." Each backend applies its OWN exposure guard/emit on top.
+//! Launch-target *resolution* atoms shared by glass's two sandbox backends, bwrap on Linux
+//! (`glass-sandbox-linux`) and Seatbelt on macOS (`glass-sandbox-macos`) — unix both, which is
+//! what makes this crate unix. No OS-specific containment logic lives here: only "given a
+//! program + args + cwd, what absolute host paths does the launch actually touch, resolved the
+//! way the child is exec'd." Each backend applies its OWN exposure guard/emit on top.
 //!
-//! Unix-only, because both consumers are: bwrap and Seatbelt have no Windows counterpart. Gating
-//! the crate is what lets `is_absolute()` and the execute-bit check mean what they say — compiled
-//! for Windows, `/a/b` reads as relative and the mode check has nothing to test.
+//! Everything here reads POSIX semantics — `/`-rooted paths, the execute bit, `execvp` lookup —
+//! so compiled off unix `is_absolute()` and the mode check would quietly mean something else.
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
