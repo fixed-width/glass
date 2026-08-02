@@ -12,15 +12,15 @@ fi
 # (mirrors scripts/test-x11.sh / test-wayland.sh / test-windows.sh).
 cd "$(dirname "$0")/.."
 
-# process::tests' SandboxLevel::Default tests (landed 2026-07-01) spawn this fixture and assert
-# the clip shim (injection support added 2026-07-02) was actually injected into it — see
-# src/bin/sandbox_probe.rs and process.rs's spawn doc. Neither the fixture nor the shim is a
-# Cargo dependency of glass-macos, so `cargo test -p glass-macos --lib` below builds neither on
-# its own: build both explicitly rather than relying on an earlier, separate `cargo build
-# --workspace` step having happened to build them first. That exact incidental ordering — the
-# shim dylib not existing when a scoped `-p glass-macos` test run built nothing else — is what
-# let the tests pass for about a month (2026-07-02 until this fix) without the shim ever
-# resolving, so injection was silently skipped every time.
+# process::tests' SandboxLevel::Default tests (landed 2026-07-01 and 2026-07-20) spawn this
+# fixture and assert the clip shim (injection support added 2026-07-02) was actually injected
+# into it — see src/bin/sandbox_probe.rs and process.rs's spawn doc. Neither the fixture nor the
+# shim is a Cargo dependency of glass-macos, so `cargo test -p glass-macos --lib` below builds
+# neither on its own: build both explicitly rather than relying on an earlier, separate `cargo
+# build --workspace` step having happened to build them first. That exact incidental ordering —
+# the shim dylib not existing when a scoped `-p glass-macos` test run built nothing else — is
+# what let both tests pass without the shim ever resolving, from whenever each landed until this
+# fix, so injection was silently skipped every time.
 #
 # Two separate invocations, not one `-p glass-macos --bin ... -p glass-clip-shim-macos`: a
 # `--bin NAME` filter applies across every `-p` package in the same command, and
