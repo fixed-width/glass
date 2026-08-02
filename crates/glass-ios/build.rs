@@ -4,6 +4,12 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The generated client's only consumer, the `idb` module, is `#![cfg(unix)]`-gated
+    // in lib.rs; skip codegen when it won't be compiled in. `CARGO_CFG_UNIX` reflects the
+    // compile target, not the host, so this holds under cross-compilation too.
+    if std::env::var_os("CARGO_CFG_UNIX").is_none() {
+        return Ok(());
+    }
     let proto = "proto/idb.proto";
     println!("cargo:rerun-if-changed={proto}");
     // protox parses the proto and returns a prost `FileDescriptorSet`.

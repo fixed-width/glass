@@ -9,7 +9,9 @@ publish.workspace = true
 [lib]
 bench = false
 
-[dependencies]
+# The whole crate body is `#![cfg(unix)]`-gated (src/lib.rs), so every dependency is
+# too — mirrors glass-x11/glass-wayland, the workspace's other fully-gated crates.
+[target.'cfg(unix)'.dependencies]
 glass-core.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -27,6 +29,10 @@ tokio-stream.workspace = true
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
+# Deliberately not target-gated: `[target.'cfg(...)'.build-dependencies]` is evaluated
+# against the host, not the compile target, so a `cfg(unix)` table here would not drop
+# these when cross-compiling to Windows from a unix host (confirmed by testing it).
+# build.rs skips codegen off-unix via `CARGO_CFG_UNIX` instead.
 [build-dependencies]
 tonic-prost-build.workspace = true
 protox.workspace = true
