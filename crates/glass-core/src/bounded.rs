@@ -20,8 +20,8 @@ use crate::{GlassError, Result};
 pub const TIMED_OUT: &str = "no answer within";
 
 /// The phrase an error carries when a call was never started, because the deadline it serves was
-/// already spent. Deliberately not [`TIMED_OUT`]: nothing was asked, so nothing failed to answer,
-/// and the remedies for a wedged tool do not apply.
+/// already spent. Deliberately not [`TIMED_OUT`]: the remedies for a tool that hung do not apply to
+/// one that never ran.
 pub const NOT_STARTED: &str = "was not started";
 
 /// Longest gap between checks on a child that has not exited yet. The wait starts far tighter and
@@ -65,11 +65,9 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
 /// serves. Killing and draining a child still runs after that, as it does for a plain budget.
 ///
 /// Several calls can answer one request: one `uiautomator dump` is a remove, a dump and a read.
-/// Each carrying only its own budget makes the sequence cost their sum, so the caller's deadline
-/// travels down and each step gets whichever bound is nearer. A step with nothing left is not
-/// started at all — its outcome is already decided, and spawning it would cost a process and the
-/// wait to kill it. That step's error says [`NOT_STARTED`] rather than [`TIMED_OUT`], so a caller
-/// does not answer it with a remedy for a tool that never ran.
+/// Each carrying only its own budget makes the sequence cost their sum, so the deadline travels
+/// down and each step gets whichever bound is nearer. A step with nothing left is not started at
+/// all, and says [`NOT_STARTED`].
 pub fn run_bounded_until(
     cmd: &mut Command,
     budget: Duration,
@@ -757,8 +755,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_call_dies_at_the_deadline_it_serves_rather_than_at_its_own_budget() {
-        // A step of a longer sequence gets what is left of the sequence's deadline. Without this,
-        // three steps each carrying their own budget cost the sum of all three.
+        // A step of a longer sequence gets what is left of the sequence's deadline, not the sum of
+        // three steps' budgets.
         let started = Instant::now();
         let err = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
@@ -793,9 +791,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_call_with_no_time_left_is_not_started_at_all() {
-        // Spawning a child only to kill it at once costs a process and a wait; the failure is
-        // already decided. The wording is what proves it: spawning would time out at 0ns and say
-        // so, which is a different sentence and one a caller answers differently.
+        // Spawning a child only to kill it at once costs a process and a wait. The wording is what
+        // discriminates: spawning would time out at 0ns and say so.
         let started = Instant::now();
         let err = run_bounded_until(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),

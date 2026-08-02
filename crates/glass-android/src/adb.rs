@@ -126,9 +126,9 @@ impl Adb {
     ///
     /// Two streams because a command whose exit status does not signal success — `uiautomator dump`
     /// exits 0 when it fails, and explains itself on stderr — leaves the caller to judge the outcome
-    /// from the streams itself. `deadline` bounds the sequence: the call gets its operation's budget
-    /// or what is left of that, whichever is nearer, so the steps of one dump cannot together cost
-    /// the sum of their budgets.
+    /// from the streams itself. The call gets its operation's budget or what is left of `deadline`,
+    /// whichever is nearer, so the steps of one dump cannot together cost the sum of their
+    /// budgets.
     pub fn run_streams_until<'a, I>(&self, args: I, deadline: Instant) -> Result<(String, String)>
     where
         I: IntoIterator<Item = &'a str>,
@@ -267,8 +267,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_deadline_handed_to_adb_reaches_the_process_that_runs() {
-        // The wiring the whole fix rests on: `output` must pass the deadline to the bounded runner,
-        // not merely accept one. `/bin/sh` stands in for adb — `AdbOp::Shell`'s 10s budget is what
+        // The wiring the fix rests on: `output` must pass the deadline to the bounded runner, not
+        // merely accept one. `/bin/sh` stands in for adb, and `AdbOp::Shell`'s 10s budget is what
         // this call would otherwise wait out.
         let adb = Adb {
             bin: "/bin/sh".to_string(),

@@ -41,10 +41,10 @@ pub(crate) fn adb_runner(
 /// When one whole dump attempt — the stale-file removal, the dump, and the read of what it wrote —
 /// must be done by.
 ///
-/// The three share [`AdbOp::Dump`]'s budget, which is what that budget already describes: one
-/// snapshot. The removal classifies as `AdbOp::Shell` and keeps its own 10s ceiling within that.
-/// A step carrying only its own budget let an attempt cost the sum of all three — 50s, against the
-/// 10s a `glass_wait_for_element` asks for by default and re-snapshots inside.
+/// The three share [`AdbOp::Dump`]'s budget — one snapshot's worth — with the removal keeping its
+/// own `AdbOp::Shell` ceiling inside that. A step carrying only its own budget let an attempt cost
+/// the sum of all three, 50s against the 10s a `glass_wait_for_element` asks for by default and
+/// re-snapshots inside.
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
 }
@@ -78,10 +78,9 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, path: &str, deadline: Instant) 
 
 /// Whether an error is the attempt's own deadline firing rather than the device answering.
 ///
-/// A read that ran out of the attempt's time never reached the device, so it is no evidence about
-/// the dump: substituting the dump's stderr for it would report a tree nobody looked for as one the
-/// dump failed to write, and — since that substitution is retryable — would keep retrying a device
-/// that had answered. Matched on the phrases `glass_core` publishes for exactly this.
+/// A read that ran out of the attempt's time never reached the device, so the dump's stderr is no
+/// explanation for it — and that substitution is retryable, so the loop would go on retrying a
+/// device that had answered. Matched on the phrases `glass_core` publishes for exactly this.
 fn bound_fired(e: &GlassError) -> bool {
     let msg = e.to_string();
     msg.contains(TIMED_OUT) || msg.contains(NOT_STARTED)
@@ -495,9 +494,9 @@ mod tests {
     #[test]
     fn the_three_steps_of_one_dump_share_one_deadline_worth_a_single_dump() {
         // The defect this fixes: each step carrying its own budget let one attempt cost their sum
-        // (10s + 20s + 20s), which the loop's own deadline — checked only between attempts — could
-        // not see. The lower bound is the other half: an attempt is given a whole dump's worth even
-        // when, as here, the loop has no budget to retry with.
+        // (10s + 20s + 20s), which the loop's deadline — checked only between attempts — could not
+        // see. The lower bound is the other half: an attempt gets a whole dump's worth even when,
+        // as here, the loop has no budget to retry with.
         let mut seen: Vec<Instant> = Vec::new();
         let mut run = |argv: &[&str], deadline: Instant| -> Result<(String, String)> {
             seen.push(deadline);
@@ -551,9 +550,8 @@ mod tests {
 
     #[test]
     fn the_wait_between_attempts_cannot_push_one_past_the_retry_budget() {
-        // The loop's whole promise — retry budget plus one attempt — with an interval far longer
-        // than the budget, which is where an unclamped wait would spend a further 2s and then start
-        // an attempt licensed to run 20s past the ceiling.
+        // An interval far longer than the budget is where an unclamped wait would spend a further
+        // 2s and then start an attempt licensed to run 20s past the ceiling.
         let budget = Duration::from_millis(50);
         let mut seen: Vec<Instant> = Vec::new();
         let mut cold = fake(usize::MAX);
@@ -580,10 +578,8 @@ mod tests {
 
     #[test]
     fn a_read_that_ran_out_of_the_attempts_time_is_not_reported_as_a_dump_that_wrote_nothing() {
-        // Sharing one deadline across the three steps is what makes this reachable: the read no
-        // longer gets a fresh budget, so an earlier slow step can leave it none. Blaming the dump's
-        // stderr for it would report a tree nobody looked for as one the dump failed to write —
-        // and, being retryable, would go on retrying a device that had answered.
+        // Sharing one deadline across the three steps is what makes this reachable: an earlier slow
+        // step can leave the read none.
         //
         // The error is the one `glass_core` really produces for a spent deadline, not a fixture
         // repeating wording this crate does not own. Nothing is spawned on that path, so it needs
