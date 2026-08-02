@@ -2,6 +2,8 @@
 //! those tools installed:
 //! `cargo test -p glass-dbus-linux --test integration -- --ignored`.
 
+#![cfg(target_os = "linux")]
+
 use glass_dbus_linux::PrivateBus;
 
 #[test]

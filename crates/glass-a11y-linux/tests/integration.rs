@@ -4,6 +4,8 @@
 //! registry (no external dbus-run-session / at-spi-bus-launcher needed). The X11
 //! backend self-spawns a private Xvfb for the fixture to render into.
 
+#![cfg(target_os = "linux")]
+
 use glass_core::{AppSpec, Backend, BaselineStore, Glass, PlatformFactory, WindowHint};
 
 /// Counts the walks a session performs — wall-clock cannot tell a wait that waited efficiently
