@@ -56,6 +56,28 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
     run_bounded_inner(cmd, budget, op, None)
 }
 
+/// [`run_bounded`], but never outliving `deadline` — the bound of the larger call this one serves.
+///
+/// Several calls can answer one request: one `uiautomator dump` is a remove, a dump and a read.
+/// Each carrying only its own budget makes the sequence cost their sum, so the caller's deadline
+/// travels down and each step gets whichever bound is nearer. A step with nothing left is not
+/// started at all — its outcome is already decided, and spawning it would cost a process and the
+/// wait to kill it.
+pub fn run_bounded_until(
+    cmd: &mut Command,
+    budget: Duration,
+    deadline: Instant,
+    op: &str,
+) -> Result<Output> {
+    let budget = budget_within(budget, deadline, Instant::now());
+    if budget.is_zero() {
+        return Err(GlassError::Backend(format!(
+            "{op}: {TIMED_OUT} the time left of the deadline it serves, so it was not started"
+        )));
+    }
+    run_bounded_inner(cmd, budget, op, None)
+}
+
 /// [`run_bounded`], but writing `stdin` to the child first.
 ///
 /// The write happens on its own thread for the same reason the reads do: a tool that answers before
@@ -286,6 +308,12 @@ fn next_wait(previous: Duration) -> Duration {
 /// Whether appending `n` more bytes to a buffer of `len` would pass [`MAX_CAPTURE`].
 fn would_exceed_capture(len: usize, n: usize) -> bool {
     len + n > MAX_CAPTURE
+}
+
+/// The budget a call actually gets: its own, or what is left of the deadline it serves, whichever
+/// is nearer. Its own function so the rule is pinned by a test, which a timing test cannot do.
+fn budget_within(budget: Duration, deadline: Instant, now: Instant) -> Duration {
+    budget.min(deadline.saturating_duration_since(now))
 }
 
 /// Whether `deadline` has arrived. Its own function so the boundary — a deadline exactly reached
@@ -693,6 +721,89 @@ mod tests {
             !msg.contains("stdout:"),
             "nothing was written to stdout: {msg}"
         );
+    }
+
+    #[test]
+    fn a_call_gets_the_nearer_of_its_own_budget_and_the_deadline_it_serves() {
+        // The rule the deadline-taking runner exists for, pinned where no timing test can reach it.
+        let now = Instant::now();
+        assert_eq!(
+            budget_within(Duration::from_secs(20), now + Duration::from_secs(5), now),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            budget_within(Duration::from_secs(3), now + Duration::from_secs(5), now),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            budget_within(Duration::from_secs(20), now, now),
+            Duration::ZERO
+        );
+        let past = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        assert_eq!(
+            budget_within(Duration::from_secs(20), past, now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_call_dies_at_the_deadline_it_serves_rather_than_at_its_own_budget() {
+        // A step of a longer sequence gets what is left of the sequence's deadline. Without this,
+        // three steps each carrying their own budget cost the sum of all three.
+        let started = Instant::now();
+        let err = run_bounded_until(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_secs(20),
+            Instant::now() + Duration::from_millis(300),
+            "test:outer-deadline",
+        )
+        .expect_err("must not wait out its own budget past the deadline it serves");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("test:outer-deadline"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deadline_further_out_than_the_budget_leaves_the_budget_in_charge() {
+        // The clamp is a ceiling, not a replacement: a call with room to spare still dies at the
+        // budget its own operation was given.
+        let err = run_bounded_until(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(300),
+            Instant::now() + Duration::from_secs(60),
+            "test:own-budget",
+        )
+        .expect_err("must time out");
+        assert!(err.to_string().contains("300ms"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_call_with_no_time_left_is_not_started_at_all() {
+        // Spawning a child only to kill it at once costs a process and a wait; the failure is
+        // already decided. Proven by side effect — the command creates a file if it ever runs.
+        let marker =
+            std::env::temp_dir().join(format!("glass-spent-deadline-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let err = run_bounded_until(
+            Command::new("/bin/sh").args(["-c", &format!("touch '{}'", marker.display())]),
+            Duration::from_secs(20),
+            Instant::now(),
+            "test:spent-deadline",
+        )
+        .expect_err("a call with no time left must fail rather than run");
+        assert!(
+            !marker.exists(),
+            "the command ran despite having no time left"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("test:spent-deadline"), "{msg}");
+        assert!(msg.contains(TIMED_OUT), "{msg}");
     }
 
     #[test]
