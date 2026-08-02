@@ -14,8 +14,8 @@ use glass_core::{GlassError, Result, TIMED_OUT, run_bounded, run_bounded_until};
 pub enum AdbOp {
     /// `uiautomator dump`, and the `cat` that reads the tree it wrote — two steps of one snapshot,
     /// so they share a deadline rather than the read-back inheriting a tap's. That deadline bounds
-    /// the whole snapshot: `a11y::attempt_deadline` runs all three of its steps inside this budget,
-    /// including the stale-file removal, which classifies as [`AdbOp::Shell`].
+    /// the whole snapshot: `a11y::dump_once` runs all three of its steps inside this budget,
+    /// including the removal of the file it read, which classifies as [`AdbOp::Shell`].
     Dump,
     /// `exec-out screencap` — encodes a full-resolution frame.
     Screencap,
@@ -301,10 +301,16 @@ mod tests {
     #[test]
     fn every_argv_this_crate_actually_runs_classifies_as_intended() {
         // The real argvs, taken from the call sites, so a refactor that renames a subcommand is
-        // caught here rather than by a call silently dropping to the short budget.
+        // caught here rather than by a call silently dropping to the short budget. Paths are
+        // illustrative — classification reads only the first two arguments.
         for (argv, want) in [
             (
-                vec!["shell", "uiautomator", "dump", "/sdcard/glass_dump.xml"],
+                vec![
+                    "shell",
+                    "uiautomator",
+                    "dump",
+                    "/sdcard/glass_dump_1234_9_0.xml",
+                ],
                 AdbOp::Dump,
             ),
             (vec!["exec-out", "screencap"], AdbOp::Screencap),
@@ -317,14 +323,17 @@ mod tests {
                 vec!["uninstall", "tech.fixedwidth.glass.a11y"],
                 AdbOp::Transfer,
             ),
-            (vec!["shell", "cat", "/sdcard/glass_dump.xml"], AdbOp::Dump),
+            (
+                vec!["shell", "cat", "/sdcard/glass_dump_1234_9_0.xml"],
+                AdbOp::Dump,
+            ),
             (vec!["shell", "input", "tap", "10", "20"], AdbOp::Shell),
             (
                 vec!["shell", "am", "start", "-W", "-n", "pkg/.Act"],
                 AdbOp::Launch,
             ),
             (
-                vec!["shell", "rm", "-f", "/sdcard/glass_dump.xml"],
+                vec!["shell", "rm", "-f", "/sdcard/glass_dump_1_2_0.xml"],
                 AdbOp::Shell,
             ),
             (vec!["shell", "pidof", "com.example.app"], AdbOp::Shell),

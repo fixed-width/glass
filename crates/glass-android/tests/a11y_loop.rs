@@ -67,6 +67,54 @@ fn snapshot_has_named_role_typed_nodes() {
     agents.shutdown(); // tear down a launched agent — these tests must not leak it
 }
 
+/// The dump files on the device, as `adb shell ls` reports them.
+///
+/// A device is shared, so what a test can assert is that reading left the listing as it found it.
+fn dump_files() -> String {
+    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+    let out = std::process::Command::new(adb)
+        .args(["shell", "ls", "/sdcard/glass_dump*"])
+        .output()
+        .expect("adb shell ls");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The only test that can tell a read's housekeeping from a no-op: the unit tests model the device
+/// filesystem, and a model cannot disagree with itself.
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
+fn a_snapshot_leaves_no_dump_file_on_the_device() {
+    let agents = glass_android::AgentRegistry::new();
+    let mut platform =
+        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
+            .expect("attach");
+    let window = platform
+        .start_app(&settings_spec())
+        .expect("launch settings");
+    let before = dump_files();
+
+    let ctx = AxContext {
+        pids: platform.app_pids(),
+        window,
+        window_handle: None,
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+    let mut a11y = glass_android::AndroidA11y::new();
+    a11y.snapshot(&ctx).expect("first snapshot");
+    a11y.snapshot(&ctx).expect("second snapshot");
+
+    assert_eq!(
+        dump_files(),
+        before,
+        "each read must take its own file with it"
+    );
+
+    platform.stop_app().expect("stop");
+    drop(platform);
+    agents.shutdown();
+}
+
 /// Depth-first search for the first node satisfying `want`.
 fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNode> {
     if want(node) {

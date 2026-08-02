@@ -211,7 +211,7 @@ fn list_avds(bin: &str) -> Option<Vec<String>> {
 /// Deep probe one online device: capture a frame (validated via the real decoder) and
 /// an a11y dump (via `uiautomator dump`, mirroring `AndroidA11y`).
 fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
-    const DUMP_PATH: &str = "/sdcard/glass_doctor_dump.xml";
+    const DUMP_PREFIX: &str = "/sdcard/glass_doctor_dump";
     let dev = adb.with_serial(serial);
 
     let screencap = match dev.run_bytes(["exec-out", "screencap"]) {
@@ -230,7 +230,7 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
     // Deliberately one attempt, where AndroidA11y retries: doctor reports what the device
     // can do now, and a dump that only succeeds after a wait is what this check exists to
     // reveal.
-    let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PATH, attempt_deadline()) {
+    let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PREFIX, attempt_deadline()) {
         Ok(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
         Ok(_) => Err("uiautomator dump produced no hierarchy".to_string()),
         Err(e) => Err(e.to_string()),

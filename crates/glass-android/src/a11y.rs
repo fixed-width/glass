@@ -2,7 +2,9 @@
 //! over adb and maps the result via `crate::axmap`. Resolves its own device
 //! lazily, since the `Accessibility` trait is handed only an `AxContext`.
 
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
 use glass_core::{
@@ -15,7 +17,40 @@ use crate::axmap::build_tree;
 use crate::input::{key_commands, pointer_commands};
 use crate::target::{choose_serial, parse_devices};
 
-const DUMP_PATH: &str = "/sdcard/glass_dump.xml";
+/// What every dump path of this reader starts with; [`attempt_path`] completes it.
+const DUMP_PREFIX: &str = "/sdcard/glass_dump";
+
+/// The device path for one dump attempt — used by no other attempt, and by no other process.
+///
+/// An attempt killed at its deadline reaps the local adb client only; the `uiautomator dump` it
+/// started still writes whenever it finishes, and on a shared path that write could answer a later
+/// attempt with nothing marking the tree as old.
+///
+/// `prefix` must be a literal a device shell needs no quoting for: `adb shell` passes it on
+/// unescaped.
+fn attempt_path(prefix: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}_{}_{}.xml",
+        process_tag(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Identifies this process among any others dumping to the same device. The time is of the first
+/// dump, not of process start.
+fn process_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        // A fixed fallback would give every host with a pre-epoch clock the same tag; the error
+        // carries the distance the other way.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| e.duration());
+        format!("{}_{}", std::process::id(), now.as_nanos())
+    })
+    .as_str()
+}
 
 /// How long the *first* snapshot of a session waits for `uiautomator` to become able to
 /// dump: a device reaches `sys.boot_completed` — all the platform waits for before
@@ -38,8 +73,8 @@ pub(crate) fn adb_runner(
     move |argv, deadline| adb.run_streams_until(argv.iter().copied(), deadline)
 }
 
-/// When one whole dump attempt — the stale-file removal, the dump, and the read of what it wrote —
-/// must be done by.
+/// When one whole dump attempt — the dump, the read of what it wrote, and the removal of the file
+/// it read — must be done by.
 ///
 /// The three share [`AdbOp::Dump`]'s budget — one snapshot's worth — with the removal keeping its
 /// own `AdbOp::Shell` ceiling inside that. A step carrying only its own budget let an attempt cost
@@ -54,12 +89,22 @@ pub(crate) fn attempt_deadline() -> Instant {
 ///
 /// `uiautomator dump` exits 0 even when it fails and reports the reason on stderr, so
 /// neither its exit status nor its stdout can be trusted; the file it was asked to write
-/// is the only reliable success signal. A stale file is removed first, best-effort, so a
-/// previous run's tree does not stand in for one this dump never wrote.
-pub(crate) fn dump_once(run: &mut AdbRunner<'_>, path: &str, deadline: Instant) -> Result<String> {
-    let _ = run(&["shell", "rm", "-f", path], deadline);
-    let (_, stderr) = run(&["shell", "uiautomator", "dump", path], deadline)?;
-    match run(&["shell", "cat", path], deadline) {
+/// is the only reliable success signal. That file is this attempt's alone — see
+/// [`attempt_path`], which `prefix` names the family for — so no other dump can stand in for one
+/// this attempt never wrote.
+///
+/// The removal is last and best-effort, and names one path: a concurrent attempt's file is not
+/// exposed to it, and housekeeping cannot spend the deadline the read needs.
+pub(crate) fn dump_once(
+    run: &mut AdbRunner<'_>,
+    prefix: &str,
+    deadline: Instant,
+) -> Result<String> {
+    let path = attempt_path(prefix);
+    let (_, stderr) = run(&["shell", "uiautomator", "dump", &path], deadline)?;
+    let read = run(&["shell", "cat", &path], deadline);
+    let _ = run(&["shell", "rm", "-f", &path], deadline);
+    match read {
         Ok((xml, _)) => Ok(xml),
         // The dump explained itself on stderr: that is why there is no file, and it names
         // the dump rather than the read that came up empty. Its stdout is never the reason
@@ -96,13 +141,13 @@ fn bound_fired(e: &GlassError) -> bool {
 /// still has a whole dump to make.
 fn dump_until_ready(
     run: &mut AdbRunner<'_>,
-    path: &str,
+    prefix: &str,
     budget: Duration,
     interval: Duration,
 ) -> Result<String> {
     let retry_until = Instant::now() + budget;
     loop {
-        match dump_once(run, path, attempt_deadline()) {
+        match dump_once(run, prefix, attempt_deadline()) {
             Ok(xml) => return Ok(xml),
             Err(e) => {
                 let retryable = matches!(e, GlassError::AccessibilityUnavailable(_));
@@ -216,7 +261,7 @@ impl AndroidA11y {
         let adb = self.ensure_adb()?;
         let xml = dump_until_ready(
             &mut adb_runner(&adb),
-            DUMP_PATH,
+            DUMP_PREFIX,
             budget,
             Duration::from_millis(DUMP_POLL_INTERVAL_MS),
         )?;
@@ -383,6 +428,7 @@ mod tests {
     use crate::adb::AdbOp;
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
     use glass_core::{GlassError, Result, WindowGeometry};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     /// A deadline no test reaches, for the cases that are not about the bound.
@@ -390,8 +436,12 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
-    const PATH: &str = "/sdcard/glass_dump.xml";
+    /// What a call site passes; each attempt extends it with an id of its own.
+    const PREFIX: &str = "/sdcard/glass_dump";
     const XML: &str = "<?xml version='1.0'?><hierarchy rotation=\"0\"></hierarchy>";
+    /// A tree from an earlier moment; it parses exactly as [`XML`] does, and only the test can
+    /// tell them apart.
+    const STALE_XML: &str = "<?xml version='1.0'?><hierarchy rotation=\"1\"></hierarchy>";
 
     /// What `uiautomator dump` writes to stderr on a device that has booted but whose
     /// accessibility bridge is not serving yet — captured from a cold emulator, where the
@@ -399,50 +449,103 @@ mod tests {
     const NOT_READY: &str = "ERROR: null root node returned by UiTestAutomationBridge.";
 
     /// What `uiautomator dump` prints on stdout when it succeeds (typo upstream's).
-    const DUMPED: &str = "UI hierchary dumped to: /sdcard/glass_dump.xml";
+    const DUMPED: &str = "UI hierchary dumped to: /sdcard/glass_dump_1234_9_0.xml";
 
     /// The `cat` of a file the dump never wrote — the error the old code surfaced in place
     /// of the dump's own.
-    fn read_err() -> GlassError {
+    fn read_err(path: &str) -> GlassError {
         GlassError::Backend(format!(
-            "`adb shell cat {PATH}` failed: cat: {PATH}: No such file"
+            "`adb shell cat {path}` failed: cat: {path}: No such file"
         ))
     }
 
     /// An adb whose `uiautomator dump` fails as a cold device's does for `cold` attempts,
-    /// then succeeds. Records every command it is given.
+    /// then succeeds.
     fn fake(cold: usize) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
         let mut dumps = 0;
-        let mut wrote = false;
         move |argv: &[&str], _deadline: Instant| match argv {
-            ["shell", "rm", "-f", _] => {
-                wrote = false;
-                Ok((String::new(), String::new()))
-            }
             ["shell", "uiautomator", "dump", _] => {
                 dumps += 1;
                 if dumps > cold {
-                    wrote = true;
                     Ok((DUMPED.to_string(), String::new()))
                 } else {
                     // Exit 0, nothing on stdout, the diagnosis on stderr.
                     Ok((String::new(), format!("{NOT_READY}\n")))
                 }
             }
-            ["shell", "cat", _] if wrote => Ok((XML.to_string(), String::new())),
-            ["shell", "cat", _] => Err(read_err()),
+            ["shell", "cat", _] if dumps > cold => Ok((XML.to_string(), String::new())),
+            ["shell", "cat", path] => Err(read_err(path)),
+            ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
             other => panic!("unexpected adb command: {other:?}"),
         }
     }
 
     #[test]
+    fn a_dump_abandoned_at_the_deadline_cannot_answer_a_later_attempt() {
+        // Killing the attempt reaps the local adb client; the dump it asked for keeps running on
+        // the device and writes whenever it finishes — here, after the next attempt has written
+        // its own file and is about to read it.
+        let mut files = HashMap::new();
+        let mut abandoned: Option<String> = None;
+        let mut dumps = 0;
+        let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "rm", "-f", path] => {
+                    files.remove(*path);
+                    Ok((String::new(), String::new()))
+                }
+                ["shell", "uiautomator", "dump", path] => {
+                    dumps += 1;
+                    if dumps == 1 {
+                        abandoned = Some((*path).to_string());
+                        return Err(GlassError::Backend(format!(
+                            "`adb shell uiautomator dump` {}",
+                            glass_core::TIMED_OUT
+                        )));
+                    }
+                    files.insert((*path).to_string(), XML.to_string());
+                    Ok((DUMPED.to_string(), String::new()))
+                }
+                ["shell", "cat", path] => {
+                    if let Some(p) = abandoned.take() {
+                        files.insert(p, STALE_XML.to_string());
+                    }
+                    match files.get(*path) {
+                        Some(xml) => Ok((xml.clone(), String::new())),
+                        None => Err(read_err(path)),
+                    }
+                }
+                other => panic!("unexpected adb command: {other:?}"),
+            }
+        };
+
+        dump_once(&mut run, PREFIX, ample()).expect_err("the attempt whose client was killed");
+        let xml = dump_once(&mut run, PREFIX, ample()).expect("the next attempt dumps for itself");
+
+        assert_eq!(
+            xml, XML,
+            "the abandoned dump's tree was served as this attempt's"
+        );
+    }
+
+    #[test]
     fn dump_reports_the_dump_that_wrote_nothing_not_the_read_that_found_nothing() {
-        let mut run = fake(1);
-        let e = dump_once(&mut run, PATH, ample()).unwrap_err();
+        let mut dumped = String::new();
+        let mut cold = fake(1);
+        let e = {
+            let mut run = |argv: &[&str], deadline: Instant| {
+                if let ["shell", "uiautomator", "dump", path] = argv {
+                    dumped = (*path).to_string();
+                }
+                cold(argv, deadline)
+            };
+            dump_once(&mut run, PREFIX, ample()).unwrap_err()
+        };
+
         let msg = e.to_string();
         assert!(
-            msg.contains(&format!("uiautomator dump did not write {PATH}")),
-            "must name the step that should have written the file: {msg}"
+            msg.contains(&format!("uiautomator dump did not write {dumped}")),
+            "must name the file the reader can go looking for: {msg}"
         );
         assert!(
             msg.contains(NOT_READY),
@@ -454,25 +557,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dump_clears_a_stale_file_before_dumping() {
-        let mut seen: Vec<String> = Vec::new();
-        let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
-            seen.push(argv.join(" "));
-            match argv {
-                ["shell", "cat", _] => Ok((XML.to_string(), String::new())),
-                _ => Ok((String::new(), String::new())),
+    /// A device that keeps the files it is given.
+    fn fake_device(
+        files: &mut HashMap<String, String>,
+    ) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
+        move |argv: &[&str], _deadline: Instant| match argv {
+            ["shell", "rm", "-f", path] => {
+                files.remove(*path);
+                Ok((String::new(), String::new()))
             }
-        };
-        dump_once(&mut run, PATH, ample()).unwrap();
+            ["shell", "uiautomator", "dump", path] => {
+                files.insert((*path).to_string(), XML.to_string());
+                Ok((DUMPED.to_string(), String::new()))
+            }
+            ["shell", "cat", path] => match files.get(*path) {
+                Some(xml) => Ok((xml.clone(), String::new())),
+                None => Err(read_err(path)),
+            },
+            other => panic!("unexpected adb command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_attempt_takes_its_file_with_it() {
+        let mut files = HashMap::new();
+        let mut run = fake_device(&mut files);
+        dump_once(&mut run, PREFIX, ample()).unwrap();
+        dump_once(&mut run, PREFIX, ample()).unwrap();
+        drop(run);
+
+        assert!(
+            files.is_empty(),
+            "a file per snapshot fills the device it is dumping: {files:?}"
+        );
+    }
+
+    #[test]
+    fn an_attempt_removes_no_file_but_its_own() {
+        // A concurrent attempt — a second glass, or `glass_doctor`, which runs off the thread the
+        // other tools share — has a file in flight between its dump and its read.
+        const THEIRS: &str = "/sdcard/glass_dump_4321_1785700000000000000_7.xml";
+        let mut files = HashMap::from([(THEIRS.to_string(), STALE_XML.to_string())]);
+        let mut run = fake_device(&mut files);
+        dump_once(&mut run, PREFIX, ample()).unwrap();
+        drop(run);
+
         assert_eq!(
-            seen,
-            vec![
-                format!("shell rm -f {PATH}"),
-                format!("shell uiautomator dump {PATH}"),
-                format!("shell cat {PATH}"),
-            ],
-            "a stale tree must not be able to stand in for a dump that never ran"
+            files.keys().collect::<Vec<_>>(),
+            vec![THEIRS],
+            "removed a file it did not write"
         );
     }
 
@@ -482,11 +615,11 @@ mod tests {
         // here would repeat the misattribution this fix exists to remove.
         let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
             match argv {
-                ["shell", "cat", _] => Err(read_err()),
+                ["shell", "cat", path] => Err(read_err(path)),
                 _ => Ok((DUMPED.to_string(), String::new())),
             }
         };
-        let e = dump_once(&mut run, PATH, ample()).unwrap_err();
+        let e = dump_once(&mut run, PREFIX, ample()).unwrap_err();
         assert!(matches!(e, GlassError::Backend(_)), "{e}");
         assert!(!e.to_string().contains("did not write"), "{e}");
     }
@@ -506,7 +639,7 @@ mod tests {
             }
         };
         let started = Instant::now();
-        dump_until_ready(&mut run, PATH, Duration::ZERO, Duration::ZERO).unwrap();
+        dump_until_ready(&mut run, PREFIX, Duration::ZERO, Duration::ZERO).unwrap();
 
         assert_eq!(seen.len(), 3, "one attempt is three adb calls");
         assert!(
@@ -534,7 +667,7 @@ mod tests {
         };
         let xml = dump_until_ready(
             &mut run,
-            PATH,
+            PREFIX,
             Duration::from_secs(5),
             Duration::from_millis(1),
         )
@@ -560,7 +693,7 @@ mod tests {
             cold(argv, deadline)
         };
         let started = Instant::now();
-        dump_until_ready(&mut run, PATH, budget, Duration::from_secs(2))
+        dump_until_ready(&mut run, PREFIX, budget, Duration::from_secs(2))
             .expect_err("a device that never becomes ready");
 
         assert!(
@@ -604,8 +737,8 @@ mod tests {
                 _ => Ok((String::new(), String::new())),
             }
         };
-        let e =
-            dump_until_ready(&mut run, PATH, Duration::from_secs(30), Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
+            .unwrap_err();
 
         let msg = e.to_string();
         assert!(
@@ -625,7 +758,7 @@ mod tests {
     #[test]
     fn a_dump_that_is_not_ready_yet_is_retried_until_it_is() {
         let mut run = fake(3);
-        let xml = dump_until_ready(&mut run, PATH, Duration::from_secs(30), Duration::ZERO)
+        let xml = dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
             .expect("a device that becomes ready within the budget must produce a tree");
         assert_eq!(xml, XML);
     }
@@ -633,7 +766,7 @@ mod tests {
     #[test]
     fn a_dump_that_never_becomes_ready_fails_with_the_last_reason() {
         let mut run = fake(usize::MAX);
-        let e = dump_until_ready(&mut run, PATH, Duration::ZERO, Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(&mut run, PREFIX, Duration::ZERO, Duration::ZERO).unwrap_err();
         assert!(e.to_string().contains(NOT_READY), "{e}");
     }
 
@@ -653,8 +786,8 @@ mod tests {
                 _ => Ok((String::new(), String::new())),
             }
         };
-        let e =
-            dump_until_ready(&mut run, PATH, Duration::from_secs(30), Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
+            .unwrap_err();
         assert!(matches!(e, GlassError::Backend(_)), "{e}");
         assert_eq!(
             attempts, 1,
