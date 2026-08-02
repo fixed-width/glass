@@ -189,6 +189,14 @@ internal refactors, CI, or test-only changes.
   live tree, so one that no longer matches the snapshot errors (`element changed;
   re-snapshot`) instead of clicking stale coordinates — the pointer-only iOS and
   Android paths have no such live check.
+- `cargo build --workspace` and `cargo clippy --workspace` now succeed on macOS. The Linux-only
+  backend crates (X11, Wayland, and their AT-SPI/D-Bus/process/sandbox helpers) gate themselves
+  and every one of their dependencies to Linux, instead of failing to build elsewhere — they
+  compile to nothing on macOS. CI's macOS job runs those two commands workspace-wide now, instead
+  of a hand-maintained list of Mac-relevant crates, so it gains a workspace-wide build and lint
+  gate; test coverage there is unchanged, still targeted `cargo test -p` runs and
+  `./scripts/test-macos.sh` rather than `cargo test --workspace`, since several macOS integration
+  tests need permissions CI doesn't grant.
 
 ### Fixed
 - On macOS, `glass_start` now reports a window's settled geometry rather than a frame of its
