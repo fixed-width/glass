@@ -139,6 +139,9 @@ The full docs — tutorial, how-to guides, reference, and explanations — are u
 **[`docs/`](docs/README.md)**. See [`CHANGELOG.md`](CHANGELOG.md) for release notes, and
 [Stability and versioning](docs/reference/stability.md) for what a 1.0 release guarantees.
 
+Contributing? [`CONTRIBUTING.md`](CONTRIBUTING.md) has the gates a PR has to pass, and
+[Verify a change](docs/how-to/verify-a-change.md) covers platform code your own host cannot run.
+
 ## License
 
 glass is **open core**, licensed **Apache-2.0** — see [`LICENSE-APACHE`](LICENSE-APACHE).

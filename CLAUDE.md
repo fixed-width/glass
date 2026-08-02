@@ -48,6 +48,11 @@ cargo clippy --workspace --all-targets -- -D warnings   # lint gate — keep cle
 ```
 The workspace is pinned to nightly via `rust-toolchain.toml`.
 
+Those cover Linux. They do **not** compile `cfg(target_os = "macos")` or `cfg(windows)` code, so on
+a change to a platform crate they report clean without having looked at it —
+[docs/how-to/verify-a-change.md](docs/how-to/verify-a-change.md) has the per-target commands that
+do, most of which run from any host.
+
 ## Invariants
 
 - **External automation only** — drive apps as a black box; never require the app to be glass-aware.

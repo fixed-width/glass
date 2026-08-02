@@ -33,6 +33,8 @@ way it does? The explanations.
 **Contribute**
 
 - [Build from source](how-to/build-from-source.md) — all platforms; macOS signing + LaunchAgent
+- [Verify a change](how-to/verify-a-change.md) — the gates, and how to cover platform code your
+  host cannot run
 - [Benchmark and profile](how-to/benchmarking.md)
 - [Measure what the verification loop costs](how-to/verification-cost.md) — semantic vs
   screenshot-every-step, round-trips and tokens
