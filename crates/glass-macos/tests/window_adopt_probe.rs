@@ -139,7 +139,10 @@ mod macos_main {
     /// owns, whether the accessibility reader could resolve the adopted window at all (#263's
     /// actual symptom), the pid `start_app` reported — needed to tell a cold launch from a
     /// re-adoption of an already-running process (see the module doc's caveat) — and how long
-    /// `start_app` itself took, the actual cost of the settle loop this probe exists to justify.
+    /// `start_app` itself took: its total end-to-end wall clock (process launch through
+    /// LaunchServices, first-window creation, `MacosPlatform::new`'s AX/Screen-Recording
+    /// preflight, window discovery, and the settle), launch-dominated rather than the settle's
+    /// own increment — isolating that would need an A/B sweep against a build without it.
     struct RunOutcome {
         matched: bool,
         snapshot_ok: bool,
@@ -338,10 +341,11 @@ mod macos_main {
              {} distinct pid(s) seen across {runs} run(s)",
             pids_seen.len()
         );
-        // The settle loop's wall-clock cost, measured rather than derived from its own
-        // parameters. `start_app_durations` has one entry per successful run — the `fail()`
-        // above exits before reaching here if any run errored — so the division below never
-        // sees a zero-length vec.
+        // `start_app`'s total end-to-end wall clock, launch-dominated — not the settle loop's
+        // own increment; that would need an A/B sweep against a build without it.
+        // `start_app_durations` has one entry per successful run — the `fail()` above exits
+        // before reaching here if any run errored — so the division below never sees a
+        // zero-length vec.
         let min = start_app_durations
             .iter()
             .min()
