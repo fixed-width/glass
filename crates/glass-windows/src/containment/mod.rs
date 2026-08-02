@@ -27,13 +27,11 @@ pub(crate) use imp::{ClipboardRoute, Launched, LogSink, resolve_containment};
 #[cfg(windows)]
 pub(crate) use sandboxie::{available, sandboxie_dir};
 
-/// Resolve the clip hook DLL path the way the launcher does (env > exe dir > None), for doctor.
+/// Resolve the clip shim DLL path the way the launcher does (env > exe dir > None), for doctor.
 #[cfg(windows)]
-pub(crate) fn config_hook_dll_path(exe_dir: Option<&str>) -> Option<String> {
-    config::hook_dll_path(
-        std::env::var("GLASS_CLIP_HOOK_DLL").ok().as_deref(),
-        exe_dir,
-    )
+pub(crate) fn config_shim_dll_path(exe_dir: Option<&str>) -> Option<String> {
+    let env = config::shim_dll_env(&|k| std::env::var(k).ok());
+    config::shim_dll_path(env.as_deref(), exe_dir, &|p| p.exists())
 }
 
 #[cfg(windows)]
@@ -186,7 +184,7 @@ mod imp {
         /// Unconfined (`sandbox=off`): the real OS clipboard (today's behavior; the explicit escape hatch).
         RealOs,
         /// Sandboxie + hook active: glass's private store.
-        Private(glass_clip_hook::store::PrivateClipboard),
+        Private(glass_clip_shim_windows::store::PrivateClipboard),
         /// Sandboxie, hook unavailable (Layer-1-only): clipboard is disabled — error, never the real clipboard.
         DisabledContained,
     }

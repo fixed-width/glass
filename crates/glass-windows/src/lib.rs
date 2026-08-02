@@ -37,7 +37,7 @@ pub(crate) fn disclose_clip_disabled(dll: &str) {
     ONCE.call_once(|| {
         eprintln!(
             "glass: private clipboard unavailable (hook DLL not found at {dll}); the sandboxed \
-             app's clipboard is DISABLED to protect your clipboard. Set GLASS_CLIP_HOOK_DLL or \
+             app's clipboard is DISABLED to protect your clipboard. Set GLASS_CLIP_SHIM_DLL or \
              reinstall to enable it."
         );
     });
@@ -288,7 +288,7 @@ mod backend {
                 Some(ClipboardRoute::Private(store)) => Ok(store.get_text().unwrap_or_default()),
                 Some(ClipboardRoute::DisabledContained) => Err(GlassError::Unsupported(
                     "private clipboard for the contained app (hook DLL not active); the app's clipboard \
-                     is disabled to protect yours — set GLASS_CLIP_HOOK_DLL"
+                     is disabled to protect yours — set GLASS_CLIP_SHIM_DLL"
                         .into(),
                 )),
             }
@@ -304,7 +304,7 @@ mod backend {
                 }
                 Some(ClipboardRoute::DisabledContained) => Err(GlassError::Unsupported(
                     "private clipboard for the contained app (hook DLL not active); the app's clipboard \
-                     is disabled to protect yours — set GLASS_CLIP_HOOK_DLL"
+                     is disabled to protect yours — set GLASS_CLIP_SHIM_DLL"
                         .into(),
                 )),
             }

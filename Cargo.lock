@@ -1072,15 +1072,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glass-clip-hook"
-version = "0.0.0"
-dependencies = [
- "retour",
- "windows",
- "windows-core",
-]
-
-[[package]]
 name = "glass-clip-shim-macos"
 version = "0.0.0"
 dependencies = [
@@ -1088,6 +1079,15 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+]
+
+[[package]]
+name = "glass-clip-shim-windows"
+version = "0.0.0"
+dependencies = [
+ "retour",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -1270,7 +1270,7 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "glass-a11y-windows",
- "glass-clip-hook",
+ "glass-clip-shim-windows",
  "glass-core",
  "tempfile",
  "windows",

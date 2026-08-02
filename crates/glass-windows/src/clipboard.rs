@@ -10,7 +10,7 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
-use glass_clip_hook::{HGlobalLock, OwnedHGlobal};
+use glass_clip_shim_windows::{HGlobalLock, OwnedHGlobal};
 use glass_core::{GlassError, Result};
 
 /// Read the clipboard as UTF-8 text.

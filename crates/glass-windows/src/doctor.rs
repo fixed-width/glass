@@ -195,7 +195,7 @@ pub(crate) fn build_clipboard_check(hook_resolvable: bool, dll_path: &str) -> Ch
             "contained app clipboard disabled (hook DLL not found); your clipboard is protected",
         )
         .with_remedy(
-            "set GLASS_CLIP_HOOK_DLL or reinstall so the boxed app gets a private clipboard",
+            "set GLASS_CLIP_SHIM_DLL or reinstall so the boxed app gets a private clipboard",
         )
     }
 }
@@ -217,7 +217,7 @@ pub fn sandbox_checks() -> Vec<Check> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
-    let dll = crate::containment::config_hook_dll_path(exe_dir.as_deref());
+    let dll = crate::containment::config_shim_dll_path(exe_dir.as_deref());
     let resolvable = dll
         .as_deref()
         .map(|p| std::path::Path::new(p).exists())
@@ -468,10 +468,10 @@ mod tests {
     #[test]
     fn clipboard_check_reports_layer() {
         // hook resolvable → private clipboard active; else Layer-1-only (disabled-for-safety).
-        let ok = build_clipboard_check(true, "C:\\g\\glass_clip_hook.dll");
+        let ok = build_clipboard_check(true, "C:\\g\\glass_clip_shim_windows.dll");
         assert_eq!(ok.status, CheckStatus::Ok);
         assert!(ok.detail.contains("private clipboard"));
-        let warn = build_clipboard_check(false, "C:\\g\\glass_clip_hook.dll");
+        let warn = build_clipboard_check(false, "C:\\g\\glass_clip_shim_windows.dll");
         assert_eq!(warn.status, CheckStatus::Warn);
         assert!(warn.detail.contains("disabled"));
     }

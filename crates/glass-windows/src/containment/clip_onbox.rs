@@ -1,9 +1,9 @@
 //! On-box deterministic validation of the private-clipboard hook. `#[ignore]`d — it needs
-//! Sandboxie running, the built `glass_clip_hook.dll` (path in `GLASS_CLIP_HOOK_DLL`), and the built
+//! Sandboxie running, the built `glass_clip_shim_windows.dll` (path in `GLASS_CLIP_SHIM_DLL`), and the built
 //! `clipprobe` example. No GUI / interactive desktop is needed: the probe only calls user32
 //! clipboard APIs, so it runs over SSH. Run on the box with:
 //! ```text
-//!   set GLASS_CLIP_HOOK_DLL=C:\Users\<user>\glass\target\release\glass_clip_hook.dll
+//!   set GLASS_CLIP_SHIM_DLL=C:\Users\<user>\glass\target\release\glass_clip_shim_windows.dll
 //!   cargo test -p glass-windows --release private_clipboard_isolation -- --ignored --nocapture
 //! ```
 
@@ -16,7 +16,7 @@ use glass_core::{AppSpec, SandboxLevel};
 
 use super::sandboxie::{Sandboxie, available, sandboxie_dir};
 
-/// `<profile>` dir (release/debug) holding the built `glass_clip_hook.dll` and `examples/`.
+/// `<profile>` dir (release/debug) holding the built `glass_clip_shim_windows.dll` and `examples/`.
 /// `current_exe` = `<profile>/deps/glass_windows-HASH.exe`.
 fn profile_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
@@ -45,7 +45,7 @@ fn wait_for_log(
 }
 
 #[test]
-#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_HOOK_DLL + the clipprobe example"]
+#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_SHIM_DLL + the clipprobe example"]
 fn private_clipboard_isolation() {
     let dir = sandboxie_dir();
     assert!(available(&dir), "Sandboxie not available at {dir}");
@@ -53,14 +53,14 @@ fn private_clipboard_isolation() {
     let probe = profile_dir().join("examples").join("clipprobe.exe");
     assert!(
         probe.exists(),
-        "build the probe first: cargo build -p glass-clip-hook --release --example clipprobe (looked at {})",
+        "build the probe first: cargo build -p glass-clip-shim-windows --release --example clipprobe (looked at {})",
         probe.display()
     );
-    let dll = std::env::var("GLASS_CLIP_HOOK_DLL")
-        .expect("set GLASS_CLIP_HOOK_DLL to the built glass_clip_hook.dll");
+    let dll = super::config::shim_dll_env(&|k| std::env::var(k).ok())
+        .expect("set GLASS_CLIP_SHIM_DLL to the built glass_clip_shim_windows.dll");
     assert!(
         PathBuf::from(&dll).exists(),
-        "GLASS_CLIP_HOOK_DLL points at a missing file: {dll}"
+        "GLASS_CLIP_SHIM_DLL points at a missing file: {dll}"
     );
 
     // A sentinel on the AMBIENT (real) clipboard of this session's window station — the boxed
@@ -123,7 +123,7 @@ fn private_clipboard_isolation() {
     );
 
     let store =
-        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+        store.expect("Layer 2 inactive — GLASS_CLIP_SHIM_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("FROM-BOX"),
@@ -140,7 +140,7 @@ fn private_clipboard_isolation() {
 }
 
 #[test]
-#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_HOOK_DLL + the clipprobe example"]
+#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_SHIM_DLL + the clipprobe example"]
 fn private_clipboard_multiformat() {
     let dir = sandboxie_dir();
     assert!(available(&dir), "Sandboxie not available at {dir}");
@@ -148,14 +148,14 @@ fn private_clipboard_multiformat() {
     let probe = profile_dir().join("examples").join("clipprobe.exe");
     assert!(
         probe.exists(),
-        "build the probe first: cargo build -p glass-clip-hook --release --example clipprobe (looked at {})",
+        "build the probe first: cargo build -p glass-clip-shim-windows --release --example clipprobe (looked at {})",
         probe.display()
     );
-    let dll = std::env::var("GLASS_CLIP_HOOK_DLL")
-        .expect("set GLASS_CLIP_HOOK_DLL to the built glass_clip_hook.dll");
+    let dll = super::config::shim_dll_env(&|k| std::env::var(k).ok())
+        .expect("set GLASS_CLIP_SHIM_DLL to the built glass_clip_shim_windows.dll");
     assert!(
         PathBuf::from(&dll).exists(),
-        "GLASS_CLIP_HOOK_DLL points at a missing file: {dll}"
+        "GLASS_CLIP_SHIM_DLL points at a missing file: {dll}"
     );
 
     let sentinel = format!("SENTINEL-{}", std::process::id());
@@ -237,7 +237,7 @@ fn private_clipboard_multiformat() {
     );
 
     let store =
-        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+        store.expect("Layer 2 inactive — GLASS_CLIP_SHIM_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("FROM-BOX-MULTI"),
@@ -245,17 +245,17 @@ fn private_clipboard_multiformat() {
     );
     let keys = store.list();
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Named(
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Named(
             "HTML Format".into()
         )),
         "host store missing HTML Format: {keys:?}"
     );
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Standard(8)),
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Standard(8)),
         "host store missing CF_DIB: {keys:?}"
     );
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Standard(13)),
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Standard(13)),
         "host store missing CF_UNICODETEXT: {keys:?}"
     );
 
@@ -269,7 +269,7 @@ fn private_clipboard_multiformat() {
 }
 
 #[test]
-#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_HOOK_DLL + the clipprobe example"]
+#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_SHIM_DLL + the clipprobe example"]
 fn private_clipboard_ole() {
     let dir = sandboxie_dir();
     assert!(available(&dir), "Sandboxie not available at {dir}");
@@ -277,14 +277,14 @@ fn private_clipboard_ole() {
     let probe = profile_dir().join("examples").join("clipprobe.exe");
     assert!(
         probe.exists(),
-        "build the probe first: cargo build -p glass-clip-hook --release --example clipprobe (looked at {})",
+        "build the probe first: cargo build -p glass-clip-shim-windows --release --example clipprobe (looked at {})",
         probe.display()
     );
-    let dll = std::env::var("GLASS_CLIP_HOOK_DLL")
-        .expect("set GLASS_CLIP_HOOK_DLL to the built glass_clip_hook.dll");
+    let dll = super::config::shim_dll_env(&|k| std::env::var(k).ok())
+        .expect("set GLASS_CLIP_SHIM_DLL to the built glass_clip_shim_windows.dll");
     assert!(
         PathBuf::from(&dll).exists(),
-        "GLASS_CLIP_HOOK_DLL points at a missing file: {dll}"
+        "GLASS_CLIP_SHIM_DLL points at a missing file: {dll}"
     );
 
     let sentinel = format!("SENTINEL-{}", std::process::id());
@@ -361,7 +361,7 @@ fn private_clipboard_ole() {
     );
 
     let store =
-        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+        store.expect("Layer 2 inactive — GLASS_CLIP_SHIM_DLL not resolved / pipe server failed");
     assert_eq!(
         store.get_text().as_deref(),
         Some("OLE-FROM-BOX"),
@@ -369,13 +369,13 @@ fn private_clipboard_ole() {
     );
     let keys = store.list();
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Named(
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Named(
             "HTML Format".into()
         )),
         "host store missing HTML Format: {keys:?}"
     );
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Standard(13)),
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Standard(13)),
         "host store missing CF_UNICODETEXT: {keys:?}"
     );
 
@@ -389,7 +389,7 @@ fn private_clipboard_ole() {
 }
 
 #[test]
-#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_HOOK_DLL + the clipprobe example"]
+#[ignore = "on-box: needs Sandboxie + GLASS_CLIP_SHIM_DLL + the clipprobe example"]
 fn private_clipboard_hdrop() {
     let dir = sandboxie_dir();
     assert!(available(&dir), "Sandboxie not available at {dir}");
@@ -397,14 +397,14 @@ fn private_clipboard_hdrop() {
     let probe = profile_dir().join("examples").join("clipprobe.exe");
     assert!(
         probe.exists(),
-        "build the probe first: cargo build -p glass-clip-hook --release --example clipprobe (looked at {})",
+        "build the probe first: cargo build -p glass-clip-shim-windows --release --example clipprobe (looked at {})",
         probe.display()
     );
-    let dll = std::env::var("GLASS_CLIP_HOOK_DLL")
-        .expect("set GLASS_CLIP_HOOK_DLL to the built glass_clip_hook.dll");
+    let dll = super::config::shim_dll_env(&|k| std::env::var(k).ok())
+        .expect("set GLASS_CLIP_SHIM_DLL to the built glass_clip_shim_windows.dll");
     assert!(
         PathBuf::from(&dll).exists(),
-        "GLASS_CLIP_HOOK_DLL points at a missing file: {dll}"
+        "GLASS_CLIP_SHIM_DLL points at a missing file: {dll}"
     );
 
     let sentinel = format!("SENTINEL-{}", std::process::id());
@@ -479,10 +479,10 @@ fn private_clipboard_hdrop() {
     );
 
     let store =
-        store.expect("Layer 2 inactive — GLASS_CLIP_HOOK_DLL not resolved / pipe server failed");
+        store.expect("Layer 2 inactive — GLASS_CLIP_SHIM_DLL not resolved / pipe server failed");
     let keys = store.list();
     assert!(
-        keys.contains(&glass_clip_hook::proto::FormatKey::Standard(15)),
+        keys.contains(&glass_clip_shim_windows::proto::FormatKey::Standard(15)),
         "host store missing CF_HDROP (id 15): {keys:?}"
     );
 
