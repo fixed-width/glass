@@ -1309,8 +1309,8 @@ mod tests {
         assert!(encloses(Some(same), Some(same)));
     }
 
-    /// Defensive default, pinned on purpose: `encloses`'s own doc calls both arms unreachable
-    /// through this reader, but not through every backend, so they stay covered.
+    /// Defensive default, pinned on purpose: the signature admits `None`, even though no caller
+    /// in this file currently supplies it — `encloses`'s own doc explains why.
     #[test]
     fn a_node_without_bounds_neither_encloses_nor_is_enclosed() {
         let rect = AxRect {
@@ -1580,16 +1580,18 @@ mod tests {
     /// test is the expectation it must consciously change.
     #[test]
     fn a_same_named_sibling_that_inherited_the_id_is_accepted_as_the_control() {
-        // Ids shifted between the click and this read-back: an already-checked impostor slid
-        // into id 1, and the control actually clicked is now id 2, still unchecked.
-        let impostor = checkable_json("android.widget.CheckBox", "Agree", true);
+        // `plan.actuated` is recorded from this tree, where id 1 really is the control clicked.
         let mut clicked = checkable_json("android.widget.CheckBox", "Agree", false);
         clicked["bounds"] = json!({"x": 40, "y": 400, "w": 200, "h": 100});
-        let after = after_tree(vec![impostor, clicked]);
+        let before = after_tree(vec![clicked.clone()]);
+        let plan = invoke_plan(&before, &target_for(&before, AxNodeId(1))).unwrap();
 
-        let act = actuated(1, AxRole::CheckBox, "Agree");
+        // Ids shifted between the click and this read-back: an already-checked impostor now
+        // occupies id 1, and the control actually clicked is id 2, still unchecked.
+        let impostor = checkable_json("android.widget.CheckBox", "Agree", true);
+        let after = after_tree(vec![impostor, clicked]);
         assert_eq!(
-            check_state(&after, &act),
+            check_state(&after, &plan.actuated),
             CheckState::Reached(true),
             "a same-named sibling is indistinguishable to a role+name fingerprint"
         );
@@ -1600,7 +1602,7 @@ mod tests {
     /// same role and name — it must not be read as `checked == false`.
     #[test]
     fn a_same_named_node_no_longer_checkable_is_not_read_as_the_control() {
-        let mut node = checkable_json("android.widget.CheckBox", "Agree", false);
+        let mut node = checkable_json("android.widget.CheckedTextView", "Agree", false);
         node["checkable"] = json!(false);
         let after = after_tree(vec![node]);
         let act = actuated(1, AxRole::CheckBox, "Agree");
