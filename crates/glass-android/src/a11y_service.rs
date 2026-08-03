@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    TruncationLimit, WalkBudget, WalkLimits,
+    Subject, TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -157,6 +157,14 @@ pub(crate) fn tree_from_json(
     Ok(tree)
 }
 
+/// A `tree` reply: the tree, and the window it came from when the companion names one.
+struct TreeReply {
+    tree: Value,
+    /// The package the companion actually answered about, when it names one. `None` on an
+    /// older companion that predates this field — absent, not a mismatch.
+    package: Option<String>,
+}
+
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
 pub struct ServiceClient {
     conn: Mutex<Conn>,
@@ -205,13 +213,18 @@ impl ServiceClient {
         self.call_with(req, CallFailure::nothing_sent)
     }
 
-    fn tree(&self, package: &str) -> Result<Value> {
+    fn tree(&self, package: &str) -> Result<TreeReply> {
         let r = self
             .call(json!({"op": "tree", "package": package}))
             .map_err(CallFailure::into_error)?;
-        r.get("tree")
+        let tree = r
+            .get("tree")
             .cloned()
-            .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))
+            .ok_or_else(|| GlassError::AccessibilityUnavailable("no tree in response".into()))?;
+        Ok(TreeReply {
+            tree,
+            package: r.get("package").and_then(Value::as_str).map(str::to_owned),
+        })
     }
 
     /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
@@ -277,10 +290,22 @@ impl ServiceA11y {
     }
 }
 
+/// What the tree describes, when the companion named a window and it is not the one asked about.
+/// A companion that names none makes no claim — absent is not a mismatch.
+fn subject_of(asked: &str, actual: Option<&str>) -> Option<Subject> {
+    let actual = actual?;
+    (actual != asked).then(|| Subject {
+        asked: asked.to_owned(),
+        actual: actual.to_owned(),
+    })
+}
+
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let tree = self.client.tree(&self.package)?;
-        tree_from_json(&tree, &ctx.window, ctx.limits)
+        let reply = self.client.tree(&self.package)?;
+        let mut tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
+        tree.subject = subject_of(&self.package, reply.package.as_deref());
+        Ok(tree)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -923,6 +948,32 @@ mod tests {
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
         );
+    }
+
+    #[test]
+    fn a_reply_naming_another_app_discloses_it() {
+        let subject = subject_of(
+            "com.example.app",
+            Some("com.google.android.permissioncontroller"),
+        );
+        assert_eq!(
+            subject,
+            Some(Subject {
+                asked: "com.example.app".into(),
+                actual: "com.google.android.permissioncontroller".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_reply_naming_the_app_asked_for_discloses_nothing() {
+        assert_eq!(subject_of("com.example.app", Some("com.example.app")), None);
+    }
+
+    #[test]
+    fn an_older_companion_that_names_no_window_makes_no_claim() {
+        // The key is absent, not null: nothing is known, which is not the same as a mismatch.
+        assert_eq!(subject_of("com.example.app", None), None);
     }
 
     #[test]
@@ -1681,6 +1732,10 @@ mod tests {
                 {
                     break;
                 }
+                // The real companion refuses `action` until a `tree` naming a matching package
+                // has been served on this SAME connection — a fresh one starts unconfirmed. This
+                // fake echoes the asked package back as served, so it matches by construction.
+                let mut tree_confirmed = false;
                 loop {
                     let mut line = String::new();
                     if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
@@ -1693,7 +1748,15 @@ mod tests {
                             log.lock().unwrap().push(format!("conn{conn}:tree"));
                             let t = trees[served.min(trees.len() - 1)].clone();
                             served += 1;
-                            json!({"id": id, "ok": true, "tree": t})
+                            tree_confirmed = true;
+                            json!({"id": id, "ok": true, "tree": t, "package": req["package"]})
+                        }
+                        "action" if !tree_confirmed => {
+                            log.lock()
+                                .unwrap()
+                                .push(format!("conn{conn}:action-refused-no-tree"));
+                            json!({"id": id, "ok": false,
+                                   "error": "no tree has been served on this connection"})
                         }
                         "action" => {
                             log.lock().unwrap().push(format!(
@@ -1739,6 +1802,58 @@ mod tests {
 
     fn ops_of(ops: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         ops.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn an_action_before_any_tree_on_this_connection_is_refused() {
+        // A fresh connection — including one opened by a client reconnect — has served no
+        // tree yet, so an action on it must be refused rather than answered `ok:true`.
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let e = client
+            .click(1)
+            .expect_err("no tree has been served on this connection yet");
+        assert!(matches!(e, CallFailure::Refused(_)), "{}", e.into_error());
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:action-refused-no-tree".to_string()]
+        );
+    }
+
+    #[test]
+    fn snapshot_discloses_a_reply_naming_a_different_app() {
+        // Exercises `ServiceA11y::snapshot`'s wiring end-to-end (asked vs. the reply's
+        // `package`), not just the pure `subject_of` comparison tested above in isolation.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let mut w = sock.try_clone().expect("clone");
+            let mut r = std::io::BufReader::new(sock);
+            writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
+                .and_then(|()| w.flush())
+                .expect("hello");
+            let mut line = String::new();
+            r.read_line(&mut line).expect("read request");
+            let req: Value = serde_json::from_str(&line).expect("request is json");
+            let reply = json!({
+                "id": req["id"], "ok": true, "tree": compose_like(),
+                "package": "com.google.android.permissioncontroller"
+            });
+            writeln!(w, "{reply}")
+                .and_then(|()| w.flush())
+                .expect("write reply");
+        });
+        let client = ServiceClient::connect(port).expect("connect");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let tree = a.snapshot(&ctx()).expect("snapshot");
+        assert_eq!(
+            tree.subject,
+            Some(Subject {
+                asked: "com.example.app".into(),
+                actual: "com.google.android.permissioncontroller".into(),
+            })
+        );
     }
 
     #[test]
