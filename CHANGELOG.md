@@ -201,7 +201,8 @@ internal refactors, CI, or test-only changes.
   — the ids address whatever app the tree described, and hold as long as that app stays
   foreground. A reconnect that cannot confirm the same foreground held refuses the action rather
   than replaying it: a read of the wrong app costs a turn, a write cannot be taken back. Requires
-  the updated companion; an older one is unaffected and reports nothing.
+  the updated companion; an older one reports no subject, and a reconnect can no longer re-send a
+  click or `set_value` against it — it fails closed instead.
 - An Android accessibility read can no longer answer with a tree captured before the interaction it
   was asked about. Every read wrote to one file on the device, and a read that ends at its deadline
   ends the local `adb` client only — the `uiautomator dump` it started keeps running on the device
