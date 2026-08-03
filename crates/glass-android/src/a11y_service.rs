@@ -1309,8 +1309,8 @@ mod tests {
         assert!(encloses(Some(same), Some(same)));
     }
 
-    /// Defensive default, pinned on purpose: the signature admits `None`, even though no caller
-    /// in this file currently supplies it — `encloses`'s own doc explains why.
+    /// Defensive default, pinned on purpose: the signature admits `None`, though no production
+    /// caller supplies it — `encloses`'s own doc explains why.
     #[test]
     fn a_node_without_bounds_neither_encloses_nor_is_enclosed() {
         let rect = AxRect {
