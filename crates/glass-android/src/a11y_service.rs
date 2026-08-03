@@ -273,10 +273,13 @@ impl ServiceClient {
 }
 
 /// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply names
-/// `pkg` before letting the pending request that triggered the reconnect follow it. Silently
-/// re-arming with whatever is foreground *now* would make the packages match by construction
-/// and authorise the pending request against a window its ref never came from — so a mismatch,
-/// or a reply that names nothing, must return without letting that request go out.
+/// `pkg` before letting the pending request that triggered the reconnect follow it. `pkg` must
+/// be the app the *served* tree actually described (its `AxTree::subject`'s `actual`, when set)
+/// — the one whose refs the pending request addresses — not the one originally asked about; a
+/// permission dialog's tree answers for the dialog, not the app behind it. Silently re-arming
+/// with whatever is foreground *now* would make the packages match by construction and
+/// authorise the pending request against a window its ref never came from — so a mismatch, or a
+/// reply that names nothing, must return without letting that request go out.
 ///
 /// Returns a plain [`GlassError`], never a [`CallFailure`]: whether the tree call itself failed,
 /// or it answered but named the wrong package (or none), says nothing about whether the
@@ -352,14 +355,21 @@ impl ServiceA11y {
     /// Split out of `invoke` so a test can force a reconnect strictly between the snapshot/plan
     /// step and this one — a window `invoke`'s own straight-line execution never otherwise
     /// exposes to a caller.
+    ///
+    /// `subject` is the plan's tree's own (from `AxTree::subject`), passed separately rather than
+    /// folded into `InvokePlan` since it re-arms a reconnect and says nothing about the click
+    /// itself. It borrows the tree, not `self`, so the caller can still hand it to this
+    /// `&mut self` method.
     fn dispatch_click(
         &mut self,
         ctx: &AxContext,
         target: &AxTarget,
         plan: &InvokePlan,
+        subject: Option<&Subject>,
     ) -> Result<Option<AxNodeId>> {
+        let acting_on = subject.map_or(self.package.as_str(), |s| s.actual.as_str());
         self.client
-            .click(plan.actuated.id.0, &self.package)
+            .click(plan.actuated.id.0, acting_on)
             .map_err(|f| action_error(target.id.0, f))?;
         if let Some(want) = plan.want_checked {
             self.wait_for_check(ctx, plan, want)?;
@@ -395,7 +405,13 @@ impl Accessibility for ServiceA11y {
             t
         };
         crate::a11y::editable_target(&tree, target)?;
-        self.client.set_text(target.id.0, text, &self.package)?;
+        // Re-arm against the app the served tree actually described, not the one asked about —
+        // that's the app `target`'s ref came from (see `rearm_tree`).
+        let acting_on = tree
+            .subject
+            .as_ref()
+            .map_or(self.package.as_str(), |s| s.actual.as_str());
+        self.client.set_text(target.id.0, text, acting_on)?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -442,7 +458,7 @@ impl Accessibility for ServiceA11y {
             t
         };
         let plan = invoke_plan(&tree, target)?;
-        self.dispatch_click(ctx, target, &plan)
+        self.dispatch_click(ctx, target, &plan, tree.subject.as_ref())
     }
 }
 
@@ -2082,11 +2098,12 @@ mod tests {
 
     #[test]
     fn set_values_call_site_sends_its_own_configured_package_to_the_rearm() {
-        // Pins `set_value`'s `self.client.set_text(target.id.0, text, &self.package)`: the
-        // re-arm reply's package is fixed to "com.example.app" regardless of what was asked, so
-        // this only passes if `ServiceA11y` actually threads its OWN configured package through
-        // — a swapped argument or a literal "" would ask for something else and be refused as a
-        // mismatch, which `reader()` (built with `String::new()`) could never catch.
+        // Pins `set_value`'s fallback to `self.package` when the served tree carries no subject
+        // (`TreePackage::Echo`, so asked == actual): the re-arm reply's package is fixed to
+        // "com.example.app" regardless of what was asked, so this only passes if `ServiceA11y`
+        // actually falls back to its OWN configured package — a swapped argument or a literal ""
+        // would ask for something else and be refused as a mismatch, which `reader()` (built
+        // with `String::new()`) could never catch.
         let field = |value: &str| {
             json!({
                 "class": "android.widget.FrameLayout",
@@ -2116,8 +2133,8 @@ mod tests {
 
     #[test]
     fn invokes_call_site_sends_its_own_configured_package_to_the_rearm() {
-        // Mirrors the `set_value` test above, for `invoke`'s
-        // `self.client.click(plan.actuated.id.0, &self.package)`. `click`'s resend fires only on
+        // Mirrors the `set_value` test above, for `invoke`'s fallback to `self.package` when the
+        // plan's tree carries no subject. `click`'s resend fires only on
         // `CallFailure::NotSent` — a real write failure, never `AnswerLost` — which only arises
         // strictly BETWEEN `invoke`'s snapshot/plan step and its click, a window `invoke`'s own
         // single call never exposes to a caller (`OnAction::DropWithoutAnswering` gives
@@ -2162,8 +2179,109 @@ mod tests {
             .shutdown(std::net::Shutdown::Write)
             .expect("shutdown");
 
-        a.dispatch_click(&ctx(), &target, &plan)
+        a.dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
             .expect("the caller's own configured package must match the rearm's fixed reply");
+    }
+
+    /// A field whose editable EditText reports `value`, wrapped exactly like the fixture used by
+    /// [`set_values_call_site_sends_its_own_configured_package_to_the_rearm`].
+    fn editable_field(value: &str) -> Value {
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.EditText", "text": value, "desc": "Email",
+                 "bounds": {"x": 0, "y": 100, "w": 600, "h": 120},
+                 "editable": true, "clickable": true, "enabled": true}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_rearm_matching_the_asked_about_app_does_not_authorise_a_stale_acting_apps_ref() {
+        // The served tree answered for `com.other.app` (a dialog), not the configured
+        // `com.example.app` — `target`'s ref is numbered from the DIALOG's nodes. `set_text` is
+        // dropped in flight; while reconnecting the dialog dismisses and `com.example.app` (the
+        // asked-about app) comes forward, so the rearm's reply names it. Comparing against the
+        // ASKED app (the bug) would match by construction here and replay the write against
+        // whatever unrelated node ref 1 resolves to in the real app — it must instead compare
+        // against the ACTING app (`com.other.app`), see the reply naming something else, and
+        // refuse.
+        let (port, ops) = fake_service_ex(
+            vec![
+                editable_field("old"),
+                editable_field("old"),
+                editable_field("new"),
+            ],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![
+                TreePackage::Other("com.other.app".into()),
+                TreePackage::Other("com.example.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+        let target = target_for(&t, AxNodeId(1));
+
+        // `OnAction::Ok` is wired for conn2 so a wrongly-authorised resend would go on to
+        // SUCCEED — the false success this pins, not just a differently-worded refusal.
+        let e = a
+            .set_value(&ctx(), &target, "new")
+            .expect_err("the rearm names the asked-about app, not the dialog the ref came from");
+        let msg = e.to_string();
+        assert!(msg.contains("com.other.app"), "{msg}");
+        assert!(msg.contains("com.example.app"), "{msg}");
+        assert!(msg.contains("moved"), "{msg}");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "no set_text on conn2 — comparing against the acting app must stop the resend"
+        );
+    }
+
+    #[test]
+    fn a_rearm_matching_the_acting_app_resends_even_though_it_differs_from_the_asked_about_app() {
+        // Mirrors the test above with the dialog still foreground at the rearm: the reply again
+        // names `com.other.app`, the same app the served tree described, so this is safe to
+        // resend even though it still differs from the configured `com.example.app`. Comparing
+        // against the asked app (the bug) would see that mismatch and spuriously refuse a resend
+        // that was actually safe.
+        let (port, ops) = fake_service_ex(
+            vec![
+                editable_field("old"),
+                editable_field("old"),
+                editable_field("new"),
+            ],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![
+                TreePackage::Other("com.other.app".into()),
+                TreePackage::Other("com.other.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&editable_field("old"));
+        let target = target_for(&t, AxNodeId(1));
+
+        a.set_value(&ctx(), &target, "new")
+            .expect("the acting app did not change, so the resend must go through");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+                "conn2:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "conn2:set_text (the resend) must follow conn2:tree (the rearm); the last conn2:tree \
+             is set_value's own post-write verification read"
+        );
     }
 
     #[test]
