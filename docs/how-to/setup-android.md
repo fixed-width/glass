@@ -128,3 +128,23 @@ GLASS_BACKEND=android glass-mcp doctor --deep
 
 Reports `adb`, the emulator + AVDs, the online/attachable device, and the agent + a11y-service status.
 Then [connect your agent](connect-an-agent.md).
+
+## Running the device suites
+
+The Android tests are `#[ignore]`d — they need a real device. Two scripts run them the same way CI does:
+
+```bash
+# Against an already-booted emulator. Needs the jar + APKs from the sections above.
+GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
+  GLASS_ANDROID_AGENT_JAR=/path/to/glass-agent.jar \
+  GLASS_ANDROID_A11Y_APK=/path/to/glass-a11y.apk \
+  GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
+  ./scripts/test-android.sh
+
+# With NO emulator running — this one is about glass booting its own.
+ANDROID_SDK_ROOT=$HOME/android-sdk GLASS_AVD=glass ./scripts/test-android-lifecycle.sh
+```
+
+The role-histogram probes in `crates/glass-android/tests/role_probe.rs` are deliberately not in
+either script; they print evidence for a human rather than asserting, and take
+`GLASS_A11Y_PROBE_APPS`. Run them by hand when mapping new widget classes.
