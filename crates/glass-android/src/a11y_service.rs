@@ -741,7 +741,9 @@ enum CheckState {
 ///
 /// The id alone cannot accept a state change: it is positional, so a node the click added above
 /// the control shifts every later id, and `checked` reads `false` on any node with no checked
-/// state — between them, an inert label sliding into the id reads as a flip.
+/// state — between them, an inert label sliding into the id reads as a flip. Role and name are
+/// what stand in its place, so a same-named sibling that inherits the id is accepted as the
+/// control; `fingerprinted` compares bounds and value too, for the same job before the click.
 fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
     match after.find(act.id) {
         Some(n) if n.states.checkable && n.role == act.role && n.name == act.name => {
@@ -786,8 +788,9 @@ fn path_to<'a>(node: &'a AxNode, id: AxNodeId, out: &mut Vec<&'a AxNode>) -> boo
     false
 }
 
-/// Whether `outer` fully contains `inner`. A node without bounds encloses nothing — the climb
-/// must not reach past a node whose geometry it cannot check.
+/// Whether `outer` fully contains `inner`, edges inclusive. Either side missing bounds is false —
+/// the climb must not reach past geometry it cannot check — though neither arm is reachable
+/// through this reader, since `json_to_node` errors a snapshot on a node with no bounds.
 fn encloses(outer: Option<AxRect>, inner: Option<AxRect>) -> bool {
     let (Some(o), Some(i)) = (outer, inner) else {
         return false;
@@ -1292,6 +1295,34 @@ mod tests {
         }
     }
 
+    /// Bounds equal on every edge. `actuable_node` climbs to the nearest enclosing clickable
+    /// ancestor, and a Compose touch target's rect routinely equals its label's — a strict
+    /// comparison here sends every such click to the pointer path instead.
+    #[test]
+    fn a_rect_encloses_one_that_shares_all_four_edges() {
+        let same = AxRect {
+            x: 40,
+            y: 200,
+            width: 200,
+            height: 100,
+        };
+        assert!(encloses(Some(same), Some(same)));
+    }
+
+    /// Defensive default, pinned on purpose: the signature admits `None`, though no production
+    /// caller supplies it — `encloses`'s own doc explains why.
+    #[test]
+    fn a_node_without_bounds_neither_encloses_nor_is_enclosed() {
+        let rect = AxRect {
+            x: 40,
+            y: 200,
+            width: 200,
+            height: 100,
+        };
+        assert!(!encloses(None, Some(rect)), "an outer with no bounds");
+        assert!(!encloses(Some(rect), None), "an inner with no bounds");
+    }
+
     #[test]
     fn a_named_label_climbs_to_the_clickable_node_that_encloses_it() {
         let t = built(&compose_like());
@@ -1321,6 +1352,17 @@ mod tests {
             actuable_node(&t, &label),
             Err(GlassError::AxActionUnavailable(2))
         ));
+    }
+
+    /// The clickable node's box shares all four edges with its label's, the coincident-edge case
+    /// `encloses` itself is unit-tested against — this proves the climb actually takes that arm.
+    #[test]
+    fn a_climb_reaches_a_clickable_ancestor_whose_bounds_exactly_match_the_target() {
+        let mut v = compose_like();
+        v["children"][0]["bounds"] = json!({"x": 120, "y": 520, "w": 80, "h": 50});
+        let t = built(&v);
+        let label = target_for(&t, AxNodeId(2));
+        assert_eq!(actuable_node(&t, &label).unwrap().id, AxNodeId(1));
     }
 
     #[test]
@@ -1527,6 +1569,51 @@ mod tests {
             "Subscribe",
             false,
         )]);
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(check_state(&after, &act), CheckState::Gone);
+    }
+
+    /// The known weakness, pinned rather than fixed: the fingerprint is `checkable` + role +
+    /// name, so a same-named sibling that inherits the id is accepted as the control that was
+    /// clicked, and its state is reported as the flip. `Actuated` records no rect, so nothing
+    /// here can tell the two apart. Strengthening this is glass#319's job — when it lands, this
+    /// test is the expectation it must consciously change.
+    #[test]
+    fn a_same_named_sibling_that_inherited_the_id_is_accepted_as_the_control() {
+        // `plan.actuated` is recorded from this tree, where id 1 really is the control clicked.
+        let mut clicked = checkable_json("android.widget.CheckBox", "Agree", false);
+        clicked["bounds"] = json!({"x": 40, "y": 400, "w": 200, "h": 100});
+        let before = after_tree(vec![clicked.clone()]);
+        let plan = invoke_plan(&before, &target_for(&before, AxNodeId(1))).unwrap();
+
+        // Ids shifted between the click and this read-back: an already-checked impostor now
+        // occupies id 1, and the control actually clicked is id 2, still unchecked.
+        let impostor = checkable_json("android.widget.CheckBox", "Agree", true);
+        let after = after_tree(vec![impostor, clicked]);
+        assert_eq!(
+            check_state(&after, &plan.actuated),
+            CheckState::Reached(true),
+            "a same-named sibling is indistinguishable to a role+name fingerprint"
+        );
+    }
+
+    /// `CheckedTextView` also maps to `AxRole::CheckBox` (see `axmap.rs`), so a node that lost
+    /// its checkable state between the click and the read-back is still reachable under the
+    /// same role and name — it must not be read as `checked == false`.
+    #[test]
+    fn a_same_named_node_no_longer_checkable_is_not_read_as_the_control() {
+        let mut node = checkable_json("android.widget.CheckedTextView", "Agree", false);
+        node["checkable"] = json!(false);
+        let after = after_tree(vec![node]);
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(check_state(&after, &act), CheckState::Gone);
+    }
+
+    /// A `Switch` maps to `AxRole::ToggleButton`, not `AxRole::CheckBox` — role is as much a
+    /// stand-in for the id as name, and this is the case that isolates it from name.
+    #[test]
+    fn a_same_named_node_of_a_different_role_is_not_read_as_the_control() {
+        let after = after_tree(vec![checkable_json("android.widget.Switch", "Agree", true)]);
         let act = actuated(1, AxRole::CheckBox, "Agree");
         assert_eq!(check_state(&after, &act), CheckState::Gone);
     }
