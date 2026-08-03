@@ -2,14 +2,13 @@
 //!   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
 //!     cargo test -p glass-android --test a11y_loop -- --ignored --nocapture --test-threads=1
 //!
-//! `--test-threads=1` is required, not tidiness: both tests drive Settings on the one attached
+//! `--test-threads=1` is required, not tidiness: these tests drive Settings on the one attached
 //! device, so in parallel each tears down the app the other is mid-interaction with.
 //!
-//! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
-//! is non-trivial and carries named, role-typed elements. A second test writes into a real
-//! `EditText` and checks that a landed write is confirmed against the live field — and that a
-//! clear cannot be confirmed here at all, because this platform reports the emptied field's hint
-//! as its text.
+//! They cover a non-trivial tree with named, role-typed elements; a write confirmed against the
+//! live field — and a clear that cannot be confirmed here at all, because this platform reports
+//! the emptied field's hint as its text; that a read takes its dump file with it; and that a
+//! snapshot taken while another app is foreground says which app it describes.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
