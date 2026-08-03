@@ -2494,8 +2494,15 @@ mod tests {
         let notice = t
             .subject_notice()
             .expect("a mismatch owes the caller a notice");
-        assert!(notice.contains("com.google.android.permissioncontroller"));
-        assert!(notice.contains("com.example.app"));
+        // Pin the order, not just presence: a swapped `actual`/`asked` pair would still
+        // contain both strings but invert the claim — telling the caller it's looking at
+        // what it asked for while the ids actually address the other app.
+        assert!(
+            notice.contains(
+                "describes com.google.android.permissioncontroller, not the com.example.app"
+            ),
+            "{notice}"
+        );
     }
 
     #[test]
