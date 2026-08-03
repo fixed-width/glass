@@ -1,0 +1,134 @@
+name: Android
+
+# WHY THIS NEVER RUNS ON PULL REQUESTS
+#
+# glass CI goes green in 3-4 minutes; its longest job (AT-SPI) is 3m. This leg cannot approach
+# that. Cold-booting an emulator is a 4-6 minute floor before a single test runs, and the device
+# tests are serialized by construction (--test-threads=1, one attached device, and an on-device
+# a11y service that accepts one connection at a time). End to end this leg is ~10-18 minutes.
+#
+# That gap does not close with tuning, so there is no promotion path and this will not become a
+# required check. What the leg buys is detection with attribution: the push-to-master trigger
+# names the merge that broke Android within ~15 minutes, instead of "someone will notice when
+# they next run the suite by hand". It does not prevent a bad merge. See glass#320.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 02:00 PT
+  workflow_dispatch:
+  push:
+    branches: [master, android-ci-leg]   # android-ci-leg is temporary; removed in Task 7
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  AGENT_TAG: v0.6.0
+  API_LEVEL: '34'
+  EMULATOR_TARGET: google_apis
+  EMULATOR_ARCH: x86_64
+
+jobs:
+  android:
+    name: Android device suite (AVD)
+    runs-on: Android-CI
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+
+      - name: Enable KVM
+        # Hardware acceleration is available on every GitHub-hosted Linux runner, but the runner
+        # user is not in the kvm group by default.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Fetch the companion jar + a11y APK from the pinned agent release
+        # These come from the release channel on purpose: it is the artifact users actually
+        # install (docs/how-to/setup-android.md sends them to that page), so a from-source build
+        # would be testing something nobody runs.
+        run: |
+          mkdir -p "$HOME/glass-android"
+          cd "$HOME/glass-android"
+          base="https://github.com/fixed-width/glass-android-agent/releases/download/${AGENT_TAG}"
+          for f in glass-agent.jar glass-a11y.apk; do
+            curl -fsSL -O "$base/$f"
+            curl -fsSL -O "$base/$f.sha256"
+            sha256sum -c "$f.sha256"
+          done
+          {
+            echo "GLASS_ANDROID_AGENT_JAR=$PWD/glass-agent.jar"
+            echo "GLASS_ANDROID_A11Y_APK=$PWD/glass-a11y.apk"
+            echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
+          } >> "$GITHUB_ENV"
+
+      - name: Cache the AVD
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
+
+      - name: Create the AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: ${{ env.EMULATOR_TARGET }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "AVD snapshot generated."
+
+      - name: Run the device suite
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          # The 120s default was tuned on a warm dev box, not a cold runner.
+          GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: ${{ env.EMULATOR_TARGET }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # Diagnostics are collected INSIDE the emulator script: the action shuts the device down
+          # when this step ends, so an `if: failure()` step afterwards would have no adb to talk to.
+          script: |
+            set +e
+            ./scripts/test-android.sh --skip native_invoke_actuates_the_fixture
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              mkdir -p diagnostics
+              adb logcat -d                  > diagnostics/logcat.txt         2>&1
+              adb shell dumpsys window       > diagnostics/dumpsys-window.txt 2>&1
+              adb shell dumpsys activity top > diagnostics/dumpsys-top.txt    2>&1
+              adb exec-out screencap -p      > diagnostics/screen.png         2>/dev/null
+            fi
+            exit $rc
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
