@@ -182,10 +182,15 @@ impl ServiceClient {
     }
 
     /// Run a request, reconnecting once and re-sending when `resend` accepts the failure.
+    /// `rearm` is `None` for a request needing no served tree (`ping`) or that IS the re-arm
+    /// (`tree`); `Some(pkg)` re-serves `tree` for `pkg` on the fresh connection first and, only
+    /// once its reply confirms `pkg` is still foreground, lets `req` follow it — see
+    /// [`rearm_tree`].
     fn call_with(
         &self,
         req: Value,
         resend: fn(&CallFailure) -> bool,
+        rearm: Option<&str>,
     ) -> std::result::Result<Value, CallFailure> {
         let mut conn = self.conn.lock().map_err(|_| {
             CallFailure::NotSent(GlassError::Backend(
@@ -197,6 +202,9 @@ impl ServiceClient {
             Err(f) if resend(&f) => {
                 // The service's accept loop accepts a fresh connection after a drop.
                 *conn = Conn::open(self.port).map_err(|e| f.with_error(e))?;
+                if let Some(pkg) = rearm {
+                    rearm_tree(&mut conn, pkg)?;
+                }
                 conn.call(req)
             }
             Err(f) => Err(f),
@@ -205,18 +213,22 @@ impl ServiceClient {
 
     /// Run a request that can be run twice without consequence, transparently reconnecting
     /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
-    fn call(&self, req: Value) -> std::result::Result<Value, CallFailure> {
-        self.call_with(req, CallFailure::is_transport)
+    fn call(&self, req: Value, rearm: Option<&str>) -> std::result::Result<Value, CallFailure> {
+        self.call_with(req, CallFailure::is_transport, rearm)
     }
 
     /// [`Self::call`] for a side-effecting request: re-send only what provably never went out.
-    fn call_once_sent(&self, req: Value) -> std::result::Result<Value, CallFailure> {
-        self.call_with(req, CallFailure::nothing_sent)
+    fn call_once_sent(
+        &self,
+        req: Value,
+        rearm: Option<&str>,
+    ) -> std::result::Result<Value, CallFailure> {
+        self.call_with(req, CallFailure::nothing_sent, rearm)
     }
 
     fn tree(&self, package: &str) -> Result<TreeReply> {
         let r = self
-            .call(json!({"op": "tree", "package": package}))
+            .call(json!({"op": "tree", "package": package}), None)
             .map_err(CallFailure::into_error)?;
         let tree = r
             .get("tree")
@@ -228,25 +240,71 @@ impl ServiceClient {
         })
     }
 
-    /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
-    /// keeps its delivery classification.
-    fn click(&self, ref_id: u32) -> std::result::Result<(), CallFailure> {
-        self.call_once_sent(json!({"op": "action", "ref": ref_id, "action": "click"}))
-            .map(|_| ())
+    /// Fire `ACTION_CLICK` on device node `ref_id` in `package`. Never re-sent once delivered;
+    /// the failure keeps its delivery classification. `package` re-arms a reconnected
+    /// connection — see [`Self::call_with`].
+    fn click(&self, ref_id: u32, package: &str) -> std::result::Result<(), CallFailure> {
+        self.call_once_sent(
+            json!({"op": "action", "ref": ref_id, "action": "click"}),
+            Some(package),
+        )
+        .map(|_| ())
     }
 
-    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
-    /// reconnecting path.
-    fn set_text(&self, ref_id: u32, text: &str) -> Result<()> {
-        self.call(json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}))
-            .map(|_| ())
-            .map_err(CallFailure::into_error)
+    /// Fire `ACTION_SET_TEXT` on device node `ref_id` in `package`. Idempotent, so this takes
+    /// the reconnecting path; `package` re-arms a reconnected connection — see
+    /// [`Self::call_with`].
+    fn set_text(&self, ref_id: u32, text: &str, package: &str) -> Result<()> {
+        self.call(
+            json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}),
+            Some(package),
+        )
+        .map(|_| ())
+        .map_err(CallFailure::into_error)
     }
 
     pub fn ping(&self) -> Result<()> {
-        self.call(json!({"op": "ping"}))
+        self.call(json!({"op": "ping"}), None)
             .map(|_| ())
             .map_err(CallFailure::into_error)
+    }
+}
+
+/// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply names
+/// `pkg` before letting the pending request that triggered the reconnect follow it. Silently
+/// re-arming with whatever is foreground *now* would make the packages match by construction
+/// and authorise the pending request against a window its ref never came from — so a mismatch,
+/// or a reply that names nothing, must return without letting that request go out.
+///
+/// The re-arm's own failure is kept distinct from the pending request's: its message says the
+/// reconnect could not re-arm, never that the request itself was refused.
+fn rearm_tree(conn: &mut Conn, pkg: &str) -> std::result::Result<(), CallFailure> {
+    let reply = conn
+        .call(json!({"op": "tree", "package": pkg}))
+        .map_err(|f| {
+            let detail = match &f {
+                CallFailure::NotSent(e) | CallFailure::AnswerLost(e) | CallFailure::Refused(e) => {
+                    e.to_string()
+                }
+            };
+            f.with_error(GlassError::Backend(format!(
+                "reconnect could not re-arm the connection: {detail}"
+            )))
+        })?;
+    let actual = reply.get("package").and_then(Value::as_str);
+    let Some(actual) = actual else {
+        return Err(CallFailure::NotSent(GlassError::Backend(format!(
+            "the reconnect could not confirm {pkg} is still the foreground app; the pending \
+             request was not re-sent"
+        ))));
+    };
+    match subject_of(pkg, Some(actual)) {
+        None => Ok(()),
+        Some(s) => Err(CallFailure::NotSent(GlassError::Backend(format!(
+            "the foreground app moved from {} to {} while reconnecting; the pending request \
+             was not re-sent",
+            s.asked, s.actual
+        )))),
     }
 }
 
@@ -318,7 +376,7 @@ impl Accessibility for ServiceA11y {
             t
         };
         crate::a11y::editable_target(&tree, target)?;
-        self.client.set_text(target.id.0, text)?;
+        self.client.set_text(target.id.0, text, &self.package)?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -366,7 +424,7 @@ impl Accessibility for ServiceA11y {
         };
         let plan = invoke_plan(&tree, target)?;
         self.client
-            .click(plan.actuated.id.0)
+            .click(plan.actuated.id.0, &self.package)
             .map_err(|f| action_error(target.id.0, f))?;
         if let Some(want) = plan.want_checked {
             self.wait_for_check(ctx, &plan, want)?;
@@ -1712,19 +1770,54 @@ mod tests {
         DropWithoutAnswering,
     }
 
+    /// What a fake `tree` reply's `package` field says, relative to what was asked — added for
+    /// glass#286's B2b, whose re-arm tests need a later connection's reply to disagree with an
+    /// earlier one, which a bare echo cannot express.
+    enum TreePackage {
+        /// Whatever the request asked for — `fake_service`'s only behavior before this enum.
+        Echo,
+        /// A different package than asked — the foreground changed since the last `tree`.
+        Other(String),
+        /// The key omitted, as an older companion sends it, or one that cannot name the active
+        /// window.
+        Unnamed,
+    }
+
     /// A fake on-device service on a local TCP listener: serves `tree` from a script (the last
     /// entry repeating) and records every request, tagged with the connection it arrived on so
     /// a re-send after a reconnect is visible in the log.
     fn fake_service(trees: Vec<Value>, on_action: OnAction) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_ex(trees, vec![on_action], vec![TreePackage::Echo])
+    }
+
+    /// [`fake_service`], varying two things **per connection** (index 0 = the first
+    /// connection, clamped to the last entry, same convention as `trees`):
+    /// - `on_action` — a later connection's action can succeed after an earlier one failed,
+    ///   needed to observe a reconnect's resend land.
+    /// - `packages` — indexed by how many `tree`s have been served *in total* across every
+    ///   connection, not by connection; a later entry can name a different package than asked
+    ///   or omit the field, modelling a foreground that changed by the time a reconnect re-arms.
+    ///
+    /// The real companion re-checks its last-served package against the active window at the
+    /// moment of each `action`, refusing if the window changed since; this fake still models
+    /// only the coarser gate glass#286 needed (some prior `tree`, ever, on THIS connection) via
+    /// a one-way flip that never re-closes — `packages` does not make the gate itself re-check
+    /// anything.
+    fn fake_service_ex(
+        trees: Vec<Value>,
+        on_action: Vec<OnAction>,
+        packages: Vec<TreePackage>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&ops);
         std::thread::spawn(move || {
-            let mut conn = 0;
+            let mut conn = 0usize;
             let mut served = 0usize;
             while let Ok((sock, _)) = listener.accept() {
                 conn += 1;
+                let this_action = on_action[(conn - 1).min(on_action.len() - 1)];
                 let Ok(mut w) = sock.try_clone() else { break };
                 let mut r = std::io::BufReader::new(sock);
                 if writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
@@ -1733,14 +1826,6 @@ mod tests {
                 {
                     break;
                 }
-                // The real companion re-checks its last-served package against the active
-                // window at the moment of each `action`, refusing if the window changed since;
-                // this fake models only the coarser gate glass#286 needed (some prior `tree`,
-                // ever, on this connection) via a one-way flip that never re-closes. It also
-                // cannot produce a `tree` reply with `package` absent (it always echoes
-                // `req["package"]` back) or express that an unnamed-package `tree` must not
-                // satisfy the gate (the real companion's `served == null` refuses) — both are
-                // covered instead by the pure `subject_of` tests above, not through this socket.
                 let mut tree_confirmed = false;
                 loop {
                     let mut line = String::new();
@@ -1753,9 +1838,16 @@ mod tests {
                         "tree" => {
                             log.lock().unwrap().push(format!("conn{conn}:tree"));
                             let t = trees[served.min(trees.len() - 1)].clone();
+                            let pkg = &packages[served.min(packages.len() - 1)];
                             served += 1;
                             tree_confirmed = true;
-                            json!({"id": id, "ok": true, "tree": t, "package": req["package"]})
+                            let mut reply = json!({"id": id, "ok": true, "tree": t});
+                            match pkg {
+                                TreePackage::Echo => reply["package"] = req["package"].clone(),
+                                TreePackage::Other(p) => reply["package"] = json!(p),
+                                TreePackage::Unnamed => {}
+                            }
+                            reply
                         }
                         "action" if !tree_confirmed => {
                             log.lock()
@@ -1770,7 +1862,7 @@ mod tests {
                                 req["action"].as_str().unwrap_or_default(),
                                 req["ref"]
                             ));
-                            match on_action {
+                            match this_action {
                                 OnAction::Ok => json!({"id": id, "ok": true}),
                                 OnAction::DropWithoutAnswering => break,
                             }
@@ -1817,12 +1909,99 @@ mod tests {
         let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
         let client = ServiceClient::connect(port).expect("connect to the fake service");
         let e = client
-            .click(1)
+            .click(1, "com.example.app")
             .expect_err("no tree has been served on this connection yet");
         assert!(matches!(e, CallFailure::Refused(_)), "{}", e.into_error());
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:action-refused-no-tree".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_reconnect_re_arms_the_fresh_connection_before_resending() {
+        // conn1's tree primes its gate; the set_text is then dropped in flight (a transport
+        // failure, not a refusal), so the idempotent path reconnects.
+        let (port, ops) = fake_service_ex(
+            vec![json!({})],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![TreePackage::Echo],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("primes conn1");
+        client
+            .set_text(1, "hi", "com.example.app")
+            .expect("re-arm confirms the same package, so the resend goes through");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+                "conn2:set_text ref=1".to_string(),
+            ],
+            "conn2:tree (the re-arm) must precede conn2:set_text (the resend)"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_whose_rearm_names_a_different_package_is_refused_without_resending() {
+        // The foreground moved between the dropped attempt and the reconnect: re-sending
+        // anyway would authorise the action against a window the caller's ref never came from.
+        let (port, ops) = fake_service_ex(
+            vec![json!({})],
+            vec![OnAction::DropWithoutAnswering],
+            vec![
+                TreePackage::Echo,
+                TreePackage::Other("com.other.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("primes conn1");
+        let e = client
+            .set_text(1, "hi", "com.example.app")
+            .expect_err("a different foreground must refuse the resend");
+        let msg = e.to_string();
+        assert!(msg.contains("com.example.app"), "{msg}");
+        assert!(msg.contains("com.other.app"), "{msg}");
+        assert!(msg.contains("moved"), "{msg}");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "no set_text on conn2 — the mismatch must stop the resend, not just be reported"
+        );
+    }
+
+    #[test]
+    fn a_reconnect_whose_rearm_names_no_package_cannot_confirm_and_is_refused() {
+        // An older companion, or one that cannot name the active window, on the re-arm: absent
+        // is not a match, so it cannot authorise the resend either.
+        let (port, ops) = fake_service_ex(
+            vec![json!({})],
+            vec![OnAction::DropWithoutAnswering],
+            vec![TreePackage::Echo, TreePackage::Unnamed],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("primes conn1");
+        let e = client
+            .set_text(1, "hi", "com.example.app")
+            .expect_err("an unconfirmed foreground must refuse the resend");
+        let msg = e.to_string();
+        assert!(msg.contains("com.example.app"), "{msg}");
+        assert!(msg.contains("could not confirm"), "{msg}");
+        assert!(!msg.contains("moved"), "{msg}");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn2:tree".to_string(),
+            ],
+            "no set_text on conn2 — an unconfirmed foreground must stop the resend"
         );
     }
 
