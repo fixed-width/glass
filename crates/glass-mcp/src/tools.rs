@@ -289,14 +289,18 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
     })
 }
 
-/// Every disclosure a snapshot owes the agent about elements it does not show: the truncation
-/// steer, and the unreadable-subtree notice. Two blocks rather than one because a tree can hit a
-/// bound, lose a subtree to a failed child read, or both, and the recourse differs.
-fn a11y_partial_steers(tree: &glass_core::AxTree) -> Vec<String> {
-    [a11y_truncation_steer(tree), tree.unreadable_notice()]
-        .into_iter()
-        .flatten()
-        .collect()
+/// Every disclosure a snapshot owes the agent: the elements it does not show, and what it turned
+/// out to describe. One function, not three call-site lists, so `a11y_snapshot` and the
+/// `return:"snapshot"` fold disclose identically.
+fn a11y_steers(tree: &glass_core::AxTree) -> Vec<String> {
+    [
+        a11y_truncation_steer(tree),
+        tree.unreadable_notice(),
+        tree.subject_notice(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
@@ -316,7 +320,7 @@ pub fn a11y_snapshot(glass: &mut Glass, a: &A11ySnapshotArgs) -> ToolResult {
     if let Some(hint) = tree.empty_guidance() {
         contents.push(OutContent::Text(hint.to_string()));
     }
-    contents.extend(a11y_partial_steers(&tree).into_iter().map(OutContent::Text));
+    contents.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
     Ok(ToolOutput::result_with(
         "glass_a11y_snapshot",
         serde_json::json!({}),
@@ -391,7 +395,7 @@ fn resolve_return(
             if let Some(hint) = tree.empty_guidance() {
                 extra.push(OutContent::Text(hint.to_string()));
             }
-            extra.extend(a11y_partial_steers(&tree).into_iter().map(OutContent::Text));
+            extra.extend(a11y_steers(&tree).into_iter().map(OutContent::Text));
             Ok((None, extra))
         }
         Some(o) => Err(format!("unknown return '{o}' (use none/settle/snapshot)")),
@@ -1241,6 +1245,22 @@ mod tests {
             }
             _ => panic!("expected the trusted truncation-steer text"),
         }
+    }
+
+    #[test]
+    fn a_snapshot_of_another_app_says_so_in_its_text() {
+        let mut tree = empty_tree();
+        tree.subject = Some(glass_core::Subject {
+            asked: "com.example.app".into(),
+            actual: "com.google.android.permissioncontroller".into(),
+        });
+        let steers = a11y_steers(&tree);
+        assert!(
+            steers
+                .iter()
+                .any(|s| s.contains("com.google.android.permissioncontroller")),
+            "the agent is told which app the ids address: {steers:?}"
+        );
     }
 
     #[test]
