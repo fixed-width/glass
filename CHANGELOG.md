@@ -191,6 +191,18 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- An Android accessibility snapshot taken through the optional on-device companion now says when
+  it describes a different app than the one asked about. The companion answered with whatever
+  window was in front — a system dialog, a permission prompt — and reported it as the requested
+  app's tree, so an element selected from it addressed the wrong app. The tree still comes back,
+  since that dialog is usually what needs reading, but it now states which app its ids address. A
+  native click or `set_value` through the companion is refused once the foreground app has changed
+  since the tree it acts against was served, not once it differs from the app that was asked about
+  — the ids address whatever app the tree described, and hold as long as that app stays
+  foreground. A reconnect that cannot confirm the same foreground held refuses the action rather
+  than replaying it: a read of the wrong app costs a turn, a write cannot be taken back. Requires
+  the updated companion; an older one says nothing about which app it answered for, and a
+  reconnect can no longer re-send a click or `set_value` against it — it fails closed instead.
 - An Android accessibility read can no longer answer with a tree captured before the interaction it
   was asked about. Every read wrote to one file on the device, and a read that ends at its deadline
   ends the local `adb` client only — the `uiautomator dump` it started keeps running on the device

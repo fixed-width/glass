@@ -2,14 +2,13 @@
 //!   GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
 //!     cargo test -p glass-android --test a11y_loop -- --ignored --nocapture --test-threads=1
 //!
-//! `--test-threads=1` is required, not tidiness: both tests drive Settings on the one attached
+//! `--test-threads=1` is required, not tidiness: these tests drive Settings on the one attached
 //! device, so in parallel each tears down the app the other is mid-interaction with.
 //!
-//! Launches com.android.settings, snapshots its a11y tree, and asserts the tree
-//! is non-trivial and carries named, role-typed elements. A second test writes into a real
-//! `EditText` and checks that a landed write is confirmed against the live field — and that a
-//! clear cannot be confirmed here at all, because this platform reports the emptied field's hint
-//! as its text.
+//! They cover a non-trivial tree with named, role-typed elements; a write confirmed against the
+//! live field — and a clear that cannot be confirmed here at all, because this platform reports
+//! the emptied field's hint as its text; that a read takes its dump file with it; and that a
+//! snapshot taken while another app is foreground says which app it describes.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
 use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
@@ -245,4 +244,78 @@ fn set_value_reports_whether_the_write_landed() {
     platform.stop_app().expect("stop");
     drop(platform);
     agents.shutdown();
+}
+
+/// Bring `component` (`pkg/.Activity`) to the foreground with a bare `am start` — bypassing
+/// `AndroidPlatform::start_app`, whose bookkeeping only ever tracks the one app it launched, so
+/// it still names the fixture while the device's real foreground has moved to something else.
+fn bring_to_front(component: &str) {
+    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+    let out = std::process::Command::new(&adb)
+        .args(["shell", "am", "start", "-n", component])
+        .output()
+        .expect("adb shell am start");
+    assert!(
+        out.status.success(),
+        "am start {component} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The service reader answering while something else holds the foreground. Ignored by default:
+///   GLASS_ADB=$HOME/android-sdk/platform-tools/adb GLASS_ANDROID_A11Y_APK=... \
+///     cargo test -p glass-android --test a11y_loop -- --ignored --nocapture --test-threads=1
+///
+/// Only a device shows this: the unit tests model the companion's replies with a fake, so a
+/// mismatched reply is whatever the fixture hands the fake — never proof that a real
+/// `AccessibilityService` names the true foreground window (glass#286).
+#[test]
+#[ignore = "requires a booted AVD + the a11y companion installed and enabled"]
+fn a_snapshot_taken_while_another_app_is_foreground_says_so() {
+    let get = |k: &str| std::env::var(k).ok();
+    let apk = glass_android::a11y_apk(&get)
+        .expect("set GLASS_ANDROID_A11Y_APK to the built a11y-debug.apk");
+
+    let agents = glass_android::AgentRegistry::new();
+    let mut platform =
+        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
+            .expect("attach");
+    let window = platform
+        .start_app(&settings_spec())
+        .expect("launch settings (the fixture asked about)");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    bring_to_front("com.google.android.deskclock/com.android.deskclock.DeskClock");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let a11y_registry = glass_android::A11yServiceRegistry::new();
+    let client = a11y_registry
+        .ensure(&platform.resolved_adb(), &apk)
+        .expect("install + enable the service");
+    let mut svc = glass_android::ServiceA11y::new(client, "com.android.settings".to_string());
+
+    let ctx = AxContext {
+        pids: platform.app_pids(),
+        window,
+        window_handle: None,
+        a11y_bus_addr: None,
+        limits: WalkLimits::DEFAULT,
+    };
+    let tree = svc
+        .snapshot(&ctx)
+        .expect("a snapshot must still succeed for the wrong app");
+    let subject = tree
+        .subject
+        .expect("the service must disclose it answered about the foreground app, not Settings");
+    assert_eq!(subject.asked, "com.android.settings");
+    assert_eq!(subject.actual, "com.google.android.deskclock");
+
+    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+    let _ = std::process::Command::new(&adb)
+        .args(["shell", "am", "force-stop", "com.google.android.deskclock"])
+        .output();
+    platform.stop_app().expect("stop");
+    drop(platform);
+    agents.shutdown();
+    a11y_registry.shutdown();
 }
