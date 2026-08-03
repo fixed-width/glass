@@ -786,8 +786,9 @@ fn path_to<'a>(node: &'a AxNode, id: AxNodeId, out: &mut Vec<&'a AxNode>) -> boo
     false
 }
 
-/// Whether `outer` fully contains `inner`. A node without bounds encloses nothing — the climb
-/// must not reach past a node whose geometry it cannot check.
+/// Whether `outer` fully contains `inner`, edges inclusive. Either side missing bounds is false —
+/// the climb must not reach past geometry it cannot check — though neither arm is reachable
+/// through this reader, since `json_to_node` errors a snapshot on a node with no bounds.
 fn encloses(outer: Option<AxRect>, inner: Option<AxRect>) -> bool {
     let (Some(o), Some(i)) = (outer, inner) else {
         return false;
@@ -1290,6 +1291,32 @@ mod tests {
             bounds: n.bounds,
             value: n.value.clone(),
         }
+    }
+
+    /// Bounds equal on every edge. `actuable_node` climbs to the nearest enclosing clickable
+    /// ancestor, and a Compose touch target's rect routinely equals its label's — a strict
+    /// comparison here sends every such click to the pointer path instead.
+    #[test]
+    fn a_rect_encloses_one_that_shares_all_four_edges() {
+        let same = AxRect {
+            x: 40,
+            y: 200,
+            width: 200,
+            height: 100,
+        };
+        assert!(encloses(Some(same), Some(same)));
+    }
+
+    #[test]
+    fn a_node_without_bounds_neither_encloses_nor_is_enclosed() {
+        let rect = AxRect {
+            x: 40,
+            y: 200,
+            width: 200,
+            height: 100,
+        };
+        assert!(!encloses(None, Some(rect)), "an outer with no bounds");
+        assert!(!encloses(Some(rect), None), "an inner with no bounds");
     }
 
     #[test]
