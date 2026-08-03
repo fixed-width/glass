@@ -272,19 +272,17 @@ impl ServiceClient {
     }
 }
 
-/// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply names
-/// `pkg` before letting the pending request that triggered the reconnect follow it. `pkg` must
-/// be the app the *served* tree actually described (its `AxTree::subject`'s `actual`, when set)
-/// — the one whose refs the pending request addresses — not the one originally asked about; a
-/// permission dialog's tree answers for the dialog, not the app behind it. Silently re-arming
-/// with whatever is foreground *now* would make the packages match by construction and
-/// authorise the pending request against a window its ref never came from — so a mismatch, or a
-/// reply that names nothing, must return without letting that request go out.
+/// Re-serve `tree` for `pkg` on a freshly reconnected connection, and confirm the reply still
+/// names `pkg` before letting the pending request that triggered the reconnect follow it.
 ///
-/// Returns a plain [`GlassError`], never a [`CallFailure`]: whether the tree call itself failed,
-/// or it answered but named the wrong package (or none), says nothing about whether the
-/// *pending* request was delivered — only the caller's own `f` gets to say that (see
-/// [`ServiceClient::call_with`]).
+/// `pkg` must be the app the *served* tree actually described (`AxTree::subject`'s `actual`,
+/// when set) — the one whose refs the pending request addresses — not the one originally asked
+/// about: a permission dialog's tree answers for the dialog, not the app behind it. Re-arming
+/// against whatever is foreground *now* would match by construction and authorise the pending
+/// request against a window its ref never came from.
+///
+/// Returns a plain [`GlassError`], never a [`CallFailure`] — only the caller's own `f` (see
+/// [`ServiceClient::call_with`]) classifies whether the *pending* request was delivered.
 fn rearm_tree(conn: &mut Conn, pkg: &str) -> Result<()> {
     let reply = conn
         .call(json!({"op": "tree", "package": pkg}))
@@ -356,10 +354,8 @@ impl ServiceA11y {
     /// step and this one — a window `invoke`'s own straight-line execution never otherwise
     /// exposes to a caller.
     ///
-    /// `subject` is the plan's tree's own (from `AxTree::subject`), passed separately rather than
-    /// folded into `InvokePlan` since it re-arms a reconnect and says nothing about the click
-    /// itself. It borrows the tree, not `self`, so the caller can still hand it to this
-    /// `&mut self` method.
+    /// `subject` (the plan's tree's own `AxTree::subject`) is passed separately from `plan`: it
+    /// borrows the tree, not `self`, so the caller can still hand it to this `&mut self` method.
     fn dispatch_click(
         &mut self,
         ctx: &AxContext,
@@ -1799,11 +1795,9 @@ mod tests {
         DropWithoutAnswering,
     }
 
-    /// What a fake `tree` reply's `package` field says, relative to what was asked — added for
-    /// glass#286's B2b, whose re-arm tests need a later connection's reply to disagree with an
-    /// earlier one, which a bare echo cannot express.
+    /// What a fake `tree` reply's `package` field says, relative to what was asked.
     enum TreePackage {
-        /// Whatever the request asked for — `fake_service`'s only behavior before this enum.
+        /// Whatever the request asked for.
         Echo,
         /// A different package than asked — the foreground changed since the last `tree`.
         Other(String),
@@ -1813,9 +1807,8 @@ mod tests {
     }
 
     /// Whether a fake `tree` request is served normally (per `packages`) or refused outright —
-    /// the `tree`-request analogue of `OnAction::DropWithoutAnswering`, needed to test a re-arm
-    /// the companion refuses (mirrors the shipped companion's `Server.kt`, which answers
-    /// `Response.error(id, "no active window")` when nothing is in the foreground).
+    /// mirrors the shipped companion's `Server.kt`, which answers `Response.error(id, "no
+    /// active window")` when nothing is in the foreground.
     #[derive(Clone, Copy)]
     enum OnTree {
         Serve,
@@ -2099,11 +2092,9 @@ mod tests {
     #[test]
     fn set_values_call_site_sends_its_own_configured_package_to_the_rearm() {
         // Pins `set_value`'s fallback to `self.package` when the served tree carries no subject
-        // (`TreePackage::Echo`, so asked == actual): the re-arm reply's package is fixed to
-        // "com.example.app" regardless of what was asked, so this only passes if `ServiceA11y`
-        // actually falls back to its OWN configured package — a swapped argument or a literal ""
-        // would ask for something else and be refused as a mismatch, which `reader()` (built
-        // with `String::new()`) could never catch.
+        // (`TreePackage::Echo`, so asked == actual): the re-arm reply's package is fixed
+        // regardless of what was asked, so this only passes if the fallback is `ServiceA11y`'s
+        // own configured package.
         let field = |value: &str| {
             json!({
                 "class": "android.widget.FrameLayout",
@@ -2134,14 +2125,12 @@ mod tests {
     #[test]
     fn invokes_call_site_sends_its_own_configured_package_to_the_rearm() {
         // Mirrors the `set_value` test above, for `invoke`'s fallback to `self.package` when the
-        // plan's tree carries no subject. `click`'s resend fires only on
-        // `CallFailure::NotSent` — a real write failure, never `AnswerLost` — which only arises
-        // strictly BETWEEN `invoke`'s snapshot/plan step and its click, a window `invoke`'s own
-        // single call never exposes to a caller (`OnAction::DropWithoutAnswering` gives
-        // `AnswerLost`, which a click never resends on). So this drives `invoke`'s own two
-        // halves directly — its own snapshot/plan step, then `dispatch_click` (split out for
-        // exactly this seam) — with a real `shutdown(Write)` sequenced between them: not a race,
-        // since nothing else runs until the test's own next line calls `dispatch_click`.
+        // plan's tree carries no subject. `click`'s resend fires only on a real
+        // `CallFailure::NotSent`, never `AnswerLost`, and that failure only arises strictly
+        // BETWEEN `invoke`'s snapshot/plan step and its click — a window `invoke`'s own single
+        // call never exposes to a caller. So this drives `invoke`'s own two halves directly —
+        // snapshot/plan, then `dispatch_click` (split out for exactly this seam) — with a real
+        // `shutdown(Write)` between them.
         let clickable = json!({
             "class": "android.widget.FrameLayout",
             "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
@@ -2185,9 +2174,8 @@ mod tests {
 
     #[test]
     fn dispatch_clicks_rearm_asks_about_the_acting_app_not_the_asked_about_one() {
-        // Sibling of the test above, on the same `shutdown(Write)` seam (a click's resend needs
-        // a real `NotSent`, never the `AnswerLost` `DropWithoutAnswering` gives), but with a
-        // subject: the served tree answered for `com.other.app`, not the configured
+        // Sibling of the test above, on the same `shutdown(Write)` seam, but with a subject:
+        // the served tree answered for `com.other.app`, not the configured
         // `com.example.app` — `target`'s ref is numbered from THAT tree. The rearm's reply names
         // the ASKED app instead. Comparing against the asked app (the bug) would match by
         // construction and replay the click against whatever unrelated node ref 1 resolves to in

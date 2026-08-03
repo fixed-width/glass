@@ -648,8 +648,8 @@ impl AxTree {
         })
     }
 
-    /// Disclosure for a tree that describes something other than what was asked for. The ids in it
-    /// address what it actually describes, so this states the subject rather than warning about it.
+    /// Disclosure for a tree that describes something other than what was asked for — the ids in
+    /// it still address what it actually describes.
     pub fn subject_notice(&self) -> Option<String> {
         self.subject.as_ref().map(|s| {
             format!(

@@ -248,9 +248,8 @@ fn set_value_reports_whether_the_write_landed() {
 }
 
 /// Bring `component` (`pkg/.Activity`) to the foreground with a bare `am start` — bypassing
-/// `AndroidPlatform::start_app`, which only ever tracks the one app it launched. That gap is the
-/// point: the platform's own bookkeeping still names the fixture, but the device's real
-/// foreground has moved to something else.
+/// `AndroidPlatform::start_app`, whose bookkeeping only ever tracks the one app it launched, so
+/// it still names the fixture while the device's real foreground has moved to something else.
 fn bring_to_front(component: &str) {
     let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
     let out = std::process::Command::new(&adb)
