@@ -203,7 +203,9 @@ impl ServiceClient {
                 // The service's accept loop accepts a fresh connection after a drop.
                 *conn = Conn::open(self.port).map_err(|e| f.with_error(e))?;
                 if let Some(pkg) = rearm {
-                    rearm_tree(&mut conn, pkg)?;
+                    // `f`'s classification, not the re-arm's own: recovering from `f` says no
+                    // more about whether `req` was delivered, whichever step trips.
+                    rearm_tree(&mut conn, pkg).map_err(|e| f.with_error(e))?;
                 }
                 conn.call(req)
             }
@@ -276,35 +278,33 @@ impl ServiceClient {
 /// and authorise the pending request against a window its ref never came from — so a mismatch,
 /// or a reply that names nothing, must return without letting that request go out.
 ///
-/// The re-arm's own failure is kept distinct from the pending request's: its message says the
-/// reconnect could not re-arm, never that the request itself was refused.
-fn rearm_tree(conn: &mut Conn, pkg: &str) -> std::result::Result<(), CallFailure> {
+/// Returns a plain [`GlassError`], never a [`CallFailure`]: whether the tree call itself failed,
+/// or it answered but named the wrong package (or none), says nothing about whether the
+/// *pending* request was delivered — only the caller's own `f` gets to say that (see
+/// [`ServiceClient::call_with`]).
+fn rearm_tree(conn: &mut Conn, pkg: &str) -> Result<()> {
     let reply = conn
         .call(json!({"op": "tree", "package": pkg}))
         .map_err(|f| {
-            let detail = match &f {
-                CallFailure::NotSent(e) | CallFailure::AnswerLost(e) | CallFailure::Refused(e) => {
-                    e.to_string()
-                }
-            };
-            f.with_error(GlassError::Backend(format!(
-                "reconnect could not re-arm the connection: {detail}"
-            )))
+            GlassError::Backend(format!(
+                "reconnect could not re-arm the connection: {}",
+                f.into_error()
+            ))
         })?;
     let actual = reply.get("package").and_then(Value::as_str);
     let Some(actual) = actual else {
-        return Err(CallFailure::NotSent(GlassError::Backend(format!(
+        return Err(GlassError::Backend(format!(
             "the reconnect could not confirm {pkg} is still the foreground app; the pending \
              request was not re-sent"
-        ))));
+        )));
     };
     match subject_of(pkg, Some(actual)) {
         None => Ok(()),
-        Some(s) => Err(CallFailure::NotSent(GlassError::Backend(format!(
+        Some(s) => Err(GlassError::Backend(format!(
             "the foreground app moved from {} to {} while reconnecting; the pending request \
              was not re-sent",
             s.asked, s.actual
-        )))),
+        ))),
     }
 }
 
@@ -1783,6 +1783,16 @@ mod tests {
         Unnamed,
     }
 
+    /// Whether a fake `tree` request is served normally (per `packages`) or refused outright —
+    /// the `tree`-request analogue of `OnAction::DropWithoutAnswering`, needed to test a re-arm
+    /// the companion refuses (mirrors the shipped companion's `Server.kt`, which answers
+    /// `Response.error(id, "no active window")` when nothing is in the foreground).
+    #[derive(Clone, Copy)]
+    enum OnTree {
+        Serve,
+        Refused(&'static str),
+    }
+
     /// A fake on-device service on a local TCP listener: serves `tree` from a script (the last
     /// entry repeating) and records every request, tagged with the connection it arrived on so
     /// a re-send after a reconnect is visible in the log.
@@ -1790,13 +1800,14 @@ mod tests {
         fake_service_ex(trees, vec![on_action], vec![TreePackage::Echo])
     }
 
-    /// [`fake_service`], varying two things **per connection** (index 0 = the first
-    /// connection, clamped to the last entry, same convention as `trees`):
-    /// - `on_action` — a later connection's action can succeed after an earlier one failed,
+    /// [`fake_service`], plus two knobs, each varying by its own count (not each other's):
+    /// - `on_action` — indexed **by connection** (index 0 = the first connection, clamped to
+    ///   the last entry): a later connection's action can succeed after an earlier one failed,
     ///   needed to observe a reconnect's resend land.
-    /// - `packages` — indexed by how many `tree`s have been served *in total* across every
-    ///   connection, not by connection; a later entry can name a different package than asked
-    ///   or omit the field, modelling a foreground that changed by the time a reconnect re-arms.
+    /// - `packages` — indexed by how many `tree`s have been served *in total*, across every
+    ///   connection (same convention as `trees`): a later entry can name a different package
+    ///   than asked, or omit the field, modelling a foreground that changed by the time a
+    ///   reconnect re-arms.
     ///
     /// The real companion re-checks its last-served package against the active window at the
     /// moment of each `action`, refusing if the window changed since; this fake still models
@@ -1807,6 +1818,19 @@ mod tests {
         trees: Vec<Value>,
         on_action: Vec<OnAction>,
         packages: Vec<TreePackage>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_full(trees, on_action, packages, vec![OnTree::Serve])
+    }
+
+    /// [`fake_service_ex`], plus `on_tree` (same indexing convention as `packages`: by how many
+    /// `tree`s have been served in total) — a served-index that resolves to `OnTree::Refused`
+    /// answers `ok:false` instead of consulting `trees`/`packages`, and does not advance
+    /// `served` or arm the connection's gate, since nothing was actually served.
+    fn fake_service_full(
+        trees: Vec<Value>,
+        on_action: Vec<OnAction>,
+        packages: Vec<TreePackage>,
+        on_tree: Vec<OnTree>,
     ) -> (u16, Arc<Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -1835,20 +1859,28 @@ mod tests {
                     let req: Value = serde_json::from_str(&line).expect("request is json");
                     let id = req["id"].clone();
                     let reply = match req["op"].as_str().unwrap_or_default() {
-                        "tree" => {
-                            log.lock().unwrap().push(format!("conn{conn}:tree"));
-                            let t = trees[served.min(trees.len() - 1)].clone();
-                            let pkg = &packages[served.min(packages.len() - 1)];
-                            served += 1;
-                            tree_confirmed = true;
-                            let mut reply = json!({"id": id, "ok": true, "tree": t});
-                            match pkg {
-                                TreePackage::Echo => reply["package"] = req["package"].clone(),
-                                TreePackage::Other(p) => reply["package"] = json!(p),
-                                TreePackage::Unnamed => {}
+                        "tree" => match on_tree[served.min(on_tree.len() - 1)] {
+                            OnTree::Refused(msg) => {
+                                log.lock().unwrap().push(format!("conn{conn}:tree-refused"));
+                                json!({"id": id, "ok": false, "error": msg})
                             }
-                            reply
-                        }
+                            OnTree::Serve => {
+                                log.lock().unwrap().push(format!("conn{conn}:tree"));
+                                let t = trees[served.min(trees.len() - 1)].clone();
+                                let pkg = &packages[served.min(packages.len() - 1)];
+                                served += 1;
+                                tree_confirmed = true;
+                                let mut reply = json!({"id": id, "ok": true, "tree": t});
+                                match pkg {
+                                    TreePackage::Echo => {
+                                        reply["package"] = req["package"].clone();
+                                    }
+                                    TreePackage::Other(p) => reply["package"] = json!(p),
+                                    TreePackage::Unnamed => {}
+                                }
+                                reply
+                            }
+                        },
                         "action" if !tree_confirmed => {
                             log.lock()
                                 .unwrap()
@@ -2003,6 +2035,70 @@ mod tests {
             ],
             "no set_text on conn2 — an unconfirmed foreground must stop the resend"
         );
+    }
+
+    #[test]
+    fn a_rearm_refused_by_the_companion_keeps_the_original_failures_own_classification() {
+        // conn1's action is dropped (AnswerLost); the re-arm on conn2 is then refused outright
+        // (`Server.kt`'s `Response.error(id, "no active window")`, `CallFailure::Refused`).
+        // Read via `call` directly, not `set_text`: `set_text`'s public `Result<()>` erases
+        // which `CallFailure` variant it was, and that variant is exactly what this pins.
+        let (port, _ops) = fake_service_full(
+            vec![json!({})],
+            vec![OnAction::DropWithoutAnswering],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve, OnTree::Refused("no active window")],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        client.tree("com.example.app").expect("primes conn1");
+        let e = client
+            .call(
+                json!({"op": "action", "ref": 1, "action": "set_text", "text": "hi"}),
+                Some("com.example.app"),
+            )
+            .expect_err("a refused re-arm must still fail — just not overwrite the original's classification");
+        assert!(
+            matches!(e, CallFailure::AnswerLost(_)),
+            "conn1's own failure was AnswerLost; a re-arm the companion refuses must not \
+             relabel it Refused (which a click would then report as the action itself having \
+             failed, or worse — Refused's own AnswerLost sibling would read as a lost result \
+             for an action that never left the host): {}",
+            e.into_error()
+        );
+    }
+
+    #[test]
+    fn set_values_call_site_sends_its_own_configured_package_to_the_rearm() {
+        // Pins `set_value`'s `self.client.set_text(target.id.0, text, &self.package)`: the
+        // re-arm reply's package is fixed to "com.example.app" regardless of what was asked, so
+        // this only passes if `ServiceA11y` actually threads its OWN configured package through
+        // — a swapped argument or a literal "" would ask for something else and be refused as a
+        // mismatch, which `reader()` (built with `String::new()`) could never catch.
+        let field = |value: &str| {
+            json!({
+                "class": "android.widget.FrameLayout",
+                "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+                "children": [
+                    {"class": "android.widget.EditText", "text": value, "desc": "Email",
+                     "bounds": {"x": 0, "y": 100, "w": 600, "h": 120},
+                     "editable": true, "clickable": true, "enabled": true}
+                ]
+            })
+        };
+        let (port, _ops) = fake_service_ex(
+            vec![field("old"), field("old"), field("new")],
+            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            vec![
+                TreePackage::Echo,
+                TreePackage::Other("com.example.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&field("old"));
+        let target = target_for(&t, AxNodeId(1));
+        a.set_value(&ctx(), &target, "new")
+            .expect("the caller's own configured package must match the rearm's fixed reply");
     }
 
     #[test]
