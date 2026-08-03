@@ -160,8 +160,9 @@ pub(crate) fn tree_from_json(
 /// A `tree` reply: the tree, and the window it came from when the companion names one.
 struct TreeReply {
     tree: Value,
-    /// The package the companion actually answered about, when it names one. `None` on an
-    /// older companion that predates this field — absent, not a mismatch.
+    /// The package the companion actually answered about, when it names one. `None` either
+    /// on an older companion that predates this field, or on a current one that cannot name
+    /// the active window on this platform/state — either way, absent is not a mismatch.
     package: Option<String>,
 }
 
@@ -1732,9 +1733,14 @@ mod tests {
                 {
                     break;
                 }
-                // The real companion refuses `action` until a `tree` naming a matching package
-                // has been served on this SAME connection — a fresh one starts unconfirmed. This
-                // fake echoes the asked package back as served, so it matches by construction.
+                // The real companion re-checks its last-served package against the active
+                // window at the moment of each `action`, refusing if the window changed since;
+                // this fake models only the coarser gate glass#286 needed (some prior `tree`,
+                // ever, on this connection) via a one-way flip that never re-closes. It also
+                // cannot produce a `tree` reply with `package` absent (it always echoes
+                // `req["package"]` back) or express that an unnamed-package `tree` must not
+                // satisfy the gate (the real companion's `served == null` refuses) — both are
+                // covered instead by the pure `subject_of` tests above, not through this socket.
                 let mut tree_confirmed = false;
                 loop {
                     let mut line = String::new();
