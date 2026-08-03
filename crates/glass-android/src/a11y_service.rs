@@ -741,7 +741,9 @@ enum CheckState {
 ///
 /// The id alone cannot accept a state change: it is positional, so a node the click added above
 /// the control shifts every later id, and `checked` reads `false` on any node with no checked
-/// state — between them, an inert label sliding into the id reads as a flip.
+/// state — between them, an inert label sliding into the id reads as a flip. Role and name are
+/// what stand in its place, so a same-named sibling that inherits the id is accepted as the
+/// control; `fingerprinted` compares bounds and value too, for the same job before the click.
 fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
     match after.find(act.id) {
         Some(n) if n.states.checkable && n.role == act.role && n.name == act.name => {
@@ -1556,6 +1558,29 @@ mod tests {
         )]);
         let act = actuated(1, AxRole::CheckBox, "Agree");
         assert_eq!(check_state(&after, &act), CheckState::Gone);
+    }
+
+    /// The known weakness, pinned rather than fixed: the fingerprint is `checkable` + role +
+    /// name, so a same-named sibling that inherits the id is accepted as the control that was
+    /// clicked, and its state is reported as the flip. `Actuated` records no rect, so nothing
+    /// here can tell the two apart. Strengthening this is glass#319's job — when it lands, this
+    /// test is the expectation it must consciously change.
+    #[test]
+    fn a_same_named_sibling_that_inherited_the_id_is_accepted_as_the_control() {
+        let mut first = checkable_json("android.widget.CheckBox", "Agree", true);
+        first["bounds"] = json!({"x": 40, "y": 200, "w": 200, "h": 100});
+        let mut second = checkable_json("android.widget.CheckBox", "Agree", false);
+        second["bounds"] = json!({"x": 40, "y": 400, "w": 200, "h": 100});
+        let after = after_tree(vec![first, second]);
+
+        // Id 1 is the FIRST of the two. Had the click been on the second, `check_state` would
+        // still answer from id 1 and report its state as the outcome.
+        let act = actuated(1, AxRole::CheckBox, "Agree");
+        assert_eq!(
+            check_state(&after, &act),
+            CheckState::Reached(true),
+            "a same-named sibling is indistinguishable to a role+name fingerprint"
+        );
     }
 
     /// A clickable card wrapping a clickable button wrapping its label — nested clickables are
