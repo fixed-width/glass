@@ -347,6 +347,25 @@ impl ServiceA11y {
             std::thread::sleep(CHECK_POLL);
         }
     }
+
+    /// Fire the click for an already-resolved `plan`, then confirm any expected state change.
+    /// Split out of `invoke` so a test can force a reconnect strictly between the snapshot/plan
+    /// step and this one — a window `invoke`'s own straight-line execution never otherwise
+    /// exposes to a caller.
+    fn dispatch_click(
+        &mut self,
+        ctx: &AxContext,
+        target: &AxTarget,
+        plan: &InvokePlan,
+    ) -> Result<Option<AxNodeId>> {
+        self.client
+            .click(plan.actuated.id.0, &self.package)
+            .map_err(|f| action_error(target.id.0, f))?;
+        if let Some(want) = plan.want_checked {
+            self.wait_for_check(ctx, plan, want)?;
+        }
+        Ok(plan.substituted())
+    }
 }
 
 /// What the tree describes, when the companion named a window and it is not the one asked about.
@@ -423,13 +442,7 @@ impl Accessibility for ServiceA11y {
             t
         };
         let plan = invoke_plan(&tree, target)?;
-        self.client
-            .click(plan.actuated.id.0, &self.package)
-            .map_err(|f| action_error(target.id.0, f))?;
-        if let Some(want) = plan.want_checked {
-            self.wait_for_check(ctx, &plan, want)?;
-        }
-        Ok(plan.substituted())
+        self.dispatch_click(ctx, target, &plan)
     }
 }
 
@@ -2098,6 +2111,58 @@ mod tests {
         let t = built(&field("old"));
         let target = target_for(&t, AxNodeId(1));
         a.set_value(&ctx(), &target, "new")
+            .expect("the caller's own configured package must match the rearm's fixed reply");
+    }
+
+    #[test]
+    fn invokes_call_site_sends_its_own_configured_package_to_the_rearm() {
+        // Mirrors the `set_value` test above, for `invoke`'s
+        // `self.client.click(plan.actuated.id.0, &self.package)`. `click`'s resend fires only on
+        // `CallFailure::NotSent` — a real write failure, never `AnswerLost` — which only arises
+        // strictly BETWEEN `invoke`'s snapshot/plan step and its click, a window `invoke`'s own
+        // single call never exposes to a caller (`OnAction::DropWithoutAnswering` gives
+        // `AnswerLost`, which a click never resends on). So this drives `invoke`'s own two
+        // halves directly — its own snapshot/plan step, then `dispatch_click` (split out for
+        // exactly this seam) — with a real `shutdown(Write)` sequenced between them: not a race,
+        // since nothing else runs until the test's own next line calls `dispatch_click`.
+        let clickable = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 0, "y": 100, "w": 200, "h": 100},
+                 "clickable": true, "enabled": true}
+            ]
+        });
+        let (port, _ops) = fake_service_ex(
+            vec![clickable.clone()],
+            vec![OnAction::Ok],
+            vec![
+                TreePackage::Echo,
+                TreePackage::Other("com.example.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&clickable);
+        let target = target_for(&t, AxNodeId(1));
+
+        // `invoke`'s own first half, called directly: snapshot + resolve the plan.
+        let mut tree = a.snapshot(&ctx()).expect("snapshot");
+        tree.assign_ids();
+        let plan = invoke_plan(&tree, &target).expect("plan resolves");
+
+        // Break the connection's write half — deterministic, not raced: this line has already
+        // returned before `dispatch_click` is called below.
+        a.client
+            .conn
+            .lock()
+            .expect("lock")
+            .writer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+
+        a.dispatch_click(&ctx(), &target, &plan)
             .expect("the caller's own configured package must match the rearm's fixed reply");
     }
 
