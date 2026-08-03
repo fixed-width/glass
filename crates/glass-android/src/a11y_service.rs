@@ -242,9 +242,9 @@ impl ServiceClient {
         })
     }
 
-    /// Fire `ACTION_CLICK` on device node `ref_id` in `package`. Never re-sent once delivered;
-    /// the failure keeps its delivery classification. `package` re-arms a reconnected
-    /// connection — see [`Self::call_with`].
+    /// Fire `ACTION_CLICK` on device node `ref_id`. Never re-sent once delivered; the failure
+    /// keeps its delivery classification. `package` never reaches the wire here — it only
+    /// re-arms a reconnected connection's `tree` call — see [`Self::call_with`].
     fn click(&self, ref_id: u32, package: &str) -> std::result::Result<(), CallFailure> {
         self.call_once_sent(
             json!({"op": "action", "ref": ref_id, "action": "click"}),
@@ -253,9 +253,9 @@ impl ServiceClient {
         .map(|_| ())
     }
 
-    /// Fire `ACTION_SET_TEXT` on device node `ref_id` in `package`. Idempotent, so this takes
-    /// the reconnecting path; `package` re-arms a reconnected connection — see
-    /// [`Self::call_with`].
+    /// Fire `ACTION_SET_TEXT` on device node `ref_id`. Idempotent, so this takes the
+    /// reconnecting path. `package` never reaches the wire here — it only re-arms a
+    /// reconnected connection's `tree` call — see [`Self::call_with`].
     fn set_text(&self, ref_id: u32, text: &str, package: &str) -> Result<()> {
         self.call(
             json!({"op": "action", "ref": ref_id, "action": "set_text", "text": text}),
@@ -2181,6 +2181,64 @@ mod tests {
 
         a.dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
             .expect("the caller's own configured package must match the rearm's fixed reply");
+    }
+
+    #[test]
+    fn dispatch_clicks_rearm_asks_about_the_acting_app_not_the_asked_about_one() {
+        // Sibling of the test above, on the same `shutdown(Write)` seam (a click's resend needs
+        // a real `NotSent`, never the `AnswerLost` `DropWithoutAnswering` gives), but with a
+        // subject: the served tree answered for `com.other.app`, not the configured
+        // `com.example.app` — `target`'s ref is numbered from THAT tree. The rearm's reply names
+        // the ASKED app instead. Comparing against the asked app (the bug) would match by
+        // construction and replay the click against whatever unrelated node ref 1 resolves to in
+        // the real app; comparing against the acting app (`com.other.app`) sees the mismatch and
+        // refuses.
+        let clickable = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 0, "w": 1080, "h": 2400},
+            "children": [
+                {"class": "android.widget.Button", "desc": "Save",
+                 "bounds": {"x": 0, "y": 100, "w": 200, "h": 100},
+                 "clickable": true, "enabled": true}
+            ]
+        });
+        let (port, ops) = fake_service_ex(
+            vec![clickable.clone()],
+            vec![OnAction::Ok],
+            vec![
+                TreePackage::Other("com.other.app".into()),
+                TreePackage::Other("com.example.app".into()),
+            ],
+        );
+        let client = ServiceClient::connect(port).expect("connect to the fake service");
+        let mut a = ServiceA11y::new(client, "com.example.app".to_string());
+        let t = built(&clickable);
+        let target = target_for(&t, AxNodeId(1));
+
+        let mut tree = a.snapshot(&ctx()).expect("snapshot");
+        tree.assign_ids();
+        let plan = invoke_plan(&tree, &target).expect("plan resolves");
+
+        a.client
+            .conn
+            .lock()
+            .expect("lock")
+            .writer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+
+        let e = a
+            .dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
+            .expect_err("the rearm names the asked-about app, not the app the ref came from");
+        let msg = e.to_string();
+        assert!(msg.contains("com.other.app"), "{msg}");
+        assert!(msg.contains("com.example.app"), "{msg}");
+        assert!(msg.contains("moved"), "{msg}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
+            "no click on conn2 — comparing against the acting app must stop the resend"
+        );
     }
 
     /// A field whose editable EditText reports `value`, wrapped exactly like the fixture used by
