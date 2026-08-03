@@ -521,6 +521,16 @@ impl WalkBudget {
     }
 }
 
+/// What a caller asked a backend about, and what it answered about, when those differ.
+///
+/// Only a backend addressed by *name* can tell — the desktop readers are handed a window and have
+/// nothing to compare. `None` on a tree means no claim either way, not agreement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subject {
+    pub asked: String,
+    pub actual: String,
+}
+
 /// The active window's accessibility subtree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxTree {
@@ -533,6 +543,9 @@ pub struct AxTree {
     /// Subtrees dropped because a child read failed. Independent of [`AxTree::truncated`]: a
     /// tree can hit no bound at all and still be missing elements this way.
     pub unreadable: usize,
+    /// `Some` when the backend answered about something other than what it was asked about —
+    /// see [`Subject`].
+    pub subject: Option<Subject>,
 }
 
 impl AxTree {
@@ -544,6 +557,7 @@ impl AxTree {
             count: 0,
             truncated: None,
             unreadable: 0,
+            subject: None,
         }
     }
 
@@ -630,6 +644,18 @@ impl AxTree {
                  show them; otherwise drive that area by pixels: glass_screenshot, then \
                  glass_click at x,y.",
                 if self.unreadable == 1 { "is" } else { "are" },
+            )
+        })
+    }
+
+    /// Disclosure for a tree that describes something other than what was asked for. The ids in it
+    /// address what it actually describes, so this states the subject rather than warning about it.
+    pub fn subject_notice(&self) -> Option<String> {
+        self.subject.as_ref().map(|s| {
+            format!(
+                "… this describes {}, not the {} that was asked for — the ids above address that \
+                 window, and a fresh glass_a11y_snapshot will follow the foreground.",
+                s.actual, s.asked,
             )
         })
     }
@@ -2456,6 +2482,28 @@ mod tests {
     #[test]
     fn new_builds_a_complete_tree() {
         assert_eq!(AxTree::new(leaf(AxRole::Window, "App")).truncated, None);
+    }
+
+    #[test]
+    fn a_tree_that_answered_for_another_subject_says_which() {
+        let mut t = AxTree::new(leaf(AxRole::Window, "w"));
+        t.subject = Some(Subject {
+            asked: "com.example.app".into(),
+            actual: "com.google.android.permissioncontroller".into(),
+        });
+        let notice = t
+            .subject_notice()
+            .expect("a mismatch owes the caller a notice");
+        assert!(notice.contains("com.google.android.permissioncontroller"));
+        assert!(notice.contains("com.example.app"));
+    }
+
+    #[test]
+    fn a_tree_that_answered_for_what_was_asked_says_nothing() {
+        assert_eq!(
+            AxTree::new(leaf(AxRole::Window, "w")).subject_notice(),
+            None
+        );
     }
 
     #[test]
