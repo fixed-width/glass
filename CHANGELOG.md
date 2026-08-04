@@ -404,17 +404,6 @@ internal refactors, CI, or test-only changes.
   it prints now names each candidate's `AXRole` and the raw `AXError` behind a failed read, and
   window adoption itself now records which on-screen window it took out of what else was
   available. `WindowNotFound` no longer asserts a timing cause it cannot know.
-- A native Android click or `set_value` through the optional on-device companion no longer fails
-  just because the screen was still animating. A screen whose open transition is playing reports its
-  content at an offset that decays over about half a second, so the tree glass reads to aim the
-  action could place the element tens of pixels from where your snapshot had it — and the check that
-  stops an action landing on the wrong element refused it. Glass now re-reads and tries again, up to
-  four reads spread over about six-tenths of a second, acting on the first read that agrees with your
-  snapshot. An element that moved under every read is still refused, now naming where each read found
-  it rather than only that it changed. Nothing else changes: an element that is genuinely a different
-  one, disabled, or exposing no click action is refused on the first read as before; an action that
-  may already have reached the device is never sent twice; and a screen that is not moving costs no
-  extra read and no wait.
 
 ## [1.1.0] - 2026-07-23
 

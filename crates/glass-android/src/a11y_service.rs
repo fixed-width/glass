@@ -306,28 +306,6 @@ fn rearm_tree(conn: &mut Conn, pkg: &str) -> Result<()> {
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// How many times [`ServiceA11y::on_a_fresh_tree`] may read the tree, how long it waits between
-/// reads, and the wall clock the whole ladder may spend — all three spent only after a refusal.
-///
-/// An activity-open transition slides its content for ~600 ms and holds each position for up to
-/// ~365 ms, so the reads have to be *spread* rather than merely repeated: four reads one pause
-/// apart span ~600 ms and cross every plateau. The budget ends the ladder early on a tree whose
-/// own reads cover that span in fewer attempts (several hundred nodes read in ~180 ms).
-const RETRY_ATTEMPTS: usize = 4;
-const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
-const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(900);
-
-/// A failed attempt at reading the tree, resolving a target in it and acting on it — and whether
-/// repeating the whole attempt can act twice.
-#[derive(Debug)]
-enum Refusal {
-    /// Raised because the target was somewhere else, and raised before anything reached the
-    /// control. A later read may find it where the caller saw it.
-    Moved(GlassError),
-    /// Everything else, including every outcome that may already have reached the device.
-    Final(GlassError),
-}
-
 /// The Accessibility reader backed by the on-device service. `package` is the target app.
 pub struct ServiceA11y {
     client: ServiceClient,
@@ -377,51 +355,15 @@ impl ServiceA11y {
         target: &AxTarget,
         plan: &InvokePlan,
         subject: Option<&Subject>,
-    ) -> std::result::Result<Option<AxNodeId>, Refusal> {
+    ) -> Result<Option<AxNodeId>> {
         let acting_on = subject.map_or(self.package.as_str(), |s| s.actual.as_str());
         self.client
             .click(plan.actuated.id.0, acting_on)
-            .map_err(|f| click_refusal(target.id.0, f))?;
+            .map_err(|f| action_error(target.id.0, f))?;
         if let Some(want) = plan.want_checked {
-            // The click has gone out; from here nothing may be repeated.
-            self.wait_for_check(ctx, plan, want)
-                .map_err(Refusal::Final)?;
+            self.wait_for_check(ctx, plan, want)?;
         }
         Ok(plan.substituted())
-    }
-
-    /// Read + number the tree, run `attempt` against it, and repeat while `attempt` reports the
-    /// target moved under it — up to [`RETRY_ATTEMPTS`] reads, [`RETRY_PAUSE`] apart, within
-    /// [`RETRY_BUDGET`].
-    ///
-    /// The whole attempt is re-run, so it is sound only because [`Refusal::Moved`] is reserved
-    /// for refusals raised before anything reached the control.
-    fn on_a_fresh_tree<T>(
-        &mut self,
-        ctx: &AxContext,
-        target: &AxTarget,
-        mut attempt: impl FnMut(&mut Self, &AxTree) -> std::result::Result<T, Refusal>,
-    ) -> Result<T> {
-        let started = std::time::Instant::now();
-        let mut found_at = Vec::new();
-        loop {
-            let tree = {
-                let mut t = self.snapshot(ctx)?;
-                t.assign_ids();
-                t
-            };
-            match attempt(self, &tree) {
-                Ok(v) => return Ok(v),
-                Err(Refusal::Final(e)) => return Err(e),
-                Err(Refusal::Moved(e)) => {
-                    found_at.push(tree.find(target.id).and_then(|n| n.bounds));
-                    if found_at.len() >= RETRY_ATTEMPTS || started.elapsed() >= RETRY_BUDGET {
-                        return Err(kept_moving(target, &found_at, started.elapsed(), e));
-                    }
-                    std::thread::sleep(RETRY_PAUSE);
-                }
-            }
-        }
     }
 }
 
@@ -446,21 +388,19 @@ impl Accessibility for ServiceA11y {
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         // Guard: re-snapshot and verify the ref still points at the same editable element before
         // acting. Shared with `AndroidA11y::set_value`, so both readers refuse the same drift.
-        self.on_a_fresh_tree(ctx, target, |a, tree| {
-            crate::a11y::editable_target(tree, target)
-                .map_err(|e| moved_or_final(e, tree, target))?;
-            // Re-arm against the app the served tree actually described, not the one asked about —
-            // that's the app `target`'s ref came from (see `rearm_tree`).
-            let acting_on = tree
-                .subject
-                .as_ref()
-                .map_or(a.package.as_str(), |s| s.actual.as_str());
-            // `set_text` consumes its own `CallFailure`, so its refusals cannot be told apart
-            // by delivery here.
-            a.client
-                .set_text(target.id.0, text, acting_on)
-                .map_err(Refusal::Final)
-        })?;
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
+        crate::a11y::editable_target(&tree, target)?;
+        // Re-arm against the app the served tree actually described, not the one asked about —
+        // that's the app `target`'s ref came from (see `rearm_tree`).
+        let acting_on = tree
+            .subject
+            .as_ref()
+            .map_or(self.package.as_str(), |s| s.actual.as_str());
+        self.client.set_text(target.id.0, text, acting_on)?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -501,10 +441,13 @@ impl Accessibility for ServiceA11y {
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
-        self.on_a_fresh_tree(ctx, target, |a, tree| {
-            let plan = invoke_plan(tree, target).map_err(|e| moved_or_final(e, tree, target))?;
-            a.dispatch_click(ctx, target, &plan, tree.subject.as_ref())
-        })
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
+        let plan = invoke_plan(&tree, target)?;
+        self.dispatch_click(ctx, target, &plan, tree.subject.as_ref())
     }
 }
 
@@ -963,81 +906,6 @@ fn action_error(target: u32, f: CallFailure) -> GlassError {
         )),
         CallFailure::Refused(e) => GlassError::AxActionFailed(target, e.to_string()),
     }
-}
-
-/// [`action_error`], plus whether the companion refused before it touched the control — the only
-/// click failure a fresh attempt may repeat.
-fn click_refusal(target: u32, f: CallFailure) -> Refusal {
-    let repeatable = refused_before_acting(&f);
-    let e = action_error(target, f);
-    if repeatable {
-        Refusal::Moved(e)
-    } else {
-        Refusal::Final(e)
-    }
-}
-
-/// The companion's `matchLive` refusal: its live re-read holds no node at the bounds of the tree
-/// it served, thrown before `performOn` (`GlassA11yService.kt`'s `liveSink`), so the control was
-/// never touched. Matched on the message because the protocol carries no error code.
-///
-/// Do not widen: every other `Refused` either ran the action or is an answer this client could
-/// not read, and neither says the control was left alone.
-fn refused_before_acting(f: &CallFailure) -> bool {
-    matches!(f, CallFailure::Refused(e) if e.to_string().contains("live node gone"))
-}
-
-/// Classify a resolution failure raised against `tree`: only [`GlassError::AxElementChanged`]
-/// for an element that is still itself is worth another read.
-///
-/// `crate::a11y::fingerprinted` rejects on role/name, on bounds and on value, so role, name and
-/// value still matching means the bounds rejected — the element standing somewhere else, which a
-/// later read can find. A role/name/value drift is a different element that inherited the id.
-fn moved_or_final(e: GlassError, tree: &AxTree, target: &AxTarget) -> Refusal {
-    let still_itself = tree.find(target.id).is_some_and(|n| {
-        target.matches(n.role, n.name.as_deref()) && target.value_consistent(n.value.as_deref())
-    });
-    if matches!(e, GlassError::AxElementChanged(_)) && still_itself {
-        Refusal::Moved(e)
-    } else {
-        Refusal::Final(e)
-    }
-}
-
-/// The refusal for a target that every read found somewhere else. It names where each read found
-/// it because `last` alone says only that the two disagree, and which of them is the stale one is
-/// not something this side can tell.
-fn kept_moving(
-    target: &AxTarget,
-    found_at: &[Option<AxRect>],
-    elapsed: std::time::Duration,
-    last: GlassError,
-) -> GlassError {
-    let found = found_at
-        .iter()
-        .copied()
-        .map(rect)
-        .collect::<Vec<_>>()
-        .join(", ");
-    GlassError::AxActionFailed(
-        target.id.0,
-        format!(
-            "the element moved under all {} reads taken over {} ms, so nothing was dispatched: \
-             the snapshot has it at {}, the re-reads found it at {found} ({last}). A screen whose \
-             open transition is still animating settles in about half a second — retry once it has",
-            found_at.len(),
-            elapsed.as_millis(),
-            rect(target.bounds),
-        ),
-    )
-}
-
-/// `(x,y wxh)`, or `absent` for an element no longer in the tree.
-fn rect(b: Option<AxRect>) -> String {
-    b.map_or_else(
-        || "absent".to_string(),
-        |r| format!("({},{} {}x{})", r.x, r.y, r.width, r.height),
-    )
 }
 
 /// The error for a control whose click was accepted but whose state never reached `want`.
@@ -2089,11 +1957,6 @@ mod tests {
         /// Read the request, then drop the socket without answering — the shape of an answer
         /// lost to a read timeout, a rebinding service or a reset `adb forward` tunnel.
         DropWithoutAnswering,
-        /// Answer `ok:false` with `msg` for the first `n` actions on each connection, then answer
-        /// normally — the shape of the companion's own per-action refusals (`matchLive` failing),
-        /// which leave the socket up. Logged as `{action}-refused`, so a request the device threw
-        /// out before touching the control is distinguishable from one it actuated.
-        RefusedFirst(usize, &'static str),
     }
 
     /// What a fake `tree` reply's `package` field says, relative to what was asked.
@@ -2180,7 +2043,6 @@ mod tests {
                     break;
                 }
                 let mut tree_confirmed = false;
-                let mut refused = 0usize;
                 loop {
                     let mut line = String::new();
                     if !matches!(r.read_line(&mut line), Ok(n) if n > 0) {
@@ -2232,27 +2094,14 @@ mod tests {
                                    "error": "no tree has been served on this connection"})
                         }
                         "action" => {
-                            let act = req["action"].as_str().unwrap_or_default();
-                            let r = &req["ref"];
-                            let record = |suffix: &str| {
-                                log.lock()
-                                    .unwrap()
-                                    .push(format!("conn{conn}:{act}{suffix} ref={r}"));
-                            };
+                            log.lock().unwrap().push(format!(
+                                "conn{conn}:{} ref={}",
+                                req["action"].as_str().unwrap_or_default(),
+                                req["ref"]
+                            ));
                             match this_action {
-                                OnAction::RefusedFirst(n, msg) if refused < n => {
-                                    refused += 1;
-                                    record("-refused");
-                                    json!({"id": id, "ok": false, "error": msg})
-                                }
-                                OnAction::DropWithoutAnswering => {
-                                    record("");
-                                    break;
-                                }
-                                OnAction::Ok | OnAction::RefusedFirst(..) => {
-                                    record("");
-                                    json!({"id": id, "ok": true})
-                                }
+                                OnAction::Ok => json!({"id": id, "ok": true}),
+                                OnAction::DropWithoutAnswering => break,
                             }
                         }
                         _ => json!({"id": id, "ok": true}),
@@ -2811,14 +2660,9 @@ mod tests {
             .shutdown(std::net::Shutdown::Write)
             .expect("shutdown");
 
-        let refusal = a
+        let e = a
             .dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
             .expect_err("the rearm names the asked-about app, not the app the ref came from");
-        // Final, not Moved: only the companion's pre-`performOn` refusal is repeatable, and a
-        // rearm that could not confirm the acting app says nothing about what the click did.
-        let Refusal::Final(e) = refusal else {
-            panic!("a click that may already have gone out must not be repeatable: {refusal:?}")
-        };
         let msg = e.to_string();
         assert!(msg.contains("com.other.app"), "{msg}");
         assert!(msg.contains("com.example.app"), "{msg}");
@@ -3043,224 +2887,6 @@ mod tests {
                 "conn1:tree".to_string()
             ],
             "the click went out and the state was read back"
-        );
-    }
-
-    /// `v` with every node's `x` moved by `dx`, and nothing else touched — the shape of the
-    /// activity-open transition #326 reproduces, in which only `x` ever changes.
-    fn slid(v: &Value, dx: i64) -> Value {
-        fn shift(v: &mut Value, dx: i64) {
-            if let Some(x) = v.pointer_mut("/bounds/x") {
-                *x = json!(x.as_i64().unwrap_or(0) + dx);
-            }
-            for c in v
-                .get_mut("children")
-                .and_then(Value::as_array_mut)
-                .into_iter()
-                .flatten()
-            {
-                shift(c, dx);
-            }
-        }
-        let mut v = v.clone();
-        shift(&mut v, dx);
-        v
-    }
-
-    #[test]
-    fn a_target_that_moved_under_the_first_read_is_actuated_from_a_second() {
-        // The caller's target came from the settled tree; `invoke`'s own read catches the open
-        // transition 79 px along, so the guard's ±8 px check refuses it.
-        let (port, ops) = fake_service(
-            vec![slid(&compose_like(), 79), compose_like()],
-            OnAction::Ok,
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let substituted = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("a re-read that finds the target where the caller saw it must actuate it");
-        assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string(),
-            ],
-            "one re-read, then exactly one dispatch"
-        );
-    }
-
-    #[test]
-    fn a_click_the_device_refused_before_touching_the_control_is_retried_on_a_fresh_read() {
-        // "live node gone" is the companion's `matchLive` finding no node at the bounds of the
-        // tree it served (`GlassA11yService.kt`'s `liveSink`); it throws before `performOn`, so
-        // nothing was actuated and the whole attempt may be repeated.
-        let (port, ops) = fake_service_ex(
-            vec![compose_like()],
-            vec![OnAction::RefusedFirst(1, "live node gone")],
-            vec![TreePackage::Echo],
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("a refusal raised before the control was touched must be retried");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:click-refused ref=1".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string(),
-            ],
-            "exactly one dispatch: the refused frame never reached the control"
-        );
-    }
-
-    #[test]
-    fn a_target_that_never_stops_moving_is_refused_within_the_bound_and_names_where_it_went() {
-        let (port, ops) = fake_service(
-            vec![
-                slid(&compose_like(), 79),
-                slid(&compose_like(), 31),
-                slid(&compose_like(), 23),
-                slid(&compose_like(), 18),
-            ],
-            OnAction::Ok,
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let started = std::time::Instant::now();
-        let e = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect_err("a target that never stops moving must not be clicked");
-        let elapsed = started.elapsed();
-        assert!(!e.invoke_fallback_eligible(), "{e}");
-        let msg = e.to_string();
-        for want in [
-            "#2",
-            "(120,420 80x50)",
-            "(199,420 80x50)",
-            "(151,420 80x50)",
-            "(143,420 80x50)",
-            "(138,420 80x50)",
-            "re-snapshot",
-        ] {
-            assert!(msg.contains(want), "{want:?} missing from: {msg}");
-        }
-        assert_eq!(
-            ops_of(&ops),
-            vec!["conn1:tree".to_string(); 4],
-            "four reads, and nothing dispatched at any point"
-        );
-        assert!(
-            elapsed >= std::time::Duration::from_millis(600),
-            "the reads must be spread across the slide, not merely repeated: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn a_click_whose_answer_was_lost_is_never_retried_even_when_the_retry_would_succeed() {
-        // The ambiguous class: the request went out and no answer came back. `on_action`'s second
-        // entry answers `ok` on the connection a retry would open, so a retry here would report a
-        // clean success having actuated the control twice.
-        let (port, ops) = fake_service_ex(
-            vec![compose_like()],
-            vec![OnAction::DropWithoutAnswering, OnAction::Ok],
-            vec![TreePackage::Echo],
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let e = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect_err("a lost answer is not a success");
-        assert!(
-            e.to_string().contains("may or may not have actuated"),
-            "{e}"
-        );
-        assert_eq!(
-            ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
-            "exactly one click frame — a failure that may have reached the device is never repeated"
-        );
-    }
-
-    #[test]
-    fn an_invoke_on_a_tree_that_did_not_move_costs_no_extra_read_and_no_wait() {
-        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let started = std::time::Instant::now();
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("clicks");
-        let elapsed = started.elapsed();
-        assert_eq!(
-            ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
-            "the read the plan came from, and the click — nothing else"
-        );
-        assert!(
-            elapsed < RETRY_PAUSE,
-            "not even one pause may be spent when there is nothing to recover from: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn an_element_that_exposes_no_activation_action_is_refused_without_spending_the_budget() {
-        // Permanent, and the one resolution error the caller may answer with a pointer click —
-        // re-reading for it delays a fallback that already works.
-        let mut v = compose_like();
-        v["children"][0]["clickable"] = json!(false);
-        let (port, ops) = fake_service(vec![v.clone()], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&v);
-        let e = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect_err("nothing on the path advertises a click");
-        assert!(e.invoke_fallback_eligible(), "{e}");
-        assert_eq!(ops_of(&ops), vec!["conn1:tree".to_string()]);
-    }
-
-    #[test]
-    fn a_target_whose_name_drifted_is_refused_on_the_first_read() {
-        // The other half of `AxElementChanged`: a different element inherited the id. No re-read
-        // undoes that, and the crisp "re-snapshot" verdict must not be buried under a wait.
-        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let mut label = target_for(&t, AxNodeId(2));
-        label.name = Some("Send".into());
-        let e = a
-            .invoke(&ctx(), &label)
-            .expect_err("a renamed target must not report success");
-        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
-        assert_eq!(ops_of(&ops), vec!["conn1:tree".to_string()]);
-    }
-
-    #[test]
-    fn set_values_guard_re_reads_a_target_that_moved_rather_than_refusing_it() {
-        // `set_value` guards with `crate::a11y::editable_target` → the same `fingerprinted`, the
-        // same ±8 px bounds check — so a field sliding through an open transition refuses a write
-        // for exactly the reason it refuses a click.
-        let settled = editable_field("old");
-        let (port, ops) = fake_service(
-            vec![slid(&settled, 79), settled.clone(), editable_field("new")],
-            OnAction::Ok,
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&settled);
-        a.set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
-            .expect("a re-read that finds the field where the caller saw it must write to it");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:set_text ref=1".to_string(),
-                "conn1:tree".to_string(),
-            ],
-            "one re-read, one write, one read-back"
         );
     }
 
