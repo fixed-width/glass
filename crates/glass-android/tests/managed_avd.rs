@@ -20,6 +20,27 @@ fn online_count() -> usize {
         .count()
 }
 
+// kill_all only sends `adb emu kill` — a fire-and-forget console command, not a wait for
+// exit — so checking online_count() right after it returns races the shutdown.
+const KILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+// Tearing down a QEMU process and its GPU renderer is heavier than a UI transition and can
+// run long on a cold CI runner; 30s gives that room while still bounding a genuine failure.
+const KILL_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Polls `online_count()` until it reaches 0 or `KILL_POLL_DEADLINE` expires. Returns the
+/// last count and elapsed wait either way, so a timed-out call still has a diagnostic.
+fn await_offline() -> (usize, std::time::Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        let n = online_count();
+        let elapsed = start.elapsed();
+        if n == 0 || elapsed >= KILL_POLL_DEADLINE {
+            return (n, elapsed);
+        }
+        std::thread::sleep(KILL_POLL_INTERVAL);
+    }
+}
+
 #[test]
 #[ignore = "requires NO running emulator + the Android SDK (GLASS_AVD)"]
 fn boots_reuses_and_cleans_up() {
@@ -48,10 +69,11 @@ fn boots_reuses_and_cleans_up() {
     agents1.shutdown(); // tear down any launched agent — these tests must not leak it
     agents2.shutdown();
     registry.kill_all();
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let (n, elapsed) = await_offline();
     assert_eq!(
-        online_count(),
+        n,
         0,
-        "kill_all should stop the booted emulator"
+        "kill_all should stop the booted emulator; still {n} online after {}ms",
+        elapsed.as_millis()
     );
 }
