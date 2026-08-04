@@ -773,7 +773,9 @@ fn same_element_moved(target: &AxTarget, node: &AxNode) -> bool {
         )
 }
 
-/// Every node [`same_element_moved`] accepts for `target`, in pre-order.
+/// Every node [`same_element_moved`] accepts for `target`, in pre-order. Searched tree-wide, not
+/// among siblings, so a second identical control anywhere refuses the whole relaxation — a list of
+/// same-size items sharing one label keeps the strict bounds guard.
 fn movement_candidates<'a>(tree: &'a AxTree, target: &AxTarget) -> Vec<&'a AxNode> {
     fn walk<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
         if same_element_moved(target, node) {
