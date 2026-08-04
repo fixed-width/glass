@@ -192,3 +192,66 @@ jobs:
           path: diagnostics/
           if-no-files-found: error
           retention-days: 14
+
+  android-lifecycle:
+    name: Managed AVD lifecycle (glass boots its own)
+    runs-on: Android-CI
+    timeout-minutes: 30
+    # No `needs:` — this is independent of the device suite and should still report if that fails.
+    # Deliberately does NOT use android-emulator-runner: that action boots the emulator and runs
+    # your script inside it, which is the exact precondition managed_avd requires to be absent.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      - name: Install the system image and define an AVD, without booting it
+        run: |
+          img="system-images;android-${API_LEVEL};${EMULATOR_TARGET};${EMULATOR_ARCH}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "$img"
+          # --device matches EMULATOR_PROFILE so this AVD is the same device as the "android"
+          # job's, not whatever avdmanager would otherwise default to.
+          echo no | avdmanager create avd -n glass -k "$img" --device "$EMULATOR_PROFILE" --force
+          # Prove nothing is running: the test's subject is the boot itself.
+          "$ANDROID_SDK_ROOT/platform-tools/adb" devices
+
+      - name: Run the lifecycle test
+        env:
+          GLASS_AVD: glass
+          GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
+        run: |
+          export GLASS_ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          set +e
+          ./scripts/test-android-lifecycle.sh
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            mkdir -p diagnostics
+            "$GLASS_ADB" devices              > diagnostics/adb-devices.txt 2>&1
+            "$GLASS_ADB" logcat -d            > diagnostics/logcat.txt      2>&1
+            ls -la "$HOME/.android/avd"       > diagnostics/avd-dir.txt     2>&1
+          fi
+          exit $rc
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-lifecycle-diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
