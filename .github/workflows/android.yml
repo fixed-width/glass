@@ -88,10 +88,6 @@ jobs:
             echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
           } >> "$GITHUB_ENV"
 
-      # Do not delete as dead: the steps through "Point the suite at the fixture" build an APK no
-      # currently enabled test consumes, because its only reader —
-      # native_invoke_actuates_the_fixture — is --skipped pending glass#324. Dropping that --skip
-      # makes this section live again with no other change.
       - name: Restore the fixture APK cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: fixture-cache
