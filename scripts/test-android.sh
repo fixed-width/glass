@@ -32,16 +32,20 @@
 #                  and kills it. It cannot share a run with tests that need a booted device;
 #                  scripts/test-android-lifecycle.sh runs it instead.
 #
-# One test within a11y_loop is filtered out below rather than excluding the whole file:
+# Two tests are filtered out below rather than excluding the whole file each belongs to:
 #
-#   set_value_reports_whether_the_write_landed — fails on a cold CI emulator with
+#   set_value_reports_whether_the_write_landed (a11y_loop) — fails on a cold CI emulator with
 #   AxElementChanged(16), glass's staleness guard refusing the write because the a11y node
 #   changed between snapshot and write; passes on a warm dev box. Deterministic, not a flake.
 #   Tracked at glass#323; remove this --skip once #323 lands.
 #
-# --skip composes with the workflow's own `--skip native_invoke_actuates_the_fixture`, forwarded
-# through "$@" below: the test harness ORs multiple --skip filters together, so both apply and
-# each still removes only the one test it names.
+#   native_invoke_actuates_the_fixture (a11y_service_loop) — fails 4 times in 9 CI runs (~45%) on
+#   a cold emulator with Backend("agent: no active window"), at varying sites in
+#   a11y_service_loop.rs; passes warm. Tracked at glass#324; remove this --skip once #324 lands.
+#
+# Multiple --skip flags compose rather than the later one overriding the earlier: the test
+# harness ORs them together, so both names above are excluded and nothing else is. "$@" below
+# still forwards any further filter a caller adds on top of these two.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec cargo test --no-fail-fast -p glass-android \
@@ -52,4 +56,6 @@ exec cargo test --no-fail-fast -p glass-android \
   --test input_loop \
   --test see_loop \
   --test window_loop \
-  -- --ignored --test-threads=1 --skip set_value_reports_whether_the_write_landed "$@"
+  -- --ignored --test-threads=1 \
+  --skip set_value_reports_whether_the_write_landed \
+  --skip native_invoke_actuates_the_fixture "$@"

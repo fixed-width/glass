@@ -82,6 +82,13 @@ jobs:
             echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
           } >> "$GITHUB_ENV"
 
+      # The steps below (through "Point the suite at the fixture") build an APK that no currently
+      # enabled test consumes: native_invoke_actuates_the_fixture, the only test that reads
+      # GLASS_ANDROID_FIXTURE_APK, is excluded by scripts/test-android.sh's --skip pending glass#324.
+      # Kept anyway, deliberately: the cache makes the marginal cost of a cache-hit run a restore,
+      # not a rebuild, and re-adding this whole section later would be more churn than this comment.
+      # Remove the --skip in scripts/test-android.sh and this section is live again with no other
+      # change needed.
       - name: Cache the built fixture APK
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: fixture-cache
