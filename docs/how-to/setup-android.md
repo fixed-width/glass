@@ -52,6 +52,10 @@ sdkmanager "system-images;android-34;google_apis;x86_64"
 avdmanager create avd -n glass -k "system-images;android-34;google_apis;x86_64" --device pixel_6
 ```
 
+> If `emulator -list-avds` doesn't list an AVD you just created, `avdmanager` and `emulator`
+> disagree on where AVDs live on your system (e.g. an XDG `~/.config/.android/avd` vs. legacy
+> `~/.android/avd` split) — set `ANDROID_AVD_HOME` to one directory so both agree.
+
 ## Managed AVD (attach-or-boot)
 
 Like Android Studio, glass prefers to attach: if an emulator is already online it uses it
@@ -128,3 +132,29 @@ GLASS_BACKEND=android glass-mcp doctor --deep
 
 Reports `adb`, the emulator + AVDs, the online/attachable device, and the agent + a11y-service status.
 Then [connect your agent](connect-an-agent.md).
+
+## Running the device suites
+
+The Android tests are `#[ignore]`d — they need a real device. Two scripts run them the same way CI does:
+
+```bash
+# Against an already-booted emulator. Needs the jar + APKs from the sections above.
+GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
+  GLASS_ANDROID_AGENT_JAR=/path/to/glass-agent.jar \
+  GLASS_ANDROID_A11Y_APK=/path/to/glass-a11y.apk \
+  GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
+  ./scripts/test-android.sh
+
+# With NO emulator running — this one is about glass booting its own.
+ANDROID_SDK_ROOT=$HOME/android-sdk GLASS_AVD=glass ./scripts/test-android-lifecycle.sh
+```
+
+Two tests are skipped by default: `set_value_reports_whether_the_write_landed`
+([#323](https://github.com/fixed-width/glass/issues/323)) and
+`native_invoke_actuates_the_fixture` ([#324](https://github.com/fixed-width/glass/issues/324)).
+The second is the only consumer of `GLASS_ANDROID_FIXTURE_APK`, so that variable matters only once
+#324 lands; the jar and a11y APK are needed either way.
+
+The role-histogram probes in `crates/glass-android/tests/role_probe.rs` are deliberately not in
+either script; they print evidence for a human rather than asserting, and take
+`GLASS_A11Y_PROBE_APPS`. Run them by hand when mapping new widget classes.

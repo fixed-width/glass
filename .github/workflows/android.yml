@@ -1,0 +1,344 @@
+name: Android
+
+# WHY THIS RUNS ON A SCHEDULE AND NOT ON PULL REQUESTS
+#
+# Not for speed: a warm run is ~3-4 minutes, the two jobs in parallel, of which the tests are
+# ~70 seconds. It stays off pull requests because:
+#
+#   - A cache miss is not 3 minutes — a cold run pays full AVD creation, and bumping AGENT_TAG
+#     also pays a JDK install and a Gradle build, landing on whichever PR follows an eviction.
+#   - These are larger-runner minutes, billed per run, on every push to every branch.
+#   - The flake profile is young: bringing this up found three intermittent tests.
+#   - Two tests are excluded (glass#323, glass#324), and #324 is the native-invoke path
+#     glass#320 cared most about.
+#
+# So this detects rather than prevents: a PR that drops every click to a pointer tap still merges
+# green, and the push-to-master trigger then names the merge that broke it. See glass#320.
+#
+# Worth revisiting once glass#324 is fixed and there is real nightly history.
+
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 09:00 UTC (02:00 PT in summer, 01:00 in winter)
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+concurrency:
+  # One group covers the schedule, push:master and dispatch, so cancelling would let a merge
+  # landing mid-nightly kill it — cancelled is not failed, so no artifacts and no signal.
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  AGENT_TAG: v0.6.0
+  API_LEVEL: '34'
+  EMULATOR_TARGET: google_apis
+  EMULATOR_ARCH: x86_64
+  # The tests assert against real on-screen layout, so the profile is part of the test contract:
+  # the emulator-runner action's default (no `profile:`) is a 320x640 mdpi device, on which a tap
+  # aimed at a list row lands in the app bar. pixel_6 (1080x2400 @420dpi) is what
+  # docs/how-to/setup-android.md has contributors create, so CI and a dev box share geometry.
+  EMULATOR_PROFILE: pixel_6
+
+jobs:
+  android:
+    name: Android device suite (AVD)
+    runs-on: Android-CI
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+
+      - name: Enable KVM
+        # Hardware acceleration is available on every GitHub-hosted Linux runner, but the runner
+        # user is not in the kvm group by default.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Fetch the companion jar + a11y APK from the pinned agent release
+        # These come from the release channel on purpose: it is the artifact users actually
+        # install (docs/how-to/setup-android.md sends them to that page), so a from-source build
+        # would be testing something nobody runs.
+        run: |
+          mkdir -p "$HOME/glass-android"
+          cd "$HOME/glass-android"
+          base="https://github.com/fixed-width/glass-android-agent/releases/download/${AGENT_TAG}"
+          for f in glass-agent.jar glass-a11y.apk; do
+            curl -fsSL -O "$base/$f"
+            curl -fsSL -O "$base/$f.sha256"
+            sha256sum -c "$f.sha256"
+          done
+          {
+            echo "GLASS_ANDROID_AGENT_JAR=$PWD/glass-agent.jar"
+            echo "GLASS_ANDROID_A11Y_APK=$PWD/glass-a11y.apk"
+            echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
+          } >> "$GITHUB_ENV"
+
+      # Do not delete as dead: the steps through "Point the suite at the fixture" build an APK no
+      # currently enabled test consumes, because its only reader —
+      # native_invoke_actuates_the_fixture — is --skipped pending glass#324. Dropping that --skip
+      # makes this section live again with no other change.
+      - name: Restore the fixture APK cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: fixture-cache
+        with:
+          path: ~/glass-fixture
+          key: glass-fixture-${{ env.AGENT_TAG }}
+
+      - name: Check out the agent repo to build the fixture (cache miss only)
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: fixed-width/glass-android-agent
+          ref: ${{ env.AGENT_TAG }}
+          path: agent-src
+
+      - name: Set up JDK 17 for the fixture build (cache miss only)
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build the fixture APK (cache miss only)
+        id: fixture-build
+        # Built from source rather than downloaded: the fixture is a test artifact with no
+        # user-facing form, so it does not belong on the release page docs point users at.
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses > /dev/null 2>&1 || true
+          "$sdk" "platforms;android-34" "build-tools;34.0.0"
+          cd agent-src
+          ./gradlew :fixture-compose:assembleDebug
+          mkdir -p "$HOME/glass-fixture"
+          cp fixture-compose/build/outputs/apk/debug/fixture-compose-debug.apk "$HOME/glass-fixture/"
+
+      - name: Point the suite at the fixture
+        # A cache hit restores the path without proving what is in it; check rather than hand the
+        # suite a variable pointing at nothing.
+        run: |
+          apk="$HOME/glass-fixture/fixture-compose-debug.apk"
+          test -f "$apk"
+          echo "GLASS_ANDROID_FIXTURE_APK=$apk" >> "$GITHUB_ENV"
+
+      - name: Restore the AVD cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          # Every input that decides what the cached AVD *is* must appear here — the profile, and
+          # via the workflow hash the action SHA, emulator-options and disable-animations.
+          # Otherwise a changed device restores the old snapshot forever: the nightly refreshes
+          # the LRU clock and save is skipped on a hit, so the entry never self-corrects.
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
+
+      - name: Create the AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: ${{ env.EMULATOR_TARGET }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          profile: ${{ env.EMULATOR_PROFILE }}
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "AVD snapshot generated."
+
+      - name: Run the device suite
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          # The 120s default was tuned on a warm dev box, not a cold runner.
+          GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
+          # This job's device is the action's. glass defaults to attach-or-boot, so if that
+          # emulator dies mid-suite glass would quietly boot its own and the remaining tests
+          # would pass against a different device.
+          GLASS_ANDROID_LIFECYCLE: attach
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: ${{ env.EMULATOR_TARGET }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          profile: ${{ env.EMULATOR_PROFILE }}
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # Do not inline this script's contents here, and do not move the diagnostics into a
+          # later `if: failure()` step — scripts/ci-android-suite.sh's header says why both fail.
+          script: ./scripts/ci-android-suite.sh
+
+      - name: Save the fixture APK cache
+        # Runs on a failed suite: the APK comes from the build step, not the test run. Skipping on
+        # a hit is no longer automatic once restore/save are split, and cache/save errors outright
+        # on a path that isn't there.
+        if: always() && steps.fixture-cache.outputs.cache-hit != 'true' && steps.fixture-build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/glass-fixture
+          key: glass-fixture-${{ env.AGENT_TAG }}
+
+      - name: Save the AVD cache
+        # Runs even on a failed suite: the snapshot comes from "Create the AVD snapshot", not the
+        # test run, so a red suite would otherwise re-pay full AVD creation every run. Skipping on
+        # a hit is no longer automatic once restore/save are split.
+        if: always() && steps.avd-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 14
+
+  android-lifecycle:
+    name: Managed AVD lifecycle (glass boots its own)
+    runs-on: Android-CI
+    # Budget: 5min boot timeout + SDK/system-image setup + cold-cache cargo build + reuse/cleanup.
+    timeout-minutes: 15
+    # No `needs:` — this is independent of the device suite and should still report if that fails.
+    # Deliberately does NOT use android-emulator-runner: that action boots the emulator and runs
+    # your script inside it, which is the exact precondition managed_avd requires to be absent.
+    env:
+      # avdmanager and the native `emulator` binary default to different AVD directories on this
+      # runner (avdmanager: ~/.config/.android/avd; emulator: ~/.android/avd, it doesn't
+      # recognize ANDROID_USER_HOME) — an unpinned AVD is invisible to glass (run 30874077553).
+      # ANDROID_AVD_HOME is the override both honor (confirmed via `strings` on each; the
+      # deprecated ANDROID_SDK_HOME is one word from ANDROID_SDK_ROOT below and means something
+      # else). Job-level: a step's `env:` doesn't reach the next step, and the create step here
+      # and glass's own `emulator` invocation in the test step both need to agree.
+      ANDROID_AVD_HOME: ${{ github.workspace }}/.android-avd
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: .
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      - name: Install the system image and define an AVD, without booting it
+        run: |
+          set +e
+          img="system-images;android-${API_LEVEL};${EMULATOR_TARGET};${EMULATOR_ARCH}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "$img"
+          mkdir -p "$ANDROID_AVD_HOME"
+
+          # --device matches EMULATOR_PROFILE so this AVD is the same device as the "android"
+          # job's, not whatever avdmanager would otherwise default to.
+          echo no | avdmanager create avd -n glass -k "$img" --device "$EMULATOR_PROFILE" --force
+          rc=$?
+          echo "avdmanager exit code: $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::avdmanager create avd failed (exit $rc)"
+            exit "$rc"
+          fi
+
+          # avdmanager warns and continues rather than failing, so exit 0 above is not proof the
+          # AVD exists where glass looks (crates/glass-android/src/sdk.rs resolve_sdk_root,
+          # avd.rs resolve_emulator_bin).
+          echo "--- AVD-location env vars ---"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-<unset>}"
+          echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-<unset>}"
+          echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-<unset>}"
+          echo "HOME=${HOME:-<unset>}"
+          echo "--- avdmanager's own view ---"
+          avdmanager list avd
+          echo "--- \$ANDROID_AVD_HOME contents ---"
+          ls -la "$ANDROID_AVD_HOME" 2>&1
+
+          # Matches glass's own resolution exactly: GLASS_EMULATOR is unset here, so
+          # resolve_emulator_bin falls through to $ANDROID_SDK_ROOT/emulator/emulator, and
+          # boot_avd parses this binary's -list-avds — not avdmanager's or adb's.
+          avds="$("$ANDROID_SDK_ROOT/emulator/emulator" -list-avds)"
+          echo "--- emulator -list-avds output ---"
+          echo "$avds"
+          if ! echo "$avds" | grep -qx glass; then
+            echo "::error::AVD 'glass' is not in \`\$ANDROID_SDK_ROOT/emulator/emulator -list-avds\` output — this is exactly what glass's boot_avd calls, so the test would fail with an empty AVD list regardless of what avdmanager or adb reported"
+            exit 1
+          fi
+
+          # Prove nothing is running: the test's subject is the boot itself.
+          "$ANDROID_SDK_ROOT/platform-tools/adb" devices
+          exit 0
+
+      - name: Run the lifecycle test
+        env:
+          GLASS_AVD: glass
+          GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
+        run: |
+          export GLASS_ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          set +e
+          ./scripts/test-android-lifecycle.sh
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            mkdir -p diagnostics
+            {
+              echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+              echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+              echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-<unset>}"
+              echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-<unset>}"
+              echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-<unset>}"
+              echo "HOME=${HOME:-<unset>}"
+            } > diagnostics/env.txt 2>&1
+            # timeout-bounded: unlike `adb devices`, `adb logcat` blocks waiting for a device
+            # instead of returning empty — exactly this job's failure mode. Without the
+            # `timeout`, this once hung 28min until the job was cancelled, skipping upload
+            # entirely.
+            timeout 10 "$ANDROID_SDK_ROOT/emulator/emulator" -list-avds > diagnostics/emulator-list-avds.txt 2>&1
+            timeout 10 "$GLASS_ADB" devices                             > diagnostics/adb-devices.txt      2>&1
+            timeout 10 "$GLASS_ADB" logcat -d                           > diagnostics/logcat.txt           2>&1
+            ls -la "$ANDROID_AVD_HOME"                                  > diagnostics/avd-dir.txt          2>&1
+            # No android-logs.txt: avd.rs spawns the emulator with stdout null and stderr piped
+            # only into the glass process, never written to disk, so `find -iname '*.log'` here
+            # always comes back empty (confirmed 0 bytes against a real failure) — an empty file
+            # would read as "collected" when nothing was. The real fix is capturing that stderr in
+            # avd.rs, out of scope here; list-avds/adb/AVD-dir above are what's actually on disk.
+          fi
+          exit $rc
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-lifecycle-diagnostics-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 14
