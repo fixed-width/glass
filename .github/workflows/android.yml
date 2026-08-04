@@ -76,8 +76,8 @@ jobs:
             echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
           } >> "$GITHUB_ENV"
 
-      - name: Cache the AVD
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the AVD cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: avd-cache
         with:
           path: |
@@ -109,20 +109,28 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # Diagnostics are collected INSIDE the emulator script: the action shuts the device down
-          # when this step ends, so an `if: failure()` step afterwards would have no adb to talk to.
-          script: |
-            set +e
-            ./scripts/test-android.sh --skip native_invoke_actuates_the_fixture
-            rc=$?
-            if [ $rc -ne 0 ]; then
-              mkdir -p diagnostics
-              adb logcat -d                  > diagnostics/logcat.txt         2>&1
-              adb shell dumpsys window       > diagnostics/dumpsys-window.txt 2>&1
-              adb shell dumpsys activity top > diagnostics/dumpsys-top.txt    2>&1
-              adb exec-out screencap -p      > diagnostics/screen.png         2>/dev/null
-            fi
-            exit $rc
+          # `script:` cannot hold this run-then-collect logic directly: the action splits it on
+          # newlines and runs each line as its own independent `sh -c`, abandoning the rest the
+          # moment one line fails — so a later `if failed, collect diagnostics` line never runs.
+          # scripts/ci-android-suite.sh is one script, invoked as one line, for exactly that
+          # reason; its own header has the full account. It can't be a separate `if: failure()`
+          # step afterwards either: the action shuts the device down when this step ends, so a
+          # later step has no adb to talk to.
+          script: ./scripts/ci-android-suite.sh --skip native_invoke_actuates_the_fixture
+
+      - name: Save the AVD cache
+        # Runs even on a failed suite: the AVD snapshot this caches comes from the earlier
+        # "Create the AVD snapshot" step, not from the test run, so a failing suite is no reason
+        # to keep re-paying full AVD creation on every following run. Mirrors actions/cache's own
+        # post-save condition (skip on a cache hit) since that behavior is no longer automatic
+        # once restore/save are split.
+        if: always() && steps.avd-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
 
       - name: Upload failure diagnostics
         if: failure()
@@ -130,5 +138,5 @@ jobs:
         with:
           name: android-diagnostics-${{ github.run_id }}
           path: diagnostics/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
