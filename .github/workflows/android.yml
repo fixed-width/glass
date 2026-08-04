@@ -82,6 +82,47 @@ jobs:
             echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
           } >> "$GITHUB_ENV"
 
+      - name: Cache the built fixture APK
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: fixture-cache
+        with:
+          path: ~/glass-fixture
+          key: glass-fixture-${{ env.AGENT_TAG }}
+
+      - name: Check out the agent repo to build the fixture (cache miss only)
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: fixed-width/glass-android-agent
+          ref: ${{ env.AGENT_TAG }}
+          path: agent-src
+
+      - name: Set up JDK 17 for the fixture build (cache miss only)
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build the fixture APK (cache miss only)
+        # Built from source rather than downloaded: the fixture is a test artifact with no
+        # user-facing form, so it does not belong on the release page docs point users at. The
+        # jar and a11y APK go the other way for the mirror-image reason — see the step above.
+        # The cache key is the agent tag, so this runs once per agent release and never again.
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdk" --licenses > /dev/null 2>&1 || true
+          "$sdk" "platforms;android-34" "build-tools;34.0.0"
+          cd agent-src
+          ./gradlew :fixture-compose:assembleDebug
+          mkdir -p "$HOME/glass-fixture"
+          cp fixture-compose/build/outputs/apk/debug/fixture-compose-debug.apk "$HOME/glass-fixture/"
+
+      - name: Point the suite at the fixture
+        run: echo "GLASS_ANDROID_FIXTURE_APK=$HOME/glass-fixture/fixture-compose-debug.apk" >> "$GITHUB_ENV"
+
       - name: Restore the AVD cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: avd-cache
@@ -127,7 +168,7 @@ jobs:
           # reason; its own header has the full account. It can't be a separate `if: failure()`
           # step afterwards either: the action shuts the device down when this step ends, so a
           # later step has no adb to talk to.
-          script: ./scripts/ci-android-suite.sh --skip native_invoke_actuates_the_fixture
+          script: ./scripts/ci-android-suite.sh
 
       - name: Save the AVD cache
         # Runs even on a failed suite: the AVD snapshot this caches comes from the earlier
