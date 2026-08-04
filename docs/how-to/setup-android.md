@@ -101,6 +101,14 @@ and sets editable fields via the real `ACTION_SET_TEXT`; glass enables it and re
 prior accessibility state on teardown. Without `glass-a11y.apk`, glass uses the `uiautomator` reader.
 Set `GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present.
 
+A snapshot through this reader waits for the screen to stop moving. A screen whose open transition is
+still playing reports its content at an offset that decays over about half a second, so the tree is
+re-read until two reads a quarter-second apart agree on every element's bounds — the coordinates you
+get are the ones the screen keeps, and a click aimed at them still resolves. A still screen costs one
+extra read; a small tree also waits out the quarter-second, since its reads are near-instant. A screen
+that never holds still errors, naming what moved and by how much, rather than reporting positions the
+UI has already left.
+
 The service also backs **`glass_click_element`**, which actuates through Android's `ACTION_CLICK`
 instead of tapping the element's centre. That reaches a control scrolled far below the fold or
 covered by something else, and it makes two outcomes honest that a tap cannot:

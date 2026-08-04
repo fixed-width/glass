@@ -306,6 +306,16 @@ fn rearm_tree(conn: &mut Conn, pkg: &str) -> Result<()> {
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// The wall clock two agreeing reads must span before [`ServiceA11y::snapshot`] calls the tree
+/// still. A screen whose open transition is animating reports its content at an offset that
+/// decays in *steps*, so two reads inside one step agree without proving anything; the longest
+/// step measured held ~160 ms, in a ~600 ms slide that stepped nine times (glass#326).
+const SETTLE_SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long [`ServiceA11y::snapshot`] keeps re-reading for the tree to hold still. Room for the
+/// ~600 ms slide, one span of agreement after it, and the reads themselves — a single read of a
+/// 300-node tree costs up to ~600 ms.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The Accessibility reader backed by the on-device service. `package` is the target app.
 pub struct ServiceA11y {
     client: ServiceClient,
@@ -323,13 +333,24 @@ impl ServiceA11y {
         }
     }
 
+    /// One tree, as the device answered it. [`Accessibility::snapshot`] settles over this. The
+    /// two read-back loops use it directly: each watches a state (a `checked` flag, a written
+    /// value) after its action has gone out, where a verdict about motion would report a change
+    /// that landed as failed.
+    fn read_tree(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        let reply = self.client.tree(&self.package)?;
+        let mut tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
+        tree.subject = subject_of(&self.package, reply.package.as_deref());
+        Ok(tree)
+    }
+
     /// Poll until the actuated control reports `checked == want`. The toolkit's UI update
     /// reaches the accessibility tree a beat after the action; `set_value` polls for the same
     /// reason.
     fn wait_for_check(&mut self, ctx: &AxContext, plan: &InvokePlan, want: bool) -> Result<()> {
         let deadline = std::time::Instant::now() + self.check_timeout;
         loop {
-            let mut after = self.snapshot(ctx)?;
+            let mut after = self.read_tree(ctx)?;
             after.assign_ids();
             let seen = check_state(&after, &plan.actuated);
             if seen == CheckState::Reached(want) {
@@ -378,11 +399,36 @@ fn subject_of(asked: &str, actual: Option<&str>) -> Option<Subject> {
 }
 
 impl Accessibility for ServiceA11y {
+    /// Re-read until two reads a [`SETTLE_SPAN`] apart describe the same geometry, and hand back
+    /// the later one.
+    ///
+    /// glass#326: a window whose activity-open transition is still animating reports its content
+    /// at an +x offset that decays in steps, so reads milliseconds apart place the same control
+    /// in two places. Every guard downstream — the ±8 px staleness check, the companion's exact
+    /// re-find, the climb to an enclosing clickable ancestor — compares one such read against
+    /// another, so settling *here* rather than in `invoke` is what leaves them nothing to
+    /// disagree about: the caller's own tree is the settled one.
+    ///
+    /// The span carries the proof, not mere consecutiveness — two reads inside one step agree
+    /// while the slide is still running. A read counts toward the span: a walk that outlasts a
+    /// step comes back with its own nodes on different frames and matches nothing exactly.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let reply = self.client.tree(&self.package)?;
-        let mut tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
-        tree.subject = subject_of(&self.package, reply.package.as_deref());
-        Ok(tree)
+        let started = std::time::Instant::now();
+        let mut since = started;
+        let mut seen = geometry_of(&self.read_tree(ctx)?);
+        loop {
+            std::thread::sleep(SETTLE_SPAN.saturating_sub(since.elapsed()));
+            let issued = std::time::Instant::now();
+            let next = self.read_tree(ctx)?;
+            let now = geometry_of(&next);
+            if now == seen {
+                return Ok(next);
+            }
+            if started.elapsed() >= SETTLE_TIMEOUT {
+                return Err(never_settled(&seen, &now, started.elapsed()));
+            }
+            (since, seen) = (issued, now);
+        }
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -407,7 +453,7 @@ impl Accessibility for ServiceA11y {
         // value to land; error honestly only on timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let mut after = self.snapshot(ctx)?;
+            let mut after = self.read_tree(ctx)?;
             after.assign_ids();
             let node = after.find(target.id);
             let got = node.and_then(|n| n.value.clone());
@@ -846,6 +892,78 @@ fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> 
         .find(|n| n.states.focusable && (n.id == target.id || encloses(n.bounds, want)))
         .copied()
         .ok_or(GlassError::AxActionUnavailable(target.id.0))
+}
+
+/// Every node's bounds in pre-order — what [`ServiceA11y::snapshot`] watches for motion; the
+/// whole tree, since a snapshot names no target. Position `n` is the node
+/// `AxTree::assign_ids` will number `AxNodeId(n)`.
+fn geometry_of(tree: &AxTree) -> Vec<Option<AxRect>> {
+    fn walk(node: &AxNode, out: &mut Vec<Option<AxRect>>) {
+        out.push(node.bounds);
+        for c in &node.children {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tree.root, &mut out);
+    out
+}
+
+/// How two reads disagreed, worded for [`never_settled`].
+fn drift_between(before: &[Option<AxRect>], after: &[Option<AxRect>]) -> String {
+    for (id, (from, to)) in before.iter().zip(after).enumerate() {
+        if from != to {
+            return format!("element #{id} moved {}", movement(*from, *to));
+        }
+    }
+    format!(
+        "the tree changed shape between reads ({} elements, then {})",
+        before.len(),
+        after.len()
+    )
+}
+
+/// `from` → `to`, with the per-edge deltas when both sides reported bounds.
+fn movement(from: Option<AxRect>, to: Option<AxRect>) -> String {
+    let deltas = match (from, to) {
+        (Some(f), Some(t)) => format!(
+            " (dx {}, dy {}, dw {}, dh {})",
+            i64::from(t.x) - i64::from(f.x),
+            i64::from(t.y) - i64::from(f.y),
+            i64::from(t.width) - i64::from(f.width),
+            i64::from(t.height) - i64::from(f.height),
+        ),
+        _ => String::new(),
+    };
+    format!("from {} to {}{deltas}", rect(from), rect(to))
+}
+
+/// One rect as `(x,y wxh)`, or `no bounds`.
+fn rect(r: Option<AxRect>) -> String {
+    r.map_or_else(
+        || "no bounds".to_string(),
+        |r| format!("({},{} {}x{})", r.x, r.y, r.width, r.height),
+    )
+}
+
+/// Nothing was read out: the tree never held still inside the budget.
+///
+/// A refusal, not the last read with a warning: the degraded trees this reader can hand back —
+/// truncated, unreadable, another app — each ride an `AxTree` field the MCP boundary surfaces as
+/// its own block, and motion has no such channel.
+fn never_settled(
+    before: &[Option<AxRect>],
+    after: &[Option<AxRect>],
+    elapsed: std::time::Duration,
+) -> GlassError {
+    GlassError::Backend(format!(
+        "the accessibility tree is still moving after {} ms of re-reads, so no snapshot was \
+         taken: {}. A screen whose open transition is still animating settles in about half a \
+         second — retry once it has. If it never stops, drive that area by pixels: \
+         glass_screenshot, then glass_click at x,y",
+        elapsed.as_millis(),
+        drift_between(before, after),
+    ))
 }
 
 /// The root-to-`id` path, inclusive of both ends. False when `id` is not in this subtree,
@@ -1352,6 +1470,32 @@ mod tests {
                  ]}
             ]
         })
+    }
+
+    /// `v` with everything below its root shifted `dx` px right — what a window reports while
+    /// its activity-open transition animates: a uniform +x offset on the content, decaying to
+    /// zero over the ~500 ms the transition runs (glass#326).
+    fn shifted(v: &Value, dx: i64) -> Value {
+        fn kids(v: &mut Value) -> impl Iterator<Item = &mut Value> {
+            v.get_mut("children")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+        }
+        fn shift(v: &mut Value, dx: i64) {
+            if let Some(x) = v["bounds"]["x"].as_i64() {
+                v["bounds"]["x"] = json!(x + dx);
+            }
+            for c in kids(v) {
+                shift(c, dx);
+            }
+        }
+        let mut v = v.clone();
+        // The window frame stays put; only its content slides.
+        for c in kids(&mut v) {
+            shift(c, dx);
+        }
+        v
     }
 
     fn built(v: &Value) -> AxTree {
@@ -2023,6 +2167,40 @@ mod tests {
         packages: Vec<TreePackage>,
         on_tree: Vec<OnTree>,
     ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_clocked(trees, TreeClock::PerRead, on_action, packages, on_tree)
+    }
+
+    /// Which scripted tree a fake answers with.
+    enum TreeClock {
+        /// The next one each time, last entry repeating.
+        PerRead,
+        /// By wall clock since the first `tree` request: entry `i` takes over `holds[i]` after
+        /// it. A per-read script advances at whatever rate the reader reads, so only this can
+        /// express a *plateau* — a position the device keeps reporting for a while and leaves.
+        Timed(Vec<std::time::Duration>),
+    }
+
+    /// [`fake_service`] with the trees keyed by wall clock — see [`TreeClock::Timed`].
+    fn fake_service_timed(
+        trees: Vec<Value>,
+        holds: Vec<std::time::Duration>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_clocked(
+            trees,
+            TreeClock::Timed(holds),
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Serve],
+        )
+    }
+
+    fn fake_service_clocked(
+        trees: Vec<Value>,
+        clock: TreeClock,
+        on_action: Vec<OnAction>,
+        packages: Vec<TreePackage>,
+        on_tree: Vec<OnTree>,
+    ) -> (u16, Arc<Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2031,6 +2209,7 @@ mod tests {
             let mut conn = 0usize;
             let mut served = 0usize;
             let mut requested = 0usize;
+            let mut clock_start = None;
             while let Ok((sock, _)) = listener.accept() {
                 conn += 1;
                 let this_action = on_action[(conn - 1).min(on_action.len() - 1)];
@@ -2070,7 +2249,16 @@ mod tests {
                                 }
                                 None => {
                                     log.lock().unwrap().push(format!("conn{conn}:tree"));
-                                    let t = trees[served.min(trees.len() - 1)].clone();
+                                    let picked = match &clock {
+                                        TreeClock::PerRead => served,
+                                        TreeClock::Timed(holds) => {
+                                            let t0 = *clock_start
+                                                .get_or_insert_with(std::time::Instant::now);
+                                            let e = t0.elapsed();
+                                            holds.iter().filter(|h| **h <= e).count() - 1
+                                        }
+                                    };
+                                    let t = trees[picked.min(trees.len() - 1)].clone();
                                     let pkg = &packages[served.min(packages.len() - 1)];
                                     served += 1;
                                     tree_confirmed = true;
@@ -2554,7 +2742,9 @@ mod tests {
         let (port, _ops) = fake_service_ex(
             vec![field("old"), field("old"), field("new")],
             vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            // Both of the guard snapshot's reads answer `Echo`; only the rearm's reply is fixed.
             vec![
+                TreePackage::Echo,
                 TreePackage::Echo,
                 TreePackage::Other("com.example.app".into()),
             ],
@@ -2588,7 +2778,9 @@ mod tests {
         let (port, _ops) = fake_service_ex(
             vec![clickable.clone()],
             vec![OnAction::Ok],
+            // Both of the snapshot's reads answer `Echo`; only the rearm's reply is fixed.
             vec![
+                TreePackage::Echo,
                 TreePackage::Echo,
                 TreePackage::Other("com.example.app".into()),
             ],
@@ -2638,7 +2830,10 @@ mod tests {
         let (port, ops) = fake_service_ex(
             vec![clickable.clone()],
             vec![OnAction::Ok],
+            // Both of the snapshot's reads describe the dialog; the rearm's reply names the
+            // asked-about app.
             vec![
+                TreePackage::Other("com.other.app".into()),
                 TreePackage::Other("com.other.app".into()),
                 TreePackage::Other("com.example.app".into()),
             ],
@@ -2669,7 +2864,11 @@ mod tests {
         assert!(msg.contains("moved"), "{msg}");
         assert_eq!(
             ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn2:tree".to_string()],
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn2:tree".to_string()
+            ],
             "no click on conn2 — comparing against the acting app must stop the resend"
         );
     }
@@ -2705,7 +2904,10 @@ mod tests {
                 editable_field("new"),
             ],
             vec![OnAction::DropWithoutAnswering, OnAction::Ok],
+            // Both of the guard snapshot's reads describe the dialog; the rearm's reply names
+            // the asked-about app.
             vec![
+                TreePackage::Other("com.other.app".into()),
                 TreePackage::Other("com.other.app".into()),
                 TreePackage::Other("com.example.app".into()),
             ],
@@ -2727,6 +2929,7 @@ mod tests {
         assert_eq!(
             ops_of(&ops),
             vec![
+                "conn1:tree".to_string(),
                 "conn1:tree".to_string(),
                 "conn1:set_text ref=1".to_string(),
                 "conn2:tree".to_string(),
@@ -2765,6 +2968,7 @@ mod tests {
             ops_of(&ops),
             vec![
                 "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
                 "conn1:set_text ref=1".to_string(),
                 "conn2:tree".to_string(),
                 "conn2:set_text ref=1".to_string(),
@@ -2788,16 +2992,20 @@ mod tests {
             writeln!(w, r#"{{"hello":{{"proto":1}}}}"#)
                 .and_then(|()| w.flush())
                 .expect("hello");
+            // Answers every read, not just the first: a snapshot re-reads until the geometry
+            // repeats.
             let mut line = String::new();
-            r.read_line(&mut line).expect("read request");
-            let req: Value = serde_json::from_str(&line).expect("request is json");
-            let reply = json!({
-                "id": req["id"], "ok": true, "tree": compose_like(),
-                "package": "com.google.android.permissioncontroller"
-            });
-            writeln!(w, "{reply}")
-                .and_then(|()| w.flush())
-                .expect("write reply");
+            while matches!(r.read_line(&mut line), Ok(n) if n > 0) {
+                let req: Value = serde_json::from_str(&line).expect("request is json");
+                let reply = json!({
+                    "id": req["id"], "ok": true, "tree": compose_like(),
+                    "package": "com.google.android.permissioncontroller"
+                });
+                if writeln!(w, "{reply}").and_then(|()| w.flush()).is_err() {
+                    break;
+                }
+                line.clear();
+            }
         });
         let client = ServiceClient::connect(port).expect("connect");
         let mut a = ServiceA11y::new(client, "com.example.app".to_string());
@@ -2829,8 +3037,13 @@ mod tests {
         );
         assert_eq!(
             ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
-            "exactly one click frame, on the one connection"
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string()
+            ],
+            "exactly one click frame, on the one connection (the second read is the one that \
+             proved the tree had stopped moving)"
         );
     }
 
@@ -2847,7 +3060,11 @@ mod tests {
         assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
         assert_eq!(
             ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()]
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string()
+            ]
         );
     }
 
@@ -2863,7 +3080,7 @@ mod tests {
         assert!(e.to_string().contains("disabled"), "{e}");
         assert_eq!(
             ops_of(&ops),
-            vec!["conn1:tree".to_string()],
+            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
             "the refusal must happen before anything is dispatched"
         );
     }
@@ -2883,17 +3100,197 @@ mod tests {
             ops_of(&ops),
             vec![
                 "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
                 "conn1:click ref=1".to_string(),
                 "conn1:tree".to_string()
             ],
-            "the click went out and the state was read back"
+            "the click went out and the state was read back — once, not settled: the read-back \
+             watches a flag, not geometry"
+        );
+    }
+
+    /// The outline of a tree as a caller would read it, ids assigned — bounds included, so two
+    /// of these differ exactly when something moved.
+    fn outline_of(t: &AxTree) -> String {
+        let mut t = t.clone();
+        t.assign_ids();
+        t.to_outline()
+    }
+
+    #[test]
+    fn a_tree_that_plateaus_and_then_moves_again_is_not_handed_back_mid_plateau() {
+        // glass#326, and the exact shape that beat the first attempt at it: the offset decays
+        // in *steps*, so two reads a few ms apart agree across a plateau and prove nothing.
+        // Whatever proves stillness must span longer than a plateau lasts.
+        let (port, _ops) = fake_service_timed(
+            vec![shifted(&compose_like(), 79), compose_like()],
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(150),
+            ],
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let tree = a
+            .snapshot(&ctx())
+            .expect("the content stops moving 150 ms in");
+        assert_eq!(
+            outline_of(&tree),
+            outline_of(&built(&compose_like())),
+            "a plateau is not stillness — the tree handed back must be the settled one"
+        );
+    }
+
+    #[test]
+    fn a_tree_that_stops_moving_is_handed_back_where_it_stopped() {
+        // Every read taken before the offset holds disagrees with the one before it, so the
+        // first pair that agrees is the settled position.
+        let (port, ops) = fake_service(
+            vec![
+                shifted(&compose_like(), 79),
+                shifted(&compose_like(), 31),
+                compose_like(),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let tree = a
+            .snapshot(&ctx())
+            .expect("it settles well inside the budget");
+        assert_eq!(outline_of(&tree), outline_of(&built(&compose_like())));
+        assert_eq!(
+            ops_of(&ops).len(),
+            4,
+            "three reads to watch the decay, one more to agree with the last"
+        );
+    }
+
+    #[test]
+    fn a_tree_that_never_holds_still_fails_inside_its_budget_and_names_what_moved() {
+        // Bounded, and the give-up carries what was seen. Nothing but reads may repeat.
+        let jitter: Vec<Value> = (0..64)
+            .map(|i| shifted(&compose_like(), if i % 2 == 0 { 0 } else { 20 }))
+            .collect();
+        let (port, ops) = fake_service(jitter, OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let started = std::time::Instant::now();
+        let e = a
+            .snapshot(&ctx())
+            .expect_err("a tree that never holds still is not a snapshot");
+        let waited = started.elapsed();
+        assert!(
+            waited >= SETTLE_TIMEOUT,
+            "gave up after {waited:?}, before the budget it was given"
+        );
+        let m = e.to_string();
+        assert!(m.contains("element #1"), "names what moved: {m}");
+        assert!(m.contains("moving"), "{m}");
+        assert!(
+            m.contains("dx 20") || m.contains("dx -20"),
+            "the delta: {m}"
+        );
+        assert!(m.contains("ms"), "how long it watched: {m}");
+        assert!(
+            ops_of(&ops).iter().all(|o| o == "conn1:tree"),
+            "only tree reads may repeat: {:?}",
+            ops_of(&ops)
+        );
+    }
+
+    #[test]
+    fn a_target_on_a_tree_that_never_holds_still_is_never_clicked() {
+        let jitter: Vec<Value> = (0..64)
+            .map(|i| shifted(&compose_like(), if i % 2 == 0 { 0 } else { 20 }))
+            .collect();
+        let (port, ops) = fake_service(jitter, OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&compose_like());
+        let e = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+            .expect_err("a control that never holds still must not be actuated");
+        assert!(
+            !e.invoke_fallback_eligible(),
+            "a moving control must not take a pointer click either: {e}"
+        );
+        assert!(
+            ops_of(&ops).iter().all(|o| o == "conn1:tree"),
+            "nothing may be dispatched: {:?}",
+            ops_of(&ops)
+        );
+    }
+
+    #[test]
+    fn a_still_tree_costs_one_extra_read_and_one_span_of_wall_clock() {
+        // The common path pays for the read that proves stillness and one span, and nothing
+        // beyond it — so a later change cannot quietly put a second wait on every read.
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let started = std::time::Instant::now();
+        a.snapshot(&ctx()).expect("nothing is moving");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
+            "the read that proved stillness, and nothing beyond it"
+        );
+        assert!(
+            elapsed >= SETTLE_SPAN,
+            "the compared reads must be a span apart; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < SETTLE_SPAN * 2,
+            "one span, not two; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_target_that_moved_since_the_caller_looked_is_still_refused() {
+        // Settling must not launder a stale target — these reads agree with each other and
+        // still sit 20 px from where the caller looked.
+        let (port, ops) = fake_service(vec![shifted(&compose_like(), 20)], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&compose_like());
+        let e = a
+            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
+            .expect_err("an element that moved since the caller's snapshot must not be actuated");
+        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
+            "the refusal must happen before anything is dispatched"
+        );
+    }
+
+    #[test]
+    fn set_values_guard_reads_a_settled_tree_and_its_read_back_does_not() {
+        // `set_value` runs the same fingerprint guard as `invoke` over the tree `snapshot`
+        // hands it, so settling covers it with no change of its own; its post-write read-back
+        // does not settle, having run after the write went out.
+        let (port, ops) = fake_service(vec![editable_field("new")], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let t = built(&editable_field("new"));
+        a.set_value(&ctx(), &target_for(&t, AxNodeId(1)), "new")
+            .expect("the field is not moving and already reads back the value");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn1:tree".to_string(),
+            ],
+            "two reads to settle the guard's tree, one to read the write back"
         );
     }
 
     #[test]
     fn a_toggle_that_flips_is_reported_clicked() {
+        // The plan comes from the read that proved stillness, so a box already reading checked
+        // by then would be planned as a flip back to false. Stillness is geometry — a `checked`
+        // that changes under the re-read is not motion.
         let (port, _) = fake_service(
             vec![
+                one_checkable("android.widget.CheckBox", false),
                 one_checkable("android.widget.CheckBox", false),
                 one_checkable("android.widget.CheckBox", true),
             ],
