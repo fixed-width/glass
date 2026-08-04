@@ -641,6 +641,13 @@ fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: 
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const READY_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// How many connections [`wait_for_ready`] splits its budget across. A refusal can clear on the
+/// device — the platform's own reader was seen serving the window again — without the connection
+/// held open across the outage recovering with it, so a stuck one is replaced, not re-asked.
+/// Four gives each 5s of the 20s, longer than any readiness that went on to succeed. Do not
+/// escalate here to the reinstall that provokes the restart in the first place.
+const READY_CONNECTIONS: u32 = 4;
+
 /// Connect to the forwarded service port and wait until the service can answer what the caller
 /// came for: a tree. Both gates share the one budget.
 pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
@@ -651,31 +658,56 @@ pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
 /// wait out the production one.
 fn wait_for_ready(port: u16, timeout: std::time::Duration) -> Result<ServiceClient> {
     let deadline = std::time::Instant::now() + timeout;
-    let client = loop {
-        match ServiceClient::connect(port) {
-            Ok(c) => break c,
-            Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(GlassError::Backend(format!(
-                    "the on-device a11y service never accepted a connection on :{port} within \
-                     {timeout:?}: {e}"
-                )));
-            }
-            Err(_) => std::thread::sleep(READY_POLL),
-        }
-    };
+    let window = timeout / READY_CONNECTIONS;
+    let mut connections = 0u32;
     loop {
-        // `ping` proves only that the process is up; a served tree proves the capability. The
-        // empty package asks for the active window, exactly what the reader asks for. One
-        // connection throughout — `ServiceClient` reopens its own socket when a call finds the
-        // service gone.
-        match client.tree("") {
-            Ok(_) => return Ok(client),
-            Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(GlassError::AccessibilityUnavailable(format!(
-                    "the on-device a11y service on :{port} answered but never served a window \
-                     within {timeout:?}: {e}"
+        let client = match connect_until(port, deadline) {
+            Ok(c) => c,
+            Err(e) => {
+                let seen = if connections == 0 {
+                    "never accepted a connection".to_string()
+                } else {
+                    format!("stopped accepting connections after {connections}")
+                };
+                return Err(GlassError::Backend(format!(
+                    "the on-device a11y service {seen} on :{port} within {timeout:?}: {e}"
                 )));
             }
+        };
+        connections += 1;
+        let window_end = std::time::Instant::now() + window;
+        loop {
+            // `ping` proves only that the process is up; a served tree proves the capability. The
+            // empty package asks for the active window, exactly what the reader asks for. A `tree`
+            // is a read, so asking again — here or on a fresh connection — actuates nothing.
+            match client.tree("") {
+                Ok(_) => return Ok(client),
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    return Err(GlassError::AccessibilityUnavailable(format!(
+                        "the on-device a11y service on :{port} answered but never served a window \
+                         across {connections} connections in {timeout:?}: {e}"
+                    )));
+                }
+                Err(_) => {}
+            }
+            let asked_at = std::time::Instant::now();
+            std::thread::sleep(READY_POLL.min(deadline.saturating_duration_since(asked_at)));
+            let now = std::time::Instant::now();
+            // Only worth abandoning this connection while there is budget left to ask on a
+            // fresh one; past the deadline, one more ask here gives the error its refusal.
+            if now >= window_end && now < deadline {
+                break;
+            }
+        }
+    }
+}
+
+/// Open a connection to `port`, retrying every [`READY_POLL`] until `deadline`.
+fn connect_until(port: u16, deadline: std::time::Instant) -> Result<ServiceClient> {
+    loop {
+        match ServiceClient::connect(port) {
+            Ok(c) => return Ok(c),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
             Err(_) => std::thread::sleep(READY_POLL),
         }
     }
@@ -2277,7 +2309,82 @@ mod tests {
             ops.len() > 1,
             "one refusal is transient, not fatal — it must be retried: {ops:?}"
         );
-        assert!(ops.iter().all(|o| o == "conn1:tree-refused"), "{ops:?}");
+        assert!(ops.iter().all(|o| o.ends_with(":tree-refused")), "{ops:?}");
+    }
+
+    /// The distinct connections `ops` was recorded across, in order of first appearance.
+    fn conns_of(ops: &[String]) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for c in ops.iter().filter_map(|o| o.split(':').next()) {
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn readiness_reconnects_when_one_connection_stays_refused() {
+        // glass#324, second half. On a cold boot the accessibility layer goes transiently
+        // unavailable and recovers, but the connection held open across the outage need not
+        // recover with it — the platform's own reader was seen serving that window again while
+        // ours kept being refused for the rest of the budget.
+        //
+        // A budget whose per-connection share is under one [`READY_POLL`] gives each connection
+        // exactly one ask, so which connection the serve lands on is the assertion, not timing.
+        let timeout = std::time::Duration::from_millis(500);
+        let (port, ops) = fake_service_full(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Refused("no active window"), OnTree::Serve],
+        );
+        let client = wait_for_ready(port, timeout).expect("a later connection serves the window");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree-refused".to_string(), "conn2:tree".to_string()],
+            "the serve must land on a new connection — re-polling conn1 is the bug"
+        );
+        client
+            .tree("com.example.app")
+            .expect("the client handed back is the reconnected, serving one");
+    }
+
+    #[test]
+    fn readiness_stops_reconnecting_at_the_budget_and_says_how_many_it_tried() {
+        // Reconnecting spends the one budget, not a fresh one each time, and the count has to
+        // reach the caller: a device that refused every fresh connection needs a fresh
+        // install+enable, not more retries here.
+        let timeout = std::time::Duration::from_millis(400);
+        let (port, ops) = fake_service_full(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Refused("no active window")],
+        );
+        let started = std::time::Instant::now();
+        let Err(e) = wait_for_ready(port, timeout) else {
+            panic!("a device that never serves a window is not ready");
+        };
+        let waited = started.elapsed();
+        assert!(waited >= timeout, "gave up after {waited:?}");
+        assert!(
+            waited < timeout * 10,
+            "waited {waited:?} — reconnecting must spend the budget, not extend it"
+        );
+        let ops = ops_of(&ops);
+        let conns = conns_of(&ops);
+        assert!(
+            conns.len() > 1,
+            "a stuck connection must be replaced, not just re-asked: {ops:?}"
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.contains(&format!("{} connections", conns.len())),
+            "the error must name the {} connections actually tried: {msg}",
+            conns.len()
+        );
+        assert!(msg.contains("no active window"), "{msg}");
     }
 
     #[test]
