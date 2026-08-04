@@ -42,4 +42,5 @@ fn see_loop_launches_and_captures_settings() {
     p.stop_app().expect("stop");
     drop(p); // close the platform's agent connection (if any) first
     agents.shutdown(); // tear down a launched agent — these tests must not leak it
+    panic!("deliberate failure to verify CI diagnostics collection");
 }
