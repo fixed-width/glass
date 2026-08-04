@@ -9,9 +9,11 @@
 #     GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 #     ./scripts/test-android.sh
 #
-# The jar and APKs come from the glass-android-agent repo. Four tests fail loudly without them
-# (a11y_service_loop's two, agent_loop, and a11y_loop's foreground-app test) rather than
-# self-skipping, so the paths are not optional.
+# The jar and APKs come from the glass-android-agent repo. Three of the tests that run fail
+# loudly without them (a11y_service_loop's snapshot test, agent_loop, and a11y_loop's
+# foreground-app test) rather than self-skipping, so GLASS_ANDROID_AGENT_JAR and
+# GLASS_ANDROID_A11Y_APK are not optional. GLASS_ANDROID_FIXTURE_APK currently is: its only
+# consumer, native_invoke_actuates_the_fixture, is excluded below until glass#324 lands.
 #
 # --test-threads=1 is required, not tidiness: every test drives the one attached device, so in
 # parallel each tears down the app another is mid-interaction with.
@@ -37,15 +39,20 @@
 #   set_value_reports_whether_the_write_landed (a11y_loop) — fails on a cold CI emulator with
 #   AxElementChanged(16), glass's staleness guard refusing the write because the a11y node
 #   changed between snapshot and write; passes on a warm dev box. Deterministic, not a flake.
-#   Tracked at glass#323; remove this --skip once #323 lands.
+#   Tracked at glass#323; remove this --skip once #323 lands. While it is off the a11y write path
+#   has no device coverage at all: the only other set_value call (a11y_service_loop) is
+#   best-effort behind "if this screen has an editable field", which Settings' top screen does not.
 #
 #   native_invoke_actuates_the_fixture (a11y_service_loop) — fails 4 times in 9 CI runs (~45%) on
 #   a cold emulator with Backend("agent: no active window"), at varying sites in
 #   a11y_service_loop.rs; passes warm. Tracked at glass#324; remove this --skip once #324 lands.
 #
 # Multiple --skip flags compose rather than the later one overriding the earlier: the test
-# harness ORs them together, so both names above are excluded and nothing else is. "$@" below
-# still forwards any further filter a caller adds on top of these two.
+# harness ORs them together, so both names above are excluded. Each is matched as a SUBSTRING,
+# not an exact name — a future test whose name contains either of these would be excluded too,
+# with no signal that it was. (--exact would stop that, but it applies to every filter, including
+# the ones a caller passes through "$@".) "$@" below still forwards any further filter on top of
+# these two.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec cargo test --no-fail-fast -p glass-android \

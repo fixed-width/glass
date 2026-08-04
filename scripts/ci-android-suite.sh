@@ -38,7 +38,7 @@
 # screen) — exactly the cases where logcat is largest and least focused. The name states when it
 # was taken so it can't be mistaken for a frame at the moment of failure.
 #
-#   ./scripts/ci-android-suite.sh --skip native_invoke_actuates_the_fixture
+#   ./scripts/ci-android-suite.sh [extra cargo-test filters]
 #
 # Not -e: a failing test suite is the expected path this script exists to handle, not a bug in
 # the script — it must survive scripts/test-android.sh's failure long enough to collect
@@ -48,17 +48,26 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-adb logcat -c
+# Resolve adb the way the tests do, and fail here if it isn't there. Without -e, an unresolvable
+# adb below would not stop anything: each redirect would write "command not found" into a
+# diagnostics file, which then uploads and reads as collected evidence.
+adb="${GLASS_ADB:-adb}"
+if ! command -v "$adb" > /dev/null 2>&1; then
+  echo "ci-android-suite: adb not found (GLASS_ADB=${GLASS_ADB:-<unset>})" >&2
+  exit 1
+fi
+
+"$adb" logcat -c
 mkdir -p diagnostics
 
 ./scripts/test-android.sh "$@" 2>&1 | tee diagnostics/test-output.txt
 rc=${PIPESTATUS[0]}
 
 if [ "$rc" -ne 0 ]; then
-  adb logcat -d -t 5000           > diagnostics/logcat.txt         2>&1
-  adb shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
-  adb shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
-  adb exec-out screencap -p       > diagnostics/screen-after-teardown.png 2>/dev/null
+  "$adb" logcat -d -t 5000           > diagnostics/logcat.txt         2>&1
+  "$adb" shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
+  "$adb" shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
+  "$adb" exec-out screencap -p       > diagnostics/screen-after-teardown.png 2>/dev/null
 fi
 
 exit "$rc"
