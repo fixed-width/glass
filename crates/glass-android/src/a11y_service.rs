@@ -182,10 +182,9 @@ impl ServiceClient {
     }
 
     /// Run a request, reconnecting once and re-sending when `resend` accepts the failure.
-    /// `rearm` is `None` for a request needing no served tree (`ping`) or that IS the re-arm
-    /// (`tree`); `Some(pkg)` re-serves `tree` for `pkg` on the fresh connection first and, only
-    /// once its reply confirms `pkg` is still foreground, lets `req` follow it — see
-    /// [`rearm_tree`].
+    /// `rearm` is `None` for a request that IS the re-arm (`tree`); `Some(pkg)` re-serves `tree`
+    /// for `pkg` on the fresh connection first and, only once its reply confirms `pkg` is still
+    /// foreground, lets `req` follow it — see [`rearm_tree`].
     fn call_with(
         &self,
         req: Value,
@@ -263,12 +262,6 @@ impl ServiceClient {
         )
         .map(|_| ())
         .map_err(CallFailure::into_error)
-    }
-
-    pub fn ping(&self) -> Result<()> {
-        self.call(json!({"op": "ping"}), None)
-            .map(|_| ())
-            .map_err(CallFailure::into_error)
     }
 }
 
@@ -528,8 +521,9 @@ impl A11yServiceRegistry {
         Self::default()
     }
 
-    /// Install + enable the service on `adb`'s device, forward a port, connect, ping. Returns a
-    /// connected `ServiceClient`. The apk path is resolved from env by the caller.
+    /// Install + enable the service on `adb`'s device, forward a port, and connect. Returns a
+    /// `ServiceClient` only once the service has served a window. The apk path is resolved from
+    /// env by the caller.
     pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
         install_service(adb, apk)?;
         let get = |k: &str| {
@@ -639,14 +633,50 @@ fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: 
     let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
 }
 
-/// Connect to the forwarded service port, retrying briefly while the service binds + listens.
+/// How long [`wait_for_service`] waits for the service to bind *and* serve a window. Sized for
+/// a cold-booted device: the install just before it makes Android restart the service (glass#324),
+/// whose socket is back in a fraction of a second but whose window manager takes seconds more to
+/// reattach a root window. Overrunning only delays the caller's fall back to the uiautomator
+/// reader.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const READY_POLL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Connect to the forwarded service port and wait until the service can answer what the caller
+/// came for: a tree. Both gates share the one budget.
 pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    wait_for_ready(port, READY_TIMEOUT)
+}
+
+/// [`wait_for_service`] with the budget passed in, so a test watching the give-up path does not
+/// wait out the production one.
+fn wait_for_ready(port: u16, timeout: std::time::Duration) -> Result<ServiceClient> {
+    let deadline = std::time::Instant::now() + timeout;
+    let client = loop {
+        match ServiceClient::connect(port) {
+            Ok(c) => break c,
+            Err(e) if std::time::Instant::now() >= deadline => {
+                return Err(GlassError::Backend(format!(
+                    "the on-device a11y service never accepted a connection on :{port} within \
+                     {timeout:?}: {e}"
+                )));
+            }
+            Err(_) => std::thread::sleep(READY_POLL),
+        }
+    };
     loop {
-        match ServiceClient::connect(port).and_then(|c| c.ping().map(|_| c)) {
-            Ok(c) => return Ok(c),
-            Err(e) if std::time::Instant::now() >= deadline => return Err(e),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(150)),
+        // `ping` proves only that the process is up; a served tree proves the capability. The
+        // empty package asks for the active window, exactly what the reader asks for. One
+        // connection throughout — `ServiceClient` reopens its own socket when a call finds the
+        // service gone.
+        match client.tree("") {
+            Ok(_) => return Ok(client),
+            Err(e) if std::time::Instant::now() >= deadline => {
+                return Err(GlassError::AccessibilityUnavailable(format!(
+                    "the on-device a11y service on :{port} answered but never served a window \
+                     within {timeout:?}: {e}"
+                )));
+            }
+            Err(_) => std::thread::sleep(READY_POLL),
         }
     }
 }
@@ -1931,10 +1961,12 @@ mod tests {
         fake_service_full(trees, on_action, packages, vec![OnTree::Serve])
     }
 
-    /// [`fake_service_ex`], plus `on_tree` (same indexing convention as `packages`: by how many
-    /// `tree`s have been served in total) — a served-index that resolves to `OnTree::Refused`
-    /// answers `ok:false` instead of consulting `trees`/`packages`, and does not advance
-    /// `served` or arm the connection's gate, since nothing was actually served.
+    /// [`fake_service_ex`], plus `on_tree` — indexed by how many `tree` requests have *arrived*
+    /// across every connection (last entry repeating), not by how many were served the way
+    /// `trees`/`packages` are: a refusal serves nothing, so a served-index would trap it on its
+    /// first entry and could never model a service that refuses and then starts serving. An
+    /// `OnTree::Refused` entry answers `ok:false` without consulting `trees`/`packages`, and
+    /// advances neither `served` nor the connection's gate.
     fn fake_service_full(
         trees: Vec<Value>,
         on_action: Vec<OnAction>,
@@ -1948,6 +1980,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut conn = 0usize;
             let mut served = 0usize;
+            let mut requested = 0usize;
             while let Ok((sock, _)) = listener.accept() {
                 conn += 1;
                 let this_action = on_action[(conn - 1).min(on_action.len() - 1)];
@@ -1968,28 +2001,32 @@ mod tests {
                     let req: Value = serde_json::from_str(&line).expect("request is json");
                     let id = req["id"].clone();
                     let reply = match req["op"].as_str().unwrap_or_default() {
-                        "tree" => match on_tree[served.min(on_tree.len() - 1)] {
-                            OnTree::Refused(msg) => {
-                                log.lock().unwrap().push(format!("conn{conn}:tree-refused"));
-                                json!({"id": id, "ok": false, "error": msg})
-                            }
-                            OnTree::Serve => {
-                                log.lock().unwrap().push(format!("conn{conn}:tree"));
-                                let t = trees[served.min(trees.len() - 1)].clone();
-                                let pkg = &packages[served.min(packages.len() - 1)];
-                                served += 1;
-                                tree_confirmed = true;
-                                let mut reply = json!({"id": id, "ok": true, "tree": t});
-                                match pkg {
-                                    TreePackage::Echo => {
-                                        reply["package"] = req["package"].clone();
-                                    }
-                                    TreePackage::Other(p) => reply["package"] = json!(p),
-                                    TreePackage::Unnamed => {}
+                        "tree" => {
+                            let this_tree = on_tree[requested.min(on_tree.len() - 1)];
+                            requested += 1;
+                            match this_tree {
+                                OnTree::Refused(msg) => {
+                                    log.lock().unwrap().push(format!("conn{conn}:tree-refused"));
+                                    json!({"id": id, "ok": false, "error": msg})
                                 }
-                                reply
+                                OnTree::Serve => {
+                                    log.lock().unwrap().push(format!("conn{conn}:tree"));
+                                    let t = trees[served.min(trees.len() - 1)].clone();
+                                    let pkg = &packages[served.min(packages.len() - 1)];
+                                    served += 1;
+                                    tree_confirmed = true;
+                                    let mut reply = json!({"id": id, "ok": true, "tree": t});
+                                    match pkg {
+                                        TreePackage::Echo => {
+                                            reply["package"] = req["package"].clone();
+                                        }
+                                        TreePackage::Other(p) => reply["package"] = json!(p),
+                                        TreePackage::Unnamed => {}
+                                    }
+                                    reply
+                                }
                             }
-                        },
+                        }
                         "action" if !tree_confirmed => {
                             log.lock()
                                 .unwrap()
@@ -2174,6 +2211,73 @@ mod tests {
              for an action that never left the host): {}",
             e.into_error()
         );
+    }
+
+    #[test]
+    fn readiness_waits_for_a_served_window_not_just_a_live_socket() {
+        // glass#324. Reinstalling the APK makes Android SIGKILL the process hosting the
+        // AccessibilityService; the restart binds its socket — and answers `ping` — before the
+        // window manager has reattached a root window, so every `tree` until then is refused
+        // "no active window".
+        let (port, ops) = fake_service_full(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![
+                OnTree::Refused("no active window"),
+                OnTree::Refused("no active window"),
+                OnTree::Serve,
+            ],
+        );
+        let client = wait_for_service(port).expect("the third tree serves, well inside the budget");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree-refused".to_string(),
+                "conn1:tree-refused".to_string(),
+                "conn1:tree".to_string(),
+            ],
+            "readiness must poll `tree` until one is served, on the one connection"
+        );
+        client
+            .tree("com.example.app")
+            .expect("the client handed back is the live, serving one");
+    }
+
+    #[test]
+    fn readiness_gives_up_within_its_budget_naming_the_refusal_not_just_the_wait() {
+        // The refusal never clears — a genuinely stuck service, not one mid-restart. The budget
+        // is what stops the retrying, and the error must carry what the device said: a bare
+        // "timed out" sends the reader hunting the host's socket, not the device's missing
+        // window.
+        let timeout = std::time::Duration::from_millis(400);
+        let (port, ops) = fake_service_full(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::Refused("no active window")],
+        );
+        let started = std::time::Instant::now();
+        let Err(e) = wait_for_ready(port, timeout) else {
+            panic!("a service that never serves a window is not ready");
+        };
+        let waited = started.elapsed();
+        assert!(
+            waited >= timeout,
+            "gave up after {waited:?}, before the budget"
+        );
+        assert!(
+            waited < timeout * 10,
+            "waited {waited:?} — the budget passed in must be the one that bounds it"
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("no active window"), "{msg}");
+        let ops = ops_of(&ops);
+        assert!(
+            ops.len() > 1,
+            "one refusal is transient, not fatal — it must be retried: {ops:?}"
+        );
+        assert!(ops.iter().all(|o| o == "conn1:tree-refused"), "{ops:?}");
     }
 
     #[test]
