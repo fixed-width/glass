@@ -25,14 +25,17 @@ name: Android
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # 02:00 PT
+    - cron: '0 9 * * *'   # 09:00 UTC (02:00 PT in summer, 01:00 in winter)
   workflow_dispatch:
   push:
     branches: [master]
 
 concurrency:
+  # One group covers the schedule, push:master and dispatch, so cancelling would let a merge
+  # landing mid-nightly kill it, with no artifacts and no failure to show for it. ci.yml cancels
+  # because it gates a PR; this leg detects, so it follows release.yml.
   group: android-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -100,8 +103,8 @@ jobs:
       # not a rebuild, and re-adding this whole section later would be more churn than this comment.
       # Remove the --skip in scripts/test-android.sh and this section is live again with no other
       # change needed.
-      - name: Cache the built fixture APK
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore the fixture APK cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: fixture-cache
         with:
           path: ~/glass-fixture
@@ -124,6 +127,7 @@ jobs:
           cache: gradle
 
       - name: Build the fixture APK (cache miss only)
+        id: fixture-build
         # Built from source rather than downloaded: the fixture is a test artifact with no
         # user-facing form, so it does not belong on the release page docs point users at. The
         # jar and a11y APK go the other way for the mirror-image reason — see the step above.
@@ -139,7 +143,12 @@ jobs:
           cp fixture-compose/build/outputs/apk/debug/fixture-compose-debug.apk "$HOME/glass-fixture/"
 
       - name: Point the suite at the fixture
-        run: echo "GLASS_ANDROID_FIXTURE_APK=$HOME/glass-fixture/fixture-compose-debug.apk" >> "$GITHUB_ENV"
+        # A cache hit restores the path without proving what is in it; check rather than hand the
+        # suite a variable pointing at nothing.
+        run: |
+          apk="$HOME/glass-fixture/fixture-compose-debug.apk"
+          test -f "$apk"
+          echo "GLASS_ANDROID_FIXTURE_APK=$apk" >> "$GITHUB_ENV"
 
       - name: Restore the AVD cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -150,8 +159,11 @@ jobs:
             ~/.android/adb*
           # The profile is part of this key: an AVD cached under a key that doesn't mention it
           # would restore silently with whatever profile happened to create it, defeating
-          # EMULATOR_PROFILE below without any signal that it happened.
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}
+          # EMULATOR_PROFILE below without any signal that it happened. The workflow hash covers
+          # the rest of what decides what the cached AVD *is* — the emulator-runner action SHA,
+          # the create step's emulator-options, disable-animations. Without it the entry never
+          # self-corrects: the nightly refreshes the LRU clock and save is skipped on a hit.
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
 
       - name: Create the AVD snapshot (cache miss only)
         if: steps.avd-cache.outputs.cache-hit != 'true'
@@ -171,6 +183,10 @@ jobs:
         env:
           # The 120s default was tuned on a warm dev box, not a cold runner.
           GLASS_EMULATOR_BOOT_TIMEOUT_MS: '300000'
+          # This job's device is the action's. glass defaults to attach-or-boot, so if that
+          # emulator dies mid-suite glass would quietly boot its own and the remaining tests
+          # would pass against a different device.
+          GLASS_ANDROID_LIFECYCLE: attach
         with:
           api-level: ${{ env.API_LEVEL }}
           target: ${{ env.EMULATOR_TARGET }}
@@ -188,6 +204,17 @@ jobs:
           # later step has no adb to talk to.
           script: ./scripts/ci-android-suite.sh
 
+      - name: Save the fixture APK cache
+        # Split from the restore above for the same reason as the AVD pair: the fixture comes
+        # from the build step, not from the test run, so a failing suite is no reason to rebuild
+        # it next time. Skipped on a hit (no longer automatic once split) and when the build that
+        # produces the path was skipped or failed — cache/save errors on a path that isn't there.
+        if: always() && steps.fixture-cache.outputs.cache-hit != 'true' && steps.fixture-build.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/glass-fixture
+          key: glass-fixture-${{ env.AGENT_TAG }}
+
       - name: Save the AVD cache
         # Runs even on a failed suite: the AVD snapshot this caches comes from the earlier
         # "Create the AVD snapshot" step, not from the test run, so a failing suite is no reason
@@ -200,7 +227,7 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
 
       - name: Upload failure diagnostics
         if: failure()
@@ -336,5 +363,5 @@ jobs:
         with:
           name: android-lifecycle-diagnostics-${{ github.run_id }}
           path: diagnostics/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
