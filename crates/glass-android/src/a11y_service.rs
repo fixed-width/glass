@@ -548,34 +548,27 @@ impl A11yServiceRegistry {
         } else {
             format!("{prior}:{SERVICE_COMPONENT}")
         };
-        adb.run([
-            "shell",
-            "settings",
-            "put",
-            "secure",
-            "enabled_accessibility_services",
-            &want,
-        ])?;
-        adb.run([
-            "shell",
-            "settings",
-            "put",
-            "secure",
-            "accessibility_enabled",
-            "1",
-        ])?;
+        put_enabled_services(adb, &want)?;
+        put_secure(adb, "accessibility_enabled", "1")?;
         let out = adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")])?;
         let port = crate::agent::parse_forward_port(&out)
             .ok_or_else(|| GlassError::Backend(format!("adb forward gave no port: {out:?}")))?;
         // From here, a failure must roll back the settings + forward, else a failed `ensure` leaks
         // an enabled service and a forward slot.
-        let client = match wait_for_service(port) {
-            Ok(c) => c,
-            Err(e) => {
-                restore_a11y(adb, prior, prior_a11y, port);
-                return Err(e);
-            }
-        };
+        let client = ready_or_restore(
+            port,
+            READY_ATTEMPT,
+            READY_ATTEMPTS,
+            &|step| {
+                // Last resort: the reinstall is what SIGKILLs the service and starts this
+                // race, and also the only step observed to bring a stuck binding back.
+                if step + 1 == READY_ATTEMPTS {
+                    install_service(adb, apk)?;
+                }
+                force_rebind(adb, &want)
+            },
+            &|| restore_a11y(adb, prior, prior_a11y, port),
+        )?;
         *self.state.lock().unwrap() = Some(Active {
             serial: adb.serial().map(str::to_string),
             port,
@@ -600,65 +593,121 @@ impl A11yServiceRegistry {
     }
 }
 
-/// Restore `enabled_accessibility_services` + `accessibility_enabled` to their prior values and
-/// remove the forwarded port. Shared by `shutdown` and the failed-`ensure` rollback. Best-effort.
-fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: u16) {
-    if prior_enabled.is_empty() {
-        // `settings put ... ""` errors ("Bad arguments"); delete to clear the list instead.
-        let _ = adb.run([
+fn put_secure(adb: &Adb, key: &str, value: &str) -> Result<()> {
+    adb.run(["shell", "settings", "put", "secure", key, value])
+        .map(|_| ())
+}
+
+/// Write `enabled_accessibility_services`. An empty list is a `delete`: `settings put ... ""`
+/// errors ("Bad arguments").
+fn put_enabled_services(adb: &Adb, list: &str) -> Result<()> {
+    if list.is_empty() {
+        adb.run([
             "shell",
             "settings",
             "delete",
             "secure",
             "enabled_accessibility_services",
-        ]);
+        ])
+        .map(|_| ())
     } else {
-        let _ = adb.run([
-            "shell",
-            "settings",
-            "put",
-            "secure",
-            "enabled_accessibility_services",
-            prior_enabled,
-        ]);
+        put_secure(adb, "enabled_accessibility_services", list)
     }
-    let _ = adb.run([
-        "shell",
-        "settings",
-        "put",
-        "secure",
-        "accessibility_enabled",
-        prior_a11y_enabled,
-    ]);
+}
+
+/// `list` with this service's component removed — the colon-separated list the platform reads.
+fn without_service(list: &str) -> String {
+    list.split(':')
+        .filter(|s| !s.is_empty() && *s != SERVICE_COMPONENT)
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Make the platform tear this service's accessibility binding down and build a fresh one, by
+/// disabling and re-enabling it. The process is left alone: a restart is what glass#324 recovers
+/// from, not a remedy for it.
+fn force_rebind(adb: &Adb, enabled: &str) -> Result<()> {
+    put_secure(adb, "accessibility_enabled", "0")?;
+    put_enabled_services(adb, &without_service(enabled))?;
+    put_enabled_services(adb, enabled)?;
+    put_secure(adb, "accessibility_enabled", "1")
+}
+
+/// Restore `enabled_accessibility_services` + `accessibility_enabled` to their prior values and
+/// remove the forwarded port. Shared by `shutdown` and the failed-`ensure` rollback. Best-effort.
+fn restore_a11y(adb: &Adb, prior_enabled: &str, prior_a11y_enabled: &str, port: u16) {
+    let _ = put_enabled_services(adb, prior_enabled);
+    let _ = put_secure(adb, "accessibility_enabled", prior_a11y_enabled);
     let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
 }
 
-/// How long [`wait_for_service`] waits for the service to bind *and* serve a window. Sized for
-/// a cold-booted device: the install just before it makes Android restart the service (glass#324),
-/// whose socket is back in a fraction of a second but whose window manager takes seconds more to
-/// reattach a root window. Overrunning only delays the caller's fall back to the uiautomator
-/// reader.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long ONE readiness attempt polls for a served window. On a cold-booted device readiness
+/// that succeeds at all has done so in 0.7-2.5s, and one still refused at 6s ran out a 20s budget
+/// too (glass#324).
+const READY_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(6);
 const READY_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// Connect to the forwarded service port and wait until the service can answer what the caller
-/// came for: a tree. Both gates share the one budget.
-pub(crate) fn wait_for_service(port: u16) -> Result<ServiceClient> {
-    wait_for_ready(port, READY_TIMEOUT)
+/// Readiness attempts [`A11yServiceRegistry::ensure`] makes, the first included: poll, force a
+/// rebind, poll, reinstall + force a rebind, poll. Three of these is 18s of polling.
+const READY_ATTEMPTS: u32 = 3;
+
+/// Wait for readiness on `port`, and when an attempt is refused for its whole budget, force the
+/// service's binding to be rebuilt and try again — `rebind(step)` for the `step`th recovery,
+/// escalating with the number. `attempts` counts the first, so it makes `attempts - 1` rebinds.
+///
+/// `restore` runs on exactly one path, giving up — here rather than at the caller so retrying
+/// cannot grow a second way out that forgets it.
+fn ready_or_restore(
+    port: u16,
+    attempt: std::time::Duration,
+    attempts: u32,
+    rebind: &dyn Fn(u32) -> Result<()>,
+    restore: &dyn Fn(),
+) -> Result<ServiceClient> {
+    let started = std::time::Instant::now();
+    let mut refusal = match wait_for_ready(port, attempt) {
+        Ok(client) => return Ok(client),
+        Err(e) => e,
+    };
+    let mut rebinds = 0u32;
+    for step in 1..attempts {
+        if let Err(e) = rebind(step) {
+            restore();
+            return Err(GlassError::Backend(format!(
+                "could not force the on-device a11y service on :{port} to rebind after {step} \
+                 readiness attempts, {}ms total: {e} — last attempt: {refusal}",
+                started.elapsed().as_millis()
+            )));
+        }
+        rebinds += 1;
+        match wait_for_ready(port, attempt) {
+            Ok(client) => return Ok(client),
+            Err(e) => refusal = e,
+        }
+    }
+    restore();
+    Err(GlassError::AccessibilityUnavailable(format!(
+        "the on-device a11y service on :{port} never served a window: {} readiness attempts of \
+         {attempt:?}, {rebinds} forced rebinds between them, {}ms total — last attempt: {refusal}",
+        rebinds + 1,
+        started.elapsed().as_millis()
+    )))
 }
 
-/// [`wait_for_service`] with the budget passed in, so a test watching the give-up path does not
-/// wait out the production one.
-fn wait_for_ready(port: u16, timeout: std::time::Duration) -> Result<ServiceClient> {
+/// One readiness attempt against the binding currently on `port`: connect, then poll `tree`
+/// until one is served. Both gates share the one budget. The error is a message, not a
+/// `GlassError`: [`ready_or_restore`] classifies the sequence, and a variant here would nest a
+/// second "accessibility unavailable:" inside the first.
+fn wait_for_ready(
+    port: u16,
+    timeout: std::time::Duration,
+) -> std::result::Result<ServiceClient, String> {
     let deadline = std::time::Instant::now() + timeout;
     let client = loop {
         match ServiceClient::connect(port) {
             Ok(c) => break c,
             Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(GlassError::Backend(format!(
-                    "the on-device a11y service never accepted a connection on :{port} within \
-                     {timeout:?}: {e}"
-                )));
+                return Err(format!("never accepted a connection in {timeout:?}: {e}"));
             }
             Err(_) => std::thread::sleep(READY_POLL),
         }
@@ -671,10 +720,7 @@ fn wait_for_ready(port: u16, timeout: std::time::Duration) -> Result<ServiceClie
         match client.tree("") {
             Ok(_) => return Ok(client),
             Err(e) if std::time::Instant::now() >= deadline => {
-                return Err(GlassError::AccessibilityUnavailable(format!(
-                    "the on-device a11y service on :{port} answered but never served a window \
-                     within {timeout:?}: {e}"
-                )));
+                return Err(format!("answered but served no window in {timeout:?}: {e}"));
             }
             Err(_) => std::thread::sleep(READY_POLL),
         }
@@ -887,6 +933,7 @@ mod tests {
     use glass_core::accessibility::AxRole;
     use serde_json::json;
     use std::io::{BufRead, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn win() -> WindowGeometry {
         WindowGeometry {
@@ -1930,6 +1977,9 @@ mod tests {
     enum OnTree {
         Serve,
         Refused(&'static str),
+        /// Refused "no active window" until the flag is set, then served: a binding that starts
+        /// serving only once something off the request path makes the platform rebuild it.
+        RefusedUntil(&'static AtomicBool),
     }
 
     /// A fake on-device service on a local TCP listener: serves `tree` from a script (the last
@@ -2004,12 +2054,21 @@ mod tests {
                         "tree" => {
                             let this_tree = on_tree[requested.min(on_tree.len() - 1)];
                             requested += 1;
-                            match this_tree {
-                                OnTree::Refused(msg) => {
+                            let refusal = match this_tree {
+                                OnTree::Refused(msg) => Some(msg),
+                                OnTree::RefusedUntil(gate)
+                                    if !gate.load(std::sync::atomic::Ordering::Relaxed) =>
+                                {
+                                    Some("no active window")
+                                }
+                                _ => None,
+                            };
+                            match refusal {
+                                Some(msg) => {
                                     log.lock().unwrap().push(format!("conn{conn}:tree-refused"));
                                     json!({"id": id, "ok": false, "error": msg})
                                 }
-                                OnTree::Serve => {
+                                None => {
                                     log.lock().unwrap().push(format!("conn{conn}:tree"));
                                     let t = trees[served.min(trees.len() - 1)].clone();
                                     let pkg = &packages[served.min(packages.len() - 1)];
@@ -2229,7 +2288,8 @@ mod tests {
                 OnTree::Serve,
             ],
         );
-        let client = wait_for_service(port).expect("the third tree serves, well inside the budget");
+        let client =
+            wait_for_ready(port, READY_ATTEMPT).expect("the third tree serves, inside the budget");
         assert_eq!(
             ops_of(&ops),
             vec![
@@ -2278,6 +2338,200 @@ mod tests {
             "one refusal is transient, not fatal — it must be retried: {ops:?}"
         );
         assert!(ops.iter().all(|o| o == "conn1:tree-refused"), "{ops:?}");
+    }
+
+    #[test]
+    fn the_disable_half_of_a_rebind_drops_our_service_and_keeps_the_devices_own() {
+        // The platform unbinds a service when it leaves `enabled_accessibility_services`. Leave
+        // ours in and the rebind degrades to a global `accessibility_enabled` toggle, which was
+        // seen recovering the platform's own reader without recovering our binding.
+        let other = "com.example.reader/.TalkBack";
+        assert_eq!(
+            without_service(&format!("{other}:{SERVICE_COMPONENT}")),
+            other,
+            "ours goes, the device's own stays"
+        );
+        assert_eq!(without_service(SERVICE_COMPONENT), "");
+        assert_eq!(without_service(""), "");
+    }
+
+    /// A fake service that refuses every `tree` until `gate` opens.
+    fn refusing_service(gate: &'static AtomicBool) -> (u16, Arc<Mutex<Vec<String>>>) {
+        fake_service_full(
+            vec![compose_like()],
+            vec![OnAction::Ok],
+            vec![TreePackage::Echo],
+            vec![OnTree::RefusedUntil(gate)],
+        )
+    }
+
+    #[test]
+    fn a_refused_readiness_forces_a_rebind_and_the_attempt_after_it_serves() {
+        // glass#324. The refusal is bimodal on a cold-booted device: readiness either succeeds
+        // in a couple of seconds or is still refused 20s later, and the only thing observed to
+        // clear the late case is re-establishing the service's binding.
+        static SERVING: AtomicBool = AtomicBool::new(false);
+        let (port, ops) = refusing_service(&SERVING);
+        let steps = Mutex::new(Vec::new());
+        let restores = AtomicUsize::new(0);
+        let client = ready_or_restore(
+            port,
+            std::time::Duration::from_millis(100),
+            3,
+            &|step| {
+                steps.lock().unwrap().push(step);
+                SERVING.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .expect("the attempt after the rebind serves");
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![1],
+            "one rebind, and no second one once readiness came back"
+        );
+        assert_eq!(
+            restores.load(Ordering::Relaxed),
+            0,
+            "readiness succeeded — rolling the device back would tear down what it just got"
+        );
+        let ops = ops_of(&ops);
+        assert_eq!(
+            ops.last().map(String::as_str),
+            Some("conn2:tree"),
+            "the serve must land on the attempt after the rebind: {ops:?}"
+        );
+        assert!(
+            ops[..ops.len() - 1]
+                .iter()
+                .all(|o| o == "conn1:tree-refused"),
+            "{ops:?}"
+        );
+        client
+            .tree("com.example.app")
+            .expect("the client handed back is the serving one");
+    }
+
+    #[test]
+    fn readiness_stops_rebinding_at_its_budget_and_says_what_it_tried() {
+        // A CI log is all anyone gets: the give-up has to name what the device said, how hard
+        // it was pushed to rebind, and over how long.
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let attempt = std::time::Duration::from_millis(200);
+        let (port, ops) = refusing_service(&NEVER);
+        let steps = Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        let Err(e) = ready_or_restore(
+            port,
+            attempt,
+            3,
+            &|step| {
+                steps.lock().unwrap().push(step);
+                Ok(())
+            },
+            &|| {},
+        ) else {
+            panic!("a device that never serves a window is not ready");
+        };
+        let waited = started.elapsed();
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![1, 2],
+            "a rebind between each pair of attempts, escalating, and none after the last"
+        );
+        assert!(
+            waited >= attempt * 3,
+            "gave up after {waited:?} — each attempt gets the budget it was given"
+        );
+        assert!(
+            waited < attempt * 3 * 3,
+            "waited {waited:?} — retrying must spend a bounded total, not a fresh budget each time"
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("3 readiness attempts"), "{msg}");
+        assert!(msg.contains("2 forced rebinds"), "{msg}");
+        assert!(msg.contains("ms total"), "{msg}");
+        assert!(msg.contains("no active window"), "{msg}");
+        assert!(
+            ops_of(&ops).iter().all(|o| o.ends_with(":tree-refused")),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn readiness_that_gives_up_restores_the_device_exactly_once() {
+        // The rollback is what keeps a failed `ensure` from leaving the service enabled and the
+        // port forwarded. Retrying is where that goes wrong: once per attempt tears down the
+        // settings the next attempt needs, and none at all leaks both.
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let (port, _ops) = refusing_service(&NEVER);
+        let steps = Mutex::new(Vec::new());
+        let restores = AtomicUsize::new(0);
+        let Err(_) = ready_or_restore(
+            port,
+            std::time::Duration::from_millis(100),
+            3,
+            &|step| {
+                steps.lock().unwrap().push(step);
+                assert_eq!(
+                    restores.load(Ordering::Relaxed),
+                    0,
+                    "a rebind after the restore would re-enable the service it just tore down"
+                );
+                Ok(())
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        ) else {
+            panic!("a device that never serves a window is not ready");
+        };
+        assert_eq!(*steps.lock().unwrap(), vec![1, 2], "every retry ran");
+        assert_eq!(
+            restores.load(Ordering::Relaxed),
+            1,
+            "the device is restored once, after the last attempt — not once per attempt"
+        );
+    }
+
+    #[test]
+    fn a_rebind_that_fails_restores_the_device_and_stops_retrying() {
+        // The other give-up path: adb itself failed. Its early return is the easiest place to
+        // leak an enabled service and a forwarded port.
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let (port, _ops) = refusing_service(&NEVER);
+        let steps = Mutex::new(Vec::new());
+        let restores = AtomicUsize::new(0);
+        let Err(e) = ready_or_restore(
+            port,
+            std::time::Duration::from_millis(100),
+            3,
+            &|step| {
+                steps.lock().unwrap().push(step);
+                Err(GlassError::Backend("device offline".into()))
+            },
+            &|| {
+                restores.fetch_add(1, Ordering::Relaxed);
+            },
+        ) else {
+            panic!("a rebind that cannot reach the device is not readiness");
+        };
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![1],
+            "a rebind adb could not deliver is not worth repeating"
+        );
+        assert_eq!(
+            restores.load(Ordering::Relaxed),
+            1,
+            "the device must still be restored when the recovery step is what failed"
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("device offline"), "{msg}");
+        assert!(msg.contains("no active window"), "{msg}");
     }
 
     #[test]
