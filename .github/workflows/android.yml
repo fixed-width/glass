@@ -196,7 +196,8 @@ jobs:
   android-lifecycle:
     name: Managed AVD lifecycle (glass boots its own)
     runs-on: Android-CI
-    timeout-minutes: 30
+    # Budget: 5min boot timeout + SDK/system-image setup + cold-cache cargo build + reuse/cleanup.
+    timeout-minutes: 15
     # No `needs:` — this is independent of the device suite and should still report if that fails.
     # Deliberately does NOT use android-emulator-runner: that action boots the emulator and runs
     # your script inside it, which is the exact precondition managed_avd requires to be absent.
@@ -221,14 +222,50 @@ jobs:
 
       - name: Install the system image and define an AVD, without booting it
         run: |
+          set +e
           img="system-images;android-${API_LEVEL};${EMULATOR_TARGET};${EMULATOR_ARCH}"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "emulator" "$img"
+
           # --device matches EMULATOR_PROFILE so this AVD is the same device as the "android"
           # job's, not whatever avdmanager would otherwise default to.
           echo no | avdmanager create avd -n glass -k "$img" --device "$EMULATOR_PROFILE" --force
+          rc=$?
+          echo "avdmanager exit code: $rc"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::avdmanager create avd failed (exit $rc)"
+            exit "$rc"
+          fi
+
+          # avdmanager warns and continues rather than failing, so exit 0 above is not proof the
+          # AVD exists where glass looks (crates/glass-android/src/sdk.rs resolve_sdk_root,
+          # avd.rs resolve_emulator_bin).
+          echo "--- AVD-location env vars ---"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-<unset>}"
+          echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-<unset>}"
+          echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-<unset>}"
+          echo "HOME=${HOME:-<unset>}"
+          echo "--- avdmanager's own view ---"
+          avdmanager list avd
+          echo "--- \$HOME/.android/avd contents ---"
+          ls -la "$HOME/.android/avd" 2>&1
+
+          # Matches glass's own resolution exactly: GLASS_EMULATOR is unset here, so
+          # resolve_emulator_bin falls through to $ANDROID_SDK_ROOT/emulator/emulator, and
+          # boot_avd parses this binary's -list-avds — not avdmanager's or adb's.
+          avds="$("$ANDROID_SDK_ROOT/emulator/emulator" -list-avds)"
+          echo "--- emulator -list-avds output ---"
+          echo "$avds"
+          if ! echo "$avds" | grep -qx glass; then
+            echo "::error::AVD 'glass' is not in \`\$ANDROID_SDK_ROOT/emulator/emulator -list-avds\` output — this is exactly what glass's boot_avd calls, so the test would fail with an empty AVD list regardless of what avdmanager or adb reported"
+            exit 1
+          fi
+
           # Prove nothing is running: the test's subject is the boot itself.
           "$ANDROID_SDK_ROOT/platform-tools/adb" devices
+          exit 0
 
       - name: Run the lifecycle test
         env:
@@ -241,9 +278,23 @@ jobs:
           rc=$?
           if [ $rc -ne 0 ]; then
             mkdir -p diagnostics
-            "$GLASS_ADB" devices              > diagnostics/adb-devices.txt 2>&1
-            "$GLASS_ADB" logcat -d            > diagnostics/logcat.txt      2>&1
-            ls -la "$HOME/.android/avd"       > diagnostics/avd-dir.txt     2>&1
+            {
+              echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+              echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+              echo "ANDROID_AVD_HOME=${ANDROID_AVD_HOME:-<unset>}"
+              echo "ANDROID_SDK_HOME=${ANDROID_SDK_HOME:-<unset>}"
+              echo "ANDROID_USER_HOME=${ANDROID_USER_HOME:-<unset>}"
+              echo "HOME=${HOME:-<unset>}"
+            } > diagnostics/env.txt 2>&1
+            # timeout-bounded: unlike `adb devices`, `adb logcat` blocks waiting for a device
+            # instead of returning empty — exactly this job's failure mode. Without the
+            # `timeout`, this once hung 28min until the job was cancelled, skipping upload
+            # entirely.
+            timeout 10 "$ANDROID_SDK_ROOT/emulator/emulator" -list-avds > diagnostics/emulator-list-avds.txt 2>&1
+            timeout 10 "$GLASS_ADB" devices                             > diagnostics/adb-devices.txt      2>&1
+            timeout 10 "$GLASS_ADB" logcat -d                           > diagnostics/logcat.txt           2>&1
+            ls -la "$HOME/.android/avd"                                 > diagnostics/avd-dir.txt          2>&1
+            find "$HOME/.android" -maxdepth 3 -iname '*.log'            > diagnostics/android-home-logs.txt 2>&1
           fi
           exit $rc
 
