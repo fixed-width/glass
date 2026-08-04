@@ -52,6 +52,10 @@ sdkmanager "system-images;android-34;google_apis;x86_64"
 avdmanager create avd -n glass -k "system-images;android-34;google_apis;x86_64" --device pixel_6
 ```
 
+> If `emulator -list-avds` doesn't list an AVD you just created, `avdmanager` and `emulator`
+> disagree on where AVDs live on your system (e.g. an XDG `~/.config/.android/avd` vs. legacy
+> `~/.android/avd` split) — set `ANDROID_AVD_HOME` to one directory so both agree.
+
 ## Managed AVD (attach-or-boot)
 
 Like Android Studio, glass prefers to attach: if an emulator is already online it uses it

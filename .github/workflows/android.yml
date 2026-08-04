@@ -201,6 +201,15 @@ jobs:
     # No `needs:` — this is independent of the device suite and should still report if that fails.
     # Deliberately does NOT use android-emulator-runner: that action boots the emulator and runs
     # your script inside it, which is the exact precondition managed_avd requires to be absent.
+    env:
+      # avdmanager and the native `emulator` binary default to different AVD directories on this
+      # runner (avdmanager: ~/.config/.android/avd; emulator: ~/.android/avd, it doesn't
+      # recognize ANDROID_USER_HOME) — an unpinned AVD is invisible to glass (run 30874077553).
+      # ANDROID_AVD_HOME is the override both honor (confirmed via `strings` on each; the
+      # deprecated ANDROID_SDK_HOME is one word from ANDROID_SDK_ROOT below and means something
+      # else). Job-level: a step's `env:` doesn't reach the next step, and the create step here
+      # and glass's own `emulator` invocation in the test step both need to agree.
+      ANDROID_AVD_HOME: ${{ github.workspace }}/.android-avd
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -226,6 +235,7 @@ jobs:
           img="system-images;android-${API_LEVEL};${EMULATOR_TARGET};${EMULATOR_ARCH}"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "emulator" "$img"
+          mkdir -p "$ANDROID_AVD_HOME"
 
           # --device matches EMULATOR_PROFILE so this AVD is the same device as the "android"
           # job's, not whatever avdmanager would otherwise default to.
@@ -249,8 +259,8 @@ jobs:
           echo "HOME=${HOME:-<unset>}"
           echo "--- avdmanager's own view ---"
           avdmanager list avd
-          echo "--- \$HOME/.android/avd contents ---"
-          ls -la "$HOME/.android/avd" 2>&1
+          echo "--- \$ANDROID_AVD_HOME contents ---"
+          ls -la "$ANDROID_AVD_HOME" 2>&1
 
           # Matches glass's own resolution exactly: GLASS_EMULATOR is unset here, so
           # resolve_emulator_bin falls through to $ANDROID_SDK_ROOT/emulator/emulator, and
@@ -293,8 +303,8 @@ jobs:
             timeout 10 "$ANDROID_SDK_ROOT/emulator/emulator" -list-avds > diagnostics/emulator-list-avds.txt 2>&1
             timeout 10 "$GLASS_ADB" devices                             > diagnostics/adb-devices.txt      2>&1
             timeout 10 "$GLASS_ADB" logcat -d                           > diagnostics/logcat.txt           2>&1
-            ls -la "$HOME/.android/avd"                                 > diagnostics/avd-dir.txt          2>&1
-            find "$HOME/.android" -maxdepth 3 -iname '*.log'            > diagnostics/android-home-logs.txt 2>&1
+            ls -la "$ANDROID_AVD_HOME"                                  > diagnostics/avd-dir.txt          2>&1
+            find "$HOME/.android" "$ANDROID_AVD_HOME" -maxdepth 3 -iname '*.log' > diagnostics/android-logs.txt 2>&1
           fi
           exit $rc
 
