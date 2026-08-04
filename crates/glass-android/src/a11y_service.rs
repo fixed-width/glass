@@ -387,13 +387,13 @@ impl Accessibility for ServiceA11y {
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         // Guard: re-snapshot and verify the ref still points at the same editable element before
-        // acting. Shared with `AndroidA11y::set_value`, so both readers refuse the same drift.
+        // acting — `invoke`'s guard plus the editable check.
         let tree = {
             let mut t = self.snapshot(ctx)?;
             t.assign_ids();
             t
         };
-        crate::a11y::editable_target(&tree, target)?;
+        resolved_editable_target(&tree, target)?;
         // Re-arm against the app the served tree actually described, not the one asked about —
         // that's the app `target`'s ref came from (see `rearm_tree`).
         let acting_on = tree
@@ -762,13 +762,110 @@ fn toggles(role: AxRole) -> bool {
     matches!(role, AxRole::CheckBox | AxRole::ToggleButton)
 }
 
+/// Whether `node` is the element `target` names, wherever it now sits: same role, name and value,
+/// and exactly the same size.
+fn same_element_moved(target: &AxTarget, node: &AxNode) -> bool {
+    target.matches(node.role, node.name.as_deref())
+        && target.value_consistent(node.value.as_deref())
+        && matches!(
+            (target.bounds, node.bounds),
+            (Some(a), Some(b)) if a.width == b.width && a.height == b.height
+        )
+}
+
+/// Every node [`same_element_moved`] accepts for `target`, in pre-order. Searched tree-wide, not
+/// among siblings, so a second identical control anywhere refuses the whole relaxation — a list of
+/// same-size items sharing one label keeps the strict bounds guard.
+fn movement_candidates<'a>(tree: &'a AxTree, target: &AxTarget) -> Vec<&'a AxNode> {
+    fn walk<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
+        if same_element_moved(target, node) {
+            out.push(node);
+        }
+        for c in &node.children {
+            walk(c, target, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tree.root, target, &mut out);
+    out
+}
+
+/// A rectangle as `(x,y wxh)`.
+fn rect(b: Option<AxRect>) -> String {
+    b.map_or_else(
+        || "(no bounds)".to_string(),
+        |r| format!("({},{} {}x{})", r.x, r.y, r.width, r.height),
+    )
+}
+
+/// The refusal for a target more than one node now matches on everything but position, so its id
+/// no longer picks one of them out.
+fn indistinguishable(target: &AxTarget, candidates: &[&AxNode]) -> GlassError {
+    let at: Vec<String> = candidates.iter().map(|n| rect(n.bounds)).collect();
+    GlassError::AxActionFailed(
+        target.id.0,
+        format!(
+            "{} elements now match its role, name, value and size — at {} — and it is no longer \
+             at {}, so which one it is cannot be told and nothing was dispatched; re-snapshot",
+            candidates.len(),
+            at.join(", "),
+            rect(target.bounds),
+        ),
+    )
+}
+
+/// [`crate::a11y::fingerprinted`], with a control's *position* taken out of its identity.
+///
+/// glass#326: an activity-open transition slides a control tens of px while the caller's snapshot
+/// still holds where it was, and the strict guard refuses it although role, name and value all
+/// match and only x differs.
+///
+/// Do not widen further. The node is still the one on `target.id` — nothing is searched for — its
+/// size must match exactly, and it is accepted only while no other node in the tree carries the
+/// same role, name, value and size. That uniqueness stands in for the bounds comparison: what
+/// `AxTarget::bounds` guards against is a *different* same-role+name element inheriting the id
+/// after drift, and there is no different one here to inherit it. Two candidates and this refuses.
+///
+/// `AndroidA11y`'s `set_value` keeps the strict core helper; only this reader relaxes.
+fn resolved_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    let strict = match crate::a11y::fingerprinted(tree, target) {
+        Ok(node) => return Ok(node),
+        Err(e) => e,
+    };
+    // Only the bounds verdict is revisited; an absent target and every other refusal pass through.
+    if !matches!(strict, GlassError::AxElementChanged(_)) {
+        return Err(strict);
+    }
+    let Some(node) = tree.find(target.id) else {
+        return Err(strict);
+    };
+    if !same_element_moved(target, node) {
+        return Err(strict);
+    }
+    let candidates = movement_candidates(tree, target);
+    if candidates.len() == 1 {
+        return Ok(node);
+    }
+    Err(indistinguishable(target, &candidates))
+}
+
+/// [`resolved_target`], plus [`crate::a11y::editable_target`]'s editable check. `set_value` shares
+/// `invoke`'s guard, so it shares the relaxation.
+fn resolved_editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
+    let node = resolved_target(tree, target)?;
+    if !node.states.editable {
+        return Err(GlassError::AxElementNotEditable(target.id.0));
+    }
+    Ok(node)
+}
+
 /// Decide what an `invoke` does with `target`: which node to actuate, and what the tree must
 /// show afterwards. Pure, so the decision is testable without a device.
 ///
 /// The order is load-bearing: a Compose control omits `ACTION_CLICK` while disabled, so a climb
 /// run before the target's own `enabled` check walks past it and actuates whatever encloses it.
 fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
-    let node = crate::a11y::fingerprinted(tree, target)?;
+    let node = resolved_target(tree, target)?;
     if !node.states.enabled {
         return Err(disabled_error(target.id.0, target.id));
     }
@@ -1351,6 +1448,39 @@ mod tests {
                      "editable": false, "clickable": false, "enabled": true, "scrollable": false}
                  ]}
             ]
+        })
+    }
+
+    /// [`compose_like`] with its content slid `dx` px along x and nothing resized — the
+    /// activity-open transition glass#326 measured, where the window stays put and its content
+    /// moves.
+    fn compose_like_slid(dx: i64) -> Value {
+        let mut v = compose_like();
+        v["children"][0]["bounds"] = json!({"x": 60 + dx, "y": 480, "w": 210, "h": 130});
+        v["children"][0]["children"][0]["bounds"] =
+            json!({"x": 120 + dx, "y": 520, "w": 80, "h": 50});
+        v
+    }
+
+    /// Two clickable cards holding a "Save" label each, identical in role, name, value and size.
+    fn two_identical_saves() -> Value {
+        let card = |x: i64| {
+            json!({
+                "class": "android.view.View",
+                "bounds": {"x": x, "y": 480, "w": 210, "h": 130},
+                "editable": false, "clickable": true, "enabled": true, "scrollable": false,
+                "children": [
+                    {"class": "android.widget.TextView", "text": "Save",
+                     "bounds": {"x": x + 60, "y": 520, "w": 80, "h": 50},
+                     "editable": false, "clickable": false, "enabled": true, "scrollable": false}
+                ]
+            })
+        };
+        json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "editable": false, "clickable": false, "enabled": true, "scrollable": false,
+            "children": [card(60), card(600)]
         })
     }
 
@@ -2688,6 +2818,13 @@ mod tests {
         })
     }
 
+    /// [`editable_field`] with the field slid `dx` px along x and nothing resized.
+    fn editable_field_slid(value: &str, dx: i64) -> Value {
+        let mut v = editable_field(value);
+        v["children"][0]["bounds"] = json!({"x": dx, "y": 100, "w": 600, "h": 120});
+        v
+    }
+
     #[test]
     fn a_rearm_matching_the_asked_about_app_does_not_authorise_a_stale_acting_apps_ref() {
         // The served tree answered for `com.other.app` (a dialog), not the configured
@@ -2906,6 +3043,177 @@ mod tests {
                 .expect("clicks"),
             None,
             "the target actuated itself, so nothing was substituted"
+        );
+    }
+
+    #[test]
+    fn a_target_that_only_moved_is_actuated_where_it_now_is() {
+        // glass#326: every observed refusal had role, name and value matching with only x
+        // different.
+        let (port, ops) = fake_service(vec![compose_like_slid(79)], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&compose_like());
+        let substituted = a
+            .invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
+            .expect("a control that only moved is still that control");
+        assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
+            "one read, one dispatch, against the moved node"
+        );
+    }
+
+    #[test]
+    fn two_elements_that_cannot_be_told_apart_are_refused_rather_than_guessed() {
+        // Position is what `AxTarget::bounds` exists to discriminate on. Forgiving it is only
+        // safe while nothing else in the tree could be mistaken for the target.
+        let (port, ops) = fake_service(vec![two_identical_saves()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&two_identical_saves());
+        let mut label = target_for(&seen, AxNodeId(2));
+        label.bounds = Some(AxRect {
+            x: 199,
+            ..label.bounds.expect("the fixture carries bounds")
+        });
+        let e = a
+            .invoke(&ctx(), &label)
+            .expect_err("two indistinguishable candidates must not be guessed between");
+        let msg = e.to_string();
+        assert!(msg.contains("2 elements"), "{msg}");
+        assert!(msg.contains("(120,420 80x50)"), "{msg}");
+        assert!(msg.contains("(660,420 80x50)"), "{msg}");
+        assert!(!e.invoke_fallback_eligible(), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "nothing may be dispatched at a guess"
+        );
+    }
+
+    #[test]
+    fn a_target_whose_name_changed_is_refused_however_far_it_moved() {
+        let mut renamed = compose_like_slid(79);
+        renamed["children"][0]["children"][0]["text"] = json!("Send");
+        let (port, ops) = fake_service(vec![renamed], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&compose_like());
+        let e = a
+            .invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
+            .expect_err("only position is forgiven");
+        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "nothing may be dispatched"
+        );
+    }
+
+    #[test]
+    fn a_field_whose_value_changed_is_refused_however_far_it_moved() {
+        // The recycled-row hazard `AxTarget::value` exists for: same role, name and size,
+        // different data.
+        let (port, ops) = fake_service(
+            vec![editable_field_slid("someone.else@example.com", 79)],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&editable_field("old@example.com"));
+        let e = a
+            .set_value(&ctx(), &target_for(&seen, AxNodeId(1)), "new@example.com")
+            .expect_err("a field holding other data is not the field that was addressed");
+        assert!(matches!(e, GlassError::AxElementChanged(1)), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "nothing may be written"
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_no_longer_in_the_tree_is_still_refused_as_absent() {
+        // Through `set_value`: the ref that reaches the device is the caller's `target.id`, so a
+        // guard that re-found the element by identity anywhere in the tree would authorise a
+        // write addressed to a node it never looked at.
+        let (port, ops) = fake_service(vec![editable_field_slid("old", 79)], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&editable_field("old"));
+        let mut gone = target_for(&seen, AxNodeId(1));
+        gone.id = AxNodeId(9);
+        let e = a
+            .set_value(&ctx(), &gone, "new")
+            .expect_err("an id that resolves to nothing is absent, not moved");
+        assert!(matches!(e, GlassError::AxElementNotFound(9)), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "nothing may be written"
+        );
+    }
+
+    #[test]
+    fn a_target_that_changed_size_is_refused_even_where_it_still_sits() {
+        let mut resized = compose_like();
+        resized["children"][0]["children"][0]["bounds"] =
+            json!({"x": 120, "y": 520, "w": 140, "h": 50});
+        let (port, ops) = fake_service(vec![resized], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&compose_like());
+        let e = a
+            .invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
+            .expect_err("a resize is not a translation");
+        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string()],
+            "nothing may be dispatched"
+        );
+    }
+
+    #[test]
+    fn an_invoke_on_a_target_that_did_not_move_costs_no_extra_read_and_no_wait() {
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&compose_like());
+        let started = std::time::Instant::now();
+        a.invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
+            .expect("clicks");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            ops_of(&ops),
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
+            "forgiving position must not buy itself a second read"
+        );
+        // The cheapest settle proposed for this path was 250ms, and the fake's two loopback
+        // round-trips measure a stable ~80ms, so this bound sits between the two rather than
+        // above both — a wait no op-count can see still has to fail here.
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "no wait may be added to the path every invoke takes: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn set_values_guard_accepts_a_field_that_only_moved() {
+        let (port, ops) = fake_service(
+            vec![
+                editable_field_slid("old", 79),
+                editable_field_slid("new", 79),
+            ],
+            OnAction::Ok,
+        );
+        let mut a = reader(port, std::time::Duration::ZERO);
+        let seen = built(&editable_field("old"));
+        a.set_value(&ctx(), &target_for(&seen, AxNodeId(1)), "new")
+            .expect("a field that only slid is still that field");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=1".to_string(),
+                "conn1:tree".to_string()
+            ],
+            "the guard's read, the write, and the read-back"
         );
     }
 }

@@ -404,6 +404,17 @@ internal refactors, CI, or test-only changes.
   it prints now names each candidate's `AXRole` and the raw `AXError` behind a failed read, and
   window adoption itself now records which on-screen window it took out of what else was
   available. `WindowNotFound` no longer asserts a timing cause it cannot know.
+- A native Android click or `set_value` through the optional on-device companion no longer fails
+  just because the control moved. A screen whose open transition is playing reports its content at
+  an offset that decays over about half a second, so glass could read the element tens of pixels
+  from where your snapshot had it — and the check that stops an action landing on the wrong element
+  refused it, although its role, name, value and size all still matched. A control that only moved
+  is now accepted where it now is. It is still refused when more than one element in the tree
+  matches it on role, name, value and size, and the error names each of their positions: an element
+  that cannot be told from another is not one glass will guess at. Everything else is unchanged —
+  a resize, a changed role, name or value, an absent element, a disabled control and one exposing
+  no click action are all refused exactly as before, no action is ever sent twice, and this costs
+  no extra read and no wait.
 
 ## [1.1.0] - 2026-07-23
 

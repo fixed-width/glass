@@ -101,6 +101,13 @@ and sets editable fields via the real `ACTION_SET_TEXT`; glass enables it and re
 prior accessibility state on teardown. Without `glass-a11y.apk`, glass uses the `uiautomator` reader.
 Set `GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present.
 
+A click or `set_value` through this reader tolerates a control that moved. A screen whose open
+transition is playing reports its content at an offset that decays over about half a second, so
+glass can read the element tens of pixels from where your snapshot had it; where its role, name,
+value and size all still match, it acts on it where it now is. Where two elements in the tree match
+on all four, it refuses and names both positions rather than guess between them — as it does for an
+element that was resized, renamed, now holds different data, or is gone.
+
 The service also backs **`glass_click_element`**, which actuates through Android's `ACTION_CLICK`
 instead of tapping the element's centre. That reaches a control scrolled far below the fold or
 covered by something else, and it makes two outcomes honest that a tap cannot:

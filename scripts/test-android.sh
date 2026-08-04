@@ -29,16 +29,14 @@
 # Two tests are filtered out below rather than excluding the whole file each belongs to:
 #
 #   set_value_reports_whether_the_write_landed (a11y_loop) — fails on a cold CI emulator with
-#   AxElementChanged(16), glass's staleness guard refusing the write; passes warm. Tracked at
+#   AxElementChanged(16), AndroidA11y's staleness guard refusing the write; passes warm. Tracked at
 #   glass#323. While it is off the a11y write path has no device coverage: the only other
 #   set_value call (a11y_service_loop) sits behind "if this screen has an editable field", which
-#   Settings' top screen does not.
+#   Settings' top screen does not. Note glass#326's fix does not reach this — it relaxed the same
+#   guard in ServiceA11y, and this test drives AndroidA11y.
 #
-#   native_invoke_actuates_the_fixture (a11y_service_loop) — fails ~45% of CI runs with
-#   Backend("agent: no active window") at varying sites; passes warm. Tracked at glass#324.
-#
-# Multiple --skip flags compose rather than overriding. Each matches as a SUBSTRING: a future test
-# whose name contains either of these would be excluded too, with no signal that it was.
+# --skip matches as a SUBSTRING: a future test whose name contains this one's would be excluded
+# too, with no signal that it was.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec cargo test --no-fail-fast -p glass-android \
@@ -50,5 +48,4 @@ exec cargo test --no-fail-fast -p glass-android \
   --test see_loop \
   --test window_loop \
   -- --ignored --test-threads=1 \
-  --skip set_value_reports_whether_the_write_landed \
-  --skip native_invoke_actuates_the_fixture "$@"
+  --skip set_value_reports_whether_the_write_landed "$@"
