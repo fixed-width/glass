@@ -306,26 +306,12 @@ fn rearm_tree(conn: &mut Conn, pkg: &str) -> Result<()> {
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
-/// How long [`ServiceA11y::settled_tree`] re-reads waiting for the target to stop moving. An
-/// activity-open transition animates for ~500 ms, and its offsets reach the accessibility tree
-/// up to ~100 ms after the platform calls it finished.
-const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-/// The pause after two reads that disagreed — a device read costs ~50 ms on its own, against an
-/// offset that steps in ~60 ms jumps.
-const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// The Accessibility reader backed by the on-device service. `package` is the target app.
 pub struct ServiceA11y {
     client: ServiceClient,
     package: String,
     /// How long [`Self::wait_for_check`] polls; [`CHECK_TIMEOUT`] outside tests.
     check_timeout: std::time::Duration,
-    /// How long [`Self::settled_tree`] re-reads; [`SETTLE_TIMEOUT`] outside tests.
-    settle_timeout: std::time::Duration,
-    /// What [`Self::settled_tree`] waits after two reads that disagreed; [`SETTLE_POLL`] outside
-    /// tests, where the still-path test inflates it so a wait added there cannot hide in
-    /// loopback latency.
-    settle_poll: std::time::Duration,
 }
 
 impl ServiceA11y {
@@ -334,8 +320,6 @@ impl ServiceA11y {
             client,
             package,
             check_timeout: CHECK_TIMEOUT,
-            settle_timeout: SETTLE_TIMEOUT,
-            settle_poll: SETTLE_POLL,
         }
     }
 
@@ -355,63 +339,6 @@ impl ServiceA11y {
                 return Err(check_timeout(plan.target.0, &plan.actuated, want, seen));
             }
             std::thread::sleep(CHECK_POLL);
-        }
-    }
-
-    /// One numbered snapshot — the pair of steps every guard in this reader starts from.
-    fn numbered_snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let mut t = self.snapshot(ctx)?;
-        t.assign_ids();
-        Ok(t)
-    }
-
-    /// Re-read until `target`'s geometry holds still, and hand back the read that proved it.
-    ///
-    /// glass#326: a window whose activity-open transition is still animating reports its content
-    /// at an +x offset that decays in steps, so two reads milliseconds apart describe the same
-    /// control in two places. Acting on such a read is what trips the ±8 px staleness check here
-    /// and the companion's exact re-find on the device.
-    ///
-    /// What has to hold still is the root→target path: the target itself (what the staleness
-    /// check compares) and its ancestors (where [`actuable_node`] climbs, and the node the
-    /// companion re-finds by exact bounds). Nodes off that path are not watched, so an animation
-    /// elsewhere in the app cannot make every click time out.
-    fn settled_tree(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<AxTree> {
-        let started = std::time::Instant::now();
-        let deadline = started + self.settle_timeout;
-        let first = self.numbered_snapshot(ctx)?;
-        // A read the target is not in is not something re-reading fixes; `invoke_plan` names it.
-        let Some(mut seen) = chain_bounds(&first, target.id) else {
-            return Ok(first);
-        };
-        let mut drift = None;
-        let mut agreed = 0usize;
-        loop {
-            let next = self.numbered_snapshot(ctx)?;
-            let Some(chain) = chain_bounds(&next, target.id) else {
-                return Ok(next);
-            };
-            if chain == seen {
-                agreed += 1;
-                // One agreement stands only while nothing has been seen moving: an offset that
-                // decays in steps holds still across a single pair of reads (measured: the same
-                // bounds 157 ms apart, then a new position 7 ms later).
-                if agreed >= if drift.is_some() { 2 } else { 1 } {
-                    return Ok(next);
-                }
-            } else {
-                drift = Some(drift_between(&seen, &chain));
-                agreed = 0;
-            }
-            seen = chain;
-            if std::time::Instant::now() >= deadline {
-                return Err(never_settled(
-                    target.id.0,
-                    drift.as_deref(),
-                    started.elapsed(),
-                ));
-            }
-            std::thread::sleep(self.settle_poll);
         }
     }
 
@@ -514,10 +441,11 @@ impl Accessibility for ServiceA11y {
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
-        // Settling comes before the plan, not after it: the plan's guards compare a live read
-        // against the caller's snapshot, and a read taken mid-animation is what makes them
-        // reject a target that is fine.
-        let tree = self.settled_tree(ctx, target)?;
+        let tree = {
+            let mut t = self.snapshot(ctx)?;
+            t.assign_ids();
+            t
+        };
         let plan = invoke_plan(&tree, target)?;
         self.dispatch_click(ctx, target, &plan, tree.subject.as_ref())
     }
@@ -918,70 +846,6 @@ fn actuable_node<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> 
         .find(|n| n.states.focusable && (n.id == target.id || encloses(n.bounds, want)))
         .copied()
         .ok_or(GlassError::AxActionUnavailable(target.id.0))
-}
-
-/// Every node on the root→`id` path as `(id, bounds)`, target last — the geometry
-/// [`ServiceA11y::settled_tree`] watches. `None` when `id` is not in this tree.
-fn chain_bounds(tree: &AxTree, id: AxNodeId) -> Option<Vec<(AxNodeId, Option<AxRect>)>> {
-    let mut path = Vec::new();
-    path_to(&tree.root, id, &mut path).then(|| path.iter().map(|n| (n.id, n.bounds)).collect())
-}
-
-/// How two reads of the target's path disagreed, worded for [`never_settled`].
-fn drift_between(a: &[(AxNodeId, Option<AxRect>)], b: &[(AxNodeId, Option<AxRect>)]) -> String {
-    for (&(id, from), &(other, to)) in a.iter().zip(b) {
-        if id != other {
-            return format!(
-                "the path to it now runs through element #{} where it ran through #{}",
-                other.0, id.0
-            );
-        }
-        if from != to {
-            return format!("element #{} moved {}", id.0, movement(from, to));
-        }
-    }
-    format!(
-        "the path to it changed length between reads ({} nodes, then {})",
-        a.len(),
-        b.len()
-    )
-}
-
-/// `from` → `to`, with the per-edge deltas when both sides reported bounds.
-fn movement(from: Option<AxRect>, to: Option<AxRect>) -> String {
-    let deltas = match (from, to) {
-        (Some(f), Some(t)) => format!(
-            " (dx {}, dy {}, dw {}, dh {})",
-            i64::from(t.x) - i64::from(f.x),
-            i64::from(t.y) - i64::from(f.y),
-            i64::from(t.width) - i64::from(f.width),
-            i64::from(t.height) - i64::from(f.height),
-        ),
-        _ => String::new(),
-    };
-    format!("from {} to {}{deltas}", rect(from), rect(to))
-}
-
-/// One rect as `(x,y wxh)`, or `no bounds`.
-fn rect(r: Option<AxRect>) -> String {
-    r.map_or_else(
-        || "no bounds".to_string(),
-        |r| format!("({},{} {}x{})", r.x, r.y, r.width, r.height),
-    )
-}
-
-/// Nothing was dispatched: the target never stopped moving inside the budget. Deliberately not
-/// `invoke_fallback_eligible` — a control that is mid-animation is the last thing to aim a
-/// pointer click at.
-fn never_settled(id: u32, drift: Option<&str>, elapsed: std::time::Duration) -> GlassError {
-    GlassError::Backend(format!(
-        "element #{id} is still moving after {} ms of re-reads, so nothing was clicked: {}. An \
-         activity-open transition settles in about half a second — re-snapshot until the bounds \
-         repeat, then retry",
-        elapsed.as_millis(),
-        // Unreachable: reaching the deadline takes a disagreement, which records one.
-        drift.unwrap_or("its bounds kept changing between reads"),
-    ))
 }
 
 /// The root-to-`id` path, inclusive of both ends. False when `id` is not in this subtree,
@@ -1488,28 +1352,6 @@ mod tests {
                  ]}
             ]
         })
-    }
-
-    /// [`compose_like`] with everything below the root shifted `dx` px right. A Compose window
-    /// whose activity-open transition is still animating reports exactly this: a uniform +x
-    /// offset on the content, decaying to zero over the ~500 ms the transition runs (glass#326).
-    fn compose_shifted(dx: i64) -> Value {
-        fn shift(v: &mut Value, dx: i64) {
-            if let Some(x) = v["bounds"]["x"].as_i64() {
-                v["bounds"]["x"] = json!(x + dx);
-            }
-            for c in v["children"].as_array_mut().into_iter().flatten() {
-                shift(c, dx);
-            }
-        }
-        let mut v = compose_like();
-        for c in v["children"]
-            .as_array_mut()
-            .expect("compose_like has children")
-        {
-            shift(c, dx);
-        }
-        v
     }
 
     fn built(v: &Value) -> AxTree {
@@ -2987,13 +2829,8 @@ mod tests {
         );
         assert_eq!(
             ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string()
-            ],
-            "exactly one click frame, on the one connection (the second tree is the re-read \
-             that proved the target had stopped moving)"
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()],
+            "exactly one click frame, on the one connection"
         );
     }
 
@@ -3010,154 +2847,7 @@ mod tests {
         assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
         assert_eq!(
             ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn a_target_whose_bounds_are_still_moving_is_not_clicked_until_they_hold_still() {
-        // glass#326. The caller's target holds the settled geometry; every read taken while the
-        // activity-open transition animates describes the same control somewhere else, and
-        // acting on one of those either trips the host's staleness guard or hands the companion
-        // bounds it can no longer re-find.
-        let (port, ops) = fake_service(
-            vec![compose_shifted(79), compose_shifted(31), compose_like()],
-            OnAction::Ok,
-        );
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let substituted = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("the reads that agreed describe the element the caller named");
-        assert_eq!(substituted, Some(AxNodeId(1)), "the climb is disclosed");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string(),
-            ],
-            "exactly one click, after the reads agreed — nothing may go out while it moves"
-        );
-    }
-
-    #[test]
-    fn a_still_target_whose_clickable_ancestor_moves_is_not_clicked_either() {
-        // One walk is not atomic, so a moving window can report the label at its settled
-        // position and its clickable parent an animation frame behind. The parent is the node
-        // the click is addressed to, and the one the companion re-finds by exact bounds.
-        let mut moving_parent = compose_like();
-        moving_parent["children"][0]["bounds"]["x"] = json!(139); // its settled 60, offset by 79
-        let (port, ops) = fake_service(vec![moving_parent, compose_like()], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("the reads that agreed describe a control that has stopped moving");
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string(),
-            ],
-            "the target never moved, but the node being clicked did"
-        );
-    }
-
-    #[test]
-    fn a_still_target_is_clicked_after_two_agreeing_reads_and_no_wait_at_all() {
-        // The common case pays for the re-read that proves nothing is moving and nothing else —
-        // no sleep, no third read — so a later change cannot quietly put a wait on the path
-        // every click takes.
-        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        // Outsized on purpose: a loopback round trip already costs ~40 ms here, so a wait at the
-        // production 20 ms would not stand out.
-        a.settle_poll = std::time::Duration::from_secs(5);
-        let t = built(&compose_like());
-        let started = std::time::Instant::now();
-        a.invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect("nothing is moving");
-        let elapsed = started.elapsed();
-        assert_eq!(
-            ops_of(&ops),
-            vec![
-                "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
-                "conn1:click ref=1".to_string(),
-            ],
-            "the re-read that proved stillness, and nothing beyond it"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "two agreeing reads must proceed without waiting; took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn a_target_that_never_stops_moving_fails_inside_its_budget_and_names_what_moved() {
-        // Bounded: the reads never agree, so nothing is ever actuated, and the give-up carries
-        // what was seen. The script holds far more entries than the budget can consume — the
-        // fake repeats its last tree, which would look settled.
-        let jitter: Vec<Value> = (0..64)
-            .map(|i| compose_shifted(if i % 2 == 0 { 0 } else { 20 }))
-            .collect();
-        let (port, ops) = fake_service(jitter, OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let budget = std::time::Duration::from_millis(200);
-        a.settle_timeout = budget;
-        let t = built(&compose_like());
-        let started = std::time::Instant::now();
-        let e = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect_err("a control that never holds still must not be actuated");
-        let waited = started.elapsed();
-        assert!(
-            waited >= budget,
-            "gave up after {waited:?}, before the budget it was given"
-        );
-        let m = e.to_string();
-        assert!(m.contains("element #2"), "{m}");
-        assert!(m.contains("moving"), "{m}");
-        assert!(m.contains("dx"), "the delta it kept seeing: {m}");
-        assert!(m.contains("ms"), "how long it watched: {m}");
-        assert!(
-            !e.invoke_fallback_eligible(),
-            "a moving control must not take a pointer click either: {e}"
-        );
-        let ops = ops_of(&ops);
-        assert!(
-            ops.iter().all(|o| o == "conn1:tree"),
-            "nothing may be dispatched: {ops:?}"
-        );
-    }
-
-    #[test]
-    fn a_settled_target_that_moved_since_the_caller_looked_is_still_refused() {
-        // Waiting for stillness must not launder a stale target: these reads agree with each
-        // other and sit 20 px from where the caller saw the element, which is what the ±8 px
-        // staleness guard is for.
-        let (port, ops) = fake_service(vec![compose_shifted(20)], OnAction::Ok);
-        let mut a = reader(port, std::time::Duration::ZERO);
-        let t = built(&compose_like());
-        let e = a
-            .invoke(&ctx(), &target_for(&t, AxNodeId(2)))
-            .expect_err("an element that moved since the caller's snapshot must not be actuated");
-        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
-        assert!(!e.invoke_fallback_eligible(), "{e}");
-        assert_eq!(
-            ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
-            "the refusal must happen before anything is dispatched"
+            vec!["conn1:tree".to_string(), "conn1:click ref=1".to_string()]
         );
     }
 
@@ -3173,7 +2863,7 @@ mod tests {
         assert!(e.to_string().contains("disabled"), "{e}");
         assert_eq!(
             ops_of(&ops),
-            vec!["conn1:tree".to_string(), "conn1:tree".to_string()],
+            vec!["conn1:tree".to_string()],
             "the refusal must happen before anything is dispatched"
         );
     }
@@ -3193,7 +2883,6 @@ mod tests {
             ops_of(&ops),
             vec![
                 "conn1:tree".to_string(),
-                "conn1:tree".to_string(),
                 "conn1:click ref=1".to_string(),
                 "conn1:tree".to_string()
             ],
@@ -3203,12 +2892,8 @@ mod tests {
 
     #[test]
     fn a_toggle_that_flips_is_reported_clicked() {
-        // Two unchecked reads, then the flipped one: the plan comes from the read that proved
-        // stillness, so a box already checked by then would be planned as a flip back to false.
-        // Stillness is geometry — a `checked` that changes under the re-read is not motion.
         let (port, _) = fake_service(
             vec![
-                one_checkable("android.widget.CheckBox", false),
                 one_checkable("android.widget.CheckBox", false),
                 one_checkable("android.widget.CheckBox", true),
             ],
