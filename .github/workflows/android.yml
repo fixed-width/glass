@@ -28,7 +28,7 @@ on:
     - cron: '0 9 * * *'   # 09:00 UTC (02:00 PT in summer, 01:00 in winter)
   workflow_dispatch:
   push:
-    branches: [master, android-ci-leg]   # TEMPORARY: verification only, removed before merge
+    branches: [master]
 
 concurrency:
   # One group covers the schedule, push:master and dispatch, so cancelling would let a merge
