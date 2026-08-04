@@ -32,6 +32,12 @@ env:
   API_LEVEL: '34'
   EMULATOR_TARGET: google_apis
   EMULATOR_ARCH: x86_64
+  # The tests assert against real on-screen layout (tap targets, scroll deltas), so the device
+  # profile is part of the test contract, not a default to inherit — the emulator-runner action's
+  # own default (no `profile:`) is a 320x640 mdpi device, nothing like a real phone. pixel_6
+  # matches the profile docs/how-to/setup-android.md has contributors create locally
+  # (1080x2400 @420dpi), so CI and a dev box assert against the same geometry.
+  EMULATOR_PROFILE: pixel_6
 
 jobs:
   android:
@@ -83,7 +89,10 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
+          # The profile is part of this key: an AVD cached under a key that doesn't mention it
+          # would restore silently with whatever profile happened to create it, defeating
+          # EMULATOR_PROFILE below without any signal that it happened.
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}
 
       - name: Create the AVD snapshot (cache miss only)
         if: steps.avd-cache.outputs.cache-hit != 'true'
@@ -92,6 +101,7 @@ jobs:
           api-level: ${{ env.API_LEVEL }}
           target: ${{ env.EMULATOR_TARGET }}
           arch: ${{ env.EMULATOR_ARCH }}
+          profile: ${{ env.EMULATOR_PROFILE }}
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
@@ -106,6 +116,7 @@ jobs:
           api-level: ${{ env.API_LEVEL }}
           target: ${{ env.EMULATOR_TARGET }}
           arch: ${{ env.EMULATOR_ARCH }}
+          profile: ${{ env.EMULATOR_PROFILE }}
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
@@ -130,7 +141,7 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}
 
       - name: Upload failure diagnostics
         if: failure()
