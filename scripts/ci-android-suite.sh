@@ -22,6 +22,15 @@
 # window isn't buried under whatever the AVD logged before this suite started, bounded so a run
 # that fails early doesn't wait on (or get truncated by) an oversized buffer.
 #
+# The screenshot is named screen-after-teardown.png, not screen.png, because that is genuinely
+# what it is: scripts/test-android.sh has already returned by the time this fires, so whatever app
+# the failing test was mid-interaction with may have already been torn down — for a test that
+# stops its own app under test, the capture shows the launcher and proves nothing about the
+# failure. It is kept anyway because it is the fastest available signal for whole-device failures
+# (the emulator never booted, a black screen, a stuck ANR/crash dialog, sitting on the lock
+# screen) — exactly the cases where logcat is largest and least focused. The name states when it
+# was taken so it can't be mistaken for a frame at the moment of failure.
+#
 #   ./scripts/ci-android-suite.sh --skip native_invoke_actuates_the_fixture
 #
 # Not -e: a failing test suite is the expected path this script exists to handle, not a bug in
@@ -40,7 +49,7 @@ if [ "$rc" -ne 0 ]; then
   adb logcat -d -t 5000           > diagnostics/logcat.txt         2>&1
   adb shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
   adb shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1
-  adb exec-out screencap -p       > diagnostics/screen.png         2>/dev/null
+  adb exec-out screencap -p       > diagnostics/screen-after-teardown.png 2>/dev/null
 fi
 
 exit "$rc"

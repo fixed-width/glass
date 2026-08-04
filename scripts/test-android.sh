@@ -16,6 +16,13 @@
 # --test-threads=1 is required, not tidiness: every test drives the one attached device, so in
 # parallel each tears down the app another is mid-interaction with.
 #
+# --no-fail-fast is required, not a debugging aid: without it cargo stops at the first failing
+# --test binary and never runs the rest, so a CI leg would need one run per failing binary to see
+# the full picture. This script's main consumer is a scheduled diagnostic leg (glass#320), where
+# the value is the complete list of what broke overnight, not the first thing that broke — so
+# every binary always runs, and cargo's own exit code still goes nonzero if any test anywhere
+# failed.
+#
 # Two files are deliberately absent from the target list below:
 #
 #   role_probe   — a PROBE, not an assertion suite. It prints a widget-class histogram for a
@@ -26,7 +33,7 @@
 #                  scripts/test-android-lifecycle.sh runs it instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec cargo test -p glass-android \
+exec cargo test --no-fail-fast -p glass-android \
   --test a11y_loop \
   --test a11y_service_loop \
   --test agent_loop \
