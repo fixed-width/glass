@@ -37,8 +37,7 @@ fn settle() {
 // Trims the tail of a capture-and-diff cycle, which costs several times this on an AVD — that
 // cycle sets the loop's cadence, not this interval.
 const DIFF_POLL_INTERVAL: Duration = Duration::from_millis(150);
-// Several times the 800ms that wasn't enough, but still short enough to bound a genuine
-// failure.
+// Several times the 800ms that wasn't enough.
 const DIFF_POLL_DEADLINE: Duration = Duration::from_secs(6);
 // Android draws touch feedback — a pressed-state ripple, an overscroll bounce — well over
 // CHANGE_THRESHOLD_PCT and gone a moment later, so a crossing counts only once a later sample

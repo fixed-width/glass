@@ -1,50 +1,32 @@
 #!/usr/bin/env bash
-# Run the Android device suite, always saving its output into ./diagnostics/test-output.txt, and
-# on failure also collect on-device diagnostics there. Exists as its own repo script rather than
-# inline in the workflow's
-# `script:` block for two reasons:
+# Run the Android device suite, saving its output to ./diagnostics/test-output.txt and, on
+# failure, on-device diagnostics alongside it. Do not inline this back into the workflow's
+# `script:` block, for two reasons:
 #
-# 1. reactivecircus/android-emulator-runner does not run `script:` as one shell session: it
-#    splits the block on newlines and runs EACH LINE as its own independent `sh -c`, and stops
-#    the moment one line exits non-zero (src/script-parser.ts + the for-loop over exec.exec in
-#    src/main.ts, at the pin this repo uses). A multi-line `run the suite; if it failed, collect
-#    diagnostics` block there is silently fragmented: the collection lines are later, unreached
-#    iterations of an already-abandoned loop, not later lines of one script. Confirmed against a
-#    real CI failure where the diagnostics step logged "No files were found" — the collection
-#    commands never ran at all. Putting the whole sequence in one script file gives the workflow
-#    a single `script:` line, which is exactly the unit that action's model handles correctly.
+# 1. reactivecircus/android-emulator-runner splits `script:` on newlines and runs EACH LINE as
+#    its own independent `sh -c`, stopping the moment one exits non-zero (src/script-parser.ts
+#    and the exec.exec loop in src/main.ts, at the pin this repo uses). A multi-line
+#    run-then-collect block there is silently fragmented and the collection never runs.
+# 2. Collection cannot be a later `if: failure()` step either: the action tears the emulator down
+#    the instant its own step ends, leaving no adb device to talk to.
 #
-# 2. Collection can't be a later `if: failure()` step in the workflow either: the emulator-runner
-#    action tears the emulator down the instant its own step ends, so a subsequent step has no
-#    adb device left to talk to. It has to happen here, inside the same script invocation that
-#    ran the tests, while the emulator is still up.
+# diagnostics/test-output.txt carries which test failed and why; that text otherwise exists only
+# in the ephemeral job log.
 #
-# diagnostics/test-output.txt captures the suite's own stdout/stderr: which test failed and why,
-# not just what the device was doing (the diagnostics below) — that text otherwise exists only in
-# the ephemeral job log. Captured unconditionally rather than only on failure: `tee` still streams
-# it live to the job log, and the upload step is already `if: failure()`, so a passing run costs
-# nothing either way.
+# logcat is cleared before the run so the failure window isn't buried under what the AVD logged
+# beforehand, and dumped bounded (-t 5000) so an early failure isn't truncated by an oversized
+# buffer.
 #
-# logcat is cleared before the run and dumped bounded (-t 5000) after: cleared so the failure
-# window isn't buried under whatever the AVD logged before this suite started, bounded so a run
-# that fails early doesn't wait on (or get truncated by) an oversized buffer.
-#
-# The screenshot is named screen-after-teardown.png, not screen.png, because that is genuinely
-# what it is: scripts/test-android.sh has already returned by the time this fires, so whatever app
-# the failing test was mid-interaction with may have already been torn down — for a test that
-# stops its own app under test, the capture shows the launcher and proves nothing about the
-# failure. It is kept anyway because it is the fastest available signal for whole-device failures
-# (the emulator never booted, a black screen, a stuck ANR/crash dialog, sitting on the lock
-# screen) — exactly the cases where logcat is largest and least focused. The name states when it
-# was taken so it can't be mistaken for a frame at the moment of failure.
+# screen-after-teardown.png is named for when it is taken: test-android.sh has already returned,
+# so a test that stops its own app leaves only the launcher on screen. Kept because it is the
+# fastest signal for whole-device failures — never booted, black screen, stuck ANR dialog, lock
+# screen — where logcat is largest and least focused.
 #
 #   ./scripts/ci-android-suite.sh [extra cargo-test filters]
 #
-# Not -e: a failing test suite is the expected path this script exists to handle, not a bug in
-# the script — it must survive scripts/test-android.sh's failure long enough to collect
-# diagnostics and still exit with the real code afterward. Piping through `tee` below normally
-# replaces $? with tee's own status; PIPESTATUS[0] is used instead so rc is the test command's
-# exit code even if tee itself fails (pipefail alone would not guarantee that).
+# Do not add -e: this script must survive test-android.sh's failure to collect diagnostics. Piping
+# through `tee` replaces $? with tee's status, so rc comes from PIPESTATUS[0] (pipefail alone
+# would not guarantee it).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 

@@ -2,24 +2,18 @@ name: Android
 
 # WHY THIS RUNS ON A SCHEDULE AND NOT ON PULL REQUESTS
 #
-# Not because it is slow. A warm run is ~3-4 minutes, comparable to the rest of CI: the device
-# suite and the lifecycle job run in parallel at roughly 3m and 2m, and the tests themselves
-# total ~70 seconds. Almost all of the cost is setup, and the AVD snapshot is cached.
+# Not for speed: a warm run is ~3-4 minutes, the two jobs in parallel, of which the tests are
+# ~70 seconds. It stays off pull requests because:
 #
-# The reasons it stays off pull requests:
+#   - A cache miss is not 3 minutes — a cold run pays full AVD creation, and bumping AGENT_TAG
+#     also pays a JDK install and a Gradle build, landing on whichever PR follows an eviction.
+#   - These are larger-runner minutes, billed per run, on every push to every branch.
+#   - The flake profile is young: bringing this up found three intermittent tests.
+#   - Two tests are excluded (glass#323, glass#324), and #324 is the native-invoke path
+#     glass#320 cared most about.
 #
-#   - A cache miss is not 3 minutes. A cold run pays full AVD creation, and bumping AGENT_TAG
-#     additionally pays a JDK install and a Gradle fixture build -- landing on whichever PR
-#     happens to follow an eviction or an agent release.
-#   - These are larger-runner minutes, billed per run, multiplied by every push to every branch.
-#   - The suite's flake profile is young. Bringing it up found three separate intermittent
-#     tests; two were fixed by bounded polling, one is excluded pending glass#324.
-#   - It does not yet cover everything it should: two tests are excluded (glass#323, glass#324),
-#     and #324 is the native-invoke path glass#320 cared most about.
-#
-# So this detects rather than prevents. A PR that drops every click to a pointer tap still
-# merges green; the push-to-master trigger then names the merge that broke it, within minutes,
-# instead of whenever someone next runs the suite by hand. See glass#320.
+# So this detects rather than prevents: a PR that drops every click to a pointer tap still merges
+# green, and the push-to-master trigger then names the merge that broke it. See glass#320.
 #
 # Worth revisiting once glass#324 is fixed and there is real nightly history.
 
@@ -32,8 +26,7 @@ on:
 
 concurrency:
   # One group covers the schedule, push:master and dispatch, so cancelling would let a merge
-  # landing mid-nightly kill it, with no artifacts and no failure to show for it. ci.yml cancels
-  # because it gates a PR; this leg detects, so it follows release.yml.
+  # landing mid-nightly kill it — cancelled is not failed, so no artifacts and no signal.
   group: android-${{ github.ref }}
   cancel-in-progress: false
 
@@ -46,11 +39,10 @@ env:
   API_LEVEL: '34'
   EMULATOR_TARGET: google_apis
   EMULATOR_ARCH: x86_64
-  # The tests assert against real on-screen layout (tap targets, scroll deltas), so the device
-  # profile is part of the test contract, not a default to inherit — the emulator-runner action's
-  # own default (no `profile:`) is a 320x640 mdpi device, nothing like a real phone. pixel_6
-  # matches the profile docs/how-to/setup-android.md has contributors create locally
-  # (1080x2400 @420dpi), so CI and a dev box assert against the same geometry.
+  # The tests assert against real on-screen layout, so the profile is part of the test contract:
+  # the emulator-runner action's default (no `profile:`) is a 320x640 mdpi device, on which a tap
+  # aimed at a list row lands in the app bar. pixel_6 (1080x2400 @420dpi) is what
+  # docs/how-to/setup-android.md has contributors create, so CI and a dev box share geometry.
   EMULATOR_PROFILE: pixel_6
 
 jobs:
@@ -96,13 +88,10 @@ jobs:
             echo "GLASS_ADB=$ANDROID_SDK_ROOT/platform-tools/adb"
           } >> "$GITHUB_ENV"
 
-      # The steps below (through "Point the suite at the fixture") build an APK that no currently
-      # enabled test consumes: native_invoke_actuates_the_fixture, the only test that reads
-      # GLASS_ANDROID_FIXTURE_APK, is excluded by scripts/test-android.sh's --skip pending glass#324.
-      # Kept anyway, deliberately: the cache makes the marginal cost of a cache-hit run a restore,
-      # not a rebuild, and re-adding this whole section later would be more churn than this comment.
-      # Remove the --skip in scripts/test-android.sh and this section is live again with no other
-      # change needed.
+      # Do not delete as dead: the steps through "Point the suite at the fixture" build an APK no
+      # currently enabled test consumes, because its only reader —
+      # native_invoke_actuates_the_fixture — is --skipped pending glass#324. Dropping that --skip
+      # makes this section live again with no other change.
       - name: Restore the fixture APK cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: fixture-cache
@@ -129,9 +118,7 @@ jobs:
       - name: Build the fixture APK (cache miss only)
         id: fixture-build
         # Built from source rather than downloaded: the fixture is a test artifact with no
-        # user-facing form, so it does not belong on the release page docs point users at. The
-        # jar and a11y APK go the other way for the mirror-image reason — see the step above.
-        # The cache key is the agent tag, so this runs once per agent release and never again.
+        # user-facing form, so it does not belong on the release page docs point users at.
         if: steps.fixture-cache.outputs.cache-hit != 'true'
         run: |
           sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
@@ -157,12 +144,10 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          # The profile is part of this key: an AVD cached under a key that doesn't mention it
-          # would restore silently with whatever profile happened to create it, defeating
-          # EMULATOR_PROFILE below without any signal that it happened. The workflow hash covers
-          # the rest of what decides what the cached AVD *is* — the emulator-runner action SHA,
-          # the create step's emulator-options, disable-animations. Without it the entry never
-          # self-corrects: the nightly refreshes the LRU clock and save is skipped on a hit.
+          # Every input that decides what the cached AVD *is* must appear here — the profile, and
+          # via the workflow hash the action SHA, emulator-options and disable-animations.
+          # Otherwise a changed device restores the old snapshot forever: the nightly refreshes
+          # the LRU clock and save is skipped on a hit, so the entry never self-corrects.
           key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}-${{ env.EMULATOR_PROFILE }}-${{ hashFiles('.github/workflows/android.yml') }}
 
       - name: Create the AVD snapshot (cache miss only)
@@ -195,20 +180,14 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          # `script:` cannot hold this run-then-collect logic directly: the action splits it on
-          # newlines and runs each line as its own independent `sh -c`, abandoning the rest the
-          # moment one line fails — so a later `if failed, collect diagnostics` line never runs.
-          # scripts/ci-android-suite.sh is one script, invoked as one line, for exactly that
-          # reason; its own header has the full account. It can't be a separate `if: failure()`
-          # step afterwards either: the action shuts the device down when this step ends, so a
-          # later step has no adb to talk to.
+          # Do not inline this script's contents here, and do not move the diagnostics into a
+          # later `if: failure()` step — scripts/ci-android-suite.sh's header says why both fail.
           script: ./scripts/ci-android-suite.sh
 
       - name: Save the fixture APK cache
-        # Split from the restore above for the same reason as the AVD pair: the fixture comes
-        # from the build step, not from the test run, so a failing suite is no reason to rebuild
-        # it next time. Skipped on a hit (no longer automatic once split) and when the build that
-        # produces the path was skipped or failed — cache/save errors on a path that isn't there.
+        # Runs on a failed suite: the APK comes from the build step, not the test run. Skipping on
+        # a hit is no longer automatic once restore/save are split, and cache/save errors outright
+        # on a path that isn't there.
         if: always() && steps.fixture-cache.outputs.cache-hit != 'true' && steps.fixture-build.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -216,11 +195,9 @@ jobs:
           key: glass-fixture-${{ env.AGENT_TAG }}
 
       - name: Save the AVD cache
-        # Runs even on a failed suite: the AVD snapshot this caches comes from the earlier
-        # "Create the AVD snapshot" step, not from the test run, so a failing suite is no reason
-        # to keep re-paying full AVD creation on every following run. Mirrors actions/cache's own
-        # post-save condition (skip on a cache hit) since that behavior is no longer automatic
-        # once restore/save are split.
+        # Runs even on a failed suite: the snapshot comes from "Create the AVD snapshot", not the
+        # test run, so a red suite would otherwise re-pay full AVD creation every run. Skipping on
+        # a hit is no longer automatic once restore/save are split.
         if: always() && steps.avd-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

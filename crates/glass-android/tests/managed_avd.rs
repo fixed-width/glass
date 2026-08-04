@@ -37,7 +37,7 @@ fn online_count() -> usize {
 // online_count() shells out to adb, so re-reading faster would mostly measure process spawns.
 const KILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // A headless AVD went offline ~2s after kill_all on a warm dev box; 30s is headroom for a
-// loaded CI runner while still bounding a genuine failure.
+// loaded CI runner.
 const KILL_POLL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What [`await_offline`] observed. Only `confirmed` may be read as a successful shutdown;
