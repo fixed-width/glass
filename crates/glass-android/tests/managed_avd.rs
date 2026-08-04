@@ -7,35 +7,69 @@
 
 use glass_android::EmulatorRegistry;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn adb() -> String {
     std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".into())
 }
 
+/// Emulators reporting `device` to `adb devices`. Panics rather than returning 0 when adb
+/// itself fails: a server restart, an `offline`/`unauthorized` transport and a plain error all
+/// print no `\tdevice` line, so a silent 0 would read as "cleanly shut down" on exactly the
+/// runs where nothing is known.
 fn online_count() -> usize {
-    let out = Command::new(adb()).arg("devices").output().unwrap();
+    let out = Command::new(adb())
+        .arg("devices")
+        .output()
+        .unwrap_or_else(|e| panic!("run `{} devices`: {e}", adb()));
+    assert!(
+        out.status.success(),
+        "`adb devices` exited {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| l.contains("\tdevice"))
         .count()
 }
 
-// kill_all only sends `adb emu kill` — a fire-and-forget console command, not a wait for
-// exit — so checking online_count() right after it returns races the shutdown.
-const KILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-// Tearing down a QEMU process and its GPU renderer is heavier than a UI transition and can
-// run long on a cold CI runner; 30s gives that room while still bounding a genuine failure.
-const KILL_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+// online_count() shells out to adb, so re-reading faster would mostly measure process spawns.
+const KILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// A headless AVD went offline ~2s after kill_all on a warm dev box; 30s is headroom for a
+// loaded CI runner while still bounding a genuine failure.
+const KILL_POLL_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Polls `online_count()` until it reaches 0 or `KILL_POLL_DEADLINE` expires. Returns the
-/// last count and elapsed wait either way, so a timed-out call still has a diagnostic.
-fn await_offline() -> (usize, std::time::Duration) {
-    let start = std::time::Instant::now();
+/// What [`await_offline`] observed. Only `confirmed` may be read as a successful shutdown;
+/// `last_count` is a diagnostic.
+struct OfflineWait {
+    confirmed: bool,
+    last_count: usize,
+    elapsed: Duration,
+}
+
+/// Polls `online_count()` until it reads 0 twice running, or `KILL_POLL_DEADLINE` expires.
+/// Polls at all because kill_all only sends `adb emu kill`, a fire-and-forget console command
+/// that does not wait for exit. Twice running because an emulator that stays up but flickers
+/// offline under load produces a lone 0.
+fn await_offline() -> OfflineWait {
+    let start = Instant::now();
+    let mut zeros_running = 0u32;
     loop {
-        let n = online_count();
+        let last_count = online_count();
+        zeros_running = if last_count == 0 {
+            zeros_running + 1
+        } else {
+            0
+        };
         let elapsed = start.elapsed();
-        if n == 0 || elapsed >= KILL_POLL_DEADLINE {
-            return (n, elapsed);
+        let confirmed = zeros_running >= 2;
+        if confirmed || elapsed >= KILL_POLL_DEADLINE {
+            return OfflineWait {
+                confirmed,
+                last_count,
+                elapsed,
+            };
         }
         std::thread::sleep(KILL_POLL_INTERVAL);
     }
@@ -69,11 +103,11 @@ fn boots_reuses_and_cleans_up() {
     agents1.shutdown(); // tear down any launched agent — these tests must not leak it
     agents2.shutdown();
     registry.kill_all();
-    let (n, elapsed) = await_offline();
-    assert_eq!(
-        n,
-        0,
-        "kill_all should stop the booted emulator; still {n} online after {}ms",
-        elapsed.as_millis()
+    let w = await_offline();
+    assert!(
+        w.confirmed,
+        "kill_all should stop the booted emulator; no two consecutive zero readings in {}ms, last read {} online",
+        w.elapsed.as_millis(),
+        w.last_count
     );
 }
