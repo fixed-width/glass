@@ -191,16 +191,6 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
-- An Android accessibility snapshot taken through the optional on-device companion no longer
-  describes a screen mid-animation. A screen whose open transition is still playing reports its
-  content at an offset that decays over about half a second, so a tree read then placed every
-  element a few dozen pixels from where it settles — and a click aimed at one of those positions
-  failed as `element changed; re-snapshot`, or missed the element on the device, or found no
-  control to actuate. A snapshot now re-reads until two reads a quarter-second apart describe the
-  same geometry and hands back that one, so the coordinates a caller reads are the ones the screen
-  keeps. It errors, naming what moved and by how much, if the screen never holds still. A screen
-  that is not moving costs one extra read; a small tree, whose reads are near-instant, also waits
-  out the quarter-second.
 - An Android accessibility snapshot taken through the optional on-device companion now says when
   it describes a different app than the one asked about. The companion answered with whatever
   window was in front — a system dialog, a permission prompt — and reported it as the requested
