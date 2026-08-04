@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run the Android device suite and, only on failure, collect on-device diagnostics into
-# ./diagnostics/. Exists as its own repo script rather than inline in the workflow's
+# Run the Android device suite, always saving its output into ./diagnostics/test-output.txt, and
+# on failure also collect on-device diagnostics there. Exists as its own repo script rather than
+# inline in the workflow's
 # `script:` block for two reasons:
 #
 # 1. reactivecircus/android-emulator-runner does not run `script:` as one shell session: it
@@ -17,6 +18,12 @@
 #    action tears the emulator down the instant its own step ends, so a subsequent step has no
 #    adb device left to talk to. It has to happen here, inside the same script invocation that
 #    ran the tests, while the emulator is still up.
+#
+# diagnostics/test-output.txt captures the suite's own stdout/stderr: which test failed and why,
+# not just what the device was doing (the diagnostics below) — that text otherwise exists only in
+# the ephemeral job log. Captured unconditionally rather than only on failure: `tee` still streams
+# it live to the job log, and the upload step is already `if: failure()`, so a passing run costs
+# nothing either way.
 #
 # logcat is cleared before the run and dumped bounded (-t 5000) after: cleared so the failure
 # window isn't buried under whatever the AVD logged before this suite started, bounded so a run
@@ -35,17 +42,19 @@
 #
 # Not -e: a failing test suite is the expected path this script exists to handle, not a bug in
 # the script — it must survive scripts/test-android.sh's failure long enough to collect
-# diagnostics and still exit with the real code afterward.
+# diagnostics and still exit with the real code afterward. Piping through `tee` below normally
+# replaces $? with tee's own status; PIPESTATUS[0] is used instead so rc is the test command's
+# exit code even if tee itself fails (pipefail alone would not guarantee that).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 adb logcat -c
+mkdir -p diagnostics
 
-./scripts/test-android.sh "$@"
-rc=$?
+./scripts/test-android.sh "$@" 2>&1 | tee diagnostics/test-output.txt
+rc=${PIPESTATUS[0]}
 
 if [ "$rc" -ne 0 ]; then
-  mkdir -p diagnostics
   adb logcat -d -t 5000           > diagnostics/logcat.txt         2>&1
   adb shell dumpsys window        > diagnostics/dumpsys-window.txt 2>&1
   adb shell dumpsys activity top  > diagnostics/dumpsys-top.txt    2>&1

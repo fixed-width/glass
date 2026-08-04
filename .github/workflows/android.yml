@@ -304,7 +304,11 @@ jobs:
             timeout 10 "$GLASS_ADB" devices                             > diagnostics/adb-devices.txt      2>&1
             timeout 10 "$GLASS_ADB" logcat -d                           > diagnostics/logcat.txt           2>&1
             ls -la "$ANDROID_AVD_HOME"                                  > diagnostics/avd-dir.txt          2>&1
-            find "$HOME/.android" "$ANDROID_AVD_HOME" -maxdepth 3 -iname '*.log' > diagnostics/android-logs.txt 2>&1
+            # No android-logs.txt: avd.rs spawns the emulator with stdout null and stderr piped
+            # only into the glass process, never written to disk, so `find -iname '*.log'` here
+            # always comes back empty (confirmed 0 bytes against a real failure) — an empty file
+            # would read as "collected" when nothing was. The real fix is capturing that stderr in
+            # avd.rs, out of scope here; list-avds/adb/AVD-dir above are what's actually on disk.
           fi
           exit $rc
 
