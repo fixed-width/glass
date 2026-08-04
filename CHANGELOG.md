@@ -404,6 +404,13 @@ internal refactors, CI, or test-only changes.
   it prints now names each candidate's `AXRole` and the raw `AXError` behind a failed read, and
   window adoption itself now records which on-screen window it took out of what else was
   available. `WindowNotFound` no longer asserts a timing cause it cannot know.
+- Android: a native click through the optional on-device companion no longer acts on a control
+  that is still moving. A screen whose open transition is still animating reports its content at
+  an offset that decays over about half a second, so a click aimed at an element read mid-flight
+  either failed as `element changed; re-snapshot` or missed the node on the device. The click now
+  re-reads until the element and the control it actuates hold still, and gives up with what it
+  saw — the bounds, the offset, how long it watched — if they never do. A control that is not
+  moving costs one extra read and no wait.
 
 ## [1.1.0] - 2026-07-23
 

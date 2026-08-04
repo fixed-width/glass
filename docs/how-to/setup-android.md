@@ -103,11 +103,14 @@ Set `GLASS_ANDROID_A11Y=off` to force `uiautomator` even when the APK is present
 
 The service also backs **`glass_click_element`**, which actuates through Android's `ACTION_CLICK`
 instead of tapping the element's centre. That reaches a control scrolled far below the fold or
-covered by something else, and it makes two outcomes honest that a tap cannot:
+covered by something else, and it makes three outcomes honest that a tap cannot:
 
 - Clicking a **disabled** control is an error, not a tap that silently does nothing.
 - A **checkbox or switch** is only reported clicked once its state is read back changed; a radio
   button or tab that was already selected counts as clicked, since re-selecting it is a no-op.
+- A control that is still **moving** — a screen whose open transition is still animating — is
+  re-read until its bounds hold still before anything is sent, and errors if they never do,
+  rather than acting on a position the control has already left.
 
 Where a control's label is a separate element from the control itself — the usual Jetpack Compose
 shape — the action fires on the enclosing control that handles the tap, and the result names it in
