@@ -1,23 +1,34 @@
 name: Android
 
-# WHY THIS NEVER RUNS ON PULL REQUESTS
+# WHY THIS RUNS ON A SCHEDULE AND NOT ON PULL REQUESTS
 #
-# glass CI goes green in 3-4 minutes; its longest job (AT-SPI) is 3m. This leg cannot approach
-# that. Cold-booting an emulator is a 4-6 minute floor before a single test runs, and the device
-# tests are serialized by construction (--test-threads=1, one attached device, and an on-device
-# a11y service that accepts one connection at a time). End to end this leg is ~10-18 minutes.
+# Not because it is slow. A warm run is ~3-4 minutes, comparable to the rest of CI: the device
+# suite and the lifecycle job run in parallel at roughly 3m and 2m, and the tests themselves
+# total ~70 seconds. Almost all of the cost is setup, and the AVD snapshot is cached.
 #
-# That gap does not close with tuning, so there is no promotion path and this will not become a
-# required check. What the leg buys is detection with attribution: the push-to-master trigger
-# names the merge that broke Android within ~15 minutes, instead of "someone will notice when
-# they next run the suite by hand". It does not prevent a bad merge. See glass#320.
+# The reasons it stays off pull requests:
+#
+#   - A cache miss is not 3 minutes. A cold run pays full AVD creation, and bumping AGENT_TAG
+#     additionally pays a JDK install and a Gradle fixture build -- landing on whichever PR
+#     happens to follow an eviction or an agent release.
+#   - These are larger-runner minutes, billed per run, multiplied by every push to every branch.
+#   - The suite's flake profile is young. Bringing it up found three separate intermittent
+#     tests; two were fixed by bounded polling, one is excluded pending glass#324.
+#   - It does not yet cover everything it should: two tests are excluded (glass#323, glass#324),
+#     and #324 is the native-invoke path glass#320 cared most about.
+#
+# So this detects rather than prevents. A PR that drops every click to a pointer tap still
+# merges green; the push-to-master trigger then names the merge that broke it, within minutes,
+# instead of whenever someone next runs the suite by hand. See glass#320.
+#
+# Worth revisiting once glass#324 is fixed and there is real nightly history.
 
 on:
   schedule:
     - cron: '0 9 * * *'   # 02:00 PT
   workflow_dispatch:
   push:
-    branches: [master, android-ci-leg]   # android-ci-leg is temporary; removed in Task 7
+    branches: [master]
 
 concurrency:
   group: android-${{ github.ref }}
