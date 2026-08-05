@@ -33,6 +33,7 @@ const PAD: i32 = 1; // chip padding around the digits, in output pixels
 const DIGIT_W: i32 = 3; // font cell width
 const DIGIT_H: i32 = 5; // font cell height
 const DIGIT_GAP: i32 = 1; // gap between digits, in font cells
+const DIGIT_GAP_PX: i32 = DIGIT_GAP * SCALE; // the same gap in output pixels
 const OUTLINE: [u8; 4] = [255, 0, 255, 255]; // magenta — element outline + chip bg
 const DIGIT_FG: [u8; 4] = [255, 255, 255, 255]; // white digits
 
@@ -103,7 +104,7 @@ fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
     //    clamped into the frame so an edge-hugging element still shows its chip.
     let ds = digits_of(id);
     let n = ds.len() as i32;
-    let chip_w = PAD * 2 + n * DIGIT_W * SCALE + (n - 1) * DIGIT_GAP * SCALE;
+    let chip_w = PAD * 2 + n * DIGIT_W * SCALE + (n - 1) * DIGIT_GAP_PX;
     let chip_h = PAD * 2 + DIGIT_H * SCALE;
     let cx = (b.x - chip_w).max(0);
     let cy = (b.y - chip_h).max(0);
@@ -113,7 +114,7 @@ fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
     let dy = cy + PAD;
     for d in ds {
         draw_digit(frame, d, dx, dy, DIGIT_FG);
-        dx += (DIGIT_W + DIGIT_GAP) * SCALE;
+        dx += DIGIT_W * SCALE + DIGIT_GAP_PX;
     }
 }
 
