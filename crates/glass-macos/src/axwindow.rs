@@ -61,17 +61,13 @@ use glass_core::{GlassError, Result};
 
 use crate::coords::point_to_global_pixel;
 
-// The private CGWindowID<->AXUIElement bridge (see module doc). Declared here, not
-// available from `objc2-application-services` (it's undocumented and intentionally absent
-// from Apple's public headers, so no binding crate exposes it) — the same contained
-// `extern "C"` pattern `permissions.rs` uses for `AXIsProcessTrusted`/
-// `CGPreflightScreenCaptureAccess`.
+// The private CGWindowID<->AXUIElement bridge (see module doc), declared here because it is
+// intentionally absent from Apple's public headers, so no binding crate exposes it.
 //
-// VERSION FRAGILITY: undocumented and unversioned; Apple could rename or remove it in any
-// macOS release without notice. Re-validate (does it still link? does it still return
-// `.Success` for real windows?) whenever this crate bumps its minimum-supported macOS
-// major. `ax_window_for_cgwindowid`'s geometry fallback exists specifically so a broken
-// symbol degrades this crate's window ops rather than making them entirely non-functional.
+// VERSION FRAGILITY: undocumented and unversioned — Apple could rename or remove it in any
+// macOS release. Re-validate whenever this crate bumps its minimum-supported macOS major;
+// `ax_window_for_cgwindowid`'s geometry fallback is what keeps a broken symbol from taking
+// out this crate's window ops entirely.
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn _AXUIElementGetWindow(element: &AXUIElement, out_wid: *mut u32) -> AXError;

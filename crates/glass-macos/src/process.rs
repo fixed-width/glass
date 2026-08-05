@@ -201,12 +201,10 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<ClipLaunch>)> {
     let mut cmd = Command::new(&spec.run[0]);
 
-    // Apply the caller's env FIRST, so glass's own containment/injection vars (set inside the
-    // block below) are written LAST and always win last-write-wins. Otherwise a caller (or an
-    // LLM footgun) could blank `DYLD_INSERT_LIBRARIES`/`GLASS_CLIP_PASTEBOARD` via `spec.env`
-    // and silently defeat injection while the profile had already granted the pasteboard —
-    // fail-OPEN. When not injecting (`sandbox: off` or a non-injectable target), caller env
-    // simply applies normally.
+    // Apply the caller's env FIRST, so glass's own containment/injection vars are written LAST
+    // and win. Otherwise a caller could blank `DYLD_INSERT_LIBRARIES`/`GLASS_CLIP_PASTEBOARD`
+    // via `spec.env` and silently defeat injection while the profile had already granted the
+    // pasteboard — fail-OPEN.
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
@@ -285,11 +283,9 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
             // dyld can't open it, injection silently fails, and the sandboxed app never sees
             // the shim. Re-allow only the file (not its whole directory) — least privilege.
             shim_file = Some(dylib.clone());
-            // Set LAST (after `spec.env` above) and BEFORE `cmd.spawn()`: `Command`'s envp is
-            // applied at the `exec` that follows `pre_exec`'s `sandbox_init` call (not at
-            // fork/`pre_exec` time), so both vars are present in the launched app's
-            // environment, having survived the sandbox — same timing guarantee the profile
-            // CString relies on.
+            // Set LAST (after `spec.env`) and BEFORE `cmd.spawn()`: `Command`'s envp is applied
+            // at the `exec` that follows `pre_exec`'s `sandbox_init`, not at fork time, so both
+            // vars survive the sandbox into the launched app's environment.
             cmd.env("DYLD_INSERT_LIBRARIES", &dylib);
             cmd.env("GLASS_CLIP_PASTEBOARD", &name);
             clip = Some(ClipLaunch { name });
@@ -300,9 +296,8 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
         // un-canonicalized `effective_cwd` (not `cwd_canon`) so relative tokens resolve against
         // where glass was actually invoked.
         let reallows = launch_reallows(&spec.run, effective_cwd.as_deref());
-        // Union the arg-literal re-allows with the shim file (if injecting); the shim file lives in
-        // glass's own target dir and is not expected to collide with a launch target, and the
-        // `.contains()` dedup below is defensive regardless (not load-bearing on that expectation).
+        // Union the arg-literal re-allows with the shim file. The `.contains()` dedup below is
+        // defensive — the shim lives in glass's own target dir and shouldn't collide.
         let mut ro_files = reallows.ro_files;
         if let Some(f) = shim_file
             && !ro_files.contains(&f)
@@ -342,11 +337,9 @@ pub(crate) fn spawn(spec: &AppSpec, logs: LogSink) -> Result<(Child, Option<Clip
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        // A PermissionDenied under containment could be `sandbox_init` rejecting the profile in
-        // pre_exec, OR a plain EACCES on a non-executable binary — the two are indistinguishable
-        // from this `io::Error` alone. Surface the actionable SandboxUnavailable either way
-        // (the failure is real regardless of cause: fail-closed, never unconfined), but don't
-        // overclaim which one it was.
+        // A PermissionDenied under containment could be `sandbox_init` rejecting the profile,
+        // or a plain EACCES on a non-executable binary — indistinguishable from this
+        // `io::Error` alone. Surface SandboxUnavailable either way without overclaiming which.
         if spec.sandbox != SandboxLevel::Off && e.kind() == std::io::ErrorKind::PermissionDenied {
             GlassError::SandboxUnavailable(format!(
                 "launch failed under containment (sandbox != off): sandbox_init rejected the profile, or the program could not be exec'd: {e}"

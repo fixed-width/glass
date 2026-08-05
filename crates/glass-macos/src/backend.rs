@@ -315,9 +315,8 @@ impl MacosPlatform {
         let (geometry, outcome) =
             settle_by_polling(seed_geometry, SETTLE_BUDGET, SETTLE_POLL_INTERVAL, || {
                 // `.map`, not `?`: `?` asks for `E: From<GlassError>` and leaves `E` itself
-                // unconstrained (`settle_by_polling`'s `E` is otherwise only ever produced, never
-                // consumed), which `rustc` can't resolve on its own. `.map` keeps the `Result`'s
-                // error type exactly `GlassError`, pinning `E` without a turbofish.
+                // unconstrained, which `rustc` can't resolve on its own. `.map` pins the error
+                // type to exactly `GlassError` without a turbofish.
                 crate::scwindow::find_window_by_id(window_id, &[pid], SETTLE_RESOLVE_TIMEOUT).map(
                     |m| {
                         let geometry = m.geometry.clone();
@@ -446,24 +445,19 @@ impl MacosPlatform {
                 Ok(m.geometry)
             }
             Err(e) => {
-                // The direct-spawned process is done with — dead (an `AppExited` stub) or
-                // simply never grew a window. Tear it down: terminate the child and release
-                // any clip-shim pasteboards it created. On a *successful* handoff `clip` is
-                // always `None` (handoff requires sandbox:off, which is never shim-injected),
-                // so `release_clip` there is a no-op; it does real work only for a contained
-                // launch that failed (a plain failure, or a contained stub the gate rejects
-                // just below).
+                // The direct-spawned process is done with — dead, or it never grew a window.
+                // On a *successful* handoff `clip` is always `None` (handoff requires
+                // sandbox:off, which is never shim-injected), so `release_clip` does real work
+                // only for a contained launch that failed.
                 process::terminate(&mut child);
                 release_clip(clip.as_ref());
-                // Only an early inner-exec exit (`AppExited`) is the handoff signal. Any other
-                // failure (e.g. `Timeout`: the process is alive but never grew a window) is
-                // propagated as-is, exactly as the plain-exec path does.
+                // Only an early inner-exec exit (`AppExited`) is the handoff signal; any other
+                // failure is propagated as-is.
                 //
-                // NOTE: `AppExited` conflates several things — an app that re-execs itself
-                // through LaunchServices and leaves a dead stub, a genuine early crash of the
-                // inner exec, and (before the platform-code check above) the kernel killing a
-                // system app for a launch-constraint violation. All fall through to the handoff,
-                // which then either finds/relaunches a real window or fails.
+                // `AppExited` conflates an app that re-execs itself through LaunchServices and
+                // leaves a dead stub, a genuine early crash of the inner exec, and the kernel
+                // killing a system app for a launch-constraint violation. All fall through to
+                // the handoff.
                 let GlassError::AppExited(_) = e else {
                     return Err(e);
                 };
@@ -488,13 +482,9 @@ impl MacosPlatform {
         let id = crate::bundle::bundle_identifier(bundle)?;
         let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
             Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
-            // NOTE (runtime-verified in Task 4): `ffi::launch_bundle` blocks this
-            // thread on a channel until `NSWorkspace`'s completion handler fires: if
-            // LaunchServices needs the main run loop to spin to complete the launch,
-            // and this call runs on the true main thread (see this module's
-            // main-thread-affinity notes), that handler could need a run-loop turn this
-            // blocked thread isn't pumping. Wired here per the design; the on-box round
-            // confirms whether it actually stalls.
+            // `ffi::launch_bundle` blocks this thread on a channel until `NSWorkspace`'s
+            // completion handler fires — on the true main thread, that handler could need a
+            // run-loop turn this blocked thread isn't pumping.
             None => match crate::ffi::launch_bundle(
                 bundle,
                 spec.run.get(1..).unwrap_or_default(),
@@ -533,11 +523,8 @@ impl MacosPlatform {
             }
         };
         self.child = None;
-        // `app_pid` is `u32` (every other pid in this struct comes from
-        // `std::process::Child::id()`); AppKit's pids are `i32` but always
-        // non-negative for a real process, so this cast is exact, matching every
-        // other `pid as {i32,u32}` cast in this file (see e.g. `resolve_active_window`'s
-        // call sites, which cast the other direction).
+        // AppKit's pids are `i32` but always non-negative for a real process, so the cast to
+        // `app_pid`'s `u32` is exact.
         self.app_pid = Some(pid as u32);
         self.active_window = Some(m.window_id);
         self.adopted = Some(Adopted { pid, disposition });
@@ -754,21 +741,16 @@ impl Platform for MacosPlatform {
                     // `stop_app`/`Drop`'s reap blast radius (symmetric with `start_bundle`'s
                     // handoff path clearing `self.child`).
                     self.adopted = None;
-                    // NOTE: this seeds the active-window model (Plan 4 design decision 2): the
-                    // first window discovered for the launched app becomes the implicit target
-                    // of capture/input, exactly as `select_window` (a later task) will retarget
-                    // it to a different window later. `resolve_active_window` (used by
-                    // `capture_frame`/`send_pointer`/`send_key` below) is what actually honors
-                    // this field on every call.
+                    // The first window discovered for the launched app becomes the implicit
+                    // target of capture/input, until `select_window` retargets it.
+                    // `resolve_active_window` is what honors this field on every call.
                     self.active_window = Some(m.window_id);
                     // Decide the session's clipboard route now that the launched window is
                     // confirmed — see `decide_clip`'s doc.
                     self.clipboard_route = decide_clip(spec.sandbox, clip.as_ref());
                     self.clip = clip;
                     // Scale/origin/geometry are NOT cached here: `send_pointer` re-resolves the
-                    // window fresh on every call instead (see its doc) since it may move/resize
-                    // after this initial discovery. Only the initial geometry is returned to the
-                    // caller, matching every other backend's `start_app` contract.
+                    // window on every call, since it may move or resize after this discovery.
                     m.geometry
                 }
                 Err(e) => {
@@ -808,20 +790,16 @@ impl Platform for MacosPlatform {
         if let Some(mut child) = self.child.take() {
             process::terminate(&mut child);
         }
-        // Release this session's named pasteboards (the content board + its `.ready` sentinel
-        // board) before dropping the shim facts. Named pasteboards persist system-wide until
-        // released, and a leftover sentinel could otherwise mask a failed injection in a later
-        // session (see `crate::clipboard_route`). Only released when a shim launch name is
-        // known (an injectable, contained launch); uncontained/hardened launches have none.
+        // Named pasteboards persist system-wide until released, and a leftover `.ready`
+        // sentinel could mask a failed injection in a later session. Only released when a shim
+        // launch name is known — uncontained/hardened launches have none.
         release_clip(self.clip.as_ref());
         self.app_pid = None;
         self.active_window = None;
-        // Reset the clipboard route too, so a later start_app on the same MacosPlatform can't
-        // have a stale route (e.g. a previous session's Private(name)) leak into
+        // Reset the route too, so a previous session's `Private(name)` can't leak into
         // get_clipboard/set_clipboard before the next start_app decides fresh.
         self.clipboard_route = ClipboardRoute::default();
-        // Same reasoning for the clip-shim facts: a stale `Some` from a previous session must
-        // not leak into a later one's clipboard routing.
+        // Same for the clip-shim facts.
         self.clip = None;
         Ok(())
     }
