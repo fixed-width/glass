@@ -1595,12 +1595,14 @@ mod tests {
 
     #[test]
     fn a_target_whose_name_drifted_is_rejected_before_any_climb() {
+        // No node in this tree is called "Send", so the refusal is `fingerprinted`'s gone
+        // verdict rather than its changed one.
         let t = built(&compose_like());
         let mut label = target_for(&t, AxNodeId(2));
         label.name = Some("Send".into());
         assert!(matches!(
             invoke_plan(&t, &label),
-            Err(GlassError::AxElementChanged(2))
+            Err(GlassError::AxElementGone(2))
         ));
     }
 
@@ -3101,7 +3103,9 @@ mod tests {
         let e = a
             .invoke(&ctx(), &target_for(&seen, AxNodeId(2)))
             .expect_err("only position is forgiven");
-        assert!(matches!(e, GlassError::AxElementChanged(2)), "{e}");
+        // Renaming the node left nothing in the tree presenting as the target, so the
+        // relaxation is never reached.
+        assert!(matches!(e, GlassError::AxElementGone(2)), "{e}");
         assert_eq!(
             ops_of(&ops),
             vec!["conn1:tree".to_string()],

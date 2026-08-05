@@ -236,8 +236,14 @@ fn set_value_reports_whether_the_write_landed() {
         bounds: target.bounds,
         value: target.value.clone(),
     };
+    // Any of the three refusals: nothing on this screen carries that name, so the usual verdict
+    // is `AxElementGone`, but a tree that renumbered or lost the id answers first.
     match a11y.set_value(&ctx, &stale, "ignored") {
-        Err(GlassError::AxElementChanged(_)) | Err(GlassError::AxElementNotFound(_)) => {}
+        Err(
+            GlassError::AxElementGone(_)
+            | GlassError::AxElementChanged(_)
+            | GlassError::AxElementNotFound(_),
+        ) => {}
         other => panic!("a stale target must not report success: {other:?}"),
     }
 
