@@ -1151,6 +1151,57 @@ mod tests {
         assert!(has_many_siblings(&g, 0, 1, 3, 3));
     }
 
+    /// A 5x5 opaque greyscale image from a grid of luminances. Anti-alias detection reads a
+    /// 3x3 neighbourhood and counts how many of it match, so only the whole grid makes a case
+    /// legible.
+    fn grey5(rows: [[u8; 5]; 5]) -> Vec<u8> {
+        rows.iter()
+            .flatten()
+            .flat_map(|&v| [v, v, v, 255])
+            .collect()
+    }
+
+    /// Overwrite the RGB of pixel (x,y) in a 5x5 greyscale image.
+    fn shade5(px: &mut [u8], x: usize, y: usize, v: u8) {
+        let o = (y * 5 + x) * 4;
+        px[o..o + 3].copy_from_slice(&[v, v, v]);
+    }
+
+    /// The centre is the only pixel excluded from its own neighbourhood, and that neighbourhood
+    /// is read at the centre's own row. Here the sole *brighter* neighbour sits directly below
+    /// the centre: skip the centre's column, or take the centre from another row, and the bright
+    /// side of the edge disappears — leaving a one-sided difference that is not anti-aliasing.
+    #[test]
+    fn is_antialiased_reads_every_neighbour_of_the_centre() {
+        let px = grey5([
+            [50, 50, 50, 0, 0],
+            [50, 50, 50, 60, 0],
+            [50, 50, 100, 61, 0],
+            [0, 71, 200, 73, 0],
+            [0, 0, 0, 0, 0],
+        ]);
+        let mut other = px.clone();
+        shade5(&mut other, 2, 2, 110); // the difference under test
+        assert!(is_antialiased(&px, 2, 2, 5, 5, &other));
+    }
+
+    /// The neighbourhood stops at the frame's right edge. One column further and a neighbour
+    /// is the first pixel of the *next* row: three of those match the centre here, which is
+    /// enough zero-deltas to write off a real anti-aliased edge as flat.
+    #[test]
+    fn is_antialiased_clamps_the_neighbourhood_to_the_right_edge() {
+        let px = grey5([
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 60, 50],
+            [100, 0, 0, 61, 100],
+            [100, 0, 0, 62, 200],
+            [100, 0, 0, 200, 200],
+        ]);
+        let mut other = px.clone();
+        shade5(&mut other, 4, 2, 110);
+        assert!(is_antialiased(&px, 4, 2, 5, 5, &other));
+    }
+
     #[test]
     fn color_delta_properties() {
         let black = [0u8, 0, 0, 255];
@@ -1199,6 +1250,19 @@ mod tests {
             perc.changed_pixels,
             exact.changed_pixels
         );
+    }
+
+    #[test]
+    fn perceptual_change_below_the_first_row_is_found() {
+        // Both the row slice the pre-scan compares and the offset each pixel is classified at
+        // have to follow `y`. Standing in row 0 for either reports a frame that differs further
+        // down as clean, and only a frame at least one SIMD chunk wide reaches the pre-scan.
+        let a = Frame::solid(8, 2, [0, 0, 0, 255]);
+        let mut b = a.clone();
+        let (x, y) = (3usize, 1usize);
+        let off = (y * 8 + x) * 4;
+        b.pixels[off..off + 3].copy_from_slice(&[255, 255, 255]);
+        assert_eq!(diff_perceptual(&a, &b, 0.1).unwrap().changed_pixels, 1);
     }
 
     #[test]
@@ -1420,7 +1484,8 @@ mod tests {
         let m = IgnoreMask::for_region(&[rect(15, 15, 10, 10)], &region).unwrap();
         assert_eq!(m.ignored_count(), 100);
         assert!(m.is_ignored(5, 5), "region-local origin of the mask");
-        assert!(!m.is_ignored(4, 5), "just outside the translated mask");
+        assert!(!m.is_ignored(4, 5), "just left of the translated mask");
+        assert!(!m.is_ignored(5, 4), "just above the translated mask");
     }
 
     #[test]
@@ -1450,6 +1515,38 @@ mod tests {
             rect(0, 0, 10, 10).intersect(&rect(5, 5, 10, 10)),
             Some(rect(5, 5, 5, 5))
         );
+    }
+
+    #[test]
+    fn region_intersect_returns_none_for_regions_that_only_touch_side_by_side() {
+        // Abutting at x=5. A zero-width overlap is no overlap: an empty region
+        // would flow on into `IgnoreMask::new`, which rejects zero area.
+        assert_eq!(rect(0, 0, 5, 5).intersect(&rect(5, 0, 5, 5)), None);
+    }
+
+    #[test]
+    fn region_intersect_returns_none_for_regions_that_only_touch_end_to_end() {
+        assert_eq!(rect(0, 0, 5, 5).intersect(&rect(0, 5, 5, 5)), None);
+    }
+
+    #[test]
+    fn region_intersect_needs_both_axes_to_overlap() {
+        // Same columns, disjoint rows.
+        assert_eq!(rect(0, 0, 5, 5).intersect(&rect(0, 9, 5, 5)), None);
+    }
+
+    /// The SIMD pre-scan is an optimisation, so it must never skip a chunk that holds a real
+    /// change. 1 against 255 is the adversarial pair: far apart, but any combination of the two
+    /// other than a difference — a sum, say — wraps through zero and reads as clean.
+    #[test]
+    fn the_simd_prescan_never_skips_a_chunk_holding_a_change() {
+        let one_pixel = |v: u8| {
+            let mut p = vec![0u8; 32]; // one 8-pixel SIMD chunk
+            p[0] = v;
+            Frame::new(8, 1, p).unwrap()
+        };
+        let d = diff(&one_pixel(1), &one_pixel(255), 0).unwrap();
+        assert_eq!(d.changed_pixels, 1);
     }
 
     // ---- masked exact diff ----

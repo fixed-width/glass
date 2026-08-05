@@ -73,6 +73,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_dashes_and_underscores() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BaselineStore::new(dir.path());
+        let frame = Frame::solid(1, 1, [0, 0, 0, 255]);
+        store.save("login_form-empty", &frame).unwrap();
+        assert_eq!(store.load("login_form-empty").unwrap(), frame);
+    }
+
+    #[test]
     fn rejects_unsafe_names() {
         let dir = tempfile::tempdir().unwrap();
         let store = BaselineStore::new(dir.path());

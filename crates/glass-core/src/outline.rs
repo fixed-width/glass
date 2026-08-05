@@ -185,6 +185,18 @@ mod tests {
     }
 
     #[test]
+    fn every_level_of_nesting_adds_one_step_of_indent() {
+        let mut toolbar = node(AxRole::Group, Some("Toolbar"));
+        toolbar.children = vec![node(AxRole::Button, Some("Save"))];
+        let out = render_compact(&tree_of(toolbar));
+        let grandchild = out.lines().nth(2).unwrap_or_default();
+        assert!(
+            grandchild.starts_with("    #"),
+            "Window > Toolbar > Save nests two levels deep:\n{out}"
+        );
+    }
+
+    #[test]
     fn a_named_group_is_kept() {
         let mut g = node(AxRole::Group, Some("Toolbar"));
         g.children = vec![node(AxRole::Button, Some("Save"))];

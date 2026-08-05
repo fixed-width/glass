@@ -21,11 +21,16 @@ pub fn tool_path(env_key: &str, default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pick;
+    use super::{pick, tool_path};
 
     #[test]
     fn unset_uses_default() {
         assert_eq!(pick(None, "bwrap"), "bwrap");
+    }
+
+    #[test]
+    fn tool_path_returns_the_default_for_an_unset_var() {
+        assert_eq!(tool_path("GLASS_UNSET_IN_TESTS", "bwrap"), "bwrap");
     }
 
     #[test]

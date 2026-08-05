@@ -269,6 +269,31 @@ mod tests {
     }
 
     #[test]
+    fn the_default_backends_section_is_not_flagged_as_optional() {
+        let text = diag().render_text("x11");
+        assert!(text.contains("[x11]\n"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_counts_every_check_by_its_effective_status() {
+        // wayland's Fail is a Warn here: x11 is the default backend.
+        let text = diag().render_text("x11");
+        assert!(
+            text.contains("Summary: 2 ok, 1 warning(s), 0 failure(s)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_a_failure_in_the_default_backend() {
+        let text = diag().render_text("wayland");
+        assert!(
+            text.contains("Summary: 2 ok, 0 warning(s), 1 failure(s)"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn serializes_to_json_without_null_remedy() {
         let c = Check::new("Xvfb", CheckStatus::Ok, "found");
         let j = serde_json::to_string(&c).unwrap();

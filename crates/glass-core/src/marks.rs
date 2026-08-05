@@ -289,6 +289,60 @@ mod tests {
         assert_eq!(legend[0].label, Some(MarkLabel::Description("Bold".into())));
     }
 
+    /// An element flush with the top-left corner clamps its chip to (0,0), which is where the
+    /// two things that can go wrong meet: a digit spilling into the chip's padding, and a clip
+    /// that drops the frame's own first row and column instead of keeping them.
+    #[test]
+    fn the_chip_padding_survives_at_the_frame_corner() {
+        let b = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 16,
+            }),
+        );
+        let (frame, _) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        let chip_w = PAD * 2 + DIGIT_W * SCALE; // one digit, so no inter-digit gap
+        let chip_h = PAD * 2 + DIGIT_H * SCALE;
+        for y in 0..chip_h as u32 {
+            assert_eq!(px(&frame, 0, y), OUTLINE, "left padding column, y={y}");
+        }
+        for x in 0..chip_w as u32 {
+            assert_eq!(px(&frame, x, 0), OUTLINE, "top padding row, x={x}");
+        }
+    }
+
+    /// Font columns are blitted rightwards from the digit's origin, so the last one lands at
+    /// the far side of the cell rather than back over the padding.
+    #[test]
+    fn a_digits_last_column_lands_at_the_far_side_of_its_cell() {
+        let b = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 16,
+            }),
+        );
+        let (frame, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        assert_eq!(
+            legend[0].id,
+            AxNodeId(1),
+            "the mark this case reads is a '1'"
+        );
+        // '1' renders its bottom row as 0b111, so that row's third column is lit.
+        let x = (PAD + 2 * SCALE) as u32;
+        let y = (PAD + 4 * SCALE) as u32;
+        assert_eq!(px(&frame, x, y), DIGIT_FG);
+    }
+
     #[test]
     fn a_named_mark_keeps_its_name() {
         let mut b = node(
