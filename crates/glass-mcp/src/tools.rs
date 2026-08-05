@@ -1189,11 +1189,10 @@ mod tests {
 
     #[test]
     fn a11y_snapshot_truncation_steer_is_a_trusted_block_outside_the_untrusted_envelope() {
-        // Regression for the finding that glass's own truncation steer was getting baked
-        // into `render_compact`'s output and so ended up buried inside the untrusted
-        // envelope — under a directive telling the agent to ignore instructions in that
-        // block, even though the steer ("drive by pixels…") IS an instruction from glass
-        // itself. It must be its own trusted, unwrapped `OutContent::Text` block.
+        // glass's own truncation steer must not be baked into `render_compact`'s output, or
+        // it ends up inside the untrusted envelope — under a directive telling the agent to
+        // ignore instructions in that block, even though the steer ("drive by pixels…") IS
+        // one of glass's own. It gets its own trusted, unwrapped block.
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), truncated_tree());
         g.start(&AppSpec {
             build: None,

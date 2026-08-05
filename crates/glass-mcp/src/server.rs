@@ -118,11 +118,10 @@ impl GlassServer {
         F: FnOnce(&mut Glass) -> ToolResult + Send + 'static,
     {
         // Hand the (synchronous, possibly slow) tool body to the dedicated glass-platform
-        // thread and await its result. That thread — not an ephemeral blocking-pool thread —
-        // is the parent of any process the body spawns, so a sandboxed app's
-        // `--die-with-parent` only fires when glass itself exits. It also keeps blocking work
-        // off the async executor and serializes tools (glass has one session). A handler
-        // panic comes back as a loud error, never an unanswered request.
+        // thread and await its result: that thread, not an ephemeral blocking-pool thread,
+        // parents any process the body spawns, so a sandboxed app's `--die-with-parent` only
+        // fires when glass itself exits. A handler panic comes back as a loud error, never an
+        // unanswered request.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.jobs.send((Box::new(f), reply_tx)).is_err() {
             return Ok(map_tool_result(Err(

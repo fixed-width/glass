@@ -141,20 +141,14 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         )],
     );
 
-    // Only show sections for backends actually compiled into THIS binary — absent
-    // backends (e.g. windows on a Linux build, or macos on a non-macOS build) are
-    // omitted rather than listed as "not built into this binary" placeholders.
-    // Accessibility is per-OS (AT-SPI on Linux, UIA on Windows); macOS instead gets three
-    // sections below — "macos" (the platform backend's own TCC posture), "sandbox" (Seatbelt
-    // containment posture, mirroring the Linux/Windows "sandbox" sections), and
-    // "accessibility (macos)" (the a11y-tool reader's readiness, kept separate from "macos" —
-    // see the comment there for why). Android is the exception: it shells out to a separate
-    // SDK's own tools (adb/emulator) rather than linking an OS framework, so it's
-    // host-OS-agnostic and always compiled in — its section is always emitted, gated at
-    // runtime (see below) rather than by cfg. iOS also shells out to a separate SDK's tools
-    // (`xcrun simctl`), but only macOS can actually run them, and `glass-ios` pulls in an
-    // `image` PNG codec chain that a non-macOS binary has no use for — so glass-mcp only
-    // depends on `glass-ios` on macOS, and its section is compiled in accordingly.
+    // Only sections for backends actually compiled into THIS binary — an absent backend is
+    // omitted, never listed as a "not built into this binary" placeholder.
+    //
+    // Android is host-OS-agnostic (it shells out to adb/emulator rather than linking an OS
+    // framework), so it is always compiled in and gated at runtime instead of by cfg. iOS
+    // also shells out (`xcrun simctl`), but only macOS can run those tools and `glass-ios`
+    // pulls in an `image` PNG codec chain a non-macOS binary has no use for — so glass-mcp
+    // depends on it on macOS only.
     let mut sections = vec![general, network];
 
     #[cfg(target_os = "linux")]
@@ -207,14 +201,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
         // Mirrors the Linux/Windows "sandbox" section: Seatbelt containment posture.
         sections.push(Section::new("sandbox", None, glass_sandbox_macos::checks()));
-        // Mirrors "accessibility (linux)"/"accessibility (windows)": a dedicated section
-        // for the a11y-tool reader itself (glass_a11y_snapshot/marks/click_element/
-        // set_value), distinct from the "macos" section above which covers the platform
-        // backend's own TCC posture (Screen Recording, session state, ...). The
-        // Accessibility grant check is intentionally duplicated between the two sections
-        // — here it answers "will the a11y tools work", there it answers "is this Mac
-        // set up at all" — both reuse the same `glass_macos::accessibility_granted()`
-        // fact and remedy string, so there's no risk of the two drifting apart.
+        // A dedicated section for the a11y-tool reader itself, distinct from the "macos"
+        // section above (the platform backend's own TCC posture). The Accessibility grant
+        // check is deliberately duplicated: here it answers "will the a11y tools work",
+        // there "is this Mac set up at all". Both read the same
+        // `glass_macos::accessibility_granted()` fact and remedy string.
         sections.push(Section::new(
             "accessibility (macos)",
             None,
@@ -226,12 +217,11 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
     }
 
-    // Android is host-OS-agnostic (drives an AVD over adb), so the crate is always compiled
-    // in. Run its basic presence checks unconditionally — like the desktop backends — so the
-    // doctor gives android pre-flight regardless of the (launch-frozen) GLASS_BACKEND. Only
-    // the expensive/mutating deep probes (boot AVD, install agent) stay gated to the selected
-    // backend. When android isn't active, soften any Fail to Warn so an irrelevant missing
-    // adb/emulator doesn't fail the overall verdict for a desktop user.
+    // Android is host-OS-agnostic, so the crate is always compiled in. Its basic presence
+    // checks run unconditionally, so doctor gives android pre-flight whatever the
+    // launch-frozen GLASS_BACKEND is; only the expensive/mutating deep probes (boot AVD,
+    // install agent) stay gated to the selected backend. When android isn't active, soften
+    // Fail to Warn so a missing adb doesn't fail a desktop user's overall verdict.
     let android_selected = backend == "android";
     let mut android_checks = glass_android::doctor::checks(deep && android_selected);
     if !android_selected {
@@ -252,11 +242,9 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
     {
         let ios_selected = backend == "ios";
         let base = glass_ios::doctor::checks(deep && ios_selected);
-        // The companion gates all iOS input + accessibility, so its status is *always* surfaced —
-        // an operator driving iOS per-call from a macos-default server still needs to see it. Only
-        // the expensive --deep spawn probe is gated to the selected backend (mirroring android's
-        // gated deep probes): spawn against a booted sim (else a bounded self-test) when driving
-        // iOS with --deep, otherwise just report resolvable-on-PATH presence.
+        // The companion gates all iOS input + accessibility, so its status is *always*
+        // surfaced — an operator driving iOS per-call from a macos-default server still needs
+        // to see it. Only the expensive --deep spawn probe is gated to the selected backend.
         let companion = if ios_selected && deep {
             companion_deep_check(glass_ios::doctor::probe_companion())
         } else {
@@ -494,11 +482,9 @@ fn macos_checks_from(
                  (see docs/how-to/build-from-source.md)",
             ),
         },
-        // The `general` section already prints the resolved default backend
-        // (`default backend`, above); this doesn't re-discover that fact, it just
-        // views it through a macOS-specific lens — is the backend this *macOS*
-        // binary resolved to actually macOS, e.g. flagging a `GLASS_BACKEND`
-        // override that names a backend not even compiled into this build.
+        // Not a re-discovery of `general`'s `default backend` line: this asks whether the
+        // backend this *macOS* binary resolved to is actually macOS, flagging a
+        // `GLASS_BACKEND` override naming a backend not compiled into this build.
         if resolved_backend == "macos" {
             Check::new("backend", CheckStatus::Ok, "resolved to macos")
         } else {
@@ -856,11 +842,8 @@ mod tests {
         let d = diagnose(false);
         let titles: Vec<&str> = d.sections.iter().map(|s| s.title.as_str()).collect();
         // Platform-gated backends compiled into THIS binary get a section; android is always
-        // present (a host-OS-agnostic crate) via a runtime gate. iOS is compiled into
-        // glass-mcp — and so gets a section — only on macOS (see this crate's Cargo.toml).
-        // No "not built into this binary" placeholders. Accessibility is per-OS (AT-SPI on
-        // Linux, UIA on Windows); macOS's grants (Screen Recording, Accessibility) live
-        // inside its own "macos" section rather than a separate accessibility section.
+        // present via a runtime gate, and iOS only on macOS. No "not built into this binary"
+        // placeholders.
         #[cfg(target_os = "linux")]
         assert_eq!(
             titles,

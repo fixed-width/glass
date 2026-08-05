@@ -104,14 +104,11 @@ pub fn make_platform(
             )));
         }
     };
-    // On Linux, AT-SPI serves both display backends, so the same reader is attached
-    // to each. It connects lazily on first snapshot; an absent a11y bus surfaces as
-    // AccessibilityUnavailable at call time, not here.
-    // Accessibility is per-OS: AT-SPI on Linux, UI Automation on Windows, AXUIElement on
-    // macOS. Each reader is attached unconditionally here — no silent fallback: a
-    // reader-specific failure (e.g. Linux's AT-SPI bus being unreachable, or macOS's
-    // Accessibility TCC grant being missing) surfaces as `AccessibilityUnavailable`
-    // (Linux/Windows) or `PermissionDenied` (macOS) at call time, not here.
+    // Accessibility is per-OS: AT-SPI on Linux (serving both display backends), UI Automation
+    // on Windows, AXUIElement on macOS. Each reader is attached unconditionally, with no
+    // silent fallback — a reader-specific failure (an unreachable AT-SPI bus, a missing macOS
+    // Accessibility grant) surfaces as `AccessibilityUnavailable` or `PermissionDenied` at
+    // call time, not here.
     #[cfg(windows)]
     let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
         Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
