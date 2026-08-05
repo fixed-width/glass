@@ -128,6 +128,33 @@ mod tests {
         assert_eq!(keysym_for_keyname("nope"), None);
     }
 
+    /// A name that loses its arm falls through to the single-character path, which no
+    /// multi-letter name can reach.
+    #[test]
+    fn every_named_key_maps_to_its_keysym() {
+        for (name, keysym) in [
+            ("Return", 0xff0d),
+            ("Enter", 0xff0d),
+            ("Escape", 0xff1b),
+            ("Esc", 0xff1b),
+            ("Tab", 0xff09),
+            ("BackSpace", 0xff08),
+            ("Backspace", 0xff08),
+            ("Delete", 0xffff),
+            ("Del", 0xffff),
+            ("space", 0x0020),
+            ("Space", 0x0020),
+            ("Up", 0xff52),
+            ("Down", 0xff54),
+            ("Left", 0xff51),
+            ("Right", 0xff53),
+            ("Home", 0xff50),
+            ("End", 0xff57),
+        ] {
+            assert_eq!(keysym_for_keyname(name), Some(keysym), "{name}");
+        }
+    }
+
     #[test]
     fn parses_chords() {
         assert_eq!(

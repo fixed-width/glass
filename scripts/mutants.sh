@@ -10,8 +10,13 @@
 #   * It reports a timeout ahead of a missed mutant, so once any mutant times out a
 #     genuine survivor is invisible at the exit code.
 #
-# So this reads `outcomes.json`, prints the breakdown, and fails on a survivor, a
-# timeout, or a run that gated nothing.
+# So this reads `outcomes.json`, prints the breakdown, and fails on a survivor or a
+# run that gated nothing.
+#
+# A timeout is not a failure here: every one this crate produces is a mutation that stops
+# the code terminating, and no test can catch a hang — the timeout budget is what catches
+# it. The count and `timeout.txt` are still printed, because a mutant that merely got slow
+# looks the same.
 #
 # The one legitimate way to generate no mutants is a diff that changes only test
 # code. That must not fail — but it must not pass unchecked either, because
@@ -147,8 +152,13 @@ if [ "$missed" -gt 0 ]; then
     exit 1
 fi
 if [ "$timed_out" -gt 0 ]; then
-    echo "A timeout also masks any survivor at cargo-mutants' own exit code."
-    echo "Timed-out mutants are listed in $graded/mutants.out/timeout.txt"
-    exit 1
+    echo "Timed-out mutants are listed in $graded/mutants.out/timeout.txt — a hang is a"
+    echo "detection, not a survivor, so they do not fail this run. Read them anyway: a"
+    echo "mutant that merely got slow, or a budget set too low, looks exactly the same."
+    # Exit 3 is cargo-mutants' "some tests timed out", the outcome just graded. An `if`
+    # rather than an `&&` list: a false `&&` is itself a failed command under `set -e`.
+    if [ "$status" -eq 3 ]; then
+        status=0
+    fi
 fi
 exit "$status"

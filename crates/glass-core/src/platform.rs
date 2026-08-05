@@ -429,6 +429,42 @@ mod tests {
         }
     }
 
+    /// Knows its pid and overrides nothing else, so `app_pids` falls through to the
+    /// default that derives from `app_pid`.
+    struct PidPlatform(u32);
+    impl Platform for PidPlatform {
+        fn app_pid(&self) -> Option<u32> {
+            Some(self.0)
+        }
+        fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn stop_app(&mut self) -> Result<()> {
+            unimplemented!()
+        }
+        fn capture_frame(&mut self, _region: Option<&Region>) -> Result<Frame> {
+            unimplemented!()
+        }
+        fn send_pointer(&mut self, _event: &PointerEvent) -> Result<()> {
+            unimplemented!()
+        }
+        fn send_key(&mut self, _event: &KeyEvent) -> Result<()> {
+            unimplemented!()
+        }
+        fn window(&mut self, _op: &WindowOp) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
+            unimplemented!()
+        }
+        fn select_window(&mut self, _id: WindowId) -> Result<WindowGeometry> {
+            unimplemented!()
+        }
+        fn drain_logs(&mut self) -> Vec<(Stream, String)> {
+            unimplemented!()
+        }
+    }
+
     #[test]
     fn default_capture_window_is_unsupported() {
         // A backend with no `capture_window` override (the common case today)
@@ -436,5 +472,37 @@ mod tests {
         let mut p = MinimalPlatform;
         let err = p.capture_window(WindowId(1), None).unwrap_err();
         assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
+    }
+
+    #[test]
+    fn default_app_pid_is_unknown() {
+        assert_eq!(MinimalPlatform.app_pid(), None);
+    }
+
+    #[test]
+    fn default_app_pids_is_the_one_pid_the_backend_knows() {
+        assert_eq!(PidPlatform(4242).app_pids(), vec![4242]);
+    }
+
+    #[test]
+    fn default_app_pids_is_empty_when_the_pid_is_unknown() {
+        assert!(MinimalPlatform.app_pids().is_empty());
+    }
+
+    #[test]
+    fn default_a11y_bus_addr_is_unset() {
+        // Not `Some("")`: an empty address would be passed to a bus connection as if real.
+        assert_eq!(MinimalPlatform.a11y_bus_addr(), None);
+    }
+
+    #[test]
+    fn default_active_window_handle_is_unset() {
+        assert_eq!(MinimalPlatform.active_window_handle(), None);
+    }
+
+    #[test]
+    fn default_backend_aims_a_checkable_at_its_centre() {
+        // Opt-in per backend: the trailing-edge aim misfires on a wide labeled checkbox.
+        assert!(!MinimalPlatform.a11y_toggle_control_at_trailing_edge());
     }
 }

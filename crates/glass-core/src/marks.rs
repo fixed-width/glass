@@ -33,6 +33,7 @@ const PAD: i32 = 1; // chip padding around the digits, in output pixels
 const DIGIT_W: i32 = 3; // font cell width
 const DIGIT_H: i32 = 5; // font cell height
 const DIGIT_GAP: i32 = 1; // gap between digits, in font cells
+const DIGIT_GAP_PX: i32 = DIGIT_GAP * SCALE; // the same gap in output pixels
 const OUTLINE: [u8; 4] = [255, 0, 255, 255]; // magenta — element outline + chip bg
 const DIGIT_FG: [u8; 4] = [255, 255, 255, 255]; // white digits
 
@@ -103,7 +104,7 @@ fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
     //    clamped into the frame so an edge-hugging element still shows its chip.
     let ds = digits_of(id);
     let n = ds.len() as i32;
-    let chip_w = PAD * 2 + n * DIGIT_W * SCALE + (n - 1) * DIGIT_GAP * SCALE;
+    let chip_w = PAD * 2 + n * DIGIT_W * SCALE + (n - 1) * DIGIT_GAP_PX;
     let chip_h = PAD * 2 + DIGIT_H * SCALE;
     let cx = (b.x - chip_w).max(0);
     let cy = (b.y - chip_h).max(0);
@@ -113,7 +114,7 @@ fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
     let dy = cy + PAD;
     for d in ds {
         draw_digit(frame, d, dx, dy, DIGIT_FG);
-        dx += (DIGIT_W + DIGIT_GAP) * SCALE;
+        dx += DIGIT_W * SCALE + DIGIT_GAP_PX;
     }
 }
 
@@ -287,6 +288,57 @@ mod tests {
         // Description, not Name: the legend renders the two differently because only a name
         // is matchable by a selector.
         assert_eq!(legend[0].label, Some(MarkLabel::Description("Bold".into())));
+    }
+
+    /// An element flush with the corner clamps its chip to (0,0), where two failures meet: a
+    /// digit spilling into the padding, and a clip that drops the frame's first row and column.
+    #[test]
+    fn the_chip_padding_survives_at_the_frame_corner() {
+        let b = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 16,
+            }),
+        );
+        let (frame, _) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        let chip_w = PAD * 2 + DIGIT_W * SCALE; // one digit, so no inter-digit gap
+        let chip_h = PAD * 2 + DIGIT_H * SCALE;
+        for y in 0..chip_h as u32 {
+            assert_eq!(px(&frame, 0, y), OUTLINE, "left padding column, y={y}");
+        }
+        for x in 0..chip_w as u32 {
+            assert_eq!(px(&frame, x, 0), OUTLINE, "top padding row, x={x}");
+        }
+    }
+
+    #[test]
+    fn a_digits_last_column_lands_at_the_far_side_of_its_cell() {
+        let b = node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 16,
+            }),
+        );
+        let (frame, legend) = render(&Frame::solid(100, 100, [0, 0, 0, 255]), &tree_of(b));
+        assert_eq!(
+            legend[0].id,
+            AxNodeId(1),
+            "the mark this case reads is a '1'"
+        );
+        // '1' renders its bottom row as 0b111, so that row's third column is lit.
+        let x = (PAD + 2 * SCALE) as u32;
+        let y = (PAD + 4 * SCALE) as u32;
+        assert_eq!(px(&frame, x, y), DIGIT_FG);
     }
 
     #[test]

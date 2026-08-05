@@ -255,6 +255,20 @@ mod tests {
     }
 
     #[test]
+    fn a_geometry_read_on_its_own_records_nothing() {
+        // `seam_records_actuations_skips_reads_and_geometry` reads the geometry immediately
+        // before a `Focus` actuation, so auditing the read instead of the actuation would
+        // produce the same record in the same slot.
+        let sink = RecordingSink::default();
+        let mut g =
+            glass_with(FakePlatform::new(50, 50).with_frames(vec![Frame::solid(50, 50, [0; 4])]));
+        g.set_audit_sink(Box::new(sink.clone()));
+        g.start(&spec()).unwrap();
+        let _ = g.window(&WindowOp::Geometry).unwrap();
+        assert_eq!(sink.0.lock().unwrap().clone(), vec!["launch:true"]);
+    }
+
+    #[test]
     fn seam_records_failed_actuation_ok_false() {
         let sink = RecordingSink::default();
         let mut g =
