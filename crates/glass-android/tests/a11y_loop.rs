@@ -13,7 +13,7 @@
 //! device back launchable.
 
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, WalkLimits,
+    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree, WalkLimits,
 };
 use glass_core::{
     AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
@@ -230,42 +230,6 @@ fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNo
     node.children.iter().find_map(|c| find(c, want))
 }
 
-/// Tap Settings' search entry, handing the task to `com.google.android.settings.intelligence`.
-///
-/// Reports whether the search screen came up — a device that has not settled draws no search entry
-/// to tap.
-fn open_search_screen(
-    platform: &mut glass_android::AndroidPlatform,
-    a11y: &mut glass_android::AndroidA11y,
-    ctx: &AxContext,
-) -> bool {
-    let Ok(mut tree) = a11y.snapshot(ctx) else {
-        return false;
-    };
-    tree.assign_ids();
-    let Some(search) = find(&tree.root, &|n| {
-        n.name.as_deref().is_some_and(|s| s.contains("Search"))
-    })
-    .and_then(|n| n.bounds)
-    .and_then(|b| b.clamped_center(ctx.window.width, ctx.window.height)) else {
-        return false;
-    };
-    if platform
-        .send_pointer(&PointerEvent::Click {
-            x: search.0,
-            y: search.1,
-            button: MouseButton::Left,
-            count: 1,
-            modifiers: vec![],
-        })
-        .is_err()
-    {
-        return false;
-    }
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    search_field_is_up(a11y, ctx)
-}
-
 /// A failing assertion must not take the *next* test down with it.
 ///
 /// Teardown written as a trailing statement is skipped by a panic, and CI run 31036771472 turned
@@ -278,29 +242,43 @@ fn open_search_screen(
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn a_panicking_test_leaves_the_device_launchable_for_the_next_one() {
     // Without this, a run where Settings drew no search entry never creates the state under test
-    // and passes by failing to look.
-    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // and passes by failing to look. It retries within [`SETUP_BUDGET`], which documents why: a
+    // single attempt reads the post-boot kill as a broken fixture.
+    let armed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let arming = armed.clone();
 
     let hushed = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {})); // the panic below is the fixture, not a failure to report
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut session = Session::start();
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        let ctx = session.ctx();
-        let mut a11y = glass_android::AndroidA11y::new();
-        arming.store(
-            open_search_screen(session.platform(), &mut a11y, &ctx),
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        panic!("a mid-test assertion failing");
+        let deadline = std::time::Instant::now() + SETUP_BUDGET;
+        loop {
+            let mut session = Session::start();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let ctx = session.ctx();
+            let mut a11y = glass_android::AndroidA11y::new();
+            match open_search_field(session.platform(), &mut a11y, &ctx) {
+                // Panics with the search screen up, which is the state under test.
+                Ok(_) => panic!("a mid-test assertion failing"),
+                Err(Abandoned(why)) if std::time::Instant::now() < deadline => {
+                    eprintln!("abandoned: {why}; reopening Settings");
+                    arming.lock().unwrap().push(why);
+                }
+                Err(Abandoned(why)) => {
+                    arming.lock().unwrap().push(why);
+                    return;
+                }
+            }
+            // Dropping `session` tore Settings down; the next attempt launches it again.
+            std::thread::sleep(SETUP_PAUSE);
+        }
     }));
     std::panic::set_hook(hushed);
 
-    assert!(outcome.is_err(), "the body must have panicked");
     assert!(
-        armed.load(std::sync::atomic::Ordering::SeqCst),
-        "Settings never put its search screen up, so this run never created the state under test"
+        outcome.is_err(),
+        "Settings never put its search screen up in {SETUP_BUDGET:?}, so this run never created \
+         the state under test: {}",
+        attempts_summary(&armed.lock().unwrap())
     );
 
     // The next test's first act: `Session::start` panics on the `Timeout(15000)` an abandoned
@@ -356,12 +334,46 @@ fn abandon_or_fail(
 }
 
 /// One attempt at the write leg, opening the search screen it needs for itself.
-fn write_leg(
+/// The reasons a retried setup gave, collapsed with their counts.
+///
+/// The raw list was fourteen identical sentences, which hides a *second* reason among them.
+fn attempts_summary(reasons: &[String]) -> String {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for reason in reasons {
+        match counted
+            .iter_mut()
+            .find(|(seen, _)| *seen == reason.as_str())
+        {
+            Some((_, n)) => *n += 1,
+            None => counted.push((reason, 1)),
+        }
+    }
+    counted
+        .iter()
+        .map(|(reason, n)| format!("{n}\u{d7} {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// How long to wait for the field after tapping Settings' search entry, and how often to look.
+///
+/// A poll, not a sleep: on the CI AVD `SearchActivity` reported `Displayed … +1s768ms` and its IME
+/// followed ~300ms after that, so the fixed 1500ms this replaces was short of a working device
+/// (run 31046794185).
+const SEARCH_FIELD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+const SEARCH_FIELD_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Tap Settings' search entry and return the editable field it puts up.
+///
+/// Every step that can fail says which one it was: a device still settling draws no search entry,
+/// one that cannot be read says nothing about the screen at all, and a field that never arrives
+/// after a landed tap is the search app going away underneath — what [`SETUP_BUDGET`] exists for.
+/// Collapsing them into one message cost a CI run its diagnosis (glass#331).
+fn open_search_field(
     platform: &mut glass_android::AndroidPlatform,
     a11y: &mut glass_android::AndroidA11y,
     ctx: &AxContext,
-) -> Result<(), Abandoned> {
-    // Tap the search entry so Settings puts up its EditText.
+) -> Result<AxTarget, Abandoned> {
     let mut tree = a11y
         .snapshot(ctx)
         .map_err(|e| Abandoned(format!("snapshot: {e}")))?;
@@ -371,7 +383,12 @@ fn write_leg(
     })
     .and_then(|n| n.bounds)
     .and_then(|b| b.clamped_center(ctx.window.width, ctx.window.height))
-    .ok_or_else(|| Abandoned("Settings shows no search entry".into()))?;
+    .ok_or_else(|| {
+        Abandoned(format!(
+            "Settings shows no search entry; {}",
+            showing(&tree)
+        ))
+    })?;
     platform
         .send_pointer(&PointerEvent::Click {
             x: search.0,
@@ -380,22 +397,60 @@ fn write_leg(
             count: 1,
             modifiers: vec![],
         })
-        .expect("tap search");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+        .map_err(|e| Abandoned(format!("tap the search entry: {e}")))?;
 
-    let mut tree = a11y
-        .snapshot(ctx)
-        .map_err(|e| Abandoned(format!("re-snapshot: {e}")))?;
-    tree.assign_ids();
-    let field = find(&tree.root, &|n| n.states.editable)
-        .ok_or_else(|| Abandoned("no editable field after the tap".into()))?;
-    let target = AxTarget {
-        id: field.id,
-        role: field.role,
-        name: field.name.clone(),
-        bounds: field.bounds,
-        value: field.value.clone(),
-    };
+    let deadline = std::time::Instant::now() + SEARCH_FIELD_BUDGET;
+    loop {
+        let mut tree = a11y
+            .snapshot(ctx)
+            .map_err(|e| Abandoned(format!("re-snapshot: {e}")))?;
+        tree.assign_ids();
+        if let Some(field) = find(&tree.root, &|n| n.states.editable) {
+            return Ok(AxTarget {
+                id: field.id,
+                role: field.role,
+                name: field.name.clone(),
+                bounds: field.bounds,
+                value: field.value.clone(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Abandoned(format!(
+                "no editable field {SEARCH_FIELD_BUDGET:?} after the tap landed; {}",
+                showing(&tree)
+            )));
+        }
+        std::thread::sleep(SEARCH_FIELD_POLL);
+    }
+}
+
+/// What a tree had on it, for an error that would otherwise say only what was missing.
+///
+/// Names rather than roles: Settings' own items name themselves, so "Network & internet, Connected
+/// devices" is the search app gone rather than a tree that came back empty.
+fn showing(tree: &AxTree) -> String {
+    fn names(node: &AxNode, into: &mut Vec<String>) {
+        if let Some(n) = node.name.as_deref()
+            && into.len() < 6
+        {
+            into.push(n.to_string());
+        }
+        node.children.iter().for_each(|c| names(c, into));
+    }
+    let mut found = Vec::new();
+    names(&tree.root, &mut found);
+    if found.is_empty() {
+        return format!("the tree has {} nodes and none is named", tree.count);
+    }
+    format!("on screen: {}", found.join(", "))
+}
+
+fn write_leg(
+    platform: &mut glass_android::AndroidPlatform,
+    a11y: &mut glass_android::AndroidA11y,
+    ctx: &AxContext,
+) -> Result<(), Abandoned> {
+    let target = open_search_field(platform, a11y, ctx)?;
 
     // A write that lands: reported Ok, and the node at that id holds it afterwards.
     if let Err(e) = a11y.set_value(ctx, &target, "glass") {
@@ -506,8 +561,8 @@ fn set_value_reports_whether_the_write_landed() {
         abandoned.push(why);
         assert!(
             std::time::Instant::now() < deadline,
-            "Settings never held its search screen up for one write leg in {SETUP_BUDGET:?}: \
-             {abandoned:?}"
+            "Settings never held its search screen up for one write leg in {SETUP_BUDGET:?}: {}",
+            attempts_summary(&abandoned)
         );
         reopen_settings();
         std::thread::sleep(SETUP_PAUSE);
