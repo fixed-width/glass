@@ -200,6 +200,14 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- `glass_set_value` on Android now really does retry the read-back that confirms a write, instead
+  of retrying only when the device happened to be fast. The retry allowance was two seconds of
+  wall-clock, but a single `uiautomator` attempt costs seconds on a loaded device — measured at
+  3.5s apart — so the allowance was routinely spent inside the first attempt and no second one ever
+  started. What that first attempt waits for is the accessibility bridge finishing registration,
+  which takes about 300ms; the write had landed, and the tool reported it as unconfirmable anyway.
+  The allowance is now expressed as attempts, so it means the same thing on a fast device and a
+  slow one, and the whole read-back phase carries one ceiling rather than one per attempt.
 - `glass_wait_for_element` now waits for a just-launched app to publish its accessibility tree
   instead of failing on its first read. An app registers with the accessibility bus a moment after
   its window maps, and until then there is nothing to read; the wait treated that as a hard failure
