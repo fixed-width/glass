@@ -87,8 +87,9 @@ pub(crate) fn attempt_deadline() -> Instant {
 /// One `uiautomator dump`, returning the XML it wrote. Every step is bounded by `deadline` — see
 /// [`attempt_deadline`].
 ///
-/// `uiautomator dump` exits 0 even when it fails and reports the reason on stderr, so
-/// neither its exit status nor its stdout can be trusted; the file it was asked to write
+/// `uiautomator dump` fails in two shapes: it exits 0 with the reason on stderr, or it crashes and
+/// exits non-zero with stderr empty, its trace going to logcat instead (glass#341). Neither its
+/// exit status nor its stdout can be trusted; the file it was asked to write
 /// is the only reliable success signal. That file is this attempt's alone — see
 /// [`attempt_path`], which `prefix` names the family for — so no other dump can stand in for one
 /// this attempt never wrote.
@@ -101,7 +102,19 @@ pub(crate) fn dump_once(
     deadline: Instant,
 ) -> Result<String> {
     let path = attempt_path(prefix);
-    let (_, stderr) = run(&["shell", "uiautomator", "dump", &path], deadline)?;
+    let stderr = match run(&["shell", "uiautomator", "dump", &path], deadline) {
+        Ok((_, stderr)) => stderr,
+        Err(e) if died_unexplained(&e) => {
+            // The crash is raised after the file is opened, so this attempt can own one. Retried,
+            // each crash would strand another.
+            let _ = run(&["shell", "rm", "-f", &path], deadline);
+            return Err(GlassError::AccessibilityUnavailable(format!(
+                "uiautomator dump exited without writing {path} and without saying why; \
+                 its reason, if any, is in logcat"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     let read = run(&["shell", "cat", &path], deadline);
     let _ = run(&["shell", "rm", "-f", &path], deadline);
     match read {
@@ -131,10 +144,21 @@ fn bound_fired(e: &GlassError) -> bool {
     msg.contains(TIMED_OUT) || msg.contains(NOT_STARTED)
 }
 
-/// Dump, retrying while `uiautomator` reports it cannot serve one yet, up to `budget`.
+/// Whether a failed dump gave no reason of its own — the mark of a `uiautomator` that crashed.
 ///
-/// Only that one failure resolves by waiting: an adb or device error is returned at once,
-/// so a device that has gone away is not retried for the whole budget.
+/// It dies with a `NullPointerException` walking a tree that is still changing, exiting non-zero
+/// with an empty stderr because the trace goes to logcat via `AndroidRuntime` (glass#341). That
+/// resolves by waiting. adb's own failures — a device that is gone, a wedged server — always carry
+/// a reason and do not.
+fn died_unexplained(e: &GlassError) -> bool {
+    !bound_fired(e) && e.to_string().trim_end().ends_with("failed:")
+}
+
+/// Dump, retrying while `uiautomator` cannot serve one yet, up to `budget`.
+///
+/// Two failures resolve by waiting — a bridge not serving yet, and the crash
+/// [`died_unexplained`] names. An adb or device error is returned at once, so a device that has
+/// gone away is not retried for the whole budget.
 ///
 /// Returns within `budget` plus one attempt — `AdbOp::Dump`'s budget, per [`attempt_deadline`].
 /// `budget` bounds the retrying, waits between attempts included, and the last attempt it starts
@@ -488,6 +512,30 @@ mod tests {
         ))
     }
 
+    /// What `Adb` raises for the crash [`died_unexplained`] names: non-zero exit, empty stderr.
+    fn crash_err(path: &str) -> GlassError {
+        GlassError::Backend(format!("`adb shell uiautomator dump {path}` failed: "))
+    }
+
+    /// An adb whose `uiautomator dump` crashes for `crashes` attempts, then succeeds.
+    fn fake_crashing(crashes: usize) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
+        let mut dumps = 0;
+        move |argv: &[&str], _deadline: Instant| match argv {
+            ["shell", "uiautomator", "dump", path] => {
+                dumps += 1;
+                if dumps > crashes {
+                    Ok((DUMPED.to_string(), String::new()))
+                } else {
+                    Err(crash_err(path))
+                }
+            }
+            ["shell", "cat", _] if dumps > crashes => Ok((XML.to_string(), String::new())),
+            ["shell", "cat", path] => Err(read_err(path)),
+            ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
+            other => panic!("unexpected adb command: {other:?}"),
+        }
+    }
+
     /// An adb whose `uiautomator dump` fails as a cold device's does for `cold` attempts,
     /// then succeeds.
     fn fake(cold: usize) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
@@ -821,6 +869,57 @@ mod tests {
         assert_eq!(
             attempts, 1,
             "must not wait out the budget on a device error"
+        );
+    }
+
+    #[test]
+    fn a_dump_that_died_without_explaining_itself_is_retried() {
+        // Measured at 3 failures in 14 runs entering the suite straight from a snapshot restore;
+        // a later dump against a settled tree succeeds, so waiting is the whole remedy.
+        let mut run = fake_crashing(2);
+        let xml = dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
+            .expect("a dump that crashed must be retried inside the budget");
+        assert_eq!(xml, XML);
+    }
+
+    #[test]
+    fn a_dump_that_crashed_takes_its_partial_file_with_it() {
+        // The crash is raised inside `dumpWindowToFile`, so a dead attempt can still own a file.
+        let mut files: HashMap<String, String> = HashMap::new();
+        let mut dumps = 0;
+        {
+            let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
+                match argv {
+                    ["shell", "uiautomator", "dump", path] => {
+                        dumps += 1;
+                        // Opened before the walk that dies, so a crashed attempt still has one.
+                        files.insert((*path).to_string(), String::new());
+                        if dumps > 2 {
+                            files.insert((*path).to_string(), XML.to_string());
+                            Ok((DUMPED.to_string(), String::new()))
+                        } else {
+                            Err(crash_err(path))
+                        }
+                    }
+                    ["shell", "cat", path] => match files.get(*path) {
+                        Some(xml) => Ok((xml.clone(), String::new())),
+                        None => Err(read_err(path)),
+                    },
+                    ["shell", "rm", "-f", path] => {
+                        files.remove(*path);
+                        Ok((String::new(), String::new()))
+                    }
+                    other => panic!("unexpected adb command: {other:?}"),
+                }
+            };
+            dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
+                .expect("the attempt after the crashes dumps");
+        }
+
+        assert!(
+            files.is_empty(),
+            "crashed attempts stranded {:?}",
+            files.keys().collect::<Vec<_>>()
         );
     }
 
