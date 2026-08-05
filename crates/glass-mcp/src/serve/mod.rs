@@ -100,14 +100,13 @@ fn build_router(cfg: &ServeConfig, server: GlassServer, cancel: &CancellationTok
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build it via the builder
     // rather than a struct literal.
     //
-    // rmcp's default `allowed_hosts` is loopback-only (`localhost`/`127.0.0.1`/`::1`) —
-    // a DNS-rebinding defense for *token-less* browser attacks. When a token is set,
-    // that allow-list would wrongly 403 a legitimate LAN client whose `Host` is the
-    // bind IP (the spec D1/D4 trusted-LAN-with-token case, incl. a `0.0.0.0` bind whose
-    // reachable IP we can't enumerate here). The bearer token is the real access
-    // control, and a rebinding attacker can't supply it, so the Host allow-list adds
-    // nothing once a token is required — disable it. With NO token (loopback-only per
-    // D4) we keep the default allow-list, where DNS-rebinding protection still matters.
+    // rmcp's default `allowed_hosts` is loopback-only (`localhost`/`127.0.0.1`/`::1`) — a
+    // DNS-rebinding defense for *token-less* browser attacks. When a token is set, that
+    // allow-list would wrongly 403 a legitimate LAN client whose `Host` is the bind IP,
+    // including a `0.0.0.0` bind whose reachable IP can't be enumerated here. The bearer
+    // token is the real access control and a rebinding attacker can't supply it, so the
+    // allow-list adds nothing once a token is required. With NO token we keep the default,
+    // where DNS-rebinding protection still matters.
     let mut http_cfg =
         StreamableHttpServerConfig::default().with_cancellation_token(cancel.clone());
     if cfg.token.is_some() {

@@ -390,19 +390,14 @@ mod tests {
 
     #[test]
     fn wait_stable_with_ignore_masks_saw_motion_without_outlasting_scripted_frames() {
-        // Pixel (3,3) blinks every frame — a stand-in for a blinking text
-        // caret, a clock, a spinner — while the rest of the 4x4 frame stays
-        // constant. Without `ignore` reaching `WaitStableParams`, the full-
-        // frame comparison would never settle; masking it lets the
-        // otherwise-constant stream settle normally.
+        // Pixel (3,3) blinks every frame — a stand-in for a caret, a clock, a spinner —
+        // while the rest of the 4x4 frame stays constant, so without `ignore` reaching
+        // `WaitStableParams` the full-frame comparison never settles.
         //
-        // `settled:true` alone is NOT the discriminator here: a generous
-        // timeout would eventually settle even without `ignore` reaching
-        // core, once polling outlasts the 3 scripted frames into
-        // `FakePlatform`'s repeat-forever fallback (the repeated final frame
-        // compared to itself "settles" trivially, proving nothing about the
-        // wiring). `saw_motion:false` and pinning the capture count to
-        // exactly 3 (the frames actually supplied) are what rule that out.
+        // `settled:true` alone is NOT the discriminator: `FakePlatform` repeats its last
+        // supplied frame forever, so polling past the 3 scripted frames settles trivially
+        // even without `ignore` reaching core. `saw_motion:false` and pinning the capture
+        // count to 3 are what rule that out.
         let log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);

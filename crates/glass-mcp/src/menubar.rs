@@ -100,12 +100,11 @@ mod macos {
         };
 
         if let Some(std_listener) = listener {
-            // We're on the `#[tokio::main]` block_on thread, so the runtime context is entered:
-            // `TcpListener::from_std` (reactor registration) and `tokio::spawn` both work here.
-            // VERIFY on-box: with the main thread blocked in `NSApplication::run`, the
-            // multi-thread runtime's worker threads must keep driving the I/O reactor + this
-            // spawned task — confirm the server actually accepts MCP connections while the menu
-            // bar is up (the whole premise of the visible daemon).
+            // We're on the `#[tokio::main]` block_on thread, so the runtime context is
+            // entered: `TcpListener::from_std` (reactor registration) and `tokio::spawn` both
+            // work here. With the main thread blocked in `NSApplication::run`, the
+            // multi-thread runtime's worker threads are what keep driving the I/O reactor and
+            // this spawned task.
             std_listener
                 .set_nonblocking(true)
                 .map_err(|e| anyhow::anyhow!("making the listener non-blocking: {e}"))?;

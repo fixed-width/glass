@@ -222,11 +222,7 @@ pub fn run(actions: MenuBarActions) -> Result<()> {
     // background threads. `status_item`, `menu`, and `target` must outlive this call
     // (`setTarget:` holds only a weak reference), so they stay bound below.
     //
-    // VERIFY on-box: the status item shows the `title` ("glass ●"), the dropdown lists the
-    // greyed status line plus "Copy endpoint", "Restart", "Quit glass", and "Uninstall glass…";
-    // "Copy endpoint"/"Restart"/"Uninstall glass…" invoke their callbacks (the uninstall one
-    // raising the host's confirm dialog first), and "Quit glass" (⌘Q → `terminate:`) exits the
-    // process cleanly. None of this is checkable off a real WindowServer/AppKit run loop; the
+    // None of the menu's behaviour is checkable off a real WindowServer/AppKit run loop; the
     // darwin build only proves it compiles.
     app.run();
 

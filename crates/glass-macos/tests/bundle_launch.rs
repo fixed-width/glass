@@ -415,13 +415,10 @@ mod macos_main {
             Ok(())
         });
 
-        // Orphan check: only meaningful once the main check above actually adopted
-        // TextEdit, and only asserted when this test's own call was the fresh launch —
-        // re-run the same `process_running` probe used above (now post-`stop_app`, via
-        // `with_stop_app`) rather than tracking the adopted pid directly, since
-        // `MacosPlatform`'s `adopted`/`app_pid` fields are private to `glass-macos`. A
-        // `match` on both facts (rather than if/else-if) keeps all three outcomes explicit,
-        // including the "main check already failed" case, which has nothing to verify here.
+        // Orphan check: only meaningful once the main check above actually adopted TextEdit,
+        // and only asserted when this test's own call was the fresh launch. Re-runs the
+        // `process_running` probe rather than tracking the adopted pid directly, since
+        // `MacosPlatform`'s `adopted`/`app_pid` fields are private to `glass-macos`.
         match (&result, text_edit_was_running) {
             (Ok(()), false) => {
                 std::thread::sleep(TERMINATE_SETTLE);
@@ -496,10 +493,8 @@ mod macos_main {
         // No blanket precondition gate here — each check declines itself (returning
         // `Outcome::Skipped`) when the ONE precondition it needs is absent, so a missing
         // `swiftc` can never skip the handoff/fail-closed checks and a missing `TextEdit.app`
-        // can never skip the foreground check. Failures fail the run; skips are reported
-        // distinctly (SKIPPED, never counted as a pass) and do not block the PASS banner for
-        // the checks that did run and pass. On the dev Mac both preconditions are present, so
-        // all three run.
+        // can never skip the foreground check. Skips are reported distinctly, never counted
+        // as a pass.
         let mut failures = Vec::new();
         let mut skips = Vec::new();
 

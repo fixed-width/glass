@@ -338,14 +338,11 @@ impl Glass {
         }
         let region = params.stability_region;
         let window = params.window;
-        // The mask is built lazily, on the first poll tick, sized from that
-        // captured frame's own dimensions rather than the session's cached
-        // geometry — which can belong to a different window than the one being
-        // watched, or be stale if the watched window resized itself since the
-        // cache was last refreshed. `for_region` intersects `ignore` with
-        // `region` and translates into region-local coordinates (`capture`
-        // crops to `region` when one is set, so the settle comparison and the
-        // mask must agree on that same cropped space).
+        // Built lazily on the first tick and sized from that frame, not the session's
+        // cached geometry, which can belong to a different window or be stale after a
+        // self-resize. `for_region` intersects `ignore` with `region` and translates into
+        // region-local coordinates, since `capture` crops to `region` and the settle
+        // comparison and the mask must agree on that space.
         let mut tracker: Option<StabilityTracker> = None;
         let outcome = crate::poll::poll_until(params.interval_ms, params.timeout_ms, || {
             // Poll only the watched region (cheap) when one is set; else the full window.
@@ -396,10 +393,9 @@ impl Glass {
         let mut signal = (params.interval_ms > 0)
             .then(|| self.subscribe_a11y_changes())
             .flatten();
-        // Subscribing spends the caller's budget, so the poll loop gets what is left. That bounds
-        // the polling, not the call: a reader bounds its own handshake in seconds, so a wait told
-        // to give up after 500ms can return later than that. `elapsed_ms` is measured from before
-        // the subscribe and reports it.
+        // Subscribing spends the caller's budget, so the poll loop gets what is left. That
+        // bounds the polling, not the call: a reader bounds its own handshake in seconds, so a
+        // wait told to give up after 500ms can return later than that.
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
@@ -501,12 +497,9 @@ impl Glass {
         self.require_active()?;
         let start = std::time::Instant::now();
         let geo = self.geometry()?;
-        // Return a match once scrolling can't improve its visibility: it has an
-        // on-screen clickable center, or its bounds are unknown (a backend that can't
-        // read an element's geometry keeps `bounds: None` — scrolling won't populate
-        // them, and `click_element` reports that state honestly). Only a known
-        // off-screen element (bounds present but no on-screen intersection) is worth
-        // scrolling past.
+        // Return a match once scrolling can't improve its visibility: it has an on-screen
+        // clickable center, or its bounds are unknown (scrolling won't populate a
+        // `bounds: None` a backend couldn't read).
         let ready = |info: &ElementInfo| match info.bounds {
             Some(b) => b.clamped_center(geo.width, geo.height).is_some(),
             None => true,
@@ -634,13 +627,10 @@ impl Glass {
             }
             None => self.capture(params.window, params.region.as_ref())?,
         };
-        // The mask is built once, sized from `reference` — the frame that will
-        // actually be compared every tick — not from the session's cached window
-        // geometry, which can be stale or belong to a different window (the same
-        // trap `wait_stable` hit: see its mask-build comment). Every polled
-        // `current` frame is required to match `reference`'s size (the masked
-        // diff functions error otherwise via `SizeMismatch`), so `reference`'s own
-        // dimensions are exactly the comparison's real size, cropped or not.
+        // Built once, sized from `reference` — the frame actually compared every tick — not
+        // from the session's cached geometry, which can be stale or belong to a different
+        // window. Every polled frame must match `reference`'s size (`SizeMismatch` otherwise),
+        // so those dimensions are the comparison's real size, cropped or not.
         let mask = mask_for(
             &params.ignore,
             params.region.as_ref(),
@@ -842,14 +832,9 @@ mod tests {
         // clock — while the rest of the 4x4 frame stays constant black. Masking
         // it lets the (otherwise-constant) frame settle on the scripted frames.
         //
-        // `settled` alone is NOT the discriminator: without the mask the stream
-        // still settles, just *late*. `FakePlatform` repeats its last supplied
-        // frame forever once exhausted, so once polling outlasts the 3 scripted
-        // frames it compares that repeated final frame to itself and "settles"
-        // trivially — proving nothing about `ignore`. Pinning the capture count to
-        // exactly 3 (the frames actually supplied) rules that out: settling within
-        // them can only happen if the blink was masked from the very first
-        // comparison.
+        // `settled` alone is NOT the discriminator: `FakePlatform` repeats its last supplied
+        // frame forever, so polling past the 3 scripted frames compares that repeat to itself
+        // and settles trivially. Pinning the capture count to 3 rules that out.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);
@@ -922,16 +907,10 @@ mod tests {
 
     #[test]
     fn wait_stable_masks_by_captured_frame_size_not_stale_cached_geometry() {
-        // The cached window geometry is a deliberately stale/smaller 2x2 —
-        // `FakePlatform::new(2, 2)` — while `with_frames` serves the same 4x4
-        // blinking frames as the sibling test above. This models watching a
-        // window whose real size the session's geometry cache doesn't reflect
-        // (a different window, or a self-resize since the cache was last
-        // refreshed). The `ignore` rect at (3,3) falls outside the stale 2x2
-        // bounds but inside the actual 4x4 frame: if the mask were ever sized
-        // from the cached geometry instead of the captured frame, (3,3) would be
-        // clamped away, the blink would go unmasked, and the frames would never
-        // settle within the timeout.
+        // The cached geometry is a deliberately stale 2x2 while the frames are 4x4 — a window
+        // whose real size the cache doesn't reflect. The `ignore` rect at (3,3) is outside the
+        // stale bounds but inside the real frame, so a mask sized from the cache would clamp
+        // it away and the blink would never settle.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);
@@ -1342,7 +1321,7 @@ mod tests {
         //
         // No lower bound: this signal answers instantly, so `d.saturating_sub(~0)` is `d` and the
         // pacing arithmetic cannot be wrong here — `a_change_arriving_mid_interval_still_paces_the_next_read`
-        // is what tells the two apart. A floor would only add timing flake for nothing.
+        // tells the two apart.
         assert!(
             n <= 36,
             "a chatty app drove {n} walks in 600ms at a 20ms interval"
@@ -1616,7 +1595,6 @@ mod tests {
         // report a misleading `matched:false`.
         let scrolls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let platform = FakePlatform::new(100, 100).with_scroll_log(scrolls.clone());
-        // A Button with no bounds (a backend that can't read geometry keeps it None).
         let tree = tree_with(100, 100, vec![ax_node(1, AxRole::Button, None, vec![])]);
         let mut g = glass_with_a11y(platform, tree);
         g.start(&spec()).unwrap();
@@ -2059,17 +2037,13 @@ mod tests {
 
     #[test]
     fn wait_for_region_ignore_masks_a_changing_rect_so_changes_never_matches() {
-        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a
-        // clock — while the rest of the 4x4 frame stays constant. Masking it means
-        // `until: Changes` has nothing left to react to: the corner is the only
-        // pixel that ever differs, and it is excluded from the comparison.
+        // Pixel (3,3) blinks every frame — a stand-in for a blinking caret or a clock — while
+        // the rest of the 4x4 frame stays constant, so masking it leaves `until: Changes`
+        // nothing to react to.
         //
-        // `timeout_ms: 0` bounds the wait to exactly one poll after the reference
-        // capture (see `poll_until`), so a generous timeout letting `FakePlatform`
-        // outlast its scripted frames into its repeat-forever fallback can't be
-        // what makes this pass — the outcome is decided by that single real
-        // comparison. Pinning the capture count to 2 (reference + one poll) makes
-        // that explicit.
+        // `timeout_ms: 0` bounds the wait to one poll after the reference capture, so a
+        // generous timeout outlasting the scripted frames into `FakePlatform`'s
+        // repeat-forever fallback can't be what makes this pass.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);
@@ -2110,18 +2084,12 @@ mod tests {
 
     #[test]
     fn wait_for_region_ignore_is_window_relative_under_a_region() {
-        // (3,3) blinks and is INSIDE the watched region (2,2,2,2), so the cropped
-        // frames differ every poll; only a window-relative rect translated into
-        // region-local space masks it. The region-scoped path was the last one
-        // left unexercised for `ignore`; the siblings are
-        // `wait_stable_ignore_is_window_relative_under_a_stability_region` and
-        // `baseline_ignore_is_window_relative_under_a_region`.
+        // (3,3) blinks and is INSIDE the watched region (2,2,2,2), so the cropped frames
+        // differ every poll; only a window-relative rect translated into region-local space
+        // masks it.
         //
-        // Pinning the capture count to 2 (reference + exactly one poll, via
-        // `timeout_ms: 0`) makes the translation load-bearing: this can only be
-        // `!matched` if the window-relative rect was translated into region-local
-        // space and masked the blink on that single real comparison. Drop the
-        // translation (build the mask with no region) and the rect lands outside
+        // Pinning the capture count to 2 (reference + one poll, via `timeout_ms: 0`) makes the
+        // translation load-bearing: build the mask with no region and the rect lands outside
         // the 2x2 crop, the blink registers, and this flips to `matched`.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
@@ -2168,15 +2136,12 @@ mod tests {
 
     #[test]
     fn wait_for_region_ignore_lets_matches_converge_despite_a_changing_rect() {
-        // The baseline is saved while the corner is 10; the polled stream then
-        // serves a frame with the corner at 20 — otherwise identical. Without
-        // masking, that real corner difference would keep `until: Matches` from
-        // ever being satisfied; masking it lets the (otherwise-constant) rest of
-        // the frame converge on the very first poll.
+        // The baseline is saved while the corner is 10; the polled frame has it at 20,
+        // otherwise identical. Unmasked, that difference keeps `until: Matches` from ever
+        // being satisfied.
         //
-        // Pinning the capture count to 2 (the baseline save + one poll) rules out
-        // a generous timeout eventually matching by other means: it can only
-        // happen if the corner was masked from that first real comparison.
+        // Pinning the capture count to 2 (baseline save + one poll) rules out a generous
+        // timeout matching by other means.
         let log = Arc::new(Mutex::new(Vec::new()));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);
@@ -2546,7 +2511,7 @@ mod tests {
             Some(ScrollDirection::Left)
         );
         assert_eq!(offscreen_direction(at(-9, 50), 100, 100), None);
-        // Same on the vertical axis, including the Up case the older test omits.
+        // Same on the vertical axis, Up included.
         assert_eq!(
             offscreen_direction(at(50, 100), 100, 100),
             Some(ScrollDirection::Down)

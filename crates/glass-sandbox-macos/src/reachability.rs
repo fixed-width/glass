@@ -278,16 +278,11 @@ mod tests {
 
     // -------------------------------------------------------------------------
     // 8. Invariant over a mixed launch: no ro_binds entry is /, /Users, or a bare home root.
-    // LOAD-BEARING. MIXED: the REAL half runs a mixed launch (project dir, directory arg, relative
-    // arg, and the real "/" arg) through launch_reallows and asserts the invariant on the actual
-    // output. The PREDICATE half closes the gap the real half can't reach on this box (no /Users
-    // tree): it sweeps representative home-root paths and proves algebraically that
-    // `push_reallows` could never place one in ro_binds — is_home_root_or_above is true for /,
-    // /Users, and every bare home root (so push_reallows returns before touching either list), and
-    // for a file living directly under a bare home root, is_safe_reallow(dir_of(file)) is false (so
-    // even when not skipped outright, the routing is forced to ro_files, never ro_binds). Together
-    // these are exactly the two branches push_reallows has for reaching ro_binds — proving neither
-    // can produce a home-root entry closes the invariant.
+    // LOAD-BEARING. MIXED: the REAL half runs a mixed launch through launch_reallows and asserts
+    // the invariant on the actual output. The PREDICATE half closes the gap the real half can't
+    // reach on this box (no /Users tree): is_home_root_or_above is true for /, /Users and every
+    // bare home root, and for a file directly under a bare home root is_safe_reallow(dir_of) is
+    // false — exactly the two branches push_reallows has for reaching ro_binds.
     // -------------------------------------------------------------------------
     #[test]
     fn no_ro_bind_is_a_home_root_or_above() {

@@ -416,21 +416,18 @@ fn walk(
     let ax_role = ffi::attribute_string(el, attr::ROLE).unwrap_or_default();
     let subrole = read_subrole(el, &ax_role);
     let role = mapping::map_role(&ax_role, subrole.as_deref());
-    // `raw_role` is normally the same AX role string `map_role` just matched on — the token, not
+    // `raw_role` is normally the same AX role string `map_role` matched on — the token, not
     // `AXRoleDescription`'s localized human phrase ("button" / "bouton"), which is useless as a
-    // mapping key and not worth a second attribute read on every node. A subrole is appended
-    // (`"AXRow/AXOutlineRow"`, `"AXCheckBox/AXSwitch"`) only when it *decided* the mapped role, so
-    // it is the evidence for a role the base token does not explain. Deliberately not appended
-    // otherwise: the gate reads a subrole for every button, and decorating them all would rename
-    // `AXButton` to `AXButton/AXCloseButton` across every window's controls and split the role
-    // histogram the probe prints, for a token nothing maps.
+    // mapping key. A subrole is appended (`"AXRow/AXOutlineRow"`) only when it *decided* the
+    // mapped role. Deliberately not appended otherwise: the gate reads a subrole for every
+    // button, and decorating them all would rename `AXButton` to `AXButton/AXCloseButton`
+    // across every window's controls and split the role histogram the probe prints.
     //
     // The fallback is conditional because that trade only holds while `AXRole` says something.
-    // A custom or non-standard control is expected to report a generic role — `AXUnknown`, or no
-    // `AXRole` at all — and put what distinguishes it in `AXRoleDescription`; there the
-    // description is the only descriptor there is, so read it rather than emit a node nothing
-    // can identify. Ordinary nodes never pay for the second read. If both are absent `raw_role`
-    // stays the empty string — a "role unknown" signal, not a guaranteed-populated field.
+    // A custom control reports a generic role — `AXUnknown`, or no `AXRole` at all — and puts
+    // what distinguishes it in `AXRoleDescription`, which is then the only descriptor there is.
+    // If both are absent `raw_role` stays empty: a "role unknown" signal, not a guaranteed
+    // field.
     let raw_role = if ax_role.is_empty() || ax_role == "AXUnknown" {
         ffi::attribute_string(el, attr::ROLE_DESCRIPTION).unwrap_or(ax_role)
     } else {
@@ -449,13 +446,10 @@ fn walk(
     // surfaces as `AXDescription`). Never fold in `AXValue`: it's volatile content, and a
     // node's name must stay stable for the `AxTarget` fingerprint `set_value` relies on.
     //
-    // Which attribute is left to describe the node therefore depends on which one named it, so
-    // both labels are decided in one place. `AXDescription` costs at most one read per node
-    // either way: as the name when there is no title, as the description only when there IS a
-    // title and no `AXHelp` — worth reading there, unlike the untitled case where
-    // `AXDescription` IS the name and could only ever normalize away as a duplicate of it. (A
-    // titled node whose title and description hold the same string still normalizes away — the
-    // value check, not the branch, is what drops it.)
+    // Which attribute is left to describe the node depends on which one named it, so both
+    // labels are decided in one place. `AXDescription` costs at most one read per node either
+    // way: as the name when there is no title, as the description only when there IS a title
+    // and no `AXHelp`.
     let (name, secondary) = match read_label(el, attr::TITLE) {
         Some(title) => (
             Some(title),

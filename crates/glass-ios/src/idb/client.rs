@@ -377,12 +377,11 @@ mod tests {
         // A stale socket file — the companion died, leaving its socket behind. Whether the
         // failure surfaces at `connect` or at the first RPC is a tonic/HTTP-2 timing detail:
         // `connect` can return `Ok` once the stream dials and the client preface is buffered,
-        // before the peer's reset is observed. `connect` makes no promise to reject a dead
-        // socket — liveness is really validated earlier (the companion's `await_socket` at
-        // spawn) and backstopped by `RPC_TIMEOUT` on the first RPC. What we guarantee, and
-        // assert here deterministically so it can't flake on connect's timing, is that a dead
-        // socket is handled cleanly: a structured `Backend` error, never a panic, at one of
-        // those two points (`map_timed` folds every RPC transport error/timeout into `Backend`).
+        // before the peer's reset is observed. Liveness is really validated earlier (the
+        // companion's `await_socket` at spawn) and backstopped by `RPC_TIMEOUT`.
+        //
+        // Asserted deterministically so it can't flake on connect's timing: a dead socket
+        // yields a structured `Backend` error, never a panic, at one of those two points.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("idb.sock");
         {

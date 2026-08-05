@@ -220,17 +220,15 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
     for f in [
         "--unshare-user",
         "--unshare-ipc",
-        // NOTE: --unshare-pid is intentionally OMITTED: a PID namespace makes the
-        // child's std::process::id() return a namespace-relative PID (often 2),
-        // which is what it would write into _NET_WM_PID. glass's window-discovery
-        // then can't match the child by PID (it holds the host PID). Filesystem
-        // and network isolation are the threat-model goals; PID enumeration
-        // isolation is unnecessary when glass owns the sandboxed process.
+        // NOTE: --unshare-pid is intentionally OMITTED: a PID namespace makes the child's
+        // std::process::id() return a namespace-relative PID (often 2), which is what it
+        // would write into _NET_WM_PID — glass's window discovery then can't match the child,
+        // since it holds the host PID.
+        //
         // Security note: without a PID namespace the contained process can see host PIDs in
-        // /proc and send signals to same-UID processes (kill() needs no capability), including
-        // glass-mcp itself. This is an accepted trade-off for this slice — the primary goals are
-        // filesystem and network containment. A future improvement could pass _NET_WM_PID via an
-        // out-of-band channel (e.g. bwrap --json-status-fd) to restore PID-namespace isolation.
+        // /proc and can signal same-UID processes, glass-mcp included. Accepted trade-off —
+        // filesystem and network containment are the goals. Passing _NET_WM_PID out-of-band
+        // (bwrap --json-status-fd) would restore PID-namespace isolation.
         "--unshare-uts",
         "--unshare-cgroup-try",
         "--die-with-parent",
@@ -280,15 +278,13 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Vec<OsS
         // ancestor of one. Mirrors the `shadowed_roots` prefix logic in `launch_ro_binds`.
         //
         // `--tmpfs <home>` and `--tmpfs /tmp` mount ephemeral tmpfs over the real $HOME (hiding
-        // ~/.ssh etc.) and /tmp. If we also emit `--bind <cwd> <cwd>` and cwd equals a shadowed
-        // root (or is a parent of one — e.g. cwd="/home" with home="/home/u", or cwd="/tmp" now
-        // that cwd defaults to glass's current dir), that bind re-mounts the real subtree OVER the
-        // tmpfs, re-exposing everything we just hid.
+        // ~/.ssh etc.) and /tmp. A `--bind <cwd> <cwd>` where cwd equals a shadowed root — or
+        // is a parent of one, e.g. cwd="/home" with home="/home/u" — would re-mount the real
+        // subtree OVER the tmpfs, re-exposing everything just hidden.
         //
-        // `root.starts_with(&cwd_c)` is true when cwd equals a root or is an ancestor of it, so we
-        // skip the bind in both cases. The common subdir case (cwd="/home/u/proj" or "/tmp/scratch")
-        // gives false and is bound rw as usual. The `--ro-bind / /` + tmpfs already provide the path
-        // for the skipped cases so `--chdir` still works.
+        // `root.starts_with(&cwd_c)` is true in both cases. The common subdir case gives false
+        // and is bound rw as usual; `--ro-bind / /` plus the tmpfs still provide the path for
+        // the skipped cases, so `--chdir` works.
         let shadowed_roots = [home_c.as_path(), std::path::Path::new("/tmp")];
         if !shadowed_roots.iter().any(|root| root.starts_with(&cwd_c)) {
             v.push(OsString::from("--bind"));

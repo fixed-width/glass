@@ -592,12 +592,11 @@ fn onbox_handoff_grace() {
         std::thread::sleep(Duration::from_millis(800));
     }
 
-    // Win11 Notepad's launcher hands its UI to a DESCENDANT process and the launcher exits, so the
-    // window is owned by a child in the pid-set (a cold no-hint launch was measured to yield
-    // app_pids=[<descendant>, <root>] and a real window). discover_window's grace period — keep polling
-    // while the pid-set still holds a live descendant — must adopt that window even with NO hint
-    // (the PR #14 behavior; pre-#14 this fast-failed AppExited before the descendant's window mapped).
-    // The no-hint fast-fail-on-true-crash path is covered by the discovery::poll_decision unit tests.
+    // Win11 Notepad's launcher hands its UI to a DESCENDANT process and the launcher exits, so
+    // the window is owned by a child in the pid-set (a cold no-hint launch was measured to
+    // yield app_pids=[<descendant>, <root>] and a real window). discover_window's grace period
+    // — keep polling while the pid-set still holds a live descendant — must adopt that window
+    // even with NO hint.
     kill_notepad();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {

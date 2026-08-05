@@ -108,13 +108,10 @@ pub(crate) fn app_kit_init() {
     if APP_KIT_INIT.is_completed() {
         return;
     }
-    // TOCTOU between the check above and `MainThreadMarker::new()` below is
-    // theoretical-only under the current call graph: every call site reaches this after
-    // `init_main_thread()` has already run on the process's real main thread before any
-    // worker thread is spawned (see this fn's and `init_main_thread`'s docs), so by the
-    // time a second/concurrent call could race the check, `is_completed()` is already
-    // `true`. A future call site that violated "init before spawning workers" would
-    // surface as a loud panic here (below), not silent UB.
+    // TOCTOU between the check above and `MainThreadMarker::new()` below is theoretical under
+    // the current call graph: every call site reaches this after `init_main_thread()` has run
+    // on the process's real main thread, before any worker is spawned. A future call site
+    // that violated that would surface as a loud panic here, not silent UB.
     let mtm = MainThreadMarker::new().expect("app_kit_init must run on the main thread");
     APP_KIT_INIT.call_once(|| {
         let _app = NSApplication::sharedApplication(mtm);
@@ -201,17 +198,12 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
 
     let url = NSURL::fileURLWithPath(&NSString::from_str(&bundle.to_string_lossy()));
     let configuration = NSWorkspaceOpenConfiguration::configuration();
-    // `AppSpec::run[1..]` are the app's arguments, and this path must not be the one that quietly
-    // loses them: the direct spawn above passes them to the process, so a bundle that falls back
-    // to LaunchServices has to carry them too, or the same spec would launch two different apps
-    // depending on which arm ran.
+    // `AppSpec::run[1..]` are the app's arguments, and this path must not lose them: the direct
+    // spawn above passes them to the process, so a bundle that falls back to LaunchServices has
+    // to carry them too, or the same spec launches two different apps depending on which arm ran.
     //
-    // Behaviourally unproven on hardware: `tests/bundle_launch.rs`'s handoff check adopts
-    // TextEdit, and handing it a document changes the window it opens enough that the check's own
-    // window discovery stops matching — so the observation costs a second fixture bundle (one
-    // whose stub exits, forcing this path, and which records its argv). Until that exists this
-    // rests on `setArguments:` doing what it documents, which is weaker evidence than the rest of
-    // this module carries.
+    // Behaviourally unproven on hardware: observing it costs a second fixture bundle whose stub
+    // exits and records its argv, so this rests on `setArguments:` doing what it documents.
     if !args.is_empty() {
         let args: Vec<Retained<NSString>> = args.iter().map(|a| NSString::from_str(a)).collect();
         let args: Vec<&NSString> = args.iter().map(|a| a.as_ref()).collect();
@@ -292,9 +284,7 @@ mod tests {
     fn app_kit_init_panics_off_the_main_thread() {
         // libtest always runs each #[test] on a freshly spawned worker thread, never the
         // process's real main thread, so `MainThreadMarker::new()` is `None` here — this
-        // exercises the off-main-thread guard rather than the real NSApplication touch.
-        // The real call only happens from Task 2's `MacosPlatform::start_app`, which
-        // glass always drives from the main thread.
+        // exercises the off-main-thread guard, not the real NSApplication touch.
         app_kit_init();
     }
 }

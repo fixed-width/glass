@@ -274,12 +274,8 @@ async fn set_value_async(ctx: &AxContext, target: &AxTarget, text: &str) -> Resu
 /// that divergence impossible to introduce by editing only one of them.
 //
 // The exactly-at-cap boundary — a *complete* tree of exactly MAX_NODES must report `None`, since
-// the last node to arrive wasn't declined — is unit-tested in the Android/iOS mappers, which
-// build a synthetic tree of a precise size in-process (a live GTK tree can't be sized to the node
-// exactly). The live *over-cap* path — a real AT-SPI tree past MAX_NODES yields a bounded,
-// complete prefix flagged `Nodes` — is covered by `snapshot_past_node_cap_is_bounded_complete_and_flagged`
-// in tests/integration.rs (run via scripts/test-a11y.sh). `walk` issues each node's independent
-// reads concurrently, so a cap-sized live tree snapshots well within `SNAPSHOT_TIMEOUT`.
+// the last node to arrive wasn't declined — is unit-tested in the Android/iOS mappers, which can
+// size a synthetic tree to the node. A live GTK tree can't be.
 fn may_explore_children(budget: &mut WalkBudget, depth: usize) -> bool {
     if budget.depth_exhausted(depth) {
         budget.hit(TruncationLimit::Depth);
@@ -411,11 +407,10 @@ async fn walk(
     budget.visit();
     // Issue the seven independent per-node reads concurrently on the shared connection and await
     // the slowest, instead of paying seven sequential D-Bus round-trips (~7x the per-node
-    // latency). zbus multiplexes concurrent method calls over one connection. Traversal order,
-    // `budget` accounting, the child-gate, and child recursion below are all unchanged, so node
-    // ids stay in lockstep with `find_nth`. On the error path `join!` completes all seven before
-    // we bail (vs. short-circuiting) — the result is identical, at the cost of a few reads on a
-    // snapshot that was already failing.
+    // latency); zbus multiplexes concurrent method calls over one connection. Traversal order and
+    // `budget` accounting are unchanged, so node ids stay in lockstep with `find_nth`. On the
+    // error path `join!` completes all seven before bailing — the same result, at the cost of a
+    // few reads on a snapshot that was already failing.
     let (role_res, raw_role_res, name_res, description_res, state_res, bounds, child_refs_res) = tokio::join!(
         proxy.get_role(),
         proxy.get_role_name(),

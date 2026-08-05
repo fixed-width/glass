@@ -141,16 +141,14 @@ pub(crate) fn tree_from_json(
 ) -> Result<AxTree> {
     let mut budget = WalkBudget::with_limits(limits);
     let mut root = json_to_node(tree, win, 0, &mut budget)?;
-    // The device answers with the root of the ACTIVE WINDOW, so this node is the window —
-    // whatever layout class it happens to carry. Say so, for the same reason the
-    // uiautomator reader wraps its dump in a Window root: both Android readers have to
-    // agree about the root, or a `role:` selector written against one misses on the other.
-    // The node itself is untouched — no synthetic wrapper — because `AxNodeId(n)` is the
-    // device's `ref` n and an extra node would shift every id `set_value` addresses by.
-    // `raw_role` keeps the device's class on the node, so anything that reads the node itself
-    // — the role histogram, a structured client — still has it. It no longer reaches the
-    // outline, though: the outline names a native token only for an element glass has no role
-    // for, and this one is now a Window.
+    // The device answers with the root of the ACTIVE WINDOW, so this node is the window
+    // whatever layout class it carries. Both Android readers have to agree about the root, or
+    // a `role:` selector written against one misses on the other.
+    //
+    // No synthetic wrapper: `AxNodeId(n)` is the device's `ref` n, and an extra node would
+    // shift every id `set_value` addresses by. `raw_role` keeps the device's class on the
+    // node, though it no longer reaches the outline, which names a native token only for an
+    // element glass has no role for.
     root.role = AxRole::Window;
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
@@ -1418,9 +1416,7 @@ mod tests {
     fn an_editable_nodes_name_is_the_desc_not_the_raw_resource_id() {
         // The only fixture here with both `desc` and `resource_id` present, so it is what
         // pins the precedence between them. (`LabelInputs`'s named fields, not this test, are
-        // what stop the call site transposing the two.) The older-companion path (neither key
-        // sent) needs no dedicated test — every fixture above that omits them already
-        // exercises it.
+        // what stop the call site transposing the two.)
         let node = mapped_full(
             Some("joe@x.com"),
             Some("Email"),

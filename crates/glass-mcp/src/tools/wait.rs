@@ -271,14 +271,11 @@ mod tests {
 
     #[test]
     fn scroll_to_element_output_includes_resolved_direction() {
-        // Save is already on-screen and direction is omitted, so the resolved axis
-        // falls back to the default vertical sweep and is serialized under
-        // `scrolled.direction` — guarding `as_str` and the shape of the JSON output.
-        // This alone can't discriminate the `None`-inference wiring itself (see
-        // `scroll_to_element_infers_right_direction_for_offscreen_element` below):
-        // an on-screen target resolves to the same "down" default whether `None`
-        // correctly falls through to inference-then-default, or a regression just
-        // hardcodes `Some(Down)`.
+        // Save is already on-screen and `direction` is omitted, so the resolved axis falls
+        // back to the default vertical sweep — this guards `as_str` and the JSON shape. It
+        // cannot discriminate the `None`-inference wiring itself: an on-screen target
+        // resolves to "down" whether inference-then-default runs or a regression hardcodes
+        // `Some(Down)`. The off-screen test below is what tells those apart.
         let mut g = started_a11y();
         let mut a = scroll_args();
         a.name = Some("Save".into());
@@ -364,14 +361,10 @@ mod tests {
 
     #[test]
     fn scroll_to_element_infers_right_direction_for_offscreen_element() {
-        // Save sits off-screen to the right; `direction` is omitted. The static
-        // fixture tree never changes, so the sweep saturates after one step per
-        // direction without ever realizing Save on-screen — `matched:false`. But
-        // `scrolled.direction` reports the *resolved* direction regardless of
-        // `matched` (see `scroll_to_element`'s shared `outcome` tail), so asserting
-        // "direction":"right" here genuinely guards the `None`-inference wiring: a
-        // `None => Some(Down)` regression would report "down" instead, which this
-        // test would catch and the on-screen test above would not.
+        // Save sits off-screen to the right with `direction` omitted. The static fixture
+        // never changes, so the sweep saturates without realizing Save — `matched:false` —
+        // but `scrolled.direction` reports the *resolved* direction regardless, so "right"
+        // here guards the `None`-inference wiring the on-screen test above cannot.
         let mut g = started_a11y_with(fake_tree_offscreen_right());
         let mut a = scroll_args();
         a.name = Some("Save".into());
@@ -596,12 +589,9 @@ mod tests {
 
     #[test]
     fn region_bbox_is_window_relative_not_crop_relative() {
-        // A non-zero-origin region must report its change bbox in WINDOW
-        // coordinates, not relative to the crop (the window-relative-at-the-
-        // tool-boundary invariant; also keeps it consistent with glass_diff).
-        // Window 4x4, region {2,2,2,2}; the whole region flips black->white so
-        // the bbox covers the full crop: crop-relative would be (0,0), but
-        // window-relative must be (2,2).
+        // A non-zero-origin region must report its change bbox in WINDOW coordinates, not
+        // relative to the crop. Window 4x4, region {2,2,2,2}; the whole region flips
+        // black->white, so crop-relative would be (0,0) and window-relative must be (2,2).
         let black = Frame::solid(4, 4, [0, 0, 0, 255]);
         let white = Frame::solid(4, 4, [255, 255, 255, 255]);
         let mut g = glass_with(FakePlatform::new(4, 4).with_frames(vec![black, white]));
@@ -691,19 +681,13 @@ mod tests {
 
     #[test]
     fn region_with_ignore_masks_a_changing_rect_so_changes_never_matches() {
-        // Pixel (3,3) blinks between the reference (captured at call start,
-        // since no baseline is given) and the polled frame — a stand-in for a
-        // blinking text caret or a clock — while the rest of the 4x4 frame
-        // stays constant. Masking it means `until: "changes"` (the default)
-        // has nothing left to react to: the corner is the only pixel that
-        // ever differs, and it is excluded from the comparison.
+        // Pixel (3,3) blinks between the reference (captured at call start) and the polled
+        // frame — a stand-in for a blinking caret or a clock — while the rest of the 4x4
+        // stays constant, so masking it leaves `until: "changes"` nothing to react to.
         //
-        // `timeout_ms: 0` bounds the wait to exactly one poll after the
-        // reference capture, so a generous timeout letting `FakePlatform`
-        // outlast its scripted frames into its repeat-forever fallback can't
-        // be what makes this pass — the outcome is decided by that single
-        // real comparison. Pinning the capture count to 2 (reference + one
-        // poll) makes that explicit.
+        // `timeout_ms: 0` bounds the wait to one poll after the reference capture, so a
+        // generous timeout outlasting the scripted frames into `FakePlatform`'s
+        // repeat-forever fallback can't be what makes this pass.
         let log = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let f0 = frame_4x4_corner([10, 0, 0, 255]);
         let f1 = frame_4x4_corner([20, 0, 0, 255]);

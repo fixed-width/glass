@@ -15,12 +15,9 @@ use std::ops::Deref;
 pub mod mcp_ignore;
 
 // Verification-loop cost benchmark harness. Like `mcp_ignore` above, `pub mod mcp_cost;`
-// compiles this into every test binary that declares `mod common;` (integration.rs,
-// network.rs, harness_smoke.rs, ignore_regions_e2e.rs, wayland_ignore_regions_e2e.rs,
-// verification_cost.rs) — only verification_cost.rs actually calls it, but its
-// `#[cfg(test)]` unit tests run under `cargo test --workspace` regardless of which binary
-// pulls them in; this file's `#![allow(dead_code)]` covers the runtime-unused public API
-// for the other binaries.
+// compiles this into every test binary declaring `mod common;`, though only
+// verification_cost.rs calls it — this file's `#![allow(dead_code)]` covers the
+// runtime-unused public API for the others.
 pub mod mcp_cost;
 
 pub struct Xvfb(glass_x11::Xvfb);

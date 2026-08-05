@@ -226,9 +226,8 @@ impl AxRect {
     /// click on the window edge that never lands on the element (the "no silent fallbacks"
     /// invariant).
     fn visible_intersection(&self, win_w: u32, win_h: u32) -> Option<(i32, i32, i32, i32)> {
-        // No zero-area early return: the emptiness test below already covers it. A zero-width
-        // rect forces `right <= left`, a zero-width window forces `right <= 0 <= left`, and
-        // both dimensions are symmetric — so a separate guard is a branch nothing can observe.
+        // No zero-area early return: the emptiness test below already covers it — a zero-width
+        // rect or window forces `right <= left`, so a separate guard is unobservable.
         let left = self.x.max(0);
         let top = self.y.max(0);
         let right = (self.x + self.width as i32).min(win_w as i32);
@@ -1051,13 +1050,11 @@ pub fn element_match<'a>(
     value_contains: Option<&str>,
     condition: ElementCondition,
 ) -> ElementMatch<'a> {
-    // Role filter: exact match, OR — when an interactable role is requested *and* a name or
-    // value disambiguator is also present — an actable node the backend left generically
-    // classified. Toolkits like Jetpack Compose surface a real button as a clickable
-    // `Group`/`Other` (the role is lost), so an exact filter would miss it; matching by
-    // name + actability finds it anyway. The disambiguator is required: without it, a
-    // role-only query would match the first focusable container in the tree — a confident
-    // wrong match reported as success rather than an honest miss.
+    // Jetpack Compose surfaces a real button as a clickable `Group`/`Other` with the role
+    // lost, so an exact filter misses it; name + actability finds it anyway.
+    //
+    // The disambiguator is required: without it a role-only query would match the first
+    // focusable container in the tree — a confident wrong match, not an honest miss.
     let has_disambiguator = name.is_some() || value_contains.is_some();
     let role_match = |n: &AxNode, r: AxRole| {
         n.role == r

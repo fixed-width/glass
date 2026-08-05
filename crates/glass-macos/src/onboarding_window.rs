@@ -144,13 +144,10 @@ impl WindowDelegate {
     }
 }
 
-// Fixed-frame layout (points). Auto Layout / `NSStackView` would add a second constraint
-// API surface (and its own feature) for no benefit at this size, so rows are placed with
-// plain frames — computed top-down and converted to AppKit's bottom-left origin by `rect`.
+// Fixed-frame layout (points): rows are placed with plain frames, computed top-down and
+// converted to AppKit's bottom-left origin by `rect`.
 //
-// VERIFY on-box: these constants are eyeballed, not measured — confirm on a real render that
-// labels aren't clipped, the ✓/○ glyph and the "Request…" button sit level with each
-// row's name, and nothing overlaps at the default system font size; nudge the constants if so.
+// These constants are eyeballed, not measured against a real render.
 const WIDTH: f64 = 480.0;
 const H_MARGIN: f64 = 24.0;
 const V_MARGIN: f64 = 20.0;
@@ -361,13 +358,11 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     let delegate = WindowDelegate::new(mtm);
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
-    // Center, show, and force to the front. A just-launched `LSUIElement` app does not come
-    // forward on its own, and the modern cooperative `activate()` (macOS 14+) deliberately
-    // refuses to steal focus from the app that launched us — Finder, immediately after a
-    // double-click — so the checklist would open *behind* the Finder window and look like
-    // nothing happened. Use the forceful path instead: `activateIgnoringOtherApps` (deprecated
-    // but still the reliable escape hatch for a user-initiated launch) plus
-    // `orderFrontRegardless`, which raises the window even before the app is fully active.
+    // A just-launched `LSUIElement` app does not come forward on its own, and the cooperative
+    // `activate()` (macOS 14+) refuses to steal focus from the app that launched us — Finder,
+    // right after a double-click — so the checklist would open *behind* the Finder window.
+    // `activateIgnoringOtherApps` is deprecated but still the reliable escape hatch, and
+    // `orderFrontRegardless` raises the window before the app is fully active.
     window.center();
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
@@ -378,11 +373,8 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // every `ButtonTarget` must outlive this call (`setTarget:`/`setDelegate:` hold only weak
     // references), so they stay bound until after `run` returns.
     //
-    // VERIFY on-box: the window shows the title "glass permissions", the instruction line,
-    // one row per permission (✓ for granted, ○ for not) each with a working "Request…"
-    // button, and a "Re-check" button that fires `on_recheck`; the window comes to the
-    // front on launch; closing it exits the process. None of this is checkable off a real
-    // WindowServer/AppKit run loop — the darwin build only proves it compiles.
+    // None of the rendering is checkable off a real WindowServer/AppKit run loop — the darwin
+    // build only proves it compiles.
     app.run();
 
     // Reached only if the run loop stops without the process exiting. Keep the AppKit

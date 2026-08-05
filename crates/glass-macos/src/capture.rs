@@ -155,10 +155,8 @@ fn capture_resolved(
                     // `CGImage` itself never leaves this block.
                     let image: &CGImage = unsafe { &*image_ptr };
                     // `Frame` is captured in backing PIXELS (`contentRect.size *
-                    // pointPixelScale`), and `region` is already window-relative PIXELS
-                    // too — the tool boundary's unit throughout (see `coords.rs`'s module
-                    // doc and `scwindow.rs`'s `WindowMatch::geometry`) — so `crop_to_region`
-                    // crops directly, no unit conversion needed.
+                    // pointPixelScale`) and `region` is already window-relative PIXELS, so
+                    // `crop_to_region` crops directly with no unit conversion.
                     let result = rgba_frame_from_cgimage(image)
                         .and_then(|frame| crop_to_region(frame, region_owned.as_ref()));
                     let _ = tx_img.send(match result {
@@ -169,9 +167,8 @@ fn capture_resolved(
 
             // SAFETY: `image_block` matches
             // `captureImageWithFilter:configuration:completionHandler:`'s documented
-            // signature (`*mut CGImage, *mut NSError`, per the generated binding) — the
-            // exact sequence the spike proved end-to-end. The call itself has no other
-            // preconditions.
+            // signature (`*mut CGImage, *mut NSError`, per the generated binding). The call
+            // itself has no other preconditions.
             unsafe {
                 SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
                     &filter,

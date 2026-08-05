@@ -52,14 +52,9 @@ use crate::adoption_log::CandidateWindow;
 /// A discovered on-screen window: enough to re-find or capture it later without holding
 /// a live `Retained<SCWindow>` across the completion handler's thread boundary (see
 /// module doc).
-// `geometry`/`scale`/`origin_pt` are read by `start_app` (via `backend.rs::discover_window`
-// -> `query_once_with_candidates`) and by `send_pointer`/`capture_frame`/`send_key` (via
-// `backend.rs`'s per-call `find_window_for_pids`/`find_window_by_id` resolution);
-// `window_id` is read by `start_app` too (to seed `MacosPlatform::active_window`, Plan 4
-// Task 1). `pid` is read by `send_pointer`/`send_key` (via `resolve_active_window`'s
-// per-call resolution) as the CGEvent focus/AX-scoping target, and by every
-// `find_window_by_id` call site's pid-scoping check (Plan 4 final-review fix 1) — every
-// field is read somewhere.
+// Every field is read: `geometry`/`scale`/`origin_pt` by `start_app` and the per-call window
+// resolution, `window_id` to seed `MacosPlatform::active_window`, and `pid` as the CGEvent
+// focus/AX-scoping target and for each `find_window_by_id` call site's pid-scoping check.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowMatch {
     /// The owning process's pid — one of the `pids` passed to `find_window_for_pids`.

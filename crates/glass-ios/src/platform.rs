@@ -489,19 +489,16 @@ impl Platform for IosPlatform {
             None => None,
         };
         // Everything above would look identical for an app that died on launch: `simctl launch`
-        // exits 0 once launchd has spawned the process, and the screenshot then captures whatever
-        // the Simulator is showing — the home screen — which would be reported as the app's
-        // window, leaving the caller to snapshot SpringBoard with nothing saying why.
+        // exits 0 once launchd has spawned the process, and the screenshot then captures
+        // whatever the Simulator is showing — the home screen — reported as the app's window.
         //
-        // Asked once at least [`LAUNCH_DEATH_WINDOW`] has passed since the launch, at the last
-        // moment before success is reported: an app that aborts takes a beat to actually go. The
-        // work above usually covers that beat, but an observe-only launch skips scale discovery,
+        // Asked once at least [`LAUNCH_DEATH_WINDOW`] has passed since the launch: an app that
+        // aborts takes a beat to actually go, and an observe-only launch skips scale discovery,
         // so the remainder is waited for rather than assumed.
         //
-        // This bounds startup only. An app that dies later is NOT noticed by this backend — every
-        // operation gates on the session being registered, not on the process being alive — so a
-        // capture or snapshot after that describes whatever the Simulator is showing. Closing
-        // that needs a liveness probe on the operation path, which is why the pid is kept.
+        // This bounds startup only. An app that dies later is NOT noticed — every operation
+        // gates on the session being registered, not on the process being alive — which is why
+        // the pid is kept.
         if let Some(pid) = launch_pid {
             let elapsed = launched_at.elapsed();
             if let Some(remaining) = LAUNCH_DEATH_WINDOW.checked_sub(elapsed) {

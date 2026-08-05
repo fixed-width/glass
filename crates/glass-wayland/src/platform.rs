@@ -1037,16 +1037,13 @@ impl Platform for WaylandPlatform {
         // Runs once: a retried compositor bring-up must not re-run the build.
         glass_sandbox_linux::run_build(spec)?;
 
-        // Bring up the per-session compositor, retrying a transient failure once.
-        // A freshly-spawned headless Xwayland occasionally crashes mid-startup
-        // ("failed to read Wayland events: Broken pipe") on the GPU-less CI renderer
-        // — after the app has already mapped its window — leaving sway alive but the
-        // window never stable in its tree, so discovery times out. The crash is rare
-        // and independent per spawn, so re-spawning a fresh compositor makes it
-        // reliable. Only transient bring-up failures retry (Timeout / Backend); a
-        // genuine app exit or a config/sandbox error fails immediately. `bring_up`
-        // reaps its own sway+Xwayland process group on failure, so a retry never
-        // races a leftover compositor.
+        // Bring up the per-session compositor, retrying a transient failure once. A
+        // freshly-spawned headless Xwayland occasionally crashes mid-startup ("failed to read
+        // Wayland events: Broken pipe") on the GPU-less CI renderer — after the app has
+        // already mapped its window — leaving sway alive but the window never stable in its
+        // tree. The crash is rare and independent per spawn, so a fresh compositor makes it
+        // reliable. Only transient bring-up failures retry (Timeout / Backend); `bring_up`
+        // reaps its own process group, so a retry never races a leftover compositor.
         self.dbus = if spec.a11y {
             Some(glass_dbus_linux::PrivateBus::start().map_err(|e| {
                 GlassError::AccessibilityUnavailable(format!(

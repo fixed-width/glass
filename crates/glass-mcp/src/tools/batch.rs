@@ -328,18 +328,14 @@ mod tests {
 
     #[test]
     fn then_settle_ignore_masks_a_blinking_pixel_so_it_settles() {
-        // Regression for `settle_args()` silently dropping `SettleArgs.ignore`
-        // instead of forwarding it into `WaitStableParams.ignore`: with no
-        // `#[serde(deny_unknown_fields)]` in this crate, a dropped field would
-        // still parse fine and just do nothing. Pixel (1,1) blinks across the
-        // three scripted frames — a stand-in for a blinking caret — while the
-        // rest of the 2x2 frame stays constant; only masking that rect lets it
-        // settle within `settle_frames`.
+        // `settle_args()` must forward `SettleArgs.ignore` into `WaitStableParams.ignore`:
+        // with no `#[serde(deny_unknown_fields)]` in this crate, a dropped field still parses
+        // and just does nothing. Pixel (1,1) blinks across the three scripted frames while
+        // the rest of the 2x2 stays constant, so only masking it settles within
+        // `settle_frames`.
         //
-        // Pinning the capture count to 3 (the frames actually supplied) rules
-        // out a generous timeout settling by outlasting the scripted frames
-        // into `FakePlatform`'s repeat-forever fallback, which would "settle"
-        // even without masking by comparing the repeated final frame to itself.
+        // Pinning the capture count to 3 rules out settling by outlasting the frames into
+        // `FakePlatform`'s repeat-forever fallback.
         let log = Arc::new(Mutex::new(0usize));
         let mut f0 = Frame::solid(2, 2, [10, 10, 10, 255]);
         let mut f1 = f0.clone();

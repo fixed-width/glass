@@ -174,8 +174,7 @@ fn run_bounded_inner(
     let (err_bytes, err_done) = stderr.take(settled_by);
     // A short read must never pass for a complete answer: `dumpsys window windows` is parsed by a
     // tolerant line scanner that would read a truncated dump as a shorter window list, and glass
-    // would then report the wrong geometry. `Command::output` cannot produce this — it reads to EOF
-    // — so failing here keeps the contract callers already had.
+    // would then report the wrong geometry.
     //
     // Bounded by the same `settled_by` as the pipes, and for the same reason: a grandchild holding
     // the read end keeps the write blocked exactly as it keeps a drain from reaching EOF. A write
@@ -610,10 +609,9 @@ mod tests {
 
     #[test]
     fn the_capture_cap_holds_the_largest_real_payload_and_stops_just_past_itself() {
-        // The cap exists to bound an abandoned drain thread, so it has to clear the biggest thing a
-        // one-shot really produces — a ~10MB `exec-out screencap` — by a wide margin.
-        // A const block, per clippy: the cap is a constant, so this is a compile-time claim. Under
-        // a mutation that shrinks it the crate stops compiling, which the gate counts too.
+        // The cap bounds an abandoned drain thread, so it must clear the biggest thing a
+        // one-shot really produces — a ~10MB `exec-out screencap` — by a wide margin. A const
+        // block, so a mutation that shrinks it stops the crate compiling, which the gate counts.
         const { assert!(MAX_CAPTURE >= 10 * 1024 * 1024) };
         // Exactly at the cap is still allowed; one byte past it is not.
         assert!(!would_exceed_capture(MAX_CAPTURE, 0));
