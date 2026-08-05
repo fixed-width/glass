@@ -6,7 +6,7 @@
 
 use glass_core::{Check, CheckStatus};
 
-use crate::a11y::{adb_runner, attempt_deadline, dump_once};
+use crate::a11y::{Attempt, adb_runner, attempt_deadline, dump_once};
 use crate::adb::Adb;
 use crate::avd::{Action, Lifecycle, decide, parse_list_avds, resolve_emulator_bin};
 use crate::target::{Device, parse_devices};
@@ -231,9 +231,9 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
     // can do now, and a dump that only succeeds after a wait is what this check exists to
     // reveal.
     let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PREFIX, attempt_deadline()) {
-        Ok(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
-        Ok(_) => Err("uiautomator dump produced no hierarchy".to_string()),
-        Err(e) => Err(e.to_string()),
+        Attempt::Dumped(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
+        Attempt::Dumped(_) => Err("uiautomator dump produced no hierarchy".to_string()),
+        Attempt::NotReady(e) | Attempt::Fatal(e) => Err(e.to_string()),
     };
 
     DeepProbe {
