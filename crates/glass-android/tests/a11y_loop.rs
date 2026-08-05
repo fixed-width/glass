@@ -7,11 +7,14 @@
 //!
 //! They cover a non-trivial tree with named, role-typed elements; a write confirmed against the
 //! live field — and a clear that cannot be confirmed here at all, because this platform reports
-//! the emptied field's hint as its text; that a read takes its dump file with it; and that a
-//! snapshot taken while another app is foreground says which app it describes.
+//! the emptied field's hint as its text; that a read takes its dump file with it; that a
+//! snapshot taken while another app is foreground says which app it describes; and that a test
+//! which fails mid-interaction still hands the device back launchable.
 
 use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
-use glass_core::{AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel};
+use glass_core::{
+    AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
+};
 
 fn settings_spec() -> AppSpec {
     AppSpec {
@@ -26,25 +29,112 @@ fn settings_spec() -> AppSpec {
     }
 }
 
+/// A launched Settings and whatever else a test woke on the device, torn down when this value goes
+/// out of scope — a panic unwinds through it, where a trailing `stop_app` is skipped.
+///
+/// [`a_panicking_test_leaves_the_device_launchable_for_the_next_one`] holds the failure that costs.
+struct Session {
+    /// Taken in `drop` so the platform is gone before the registries it drew its clients from.
+    platform: Option<glass_android::AndroidPlatform>,
+    agents: glass_android::AgentRegistry,
+    a11y_service: Option<glass_android::A11yServiceRegistry>,
+    /// Packages the test itself brought to the foreground, which `stop_app` knows nothing about.
+    also_stop: Vec<String>,
+    window: WindowGeometry,
+}
+
+impl Session {
+    /// Attach to the device and launch Settings.
+    fn start() -> Self {
+        let agents = glass_android::AgentRegistry::new();
+        let platform = glass_android::AndroidPlatform::from_env(
+            &glass_android::EmulatorRegistry::new(),
+            &agents,
+        )
+        .expect("attach");
+        // Built before the launch, not after it: a launch that fails would otherwise drop the
+        // registry without shutting down an agent it had already started.
+        let mut session = Session {
+            platform: Some(platform),
+            agents,
+            a11y_service: None,
+            also_stop: Vec::new(),
+            window: WindowGeometry::default(),
+        };
+        session.window = session
+            .platform()
+            .start_app(&settings_spec())
+            .expect("launch settings");
+        session
+    }
+
+    fn platform(&mut self) -> &mut glass_android::AndroidPlatform {
+        self.platform
+            .as_mut()
+            .expect("the platform outlives the session")
+    }
+
+    /// The reader context for the launched app, re-reading its pids.
+    fn ctx(&mut self) -> AxContext {
+        let window = self.window.clone();
+        AxContext {
+            pids: self.platform().app_pids(),
+            window,
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+        }
+    }
+
+    /// Bring `component` (`pkg/.Activity`) to the foreground, and stop its package at teardown.
+    ///
+    /// Uses a bare `am start` rather than [`glass_android::AndroidPlatform::start_app`], whose
+    /// bookkeeping only ever tracks the one app it launched — it would still name Settings while
+    /// the device's real foreground had moved on.
+    fn bring_to_front(&mut self, component: &str) {
+        let (package, _) = component.split_once('/').expect("pkg/.Activity");
+        self.also_stop.push(package.to_string());
+        am_start(component);
+    }
+
+    /// Install and enable the on-device accessibility companion, disabled again at teardown.
+    fn a11y_service(&mut self, apk: &str) -> glass_android::ServiceA11y {
+        let registry = glass_android::A11yServiceRegistry::new();
+        let client = registry
+            .ensure(&self.platform().resolved_adb(), apk)
+            .expect("install + enable the service");
+        self.a11y_service = Some(registry);
+        glass_android::ServiceA11y::new(client, "com.android.settings".to_string())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Reached while a panic unwinds, where a second panic aborts the process — nothing here
+        // may assert.
+        let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+        for package in &self.also_stop {
+            let _ = std::process::Command::new(&adb)
+                .args(["shell", "am", "force-stop", package])
+                .output();
+        }
+        if let Some(mut platform) = self.platform.take() {
+            let _ = platform.stop_app();
+        }
+        self.agents.shutdown();
+        if let Some(registry) = &self.a11y_service {
+            registry.shutdown();
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn snapshot_has_named_role_typed_nodes() {
-    let agents = glass_android::AgentRegistry::new();
-    let mut platform =
-        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
-            .expect("attach");
-    let window = platform
-        .start_app(&settings_spec())
-        .expect("launch settings");
+    let mut session = Session::start();
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
-    let ctx = AxContext {
-        pids: platform.app_pids(),
-        window,
-        window_handle: None,
-        a11y_bus_addr: None,
-        limits: WalkLimits::DEFAULT,
-    };
+    let ctx = session.ctx();
     let mut a11y = glass_android::AndroidA11y::new();
     let mut tree = a11y.snapshot(&ctx).expect("snapshot");
     tree.assign_ids();
@@ -60,10 +150,6 @@ fn snapshot_has_named_role_typed_nodes() {
         n.name.is_some() || n.children.iter().any(any_named)
     }
     assert!(any_named(&tree.root), "expected at least one named node");
-
-    platform.stop_app().expect("stop");
-    drop(platform); // close the platform's agent connection (if any) first
-    agents.shutdown(); // tear down a launched agent — these tests must not leak it
 }
 
 /// The dump files on the device, as `adb shell ls` reports them.
@@ -83,22 +169,10 @@ fn dump_files() -> String {
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn a_snapshot_leaves_no_dump_file_on_the_device() {
-    let agents = glass_android::AgentRegistry::new();
-    let mut platform =
-        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
-            .expect("attach");
-    let window = platform
-        .start_app(&settings_spec())
-        .expect("launch settings");
+    let mut session = Session::start();
     let before = dump_files();
 
-    let ctx = AxContext {
-        pids: platform.app_pids(),
-        window,
-        window_handle: None,
-        a11y_bus_addr: None,
-        limits: WalkLimits::DEFAULT,
-    };
+    let ctx = session.ctx();
     let mut a11y = glass_android::AndroidA11y::new();
     a11y.snapshot(&ctx).expect("first snapshot");
     a11y.snapshot(&ctx).expect("second snapshot");
@@ -108,10 +182,6 @@ fn a_snapshot_leaves_no_dump_file_on_the_device() {
         before,
         "each read must take its own file with it"
     );
-
-    platform.stop_app().expect("stop");
-    drop(platform);
-    agents.shutdown();
 }
 
 /// Depth-first search for the first node satisfying `want`.
@@ -120,6 +190,84 @@ fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNo
         return Some(node);
     }
     node.children.iter().find_map(|c| find(c, want))
+}
+
+/// Tap Settings' search entry, handing the task to `com.google.android.settings.intelligence`.
+///
+/// Reports whether the search screen came up — a device that has not settled draws no search entry
+/// to tap.
+fn open_search_screen(
+    platform: &mut glass_android::AndroidPlatform,
+    a11y: &mut glass_android::AndroidA11y,
+    ctx: &AxContext,
+) -> bool {
+    let Ok(mut tree) = a11y.snapshot(ctx) else {
+        return false;
+    };
+    tree.assign_ids();
+    let Some(search) = find(&tree.root, &|n| {
+        n.name.as_deref().is_some_and(|s| s.contains("Search"))
+    })
+    .and_then(|n| n.bounds)
+    .and_then(|b| b.clamped_center(ctx.window.width, ctx.window.height)) else {
+        return false;
+    };
+    if platform
+        .send_pointer(&PointerEvent::Click {
+            x: search.0,
+            y: search.1,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        })
+        .is_err()
+    {
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    search_field_is_up(a11y, ctx)
+}
+
+/// A failing assertion must not take the *next* test down with it.
+///
+/// Teardown written as a trailing statement is skipped by a panic, and CI run 31036771472 turned
+/// one failure into two that way: `set_value_reports_whether_the_write_landed` panicked with
+/// Settings' search screen up, leaving `com.google.android.settings.intelligence` on top — a
+/// different package, which `am force-stop com.android.settings` would have taken down with the
+/// task. The next test's `am start` was delivered to that sibling, no `com.android.settings` window
+/// ever reached the screen, and its launch failed as `Timeout(15000)` (glass#338).
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
+fn a_panicking_test_leaves_the_device_launchable_for_the_next_one() {
+    // Without this, a run where Settings drew no search entry never creates the state under test
+    // and passes by failing to look.
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let arming = armed.clone();
+
+    let hushed = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // the panic below is the fixture, not a failure to report
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut session = Session::start();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let ctx = session.ctx();
+        let mut a11y = glass_android::AndroidA11y::new();
+        arming.store(
+            open_search_screen(session.platform(), &mut a11y, &ctx),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        panic!("a mid-test assertion failing");
+    }));
+    std::panic::set_hook(hushed);
+
+    assert!(outcome.is_err(), "the body must have panicked");
+    assert!(
+        armed.load(std::sync::atomic::Ordering::SeqCst),
+        "Settings never put its search screen up, so this run never created the state under test"
+    );
+
+    // The next test's first act: `Session::start` panics on the `Timeout(15000)` an abandoned
+    // search screen used to cause.
+    drop(Session::start());
 }
 
 /// An attempt that saw nothing which is evidence about `set_value` — the search screen went away
@@ -307,27 +455,15 @@ fn write_leg(
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn set_value_reports_whether_the_write_landed() {
-    let agents = glass_android::AgentRegistry::new();
-    let mut platform =
-        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
-            .expect("attach");
-    let window = platform
-        .start_app(&settings_spec())
-        .expect("launch settings");
+    let mut session = Session::start();
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
-    let ctx = AxContext {
-        pids: platform.app_pids(),
-        window,
-        window_handle: None,
-        a11y_bus_addr: None,
-        limits: WalkLimits::DEFAULT,
-    };
+    let ctx = session.ctx();
     let mut a11y = glass_android::AndroidA11y::new();
 
     let deadline = std::time::Instant::now() + SETUP_BUDGET;
     let mut abandoned: Vec<String> = Vec::new();
-    while let Err(Abandoned(why)) = write_leg(&mut platform, &mut a11y, &ctx) {
+    while let Err(Abandoned(why)) = write_leg(session.platform(), &mut a11y, &ctx) {
         eprintln!("abandoned: {why}; reopening Settings");
         abandoned.push(why);
         assert!(
@@ -338,16 +474,10 @@ fn set_value_reports_whether_the_write_landed() {
         reopen_settings();
         std::thread::sleep(SETUP_PAUSE);
     }
-
-    platform.stop_app().expect("stop");
-    drop(platform);
-    agents.shutdown();
 }
 
-/// Bring `component` (`pkg/.Activity`) to the foreground with a bare `am start` — bypassing
-/// `AndroidPlatform::start_app`, whose bookkeeping only ever tracks the one app it launched, so
-/// it still names the fixture while the device's real foreground has moved to something else.
-fn bring_to_front(component: &str) {
+/// `am start -n component`, asserting the launch was accepted.
+fn am_start(component: &str) {
     let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
     let out = std::process::Command::new(&adb)
         .args(["shell", "am", "start", "-n", component])
@@ -376,7 +506,7 @@ fn reopen_settings() {
         "am force-stop com.android.settings failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    bring_to_front("com.android.settings/.Settings");
+    am_start("com.android.settings/.Settings");
 }
 
 /// The service reader answering while something else holds the foreground. Ignored by default:
@@ -393,31 +523,14 @@ fn a_snapshot_taken_while_another_app_is_foreground_says_so() {
     let apk = glass_android::a11y_apk(&get)
         .expect("set GLASS_ANDROID_A11Y_APK to the built a11y-debug.apk");
 
-    let agents = glass_android::AgentRegistry::new();
-    let mut platform =
-        glass_android::AndroidPlatform::from_env(&glass_android::EmulatorRegistry::new(), &agents)
-            .expect("attach");
-    let window = platform
-        .start_app(&settings_spec())
-        .expect("launch settings (the fixture asked about)");
+    let mut session = Session::start();
     std::thread::sleep(std::time::Duration::from_millis(1200));
 
-    bring_to_front("com.google.android.deskclock/com.android.deskclock.DeskClock");
+    session.bring_to_front("com.google.android.deskclock/com.android.deskclock.DeskClock");
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
-    let a11y_registry = glass_android::A11yServiceRegistry::new();
-    let client = a11y_registry
-        .ensure(&platform.resolved_adb(), &apk)
-        .expect("install + enable the service");
-    let mut svc = glass_android::ServiceA11y::new(client, "com.android.settings".to_string());
-
-    let ctx = AxContext {
-        pids: platform.app_pids(),
-        window,
-        window_handle: None,
-        a11y_bus_addr: None,
-        limits: WalkLimits::DEFAULT,
-    };
+    let mut svc = session.a11y_service(&apk);
+    let ctx = session.ctx();
     let tree = svc
         .snapshot(&ctx)
         .expect("a snapshot must still succeed for the wrong app");
@@ -426,13 +539,4 @@ fn a_snapshot_taken_while_another_app_is_foreground_says_so() {
         .expect("the service must disclose it answered about the foreground app, not Settings");
     assert_eq!(subject.asked, "com.android.settings");
     assert_eq!(subject.actual, "com.google.android.deskclock");
-
-    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
-    let _ = std::process::Command::new(&adb)
-        .args(["shell", "am", "force-stop", "com.google.android.deskclock"])
-        .output();
-    platform.stop_app().expect("stop");
-    drop(platform);
-    agents.shutdown();
-    a11y_registry.shutdown();
 }
