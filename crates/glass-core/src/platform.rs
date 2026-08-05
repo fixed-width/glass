@@ -430,7 +430,7 @@ mod tests {
     }
 
     /// Knows its pid and overrides nothing else, so `app_pids` falls through to the
-    /// default that derives from `app_pid`. Only that one question is ever asked of it.
+    /// default that derives from `app_pid`.
     struct PidPlatform(u32);
     impl Platform for PidPlatform {
         fn app_pid(&self) -> Option<u32> {

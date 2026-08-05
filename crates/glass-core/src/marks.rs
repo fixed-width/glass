@@ -290,9 +290,8 @@ mod tests {
         assert_eq!(legend[0].label, Some(MarkLabel::Description("Bold".into())));
     }
 
-    /// An element flush with the top-left corner clamps its chip to (0,0), which is where the
-    /// two things that can go wrong meet: a digit spilling into the chip's padding, and a clip
-    /// that drops the frame's own first row and column instead of keeping them.
+    /// An element flush with the corner clamps its chip to (0,0), where two failures meet: a
+    /// digit spilling into the padding, and a clip that drops the frame's first row and column.
     #[test]
     fn the_chip_padding_survives_at_the_frame_corner() {
         let b = node(
@@ -317,8 +316,6 @@ mod tests {
         }
     }
 
-    /// Font columns are blitted rightwards from the digit's origin, so the last one lands at
-    /// the far side of the cell rather than back over the padding.
     #[test]
     fn a_digits_last_column_lands_at_the_far_side_of_its_cell() {
         let b = node(

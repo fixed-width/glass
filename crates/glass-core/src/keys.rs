@@ -128,8 +128,8 @@ mod tests {
         assert_eq!(keysym_for_keyname("nope"), None);
     }
 
-    /// Every name in the table, each alias included. A name that loses its arm falls
-    /// through to the single-character path, which no multi-letter name can reach.
+    /// A name that loses its arm falls through to the single-character path, which no
+    /// multi-letter name can reach.
     #[test]
     fn every_named_key_maps_to_its_keysym() {
         for (name, keysym) in [

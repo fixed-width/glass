@@ -1151,9 +1151,7 @@ mod tests {
         assert!(has_many_siblings(&g, 0, 1, 3, 3));
     }
 
-    /// A 5x5 opaque greyscale image from a grid of luminances. Anti-alias detection reads a
-    /// 3x3 neighbourhood and counts how many of it match, so only the whole grid makes a case
-    /// legible.
+    /// A 5x5 opaque greyscale image from a grid of luminances.
     fn grey5(rows: [[u8; 5]; 5]) -> Vec<u8> {
         rows.iter()
             .flatten()
@@ -1167,10 +1165,8 @@ mod tests {
         px[o..o + 3].copy_from_slice(&[v, v, v]);
     }
 
-    /// The centre is the only pixel excluded from its own neighbourhood, and that neighbourhood
-    /// is read at the centre's own row. Here the sole *brighter* neighbour sits directly below
-    /// the centre: skip the centre's column, or take the centre from another row, and the bright
-    /// side of the edge disappears — leaving a one-sided difference that is not anti-aliasing.
+    /// The sole *brighter* neighbour sits directly below the centre, so skipping the centre's
+    /// column — or reading the centre from another row — loses the bright side of the edge.
     #[test]
     fn is_antialiased_reads_every_neighbour_of_the_centre() {
         let px = grey5([
@@ -1185,9 +1181,8 @@ mod tests {
         assert!(is_antialiased(&px, 2, 2, 5, 5, &other));
     }
 
-    /// The neighbourhood stops at the frame's right edge. One column further and a neighbour
-    /// is the first pixel of the *next* row: three of those match the centre here, which is
-    /// enough zero-deltas to write off a real anti-aliased edge as flat.
+    /// One column past the right edge, a neighbour is the first pixel of the *next* row —
+    /// three of those match the centre here, enough zero-deltas to call the edge flat.
     #[test]
     fn is_antialiased_clamps_the_neighbourhood_to_the_right_edge() {
         let px = grey5([
@@ -1254,9 +1249,8 @@ mod tests {
 
     #[test]
     fn perceptual_change_below_the_first_row_is_found() {
-        // Both the row slice the pre-scan compares and the offset each pixel is classified at
-        // have to follow `y`. Standing in row 0 for either reports a frame that differs further
-        // down as clean, and only a frame at least one SIMD chunk wide reaches the pre-scan.
+        // Both the row slice and the per-pixel offset have to follow `y`; the frame is 8 wide
+        // because a narrower one never reaches the SIMD pre-scan.
         let a = Frame::solid(8, 2, [0, 0, 0, 255]);
         let mut b = a.clone();
         let (x, y) = (3usize, 1usize);
@@ -1519,8 +1513,8 @@ mod tests {
 
     #[test]
     fn region_intersect_returns_none_for_regions_that_only_touch_side_by_side() {
-        // Abutting at x=5. A zero-width overlap is no overlap: an empty region
-        // would flow on into `IgnoreMask::new`, which rejects zero area.
+        // A zero-width overlap is no overlap — an empty region would flow on into
+        // `IgnoreMask::new`, which rejects zero area.
         assert_eq!(rect(0, 0, 5, 5).intersect(&rect(5, 0, 5, 5)), None);
     }
 
@@ -1531,13 +1525,11 @@ mod tests {
 
     #[test]
     fn region_intersect_needs_both_axes_to_overlap() {
-        // Same columns, disjoint rows.
         assert_eq!(rect(0, 0, 5, 5).intersect(&rect(0, 9, 5, 5)), None);
     }
 
-    /// The SIMD pre-scan is an optimisation, so it must never skip a chunk that holds a real
-    /// change. 1 against 255 is the adversarial pair: far apart, but any combination of the two
-    /// other than a difference — a sum, say — wraps through zero and reads as clean.
+    /// 1 against 255 is the adversarial pair: far apart, but any combination of the two other
+    /// than a difference wraps through zero and reads as clean.
     #[test]
     fn the_simd_prescan_never_skips_a_chunk_holding_a_change() {
         let one_pixel = |v: u8| {

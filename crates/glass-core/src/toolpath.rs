@@ -28,9 +28,11 @@ mod tests {
         assert_eq!(pick(None, "bwrap"), "bwrap");
     }
 
+    /// Deliberately outside the `GLASS_` namespace: every `GLASS_*` name read anywhere in the
+    /// tree has to appear in `glass-mcp`'s env registry, and this one names nothing real.
     #[test]
     fn tool_path_returns_the_default_for_an_unset_var() {
-        assert_eq!(tool_path("GLASS_UNSET_IN_TESTS", "bwrap"), "bwrap");
+        assert_eq!(tool_path("TOOLPATH_UNSET_IN_TESTS", "bwrap"), "bwrap");
     }
 
     #[test]
