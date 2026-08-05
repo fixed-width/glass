@@ -84,6 +84,15 @@ internal refactors, CI, or test-only changes.
   of parsing prose. Purely additive: `report` is unchanged.
 
 ### Changed
+- A `glass_start` on Android that finds no window now says what it saw instead of just how long it
+  waited. `operation timed out after 15000 ms` gave an agent nothing to act on, and the four device
+  states behind it need different responses: the app has opened no window, its window is behind
+  another app's, it is still on its splash screen, or the window manager reported no frame for it.
+  The error now names the package it wanted and, where something else holds the screen, which
+  packages those are — for instance `no window for com.android.settings appeared within 15000 ms —
+  its window is not on screen; on screen: com.google.android.settings.intelligence`. Diagnosing
+  that one previously took a whole-run device log. The wait itself is unchanged, and so is
+  `timeout_ms`.
 - On Linux and Windows, `glass_wait_for_element` no longer re-reads the whole accessibility tree on
   a timer. Where the platform can say whether anything changed, a wait for something that has not
   happened yet now reads the tree when something changes instead of once per interval — measured at
