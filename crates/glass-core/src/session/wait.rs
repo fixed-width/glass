@@ -435,9 +435,7 @@ impl Glass {
                 // fresh snapshot; assigns ids, caches, pumps
                 let tree = match self.a11y_resnapshot() {
                     Ok(t) => t,
-                    // An app that has not published a tree yet is a condition to wait out, not a
-                    // failure to report — kept so a spent budget can say this instead of
-                    // "not found" (glass#329).
+                    // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
                         never_published = Some(e);
                         return Ok(None);
@@ -1225,8 +1223,6 @@ mod tests {
 
     #[test]
     fn a_wait_polls_through_an_app_that_has_not_published_its_tree_yet() {
-        // An app registers with the accessibility bus after its window maps, so the first reads of
-        // a freshly launched app can find nothing to read (glass#329). Waiting is what resolves it.
         let (mut g, reads) = glass_with_a11y_not_ready(FakePlatform::new(100, 100), 3);
         g.start(&spec()).unwrap();
         let o = g

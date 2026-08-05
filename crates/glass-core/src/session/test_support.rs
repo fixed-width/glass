@@ -921,9 +921,8 @@ pub(crate) fn first_button(t: &AxTree) -> AxNodeId {
     walk(&t.root).expect("fake_tree has a Button")
 }
 
-/// A reader with nothing to serve for its first `silent` snapshots — an app that has launched but
-/// has not registered with the accessibility bus yet (glass#329). `silent: usize::MAX` models one
-/// that never does.
+/// A reader with nothing to serve for its first `silent` snapshots. `silent: usize::MAX` models an
+/// app that never publishes a tree at all.
 pub(crate) struct NotReadyThenTree {
     pub(crate) silent: usize,
     pub(crate) tree: AxTree,

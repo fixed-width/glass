@@ -121,16 +121,13 @@ fn fixture_spec() -> AppSpec {
     }
 }
 
-/// How long a fixture gets to publish its tree. Generous, and never reached on a healthy machine:
-/// this bounds a hang, it does not pace anything.
+/// How long a fixture gets to publish its tree — this bounds a hang, it does not pace anything.
 const A11Y_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Block until the launched app has published its accessibility tree.
 ///
-/// Replaces a fixed sleep. Registration with the AT-SPI registry lags the window map by an amount
-/// that depends on the machine, so a delay tuned on an idle one flakes on a loaded one
-/// (glass#329). `AccessibilityNotReady` is the reader's "not yet"; every other error is raised
-/// at once.
+/// Replaces a fixed sleep: registration with the AT-SPI registry lags the window map by an amount
+/// that depends on the machine, so a delay tuned on an idle one flakes on a loaded one (glass#329).
 fn await_a11y_ready(glass: &mut Glass) {
     let deadline = std::time::Instant::now() + A11Y_READY_TIMEOUT;
     loop {
@@ -1240,8 +1237,7 @@ fn stopping_an_a11y_launch_finishes_inside_the_teardown_budget() {
 fn a_quiet_wait_stops_re_walking_the_tree() {
     let (mut glass, walks, signals) = glass_counting();
     glass.start(&fixture_spec()).expect("launch");
-    // Settled, not merely readable: this measures a *quiet* wait, and an app still registering
-    // widgets emits the change signals that wake one.
+    // Settled, not merely readable: this measures a *quiet* wait.
     await_a11y_settled(&mut glass);
 
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
