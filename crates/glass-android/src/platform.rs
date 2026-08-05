@@ -7,6 +7,8 @@ use glass_core::{
     WindowId, WindowInfo, WindowOp,
 };
 
+use crate::a11y::AndroidA11y;
+use crate::a11y_service::{A11yServiceRegistry, ServiceA11y};
 use crate::adb::Adb;
 use crate::agent::{AgentClient, AgentRegistry};
 use crate::build::run_build;
@@ -88,6 +90,31 @@ impl AndroidPlatform {
     /// the platform resolved (possibly a freshly booted AVD `choose_serial` can't disambiguate).
     pub fn resolved_adb(&self) -> Adb {
         self.target.adb().clone()
+    }
+
+    /// This device's accessibility reader: the Compose-rich [`ServiceA11y`] when the companion
+    /// APK resolves and its service installs and connects, else the basic `uiautomator`
+    /// [`AndroidA11y`]. Never absent — `uiautomator` needs nothing beyond `adb`.
+    ///
+    /// The input agent, the other optional companion, degrades the same way in
+    /// [`AndroidPlatform::from_env`].
+    pub fn accessibility(
+        &self,
+        services: &A11yServiceRegistry,
+    ) -> Box<dyn glass_core::Accessibility + Send> {
+        let get = |k: &str| std::env::var(k).ok();
+        let Some(apk) = crate::a11y_service::a11y_apk(&get) else {
+            return Box::new(AndroidA11y::for_adb(self.resolved_adb()));
+        };
+        match services.ensure(&self.resolved_adb(), &apk) {
+            // The package isn't known until start_app; the device service serves the ACTIVE
+            // window regardless, so an empty package is correct for the MVP.
+            Ok(client) => Box::new(ServiceA11y::new(client, String::new())),
+            Err(e) => {
+                eprintln!("glass-android: a11y service unavailable, using uiautomator: {e}");
+                Box::new(AndroidA11y::for_adb(self.resolved_adb()))
+            }
+        }
     }
 
     /// Re-read the active window's current on-screen frame before capturing — a rotation or
