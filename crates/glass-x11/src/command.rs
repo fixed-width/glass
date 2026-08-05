@@ -34,11 +34,10 @@ pub fn build_command(spec: &AppSpec, display: &str, a11y: Option<glass_core::A11
             let args: Vec<OsString> = spec.run[1..].iter().map(OsString::from).collect();
             // Default the working directory to glass's own cwd when the spec sets none, so a
             // contained launch with no `cwd` still gets `--chdir` + a guarded rw bind of that
-            // directory (matching `sandbox:"off"`) and any relative launch token resolves against
-            // it. Computed ONCE (as an `Option<PathBuf>`) and shared by both consumers verbatim:
-            // `launch_ro_binds` via `as_deref()` and `WrapOpts.cwd` by move. If `current_dir()`
-            // fails, the error is logged and both consumers see `None` (no `--chdir`/bind; relative
-            // tokens are skipped, never resolved against a wrong root).
+            // directory and any relative launch token resolves against it. Computed ONCE and
+            // shared by both consumers verbatim. If `current_dir()` fails, both see `None` —
+            // no `--chdir`/bind, and relative tokens are skipped rather than resolved against
+            // a wrong root.
             let effective_cwd = spec.cwd.clone().or_else(|| {
                 std::env::current_dir()
                     .inspect_err(|e| {

@@ -683,13 +683,9 @@ fn set_value_selects_dropdown_option() {
 // A whole-frame pixel diff is too weak a check here: opening the GtkDropDown also
 // repaints the combo button itself (pressed style / arrow), which lives in the main
 // window's own drawable and would change even under the OLD (buggy) window-drawable
-// capture. So the comparison is scoped to the region strictly BELOW the combo button —
-// where the popover's option rows draw, and where the main window's own content (e.g.
-// the switch) does NOT change when the dropdown opens. Only the new root capture can
-// see anything change there, because that's where the popover (a separate top-level X
-// window) is composited on top; the old window-drawable capture would show that band
-// completely unchanged. So a substantial pixel change confined to that band is
-// specific evidence the popover itself was captured, not just the button's own repaint.
+// capture. So the comparison is scoped to the band strictly BELOW the combo button —
+// where only the popover's option rows draw, and which the old window-drawable capture
+// would show completely unchanged.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn screenshot_includes_open_popover() {

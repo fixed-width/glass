@@ -59,13 +59,12 @@ pub(crate) mod attr {
 
 // `AXIsProcessTrusted` is a plain C predicate not surfaced by the objc2 bindings, declared
 // with the same contained `extern "C"` pattern `permissions.rs` uses. It is a public,
-// documented, stable AX API (unlike `axwindow.rs`'s `_AXUIElementGetWindow`, a private
-// symbol that carries its own version-fragility caveat, which doesn't apply here).
-// `AXUIElementIsAttributeSettable`/`AXUIElementSetAttributeValue` are *not* declared this
-// way — `AXUIElement` already exposes them as safe-shaped methods
-// (`is_attribute_settable`/`set_attribute_value`, both gated behind the `AXError` feature
-// this crate already enables), so [`is_settable`]/[`set_string_value`] call those directly
-// instead of duplicating the raw externs.
+// documented, stable AX API — unlike `axwindow.rs`'s private `_AXUIElementGetWindow`, whose
+// version-fragility caveat doesn't apply here.
+//
+// `AXUIElementIsAttributeSettable`/`AXUIElementSetAttributeValue` are deliberately NOT
+// declared this way: `AXUIElement` already exposes them as safe-shaped methods, so
+// [`is_settable`]/[`set_string_value`] call those instead of duplicating the raw externs.
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     // Apple declares this `Boolean` (= `unsigned char`), NOT C99 `_Bool`. Binding it as
