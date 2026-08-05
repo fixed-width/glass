@@ -3020,12 +3020,12 @@ mod tests {
         ));
     }
 
-    /// A row-shaped CheckBox "Sw" (300x30 at the origin) as the single child of a root Window —
-    /// the iOS-switch fixture shared by the trailing-toggle `set_value` tests below. Pre-order
-    /// numbering gives the switch id 1.
-    /// A switch as the readers report one *after* the subrole normalization: `ToggleButton`, row
-    /// shaped, checkable — a fixture still calling a switch a `CheckBox` would test the swipe path
-    /// against a role no backend produces.
+    /// A switch "Sw" as the readers report one *after* subrole normalization: `ToggleButton`,
+    /// row shaped (300x30 at the origin), checkable — the single child of a root Window, so
+    /// pre-order numbering gives it id 1. Shared by the trailing-toggle `set_value` tests below.
+    ///
+    /// Do not re-role it to `CheckBox`: that tests the swipe path against a role no backend
+    /// produces.
     fn sw(checked: bool) -> AxTree {
         let switch = AxNode {
             id: AxNodeId(0),
