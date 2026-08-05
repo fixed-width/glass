@@ -233,8 +233,6 @@ fn deep_probe(adb: &Adb, serial: &str) -> DeepProbe {
     let uiautomator = match dump_once(&mut adb_runner(&dev), DUMP_PREFIX, attempt_deadline()) {
         Attempt::Dumped(xml) if xml.contains("<hierarchy") => Ok("a11y dump OK".to_string()),
         Attempt::Dumped(_) => Err("uiautomator dump produced no hierarchy".to_string()),
-        // A device that could serve one after a wait reports here as one that cannot, which is
-        // what this check is for.
         Attempt::NotReady(e) | Attempt::Fatal(e) => Err(e.to_string()),
     };
 

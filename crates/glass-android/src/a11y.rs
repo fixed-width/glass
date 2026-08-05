@@ -191,6 +191,9 @@ impl RetryBound {
 ///
 /// Only [`Attempt::NotReady`] is retried, so a device that has gone away is reported at once
 /// rather than waited on.
+///
+/// Returns after `bound.least` attempts plus however many more start while `bound.then_within`
+/// remains — each costing up to `AdbOp::Dump`'s budget, per [`attempt_deadline`].
 fn dump_until_ready(
     run: &mut AdbRunner<'_>,
     prefix: &str,
@@ -288,6 +291,9 @@ const VERIFY_SETTLE_MS: u64 = 300;
 /// accessibility bridge finishing registration, ~300ms, but a loaded device spends seconds per
 /// attempt, so the 2s budget this replaces was reliably gone before a second one could start
 /// (glass#338).
+///
+/// Do NOT widen this to [`COLD_BOUND`]: at [`VERIFY_ATTEMPTS`] reads it would let a routine write
+/// hold the single-threaded tool loop for minutes.
 const VERIFY_BOUND: RetryBound = RetryBound {
     least: 2,
     then_within: Duration::ZERO,
@@ -632,7 +638,7 @@ mod tests {
             match argv {
                 ["shell", "uiautomator", "dump", _] => {
                     dumps += 1;
-                    // One attempt costing more than the whole budget below is the whole point.
+                    // Costs more than the whole budget below — the condition under test.
                     std::thread::sleep(Duration::from_millis(30));
                     if dumps > 1 {
                         Ok((DUMPED.to_string(), String::new()))
