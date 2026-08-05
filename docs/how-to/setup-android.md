@@ -156,11 +156,8 @@ GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
 ANDROID_SDK_ROOT=$HOME/android-sdk GLASS_AVD=glass ./scripts/test-android-lifecycle.sh
 ```
 
-Two tests are skipped by default: `set_value_reports_whether_the_write_landed`
-([#323](https://github.com/fixed-width/glass/issues/323)) and
-`native_invoke_actuates_the_fixture` ([#324](https://github.com/fixed-width/glass/issues/324)).
-The second is the only consumer of `GLASS_ANDROID_FIXTURE_APK`, so that variable matters only once
-#324 lands; the jar and a11y APK are needed either way.
+No test is skipped, so all three artifacts are required: `native_invoke_actuates_the_fixture` is
+the only consumer of `GLASS_ANDROID_FIXTURE_APK`, and fails loudly without it.
 
 The role-histogram probes in `crates/glass-android/tests/role_probe.rs` are deliberately not in
 either script; they print evidence for a human rather than asserting, and take

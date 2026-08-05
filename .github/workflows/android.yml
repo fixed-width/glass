@@ -9,13 +9,11 @@ name: Android
 #     also pays a JDK install and a Gradle build, landing on whichever PR follows an eviction.
 #   - These are larger-runner minutes, billed per run, on every push to every branch.
 #   - The flake profile is young: bringing this up found three intermittent tests.
-#   - Two tests are excluded (glass#323, glass#324), and #324 is the native-invoke path
-#     glass#320 cared most about.
 #
 # So this detects rather than prevents: a PR that drops every click to a pointer tap still merges
 # green, and the push-to-master trigger then names the merge that broke it. See glass#320.
 #
-# Worth revisiting once glass#324 is fixed and there is real nightly history.
+# Worth revisiting once there is real nightly history.
 
 on:
   schedule:

@@ -122,6 +122,186 @@ fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNo
     node.children.iter().find_map(|c| find(c, want))
 }
 
+/// An attempt that saw nothing which is evidence about `set_value` — Settings' search screen went
+/// away under it, or the device could not be read — carrying the step that noticed. Abandoned for
+/// a retry rather than asserted on; every reason reaches the final failure.
+struct Abandoned(String);
+
+/// How long [`set_value_reports_whether_the_write_landed`] may spend getting Settings' search
+/// screen to stay up, and the pause between attempts at it.
+///
+/// A device's FIRST boot after a data wipe takes both these away from the test, and neither is
+/// anything glass did (glass#323):
+///
+///   - `com.google.android.settings.intelligence` — a different package from the
+///     `com.android.settings` this test launches, and the one that owns the search screen — takes
+///     a Phenotype config commit ~10s after `boot_completed`, and the platform force-stops it:
+///     `Killing …/u0a118 (adj 0): change com.google.android.settings.intelligence`, then `Force
+///     removing ActivityRecord{…SearchActivity}: app died, no saved state`. The field the write
+///     is aimed at is destroyed and Settings' home screen resumes under it.
+///   - Until that package is serving, Settings' home screen draws no search entry at all, so
+///     there is nothing to tap.
+///
+/// Both settle within the first half-minute of a boot. A warm device pays nothing: the first
+/// attempt succeeds and the budget is never consulted. Do not delete this as defensive noise —
+/// without it this test is red on a fresh CI emulator (12/12 on wiped cold boots, 0/22 warm).
+const SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+const SETUP_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether Settings still has its search screen up — the premise every assertion in the write leg
+/// rests on. An editable field is what this test drives, and Settings' home screen has none.
+fn search_field_is_up(a11y: &mut glass_android::AndroidA11y, ctx: &AxContext) -> bool {
+    match a11y.snapshot(ctx) {
+        Ok(mut t) => {
+            t.assign_ids();
+            find(&t.root, &|n| n.states.editable).is_some()
+        }
+        Err(_) => false,
+    }
+}
+
+/// A step of the write leg did not do what it must. Panics when the field is still on screen,
+/// and abandons the attempt only when the screen the step was judging has gone. A guard bug
+/// refuses with the field still there, so it can never be retried away.
+fn abandon_or_fail(
+    a11y: &mut glass_android::AndroidA11y,
+    ctx: &AxContext,
+    what: String,
+) -> Abandoned {
+    assert!(!search_field_is_up(a11y, ctx), "{what}");
+    Abandoned(what)
+}
+
+/// One attempt at the write leg, opening the search screen it needs for itself.
+fn write_leg(
+    platform: &mut glass_android::AndroidPlatform,
+    a11y: &mut glass_android::AndroidA11y,
+    ctx: &AxContext,
+) -> Result<(), Abandoned> {
+    // Tap the search entry so Settings puts up its EditText.
+    let mut tree = a11y
+        .snapshot(ctx)
+        .map_err(|e| Abandoned(format!("snapshot: {e}")))?;
+    tree.assign_ids();
+    let search = find(&tree.root, &|n| {
+        n.name.as_deref().is_some_and(|s| s.contains("Search"))
+    })
+    .and_then(|n| n.bounds)
+    .and_then(|b| b.clamped_center(ctx.window.width, ctx.window.height))
+    .ok_or_else(|| Abandoned("Settings shows no search entry".into()))?;
+    platform
+        .send_pointer(&PointerEvent::Click {
+            x: search.0,
+            y: search.1,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        })
+        .expect("tap search");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let mut tree = a11y
+        .snapshot(ctx)
+        .map_err(|e| Abandoned(format!("re-snapshot: {e}")))?;
+    tree.assign_ids();
+    let field = find(&tree.root, &|n| n.states.editable)
+        .ok_or_else(|| Abandoned("no editable field after the tap".into()))?;
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+        value: field.value.clone(),
+    };
+
+    // A write that lands: reported Ok, and the node at that id holds it afterwards.
+    if let Err(e) = a11y.set_value(ctx, &target, "glass") {
+        return Err(abandon_or_fail(
+            a11y,
+            ctx,
+            format!("a real write into a real field must succeed: {e}"),
+        ));
+    }
+    let mut after = a11y
+        .snapshot(ctx)
+        .map_err(|e| Abandoned(format!("snapshot after write: {e}")))?;
+    after.assign_ids();
+    let held = after
+        .find(target.id)
+        .and_then(|n| n.value.clone())
+        .unwrap_or_default();
+    if !held.contains("glass") {
+        return Err(abandon_or_fail(
+            a11y,
+            ctx,
+            format!("field holds {held:?} after the write"),
+        ));
+    }
+
+    // Clearing the field, on the device whose behaviour decided the rule: an emptied Android
+    // `EditText` reports its *hint* as its text and `uiautomator` exposes no hint attribute, so a
+    // clear cannot be confirmed here at all — the deliberate cost of judging one by "reads back
+    // empty". What the device still has to show is that the text went.
+    //
+    // The target is re-located first: typing into Settings' search renders a results list, so the
+    // screen the pre-write target was captured against is gone.
+    let mut before_clear = a11y
+        .snapshot(ctx)
+        .map_err(|e| Abandoned(format!("snapshot before the clear: {e}")))?;
+    before_clear.assign_ids();
+    let field = find(&before_clear.root, &|n| n.states.editable)
+        .ok_or_else(|| Abandoned("the field went before the clear".into()))?;
+    let target = AxTarget {
+        id: field.id,
+        role: field.role,
+        name: field.name.clone(),
+        bounds: field.bounds,
+        value: field.value.clone(),
+    };
+    let verdict = a11y.set_value(ctx, &target, "");
+    if !matches!(verdict, Err(GlassError::AxValueNotApplied(_))) {
+        return Err(abandon_or_fail(
+            a11y,
+            ctx,
+            format!("a field that reports its hint cannot confirm a clear: {verdict:?}"),
+        ));
+    }
+    let mut cleared = a11y
+        .snapshot(ctx)
+        .map_err(|e| Abandoned(format!("snapshot after clear: {e}")))?;
+    cleared.assign_ids();
+    // Found by what it is, not by an id the clear may have shifted, so this cannot pass by failing
+    // to look.
+    let field = find(&cleared.root, &|n| n.states.editable)
+        .ok_or_else(|| Abandoned("the field went during the clear".into()))?;
+    assert_ne!(
+        field.value.as_deref(),
+        Some("glass"),
+        "the typed text is gone from the field"
+    );
+
+    // A stale target is refused before anything is typed — the pre-write fingerprint check, which
+    // predates the read-back. Kept as a regression guard, not as evidence about the read-back.
+    let stale = AxTarget {
+        id: target.id,
+        role: target.role,
+        name: Some("not the field that is there".into()),
+        bounds: target.bounds,
+        value: target.value.clone(),
+    };
+    // Any of the three refusals: nothing on this screen carries that name, so the usual verdict
+    // is `AxElementGone`, but a tree that renumbered or lost the id answers first.
+    match a11y.set_value(ctx, &stale, "ignored") {
+        Err(
+            GlassError::AxElementGone(_)
+            | GlassError::AxElementChanged(_)
+            | GlassError::AxElementNotFound(_),
+        ) => {}
+        other => panic!("a stale target must not report success: {other:?}"),
+    }
+    Ok(())
+}
+
 /// A real write into a real field, and a real clear of it.
 ///
 /// Settings has no editable field until its search entry is tapped, so the test taps it first and
@@ -142,109 +322,25 @@ fn set_value_reports_whether_the_write_landed() {
 
     let ctx = AxContext {
         pids: platform.app_pids(),
-        window: window.clone(),
+        window,
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
     };
     let mut a11y = glass_android::AndroidA11y::new();
 
-    // Tap the search entry so Settings puts up its EditText.
-    let mut tree = a11y.snapshot(&ctx).expect("snapshot");
-    tree.assign_ids();
-    let search = find(&tree.root, &|n| {
-        n.name.as_deref().is_some_and(|s| s.contains("Search"))
-    })
-    .and_then(|n| n.bounds)
-    .and_then(|b| b.clamped_center(window.width, window.height))
-    .expect("Settings shows a search entry");
-    platform
-        .send_pointer(&PointerEvent::Click {
-            x: search.0,
-            y: search.1,
-            button: MouseButton::Left,
-            count: 1,
-            modifiers: vec![],
-        })
-        .expect("tap search");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
-    let mut tree = a11y.snapshot(&ctx).expect("re-snapshot");
-    tree.assign_ids();
-    let field = find(&tree.root, &|n| n.states.editable).expect("an editable field after the tap");
-    let target = AxTarget {
-        id: field.id,
-        role: field.role,
-        name: field.name.clone(),
-        bounds: field.bounds,
-        value: field.value.clone(),
-    };
-
-    // A write that lands: reported Ok, and the node at that id holds it afterwards.
-    a11y.set_value(&ctx, &target, "glass")
-        .expect("a real write into a real field must succeed");
-    let mut after = a11y.snapshot(&ctx).expect("snapshot after write");
-    after.assign_ids();
-    let held = after
-        .find(target.id)
-        .and_then(|n| n.value.clone())
-        .unwrap_or_default();
-    assert!(
-        held.contains("glass"),
-        "field holds {held:?} after the write"
-    );
-
-    // Clearing the field, on the device whose behaviour decided the rule: an emptied Android
-    // `EditText` reports its *hint* as its text and `uiautomator` exposes no hint attribute, so a
-    // clear cannot be confirmed here at all — the deliberate cost of judging one by "reads back
-    // empty". What the device still has to show is that the text went.
-    //
-    // The target is re-located first: typing into Settings' search renders a results list, so the
-    // screen the pre-write target was captured against is gone.
-    let mut before_clear = a11y.snapshot(&ctx).expect("snapshot before the clear");
-    before_clear.assign_ids();
-    let field = find(&before_clear.root, &|n| n.states.editable).expect("the field is still there");
-    let target = AxTarget {
-        id: field.id,
-        role: field.role,
-        name: field.name.clone(),
-        bounds: field.bounds,
-        value: field.value.clone(),
-    };
-    match a11y.set_value(&ctx, &target, "") {
-        Err(GlassError::AxValueNotApplied(_)) => {}
-        other => panic!("a field that reports its hint cannot confirm a clear: {other:?}"),
-    }
-    let mut cleared = a11y.snapshot(&ctx).expect("snapshot after clear");
-    cleared.assign_ids();
-    // Found by what it is, not by an id the clear may have shifted, so this cannot pass by failing
-    // to look.
-    let field = find(&cleared.root, &|n| n.states.editable)
-        .expect("the field is still there after the clear");
-    assert_ne!(
-        field.value.as_deref(),
-        Some("glass"),
-        "the typed text is gone from the field"
-    );
-
-    // A stale target is refused before anything is typed — the pre-write fingerprint check, which
-    // predates the read-back. Kept as a regression guard, not as evidence about the read-back.
-    let stale = AxTarget {
-        id: target.id,
-        role: target.role,
-        name: Some("not the field that is there".into()),
-        bounds: target.bounds,
-        value: target.value.clone(),
-    };
-    // Any of the three refusals: nothing on this screen carries that name, so the usual verdict
-    // is `AxElementGone`, but a tree that renumbered or lost the id answers first.
-    match a11y.set_value(&ctx, &stale, "ignored") {
-        Err(
-            GlassError::AxElementGone(_)
-            | GlassError::AxElementChanged(_)
-            | GlassError::AxElementNotFound(_),
-        ) => {}
-        other => panic!("a stale target must not report success: {other:?}"),
+    let deadline = std::time::Instant::now() + SETUP_BUDGET;
+    let mut abandoned: Vec<String> = Vec::new();
+    while let Err(Abandoned(why)) = write_leg(&mut platform, &mut a11y, &ctx) {
+        eprintln!("abandoned: {why}; reopening Settings");
+        abandoned.push(why);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Settings never held its search screen up for one write leg in {SETUP_BUDGET:?}: \
+             {abandoned:?}"
+        );
+        reopen_settings();
+        std::thread::sleep(SETUP_PAUSE);
     }
 
     platform.stop_app().expect("stop");
@@ -266,6 +362,27 @@ fn bring_to_front(component: &str) {
         "am start {component} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Restart Settings from nothing, for [`set_value_reports_whether_the_write_landed`]'s retry.
+///
+/// The force-stop is what makes it a restart. Settings is already the front-most activity by then,
+/// so a bare `am start` is only delivered to it — `START … result code=3` — and redraws nothing;
+/// measured on this AVD, a home screen that lost its search entry when
+/// `com.google.android.settings.intelligence` was killed never grew one back without a fresh
+/// `com.android.settings` process.
+fn reopen_settings() {
+    let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
+    let out = std::process::Command::new(&adb)
+        .args(["shell", "am", "force-stop", "com.android.settings"])
+        .output()
+        .expect("adb shell am force-stop");
+    assert!(
+        out.status.success(),
+        "am force-stop com.android.settings failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    bring_to_front("com.android.settings/.Settings");
 }
 
 /// The service reader answering while something else holds the foreground. Ignored by default:
