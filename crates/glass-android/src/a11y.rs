@@ -557,6 +557,35 @@ pub(crate) fn editable_target<'a>(tree: &'a AxTree, target: &AxTarget) -> Result
     Ok(node)
 }
 
+/// Readiness bound for the read a write makes before it can act.
+///
+/// `uiautomator` serves no tree for a moment while a window transition finishes or the
+/// accessibility bridge re-registers, and one attempt turns that into `AccessibilityUnavailable`
+/// where the caller asked about an element (glass#338).
+///
+/// Same shape as [`VERIFY_BOUND`] and kept separate from it: they wait out different moments, so a
+/// change to one is not a change to the other. The cost is that a write against a device that never
+/// serves a tree now pays two [`AdbOp::Dump`] budgets here rather than one, and `set_value` carries
+/// no caller deadline to cap that — do not add a third attempt without one.
+const PRE_WRITE_BOUND: RetryBound = RetryBound {
+    least: 2,
+    then_within: Duration::ZERO,
+};
+
+/// Read the tree and locate `target`'s tap point — the read every write makes before it can act.
+///
+/// Over a runner so the bound above is testable without a device — the rest of a write taps and
+/// types through `Adb` directly.
+fn locate_for_write(
+    run: &mut AdbRunner<'_>,
+    ctx: &AxContext,
+    target: &AxTarget,
+) -> Result<(i32, i32)> {
+    let mut tree = snapshot_with_runner(run, ctx, PRE_WRITE_BOUND)?;
+    tree.assign_ids();
+    locate_editable_target(&tree, target, &ctx.window)
+}
+
 /// [`editable_target`], plus the window-relative tap point for editing it — the extra step the
 /// `uiautomator` reader needs, because it edits by tapping where the on-device service can act on
 /// the node directly. Errors `AxElementNotClickable` when the element has no on-screen center.
@@ -578,12 +607,10 @@ impl Accessibility for AndroidA11y {
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let window = ctx.window.clone();
-        // Re-snapshot and number nodes to locate the target by its pre-order id.
-        let mut tree = self.snapshot(ctx)?;
-        tree.assign_ids();
-        let (cx, cy) = locate_editable_target(&tree, target, &window)?;
-
         let adb = self.ensure_adb()?;
+        // Re-snapshot and number nodes to locate the target by its pre-order id.
+        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
+        self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
         let tap = PointerEvent::Click {
             x: cx,
@@ -642,7 +669,8 @@ impl Accessibility for AndroidA11y {
 mod tests {
     use super::{
         Attempt, COLD_BOUND, RetryBound, Warmth, dump_once, dump_until_ready, editable_target,
-        locate_editable_target, snapshot_bound, snapshot_with_runner, verify_write,
+        locate_editable_target, locate_for_write, snapshot_bound, snapshot_with_runner,
+        verify_write,
     };
     use crate::adb::AdbOp;
     use glass_core::accessibility::{
@@ -1014,6 +1042,51 @@ mod tests {
                 "the {step} step ignored the context's deadline by {:?}",
                 d.saturating_duration_since(latest)
             );
+        }
+    }
+
+    /// glass#338 row 1: the read a write makes before it can act is owed a second attempt.
+    ///
+    /// The recorded failure is a `set_value` on a deliberately stale target answering
+    /// `AccessibilityUnavailable("…null root node…")` instead of one of the three element verdicts
+    /// the caller asked for.
+    ///
+    /// The empty tree is what discriminates: a read that got through reports the element missing, a
+    /// read that did not reports readiness.
+    #[test]
+    fn the_read_before_a_write_is_owed_a_second_attempt() {
+        let mut cold = fake(1);
+        let target = AxTarget {
+            id: AxNodeId(7),
+            role: AxRole::TextField,
+            name: Some("Search".into()),
+            bounds: None,
+            value: None,
+        };
+
+        let e = locate_for_write(&mut cold, &write_ctx(), &target)
+            .expect_err("the fixture tree holds no element to write into");
+
+        assert!(
+            matches!(e, GlassError::AxElementNotFound(_)),
+            "the write's own read gave up on a device that was ready a moment later: {e}"
+        );
+    }
+
+    /// The context a write reads under: no caller deadline, which is what `set_value` is handed.
+    fn write_ctx() -> AxContext {
+        AxContext {
+            pids: vec![],
+            window: WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::UNBOUNDED,
         }
     }
 

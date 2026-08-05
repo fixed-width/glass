@@ -215,6 +215,14 @@ internal refactors, CI, or test-only changes.
   which is the case where "the element is missing" would be the wrong answer. Previously a single
   not-ready read anywhere in the wait — including the one that ends it — turned the whole call into
   an error, so on a slow-to-start app the documented soft timeout could not be reached.
+- `glass_set_value` on Android no longer fails a write outright because the tree was briefly
+  unreadable when it started. Before touching anything the tool re-reads the accessibility tree to
+  find the element you named, and `uiautomator` serves nothing for a moment while a window
+  transition finishes or the accessibility bridge re-registers. That one read got a single attempt,
+  so the moment surfaced as `accessibility unavailable: … null root node …` — an answer about the
+  device where the caller had asked about an element, and one that told you nothing about whether
+  writing would have worked. It is now owed a second attempt, like the read-back that confirms the
+  write already was.
 - `glass_set_value` on Android now really does retry the read-back that confirms a write, instead
   of retrying only when the device happened to be fast. The retry allowance was two seconds of
   wall-clock, but a single `uiautomator` attempt costs seconds on a loaded device — measured at
