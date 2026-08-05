@@ -73,7 +73,7 @@ fn screen_of(spec: &AppSpec) -> AxTree {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
-        deadline: AxDeadline::NONE,
+        deadline: AxDeadline::UNBOUNDED,
     };
     // UIKit keeps building the hierarchy for a beat after the app is up, so a tree read straight
     // after `start_app` can be half-drawn — which would fail here as "the argument did not

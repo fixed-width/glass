@@ -136,7 +136,7 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
-        deadline: AxDeadline::NONE,
+        deadline: AxDeadline::UNBOUNDED,
     };
 
     // 1) Snapshot: the fixture's elements must appear, and the status starts at READY. The

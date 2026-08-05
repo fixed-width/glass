@@ -393,7 +393,7 @@ mod macos_main {
                 window_handle: None,
                 a11y_bus_addr: None,
                 limits: WalkLimits::DEFAULT,
-                deadline: AxDeadline::NONE,
+                deadline: AxDeadline::UNBOUNDED,
             };
             let mut a11y = MacosA11y::new();
             let mut tree = try_expect(a11y.snapshot(&ctx), "a11y snapshot(TextEdit)")?;

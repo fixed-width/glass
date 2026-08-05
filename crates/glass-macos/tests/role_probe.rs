@@ -254,7 +254,7 @@ mod macos_main {
                 window_handle: None,
                 a11y_bus_addr: None,
                 limits: WalkLimits::from_max_nodes(Some(0)),
-                deadline: AxDeadline::NONE,
+                deadline: AxDeadline::UNBOUNDED,
             };
             let mut a11y = MacosA11y::new();
             let mut tree = a11y

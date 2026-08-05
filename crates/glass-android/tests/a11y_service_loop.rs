@@ -57,7 +57,7 @@ fn a11y_service_snapshot_and_actions() {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
-        deadline: AxDeadline::NONE,
+        deadline: AxDeadline::UNBOUNDED,
     };
 
     let mut tree = a11y.snapshot(&ctx).expect("snapshot");
@@ -140,7 +140,7 @@ fn native_invoke_actuates_the_fixture() {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
-        deadline: AxDeadline::NONE,
+        deadline: AxDeadline::UNBOUNDED,
     };
 
     fn by_desc<'a>(n: &'a AxNode, desc: &str) -> Option<&'a AxNode> {

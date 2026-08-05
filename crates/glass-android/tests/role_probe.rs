@@ -258,7 +258,7 @@ fn uiautomator_role_histogram_probe() {
             window_handle: None,
             a11y_bus_addr: None,
             limits: uncapped(),
-            deadline: AxDeadline::NONE,
+            deadline: AxDeadline::UNBOUNDED,
         };
         let mut a11y = AndroidA11y::new();
         let mut tree = a11y
@@ -340,7 +340,7 @@ fn service_role_histogram_probe() {
             window_handle: None,
             a11y_bus_addr: None,
             limits: uncapped(),
-            deadline: AxDeadline::NONE,
+            deadline: AxDeadline::UNBOUNDED,
         };
         let mut tree = a11y
             .snapshot(&ctx)

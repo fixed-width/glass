@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal, GlassError,
-    Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
+    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxTarget, AxTree, ChangeSignal,
+    GlassError, Result, TruncationLimit, WalkBudget, normalize_description, read_back_confirms,
 };
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -19,6 +19,34 @@ use uiautomation::{UIAutomation, UIElement, UITreeWalker};
 
 /// Hard cap so a hung UIA provider can't block the calling tool forever.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a read may block for its worker, and whether the caller's deadline — not
+/// [`SNAPSHOT_TIMEOUT`] — is what ends the wait.
+///
+/// Both come from one comparison, decided before the wait: a read the *caller* cut short is a
+/// spent budget, a read that used the whole ceiling is UIA that stopped answering, and inferring
+/// which afterwards is the mistake glass#341 recorded.
+fn bounded_wait(deadline: AxDeadline) -> (Duration, bool) {
+    let own = Instant::now() + SNAPSHOT_TIMEOUT;
+    (
+        deadline.cap(own).saturating_duration_since(Instant::now()),
+        deadline.governs(own),
+    )
+}
+
+/// What a read reports when it never answered: the caller's own deadline ending it is
+/// `AccessibilityNotReady`, which [`glass_core::Glass::wait_for_element`] polls through, where UIA
+/// going quiet for a whole [`SNAPSHOT_TIMEOUT`] is not.
+fn never_answered(by_caller: bool) -> GlassError {
+    if by_caller {
+        return GlassError::AccessibilityNotReady(
+            "no accessibility tree within the time this call allowed".into(),
+        );
+    }
+    GlassError::AccessibilityUnavailable(
+        "accessibility snapshot timed out (UIA not responding)".into(),
+    )
+}
 /// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
 /// bounds are stable for a static element across snapshot→set_value (window moves cancel),
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
@@ -42,6 +70,12 @@ impl WindowsA11y {
 
 impl Accessibility for WindowsA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        // Checked before the spawn: the worker below is detached and holds its own COM apartment,
+        // so one started for a caller that has stopped waiting outlives the answer nobody reads.
+        if ctx.deadline.has_passed() {
+            return Err(never_answered(true));
+        }
+        let (wait, by_caller) = bounded_wait(ctx.deadline);
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         // UIA is COM and thread-affine; run it on a fresh OS thread, fully decoupled
@@ -49,11 +83,9 @@ impl Accessibility for WindowsA11y {
         std::thread::spawn(move || {
             let _ = tx.send(run_snapshot(&ctx));
         });
-        match rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+        match rx.recv_timeout(wait) {
             Ok(r) => r,
-            Err(_) => Err(GlassError::AccessibilityUnavailable(
-                "accessibility snapshot timed out (UIA not responding)".into(),
-            )),
+            Err(_) => Err(never_answered(by_caller)),
         }
     }
 
@@ -597,6 +629,38 @@ fn find_nth(
 mod tests {
     use super::*;
     use glass_core::{MAX_DEPTH, MAX_NODES};
+
+    /// glass#338: only the reader can hold a read inside the caller's timeout — the worker below
+    /// is detached, so nothing outside it can shorten one that has started.
+    #[test]
+    fn a_read_is_bounded_by_the_caller_when_that_falls_first() {
+        let (wait, by_caller) = bounded_wait(AxDeadline::from_millis(50));
+        assert!(wait <= Duration::from_millis(50), "{wait:?}");
+        assert!(by_caller);
+    }
+
+    /// The other direction: without it the test above passes on a reader that waits for nothing.
+    #[test]
+    fn a_caller_that_names_no_deadline_leaves_the_read_its_own_ceiling() {
+        let (wait, by_caller) = bounded_wait(AxDeadline::UNBOUNDED);
+        assert!(wait > SNAPSHOT_TIMEOUT - Duration::from_secs(1), "{wait:?}");
+        assert!(!by_caller);
+    }
+
+    /// The variant decides whether a wait polls on or fails, so the two causes must not collapse:
+    /// a bus that went quiet for the whole ceiling is a real fault, and a caller that ran out of
+    /// its own time is not.
+    #[test]
+    fn a_read_the_caller_cut_short_reads_as_not_ready_where_a_quiet_bus_does_not() {
+        assert!(matches!(
+            never_answered(true),
+            GlassError::AccessibilityNotReady(_)
+        ));
+        assert!(matches!(
+            never_answered(false),
+            GlassError::AccessibilityUnavailable(_)
+        ));
+    }
 
     /// The failure mode this guards: if an absent child ever stopped arriving as a zero code,
     /// every leaf in every snapshot would report an unreadable subtree. Builds the error

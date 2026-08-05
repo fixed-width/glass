@@ -225,7 +225,7 @@ fn role_histogram_probe() {
             // The node cap lifted, so a big app's tree is never truncated mid-probe. Depth
             // and per-level sibling rails keep their generous structural defaults regardless.
             limits: WalkLimits::from_max_nodes(Some(0)),
-            deadline: AxDeadline::NONE,
+            deadline: AxDeadline::UNBOUNDED,
         };
         let mut tree = a11y
             .snapshot(&ctx)

@@ -86,7 +86,7 @@ impl Session {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
-            deadline: AxDeadline::NONE,
+            deadline: AxDeadline::UNBOUNDED,
         }
     }
 
@@ -173,7 +173,7 @@ fn a_read_stops_at_the_deadline_its_caller_named() {
         .expect("the first snapshot warms the reader");
 
     let mut hurried = session.ctx();
-    hurried.deadline = AxDeadline::in_ms(50);
+    hurried.deadline = AxDeadline::from_millis(50);
     let started = std::time::Instant::now();
     let e = a11y
         .snapshot(&hurried)

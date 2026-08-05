@@ -34,7 +34,7 @@ impl Glass {
             crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
         // The tool takes no timeout, so the reader keeps its own budget. Inventing one here would
         // cap a plain snapshot at a number no caller asked for.
-        self.snapshot_at_current_limits(AxDeadline::NONE)
+        self.snapshot_at_current_limits(AxDeadline::UNBOUNDED)
     }
 
     /// Subscribe to the backend's change notifications for the active app, if it has any.
@@ -42,6 +42,10 @@ impl Glass {
     /// Callers hold the returned signal in a local, never in the session: a poll loop's tick
     /// closure borrows `self` mutably, so a signal stored here could not be waited on from the
     /// pause between ticks.
+    ///
+    /// `deadline` is passed for the handshake, which spends the caller's budget before the poll
+    /// loop starts. No reader bounds its subscription by it yet — the two that have event streams
+    /// bound their own registration — so today it only travels.
     pub(crate) fn subscribe_a11y_changes(
         &mut self,
         deadline: AxDeadline,
@@ -69,7 +73,7 @@ impl Glass {
     /// id-space instead of silently reverting to the default cap on the next internal snapshot.
     ///
     /// `deadline` is the enclosing operation's bound, not this walk's — see [`AxDeadline`]. A
-    /// caller with no timeout of its own passes [`AxDeadline::NONE`].
+    /// caller with no timeout of its own passes [`AxDeadline::UNBOUNDED`].
     pub fn a11y_resnapshot(&mut self, deadline: AxDeadline) -> Result<AxTree> {
         self.snapshot_at_current_limits(deadline)
     }
@@ -115,7 +119,7 @@ impl Glass {
     /// Caches the snapshot, so `click_element` resolves a mark's id afterward.
     pub fn a11y_marks(&mut self) -> Result<(Frame, Vec<Mark>)> {
         let frame = self.screenshot(None, None)?;
-        let tree = self.a11y_resnapshot(AxDeadline::NONE)?;
+        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
         Ok(crate::marks::render(&frame, &tree))
     }
 
@@ -301,7 +305,7 @@ impl Glass {
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
                 limits: s.a11y_limits,
-                deadline: AxDeadline::NONE,
+                deadline: AxDeadline::UNBOUNDED,
             };
             (target, ctx)
         };
@@ -366,7 +370,7 @@ impl Glass {
                 window_handle: s.platform.active_window_handle(),
                 a11y_bus_addr: s.platform.a11y_bus_addr(),
                 limits: s.a11y_limits,
-                deadline: AxDeadline::NONE,
+                deadline: AxDeadline::UNBOUNDED,
             };
             (target, ctx)
         };
@@ -418,7 +422,7 @@ impl Glass {
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,
                 || {
-                    let tree = self.a11y_resnapshot(AxDeadline::NONE)?;
+                    let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
                     let now = find_checkable_near(&tree.root, target.bounds.as_ref())
                         .is_some_and(|n| n.states.checked == want);
                     Ok(now.then_some(()))
@@ -483,7 +487,7 @@ impl Glass {
         self.settle_for_popup();
         // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
         // nearest the target's bounds.
-        let tree = self.a11y_resnapshot(AxDeadline::NONE)?;
+        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
             .ok_or(GlassError::AxElementChanged(id.0))?;
@@ -521,7 +525,7 @@ impl Glass {
         self.settle_for_popup();
         // Verify the model actually committed — the *target* combo (matched by bounds,
         // now closed so nothing is `expanded`) must read the wanted label.
-        let tree = self.a11y_resnapshot(AxDeadline::NONE)?;
+        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
         let ok = find_combo_near(&tree.root, target.bounds.as_ref())
             .and_then(|c| c.name.as_deref())
             .is_some_and(|n| n.eq_ignore_ascii_case(want));
@@ -2962,7 +2966,7 @@ mod tests {
                 .as_ref()
                 .expect("snapshot recorded its ctx")
                 .deadline,
-            AxDeadline::NONE,
+            AxDeadline::UNBOUNDED,
         );
     }
 
