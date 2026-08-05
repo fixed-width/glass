@@ -9,9 +9,8 @@
 #     GLASS_ANDROID_FIXTURE_APK=/path/to/fixture-compose-debug.apk \
 #     ./scripts/test-android.sh
 #
-# Three tests fail loudly without the jar and a11y APK rather than self-skipping, so neither is
-# optional. GLASS_ANDROID_FIXTURE_APK currently is: its only consumer,
-# native_invoke_actuates_the_fixture, is excluded below until glass#324 lands.
+# Every test needing the jar, the a11y APK or the fixture APK fails loudly without it rather than
+# self-skipping, so all three are required.
 #
 # --test-threads=1 is required: every test drives the one attached device, so in parallel each
 # tears down the app another is mid-interaction with.
@@ -26,17 +25,8 @@
 #   managed_avd  — requires NO emulator running, so it cannot share a run with tests that need a
 #                  booted device. scripts/test-android-lifecycle.sh runs it instead.
 #
-# Two tests are filtered out below rather than excluding the whole file each belongs to:
-#
-#   set_value_reports_whether_the_write_landed (a11y_loop) — fails on a cold CI emulator with
-#   AxElementChanged(16), AndroidA11y's staleness guard refusing the write; passes warm. Tracked at
-#   glass#323. While it is off the a11y write path has no device coverage: the only other
-#   set_value call (a11y_service_loop) sits behind "if this screen has an editable field", which
-#   Settings' top screen does not. Note glass#326's fix does not reach this — it relaxed the same
-#   guard in ServiceA11y, and this test drives AndroidA11y.
-#
-# --skip matches as a SUBSTRING: a future test whose name contains this one's would be excluded
-# too, with no signal that it was.
+# Nothing is filtered out. If a test ever has to be, use --skip and say why here — it matches as a
+# SUBSTRING, so a future test whose name contains the excluded one's would go too, unannounced.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec cargo test --no-fail-fast -p glass-android \
@@ -47,5 +37,4 @@ exec cargo test --no-fail-fast -p glass-android \
   --test input_loop \
   --test see_loop \
   --test window_loop \
-  -- --ignored --test-threads=1 \
-  --skip set_value_reports_whether_the_write_landed "$@"
+  -- --ignored --test-threads=1 "$@"

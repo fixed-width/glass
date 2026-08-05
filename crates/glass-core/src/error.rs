@@ -99,6 +99,15 @@ pub enum GlassError {
     #[error("element #{0} changed since the snapshot; re-snapshot")]
     AxElementChanged(u32),
 
+    /// Raised in place of [`Self::AxElementChanged`] when nothing in the tree presents as the
+    /// element any more.
+    #[error(
+        "element #{0} is gone — nothing in the tree carries its role and name any more, so it has \
+         not moved or been renumbered; the screen it was on was replaced, or the app that drew it \
+         restarted. Re-snapshot to see where the app is now rather than re-addressing this element"
+    )]
+    AxElementGone(u32),
+
     #[error(
         "set_value on element #{0} did not take — the element does not hold the requested value. On \
          a desktop backend this usually means a read-only accessibility projection, so try \
@@ -295,6 +304,17 @@ mod tests {
     }
 
     #[test]
+    fn a_gone_element_forecloses_the_drift_hunt_its_neighbour_invites() {
+        assert_eq!(
+            GlassError::AxElementGone(16).to_string(),
+            "element #16 is gone — nothing in the tree carries its role and name any more, so it \
+             has not moved or been renumbered; the screen it was on was replaced, or the app that \
+             drew it restarted. Re-snapshot to see where the app is now rather than re-addressing \
+             this element"
+        );
+    }
+
+    #[test]
     fn ax_action_errors_name_the_element_and_cause() {
         assert_eq!(
             GlassError::AxActionUnavailable(7).to_string(),
@@ -322,6 +342,7 @@ mod tests {
             GlassError::AxActionFailed(3, "boom".into()),
             GlassError::AccessibilityUnavailable("invoke timed out".into()),
             GlassError::AxElementChanged(3),
+            GlassError::AxElementGone(3),
             GlassError::NoAxSnapshot,
             GlassError::AxElementNotFound(3),
             GlassError::NoActiveSession,
@@ -341,6 +362,7 @@ mod tests {
         for e in [
             GlassError::AxElementNotFound(3),
             GlassError::AxElementChanged(3),
+            GlassError::AxElementGone(3),
             GlassError::AxElementNotEditable(3),
             GlassError::AxElementNotClickable(3),
             GlassError::AxUnsupported,

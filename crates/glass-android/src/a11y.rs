@@ -199,11 +199,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
                 t.limit_value,
                 t.limit.label(),
             )),
-            None => GlassError::AxElementChanged(target.id.0),
+            None => drifted(after_tree, target),
         });
     };
     if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
-        return Err(GlassError::AxElementChanged(target.id.0));
+        return Err(drifted(after_tree, target));
     }
     let landed = if text.is_empty() {
         typed_clear_landed(node.value.as_deref())
@@ -304,8 +304,37 @@ impl Default for AndroidA11y {
     }
 }
 
+/// Whether any node in `tree` still presents as `target` — same role and name, wherever it sits.
+/// Bounds and value are excluded: both move under a live app without the control going anywhere.
+fn still_on_screen(tree: &AxTree, target: &AxTarget) -> bool {
+    fn walk(node: &AxNode, target: &AxTarget) -> bool {
+        target.matches(node.role, node.name.as_deref())
+            || node.children.iter().any(|c| walk(c, target))
+    }
+    walk(&tree.root, target)
+}
+
+/// Which of the two disagreements a tree that no longer agrees with `target` has.
+///
+/// `AxElementChanged` sends the reader looking for where the element went, which is worth doing
+/// only while it is still somewhere; nothing carrying its role and name means the screen was
+/// replaced or the app that drew it restarted (glass#323).
+///
+/// Both Android readers get this. Do not tighten [`still_on_screen`] to include bounds or value:
+/// `a11y_service`'s relaxation needs `AxElementChanged` in every case it can relax.
+fn drifted(tree: &AxTree, target: &AxTarget) -> GlassError {
+    if still_on_screen(tree, target) {
+        GlassError::AxElementChanged(target.id.0)
+    } else {
+        GlassError::AxElementGone(target.id.0)
+    }
+}
+
 /// Find `target.id` and reject a tree that drifted under it — shared by [`editable_target`]
 /// and the service reader's `invoke`, which needs the same rejection without the editable check.
+///
+/// An id that resolves to nothing stays [`GlassError::AxElementNotFound`]; [`drifted`] classifies
+/// only an id occupied by something unrelated.
 pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
@@ -314,7 +343,7 @@ pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&
         || !target.bounds_consistent(node.bounds, 8)
         || !target.value_consistent(node.value.as_deref())
     {
-        return Err(GlassError::AxElementChanged(target.id.0));
+        return Err(drifted(tree, target));
     }
     Ok(node)
 }
@@ -837,6 +866,26 @@ mod tests {
         t
     }
 
+    /// `inner`'s root one level down, under a container that has taken over its id — the shape a
+    /// tree that grew a node above the element arrives in.
+    fn under_a_container(inner: AxTree) -> AxTree {
+        let mut t = tree(AxRole::Group, None, Some(BOUNDS), false);
+        t.root.children.push(inner.root);
+        t.assign_ids();
+        t
+    }
+
+    /// A tree with nothing resembling the target in it — Settings' home screen after the search
+    /// activity that owned the field was killed (glass#323).
+    fn a_different_screen() -> AxTree {
+        tree(
+            AxRole::Group,
+            None,
+            Some(AxRect { y: 900, ..BOUNDS }),
+            false,
+        )
+    }
+
     /// Like `tree`, but also holding `value` — see `editable_target`'s doc for why that's part of
     /// the fingerprint too. Always at `BOUNDS`, always editable.
     fn tree_with_value(role: AxRole, name: Option<&str>, value: Option<&str>) -> AxTree {
@@ -925,12 +974,22 @@ mod tests {
     fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
         // The write may well have landed — on something that then moved. Saying "not applied"
         // would send an agent to retype into whatever now sits at that id.
-        let after = tree_holding(Some("world"));
-        let t = target(0, Some("A different field"), Some(BOUNDS));
+        let after = under_a_container(tree_holding(Some("world")));
+        let t = target(0, Some("Search"), Some(BOUNDS));
         assert!(matches!(
             verify_write(&after, &t, "world"),
             Err(GlassError::AxElementChanged(0))
         ));
+    }
+
+    #[test]
+    fn a_read_back_of_a_screen_that_was_replaced_reports_the_element_gone() {
+        // glass#323's other half: the kill can land between the write and the read-back, which
+        // is where four of the nine observed refusals came from.
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        let e = verify_write(&a_different_screen(), &t, "world")
+            .expect_err("the field the write was aimed at is not in this tree");
+        assert!(matches!(e, GlassError::AxElementGone(0)), "{e}");
     }
 
     #[test]
@@ -948,6 +1007,8 @@ mod tests {
 
     #[test]
     fn a_target_missing_from_the_read_back_is_reported_as_changed() {
+        // The element is still in the tree, just no longer at that id — renumbered, which is what
+        // "changed" means.
         let after = tree_holding(Some("world"));
         let t = target(7, Some("Search"), Some(BOUNDS));
         assert!(matches!(
@@ -993,13 +1054,55 @@ mod tests {
     }
 
     #[test]
-    fn drifted_name_is_element_changed() {
-        // Same id lands on a different-named element (tree drift) — must refuse, not overwrite.
-        let t = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+    fn an_element_that_moved_to_another_id_is_element_changed() {
+        // Same id lands on a different element (tree drift) — must refuse, not overwrite, and
+        // the element is still there to be re-addressed.
+        let t = under_a_container(tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true));
         assert!(matches!(
-            locate_editable_target(&t, &target(0, Some("Other"), Some(BOUNDS)), &WIN),
+            locate_editable_target(&t, &target(0, Some("Search"), Some(BOUNDS)), &WIN),
             Err(GlassError::AxElementChanged(0))
         ));
+    }
+
+    #[test]
+    fn an_element_nothing_in_the_tree_resembles_is_element_gone() {
+        // glass#323: a first-boot platform kill destroyed the search activity mid-write, and the
+        // id then denoted a container in the tree that replaced it.
+        let t = a_different_screen();
+        let e = locate_editable_target(&t, &target(0, Some("Search"), Some(BOUNDS)), &WIN)
+            .expect_err("a container from another activity is not the field");
+        assert!(matches!(e, GlassError::AxElementGone(0)), "{e}");
+    }
+
+    #[test]
+    fn renaming_a_refusal_never_turns_it_into_a_write() {
+        // The taxonomy changes what a refusal is called, not when one happens.
+        let field = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+        let nested = under_a_container(tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true));
+        let replaced = a_different_screen();
+        let here = target(0, Some("Search"), Some(BOUNDS));
+        let moved = target(0, Some("Search"), Some(AxRect { x: 700, ..BOUNDS }));
+        for (what, got) in [
+            (
+                "a screen that was replaced",
+                editable_target(&replaced, &here),
+            ),
+            (
+                "the element one level down",
+                editable_target(&nested, &here),
+            ),
+            ("bounds that drifted", editable_target(&field, &moved)),
+            (
+                "a name no node carries",
+                editable_target(&field, &target(0, Some("Other"), Some(BOUNDS))),
+            ),
+            (
+                "an id that resolves to nothing",
+                editable_target(&field, &target(9, Some("Search"), Some(BOUNDS))),
+            ),
+        ] {
+            assert!(got.is_err(), "{what} must not authorise a write");
+        }
     }
 
     #[test]
