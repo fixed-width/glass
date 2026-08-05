@@ -14,22 +14,18 @@
 //! `MainThreadMarker::new()`, `None` off the main thread) and blocks that thread on
 //! `NSApplication::run`, exactly like the menu-bar app.
 //!
-//! Unlike the menu bar, the onboarder does **not** serve: there is no background tokio
-//! server running alongside this window. The onboarding process exists only to show this
-//! window and run its loop, so `run_checklist` owns the whole main thread for its lifetime
-//! and nothing needs to have been spawned before it.
+//! Unlike the menu bar, the onboarder does **not** serve: there is no background tokio server
+//! alongside this window, so `run_checklist` owns the whole main thread for its lifetime.
 //!
 //! ## Actions
 //!
 //! Each row's "Request…" button and the footer "Re-check" button are wired to a tiny
-//! per-button [`ButtonTarget`] (an `objc2` `define_class!` object holding one boxed
-//! closure), all responding to the same `fire:` selector — the same minimal-target idiom
-//! `menubar.rs` uses, one instance per button so no selector/tag dispatch is needed. A
-//! [`WindowDelegate`] terminates the process on `windowWillClose:` so closing the window
-//! ends the run loop (the onboarder has no other windows and no server to keep alive).
-//! `setTarget:`/`setDelegate:` hold only weak references, so the retained targets, the
-//! delegate, the content view and the window are all kept in locals across
-//! `NSApplication::run` for the whole lifetime of the app.
+//! per-button [`ButtonTarget`] (an `objc2` `define_class!` object holding one boxed closure),
+//! all responding to the same `fire:` selector — one instance per button, so no selector/tag
+//! dispatch is needed. A [`WindowDelegate`] terminates the process on `windowWillClose:` so
+//! closing the window ends the run loop. `setTarget:`/`setDelegate:` hold only weak references,
+//! so the targets, the delegate, the content view and the window are all kept in locals across
+//! `NSApplication::run`.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -201,15 +197,12 @@ fn rect(content_h: f64, x: f64, top: f64, w: f64, h: f64) -> CGRect {
 /// the process terminates (either via a row/re-check action that relaunches-and-exits, or
 /// via the window's close button → [`WindowDelegate::window_will_close`] → `terminate:`).
 ///
-/// Main-thread only, like [`crate::menubar::run`]: it takes a [`MainThreadMarker`] and
-/// blocks the calling thread (thread 0, the `#[tokio::main]` `block_on` thread) on
-/// `NSApplication::run`. Unlike the menu bar there is no background server here — the
-/// onboarder does nothing but run this window loop.
+/// Main-thread only, like [`crate::menubar::run`]: it takes a [`MainThreadMarker`] and blocks
+/// the calling thread (thread 0, the `#[tokio::main]` `block_on` thread) on
+/// `NSApplication::run`.
 ///
 /// Returns `Err` only for the one precondition this crate can enforce off a real AppKit run
-/// loop: being called off the main thread. Everything else (the window appearing, the
-/// buttons firing their callbacks, the delegate terminating on close) is main-thread AppKit
-/// runtime behavior verified on-box.
+/// loop: being called off the main thread.
 pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         "the onboarding checklist window must start on the main thread".to_string()

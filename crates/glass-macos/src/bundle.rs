@@ -2,9 +2,8 @@
 //! containment gate. Host-agnostic (no FFI) so it unit-tests on any host, like
 //! `glass-windows/src/discovery.rs`.
 #![forbid(unsafe_code)]
-// These fns are consumed by the cfg(macos) launch path (tasks 2/3) and exercised by the
-// unit tests below, so off-macOS non-test builds see them as dead. Keep the lint live on
-// macOS. Same pattern as `glass-windows/src/doctor.rs`.
+// These fns are consumed by the cfg(macos) launch path and exercised by the unit tests below,
+// so off-macOS non-test builds see them as dead. Keep the lint live on macOS.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use glass_core::{GlassError, Result, platform::SandboxLevel};
@@ -82,11 +81,9 @@ pub(crate) enum Disposition {
 }
 
 impl Disposition {
-    /// Pure reap predicate: only a `Fresh` adoption is terminated on `stop_app`/`Drop`. Kept
-    /// as a standalone predicate (rather than an inline `if fresh`) so the "which
-    /// disposition gets terminated" decision has one unit-testable definition — a boolean
-    /// inversion here would terminate a user's pre-existing app, so it carries a dedicated
-    /// off-macOS test (see `disposition_only_terminates_fresh`).
+    /// Pure reap predicate: only a `Fresh` adoption is terminated on `stop_app`/`Drop`. A
+    /// boolean inversion here would terminate a user's pre-existing app, hence the dedicated
+    /// off-macOS test `disposition_only_terminates_fresh`.
     pub(crate) fn should_terminate(self) -> bool {
         matches!(self, Disposition::Fresh)
     }

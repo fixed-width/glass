@@ -2,8 +2,7 @@
 //!
 //! Re-resolves the target window fresh on every call — a `Retained<SCWindow>` can't be
 //! held across calls or across the completion-handler's thread boundary (see
-//! `scwindow.rs`'s module doc) — via the nested async flow proven end-to-end in the objc2
-//! spike:
+//! `scwindow.rs`'s module doc) — via a nested async flow:
 //! `SCShareableContent` → [`crate::scwindow::find_on_screen_window`]/
 //! [`crate::scwindow::find_on_screen_window_by_id`] (pid-set lookup for `capture_window`,
 //! exact-`CGWindowID` lookup for `capture_window_by_id` — see [`capture_resolved`]) →
@@ -34,9 +33,9 @@ use glass_core::{GlassError, Result};
 
 use crate::scwindow::{find_on_screen_window, find_on_screen_window_by_id};
 
-/// Max wait for one capture round trip (`SCShareableContent` + `SCScreenshotManager`
-/// both completing). Generous relative to the spike's sub-second observations — this
-/// covers a wedged completion handler, not normal latency.
+/// Max wait for one capture round trip (`SCShareableContent` + `SCScreenshotManager` both
+/// completing). Generous relative to observed sub-second round trips — this covers a wedged
+/// completion handler, not normal latency.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capture the first on-screen window owned by one of `pids` as an RGBA8 [`Frame`],
@@ -58,12 +57,10 @@ pub(crate) fn capture_window(pids: &[i32], region: Option<&Region>) -> Result<Fr
 /// `owningApplication().processID() ∈ pids` as an RGBA8 [`Frame`], optionally cropped to a
 /// window-relative `region`. Same error mapping as [`capture_window`]. This is
 /// `backend.rs::capture_frame`'s active-window (retargeted) path: once
-/// `MacosPlatform::active_window` is set (by `start_app`, later by `select_window`), capture
-/// must target that *exact* window rather than "first on-screen window for this pid" — a
-/// multi-window app would otherwise silently capture the wrong window (Plan 4's design
-/// decision 2). The `pids` scoping (final-review fix 1) additionally guards against a
-/// stale/foreign `active_window` id: without it, `window_id` alone could match a window
-/// owned by a completely different app, silently capturing its pixels instead of erroring.
+/// `MacosPlatform::active_window` is set, capture must target that *exact* window rather than
+/// "first on-screen window for this pid", or a multi-window app silently captures the wrong
+/// one. The `pids` scoping additionally guards a stale or foreign `active_window` id — without
+/// it, `window_id` alone could match a window owned by a completely different app.
 pub(crate) fn capture_window_by_id(
     window_id: u32,
     pids: &[i32],
@@ -78,11 +75,9 @@ pub(crate) fn capture_window_by_id(
 /// Shared nested-async capture body for [`capture_window`]/[`capture_window_by_id`]: resolve
 /// the target `SCWindow` via `resolve` (the only thing that differs between a pid-set lookup
 /// and an exact-`CGWindowID` lookup), then build the `SCContentFilter`/`SCStreamConfiguration`
-/// and run `SCScreenshotManager`'s capture — identical for both callers, so this is the one
-/// place that logic lives (no risk of the two paths drifting on filter/config/crop
-/// handling). `resolve` runs inside the `SCShareableContent` completion block, so it must be
-/// `Send` (queue-hopped, like every other closure this module posts across the FFI
-/// boundary — see `ffi.rs`'s async-bridge doc) but does not need to be `Sync` (called once).
+/// and run `SCScreenshotManager`'s capture — identical for both callers, so the two paths can't
+/// drift on filter/config/crop handling. `resolve` runs inside the `SCShareableContent`
+/// completion block, so it must be `Send` (queue-hopped) but not `Sync` (called once).
 fn capture_resolved(
     region: Option<&Region>,
     resolve: impl Fn(&SCShareableContent) -> Option<(Retained<SCWindow>, i32)> + Send + 'static,
@@ -210,11 +205,9 @@ enum CaptureReply {
 }
 
 /// Crop `frame` to `region`, clamping to the captured frame first via
-/// [`crate::coords::clamp_region`] (defense in depth — the session layer should already
-/// validate the region against the window before it reaches the backend, per
-/// `glass_core::frame::Region::check_fits`'s doc). `region` is already window-relative
-/// PIXELS, the same unit `frame` itself is in — no scaling needed. `None` returns `frame`
-/// unchanged.
+/// [`crate::coords::clamp_region`] (defense in depth — the session layer already validates the
+/// region against the window, per `glass_core::frame::Region::check_fits`). `region` is already
+/// window-relative PIXELS, the same unit `frame` is in. `None` returns `frame` unchanged.
 fn crop_to_region(frame: Frame, region: Option<&Region>) -> Result<Frame> {
     let Some(r) = region else { return Ok(frame) };
     let clamped = crate::coords::clamp_region(
@@ -228,13 +221,10 @@ fn crop_to_region(frame: Frame, region: Option<&Region>) -> Result<Frame> {
     frame.crop(&clamped)
 }
 
-/// Draw a captured `CGImage` into a tightly-packed RGBA8 (premultiplied-last, host byte
-/// order) bitmap context and hand back the raw bytes as a [`Frame`] — the spike's
-/// `analyze_and_write` bitmap path, minus the luma-sampling/PNG-writing (capture only
-/// needs the pixels). `CGContextDrawImage`'s internal colorspace conversion means this
-/// yields tightly-packed RGBA bytes directly regardless of the source image's own pixel
-/// format (BGRA for SDR captures, per `SCScreenshotManager`'s docs) — no separate swizzle
-/// needed.
+/// Draw a captured `CGImage` into a tightly-packed RGBA8 (premultiplied-last, host byte order)
+/// bitmap context and hand back the raw bytes as a [`Frame`]. `CGContextDrawImage`'s internal
+/// colorspace conversion yields tightly-packed RGBA bytes regardless of the source image's own
+/// pixel format (BGRA for SDR captures, per `SCScreenshotManager`'s docs) — no swizzle needed.
 fn rgba_frame_from_cgimage(image: &CGImage) -> Result<Frame> {
     let w = CGImage::width(Some(image));
     let h = CGImage::height(Some(image));

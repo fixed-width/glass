@@ -1,8 +1,7 @@
 //! The visible menu-bar UI: an `NSStatusItem` + `NSMenu` driven on the main-thread AppKit
 //! run loop. This module owns *only* the AppKit surface — the host (`glass-mcp`) supplies the
 //! text to show and boxed callbacks for the actionable items, so this crate stays free of
-//! glass-mcp's serve/onboarding logic (matching how every other objc2/AppKit call in this
-//! crate is confined to `glass-macos`).
+//! glass-mcp's serve/onboarding logic.
 //!
 //! ## Threading
 //!
@@ -17,11 +16,10 @@
 //! ## Actions
 //!
 //! "Quit glass" uses AppKit's built-in `terminate:` routed through the responder chain to
-//! `NSApp` (no custom target needed). "Copy endpoint", "Restart", and "Uninstall glass…" are
-//! wired to a minimal custom [`MenuTarget`] (an `objc2` `define_class!` object) that just
-//! invokes the boxed callbacks the host supplied. `setTarget:` is a *weak* reference, so the
-//! retained `MenuTarget` (and the status item and menu) are held in locals across `run`'s
-//! `NSApplication::run` call for the whole lifetime of the app.
+//! `NSApp`. "Copy endpoint", "Restart", and "Uninstall glass…" are wired to a minimal custom
+//! [`MenuTarget`] (an `objc2` `define_class!` object) that invokes the boxed callbacks the host
+//! supplied. `setTarget:` is a *weak* reference, so the retained `MenuTarget` (and the status
+//! item and menu) are held in locals across `run`'s `NSApplication::run` call.
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, Sel};

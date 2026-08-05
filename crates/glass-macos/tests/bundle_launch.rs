@@ -1,4 +1,4 @@
-//! Mac-gated `.app`-bundle-launch integration test — the first real-bundle proof of
+//! Mac-gated `.app`-bundle-launch integration test over
 //! `MacosPlatform::start_app`'s `.app` branch (`backend.rs::start_bundle`): direct-spawn
 //! the bundle's inner executable first, fall back to an `NSWorkspace` handoff only if that
 //! stub exits before a window appears, and fail closed if the handoff would need
@@ -75,11 +75,9 @@ mod macos_main {
     /// A stock-macOS handoff app. NOTE the mechanism is not what it looks like: it does not
     /// re-exec itself through LaunchServices. Directly spawning `Contents/MacOS/TextEdit` gets
     /// the process `SIGKILL`ed by the kernel for a launch-constraint violation (`CODESIGNING`),
-    /// which used to reach `start_bundle` as the same `AppExited` signal a re-exec stub would —
-    /// and left a crash report each time. `start_bundle` now recognizes platform code and hands
-    /// off without spawning, which is the path checks 2
-    /// and 3 need, without shipping a second custom `.app`. Present on every stock macOS
-    /// install (unlike a third-party app), so no availability probe is needed.
+    /// so `start_bundle` recognizes platform code and hands off without spawning — the path
+    /// checks 2 and 3 need. Present on every stock macOS install, so no availability probe is
+    /// needed.
     const TEXT_EDIT: &str = "/System/Applications/TextEdit.app";
 
     /// `CFBundleIdentifier` [`build_demo_app`] writes into the fixture's `Info.plist` —
@@ -198,10 +196,9 @@ mod macos_main {
         Ok((bundle, out_dir))
     }
 
-    /// Build the `AppSpec` every check here launches: `run[0]` is `run0` (a `.app` bundle
-    /// path in every call site), sandboxed at `sandbox`, with the fixed no-build/no-a11y/
-    /// 8s-timeout settings none of the three checks vary. Extracted because checks 2 and 3
-    /// launch the identical `TEXT_EDIT` target and differ only in `sandbox`.
+    /// Build the `AppSpec` every check here launches: `run[0]` is `run0` (a `.app` bundle path
+    /// in every call site), sandboxed at `sandbox`, with the fixed no-build/no-a11y/8s-timeout
+    /// settings none of the three checks vary.
     fn bundle_spec(run0: impl Into<String>, sandbox: SandboxLevel) -> AppSpec {
         AppSpec {
             build: None,
@@ -216,13 +213,9 @@ mod macos_main {
     }
 
     /// Run `body`, then always call `platform.stop_app()` before returning — regardless of
-    /// whether `body` succeeded — so a failing check never leaks whatever it started.
-    /// Mirrors the sibling tests' `run()`/`run_checks` cleanup-always-runs discipline,
-    /// collapsed into one helper since each check function here owns a short-lived
-    /// `MacosPlatform` of its own rather than sharing one across the whole file. On success,
-    /// a `stop_app` failure becomes the check's own failure; on an already-failing `body`,
-    /// a `stop_app` failure is only logged (the original failure is more informative and
-    /// must not be masked).
+    /// whether `body` succeeded — so a failing check never leaks whatever it started. On
+    /// success, a `stop_app` failure becomes the check's own failure; on an already-failing
+    /// `body` it is only logged, so it can't mask the original failure.
     fn with_stop_app<T>(
         platform: &mut MacosPlatform,
         body: impl FnOnce(&mut MacosPlatform) -> Result<T, String>,
@@ -240,13 +233,12 @@ mod macos_main {
         }
     }
 
-    /// The result of running one check. Kept distinct from a plain `Result` so a missing
-    /// precondition for ONE check (`Skipped`) is reported as skipped-not-passed and, crucially,
-    /// never causes the OTHER checks to be skipped — the pathological "the whole test silently
-    /// passes because a single precondition was absent" shape. `Ran(Ok(()))` passed;
-    /// `Ran(Err(_))` failed with a reason; `Skipped(_)` asserted nothing. Each check gates
-    /// itself on ONLY the precondition it actually needs (swiftc for check 1; `TextEdit.app`
-    /// for checks 2/3), so `run` no longer has any blanket gate that could skip everything.
+    /// The result of running one check. Distinct from a plain `Result` so a missing precondition
+    /// for ONE check (`Skipped`) is reported as skipped-not-passed and never causes the OTHER
+    /// checks to be skipped — the pathological "the whole test silently passes because a single
+    /// precondition was absent" shape. `Ran(Ok(()))` passed; `Ran(Err(_))` failed with a reason;
+    /// `Skipped(_)` asserted nothing. Each check gates itself on ONLY the precondition it needs
+    /// (swiftc for check 1; `TextEdit.app` for checks 2/3) — do not add a blanket gate in `run`.
     enum Outcome {
         Ran(Result<(), String>),
         Skipped(String),

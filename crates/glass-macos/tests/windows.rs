@@ -1,15 +1,15 @@
-//! Mac-gated window-management integration test — the first real-window proof of
-//! `list_windows`/`select_window`/`window(op)` end-to-end, and in particular of the private
-//! `CGWindowID` <-> `AXUIElement` correlation (`axwindow::ax_window_for_cgwindowid`'s private
-//! `_AXUIElementGetWindow` call, contained + geometry-fallback — see `axwindow.rs`'s module
-//! doc). Every earlier Plan 4 task exercised this only against a *single* on-screen window,
-//! where "the app's only window" and "the correlated window" happen to be the same thing
-//! even if the correlation itself were silently broken. This test launches the extended
-//! `fixture/quadrants.swift` with TWO windows and drives ops against the *non-default* one
+//! Mac-gated window-management integration test over `list_windows`/`select_window`/
+//! `window(op)` end-to-end, and in particular the private `CGWindowID` <-> `AXUIElement`
+//! correlation (`axwindow::ax_window_for_cgwindowid`'s private `_AXUIElementGetWindow` call,
+//! contained + geometry-fallback — see `axwindow.rs`'s module doc).
+//!
+//! Must drive TWO windows: against a single on-screen window, "the app's only window" and "the
+//! correlated window" are the same thing even if the correlation is silently broken. So this
+//! launches `fixture/quadrants.swift` with two and drives ops against the *non-default* one
 //! (`select_window` to a specific `CGWindowID`, then `Move`/`Resize`/`Geometry`/
-//! `capture_frame` against it) — a wrong correlation would move/resize/capture the WRONG
-//! window, which the assertions below would catch (the moved/resized window's own geometry
-//! reads back wrong, or the captured pixels show the other window's palette).
+//! `capture_frame`) — a wrong correlation moves/resizes/captures the WRONG window, and the
+//! assertions below catch it (the geometry reads back wrong, or the captured pixels show the
+//! other window's palette).
 //!
 //! **`harness = false`** (see `Cargo.toml`'s `[[test]] name = "windows"` entry) for the exact
 //! same reason as `tests/capture.rs`/`tests/input.rs`: `start_app`/`list_windows`/`window`/
@@ -62,14 +62,11 @@ mod macos_main {
     /// fixed sleep for the single-window case).
     const STARTUP_SETTLE: Duration = Duration::from_millis(500);
 
-    /// Settle after `window(Resize)` before `capture_frame(None)`. Discovered empirically:
-    /// `window(Resize)`'s own read-back goes through `AXUIElement` (synchronous, and already
-    /// reflects the new size immediately), but `capture_frame`'s `SCShareableContent`/
-    /// ScreenCaptureKit path lags slightly behind the on-screen compositor catching up to a
-    /// just-resized window — capturing with zero delay observed a captured `Frame` still
-    /// reporting the PRE-resize dimensions, with pixels beyond the window's actual new bounds
-    /// reading back as transparent black. Generous relative to `input.rs`'s 400ms
-    /// `ACTION_SETTLE` for the same class of "let the window system catch up" reason.
+    /// Settle after `window(Resize)` before `capture_frame(None)`. `window(Resize)`'s own
+    /// read-back goes through `AXUIElement` and reflects the new size immediately, but
+    /// `capture_frame`'s ScreenCaptureKit path lags the compositor catching up to a just-resized
+    /// window: capturing with zero delay observed a `Frame` still reporting the PRE-resize
+    /// dimensions, with pixels beyond the new bounds reading back as transparent black.
     const RESIZE_SETTLE: Duration = Duration::from_millis(500);
 
     /// `WindowOp::Move` target, in global screen PIXELS — comfortably away from (0,0) and

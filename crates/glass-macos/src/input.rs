@@ -6,34 +6,24 @@
 //! `glass_core::platform::PointerEvent`'s doc. `send_key` does the same focus-before-inject,
 //! then posts `KeyEvent::Text`/`Chord` as keyboard CGEvents.
 //!
-//! Ported from the proven reference `tools/macos-validation/inject_input.swift`'s
-//! `clickGlobal`/`postKey`/`typeString` (down/up via `CGEvent(mouseEventSource:...)`/
-//! `CGEvent(keyboardEventSource:virtualKey:keyDown:)` + `.post(tap: .cghidEventTap)`) and its
-//! focus-before-inject (`NSRunningApplication(processIdentifier:).activate()`), onto
-//! `objc2-core-graphics`'s generated bindings — which expose `CGEvent`'s
-//! constructors/accessors as **associated** functions taking `Option<&CGEvent>` (e.g.
-//! `CGEvent::post(tap, event)`, `CGEvent::set_flags(event, flags)`), not Swift's
-//! `self`-methods. header-translator marks all of them (and
-//! `NSRunningApplication::activateWithOptions`) as plain safe Rust functions — their only
-//! precondition, a live `CGEvent`/`CGEventSource`/`NSRunningApplication` reference, is
-//! already enforced by the type system — so no `unsafe` block is needed anywhere in this
-//! file.
+//! Ported from `tools/macos-validation/inject_input.swift`'s
+//! `clickGlobal`/`postKey`/`typeString` onto `objc2-core-graphics`'s generated bindings, which
+//! expose `CGEvent`'s constructors/accessors as **associated** functions taking
+//! `Option<&CGEvent>` (e.g. `CGEvent::post(tap, event)`), not Swift's `self`-methods.
+//! header-translator marks all of them (and `NSRunningApplication::activateWithOptions`) plain
+//! safe: their only precondition, a live `CGEvent`/`CGEventSource`/`NSRunningApplication`
+//! reference, is already enforced by the type system, so this file needs no `unsafe` block.
 //!
-//! Drag/scroll/text reuse glass_core's shared, already-unit-tested drivers
-//! ([`glass_core::run_drag`]/[`glass_core::DragGesture`], [`glass_core::run_scroll`],
-//! [`glass_core::run_type`]) — the same ones `glass-windows`/`glass-x11` sequence through
-//! their own `DragSink`/`ScrollSink`/`TypeSink` — so the waypoint interpolation/pacing/dwell
-//! math isn't reimplemented here. `KeyEvent::Chord` does not: unlike Windows/X11 (where a
-//! held modifier is a real separate key down/up event, needing `glass_core::run_chord`'s
-//! cross-frame hold-then-release ordering), macOS conveys a held modifier via
-//! `CGEventFlags` stamped directly on the key's own down/up events — the same technique
-//! `to_flags`/`MacDragSink`/`MacScrollSink` already use for pointer modifiers below — so
-//! there is no separate modifier event to sequence.
+//! Drag/scroll/text reuse glass_core's shared drivers ([`glass_core::run_drag`]/
+//! [`glass_core::DragGesture`], [`glass_core::run_scroll`], [`glass_core::run_type`]) — the
+//! same ones `glass-windows`/`glass-x11` sequence through their own
+//! `DragSink`/`ScrollSink`/`TypeSink`. `KeyEvent::Chord` does not: unlike Windows/X11, where a
+//! held modifier is a real separate key down/up event needing `glass_core::run_chord`'s
+//! hold-then-release ordering, macOS conveys a held modifier via `CGEventFlags` stamped
+//! directly on the key's own down/up events, so there is no separate event to sequence.
 //!
-//! **Main-thread affinity:** like `backend.rs`'s `start_app`/`capture_frame`, this is called
-//! from `MacosPlatform::send_pointer`/`send_key`, which glass always drives from the main
-//! thread; wiring that under glass-mcp's worker-thread dispatcher is deferred to Plan 5 (see
-//! `backend.rs`'s module doc).
+//! **Main-thread affinity:** called from `MacosPlatform::send_pointer`/`send_key`, which glass
+//! always drives from the main thread.
 
 use std::thread;
 use std::time::Duration;
@@ -62,9 +52,8 @@ fn to_cgpoint(x: i32, y: i32, scale: f64, origin_pt: (f64, f64)) -> CGPoint {
 }
 
 /// Settle after raising the target app before the first event, so the window server has
-/// finished the activation before input lands. The validated probe (`inject_input.swift`)
-/// used 300ms after `activate()`; glass's own activation call is otherwise identical, so this
-/// uses the same 300ms settle time to clear the focus-before-inject race.
+/// finished the activation before input lands. 300ms, the value the validated probe
+/// (`inject_input.swift`) used after `activate()`.
 const FOCUS_SETTLE: Duration = Duration::from_millis(300);
 
 /// Inject `event` (already window-relative PIXELS) as CGEvents targeting the app at `pid`,
@@ -184,11 +173,9 @@ pub(crate) fn send_pointer(
     Ok(())
 }
 
-/// Inter-keystroke delay for `KeyEvent::Text` typing — matches the proven reference
-/// (`inject_input.swift`'s `typeString`'s `usleep(12_000)`), so each keystroke is its own
-/// committed HID post before the next one lands (the same self-committing-per-keystroke
-/// discipline `glass-windows`/`glass-x11`/`glass-wayland` already need — see
-/// `glass_core::run_type`'s doc).
+/// Inter-keystroke delay for `KeyEvent::Text` typing — matches `inject_input.swift`'s
+/// `typeString`'s `usleep(12_000)`, so each keystroke is its own committed HID post before the
+/// next one lands (see `glass_core::run_type`'s doc).
 const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
 
 /// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
@@ -239,11 +226,9 @@ fn tap_key(source: Option<&CGEventSource>, keycode: u16, flags: CGEventFlags) ->
 
 /// `TypeSink` for macOS: one keyDown+keyUp CGEvent pair per character — already a
 /// self-committed HID post (`CGEventPost` delivers synchronously) — so `run_type`'s
-/// inter-character dwell (`KEY_TYPE_DWELL`) lands between keystrokes exactly like the
-/// validated `inject_input.swift` probe. An unmappable char (no US-layout key —
-/// `keymap::key_for` returns `None`) fails the whole call rather than silently skipping it,
-/// per the no-silent-fallback invariant (`inject_input.swift`'s probe skips-and-warns; this
-/// backend does not).
+/// inter-character dwell (`KEY_TYPE_DWELL`) lands between keystrokes. An unmappable char (no
+/// US-layout key — `keymap::key_for` returns `None`) fails the whole call rather than silently
+/// skipping it, per the no-silent-fallback invariant.
 struct MacTypeSink<'a> {
     source: Option<&'a CGEventSource>,
 }
@@ -315,20 +300,13 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
 /// the pointer into an app it already knows the geometry of.
 ///
 /// A missing/exited process (`runningApplicationWithProcessIdentifier` returns `None`) is a
-/// hard error (final-review fix 4), not best-effort: silently posting input to "whatever
-/// currently has focus" when the target app is actually gone is exactly the kind of
-/// silent-wrong-target failure the rest of this crate's pid-scoping goes out of its way to
-/// avoid (see `scwindow.rs`'s `find_window_by_id` doc) — an agent driving a dead app should
-/// see `GlassError::AppExited`, not a keystroke/click that silently landed somewhere else. A
-/// *declined* activation (`activateWithOptions` returns `false`, e.g. the OS deprioritizes a
-/// background-app activation request) still doesn't fail the call: the process is
-/// confirmed alive, and the event still posts to whatever currently has focus, matching
-/// `glass-windows::input::send_pointer`'s own best-effort `focus_window` nudge for that
-/// narrower case.
+/// hard error, not best-effort: an agent driving a dead app should see
+/// `GlassError::AppExited`, not a keystroke that silently landed somewhere else. A *declined*
+/// activation (`activateWithOptions` returns `false`, e.g. the OS deprioritizes a background-app
+/// request) does not fail the call — the process is confirmed alive and the event still posts.
 ///
-/// `pub(crate)`: also the `NSRunningApplication(pid).activate()` step of
-/// `backend::MacosPlatform::window`'s `WindowOp::Focus` branch (Plan 4 Task 4), ahead of that
-/// branch's `axwindow::ax_raise`/`ax_set_main` — one activation call site rather than two.
+/// `pub(crate)`: also the activation step of `backend::MacosPlatform::window`'s
+/// `WindowOp::Focus` branch, ahead of its `axwindow::ax_raise`/`ax_set_main`.
 pub(crate) fn focus(pid: i32) -> Result<()> {
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .ok_or(GlassError::AppExited(None))?;
@@ -402,11 +380,10 @@ fn to_flags(modifiers: &[Modifier]) -> CGEventFlags {
     })
 }
 
-/// Lets `glass_core::run_drag` drive a macOS drag through CGEvent. Unlike Windows'
-/// `SendInput` (no per-event flags field, so held modifiers are real key down/up events) or
-/// X11 (XTEST key press/release), a CGEvent's `CGEventFlags` are stamped directly on every
-/// posted event — so `flags` is computed once from the gesture's modifiers and applied to
-/// every `place`/`move_to`/`button` call; `modifiers()` itself has nothing to emit.
+/// Lets `glass_core::run_drag` drive a macOS drag through CGEvent. A CGEvent's `CGEventFlags`
+/// are stamped directly on every posted event — unlike Windows' `SendInput` or X11's XTEST,
+/// where a held modifier is a real key down/up — so `flags` is computed once from the gesture's
+/// modifiers and applied to every `place`/`move_to`/`button` call; `modifiers()` emits nothing.
 struct MacDragSink<'a> {
     source: Option<&'a CGEventSource>,
     scale: f64,
