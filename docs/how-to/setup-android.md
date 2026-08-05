@@ -156,8 +156,13 @@ GLASS_ADB=$HOME/android-sdk/platform-tools/adb \
 ANDROID_SDK_ROOT=$HOME/android-sdk GLASS_AVD=glass ./scripts/test-android-lifecycle.sh
 ```
 
-No test is skipped, so all three artifacts are required: `native_invoke_actuates_the_fixture` is
-the only consumer of `GLASS_ANDROID_FIXTURE_APK`, and fails loudly without it.
+No test is skipped, so all three artifacts are required. `GLASS_ANDROID_FIXTURE_APK` is read by
+`native_invoke_actuates_the_fixture` and by the session-level click leg in
+`crates/glass-mcp/tests/android_session_loop.rs`; both fail loudly without it.
+
+That leg is the reason `./scripts/test-android.sh` runs `cargo test` twice. It lives in
+`glass-mcp` because that crate owns the backend factory choosing a session's accessibility
+reader, and it is the only test that can see a session fall back to pointer taps.
 
 The role-histogram probes in `crates/glass-android/tests/role_probe.rs` are deliberately not in
 either script; they print evidence for a human rather than asserting, and take
