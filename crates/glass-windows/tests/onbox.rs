@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use glass_a11y_windows::WindowsA11y;
 use glass_core::{
-    Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, AxTree, Backend, BaselineStore,
-    ChangeSignal, DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier, MouseButton,
-    Platform, PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint, WindowOp,
-    description_census, description_census_report, role_histogram,
+    Accessibility, AppSpec, AxContext, AxDeadline, AxNode, AxRole, AxTarget, AxTree, Backend,
+    BaselineStore, ChangeSignal, DescriptionSourcing, Glass, GlassError, KeyEvent, Modifier,
+    MouseButton, Platform, PlatformFactory, PointerEvent, WalkLimits, WindowGeometry, WindowHint,
+    WindowOp, description_census, description_census_report, role_histogram,
 };
 use glass_windows::WindowsPlatform;
 
@@ -640,6 +640,7 @@ fn onbox_modifier_click() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
     let mut hit = None;
@@ -761,6 +762,7 @@ fn onbox_a11y_set_value() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
     let tree = a11y.snapshot(&ctx).expect("a11y snapshot");
 
@@ -829,6 +831,7 @@ fn onbox_egui_set_value_honesty() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
     let tree = a11y
         .snapshot(&ctx)
@@ -1012,6 +1015,7 @@ fn onbox_a11y_edge_multiprocess() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
     let tree = a11y
         .snapshot(&ctx)
@@ -1276,6 +1280,7 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Pro
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::from_max_nodes(Some(0)),
+        deadline: AxDeadline::NONE,
     };
     let tree = a11y
         .snapshot(&ctx)
@@ -1448,6 +1453,7 @@ fn onbox_a11y_subscription_reports_a_real_change() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
 
     // Before the first read, as the seam requires: a change landing between a read and the
@@ -1509,6 +1515,7 @@ fn onbox_a11y_subscription_is_quiet_on_an_idle_app() {
         window_handle: p.active_window_handle(),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
     let mut signal = a11y
         .subscribe_changes(&ctx)
@@ -1861,6 +1868,7 @@ fn independent_ctx(handle: i64) -> AxContext {
         window_handle: Some(handle),
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     }
 }
 

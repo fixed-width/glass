@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree};
+use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, NOT_STARTED, PointerEvent, Result, TIMED_OUT,
     WindowGeometry, typed_clear_landed, typed_text_landed,
@@ -75,14 +75,33 @@ pub(crate) fn adb_runner(
 }
 
 /// When one whole dump attempt — the dump, the read of what it wrote, and the removal of the file
-/// it read — must be done by.
+/// it read — must be done by, ignoring any deadline the caller set.
 ///
 /// The three share [`AdbOp::Dump`]'s budget — one snapshot's worth — with the removal keeping its
 /// own `AdbOp::Shell` ceiling inside that. A step carrying only its own budget let an attempt cost
 /// the sum of all three, 50s against the 10s a `glass_wait_for_element` asks for by default and
 /// re-snapshots inside.
+///
+/// A caller that named a deadline gets [`AxDeadline::cap`] of this instead — see
+/// [`dump_until_ready`], which needs both to tell which of them ended an attempt.
 pub(crate) fn attempt_deadline() -> Instant {
     Instant::now() + AdbOp::Dump.budget()
+}
+
+/// What a read reports when the caller's deadline, not the device, ended it — naming what the last
+/// attempt saw, where there was one.
+///
+/// [`GlassError::AccessibilityNotReady`] rather than the timeout adb raised: that is the variant
+/// `wait_for_element` polls through, keeping a spent budget distinguishable from an element that
+/// is genuinely absent (glass#329).
+fn out_of_time(last: Option<&GlassError>) -> GlassError {
+    let seen = match last {
+        Some(e) => format!(" (last attempt: {e})"),
+        None => String::new(),
+    };
+    GlassError::AccessibilityNotReady(format!(
+        "uiautomator served no tree within the time this call allowed{seen}"
+    ))
 }
 
 /// What one dump attempt settled, for a loop deciding whether another would help.
@@ -187,31 +206,54 @@ impl RetryBound {
     };
 }
 
-/// Dump, retrying while `uiautomator` cannot serve one yet, within `bound`.
+/// Dump, retrying while `uiautomator` cannot serve one yet, within `bound` and `caller`.
 ///
 /// Only [`Attempt::NotReady`] is retried, so a device that has gone away is reported at once
 /// rather than waited on.
 ///
 /// Returns after `bound.least` attempts plus however many more start while `bound.then_within`
-/// remains — each costing up to `AdbOp::Dump`'s budget, per [`attempt_deadline`].
+/// remains — each costing up to `AdbOp::Dump`'s budget, per [`attempt_deadline`] — and no later
+/// than `caller`, which caps both the attempts and the window they retry in.
 fn dump_until_ready(
     run: &mut AdbRunner<'_>,
     prefix: &str,
     bound: RetryBound,
     interval: Duration,
+    caller: AxDeadline,
 ) -> Result<String> {
-    let retry_until = Instant::now() + bound.then_within;
+    let retry_until = caller.cap(Instant::now() + bound.then_within);
     let mut owed = bound.least.max(1);
+    // Kept so a spent caller deadline can name what the device last said, not just the budget.
+    let mut unready: Option<GlassError> = None;
     loop {
-        match dump_once(run, prefix, attempt_deadline()) {
+        // Checked rather than left to the cap below, which would still spawn an adb process to
+        // abandon.
+        if caller.is_spent() {
+            return Err(out_of_time(unready.as_ref()));
+        }
+        let own = attempt_deadline();
+        let ends = caller.cap(own);
+        match dump_once(run, prefix, ends) {
             Attempt::Dumped(xml) => return Ok(xml),
+            // An attempt the *caller's* deadline cut short is not a device that failed. Which
+            // bound governs is settled before the attempt, not read off its error (glass#341).
+            Attempt::Fatal(e) if ends < own && bound_fired(&e) => {
+                return Err(out_of_time(unready.as_ref()));
+            }
             Attempt::Fatal(e) => return Err(e),
             Attempt::NotReady(e) => {
                 owed = owed.saturating_sub(1);
                 let left = retry_until.saturating_duration_since(Instant::now());
                 if owed == 0 && left.is_zero() {
-                    return Err(e);
+                    // The caller closing the window is about the budget, not the device — even
+                    // with the device's own answer in hand.
+                    return Err(if caller.is_spent() {
+                        out_of_time(Some(&e))
+                    } else {
+                        e
+                    });
                 }
+                unready = Some(e);
                 // Clamped, so an attempt the ceiling still governs starts inside it — unclamped, a
                 // whole further attempt would land past the bound. An owed attempt waits only what
                 // is left, which a spent ceiling makes zero.
@@ -304,6 +346,30 @@ const VERIFY_BOUND: RetryBound = RetryBound {
 /// attempt in flight, which [`VERIFY_BOUND`] still owes its second dump.
 const VERIFY_PHASE_BUDGET_MS: u64 = 20_000;
 
+/// How much retrying one [`Accessibility::snapshot`] is worth, from whether a dump has ever
+/// succeeded on this reader and how long the caller said it would wait.
+///
+/// A warmed reader gets no retry of its own — only what the caller's deadline pays for. Retrying
+/// without one is what a `glass_wait_for_element` cannot afford: it re-reads on its own schedule,
+/// so a second attempt here costs it another whole [`AdbOp::Dump`] budget past its timeout
+/// (glass#338).
+///
+/// The cold wait is not capped here: [`dump_until_ready`] caps every wait by the caller, and this
+/// one must still *owe* the two attempts the accessibility bridge's registration needs.
+fn snapshot_bound(warmed: bool, deadline: AxDeadline) -> RetryBound {
+    if !warmed {
+        return COLD_BOUND;
+    }
+    match deadline.remaining() {
+        // Nothing bounds a retry, so there is no retry.
+        None => RetryBound::ONCE,
+        Some(left) => RetryBound {
+            least: 1,
+            then_within: left,
+        },
+    }
+}
+
 /// Reads the active window's accessibility tree via `uiautomator`.
 pub struct AndroidA11y {
     adb: Adb,
@@ -324,8 +390,8 @@ impl AndroidA11y {
     /// One dump, retrying a not-ready device within `bound`.
     ///
     /// Split out of [`Accessibility::snapshot`] so a caller that knows the UI is mid-flux can ask
-    /// for retries even on a warmed reader: `snapshot` gives a warmed reader one attempt, which is
-    /// right for a `wait_for_element` tick and wrong immediately after typing.
+    /// for retries a [`snapshot_bound`] would not give it — immediately after typing, where the
+    /// tree is expected to be unreadable for a moment and no deadline says how long to allow.
     fn snapshot_within(&mut self, ctx: &AxContext, bound: RetryBound) -> Result<AxTree> {
         let window = ctx.window.clone();
         let adb = self.ensure_adb()?;
@@ -334,6 +400,7 @@ impl AndroidA11y {
             DUMP_PREFIX,
             bound,
             Duration::from_millis(DUMP_POLL_INTERVAL_MS),
+            ctx.deadline,
         )?;
         self.warmed = true;
         build_tree(&xml, &window, ctx.limits)
@@ -451,15 +518,7 @@ fn locate_editable_target(
 
 impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let bound = if self.warmed {
-            // One attempt, because this reader cannot see the caller's deadline: `wait_for_element`
-            // re-snapshots on its own schedule, and a second attempt here could cost it another
-            // whole `AdbOp::Dump` budget past the timeout it was given.
-            RetryBound::ONCE
-        } else {
-            COLD_BOUND
-        };
-        self.snapshot_within(ctx, bound)
+        self.snapshot_within(ctx, snapshot_bound(self.warmed, ctx.deadline))
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
@@ -527,11 +586,13 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, RetryBound, dump_once, dump_until_ready, editable_target, locate_editable_target,
-        verify_write,
+        Attempt, COLD_BOUND, RetryBound, dump_once, dump_until_ready, editable_target,
+        locate_editable_target, snapshot_bound, verify_write,
     };
     use crate::adb::AdbOp;
-    use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
+    use glass_core::accessibility::{
+        AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
+    };
     use glass_core::{GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -660,11 +721,240 @@ mod tests {
                 then_within: Duration::from_millis(10),
             },
             Duration::ZERO,
+            AxDeadline::NONE,
         )
         .expect("the second attempt is owed however long the first took");
 
         assert_eq!(xml, XML);
         assert_eq!(dumps, 2, "exactly the attempt that was owed");
+    }
+
+    /// A runner that answers every step, recording the deadline each was given.
+    fn recording(
+        seen: &mut Vec<Instant>,
+    ) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
+        move |argv: &[&str], deadline: Instant| {
+            seen.push(deadline);
+            match argv {
+                ["shell", "uiautomator", "dump", _] => Ok((DUMPED.to_string(), String::new())),
+                ["shell", "cat", _] => Ok((XML.to_string(), String::new())),
+                ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
+                other => panic!("unexpected adb command: {other:?}"),
+            }
+        }
+    }
+
+    /// glass#338: `wait_for_element` re-reads from a synchronous tick, so only the reader can
+    /// hold a read inside the timeout.
+    #[test]
+    fn every_step_is_bounded_by_the_callers_deadline_not_by_the_dump_budget() {
+        let mut seen: Vec<Instant> = Vec::new();
+        {
+            let mut run = recording(&mut seen);
+            dump_until_ready(
+                &mut run,
+                PREFIX,
+                RetryBound::ONCE,
+                Duration::ZERO,
+                AxDeadline::in_ms(50),
+            )
+            .expect("the dump succeeds");
+        }
+
+        assert!(!seen.is_empty(), "no adb step ran");
+        // The caller's instant was fixed before this line, so it passes however slow the machine
+        // is; `AdbOp::Dump`'s 20s budget cannot.
+        let latest = Instant::now() + Duration::from_millis(50);
+        for (i, d) in seen.iter().enumerate() {
+            assert!(
+                *d <= latest,
+                "step {i} was given {:?} past the caller's deadline",
+                d.saturating_duration_since(latest)
+            );
+        }
+    }
+
+    /// Without this the test above passes on a reader that caps every step at nothing.
+    #[test]
+    fn a_caller_that_names_no_deadline_leaves_the_reader_its_own_budget() {
+        let mut seen: Vec<Instant> = Vec::new();
+        let at_least = Instant::now() + AdbOp::Dump.budget() - Duration::from_secs(1);
+        {
+            let mut run = recording(&mut seen);
+            dump_until_ready(
+                &mut run,
+                PREFIX,
+                RetryBound::ONCE,
+                Duration::ZERO,
+                AxDeadline::NONE,
+            )
+            .expect("the dump succeeds");
+        }
+
+        assert!(!seen.is_empty(), "no adb step ran");
+        assert!(
+            seen.iter().all(|d| *d >= at_least),
+            "a caller that asked for nothing had the dump budget cut anyway"
+        );
+    }
+
+    /// The error names the budget rather than a device that was never consulted.
+    #[test]
+    fn a_dump_the_caller_stopped_waiting_for_is_not_started() {
+        let mut ran = false;
+        let mut run = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            ran = true;
+            Ok((DUMPED.to_string(), String::new()))
+        };
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::ZERO,
+            AxDeadline::in_ms(0),
+        )
+        .expect_err("the caller had stopped waiting");
+
+        assert!(
+            !ran,
+            "an adb step ran for a caller that had stopped waiting"
+        );
+        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+    }
+
+    /// glass#338: before the deadline reached the reader, one attempt was the only safe number —
+    /// nothing else bounded a retry.
+    #[test]
+    fn a_warmed_reader_retries_only_inside_the_deadline_the_caller_named() {
+        let told = snapshot_bound(true, AxDeadline::in_ms(5_000));
+        assert!(
+            told.then_within > Duration::from_secs(4) && told.then_within <= Duration::from_secs(5),
+            "the retry window is not the caller's: {told:?}"
+        );
+
+        let untold = snapshot_bound(true, AxDeadline::NONE);
+        assert_eq!(
+            untold.then_within,
+            Duration::ZERO,
+            "retried on a budget no caller had agreed to: {untold:?}"
+        );
+        assert_eq!(untold.least, 1, "{untold:?}");
+    }
+
+    /// The first snapshot of a session waits out a boot whatever the caller allowed: the bridge
+    /// registration it is owed two attempts for is not negotiable, and `dump_until_ready` caps the
+    /// wall-clock by the caller regardless.
+    #[test]
+    fn a_cold_reader_is_owed_its_attempts_however_little_the_caller_allowed() {
+        let bound = snapshot_bound(false, AxDeadline::in_ms(1));
+        assert_eq!(bound.least, COLD_BOUND.least, "{bound:?}");
+        assert_eq!(bound.then_within, COLD_BOUND.then_within, "{bound:?}");
+    }
+
+    /// A [`RetryBound`] outliving the caller sleeps out a whole interval before noticing nobody
+    /// is waiting — and the interval is sized against a cold boot, not against any one caller.
+    #[test]
+    fn the_retry_window_ends_with_the_caller_even_when_the_bound_would_run_longer() {
+        let mut run = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "uiautomator", "dump", _] => {
+                    // Outlasts the caller's deadline, so it expires mid-attempt rather than before
+                    // the loop can start one.
+                    std::thread::sleep(Duration::from_millis(30));
+                    Ok((String::new(), format!("{NOT_READY}\n")))
+                }
+                ["shell", "cat", path] => Err(read_err(path)),
+                ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
+                other => panic!("unexpected adb command: {other:?}"),
+            }
+        };
+        let started = Instant::now();
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::from_secs(5),
+            AxDeadline::in_ms(10),
+        )
+        .expect_err("the caller's deadline passed during the attempt");
+
+        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "slept a retry interval for a caller that had stopped waiting: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// [`RetryBound::least`] says how many attempts the *device* is owed, not how many a caller
+    /// must pay for: an owed attempt is not started once the caller has stopped waiting. Both
+    /// production bounds owe two, so this is the shape a real not-ready read takes.
+    #[test]
+    fn an_owed_attempt_is_not_started_once_the_caller_has_stopped_waiting() {
+        let mut dumps = 0;
+        let mut run = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "uiautomator", "dump", _] => {
+                    dumps += 1;
+                    // Outlasts the caller, so the deadline passes with an attempt still owed.
+                    std::thread::sleep(Duration::from_millis(30));
+                    Ok((String::new(), format!("{NOT_READY}\n")))
+                }
+                ["shell", "cat", path] => Err(read_err(path)),
+                ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
+                other => panic!("unexpected adb command: {other:?}"),
+            }
+        };
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            COLD_BOUND,
+            Duration::ZERO,
+            AxDeadline::in_ms(10),
+        )
+        .expect_err("the caller's deadline passed during the first attempt");
+
+        assert_eq!(dumps, 1, "the owed attempt ran for a caller that had gone");
+        assert!(
+            e.to_string().contains("null root node"),
+            "the spent-budget error dropped what the device had said: {e}"
+        );
+    }
+
+    /// An attempt the caller's deadline cut short is a spent budget, not a broken device — and a
+    /// wait told the difference reports `{matched:false}` instead of failing.
+    #[test]
+    fn an_attempt_the_caller_cut_short_reports_the_budget_rather_than_the_device() {
+        let timed_out = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            Err(GlassError::Backend(format!(
+                "`adb shell uiautomator dump` {}",
+                glass_core::TIMED_OUT
+            )))
+        };
+
+        let mut cut_short = timed_out;
+        let e = dump_until_ready(
+            &mut cut_short,
+            PREFIX,
+            RetryBound::ONCE,
+            Duration::ZERO,
+            AxDeadline::in_ms(20),
+        )
+        .expect_err("the attempt was abandoned");
+        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+
+        // The control: the same timeout with no caller deadline is glass's own 20s budget firing,
+        // which *is* about the device — reporting it as a spent caller budget would hide a hang.
+        let mut hung = timed_out;
+        let e = dump_until_ready(
+            &mut hung,
+            PREFIX,
+            RetryBound::ONCE,
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .expect_err("the attempt timed out");
+        assert!(matches!(e, GlassError::Backend(_)), "{e}");
     }
 
     /// Retryability is the attempt's own verdict, not a guess from the error variant it carries:
@@ -857,7 +1147,14 @@ mod tests {
             }
         };
         let started = Instant::now();
-        dump_until_ready(&mut run, PREFIX, RetryBound::ONCE, Duration::ZERO).unwrap();
+        dump_until_ready(
+            &mut run,
+            PREFIX,
+            RetryBound::ONCE,
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .unwrap();
 
         assert_eq!(seen.len(), 3, "one attempt is three adb calls");
         assert!(
@@ -891,6 +1188,7 @@ mod tests {
                 then_within: Duration::from_secs(5),
             },
             Duration::from_millis(1),
+            AxDeadline::NONE,
         )
         .expect("the second attempt succeeds");
 
@@ -919,8 +1217,14 @@ mod tests {
             cold(argv, deadline)
         };
         let started = Instant::now();
-        dump_until_ready(&mut run, PREFIX, bound, Duration::from_secs(2))
-            .expect_err("a device that never becomes ready");
+        dump_until_ready(
+            &mut run,
+            PREFIX,
+            bound,
+            Duration::from_secs(2),
+            AxDeadline::NONE,
+        )
+        .expect_err("a device that never becomes ready");
 
         assert!(
             started.elapsed() < Duration::from_millis(500),
@@ -963,7 +1267,14 @@ mod tests {
                 _ => Ok((String::new(), String::new())),
             }
         };
-        let e = dump_until_ready(&mut run, PREFIX, patient(), Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .unwrap_err();
 
         let msg = e.to_string();
         assert!(
@@ -983,15 +1294,28 @@ mod tests {
     #[test]
     fn a_dump_that_is_not_ready_yet_is_retried_until_it_is() {
         let mut run = fake(3);
-        let xml = dump_until_ready(&mut run, PREFIX, patient(), Duration::ZERO)
-            .expect("a device that becomes ready within the budget must produce a tree");
+        let xml = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .expect("a device that becomes ready within the budget must produce a tree");
         assert_eq!(xml, XML);
     }
 
     #[test]
     fn a_dump_that_never_becomes_ready_fails_with_the_last_reason() {
         let mut run = fake(usize::MAX);
-        let e = dump_until_ready(&mut run, PREFIX, RetryBound::ONCE, Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            RetryBound::ONCE,
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains(NOT_READY), "{e}");
     }
 
@@ -1011,7 +1335,14 @@ mod tests {
                 _ => Ok((String::new(), String::new())),
             }
         };
-        let e = dump_until_ready(&mut run, PREFIX, patient(), Duration::ZERO).unwrap_err();
+        let e = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .unwrap_err();
         assert!(matches!(e, GlassError::Backend(_)), "{e}");
         assert_eq!(
             attempts, 1,
@@ -1024,8 +1355,14 @@ mod tests {
         // Measured at 3 failures in 14 runs entering the suite straight from a snapshot restore;
         // a later dump against a settled tree succeeds, so waiting is the whole remedy.
         let mut run = fake_crashing(2);
-        let xml = dump_until_ready(&mut run, PREFIX, patient(), Duration::ZERO)
-            .expect("a dump that crashed must be retried inside the budget");
+        let xml = dump_until_ready(
+            &mut run,
+            PREFIX,
+            patient(),
+            Duration::ZERO,
+            AxDeadline::NONE,
+        )
+        .expect("a dump that crashed must be retried inside the budget");
         assert_eq!(xml, XML);
     }
 
@@ -1059,8 +1396,14 @@ mod tests {
                     other => panic!("unexpected adb command: {other:?}"),
                 }
             };
-            dump_until_ready(&mut run, PREFIX, patient(), Duration::ZERO)
-                .expect("the attempt after the crashes dumps");
+            dump_until_ready(
+                &mut run,
+                PREFIX,
+                patient(),
+                Duration::ZERO,
+                AxDeadline::NONE,
+            )
+            .expect("the attempt after the crashes dumps");
         }
 
         assert!(

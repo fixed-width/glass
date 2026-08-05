@@ -1025,7 +1025,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::AxRole;
+    use glass_core::accessibility::{AxDeadline, AxRole};
     use serde_json::json;
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2260,6 +2260,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::NONE,
         }
     }
 

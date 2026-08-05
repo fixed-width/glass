@@ -30,7 +30,9 @@
 
 use std::time::Duration;
 
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, AxTree, WalkLimits};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree, WalkLimits,
+};
 use glass_core::{AppSpec, KeyEvent, MouseButton, Platform, PointerEvent, SandboxLevel};
 use glass_ios::{IosA11y, IosPlatform, SimulatorRegistry};
 
@@ -134,6 +136,7 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
         window_handle: None,
         a11y_bus_addr: None,
         limits: WalkLimits::DEFAULT,
+        deadline: AxDeadline::NONE,
     };
 
     // 1) Snapshot: the fixture's elements must appear, and the status starts at READY. The

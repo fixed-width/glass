@@ -43,8 +43,9 @@ mod macos_main {
 
     use glass_a11y_macos::MacosA11y;
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxRole, AxTree, DescriptionSourcing, Platform,
-        SandboxLevel, WalkLimits, description_census, description_census_report, role_histogram,
+        Accessibility, AppSpec, AxContext, AxDeadline, AxRole, AxTree, DescriptionSourcing,
+        Platform, SandboxLevel, WalkLimits, description_census, description_census_report,
+        role_histogram,
     };
     use glass_macos::MacosPlatform;
 
@@ -253,6 +254,7 @@ mod macos_main {
                 window_handle: None,
                 a11y_bus_addr: None,
                 limits: WalkLimits::from_max_nodes(Some(0)),
+                deadline: AxDeadline::NONE,
             };
             let mut a11y = MacosA11y::new();
             let mut tree = a11y

@@ -200,6 +200,17 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- `glass_wait_for_element`'s `timeout_ms` now bounds the reader too, so on Android a wait can no
+  longer return at twice the timeout it was given. Each tick re-reads the accessibility tree, and a
+  single `uiautomator` read carried its own 20-second ceiling — so a wait told to give up after 10
+  seconds could sit inside one read for 20. The timeout now reaches the reader, which stops a read
+  it cannot finish in time and starts no read once the wait is over. A wait that ends that way
+  still answers `{matched: false}` rather than failing, and a wait that never saw a tree at all
+  reports what the device last said, so a slow device and a missing element stay distinguishable.
+  Knowing the timeout also lets the Android reader retry a device that is momentarily unable to
+  serve a tree — mid-animation, or with the accessibility bridge still registering — where before
+  it had to give up after one read to avoid overrunning. Tools that take no timeout are
+  unaffected: `glass_a11y_snapshot` and `glass_set_value` leave the reader its own ceiling.
 - `glass_set_value` on Android now really does retry the read-back that confirms a write, instead
   of retrying only when the device happened to be fast. The retry allowance was two seconds of
   wall-clock, but a single `uiautomator` attempt costs seconds on a loaded device — measured at

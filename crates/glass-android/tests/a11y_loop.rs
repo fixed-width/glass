@@ -7,11 +7,14 @@
 //!
 //! They cover a non-trivial tree with named, role-typed elements; a write confirmed against the
 //! live field — and a clear that cannot be confirmed here at all, because this platform reports
-//! the emptied field's hint as its text; that a read takes its dump file with it; that a
-//! snapshot taken while another app is foreground says which app it describes; and that a test
-//! which fails mid-interaction still hands the device back launchable.
+//! the emptied field's hint as its text; that a read takes its dump file with it; that a read
+//! stops at the deadline its caller named; that a snapshot taken while another app is foreground
+//! says which app it describes; and that a test which fails mid-interaction still hands the
+//! device back launchable.
 
-use glass_core::accessibility::{Accessibility, AxContext, AxNode, AxTarget, WalkLimits};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, WalkLimits,
+};
 use glass_core::{
     AppSpec, GlassError, MouseButton, Platform, PointerEvent, SandboxLevel, WindowGeometry,
 };
@@ -83,6 +86,7 @@ impl Session {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::NONE,
         }
     }
 
@@ -150,6 +154,40 @@ fn snapshot_has_named_role_typed_nodes() {
         n.name.is_some() || n.children.iter().any(any_named)
     }
     assert!(any_named(&tree.root), "expected at least one named node");
+}
+
+/// glass#338: the caller's deadline reaches the device, so a read told to be done in 50ms stops
+/// there rather than spending `AdbOp::Dump`'s 20s budget.
+///
+/// Only a device shows this: the unit tests drive a fake runner, which cannot be slow the way a
+/// real `uiautomator dump` is.
+#[test]
+#[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
+fn a_read_stops_at_the_deadline_its_caller_named() {
+    let mut session = Session::start();
+    let mut a11y = glass_android::AndroidA11y::new();
+    // Warmed first: a cold reader is owed its attempts however little the caller allowed, so an
+    // unwarmed one would prove nothing about the deadline.
+    let ctx = session.ctx();
+    a11y.snapshot(&ctx)
+        .expect("the first snapshot warms the reader");
+
+    let mut hurried = session.ctx();
+    hurried.deadline = AxDeadline::in_ms(50);
+    let started = std::time::Instant::now();
+    let e = a11y
+        .snapshot(&hurried)
+        .expect_err("50ms is not enough for a dump this device serves in seconds");
+    let took = started.elapsed();
+
+    assert!(
+        matches!(e, GlassError::AccessibilityNotReady(_)),
+        "a read the caller cut short must not read as a broken device: {e}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the read outlived the 50ms it was given by {took:?} — the dump budget still governs"
+    );
 }
 
 /// The dump files on the device, as `adb shell ls` reports them.

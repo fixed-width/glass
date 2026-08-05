@@ -698,6 +698,50 @@ pub struct AxContext {
     /// Set from the session's stored limits so a snapshot and a later `set_value` walk the
     /// tree with the same bounds (ids stay resolvable).
     pub limits: WalkLimits,
+    /// The time bound for this call, as [`Self::limits`] is its size bound.
+    pub deadline: AxDeadline,
+}
+
+/// When the caller stops waiting for the accessibility call this context belongs to.
+///
+/// A reader must cap its own per-call budgets by this, because the caller cannot interrupt one:
+/// [`crate::Glass::wait_for_element`] re-reads the tree from a synchronous tick, so a 20s
+/// `uiautomator dump` answered a 10s wait (glass#338).
+///
+/// [`Self::NONE`] means the caller named no instant, leaving the reader its own budget — NOT that
+/// there is no time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxDeadline(Option<std::time::Instant>);
+
+impl AxDeadline {
+    /// The caller named no instant to stop at.
+    pub const NONE: Self = Self(None);
+
+    /// Stop `ms` milliseconds from now.
+    pub fn in_ms(ms: u64) -> Self {
+        Self(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(ms),
+        ))
+    }
+
+    /// `proposed`, or this deadline when it falls first — the bound one step of a call runs under.
+    pub fn cap(self, proposed: std::time::Instant) -> std::time::Instant {
+        match self.0 {
+            Some(d) => proposed.min(d),
+            None => proposed,
+        }
+    }
+
+    /// How long is left, or `None` when the caller named no instant. Zero once it has passed.
+    pub fn remaining(self) -> Option<std::time::Duration> {
+        self.0
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Whether the caller named an instant that has passed — work started now cannot be wanted.
+    pub fn is_spent(self) -> bool {
+        self.remaining().is_some_and(|left| left.is_zero())
+    }
 }
 
 /// A fingerprint identifying the element a value-set targets: its synthetic id
@@ -1191,6 +1235,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::NONE,
         };
         let err = Bare
             .set_value(&ctx, &target, "x")
@@ -2528,6 +2573,7 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::NONE,
         };
         let target = AxTarget {
             id: AxNodeId(1),

@@ -385,17 +385,20 @@ impl Glass {
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let started = std::time::Instant::now();
+        // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
+        // loop cannot take back a read a reader has started (glass#338).
+        let deadline = AxDeadline::in_ms(params.timeout_ms);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
         // An interval of 0 means "re-read as fast as you can", which never pauses — so there is
         // nothing for a signal to save, and subscribing would only cost a round-trip.
         let mut signal = (params.interval_ms > 0)
-            .then(|| self.subscribe_a11y_changes())
+            .then(|| self.subscribe_a11y_changes(deadline))
             .flatten();
         // Subscribing spends the caller's budget, so the poll loop gets what is left. That
-        // bounds the polling, not the call: a reader bounds its own handshake in seconds, so a
-        // wait told to give up after 500ms can return later than that.
+        // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
+        // own handshake in seconds, so a wait told to give up after 500ms can return later.
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
@@ -433,7 +436,7 @@ impl Glass {
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let tree = match self.a11y_resnapshot() {
+                let tree = match self.a11y_resnapshot(deadline) {
                     Ok(t) => t,
                     // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
@@ -597,7 +600,10 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
     ) -> Result<(Option<ElementInfo>, String)> {
-        let tree = self.a11y_resnapshot()?;
+        // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
+        // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
+        // into an error.
+        let tree = self.a11y_resnapshot(AxDeadline::NONE)?;
         let found = match element_match(
             &tree,
             params.name.as_deref(),
@@ -1219,6 +1225,42 @@ mod tests {
         let e = o.element.expect("matched element");
         assert_eq!(e.id, AxNodeId(1));
         assert_eq!(e.name.as_deref(), Some("Save"));
+    }
+
+    /// glass#338: on Android a `uiautomator dump` spending its own 20s budget answered a 10s
+    /// wait, because `poll_until_with_pause` ticks synchronously and only the reader can stop one
+    /// read early.
+    #[test]
+    fn a_wait_tells_the_reader_when_it_stops_waiting() {
+        let (mut g, ctx_log) =
+            glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree_enabled());
+        g.start(&spec()).unwrap();
+        g.wait_for_element(&WaitElementParams {
+            name: Some("Save".into()),
+            role: Some(AxRole::Button),
+            value_contains: None,
+            condition: ElementCondition::Enabled,
+            interval_ms: 0,
+            timeout_ms: 5_000,
+        })
+        .unwrap();
+
+        let left = ctx_log
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("the reader was called")
+            .deadline
+            .remaining()
+            .expect("the wait named the instant it stops waiting at");
+        assert!(
+            left <= std::time::Duration::from_millis(5_000),
+            "a deadline past the wait's own timeout bounds nothing: {left:?}"
+        );
+        assert!(
+            !left.is_zero(),
+            "the reader was handed a deadline already spent"
+        );
     }
 
     #[test]

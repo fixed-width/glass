@@ -514,6 +514,13 @@ pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
     )
 }
 
+/// [`glass_with_a11y`] plus the ctx log — for a test that must prove what reached the backend
+/// rather than what the session recorded, without also scripting `invoke`.
+pub(crate) fn glass_with_a11y_ctx(platform: FakePlatform, tree: AxTree) -> (Glass, CtxLog) {
+    let (g, _, ctx_log) = glass_with_a11y_invoke_ctx(platform, tree, InvokeBehavior::Unsupported);
+    (g, ctx_log)
+}
+
 /// Like `glass_with_a11y`, but scripts the backend's `invoke` outcome — for tests of the
 /// native-invoke-first `click_element` path. Returns the invoke log alongside the session
 /// so a test can assert what (if anything) was "actuated" natively.
