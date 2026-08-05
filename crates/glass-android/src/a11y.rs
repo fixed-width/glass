@@ -305,8 +305,7 @@ impl Default for AndroidA11y {
 }
 
 /// Whether any node in `tree` still presents as `target` — same role and name, wherever it sits.
-/// A control's identity, not one particular reading of it: bounds and value both move under a
-/// live app without the control going anywhere.
+/// Bounds and value are excluded: both move under a live app without the control going anywhere.
 fn still_on_screen(tree: &AxTree, target: &AxTarget) -> bool {
     fn walk(node: &AxNode, target: &AxTarget) -> bool {
         target.matches(node.role, node.name.as_deref())
@@ -317,14 +316,12 @@ fn still_on_screen(tree: &AxTree, target: &AxTarget) -> bool {
 
 /// Which of the two disagreements a tree that no longer agrees with `target` has.
 ///
-/// [`GlassError::AxElementChanged`] — "this id now denotes something else" — sends the reader
-/// looking for where the element went, worth doing only while it is still somewhere. When nothing
-/// in the tree carries its role and name, the cause is that the screen was replaced or the app
-/// that drew it restarted (glass#323).
+/// `AxElementChanged` sends the reader looking for where the element went, which is worth doing
+/// only while it is still somewhere; nothing carrying its role and name means the screen was
+/// replaced or the app that drew it restarted (glass#323).
 ///
-/// Both Android readers get this. `a11y_service`'s bounds relaxation still sees
-/// `AxElementChanged` in every case it can relax — relaxing at all requires the node on the id to
-/// match role and name, which is already enough for [`still_on_screen`].
+/// Both Android readers get this. Do not tighten [`still_on_screen`] to include bounds or value:
+/// `a11y_service`'s relaxation needs `AxElementChanged` in every case it can relax.
 fn drifted(tree: &AxTree, target: &AxTarget) -> GlassError {
     if still_on_screen(tree, target) {
         GlassError::AxElementChanged(target.id.0)
@@ -336,9 +333,8 @@ fn drifted(tree: &AxTree, target: &AxTarget) -> GlassError {
 /// Find `target.id` and reject a tree that drifted under it — shared by [`editable_target`]
 /// and the service reader's `invoke`, which needs the same rejection without the editable check.
 ///
-/// An id that resolves to nothing stays [`GlassError::AxElementNotFound`]: "that id is not in the
-/// tree" is a different report from "that id is occupied by something unrelated", and only the
-/// second is what [`drifted`] classifies.
+/// An id that resolves to nothing stays [`GlassError::AxElementNotFound`]; [`drifted`] classifies
+/// only an id occupied by something unrelated.
 pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
@@ -1071,8 +1067,7 @@ mod tests {
     #[test]
     fn an_element_nothing_in_the_tree_resembles_is_element_gone() {
         // glass#323: a first-boot platform kill destroyed the search activity mid-write, and the
-        // id then denoted a container in the tree that replaced it. "Changed" reads as "it moved"
-        // and sends the reader hunting a drift that never happened.
+        // id then denoted a container in the tree that replaced it.
         let t = a_different_screen();
         let e = locate_editable_target(&t, &target(0, Some("Search"), Some(BOUNDS)), &WIN)
             .expect_err("a container from another activity is not the field");

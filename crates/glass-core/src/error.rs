@@ -305,8 +305,6 @@ mod tests {
 
     #[test]
     fn a_gone_element_forecloses_the_drift_hunt_its_neighbour_invites() {
-        // "changed" reads as "it moved", and a reader who takes that at face value looks for a
-        // drift that never happened (glass#323).
         assert_eq!(
             GlassError::AxElementGone(16).to_string(),
             "element #16 is gone — nothing in the tree carries its role and name any more, so it \

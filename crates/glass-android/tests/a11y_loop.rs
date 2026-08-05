@@ -122,29 +122,26 @@ fn find<'a>(node: &'a AxNode, want: &dyn Fn(&AxNode) -> bool) -> Option<&'a AxNo
     node.children.iter().find_map(|c| find(c, want))
 }
 
-/// An attempt that saw nothing which is evidence about `set_value` — Settings' search screen went
-/// away under it, or the device could not be read — carrying the step that noticed. Abandoned for
-/// a retry rather than asserted on; every reason reaches the final failure.
+/// An attempt that saw nothing which is evidence about `set_value` — the search screen went away
+/// under it, or the device could not be read — carrying the step that noticed. Retried rather
+/// than asserted on.
 struct Abandoned(String);
 
 /// How long [`set_value_reports_whether_the_write_landed`] may spend getting Settings' search
 /// screen to stay up, and the pause between attempts at it.
 ///
-/// A device's FIRST boot after a data wipe takes both these away from the test, and neither is
-/// anything glass did (glass#323):
+/// A device's FIRST boot after a data wipe takes the search screen away twice over, neither of
+/// them anything glass did (glass#323), and both settle within the first half-minute:
 ///
-///   - `com.google.android.settings.intelligence` — a different package from the
-///     `com.android.settings` this test launches, and the one that owns the search screen — takes
-///     a Phenotype config commit ~10s after `boot_completed`, and the platform force-stops it:
-///     `Killing …/u0a118 (adj 0): change com.google.android.settings.intelligence`, then `Force
-///     removing ActivityRecord{…SearchActivity}: app died, no saved state`. The field the write
-///     is aimed at is destroyed and Settings' home screen resumes under it.
-///   - Until that package is serving, Settings' home screen draws no search entry at all, so
-///     there is nothing to tap.
+///   - `com.google.android.settings.intelligence` owns the search screen and is a different
+///     package from the `com.android.settings` this test launches. It takes a Phenotype config
+///     commit ~10s after `boot_completed` and the platform force-stops it — `Killing …(adj 0):
+///     change com.google.android.settings.intelligence`, then `Force removing
+///     ActivityRecord{…SearchActivity}: app died, no saved state`.
+///   - Until that package is serving, Settings' home screen draws no search entry to tap.
 ///
-/// Both settle within the first half-minute of a boot. A warm device pays nothing: the first
-/// attempt succeeds and the budget is never consulted. Do not delete this as defensive noise —
-/// without it this test is red on a fresh CI emulator (12/12 on wiped cold boots, 0/22 warm).
+/// Do not delete this as defensive noise: without it the test is 12/12 red on wiped cold boots
+/// (0/22 warm).
 const SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 const SETUP_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -305,9 +302,8 @@ fn write_leg(
 /// A real write into a real field, and a real clear of it.
 ///
 /// Settings has no editable field until its search entry is tapped, so the test taps it first and
-/// then drives `set_value` against the `EditText` that appears — which is the point: this exercises
-/// the tap-clear-type path on a live toolkit, where the read-back has to come from `uiautomator`'s
-/// own view of the field rather than from anything glass remembers writing.
+/// drives `set_value` against the `EditText` that appears. The read-back comes from `uiautomator`'s
+/// view of the field, not from anything glass remembers writing.
 #[test]
 #[ignore = "requires a booted AVD + GLASS_ANDROID_SERIAL/GLASS_ADB"]
 fn set_value_reports_whether_the_write_landed() {
@@ -366,11 +362,9 @@ fn bring_to_front(component: &str) {
 
 /// Restart Settings from nothing, for [`set_value_reports_whether_the_write_landed`]'s retry.
 ///
-/// The force-stop is what makes it a restart. Settings is already the front-most activity by then,
-/// so a bare `am start` is only delivered to it — `START … result code=3` — and redraws nothing;
-/// measured on this AVD, a home screen that lost its search entry when
-/// `com.google.android.settings.intelligence` was killed never grew one back without a fresh
-/// `com.android.settings` process.
+/// Do not drop the force-stop: Settings is already front-most by then, so a bare `am start` is
+/// only delivered to it — `START … result code=3` — and a home screen that lost its search entry
+/// never grew one back without a fresh `com.android.settings` process.
 fn reopen_settings() {
     let adb = std::env::var("GLASS_ADB").unwrap_or_else(|_| "adb".to_string());
     let out = std::process::Command::new(&adb)
