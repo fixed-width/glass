@@ -401,6 +401,8 @@ impl Glass {
             .saturating_sub(started.elapsed().as_millis() as u64);
         // Starts now rather than at the first read: the first tick follows immediately.
         let mut last_read = std::time::Instant::now();
+        // Never cleared: a tree that arrives leaves the match to answer for the result.
+        let mut never_published: Option<GlassError> = None;
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
@@ -430,7 +432,18 @@ impl Glass {
                 read_now
             },
             || {
-                let tree = self.a11y_resnapshot()?; // fresh snapshot; assigns ids, caches, pumps
+                // fresh snapshot; assigns ids, caches, pumps
+                let tree = match self.a11y_resnapshot() {
+                    Ok(t) => t,
+                    // An app that has not published a tree yet is a condition to wait out, not a
+                    // failure to report — kept so a spent budget can say this instead of
+                    // "not found" (glass#329).
+                    Err(e @ GlassError::AccessibilityNotReady(_)) => {
+                        never_published = Some(e);
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
                 Ok(
                     match element_match(
                         &tree,
@@ -445,6 +458,11 @@ impl Glass {
                 )
             },
         )?;
+        if outcome.value.is_none()
+            && let Some(e) = never_published
+        {
+            return Err(e);
+        }
         Ok(WaitElementOutcome {
             matched: outcome.value.is_some(),
             element: outcome.value.flatten(),
@@ -1203,6 +1221,54 @@ mod tests {
         let e = o.element.expect("matched element");
         assert_eq!(e.id, AxNodeId(1));
         assert_eq!(e.name.as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn a_wait_polls_through_an_app_that_has_not_published_its_tree_yet() {
+        // An app registers with the accessibility bus after its window maps, so the first reads of
+        // a freshly launched app can find nothing to read (glass#329). Waiting is what resolves it.
+        let (mut g, reads) = glass_with_a11y_not_ready(FakePlatform::new(100, 100), 3);
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                role: Some(AxRole::Button),
+                value_contains: None,
+                condition: ElementCondition::Appears,
+                interval_ms: 10,
+                timeout_ms: 2_000,
+            })
+            .expect("a tree that appears inside the budget must be waited for");
+        assert!(o.matched);
+        assert!(
+            reads.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "the wait returned on its first read instead of polling"
+        );
+    }
+
+    #[test]
+    fn a_wait_that_never_saw_a_tree_says_so_rather_than_reporting_the_element_absent() {
+        // `matched: false` would send the caller looking for a missing element; the app published
+        // no tree at all, and the remedies for those two do not overlap.
+        let (mut g, reads) = glass_with_a11y_not_ready(FakePlatform::new(100, 100), usize::MAX);
+        g.start(&spec()).unwrap();
+        let e = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                role: Some(AxRole::Button),
+                value_contains: None,
+                condition: ElementCondition::Appears,
+                interval_ms: 10,
+                timeout_ms: 100,
+            })
+            .expect_err("a budget spent without ever seeing a tree is not a missing element");
+        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        // Without this the test passes on a wait that abandoned its budget on the first read,
+        // which is the defect, not the fix.
+        assert!(
+            reads.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "the wait reported without ever polling"
+        );
     }
 
     /// A condition the fixed fake tree never satisfies, so the wait runs its full budget.

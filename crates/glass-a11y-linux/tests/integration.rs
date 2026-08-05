@@ -121,6 +121,64 @@ fn fixture_spec() -> AppSpec {
     }
 }
 
+/// How long a fixture gets to publish its tree. Generous, and never reached on a healthy machine:
+/// this bounds a hang, it does not pace anything.
+const A11Y_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Block until the launched app has published its accessibility tree.
+///
+/// Replaces a fixed sleep. Registration with the AT-SPI registry lags the window map by an amount
+/// that depends on the machine, so a delay tuned on an idle one flakes on a loaded one
+/// (glass#329). `AccessibilityNotReady` is the reader's "not yet"; every other error is raised
+/// at once.
+fn await_a11y_ready(glass: &mut Glass) {
+    let deadline = std::time::Instant::now() + A11Y_READY_TIMEOUT;
+    loop {
+        match glass.a11y_snapshot(None) {
+            Ok(_) => return,
+            Err(glass_core::GlassError::AccessibilityNotReady(m)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the app published no accessibility tree within {A11Y_READY_TIMEOUT:?}: {m}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => panic!("a11y snapshot failed for a reason waiting cannot fix: {e}"),
+        }
+    }
+}
+
+/// How long the tree must hold still to count as settled. Long enough that a widget arriving
+/// between two reads lands inside the window rather than between them.
+const A11Y_QUIET_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Block until the tree has stopped changing — the bench fixture realizes ~1300 widgets, and they
+/// reach the registry over time, so "readable" arrives well before "all there".
+///
+/// Compares whole outlines rather than node counts: a tree can hold its size while widgets are
+/// still being renamed or restated, and `a_quiet_wait_stops_re_walking_the_tree` measures a wait
+/// against an app that has gone quiet — every one of those changes wakes it.
+fn await_a11y_settled(glass: &mut Glass) {
+    await_a11y_ready(glass);
+    let deadline = std::time::Instant::now() + A11Y_READY_TIMEOUT;
+    let mut last = String::new();
+    loop {
+        let outline = glass
+            .a11y_snapshot(None)
+            .expect("the tree was readable a moment ago")
+            .to_outline();
+        if !outline.is_empty() && outline == last {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tree was still changing after {A11Y_READY_TIMEOUT:?}"
+        );
+        last = outline;
+        std::thread::sleep(A11Y_QUIET_GAP);
+    }
+}
+
 /// Regression: the real MCP runs the (blocking) `glass_start` from *inside* its
 /// multi-thread tokio runtime. `PrivateBus::start` must bring up the a11y bus without
 /// nesting a runtime — nesting panics ("Cannot start a runtime from within a runtime"),
@@ -194,7 +252,7 @@ fn snapshot_finds_gtk_widgets() {
     // The launch itself is fast: glass spawns the private session bus with no
     // auto-activatable services, so the app's startup portal probe fails fast instead of
     // blocking on a D-Bus activation timeout.
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
 
     let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     let outline = tree.to_outline();
@@ -224,7 +282,7 @@ fn snapshot_covers_the_declared_linux_roles() {
     glass.start(&fixture_spec()).expect("start fixture");
     // Give the AT-SPI tree a moment to populate after the window maps, same convention as
     // snapshot_finds_gtk_widgets et al.
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
     let tree = glass.a11y_snapshot(None).expect("snapshot");
     glass.stop().expect("stop");
 
@@ -312,7 +370,7 @@ fn a11y_launch_is_fast_without_the_portal_hang() {
         "a11y launch took {launch:?}; the ~25s portal-activation hang may have regressed"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
     let outline = glass
         .a11y_snapshot(None)
         .expect("a11y snapshot")
@@ -351,7 +409,7 @@ fn snapshot_reads_entry_value() {
             a11y: true,
         })
         .expect("launch GTK fixture");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
 
     let tree = glass.a11y_snapshot(None).expect("a11y snapshot");
     let outline = tree.to_outline();
@@ -394,7 +452,7 @@ fn set_value_changes_entry() {
             a11y: true,
         })
         .expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
 
     let tree = glass.a11y_snapshot(None).expect("snapshot");
     // GTK4 Gtk.Entry exposes AT-SPI Role::Text -> maps to AxRole::TextArea.
@@ -443,7 +501,7 @@ fn set_value_on_button_is_not_editable() {
             a11y: true,
         })
         .expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
 
     let tree = glass.a11y_snapshot(None).expect("snapshot");
     let button = find_role(&tree.root, glass_core::AxRole::Button).expect("button");
@@ -481,7 +539,7 @@ fn set_value_changes_spinbutton() {
             a11y: true,
         })
         .expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
 
     // A GtkSpinButton exposes both EditableText and Value; set_value must write through the
     // Value interface (the only one that commits to the adjustment) rather than the entry
@@ -536,7 +594,7 @@ fn find_node<'a>(node: &'a glass_core::AxNode, name: &str) -> Option<&'a glass_c
 fn launch_fixture() -> Glass {
     let mut glass = glass_x11_with_a11y();
     glass.start(&fixture_spec()).expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
     glass
 }
 
@@ -790,7 +848,6 @@ fn snapshot_without_a11y_flag_errors() {
             a11y: false,
         })
         .expect("launch GTK fixture");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
 
     let err = glass
         .a11y_snapshot(None)
@@ -829,7 +886,7 @@ fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
             a11y: true,
         })
         .unwrap_or_else(|e| panic!("launch GTK fixture sandboxed ({level:?}): {e}"));
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
     let outline = glass
         .a11y_snapshot(None)
         .expect("a11y snapshot (sandboxed)")
@@ -891,7 +948,7 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
             a11y: true,
         })
         .unwrap_or_else(|e| panic!("wayland a11y launch ({level:?}): {e}"));
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_ready(&mut glass);
     let outline = glass
         .a11y_snapshot(None)
         .expect("a11y snapshot (wayland)")
@@ -1043,7 +1100,7 @@ fn launch_bench() -> Glass {
     // snapshot_finds_gtk_widgets et al.), before starting the timed snapshot below. This
     // fixture realizes ~1300 widgets, so registration with the AT-SPI registry lags the
     // window map more than the small fixture's does.
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    await_a11y_settled(&mut glass);
     glass
 }
 
@@ -1183,7 +1240,9 @@ fn stopping_an_a11y_launch_finishes_inside_the_teardown_budget() {
 fn a_quiet_wait_stops_re_walking_the_tree() {
     let (mut glass, walks, signals) = glass_counting();
     glass.start(&fixture_spec()).expect("launch");
-    std::thread::sleep(std::time::Duration::from_millis(3_000));
+    // Settled, not merely readable: this measures a *quiet* wait, and an app still registering
+    // widgets emits the change signals that wake one.
+    await_a11y_settled(&mut glass);
 
     walks.store(0, std::sync::atomic::Ordering::Relaxed);
     let out = glass
@@ -1210,5 +1269,26 @@ fn a_quiet_wait_stops_re_walking_the_tree() {
     assert!(
         walked <= 5,
         "a quiet 3s wait walked {walked} times; the subscription is not suppressing walks"
+    );
+}
+
+/// An app that is up and publishing nothing reports *not ready*, not *unavailable* — the
+/// distinction a wait polls on (glass#329). `GTK_A11Y=none` brings the fixture up with its AT-SPI
+/// bridge switched off.
+#[test]
+#[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
+fn a_running_app_that_publishes_no_tree_reports_not_ready() {
+    let mut spec = fixture_spec();
+    spec.env.push(("GTK_A11Y".into(), "none".into()));
+    let mut glass = glass_x11_with_a11y();
+    glass.start(&spec).expect("launch GTK fixture without a11y");
+
+    let err = glass
+        .a11y_snapshot(None)
+        .expect_err("an app publishing no tree must not snapshot");
+    glass.stop().expect("stop");
+    assert!(
+        matches!(err, glass_core::GlassError::AccessibilityNotReady(_)),
+        "expected AccessibilityNotReady, got: {err:?}"
     );
 }

@@ -524,8 +524,10 @@ impl GlassServer {
                        disabled|checked|unchecked|selected|unselected|expanded|collapsed|focused|\
                        visible|hidden; optional `value_contains`. Returns \
                        {matched,elapsed_ms,element{id,role,name,bounds,states}} — the id is usable \
-                       with glass_click_element. On timeout returns {matched:false}. Errors if the \
-                       app exposes no accessibility tree. Collapses screenshot poll-loops into one call."
+                       with glass_click_element. On timeout returns {matched:false}. Waits through a \
+                       just-launched app that has not published its accessibility tree yet, and \
+                       errors if none appeared before the timeout. Collapses screenshot poll-loops \
+                       into one call."
     )]
     async fn glass_wait_for_element(
         &self,

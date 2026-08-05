@@ -118,6 +118,8 @@ fn bus_err(e: impl std::fmt::Display) -> GlassError {
 
 /// Error shown when glass reached the a11y bus but the launched app publishes no accessible
 /// tree — framed for the developer (it's their app's choice), distinct from a glass/bus problem.
+///
+/// Carried by [`GlassError::AccessibilityNotReady`] — a wait polls this rather than failing on it.
 fn no_app_tree_message(pids: &[u32]) -> String {
     format!(
         "the launched app (pid {pids:?}) isn't publishing an accessibility tree. If it should, \
@@ -165,8 +167,8 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
             break;
         }
     }
-    let app_ref = chosen
-        .ok_or_else(|| GlassError::AccessibilityUnavailable(no_app_tree_message(&ctx.pids)))?;
+    let app_ref =
+        chosen.ok_or_else(|| GlassError::AccessibilityNotReady(no_app_tree_message(&ctx.pids)))?;
     Ok((app_ref, zbus_conn))
 }
 
