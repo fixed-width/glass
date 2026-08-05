@@ -19,6 +19,7 @@ perf.data.old
 
 # cargo-mutants default output dir (root or a crate subdirectory)
 mutants.out/
+mutants.out.old/
 
 # Editor / OS cruft
 *.swp
