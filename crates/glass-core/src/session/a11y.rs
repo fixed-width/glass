@@ -28,9 +28,8 @@ impl Glass {
     /// relative, ids assigned by the core). Caches it for `click_element`.
     /// `AxUnsupported` if the backend has no accessibility reader.
     pub fn a11y_snapshot(&mut self, max_nodes: Option<usize>) -> Result<AxTree> {
-        // A user-facing snapshot sets the limits for the id-space that follows: `set_value`
-        // re-walks with them, and internal re-snapshots reuse them via `a11y_resnapshot`. So
-        // this is the ONLY place that changes `a11y_limits` from a caller's `max_nodes`.
+        // The ONLY place `a11y_limits` changes from a caller's `max_nodes` — every other walk
+        // reuses them.
         self.active_mut()?.a11y_limits =
             crate::accessibility::WalkLimits::from_max_nodes(max_nodes);
         self.snapshot_at_current_limits()
@@ -43,14 +42,11 @@ impl Glass {
     /// pause between ticks.
     pub(crate) fn subscribe_a11y_changes(&mut self) -> Option<Box<dyn ChangeSignal>> {
         let s = self.active_mut().ok()?;
-        // Reader check first, like `snapshot_at_current_limits`: the accessors below are platform
-        // round-trips (`app_pids` shells out to `adb` on Android). A reader that has no event
-        // stream still pays them once per wait, inside the caller's budget — nothing short of
-        // asking it can tell.
+        // Reader check first: the accessors below are platform round-trips (`app_pids` shells
+        // out to `adb` on Android).
         s.accessibility.as_ref()?;
-        // The cached geometry, deliberately: subscribing must not depend on a window round-trip
-        // that can fail, because failing to subscribe has to degrade to polling rather than to an
-        // error. The reader only needs enough context to identify the app.
+        // Cached geometry deliberately: a failed window round-trip must degrade to polling,
+        // not to an error.
         let ctx = AxContext {
             pids: s.platform.app_pids(),
             window: s.geometry.clone(),
@@ -80,15 +76,11 @@ impl Glass {
         if s.accessibility.is_none() {
             return Err(GlassError::AxUnsupported);
         }
-        // Re-read the current window geometry: an app can resize itself (open a sidebar / panel)
-        // without a glass_window op, leaving `s.geometry` stale so the tree's scale/origin — and
-        // the subsequent click_element clamp / set_value context, which read `s.geometry` — would
-        // map to the old window bounds and clip elements now beyond them. Strict by design: a
-        // failure propagates rather than silently reusing a stale cache. Note: on macOS this
-        // resolves the window via ScreenCaptureKit, so a snapshot depends on that and can fail on
-        // a momentarily off-screen window — accepted for correctness. (Android reports a cached
-        // fullscreen window, so a freeform self-resize wouldn't refresh — a residual limitation,
-        // moot while Android apps run fullscreen.)
+        // Re-read: an app can resize itself (open a sidebar / panel) with no glass_window op, and
+        // stale geometry maps the tree to the old bounds and clips elements now beyond them.
+        // macOS resolves this window via ScreenCaptureKit, so a momentarily off-screen window
+        // fails here. Android reports a cached fullscreen window, so a freeform self-resize
+        // would not refresh.
         let window = s.platform.window(&WindowOp::Geometry)?;
         s.geometry = window.clone();
         let pids = s.platform.app_pids();
@@ -156,15 +148,12 @@ impl Glass {
     }
 
     fn click_element_inner(&mut self, id: AxNodeId) -> Result<ClickMethod> {
-        // Native action first: works for occluded/off-screen/boundless elements and
-        // (on backends whose action API is out-of-band) doesn't move the cursor.
+        // Native action first: works for occluded/off-screen/boundless elements, and on a
+        // backend whose action API is out-of-band it doesn't move the cursor.
         //
-        // Falling back is an allowlist, not a denylist: only an attempt that dispatched
-        // NOTHING may be retried with the pointer (see
-        // [`GlassError::invoke_fallback_eligible`]). Anything else — a reported action
-        // failure, an ambiguous transport error, a drifted tree, the pre-check errors —
-        // propagates, because clicking on top of a native action that may still land would
-        // actuate the control twice while the result claimed only "pointer" ran.
+        // Do not widen the fallback to a denylist: only an attempt that dispatched NOTHING may
+        // retry with the pointer (see [`GlassError::invoke_fallback_eligible`]), or a native
+        // action that may still land actuates the control twice.
         let native_fallback = match self.try_native_invoke(id) {
             Ok(actuated) => return Ok(ClickMethod::NativeAction { actuated }),
             Err(e) if !e.invoke_fallback_eligible() => return Err(e),
@@ -192,17 +181,12 @@ impl Glass {
                 s.geometry.clone(),
             )
         };
-        // The element's a11y bounds are reported relative to the active window, but it
-        // may actually render in a separate popover window (e.g. an open dropdown's
-        // option list) whose own origin they don't reflect. Detect that and route the
-        // click into the popover instead of silently missing.
+        // a11y bounds are relative to the active window, but the element may render in a
+        // separate popover window (an open dropdown's option list) whose own origin they
+        // don't reflect.
         //
-        // This enumeration is a best-effort popover probe, not something an ordinary
-        // click depends on: a backend where `list_windows` is heavier or flaky must
-        // never turn a normal click into a failure just because the probe failed. An
-        // `Err` here degrades to an empty list, which makes `owning_popover` return
-        // `None` below and falls straight through to the unchanged `clamped_center`
-        // click path.
+        // The probe is best-effort: an `Err` degrades to an empty list rather than failing a
+        // normal click on a backend where `list_windows` is heavy or flaky.
         let windows = self.list_windows().unwrap_or_default();
         if let Some(popover_id) = owning_popover(bounds, &active_geo, &windows) {
             let popover_geo = windows
@@ -231,15 +215,13 @@ impl Glass {
             }
             return result;
         }
-        // A switch whose backend reports the whole row as its frame with the control at the
-        // trailing edge (iOS/idb) is mis-tapped at the geometric center — that lands on the inert
-        // label, and even aimed at the control a `UISwitch` does NOT actuate on a tap: it needs a
-        // short swipe (see `AxRect::trailing_toggle_swipe`). For such a backend, swipe a
-        // row-shaped checkable's trailing control instead of clicking it. Gated on the backend
-        // capability, NOT geometry alone: a wide *labeled* checkbox on a desktop backend is also
-        // row-shaped but has its indicator at the LEADING edge, so the trailing-aim must not
-        // apply there. The row-shape test uses the raw-bounds aspect as a cheap pre-filter;
-        // `trailing_toggle_swipe` derives its inset from the clamped visible height.
+        // On a backend that frames a switch as its whole row with the control at the trailing
+        // edge (iOS/idb), a center tap lands on the inert label — and a `UISwitch` does NOT
+        // actuate on a tap even when aimed at the control, it needs a short swipe (see
+        // `AxRect::trailing_toggle_swipe`).
+        //
+        // Gate on the backend capability, NOT geometry alone: a wide labeled checkbox on a
+        // desktop backend is row-shaped too, but its indicator is at the LEADING edge.
         let row_shaped_toggle = checkable
             && trailing_toggle_backend
             && bounds.width > bounds.height.saturating_mul(ROW_ASPECT);
@@ -282,16 +264,12 @@ impl Glass {
             if s.accessibility.is_none() {
                 return Err(GlassError::AxUnsupported);
             }
-            // Re-read the window geometry, as `a11y_snapshot` does: the Windows/macOS `invoke`
-            // fingerprints the element by window-RELATIVE bounds derived from `ctx.window`, so
-            // a window the user moved since the snapshot would make every element look
-            // displaced and reject the invoke as drift. Storing it back also keeps the pointer
-            // fallback clamping against the same window.
+            // Re-read the window geometry: the Windows/macOS `invoke` fingerprints the element
+            // by window-RELATIVE bounds derived from `ctx.window`, so a window moved since the
+            // snapshot reads as drift and rejects.
             //
-            // Best-effort, unlike the snapshot's strict refresh: a click must not become
-            // unclickable because a geometry probe hiccuped, so an `Err` keeps the cached
-            // value and carries on — worst case the fingerprint check below rejects, exactly
-            // as it did before this refresh existed.
+            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
+            // value so a geometry-probe hiccup can't make a click unclickable.
             if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
                 s.geometry = window;
             }
@@ -345,20 +323,17 @@ impl Glass {
     fn set_value_inner(&mut self, id: AxNodeId, text: &str) -> Result<()> {
         {
             let s = self.active_mut()?;
-            // Check for reader availability before consulting the snapshot, so that
-            // `AxUnsupported` takes precedence when there is no accessibility backend — and so
-            // a reader-less backend skips the geometry round-trip below.
+            // Reader-presence check up front so `AxUnsupported` keeps precedence over — and a
+            // reader-less backend skips — the geometry round-trip below.
             if s.accessibility.is_none() {
                 return Err(GlassError::AxUnsupported);
             }
-            // Re-read the window geometry, as `a11y_snapshot` and `try_native_invoke` do: the
-            // Windows/macOS `set_value` fingerprints the element by window-RELATIVE bounds
-            // derived from `ctx.window`, so a window moved since the snapshot would make every
-            // element look displaced and reject the write as drift.
+            // Re-read the window geometry: the Windows/macOS `set_value` fingerprints the
+            // element by window-RELATIVE bounds derived from `ctx.window`, so a window moved
+            // since the snapshot reads as drift and rejects.
             //
-            // Best-effort, unlike the snapshot's strict refresh: a write must not fail because
-            // a geometry probe hiccuped, so an `Err` keeps the cached value and carries on —
-            // worst case the backend's own fingerprint check rejects, exactly as before.
+            // Best-effort, unlike the snapshot's strict refresh: an `Err` keeps the cached
+            // value so a geometry-probe hiccup can't fail a write.
             if let Ok(window) = s.platform.window(&WindowOp::Geometry) {
                 s.geometry = window;
             }
@@ -383,24 +358,22 @@ impl Glass {
             };
             (target, ctx)
         };
-        // A dropdown/combo has no committing accessibility write: its `Selection`
-        // interface only moves the popup's *preview* selection, and the model commits
-        // only on row activation (Enter/click). So drive it like a person does —
-        // open it, keyboard-navigate to the option, and press Enter.
+        // A combo has no committing accessibility write: its `Selection` interface moves only
+        // the popup's *preview* selection, and the model commits on row activation (Enter/click).
         //
-        // No cache patch on this path: every `Ok` it returns either actuated nothing or followed
-        // an `a11y_resnapshot`, which replaces `last_ax` wholesale — a fresher fact than a patch.
+        // No cache patch on this path: every `Ok` either actuated nothing or followed an
+        // `a11y_resnapshot`, which replaces `last_ax` wholesale.
         if target.role == AxRole::ComboBox {
             return self.set_combo_value(id, &target, text);
         }
-        // iOS's value-set (tap+type) doesn't apply to a checkable — a tap doesn't toggle a
-        // UISwitch and there's no text to type — so a checkable is driven by the trailing-edge
-        // swipe instead. Set-to-target = toggle iff current != target, then verify by a bounded
-        // poll (never a silent ok). Gated on `checkable` alone (NOT row-shape): a checkable
-        // switch that isn't row-shaped on a trailing backend must still fail-safe through this
-        // branch (parse/verify → error) rather than fall through to the delegate below, which
-        // would silently tap the inert label and type into nothing. Read the needed state and
-        // DROP the `&self` borrow before calling click_element_inner (which needs `&mut self`).
+        // iOS's value-set (tap+type) can't drive a checkable: a tap doesn't toggle a UISwitch
+        // and there's no text to type, so it takes the trailing-edge swipe instead.
+        //
+        // Gate on `checkable` alone, NOT row-shape: a checkable that isn't row-shaped must
+        // fail-safe through this branch rather than fall through to the delegate below, which
+        // would silently tap the inert label and type into nothing.
+        //
+        // DROP the `&self` borrow before `click_element_inner`, which needs `&mut self`.
         let (trailing, node_state) = {
             let s = self.require_active()?;
             (
@@ -415,22 +388,18 @@ impl Glass {
             && let Some(st) = node_state
             && st.checkable
         {
-            // A checkable switch expects a boolean; unrecognized text must NOT fall
-            // through to the tap+type delegate (which would silently no-op a UISwitch).
-            // Erroring here preserves the "never a silent ok" invariant — and the error
-            // must tell the agent to pass a boolean, not misdirect it (a generic
-            // "value not applied — use keystrokes" would send it down a futile path).
+            // Unrecognized text must NOT fall through to the tap+type delegate, which would
+            // silently no-op a UISwitch — and the error has to name "boolean", or a generic
+            // "use keystrokes" sends the agent down a futile path.
             let want = parse_bool(text)
                 .ok_or_else(|| GlassError::AxValueNotBoolean(id.0, text.to_string()))?;
             if st.checked == want {
                 return Ok(()); // truthful no-op, no actuation
             }
-            // No cache patch here either, for the combo path's reason: the verify poll below
-            // re-snapshots, so `last_ax` holds the tree that observed the toggle.
+            // No cache patch here either: the verify poll below re-snapshots, so `last_ax`
+            // holds the tree that observed the toggle.
             self.click_element_inner(id)?; // the toggle actuation (a swipe for a row-shaped control)
-            // Not event-gated, and cannot be: this branch runs only on a backend that frames a
-            // switch as its whole row, which today is iOS alone — a reader with no event stream to
-            // subscribe to.
+            // Not event-gated: this branch runs only on iOS, whose reader has no event stream.
             let outcome = crate::poll::poll_until(
                 TOGGLE_VERIFY_INTERVAL_MS,
                 TOGGLE_VERIFY_TIMEOUT_MS,
@@ -454,11 +423,10 @@ impl Glass {
             .ok_or(GlassError::AxUnsupported)?
             .set_value(&ctx, &target, text);
         if let Err(e) = result {
-            // A failure after dispatch doesn't mean the field is unchanged — Android types before
-            // it verifies, so a partial type or the AVD's documented placeholder-on-clear can
-            // still have altered it. Invalidate (not gate) so a retry with no intervening snapshot
-            // isn't rejected as drift; every other failure keeps its value, for the asymmetry
-            // `set_value_failed_after_writing` documents.
+            // A failure after dispatch doesn't mean the field is unchanged: Android types before
+            // it verifies, so a partial type or the AVD's placeholder-on-clear can still have
+            // altered it. Invalidate rather than gate, so a retry with no intervening snapshot
+            // isn't rejected as drift.
             if e.set_value_failed_after_writing()
                 && let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id))
             {
@@ -466,9 +434,9 @@ impl Glass {
             }
             return Err(e);
         }
-        // `Ok`'s guarantee varies by backend — see `AxTarget::value`'s doc — but patching to the
-        // requested text still beats leaving the pre-write value, which is definitely stale, not
-        // just possibly imprecise. Patch by id; a re-snapshot would cost a whole walk for one field.
+        // `Ok`'s guarantee varies by backend (see `AxTarget::value`), but the requested text
+        // still beats the definitely-stale pre-write value. Patch by id; a re-snapshot would
+        // cost a whole walk for one field.
         if let Some(node) = s.last_ax.as_mut().and_then(|t| t.find_mut(id)) {
             node.value = (!text.is_empty()).then(|| text.to_string());
         }
@@ -489,12 +457,9 @@ impl Glass {
         {
             return Ok(());
         }
-        // Open the popup with a real pointer click, deliberately NOT the native action (the
-        // combo button is in the main window, so this click lands). A programmatic expand —
-        // UIA's `ExpandCollapsePattern` is the concrete case — opens the popup without moving
-        // keyboard focus, and everything below is keyboard navigation (Down/Up/Return), which
-        // would then go to whatever held focus instead of the popup. Clicking focuses the
-        // combo the way a person's click does.
+        // A real pointer click, deliberately NOT the native action: a programmatic expand
+        // (UIA's `ExpandCollapsePattern`) opens the popup without moving keyboard focus, so the
+        // Down/Up/Return below would go to whatever held focus instead.
         self.audited_click(id, |g, id| {
             g.click_element_pointer_only(id)
                 .map(|()| ClickMethod::Pointer {
@@ -502,9 +467,8 @@ impl Glass {
                 })
         })?;
         self.settle_for_popup();
-        // Re-read the realized options + which one is currently selected. The open
-        // combo is `expanded`; when several combos exist, ids don't survive the
-        // re-snapshot, so fall back to the one nearest the target's bounds.
+        // Ids don't survive a re-snapshot, so match the open (`expanded`) combo, else the one
+        // nearest the target's bounds.
         let tree = self.a11y_resnapshot()?;
         let combo = find_expanded_combo(&tree.root)
             .or_else(|| find_combo_near(&tree.root, target.bounds.as_ref()))
@@ -533,9 +497,8 @@ impl Glass {
         // Opening focuses the current selection; step from it to the target, then Enter.
         let current_idx = options.iter().position(|(_, sel)| *sel).unwrap_or(0);
         let delta = target_idx as i32 - current_idx as i32;
-        // `is_negative` rather than a comparison against 0: the two differ only at delta == 0,
-        // where the loop below runs zero times and the chord is never sent, so which comparison
-        // is written cannot be observed.
+        // `is_negative` and `< 0` differ only at delta == 0, where the loop runs zero times and
+        // the chord is never sent — not observable either way.
         let chord = if delta.is_negative() { "Up" } else { "Down" };
         for _ in 0..delta.unsigned_abs() {
             self.key(&KeyEvent::Chord(chord.to_string()))?;
@@ -856,10 +819,8 @@ mod tests {
             Some(AxNodeId(1)),
             "a tie must not be taken by the later node"
         );
-        // The distance is a difference of coordinates, squared and summed. Candidates near the
-        // origin cannot tell that apart from a ratio or a product: put the target far from the
-        // origin and give each candidate its whole error on one axis, so a divide collapses one
-        // term to nothing and a product collapses both.
+        // Near the origin a difference of coordinates is indistinguishable from a ratio or a
+        // product — put the target far out and give each candidate its whole error on one axis.
         let far_x = ax_node(4, AxRole::ComboBox, Some(rect(-5, 995, 10, 10)), vec![]);
         let near_y = ax_node(5, AxRole::ComboBox, Some(rect(995, 985, 10, 10)), vec![]);
         let root_x = ax_node(
@@ -1066,8 +1027,7 @@ mod tests {
             width: 400,
             height: 400,
         };
-        // 10x100 (area 1000, sum 110) vs 60x60 (area 3600, sum 120): the first wins on area,
-        // and on sum too — so make the sums disagree with the areas.
+        // The sums must disagree with the areas, or the test cannot tell the two rules apart.
         let thin = WindowGeometry {
             x: 100,
             y: 100,
@@ -1332,12 +1292,10 @@ mod tests {
 
     #[test]
     fn menu_container_bounds_prefers_closest_size_over_nearest_ancestor() {
-        // Reproduces the real GTK4 widget tree (captured from the Xvfb spike): several
-        // layout wrapper `Group`s sit between the option row and the actual menu `List`,
-        // and their bounds *also* fall within the 16px tolerance of the popover's size —
-        // so picking the ancestor NEAREST `target` returns a wrapper Group, not the real
-        // container. The real container (List, id 2) must win because its size is
-        // closest to the popover's, even though it's farther up the chain.
+        // The real GTK4 widget tree from the Xvfb spike: layout wrapper `Group`s sit between
+        // the option row and the menu `List`, and their bounds *also* fall within the 16px
+        // tolerance — so picking the ancestor NEAREST `target` returns a wrapper, not the
+        // container.
         let popover = WindowGeometry {
             x: -3,
             y: 220,
@@ -1426,13 +1384,9 @@ mod tests {
 
     #[test]
     fn menu_container_bounds_prefers_content_container_over_window_root_sized_ancestor() {
-        // Disambiguates the two kinds of ancestor that both commonly fall within
-        // tolerance of the popover's size: an outer node sized like the popover
-        // window's own frame (e.g. the toplevel root, a few px *larger* — decorations/
-        // margins), and the inner content container a few px *smaller* (the real
-        // GTK4 shape: a `List` a little inside the window's own bounds). Both are
-        // "near" the popover size, so this proves the scoring picks whichever is
-        // numerically closest — the content container — not whichever is outermost.
+        // Two kinds of ancestor commonly fall within tolerance: an outer node sized like the
+        // popover window's own frame (a few px *larger* — decorations/margins) and the inner
+        // content container a few px *smaller* (the real GTK4 shape).
         let popover = WindowGeometry {
             x: -3,
             y: 220,
@@ -1510,10 +1464,9 @@ mod tests {
 
     #[test]
     fn a11y_snapshot_refreshes_geometry_so_click_element_uses_current_window() {
-        // #6: an app resizes itself (opens a sidebar) without a glass_window op; a11y_snapshot
-        // must re-read the current geometry, else click_element clamps against the stale (smaller)
-        // window and clips elements now beyond it. Start 230 wide, platform now reports 458; a
-        // Button at x=292 is off a stale 230 window but on-screen in the real 458 one.
+        // #6: an app resizes itself (opens a sidebar) with no glass_window op, and a stale
+        // window clips elements now beyond it. Start 230 wide, platform now reports 458; a
+        // Button at x=292 is off a stale 230 window but on-screen in the real 458.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let bounds = AxRect {
             x: 292,
@@ -1568,12 +1521,9 @@ mod tests {
 
     #[test]
     fn click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window() {
-        // The Windows/macOS `invoke` fingerprints the element by window-RELATIVE bounds,
-        // derived from `ctx.window`. If the window moved since the snapshot and the click
-        // handed the backend the stale origin, every element would look displaced and the
-        // invoke would be rejected as drift. The snapshot refreshes geometry, so the invoke
-        // path must too: script the geometry read to report a moved window after the
-        // snapshot's own read, and prove the ctx the backend received carries the new origin.
+        // The Windows/macOS `invoke` fingerprints by window-RELATIVE bounds from `ctx.window`,
+        // so a window moved since the snapshot reads as drift. Script the geometry read to
+        // report a moved window after the snapshot's own read.
         let snapshot_geo = WindowGeometry {
             x: 0,
             y: 0,
@@ -1752,8 +1702,7 @@ mod tests {
     fn click_element_action_failure_propagates_and_never_pointer_clicks() {
         // A native action that reported failure may still have been DISPATCHED (the backend
         // fires it on a detached worker and can lose the answer), so a pointer click on top
-        // of it would actuate the control twice. Only outcomes that dispatched nothing may
-        // fall back — everything else fails closed.
+        // of it would actuate the control twice.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(100, 100).with_click_log(clicks.clone());
         let (mut g, _) = glass_with_a11y_invoke(platform, fake_tree(), InvokeBehavior::Fail);
@@ -1884,10 +1833,9 @@ mod tests {
 
     #[test]
     fn click_element_swipes_the_trailing_control_for_a_row_shaped_checkable() {
-        // A checkable node whose bounds are row-shaped (w > 4h) — a backend (iOS/idb) that
-        // reports the whole cell as a switch's frame. A `UISwitch` does not actuate on a tap, so
-        // the click must emit a swipe across the trailing control instead of a `Click`; a
-        // non-checkable node of the SAME bounds still clicks center.
+        // A checkable node with row-shaped bounds (w > 4h) on a backend that reports the whole
+        // cell as the switch's frame: it must swipe the trailing control, while a non-checkable
+        // node of the SAME bounds still clicks center.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let bounds = AxRect {
@@ -1988,11 +1936,9 @@ mod tests {
 
     #[test]
     fn click_element_uses_center_for_a_row_shaped_checkable_on_a_non_trailing_backend() {
-        // The trailing-aim is opt-in per backend. A desktop backend (default FakePlatform: no
-        // `with_trailing_toggle_backend`) frames a labeled checkbox as a wide row too, but its
-        // indicator is at the LEADING edge — so a row-shaped checkable here must still click
-        // center, never trailing. This is the guard that keeps the iOS fix from misfiring
-        // on macOS/Windows/Linux/Android.
+        // The trailing-aim is opt-in per backend: a desktop backend frames a labeled checkbox
+        // as a wide row too, but its indicator is at the LEADING edge, so a row-shaped
+        // checkable here must still click center.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let bounds = AxRect {
             x: 10,
@@ -2256,9 +2202,8 @@ mod tests {
 
     #[test]
     fn click_element_native_invoke_succeeds_for_popover_hosted_element_without_window_select() {
-        // The native action addresses the element directly, so the whole popover machinery —
-        // enumerate windows, select the popover, click at a container-relative offset, restore
-        // the previous window — must be skipped: no focus change, no pointer event.
+        // The native action addresses the element directly, so the whole popover machinery is
+        // skipped: no focus change, no pointer event.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let select_log = Arc::new(Mutex::new(Vec::new()));
         let (mut g, invoke_log) = glass_with_a11y_invoke(
@@ -2321,11 +2266,9 @@ mod tests {
         // Same popover-owning geometry, but the target has no List-sized ancestor to
         // recover a container origin from — must error, not silently mis-click.
         //
-        // This also stands in for the residual `owning_popover` false-positive case
-        // documented on that function: a normal element whose projected point happens to
-        // land inside another real window is indistinguishable, geometrically, from a
-        // genuine popover — the size-matching gate is what turns that misdetection into
-        // this clear, catchable error instead of a silent click into the wrong window.
+        // This also stands in for the residual `owning_popover` false positive documented on
+        // that function: the size-matching gate turns a geometric misdetection into this
+        // catchable error instead of a silent click into the wrong window.
         let globex = AxNode {
             id: AxNodeId(0),
             role: AxRole::ListItem,
@@ -2598,11 +2541,9 @@ mod tests {
 
     #[test]
     fn set_value_on_a_combo_opens_the_popup_with_a_pointer_click_even_when_invoke_succeeds() {
-        // The combo commit loop is keyboard navigation (Down/Up/Return), so the popup must be
-        // opened by something that takes keyboard focus. A native "expand" action doesn't
-        // (UIA's ExpandCollapsePattern is the concrete case), which would send the keystrokes
-        // to whatever had focus instead. So this one click stays pointer-only even on a
-        // backend whose invoke works.
+        // The combo commit loop is keyboard navigation, so the popup must be opened by
+        // something that takes keyboard focus — a native expand (UIA's ExpandCollapsePattern)
+        // doesn't, and the keystrokes would go to whatever had focus instead.
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(340, 300).with_click_log(clicks.clone());
         let (mut g, invoke_log) = glass_with_a11y_seq_invoke(
@@ -2665,10 +2606,8 @@ mod tests {
 
     #[test]
     fn set_value_refreshes_geometry_so_the_backend_sees_the_current_window() {
-        // The mirror of `click_element_refreshes_geometry_so_the_native_invoke_sees_the_current_window`:
-        // `set_value` fingerprints the element the same way `invoke` does (Windows/macOS compare
-        // window-RELATIVE bounds derived from `ctx.window`), so a window moved since the snapshot
-        // would make every element look displaced and reject the write as drift.
+        // The mirror of the `invoke` case: `set_value` fingerprints by window-RELATIVE bounds
+        // from `ctx.window` too, so a window moved since the snapshot reads as drift.
         let snapshot_geo = WindowGeometry {
             x: 0,
             y: 0,
@@ -3000,12 +2939,9 @@ mod tests {
 
     #[test]
     fn a11y_snapshot_threads_max_nodes_into_ctx_limits_and_set_value_reuses_them() {
-        // Same mock harness as `set_value_passes_target_and_text_to_backend`, but this
-        // time inspecting `ctx_log` — the `AxContext.limits` the backend actually
-        // received — to prove `max_nodes` reaches the ctx, and that `set_value` reuses
-        // whatever the last `a11y_snapshot` recorded rather than falling back to the
-        // default cap. Real backends still ignore `limits` in this task (they build
-        // `WalkBudget::new()`), so this is the only way to observe the plumbing.
+        // Inspects `ctx_log` — the `AxContext.limits` the backend actually received. Real
+        // backends still ignore `limits` (they build `WalkBudget::new()`), so this is the only
+        // way to observe the plumbing.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("baselines");
         std::mem::forget(dir);
@@ -3245,11 +3181,9 @@ mod tests {
 
     #[test]
     fn set_value_false_swipes_a_checked_ios_switch_and_verifies() {
-        // The mirror of `set_value_true_swipes_an_unchecked_ios_switch_and_verifies` — proves
-        // the toggle path handles a checked -> unchecked transition too, not just off -> on.
         // The fixed swipe is a TOGGLE gesture (proven on-device: identical swipes alternate
         // off/on/off/on — see `AxRect::trailing_toggle_swipe`), so the same swipe that turns a
-        // switch on also turns it off; there is no direction logic to exercise separately.
+        // switch on turns it off; there is no direction logic to exercise separately.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(drags.clone())
@@ -3332,11 +3266,8 @@ mod tests {
     #[test]
     fn set_value_true_verifies_the_target_by_bounds_when_a_same_named_sibling_is_already_checked() {
         // The sibling "Sw" is already checked (the wanted state) throughout; only the TARGET
-        // flips false -> true on the verify re-snapshot. A name-only verify (the old,
-        // pre-order-first `find_named`) would match the sibling — listed first — and return Ok
-        // regardless of whether the target itself ever moved. The bounds-nearest verify must
-        // instead confirm THIS node (the target, at its own captured bounds) reached the
-        // wanted state.
+        // flips false -> true on the verify re-snapshot. A name-only verify would match the
+        // sibling — listed first — and return Ok whether or not the target ever moved.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(drags.clone())
@@ -3356,12 +3287,9 @@ mod tests {
 
     #[test]
     fn set_value_true_errors_when_only_a_same_named_sibling_is_checked() {
-        // Same same-named-sibling setup, but this time the swipe "does not take": the target
-        // stays unchecked on the verify re-snapshot while the sibling remains (coincidentally)
-        // already checked. A name-only verify would match the sibling first and return a false
-        // Ok — exactly the silent-success bug this fixture guards against. The bounds-nearest
-        // verify must instead see the ACTUAL target still unchecked and report
-        // `AxValueNotApplied`, proving a same-name collision can never fake a false ok.
+        // Same setup, but the swipe "does not take": the target stays unchecked on the verify
+        // re-snapshot while the sibling remains (coincidentally) already checked. A name-only
+        // verify would match the sibling first and return a false Ok.
         let platform = FakePlatform::new(400, 400)
             .with_drag_log(Arc::new(Mutex::new(Vec::new())))
             .with_trailing_toggle_backend();
@@ -3378,15 +3306,10 @@ mod tests {
 
     #[test]
     fn set_value_on_a_non_checkable_element_ignores_the_trailing_toggle_gate() {
-        // The iOS toggle gate (`set_value_inner`'s trailing-toggle branch) must only intercept
-        // CHECKABLE elements — `checkable` is the discriminator, not "did the text parse as a
-        // bool". Uses a BOOLEAN value ("true") deliberately: with non-bool text, a dropped
-        // `checkable` guard is invisible (both arms fall through to the delegate the same way),
-        // so this must exercise the boolean path to actually catch a removed guard. A boolean
-        // value on a non-checkable element (e.g. a plain button) must still fall straight
-        // through to the normal accessibility `set_value` delegate path, unchanged — no
-        // swipe/drag is ever emitted, and the backend's `set_value` is the one that actually
-        // runs.
+        // The toggle gate must intercept only CHECKABLE elements — `checkable` is the
+        // discriminator, not "did the text parse as a bool". Uses a BOOLEAN value ("true")
+        // deliberately: with non-bool text both arms fall through to the delegate alike, so a
+        // dropped `checkable` guard would be invisible.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let dir = tempfile::tempdir().unwrap();
@@ -3433,10 +3356,9 @@ mod tests {
 
     #[test]
     fn set_value_on_a_checkable_rejects_non_boolean_text() {
-        // FIX 1's core invariant: a non-boolean value on a checkable+trailing target must ERROR,
-        // never fall through to the tap+type delegate (which would tap the inert label, type
-        // into nothing, and still report Ok — the exact silent success this branch exists to
-        // kill). No actuation (no swipe) and no delegate call either.
+        // A non-boolean value on a checkable+trailing target must ERROR, never fall through to
+        // the tap+type delegate, which would tap the inert label, type into nothing, and still
+        // report Ok.
         let drags: Arc<Mutex<Vec<PointerEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let dir = tempfile::tempdir().unwrap();
