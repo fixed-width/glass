@@ -1033,11 +1033,10 @@ mod tests {
                         "{role:?} is produced by a class but the matrix does not declare it"
                     );
                     // The named class must not resolve to the very role the cell says is out
-                    // of reach. Largely a second line behind the `!mapped` assertion above —
-                    // if the class produced the role, that one fires too — but it pins the
-                    // token itself, so a cell rewritten to name a different class is checked
-                    // against the map rather than against nothing. A misspelt class resolves
-                    // to `Other` and passes: only an on-box read catches that.
+                    // of reach. Largely a second line behind the `!mapped` assertion above,
+                    // but it pins the token itself, so a cell rewritten to name a different
+                    // class is checked against the map. A misspelt class resolves to `Other`
+                    // and passes — only an on-box read catches that.
                     if let Some(token) = cell.named_token() {
                         assert_ne!(
                             class_to_role(token),
