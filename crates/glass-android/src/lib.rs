@@ -34,12 +34,13 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus};
 /// This backend's canonical name (matches the `glass_capabilities` / `GLASS_BACKEND` value).
 pub const BACKEND: &str = "android";
 
-/// This backend's live capability map. `input` degrades and `multi_touch`/`clipboard`
-/// need the on-device agent — gated on [`agent::agent_enabled`], the same predicate the
-/// runtime uses to pick `AgentInjector` vs `ShellInjector`, so this can't disagree with
-/// real behavior. `accessibility` degrades without the a11y APK — gated on
-/// [`a11y_service::a11y_apk`], the same predicate the runtime uses to pick the Compose-rich
-/// reader vs the basic `uiautomator` one.
+/// This backend's live capability map. `input`, `multi_touch` and `clipboard` are gated on
+/// [`agent::agent_enabled`]; `accessibility` on [`a11y_service::a11y_apk`].
+///
+/// Both gates answer whether a companion is *configured*, not whether it comes up: one that
+/// fails to install or connect degrades at runtime with a note on stderr
+/// ([`AndroidPlatform::from_env`] for the agent, [`AndroidPlatform::accessibility`] for the a11y
+/// service). This map is computed without a device, so it cannot see that.
 pub fn capabilities() -> CapabilityMap {
     let get = |k: &str| std::env::var(k).ok();
     capabilities_with(

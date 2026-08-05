@@ -74,34 +74,13 @@ pub fn make_platform(
         });
     }
     if backend == "android" {
+        // Do not expand this back into a reader choice here — that is what let it drift from
+        // the capability gate that reports it.
         let platform = glass_android::AndroidPlatform::from_env(registry, agents)?;
-        let get = |k: &str| std::env::var(k).ok();
-        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-            match glass_android::a11y_apk(&get) {
-                Some(apk) => match a11y.ensure(&platform.resolved_adb(), &apk) {
-                    // The package isn't known until start_app; the device service serves the
-                    // ACTIVE window regardless, so an empty package is correct for the MVP.
-                    Ok(client) => Some(Box::new(glass_android::ServiceA11y::new(
-                        client,
-                        String::new(),
-                    ))),
-                    Err(e) => {
-                        eprintln!(
-                            "glass-android: a11y service unavailable, using uiautomator: {e}"
-                        );
-                        Some(Box::new(glass_android::AndroidA11y::for_adb(
-                            platform.resolved_adb(),
-                        )))
-                    }
-                },
-                None => Some(Box::new(glass_android::AndroidA11y::for_adb(
-                    platform.resolved_adb(),
-                ))),
-            };
-        let platform: Box<dyn Platform + Send> = Box::new(platform);
+        let accessibility = platform.accessibility(a11y);
         return Ok(Backend {
-            platform,
-            accessibility,
+            platform: Box::new(platform),
+            accessibility: Some(accessibility),
         });
     }
     let platform: Box<dyn Platform + Send> = match backend {
