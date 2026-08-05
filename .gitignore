@@ -29,6 +29,10 @@ mutants.out.old/
 # Pulled-back artifacts from scripts/test-windows.sh on-box runs
 /.windows-artifacts/
 
+# On-device diagnostics from scripts/ci-android-suite.sh — CI uploads these as an artifact; a local
+# run leaves a device screenshot and a whole-run logcat here.
+/diagnostics/
+
 # Fixture cruft
 **/__pycache__/
 
