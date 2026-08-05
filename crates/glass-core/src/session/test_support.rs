@@ -920,3 +920,44 @@ pub(crate) fn first_button(t: &AxTree) -> AxNodeId {
     }
     walk(&t.root).expect("fake_tree has a Button")
 }
+
+/// A reader with nothing to serve for its first `silent` snapshots. `silent: usize::MAX` models an
+/// app that never publishes a tree at all.
+pub(crate) struct NotReadyThenTree {
+    pub(crate) silent: usize,
+    pub(crate) tree: AxTree,
+    /// How many snapshots were asked for — a wait that gave up on the first read looks the same as
+    /// one that polled, until you count.
+    pub(crate) reads: Arc<AtomicUsize>,
+}
+
+impl Accessibility for NotReadyThenTree {
+    fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        if self.silent > 0 {
+            self.silent = self.silent.saturating_sub(1);
+            return Err(GlassError::AccessibilityNotReady(
+                "the launched app (pid [123]) isn't publishing an accessibility tree".into(),
+            ));
+        }
+        Ok(self.tree.clone())
+    }
+}
+
+/// A session whose reader publishes nothing for its first `silent` snapshots, reporting its
+/// read count.
+pub(crate) fn glass_with_a11y_not_ready(
+    platform: FakePlatform,
+    silent: usize,
+) -> (Glass, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let g = glass_with_backend(
+        platform,
+        Box::new(NotReadyThenTree {
+            silent,
+            tree: fake_tree_enabled(),
+            reads: reads.clone(),
+        }),
+    );
+    (g, reads)
+}

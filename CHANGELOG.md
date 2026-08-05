@@ -191,6 +191,17 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- `glass_wait_for_element` now waits for a just-launched app to publish its accessibility tree
+  instead of failing on its first read. An app registers with the accessibility bus a moment after
+  its window maps, and until then there is nothing to read; the wait treated that as a hard failure
+  and returned instantly, so the documented way to wait for an app to come up was the one thing
+  that could not do it. A tree that never appears is still reported — the wait says the app
+  published nothing, rather than that the element is missing, since those have different remedies.
+  Launching without `a11y: true` still errors at once, as waiting cannot fix it. On Linux the
+  reader now distinguishes the two: "the app isn't publishing an accessibility tree" is a
+  not-ready condition a wait can outlast, and the message is unchanged. `glass_scroll_to_element`
+  still reads once and reports not-ready rather than waiting; call `glass_wait_for_element` first
+  if the app may still be starting.
 - An Android accessibility read no longer gives up when `uiautomator` crashes on a screen that is
   still settling. `uiautomator dump` dies with a `NullPointerException` walking a tree whose nodes
   are still coming and going, and it exits non-zero with nothing on stderr — its trace goes to

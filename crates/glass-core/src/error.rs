@@ -135,6 +135,16 @@ pub enum GlassError {
     #[error("accessibility unavailable: {0}")]
     AccessibilityUnavailable(String),
 
+    /// The app is up but has published no accessibility tree *yet*. Distinct from
+    /// [`Self::AccessibilityUnavailable`] because waiting can resolve it and nothing else can:
+    /// a wait polls through this instead of abandoning its budget on the first read (glass#329),
+    /// where a session launched without `a11y: true` is wrong however long anyone waits.
+    ///
+    /// An app that never publishes one is indistinguishable from a slow one at any single read,
+    /// so this is what a wait reports when its whole budget goes by.
+    #[error("accessibility not ready: {0}")]
+    AccessibilityNotReady(String),
+
     /// A sandbox was requested but the mechanism is unavailable on a host that
     /// supports it. Carries an actionable remedy.
     #[error("{0}")]
