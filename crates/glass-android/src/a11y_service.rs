@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use serde_json::{Value, json};
 
 use glass_core::accessibility::{
-    Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-    Subject, TruncationLimit, WalkBudget, WalkLimits,
+    Accessibility, AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget,
+    AxTree, Subject, TruncationLimit, WalkBudget, WalkLimits,
 };
 use glass_core::platform::WindowGeometry;
 use glass_core::{GlassError, Result};
@@ -210,6 +210,19 @@ impl ServiceClient {
         }
     }
 
+    /// Bound the connection's reads by `deadline` for as long as the returned guard lives, and
+    /// restore the standing timeout when it drops.
+    ///
+    /// Scoped rather than set-and-leave: the connection outlives any one request, so a bound left
+    /// behind would apply to a later call that never agreed to it — and to the *reconnect* path,
+    /// where a fresh `Conn` starts from the standing timeout again.
+    fn read_within(&self, deadline: AxDeadline) -> ReadBound<'_> {
+        if let Ok(mut conn) = self.conn.lock() {
+            conn.read_within(deadline.remaining());
+        }
+        ReadBound { client: self }
+    }
+
     /// Run a request that can be run twice without consequence, transparently reconnecting
     /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
     fn call(&self, req: Value, rearm: Option<&str>) -> std::result::Result<Value, CallFailure> {
@@ -225,7 +238,18 @@ impl ServiceClient {
         self.call_with(req, CallFailure::nothing_sent, rearm)
     }
 
+    /// Serve the tree for `package` on the connection's standing timeout — the readiness probe and
+    /// the tests, neither of which has a caller waiting on a clock.
     fn tree(&self, package: &str) -> Result<TreeReply> {
+        self.tree_within(package, AxDeadline::UNBOUNDED)
+    }
+
+    /// Serve the tree for `package`, blocking no longer than `deadline` allows.
+    ///
+    /// The bound covers the reconnect-and-re-send too, so one call cannot cost two socket
+    /// timeouts against a caller who asked for less than one (glass#338).
+    fn tree_within(&self, package: &str, deadline: AxDeadline) -> Result<TreeReply> {
+        let _bound = self.read_within(deadline);
         let r = self
             .call(json!({"op": "tree", "package": package}), None)
             .map_err(CallFailure::into_error)?;
@@ -375,9 +399,30 @@ fn subject_of(asked: &str, actual: Option<&str>) -> Option<Subject> {
     })
 }
 
+/// Restores [`ServiceClient`]'s standing read timeout when it drops, so a bound one call set
+/// cannot be inherited by the next.
+struct ReadBound<'a> {
+    client: &'a ServiceClient,
+}
+
+impl Drop for ReadBound<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = self.client.conn.lock() {
+            conn.read_within(None);
+        }
+    }
+}
+
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        let reply = self.client.tree(&self.package)?;
+        // Checked before the round-trip: a companion that answers after the caller has gone costs
+        // a socket timeout nobody is waiting through.
+        if ctx.deadline.has_passed() {
+            return Err(GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ));
+        }
+        let reply = self.client.tree_within(&self.package, ctx.deadline)?;
         let mut tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
         tree.subject = subject_of(&self.package, reply.package.as_deref());
         Ok(tree)
@@ -1025,7 +1070,7 @@ fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glass_core::accessibility::AxRole;
+    use glass_core::accessibility::{AxDeadline, AxRole};
     use serde_json::json;
     use std::io::{BufRead, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2260,11 +2305,37 @@ mod tests {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::UNBOUNDED,
         }
     }
 
     fn ops_of(ops: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         ops.lock().unwrap().clone()
+    }
+
+    /// glass#338: this reader is the one the platform *prefers* once the companion is installed,
+    /// so a deadline it ignores is a deadline the dogfood configuration ignores.
+    ///
+    /// A caller that has stopped waiting is answered without a round-trip at all — the socket's
+    /// standing timeout is 30s and a failed call reconnects and re-sends, so one snapshot can
+    /// outlast a whole `glass_wait_for_element` twice over.
+    #[test]
+    fn a_snapshot_the_caller_stopped_waiting_for_never_reaches_the_device() {
+        let (port, ops) = fake_service(vec![compose_like()], OnAction::Ok);
+        let mut a11y = reader(port, std::time::Duration::ZERO);
+        let mut ctx = ctx();
+        ctx.deadline = AxDeadline::from_millis(0);
+
+        let e = a11y
+            .snapshot(&ctx)
+            .expect_err("the caller had stopped waiting");
+
+        assert!(matches!(e, GlassError::AccessibilityNotReady(_)), "{e}");
+        assert!(
+            ops_of(&ops).is_empty(),
+            "the device was asked for a tree nobody was waiting for: {:?}",
+            ops_of(&ops)
+        );
     }
 
     #[test]

@@ -357,6 +357,12 @@ impl Accessibility for FakeAccessibility {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         Ok(self.tree.clone())
     }
+    /// Records the context and declines, so the wait falls back to polling exactly as it does
+    /// against a reader with no event stream — but the bound it was handed is now observable.
+    fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
+        *self.ctx_log.lock().unwrap() = Some(ctx.clone());
+        None
+    }
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         if self.set_fail {
@@ -512,6 +518,13 @@ pub(crate) fn glass_with_a11y(platform: FakePlatform, tree: AxTree) -> Glass {
             invoke_log: Arc::new(Mutex::new(Vec::new())),
         }),
     )
+}
+
+/// [`glass_with_a11y`] plus the ctx log — for a test that must prove what reached the backend
+/// rather than what the session recorded, without also scripting `invoke`.
+pub(crate) fn glass_with_a11y_ctx(platform: FakePlatform, tree: AxTree) -> (Glass, CtxLog) {
+    let (g, _, ctx_log) = glass_with_a11y_invoke_ctx(platform, tree, InvokeBehavior::Unsupported);
+    (g, ctx_log)
 }
 
 /// Like `glass_with_a11y`, but scripts the backend's `invoke` outcome — for tests of the
@@ -942,6 +955,47 @@ impl Accessibility for NotReadyThenTree {
         }
         Ok(self.tree.clone())
     }
+}
+
+/// A reader that answers while the caller's deadline has time and gives up once it is spent —
+/// what a backend honouring [`AxDeadline`] does on the tick that ends a wait.
+///
+/// Every other fake here ignores `ctx.deadline`, so none of them can reach the case a wait's own
+/// deadline creates.
+pub(crate) struct UntilDeadline {
+    pub(crate) tree: AxTree,
+    /// How long every read was left, in order, *measured at the read* — a deadline read back
+    /// afterwards has always expired. `None` is a read the caller left unbounded, which the first
+    /// one is on purpose.
+    pub(crate) seen: Arc<Mutex<Vec<Option<std::time::Duration>>>>,
+}
+
+impl Accessibility for UntilDeadline {
+    fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.seen.lock().unwrap().push(ctx.deadline.remaining());
+        if ctx.deadline.has_passed() {
+            return Err(GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ));
+        }
+        Ok(self.tree.clone())
+    }
+}
+
+/// A session whose reader answers until the caller's deadline is spent, reporting the bound each
+/// read was given.
+pub(crate) fn glass_with_a11y_until_deadline(
+    platform: FakePlatform,
+) -> (Glass, Arc<Mutex<Vec<Option<std::time::Duration>>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let g = glass_with_backend(
+        platform,
+        Box::new(UntilDeadline {
+            tree: fake_tree_enabled(),
+            seen: seen.clone(),
+        }),
+    );
+    (g, seen)
 }
 
 /// A session whose reader publishes nothing for its first `silent` snapshots, reporting its

@@ -61,8 +61,8 @@ mod macos_main {
 
     use glass_core::platform::{MouseButton, PointerEvent};
     use glass_core::{
-        Accessibility, AppSpec, AxContext, AxNode, AxRole, AxTarget, GlassError, Platform,
-        SandboxLevel, Stream, WalkLimits,
+        Accessibility, AppSpec, AxContext, AxDeadline, AxNode, AxRole, AxTarget, GlassError,
+        Platform, SandboxLevel, Stream, WalkLimits,
     };
     use glass_macos::MacosPlatform;
 
@@ -219,6 +219,7 @@ mod macos_main {
             window_handle: None,
             a11y_bus_addr: None,
             limits: WalkLimits::DEFAULT,
+            deadline: AxDeadline::UNBOUNDED,
         };
 
         let mut a11y = glass_a11y_macos::MacosA11y::new();

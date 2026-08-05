@@ -385,24 +385,34 @@ impl Glass {
     pub fn wait_for_element(&mut self, params: &WaitElementParams) -> Result<WaitElementOutcome> {
         self.require_active()?; // fail fast; a11y_snapshot rechecks inside the loop
         let started = std::time::Instant::now();
+        // Every read this wait makes carries when the wait stops: the tick is synchronous, so the
+        // loop cannot take back a read a reader has started (glass#338).
+        let deadline = AxDeadline::from_millis(params.timeout_ms);
         // Before the first walk, not after: a change landing in that gap is announced to nobody,
         // and the wait then burns its whole budget on a condition that already holds.
         //
         // An interval of 0 means "re-read as fast as you can", which never pauses — so there is
         // nothing for a signal to save, and subscribing would only cost a round-trip.
         let mut signal = (params.interval_ms > 0)
-            .then(|| self.subscribe_a11y_changes())
+            .then(|| self.subscribe_a11y_changes(deadline))
             .flatten();
         // Subscribing spends the caller's budget, so the poll loop gets what is left. That
-        // bounds the polling, not the call: a reader bounds its own handshake in seconds, so a
-        // wait told to give up after 500ms can return later than that.
+        // bounds the polling, not the call: a reader that does not honour `deadline` bounds its
+        // own handshake in seconds, so a wait told to give up after 500ms can return later.
         let remaining = params
             .timeout_ms
             .saturating_sub(started.elapsed().as_millis() as u64);
         // Starts now rather than at the first read: the first tick follows immediately.
         let mut last_read = std::time::Instant::now();
-        // Never cleared: a tree that arrives leaves the match to answer for the result.
-        let mut never_published: Option<GlassError> = None;
+        // Only a wait that never saw a tree reports why it saw none. A reader honouring
+        // `deadline` gives up on the tick that ends the wait, so without this every unmatched wait
+        // on such a backend failed instead of answering `{matched:false}` (glass#338).
+        let mut unread: Option<GlassError> = None;
+        let mut saw_a_tree = false;
+        // The first read carries no deadline: `poll_until_with_pause` guarantees one tick, so a
+        // wait must look once, and `timeout_ms: 0` ("check now") would otherwise error against a
+        // healthy app nobody consulted. Reads after it carry the bound.
+        let mut looked = false;
         let outcome = crate::poll::poll_until_with_pause(
             params.interval_ms,
             remaining,
@@ -433,11 +443,20 @@ impl Glass {
             },
             || {
                 // fresh snapshot; assigns ids, caches, pumps
-                let tree = match self.a11y_resnapshot() {
-                    Ok(t) => t,
+                let bound = if looked {
+                    deadline
+                } else {
+                    AxDeadline::UNBOUNDED
+                };
+                looked = true;
+                let tree = match self.a11y_resnapshot(bound) {
+                    Ok(t) => {
+                        saw_a_tree = true;
+                        t
+                    }
                     // Kept so a spent budget can report this instead of "not found" (glass#329).
                     Err(e @ GlassError::AccessibilityNotReady(_)) => {
-                        never_published = Some(e);
+                        unread = Some(e);
                         return Ok(None);
                     }
                     Err(e) => return Err(e),
@@ -457,7 +476,8 @@ impl Glass {
             },
         )?;
         if outcome.value.is_none()
-            && let Some(e) = never_published
+            && !saw_a_tree
+            && let Some(e) = unread
         {
             return Err(e);
         }
@@ -597,7 +617,10 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
     ) -> Result<(Option<ElementInfo>, String)> {
-        let tree = self.a11y_resnapshot()?;
+        // No deadline, though the sweep has a `timeout_ms`: this read propagates its error with
+        // `?`, so a reader giving up at the deadline would turn the sweep's soft `{matched:false}`
+        // into an error.
+        let tree = self.a11y_resnapshot(AxDeadline::UNBOUNDED)?;
         let found = match element_match(
             &tree,
             params.name.as_deref(),
@@ -1219,6 +1242,127 @@ mod tests {
         let e = o.element.expect("matched element");
         assert_eq!(e.id, AxNodeId(1));
         assert_eq!(e.name.as_deref(), Some("Save"));
+    }
+
+    /// glass#338: on Android a `uiautomator dump` spending its own 20s budget answered a 10s
+    /// wait, because `poll_until_with_pause` ticks synchronously and only the reader can stop one
+    /// read early.
+    ///
+    /// This asserts over the reads *after* the first, which is deliberately unbounded — see
+    /// [`a_wait_looks_once_however_little_time_it_was_given`].
+    #[test]
+    fn a_wait_tells_the_reader_when_it_stops_waiting() {
+        let (mut g, seen) = glass_with_a11y_until_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+        g.wait_for_element(&WaitElementParams {
+            name: Some("Ghost".into()), // never matches, so the wait reads more than once
+            role: None,
+            value_contains: None,
+            condition: ElementCondition::Appears,
+            interval_ms: 5,
+            timeout_ms: 400,
+        })
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 1, "the wait read only once: {}", seen.len());
+        let left = seen[1].expect("the read after the first is bounded by the wait's timeout");
+        // A lower bound as well as an upper one: a deadline built from `interval_ms`, or from any
+        // constant smaller than the timeout, passes an upper bound alone (glass#284).
+        assert!(
+            left > std::time::Duration::from_millis(200),
+            "the second read's bound is not the wait's 400ms timeout: {left:?}"
+        );
+        assert!(
+            left <= std::time::Duration::from_millis(400),
+            "a deadline past the wait's own timeout bounds nothing: {left:?}"
+        );
+    }
+
+    /// A wait that read the tree and did not find the element answers `{matched:false}`, which is
+    /// what `glass_wait_for_element`'s schema and the tool description promise.
+    ///
+    /// The poll loop checks its budget *after* a tick, so the last read always starts at the
+    /// deadline and a reader honouring it always gives up there.
+    #[test]
+    fn a_wait_that_read_the_tree_reports_no_match_even_when_its_last_read_ran_out_of_time() {
+        let (mut g, seen) = glass_with_a11y_until_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Ghost".into()), // never in the tree
+                role: None,
+                value_contains: None,
+                condition: ElementCondition::Appears,
+                interval_ms: 10,
+                timeout_ms: 120,
+            })
+            .expect("a wait that read the UI reports the element absent, it does not fail");
+
+        assert!(!o.matched);
+        assert!(
+            seen.lock().unwrap().len() > 1,
+            "the wait answered from one read, so it never reached the read that runs out of time"
+        );
+    }
+
+    /// A wait looks once however little time it was given: `poll_until_with_pause` guarantees one
+    /// tick, and `timeout_ms: 0` means "check now" — answering for a device nobody consulted is
+    /// the one outcome worse than answering late.
+    #[test]
+    fn a_wait_looks_once_however_little_time_it_was_given() {
+        let (mut g, seen) = glass_with_a11y_until_deadline(FakePlatform::new(100, 100));
+        g.start(&spec()).unwrap();
+        let o = g
+            .wait_for_element(&WaitElementParams {
+                name: Some("Save".into()),
+                role: Some(AxRole::Button),
+                value_contains: None,
+                condition: ElementCondition::Appears,
+                interval_ms: 0,
+                timeout_ms: 0,
+            })
+            .expect("a wait given no time still looks once");
+
+        assert!(o.matched, "the element is in the very first tree read");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0], None,
+            "the one look a wait is guaranteed was handed a bound it could not meet"
+        );
+    }
+
+    /// The sweep has a `timeout_ms` of its own and still leaves the reader unbounded, because its
+    /// read propagates with `?` — a reader giving up at the deadline would turn the soft
+    /// `{matched:false}` a spent sweep promises into an error.
+    ///
+    /// The asymmetry with `wait_for_element` is deliberate and lived only in a comment, one line
+    /// from a `timeout_ms` inviting a contributor to "fix" it.
+    #[test]
+    fn a_scroll_sweep_leaves_the_reader_its_own_budget() {
+        let (mut g, ctx_log) = glass_with_a11y_ctx(FakePlatform::new(100, 100), fake_tree());
+        g.start(&spec()).unwrap();
+        g.scroll_to_element(&ScrollToElementParams {
+            name: Some("Ghost".into()),
+            role: None,
+            value_contains: None,
+            direction: Some(ScrollDirection::Down),
+            anchor: None,
+            step: SCROLL_TO_DEFAULT_STEP,
+            timeout_ms: 20_000,
+        })
+        .unwrap();
+
+        assert_eq!(
+            ctx_log
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the sweep read the tree")
+                .deadline,
+            AxDeadline::UNBOUNDED,
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@
 use std::time::Duration;
 
 use glass_core::Accessibility; // the trait must be in scope to call `snapshot` on the boxed reader
-use glass_core::accessibility::{AxContext, WalkLimits};
+use glass_core::accessibility::{AxContext, AxDeadline, WalkLimits};
 use glass_core::{
     AppSpec, AxRole, AxTree, DescriptionSourcing, Platform, SandboxLevel,
     description_census_report, role_histogram,
@@ -225,6 +225,7 @@ fn role_histogram_probe() {
             // The node cap lifted, so a big app's tree is never truncated mid-probe. Depth
             // and per-level sibling rails keep their generous structural defaults regardless.
             limits: WalkLimits::from_max_nodes(Some(0)),
+            deadline: AxDeadline::UNBOUNDED,
         };
         let mut tree = a11y
             .snapshot(&ctx)

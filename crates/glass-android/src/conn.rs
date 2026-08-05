@@ -55,6 +55,11 @@ impl CallFailure {
 }
 
 /// A live connection to the agent: a framed line reader/writer + a monotonic id.
+/// How long a read blocks for the companion when no caller named a bound — long enough that a
+/// stalled agent surfaces as a transport error the reconnect path handles, rather than hanging the
+/// single-threaded MCP loop forever.
+const STANDING_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) struct Conn {
     pub(crate) writer: TcpStream,
     pub(crate) reader: BufReader<TcpStream>,
@@ -68,9 +73,8 @@ impl Conn {
             .map_err(|e| GlassError::Backend(format!("agent connect :{port}: {e}")))?;
         // Set read/write timeouts so a stalled agent surfaces as a transport error (which
         // the existing reconnect path handles) rather than hanging the MCP thread forever.
-        let to = Duration::from_secs(30);
-        stream.set_read_timeout(Some(to)).ok();
-        stream.set_write_timeout(Some(to)).ok();
+        stream.set_read_timeout(Some(STANDING_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(STANDING_TIMEOUT)).ok();
         let reader = BufReader::new(
             stream
                 .try_clone()
@@ -106,6 +110,17 @@ impl Conn {
             return Err(GlassError::Backend("agent closed the connection".into()));
         }
         Ok(line.trim_end().to_string())
+    }
+
+    /// Bound how long the next reads may block for, or restore the standing timeout when the
+    /// caller named nothing.
+    ///
+    /// Per-call rather than per-connection: the socket outlives any one request, so a bound left
+    /// behind would be applied to a later call that never agreed to it.
+    pub(crate) fn read_within(&mut self, wait: Option<Duration>) {
+        self.writer
+            .set_read_timeout(Some(wait.unwrap_or(STANDING_TIMEOUT)))
+            .ok();
     }
 
     /// Send one request object (an `id` is injected) and return the response `Value`.
