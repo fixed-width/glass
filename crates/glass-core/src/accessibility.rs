@@ -1129,6 +1129,38 @@ pub fn element_match<'a>(
 mod tests {
     use super::*;
 
+    /// The two bounds a reader holds — its own and its caller's — resolve to whichever falls
+    /// first, in both directions.
+    #[test]
+    fn a_deadline_caps_a_proposed_instant_only_when_it_falls_first() {
+        let soon = AxDeadline::in_ms(1_000);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(soon.cap(later) < later, "the nearer bound did not govern");
+
+        let now = std::time::Instant::now();
+        assert_eq!(
+            soon.cap(now),
+            now,
+            "a reader's own nearer bound was widened"
+        );
+    }
+
+    /// A caller that named no instant leaves the reader whatever it proposed — [`AxDeadline::NONE`]
+    /// is not a deadline of zero, which would stop every read before it started.
+    #[test]
+    fn no_deadline_caps_nothing_and_is_never_spent() {
+        let proposed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(AxDeadline::NONE.cap(proposed), proposed);
+        assert_eq!(AxDeadline::NONE.remaining(), None);
+        assert!(!AxDeadline::NONE.is_spent());
+    }
+
+    #[test]
+    fn a_deadline_is_spent_once_its_instant_has_passed() {
+        assert!(AxDeadline::in_ms(0).is_spent());
+        assert!(!AxDeadline::in_ms(60_000).is_spent());
+    }
+
     /// Compile-time guard for [`AxRole::ALL`] — never called, and exists only for its exhaustive
     /// match. The role-parity tests and [`crate::role_support::ROLE_SUPPORT`] quantify their
     /// completeness claims over `ALL`, so a new variant missing from it would silently weaken
