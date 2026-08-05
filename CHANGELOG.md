@@ -191,6 +191,18 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- An Android accessibility read no longer gives up when `uiautomator` crashes on a screen that is
+  still settling. `uiautomator dump` dies with a `NullPointerException` walking a tree whose nodes
+  are still coming and going, and it exits non-zero with nothing on stderr — its trace goes to
+  logcat — so glass saw only a bare failure and returned it as a backend error, which its readiness
+  retry deliberately does not wait out. That landed on a session's very first snapshot, the one
+  read that carries a 30-second budget for a device that is not ready, and spent none of it.
+  A dump that fails without saying why is now treated as the device not being ready, so it is
+  retried inside that budget, and the partial file such a crash leaves behind is removed rather
+  than stranded on the device once per attempt. A device that has genuinely gone away still fails
+  at once, since adb says so. Measured on an API 34 emulator entered straight from a snapshot
+  restore: 3 failures in 14 runs before, none in 10 after, including one run where the crash
+  happened and the read recovered.
 - An Android accessibility snapshot taken through the optional on-device companion now says when
   it describes a different app than the one asked about. The companion answered with whatever
   window was in front — a system dialog, a permission prompt — and reported it as the requested
