@@ -77,11 +77,10 @@ pub(crate) fn send_pointer(
     scale: f64,
     origin_pt: (f64, f64),
 ) -> Result<()> {
-    // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity (see
-    // the `PointerEvent::Gesture` arm below) — checked first, ahead of `focus`, so this
-    // fails fast without the side effect of raising/activating `pid`'s app for an operation
-    // that can never succeed (also keeps `focus`'s now-fallible missing-process check, fix
-    // 4, from masking this call-shape error behind an unrelated `AppExited`).
+    // `Gesture` is unconditionally unsupported on macOS regardless of `pid`'s validity —
+    // checked ahead of `focus` so it fails fast without raising/activating the app for an
+    // operation that can never succeed, and so `focus`'s missing-process check can't mask
+    // this call-shape error behind an unrelated `AppExited`.
     if matches!(event, PointerEvent::Gesture { .. }) {
         return Err(GlassError::unsupported(
             "multi_touch",

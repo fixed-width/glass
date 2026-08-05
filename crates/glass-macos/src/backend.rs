@@ -1134,12 +1134,10 @@ mod tests {
 
     #[test]
     fn stop_app_clears_clipboard_route() {
-        // start_app decides clipboard_route for the session; stop_app must reset it to the
-        // fail-closed default (Unsupported) too, so a later start_app on the same
-        // MacosPlatform never inherits a stale contained-session route (here a
-        // `Private(name)`, which would wrongly route get_clipboard/set_clipboard to a private
-        // pasteboard that no longer applies) before the next start_app decides fresh. `clip`
-        // is None so stop_app touches no pasteboard here.
+        // `stop_app` must reset the route to the fail-closed default, so a later `start_app`
+        // on the same MacosPlatform never inherits a stale `Private(name)` that would route
+        // get_clipboard/set_clipboard to a pasteboard no longer in play. `clip` is None here,
+        // so no pasteboard is touched.
         let mut p = MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
@@ -1155,12 +1153,9 @@ mod tests {
 
     #[test]
     fn stop_app_clears_clip() {
-        // start_app stores process::spawn's ClipLaunch facts for a later clipboard-routing
-        // decision; stop_app must clear them too, so a later start_app on the same
-        // MacosPlatform never leaks a previous session's shim facts (e.g. a stale private
-        // pasteboard name) into a new one. With `clip` set, stop_app also exercises the
-        // `release_named` path for the content + `.ready` boards (harmless on names no live
-        // shim ever wrote).
+        // `stop_app` must clear the stored `ClipLaunch` facts too, so a later session never
+        // inherits a previous one's private pasteboard name. With `clip` set, this also runs
+        // the `release_named` path for the content + `.ready` boards.
         let mut p = MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
@@ -1598,11 +1593,9 @@ mod tests {
 
     #[test]
     fn resize_was_refused_catches_a_total_refusal_of_a_small_requested_delta() {
-        // Regression test for final-review fix 3: a small (> REQUEST_EPSILON_PX, but within
-        // the old WINDOW_OP_TOLERANCE_PX-based "was a change requested" threshold) resize
-        // request that's fully refused must now be caught. Before this fix, a 5px delta
-        // wasn't even considered "a change was requested" (5 <= the old 8px threshold), so a
-        // total no-op silently reported success.
+        // A small resize request — over REQUEST_EPSILON_PX but under the old
+        // WINDOW_OP_TOLERANCE_PX threshold — that is fully refused must be caught. A 5px delta
+        // did not used to count as "a change was requested", so a total no-op reported success.
         let before = WindowGeometry {
             x: 0,
             y: 0,

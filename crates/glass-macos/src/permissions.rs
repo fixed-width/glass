@@ -152,11 +152,10 @@ pub fn open_pane(url: &str) -> Result<()> {
 
 // --- Guided setup: prompting requests --------------------------------------------------
 //
-// Everything above this point only *reads* TCC state (`screen_recording_granted`,
-// `accessibility_granted`, `preflight`) — safe to call from `doctor` on every run. The two
-// functions below are the opposite: they actively trigger the OS consent flow (a system
-// dialog, on first request). They exist only for the future interactive `setup` command
-// and must never be called from `preflight`/`doctor`, which must stay non-prompting.
+// Everything above this point only *reads* TCC state — safe to call from `doctor` on every
+// run. The two functions below actively trigger the OS consent flow (a system dialog, on
+// first request), and must never be called from `preflight`/`doctor`, which stay
+// non-prompting.
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -251,11 +250,8 @@ mod tests {
         assert!(accessibility_pane_url().contains("Privacy_Accessibility"));
     }
 
-    // `request_screen_recording`/`request_accessibility` are deliberately not exercised
-    // here: unlike every predicate above, they have a real side effect (they can pop the
-    // OS consent dialog), which is unsafe to trigger unattended in CI — a headless runner
-    // has no user to click through it, and a real one shouldn't have its TCC state
-    // mutated by every test run. Their FFI plumbing is verified by hand against the
-    // granted dev Mac; `open_pane` is likewise
-    // side-effecting (launches System Settings) and not called here for the same reason.
+    // `request_screen_recording`/`request_accessibility` are deliberately not exercised here:
+    // they can pop the OS consent dialog, which a headless runner has no user to click through
+    // and a real one shouldn't have its TCC state mutated by every test run. `open_pane`
+    // launches System Settings and is skipped for the same reason.
 }

@@ -25,22 +25,14 @@ use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFStr
 const SCREEN_IS_LOCKED_KEY: &str = "CGSSessionScreenIsLocked";
 
 // `CGSessionCopyCurrentDictionary` is a long-standing (if formally undocumented)
-// CoreGraphics entry point — the standard way idle-time/lock-state tools read the
-// window server's session dictionary. `objc2-core-graphics` doesn't bind it, so it's
-// declared manually here, the same way `permissions.rs` declares
-// `CGPreflightScreenCaptureAccess`/`AXIsProcessTrusted`.
+// CoreGraphics entry point — the standard way idle-time/lock-state tools read the window
+// server's session dictionary. `objc2-core-graphics` doesn't bind it, so it's declared here.
 //
-// The return type is written as the parameterized `*mut CFDictionary<CFString,
-// CFType>` rather than an untyped `*mut c_void` (this is the first FFI declaration in
-// the crate to do so). That's sound: `CFDictionary<K, V>` is a zero-cost phantom
-// wrapper around the same `CFDictionaryRef` C ABI regardless of `K`/`V` — the type
-// parameters only narrow what `objc2-core-foundation`'s safe accessors (`get`,
-// `from_slices`, ...) let Rust assume about the *values*, they don't change the
-// pointer's layout or the call's ABI. `CFType` is `objc2-core-foundation`'s top type
-// (every CF object downcasts to it), so `CFType` values are always a safe upper bound
-// for "whatever this dictionary actually holds" — declaring the precise
-// `CFDictionary<CFString, CFType>` here (instead of a bare pointer + a manual cast at
-// every call site) pushes the unsafety to one declaration instead of many.
+// The return type is the parameterized `*mut CFDictionary<CFString, CFType>` rather than an
+// untyped `*mut c_void`: `CFDictionary<K, V>` is a zero-cost phantom wrapper over the same
+// `CFDictionaryRef` ABI, and `CFType` is the top type every CF object downcasts to — so
+// declaring it precisely here pushes the unsafety into one declaration instead of a manual
+// cast at every call site.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *mut CFDictionary<CFString, CFType>;

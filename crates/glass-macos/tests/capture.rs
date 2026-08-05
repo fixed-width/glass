@@ -211,12 +211,9 @@ mod macos_main {
         let geometry = try_expect(platform.start_app(&spec), "start_app")?;
         println!("started fixture window: {geometry:?}");
 
-        // start_app only waits for the window to *exist* (SCShareableContent
-        // enumeration), not for its first paint to land — give the initial draw() a
-        // moment to complete before capturing. This fixture draws once, synchronously,
-        // immediately on launch, so a fixed sleep is sufficient here; it is NOT a
-        // wait-for-first-paint pattern to reuse for apps with slower or async first
-        // paints.
+        // start_app only waits for the window to *exist*, not for its first paint to land.
+        // This fixture draws once, synchronously, on launch, so a fixed sleep suffices — do
+        // NOT reuse it as a wait-for-first-paint pattern for apps with slower or async paints.
         std::thread::sleep(Duration::from_millis(500));
 
         let frame = try_expect(platform.capture_frame(None), "capture_frame(None)")?;
@@ -299,11 +296,9 @@ mod macos_main {
 
         let result = run_checks(&mut platform, &fixture_bin);
 
-        // Reached regardless of outcome, and BEFORE any process::exit below: stop_app is
-        // documented idempotent (a no-op if start_app never got far enough to spawn a
-        // child), so this is always safe and is what guarantees the fixture's `quadrants`
-        // process never survives a failed run. Best-effort temp dir cleanup rides along
-        // here too, on both the success and failure paths.
+        // Reached regardless of outcome and BEFORE any process::exit below: `stop_app` is
+        // documented idempotent, so this is what guarantees the fixture's `quadrants` process
+        // never survives a failed run.
         let stop_result = platform.stop_app();
         let _ = std::fs::remove_dir_all(&fixture_dir);
 
