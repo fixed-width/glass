@@ -37,6 +37,17 @@ pub enum GlassError {
     )]
     WindowNotFound,
 
+    /// A launch was accepted but produced no window glass can drive before the deadline, carrying
+    /// what the backend saw on screen instead. Distinct from [`Self::AppNotStarted`], which means
+    /// the launch itself failed: the app here may be running, with another app's window in front
+    /// of it — which a bare [`Self::Timeout`] cannot say (glass#338).
+    #[error("no window for {package} appeared within {timeout_ms} ms — {observed}")]
+    AppWindowNotVisible {
+        package: String,
+        timeout_ms: u64,
+        observed: String,
+    },
+
     #[error("capture failed: {0}")]
     CaptureFailed(String),
 

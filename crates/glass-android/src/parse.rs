@@ -31,24 +31,16 @@ pub struct ParsedWindow {
 struct WinBlock {
     id: u64,
     title: String,
-    pkg_match: bool,
+    package: Option<String>,
     on_screen: bool,
     frame: Option<WindowGeometry>,
 }
 
-fn finish_block(b: WinBlock, out: &mut Vec<ParsedWindow>) {
-    // Skip the transient starting window (title `Splash Screen <pkg>`): a real app-package
-    // window during launch, but not one the agent should drive.
-    if b.pkg_match
-        && b.on_screen
-        && !b.title.starts_with("Splash Screen")
-        && let Some(frame) = b.frame
-    {
-        out.push(ParsedWindow {
-            id: b.id,
-            title: b.title,
-            frame,
-        });
+impl WinBlock {
+    /// The transient starting window, title `Splash Screen <pkg>` — a real app-package window
+    /// during launch, but not one the agent should drive.
+    fn is_splash(&self) -> bool {
+        self.title.starts_with("Splash Screen")
     }
 }
 
@@ -69,20 +61,21 @@ fn parse_window_header(t: &str) -> Option<(u64, String)> {
     Some((id, name))
 }
 
-/// All on-screen windows owned by `package`, in dumpsys z-order (topmost first).
-pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
+/// Every `Window #N` block in a `dumpsys window windows` dump, in z-order (topmost first).
+///
+/// Package-agnostic so [`parse_app_windows`] and [`describe_missing_window`] share one parse — a
+/// description derived from a second could contradict the search.
+fn parse_blocks(dump: &str) -> Vec<WinBlock> {
     let mut out = Vec::new();
     let mut cur: Option<WinBlock> = None;
     for line in dump.lines() {
         let t = line.trim_start();
         if let Some((id, title)) = parse_window_header(t) {
-            if let Some(b) = cur.take() {
-                finish_block(b, &mut out);
-            }
+            out.extend(cur.take());
             cur = Some(WinBlock {
                 id,
                 title,
-                pkg_match: false,
+                package: None,
                 on_screen: false,
                 frame: None,
             });
@@ -93,14 +86,12 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
         // app's `package=`) don't leak into the last real window block.
         let indent = line.len() - t.len();
         if !t.is_empty() && indent < 4 {
-            if let Some(b) = cur.take() {
-                finish_block(b, &mut out);
-            }
+            out.extend(cur.take());
             continue;
         }
         if let Some(b) = cur.as_mut() {
             if let Some(rest) = line.split("package=").nth(1) {
-                b.pkg_match = rest.split_whitespace().next() == Some(package);
+                b.package = rest.split_whitespace().next().map(str::to_string);
             }
             if line.contains("isOnScreen=true") {
                 b.on_screen = true;
@@ -120,10 +111,74 @@ pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
             }
         }
     }
-    if let Some(b) = cur.take() {
-        finish_block(b, &mut out);
+    out.extend(cur.take());
+    out
+}
+
+/// All on-screen windows owned by `package`, in dumpsys z-order (topmost first).
+pub fn parse_app_windows(dump: &str, package: &str) -> Vec<ParsedWindow> {
+    let mut out = Vec::new();
+    for b in parse_blocks(dump) {
+        if b.package.as_deref() != Some(package) || !b.on_screen || b.is_splash() {
+            continue;
+        }
+        if let Some(frame) = b.frame {
+            out.push(ParsedWindow {
+                id: b.id,
+                title: b.title,
+                frame,
+            });
+        }
     }
     out
+}
+
+/// Packages owning an on-screen window other than `exclude`, deduped, in z-order.
+fn on_screen_packages(blocks: &[WinBlock], exclude: &str) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for b in blocks.iter().filter(|b| b.on_screen) {
+        if let Some(p) = b.package.as_deref()
+            && p != exclude
+            && !seen.contains(&p)
+        {
+            seen.push(p);
+        }
+    }
+    if seen.is_empty() {
+        return "nothing else is on screen".to_string();
+    }
+    format!("on screen: {}", seen.join(", "))
+}
+
+/// Why [`parse_app_windows`] found nothing for `package`, read off the dump it just searched.
+///
+/// It rejects a block for one of four reasons an agent would act on differently, and an empty
+/// result tells none of them apart: no window opened, the window is behind another app's, it is
+/// still a splash screen, or the dump carried no frame (glass#338).
+pub fn describe_missing_window(dump: &str, package: &str) -> String {
+    let blocks = parse_blocks(dump);
+    let mine: Vec<&WinBlock> = blocks
+        .iter()
+        .filter(|b| b.package.as_deref() == Some(package))
+        .collect();
+
+    if mine.is_empty() {
+        return format!(
+            "no window belongs to it yet; {}",
+            on_screen_packages(&blocks, package)
+        );
+    }
+    if !mine.iter().any(|b| b.on_screen) {
+        return format!(
+            "its window is not on screen; {}",
+            on_screen_packages(&blocks, package)
+        );
+    }
+    if !mine.iter().any(|b| b.on_screen && !b.is_splash()) {
+        return "only its splash screen is on screen".to_string();
+    }
+    // The other three reasons are eliminated, so the frame is the one left.
+    "its window is on screen but the dump carried no frame for it".to_string()
 }
 
 /// `adb install` → Ok on `Success`, else `AppNotStarted` with the failure reason.
@@ -194,6 +249,68 @@ mod tests {
         assert_eq!(parse_pid("4321\n"), Some(4321));
         assert_eq!(parse_pid("\n"), None);
         assert_eq!(parse_pids("4321 4322 4400\n"), vec![4321, 4322, 4400]);
+    }
+
+    /// The state behind glass#338: the app is up, with a window of a *different* package in
+    /// front of it.
+    #[test]
+    fn a_window_hidden_behind_another_package_is_reported_as_hidden_and_names_it() {
+        let dump = concat!(
+            "  Window #0 Window{aaa111 u0 com.google.android.settings.intelligence/.SearchActivity}:\n",
+            "    package=com.google.android.settings.intelligence appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+            "  Window #1 Window{bbb222 u0 com.android.settings/.Settings}:\n",
+            "    package=com.android.settings appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=false\n",
+        );
+        assert!(parse_app_windows(dump, "com.android.settings").is_empty());
+
+        let why = describe_missing_window(dump, "com.android.settings");
+        assert!(why.contains("not on screen"), "{why}");
+        assert!(
+            why.contains("com.google.android.settings.intelligence"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_app_with_no_window_at_all_is_told_apart_from_one_that_is_covered() {
+        let dump = concat!(
+            "  Window #0 Window{aaa111 u0 NexusLauncherActivity}:\n",
+            "    package=com.google.android.apps.nexuslauncher appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+        );
+        let why = describe_missing_window(dump, "com.android.settings");
+        assert!(why.contains("no window"), "{why}");
+        assert!(
+            why.contains("com.google.android.apps.nexuslauncher"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_app_still_on_its_splash_screen_says_so_rather_than_reporting_no_window() {
+        let dump = concat!(
+            "  Window #0 Window{ccc333 u0 Splash Screen com.example.app}:\n",
+            "    package=com.example.app appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+        );
+        assert!(parse_app_windows(dump, "com.example.app").is_empty());
+        let why = describe_missing_window(dump, "com.example.app");
+        assert!(why.contains("splash"), "{why}");
+    }
+
+    /// The fourth rejection reason, so no device state maps to a message naming the wrong one.
+    #[test]
+    fn an_on_screen_window_whose_frame_did_not_parse_says_that() {
+        let dump = concat!(
+            "  Window #0 Window{ddd444 u0 com.example.app/.MainActivity}:\n",
+            "    package=com.example.app appop=NONE\n",
+            "    isOnScreen=true\n",
+        );
+        assert!(parse_app_windows(dump, "com.example.app").is_empty());
+        let why = describe_missing_window(dump, "com.example.app");
+        assert!(why.contains("frame"), "{why}");
     }
 
     const WINDOWS: &str = concat!(

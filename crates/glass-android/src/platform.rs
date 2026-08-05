@@ -15,7 +15,10 @@ use crate::build::run_build;
 use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
 use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::logs::{LogSink, LogcatStream};
-use crate::parse::{check_am_start, check_install, parse_app_windows, parse_pid, parse_pids};
+use crate::parse::{
+    check_am_start, check_install, describe_missing_window, parse_app_windows, parse_pid,
+    parse_pids,
+};
 use crate::screencap::decode_screencap;
 use crate::target::AdbTarget;
 
@@ -157,10 +160,20 @@ impl AndroidPlatform {
                 return Ok((WindowId(w.id), w.frame));
             }
             if Instant::now() >= deadline {
-                return Err(GlassError::Timeout(timeout_ms));
+                return Err(window_never_appeared(&dump, package, timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(150));
         }
+    }
+}
+
+/// What a discovery reports when its budget ran out, diagnosed from the last dump it read — not a
+/// fresh one, which would describe a different moment.
+fn window_never_appeared(dump: &str, package: &str, timeout_ms: u64) -> GlassError {
+    GlassError::AppWindowNotVisible {
+        package: package.to_string(),
+        timeout_ms,
+        observed: describe_missing_window(dump, package),
     }
 }
 
@@ -367,6 +380,27 @@ impl Platform for AndroidPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glass#338's failure, now readable in the error rather than only in a whole-run device log.
+    #[test]
+    fn a_discovery_that_ran_out_of_time_says_what_was_on_screen_instead() {
+        let dump = concat!(
+            "  Window #0 Window{aaa111 u0 com.google.android.settings.intelligence/.SearchActivity}:\n",
+            "    package=com.google.android.settings.intelligence appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=true\n",
+            "  Window #1 Window{bbb222 u0 com.android.settings/.Settings}:\n",
+            "    package=com.android.settings appop=NONE\n",
+            "    mFrame=[0,0][1080,2400] isOnScreen=false\n",
+        );
+        let msg = window_never_appeared(dump, "com.android.settings", 15_000).to_string();
+        assert!(msg.contains("com.android.settings"), "{msg}");
+        assert!(msg.contains("15000 ms"), "{msg}");
+        assert!(msg.contains("not on screen"), "{msg}");
+        assert!(
+            msg.contains("com.google.android.settings.intelligence"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn visible_window_region_full_onscreen_is_identity() {
