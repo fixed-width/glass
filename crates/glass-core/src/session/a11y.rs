@@ -677,9 +677,7 @@ fn first_label(node: &AxNode) -> Option<String> {
 /// contains the point; the smallest-area match wins when several do (an outer window
 /// fully behind/around a smaller popover shouldn't shadow it). If several windows tie
 /// on area, the first one in `windows`' order wins (`min_by_key` keeps the first
-/// minimum) — i.e. whatever order the platform's `list_windows` enumerated them in;
-/// this doesn't matter in practice since same-area overlapping windows aren't a shape
-/// any backend produces.
+/// minimum) — whatever order the platform's `list_windows` enumerated them in.
 ///
 /// Known best-effort limitation: this detection is purely geometric — it has no way to
 /// tell "the app's own popover" apart from an unrelated second top-level window of the
@@ -740,8 +738,7 @@ fn ancestor_path(root: &AxNode, target: AxNodeId) -> Option<Vec<&AxNode>> {
 /// tracks the popover's size most tightly, while wrappers trimmed by padding/scrollbars
 /// drift further from it. Ties (equal score) break toward the shallower ancestor — the
 /// one closer to `root` — since `ancestor_path` walks root-to-target and `min_by_key`
-/// keeps the first minimum; in practice two ancestors matching to the exact same pixel
-/// is vanishingly rare (padding/scrollbar trims almost always differ by at least 1px).
+/// keeps the first minimum.
 fn menu_container_bounds(
     root: &AxNode,
     target: AxNodeId,

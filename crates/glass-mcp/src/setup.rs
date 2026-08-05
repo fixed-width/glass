@@ -9,17 +9,15 @@
 //! This module is split so the parts that don't need macOS are unit-testable on Linux:
 //! [`RunMode`], [`registration_line`], [`fill_launch_agent`], [`run_mode_from_flags`],
 //! [`is_inside_app_bundle`], [`codesign_report_is_unstable`], [`parse_health_response`], and
-//! [`fetch_health`] are pure/cross-platform — a raw TCP `GET /healthz` and a JSON parse, no
-//! macOS-specific call — and are exercised (or, for `fetch_health`, reachable) on every
-//! target: `glass-mcp status` (`status.rs`) polls a running server's health on any OS, not
-//! just macOS. The interactive grant flow itself (`#[cfg(target_os = "macos")]` inside
-//! [`run`], plumbed through the private `macos_impl` submodule) is macOS-only: permission
-//! prompts, `codesign`/`launchctl` shell-outs, real file writes. `fetch_health` stays its own
-//! top-level `pub(crate) fn` rather than moving into `macos_impl` (itself macOS-only) since
-//! it has callers both outside that module and outside macOS entirely (see its doc comment).
-//! The onboarding module also needs to install the LaunchAgent, so a thin top-level
-//! `install_launch_agent` forwards to `macos_impl::install_launch_agent` for the same reason:
-//! a private `mod` can't be named from a sibling module regardless of its items' visibility.
+//! [`fetch_health`] are pure/cross-platform. The interactive grant flow itself
+//! (`#[cfg(target_os = "macos")]` inside [`run`], plumbed through the private `macos_impl`
+//! submodule) is macOS-only: permission prompts, `codesign`/`launchctl` shell-outs, real file
+//! writes.
+//!
+//! The thin top-level forwarders to `macos_impl` ([`fetch_health`], `install_launch_agent`,
+//! `restart_launch_agent`, `uninstall_launch_agent`) exist because a private `mod` can't be
+//! named from a sibling module regardless of its items' visibility, and those items have
+//! callers in `onboarding`/`menubar`/`status`.
 
 // `GlassError` itself is only named in the `#[cfg(not(target_os = "macos"))]` arm of `run`
 // (and its test) — on a macOS build that arm doesn't exist, so import only `Result` here
@@ -126,10 +124,8 @@ pub fn surviving_placeholders(filled: &str, fields: LaunchAgentFields<'_>) -> Ve
 
 /// Decide the run mode from the `--launchagent`/`--no-launchagent` flags alone, without
 /// prompting. `None` means neither flag forced a choice — the caller must ask interactively,
-/// or fall back to a non-prompting default (`--non-interactive`). Pure — no OS call, no IO —
-/// same Linux-testable shape as [`registration_line`]/[`fill_launch_agent`] above; the actual
-/// prompt (when both flags are absent and the run is interactive) lives in the macOS-only
-/// body of [`run`], since reading stdin isn't something to unit-test here.
+/// or fall back to a non-prompting default (`--non-interactive`). Pure; the actual prompt (when
+/// both flags are absent and the run is interactive) lives in the macOS-only body of [`run`].
 ///
 /// Precedence: `--launchagent` wins over `--no-launchagent`. Clap's `conflicts_with` makes the
 /// `(true, true)` combination unreachable from the CLI, so the `debug_assert!` documents that
@@ -152,9 +148,8 @@ pub fn run_mode_from_flags(launchagent: bool, no_launchagent: bool) -> Option<Ru
 /// `packaging/macos/build-app.sh` produces. A TCC grant is recorded against the *process's*
 /// Designated Requirement (bundle id + signing certificate); running a bare binary outside a
 /// bundle means a grant given today has nothing stable to attach to. Advisory only — [`run`]
-/// warns, never refuses, since `setup` should still be usable from `cargo run` while
-/// iterating. Pure (no filesystem access — just path-shape matching), so it's unit-tested on
-/// Linux against fabricated paths.
+/// warns, never refuses, so `setup` stays usable from `cargo run`. Pure path-shape matching,
+/// no filesystem access.
 pub fn is_inside_app_bundle(exe: &Path) -> bool {
     let macos_dir = exe.parent();
     let contents_dir = macos_dir.and_then(Path::parent);
@@ -397,13 +392,6 @@ pub fn run(args: SetupArgs) -> Result<()> {
 /// — never a fabricated [`HealthStatus`]. Pure `std::net::TcpStream` networking, so — unlike
 /// the rest of this module — it isn't macOS-specific: cross-platform so `status::run`
 /// (`status.rs`) can poll a running server's health on any OS.
-///
-/// `pub(crate)`, and kept at the top level rather than nested in the private, macOS-only
-/// `macos_impl` module, because it has callers outside that module and outside macOS
-/// entirely — `run`'s guided-enable poll (via `macos_impl::guide_enable_and_verify` right
-/// here in `setup.rs`, macOS-only), the onboarding module's already-running health short-circuit
-/// (macOS-only), and `status::run` (every platform) — and a private `mod` can't be named from a sibling module
-/// regardless of its items' visibility. Crate-internal, so `pub(crate)`, not `pub`.
 pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
@@ -428,12 +416,7 @@ pub(crate) fn fetch_health(addr: &str) -> Option<HealthStatus> {
 }
 
 /// Install (or reload) the LaunchAgent — a thin `pub(crate)` forwarder to
-/// [`macos_impl::install_launch_agent`]. Kept at the top level rather than called via its
-/// `macos_impl::` path, for the same reason [`fetch_health`] is: `macos_impl` is a private
-/// module, so a sibling `onboarding` module can't name `crate::setup::macos_impl::...` at
-/// all — module privacy is checked per path segment — regardless of the item's own
-/// visibility. Only a `pub(crate)` item defined directly in `setup` (this module) is
-/// reachable from a sibling module.
+/// [`macos_impl::install_launch_agent`] for `onboarding` (see this module's doc).
 #[cfg(target_os = "macos")]
 pub(crate) fn install_launch_agent(
     app_bin: &str,
@@ -443,25 +426,20 @@ pub(crate) fn install_launch_agent(
 }
 
 /// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
-/// [`macos_impl::restart_launch_agent`], for the same reason [`install_launch_agent`] above
-/// has one (a sibling module can't name the private `macos_impl` module at all). A fresh
-/// process re-reads TCC (the Screen Recording grant is cached per-process at launch), so the
-/// menu-bar app's "Restart" item (`crate::menubar`) restarts after a grant changes — independent
-/// of `KeepAlive`, which is `false` precisely so the LaunchAgent itself never does this uninvited.
+/// [`macos_impl::restart_launch_agent`] (see this module's doc). A fresh process re-reads TCC
+/// (the Screen Recording grant is cached per-process at launch), so the menu-bar app's
+/// "Restart" item (`crate::menubar`) restarts after a grant changes — independent of
+/// `KeepAlive`, which is `false` precisely so the LaunchAgent never does this uninvited.
 ///
-/// Gated to `network` + macOS to match that sole caller (`crate::menubar` is itself
-/// `#[cfg(feature = "network")]`): the onboarder re-reads TCC by relaunching a fresh *process*
-/// (`open -n`, see `crate::onboarding`), not by restarting the agent, so without the `network`
-/// feature a plain macOS build would have no caller and flag this dead.
+/// Gated to `network` + macOS to match its sole caller: the onboarder re-reads TCC by
+/// relaunching a fresh *process* (`open -n`), not by restarting the agent.
 #[cfg(all(target_os = "macos", feature = "network"))]
 pub(crate) fn restart_launch_agent() -> Result<()> {
     macos_impl::restart_launch_agent()
 }
 
 /// Remove the login LaunchAgent so glass stops auto-starting — a thin `pub(crate)` forwarder to
-/// [`macos_impl::uninstall_launch_agent`], for the same reason [`install_launch_agent`] above has
-/// one (a sibling module can't name the private `macos_impl` module at all regardless of an
-/// item's own visibility).
+/// [`macos_impl::uninstall_launch_agent`] (see this module's doc).
 #[cfg(target_os = "macos")]
 pub(crate) fn uninstall_launch_agent() -> Result<()> {
     macos_impl::uninstall_launch_agent()
@@ -799,10 +777,6 @@ mod macos_impl {
     ///
     /// Errors surface (`kickstart` failing to spawn, or exiting non-zero) rather than being
     /// silently swallowed.
-    ///
-    /// Reached through [`super::restart_launch_agent`] from the menu-bar app's "Restart" item;
-    /// gated to the `network` feature to match it (see the forwarder's note), so it isn't dead
-    /// code in a plain macOS build where the menu bar isn't compiled.
     #[cfg(feature = "network")]
     pub(super) fn restart_launch_agent() -> Result<()> {
         let target = super::launch_agent_target(self_uid());

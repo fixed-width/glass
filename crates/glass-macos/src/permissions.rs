@@ -12,10 +12,8 @@ use objc2_core_foundation::{
 
 use glass_core::Result;
 
-/// The two macOS TCC grants glass needs. A local enum keeps the permission names in
-/// one place (no stringly-typed drift) and lets the preflight test assert the specific
-/// missing grant. Converted to a `String` only at the `GlassError` boundary — the shared
-/// `glass-core` error stays platform-agnostic.
+/// The two macOS TCC grants glass needs. Converted to a `String` only at the `GlassError`
+/// boundary, so the shared `glass-core` error stays platform-agnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Permission {
     ScreenRecording,
@@ -46,12 +44,10 @@ impl Permission {
         }
     }
 
-    /// Like [`Permission::denied`], but appends a caller-supplied diagnostic (e.g. the
-    /// raw `NSError` ScreenCaptureKit reported for a TCC decline) to the remedy text, so
-    /// the agent sees both the actionable fix and the underlying OS-reported reason.
-    /// `pub(crate)` (unlike `denied`) so other modules — e.g. `scwindow`'s
-    /// `SCShareableContent` preflight — can reuse this wording instead of hand-rolling
-    /// their own remedy string.
+    /// Like [`Permission::denied`], but appends a caller-supplied diagnostic (e.g. the raw
+    /// `NSError` ScreenCaptureKit reported for a TCC decline) to the remedy text, so the agent
+    /// sees both the actionable fix and the underlying OS-reported reason. `pub(crate)` so
+    /// other modules can reuse this wording rather than hand-rolling a remedy string.
     pub(crate) fn denied_with_detail(
         self,
         detail: impl std::fmt::Display,

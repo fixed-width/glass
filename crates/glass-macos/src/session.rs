@@ -9,16 +9,11 @@
 //! There's a second, distinct failure mode: `CGSessionCopyCurrentDictionary` returns
 //! NULL when there's no active graphical (Aqua) login session on the *console* at
 //! all — before anyone has logged in, after everyone has logged out, or on a headless
-//! boot with auto-login off. Note this is a console-wide fact, not one scoped to the
-//! calling process: it isn't "returns NULL whenever you're on a bare SSH shell" — a
-//! bare-SSH `doctor` run on a box where an account IS logged in at the console still
-//! sees that account's real (locked/unlocked) session dict, same as a GUI-launched
-//! process would (verified by hand: `doctor` run over plain SSH against the dev Mac
-//! host, logged-in-but-unattended, reported the true unlocked state, not NoSession).
-//! What NULL actually signals is "capture/input have nothing to attach to *regardless
-//! of who calls this*" — which is not "a present, unlocked session" and so
-//! [`SessionState`] keeps it as its own variant rather than folding it into
-//! `Unlocked` the way an early version of this predicate did.
+//! boot with auto-login off. This is a console-wide fact, not one scoped to the calling
+//! process: a bare-SSH run on a box where an account IS logged in at the console still
+//! sees that account's real locked/unlocked session dict (verified by hand). NULL means
+//! "capture/input have nothing to attach to regardless of who calls this", which is not
+//! "a present, unlocked session" — so [`SessionState`] keeps it as its own variant.
 
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 
@@ -38,13 +33,10 @@ unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *mut CFDictionary<CFString, CFType>;
 }
 
-/// The three states the console session can be in. Collapsing all of these to a
-/// single `bool` (as an earlier version of this predicate did) hides
-/// [`SessionState::NoSession`] behind "unlocked", which would let a box with nobody
-/// logged in at the console sail through `doctor` with a clean bill of health while
-/// capture/input silently fail. Keeping the three states distinct lets callers —
-/// [`session_state`]'s only consumer today is `glass-mcp`'s doctor — report each
-/// honestly.
+/// The three states the console session can be in. Do not collapse them to a single `bool`:
+/// that hides [`SessionState::NoSession`] behind "unlocked", letting a box with nobody logged
+/// in at the console sail through `doctor` with a clean bill of health while capture/input
+/// silently fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionState {
     /// A console session is logged in and its display is unlocked/awake.
@@ -88,17 +80,13 @@ fn copy_session_dictionary() -> Option<CFRetained<CFDictionary<CFString, CFType>
     Some(unsafe { CFRetained::from_raw(nn) })
 }
 
-/// Pure: map a session dictionary (or its absence) to a [`SessionState`]. Fully safe
-/// (no OS calls), so it's unit-tested directly against synthetic dictionaries and a
-/// missing one. A `None` dictionary is [`SessionState::NoSession`] (see the module
-/// docs) — everything else means *some* window-server session is attached, so it's
-/// `Locked`/`Unlocked` depending on the key. Apple's documented type for the key is
-/// `CFBoolean`; a `CFNumber` fallback costs nothing and keeps this robust if that ever
-/// changes. A value of neither type is indeterminate — fail safe as `Locked` rather than
-/// silently reporting `Unlocked`, since `doctor` treats `Unlocked` as "capture/input
-/// should work" and a false-negative there just means a redundant "recover with
-/// `caffeinate -d`" hint, while a false-positive `Unlocked` would hide a real capture/
-/// input failure behind a clean bill of health.
+/// Pure: map a session dictionary (or its absence) to a [`SessionState`]. A `None` dictionary
+/// is [`SessionState::NoSession`] (see the module docs); everything else means *some*
+/// window-server session is attached, so it's `Locked`/`Unlocked` depending on the key. Apple's
+/// documented type for the key is `CFBoolean`, with a `CFNumber` fallback in case that changes.
+/// A value of neither type is indeterminate and fails safe as `Locked`: a false `Locked` costs
+/// a redundant "recover with `caffeinate -d`" hint, while a false `Unlocked` would hide a real
+/// capture/input failure behind a clean bill of health.
 fn dict_reports_state(dict: Option<&CFDictionary<CFString, CFType>>) -> SessionState {
     let Some(dict) = dict else {
         return SessionState::NoSession;

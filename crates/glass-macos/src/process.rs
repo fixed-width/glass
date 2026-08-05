@@ -9,8 +9,7 @@
 //! reimplemented here (rather than depending on that crate) because it is `/proc`-based
 //! and therefore Linux-only.
 //!
-//! Window discovery is a separate concern ([`crate::scwindow::find_window_for_pids`]);
-//! this module only owns the process lifecycle.
+//! Window discovery is a separate concern ([`crate::scwindow::find_window_for_pids`]).
 //!
 //! Clip-shim injection: a contained launch whose target is not hardened-runtime signed
 //! ([`target_is_injectable`]) gets `glass-clip-shim-macos`'s built dylib
@@ -20,9 +19,8 @@
 //! `cmd.spawn()` in [`spawn`]. `Command`'s envp is applied at the `exec` that follows
 //! `pre_exec`'s `sandbox_init` call (not at fork/`pre_exec` time), so both vars are present
 //! in the launched app's environment, having survived the sandbox. [`ClipLaunch`] carries
-//! those facts back to `start_app`, which holds them until the launched window is
-//! confirmed and the clipboard route can be decided (a later step; not this module's
-//! concern).
+//! those facts back to `start_app`, which holds them until the launched window is confirmed
+//! and the clipboard route can be decided.
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader};
@@ -43,15 +41,14 @@ use glass_sandbox_macos::{ProfileOpts, build_profile, launch_reallows};
 /// [`crate::clipboard_route::session_pasteboard_name`] (combined there with this process's pid
 /// and a wall-clock nonce). It only disambiguates multiple launches WITHIN a single `glass-mcp`
 /// run; the pid+nonce components are what prevent name reuse ACROSS runs (a bare counter resets
-/// to its start value on every restart). The exact starting value has no significance.
+/// to its start value on every restart).
 static CLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Clip-shim facts for one contained, injectable launch: the private pasteboard name the
 /// shim redirects `NSPasteboard.generalPasteboard` to. Produced only when [`spawn`] actually
-/// set up injection (its second return value is `Some`), so injectability is encoded by the
-/// `Option` itself — there is no separate flag. `start_app` holds this until the launched
-/// window is confirmed, then combines `name` with a live shim-confirmation check to decide the
-/// session's `ClipboardRoute` (`crate::clipboard_route::decide_route`).
+/// set up injection, so injectability is encoded by the `Option` itself. `start_app` holds this
+/// until the launched window is confirmed, then combines `name` with a live shim-confirmation
+/// check to decide the session's `ClipboardRoute` (`crate::clipboard_route::decide_route`).
 #[derive(Debug)]
 pub(crate) struct ClipLaunch {
     pub name: String,
@@ -59,9 +56,8 @@ pub(crate) struct ClipLaunch {
 
 /// Whether `stderr` — a `codesign --display --verbose=2` report, with `status_success`
 /// codesign's exit status — shows a RECOGNIZED non-hardened signature, i.e.
-/// `DYLD_INSERT_LIBRARIES` injection can take on this target. Factored out of
-/// [`target_is_injectable`] as a pure function so the decision is unit-testable without
-/// shelling out to `codesign`.
+/// `DYLD_INSERT_LIBRARIES` injection can take on this target. Pure, so the decision is
+/// unit-testable without shelling out to `codesign`.
 ///
 /// Fail-closed: `true` only on a recognized non-hardened signal, `false` otherwise (including
 /// any unrecognized/garbled output). Injectable iff either:
@@ -87,12 +83,11 @@ fn injectable_from_codesign_report(stderr: &str, status_success: bool) -> bool {
 }
 
 /// True iff `program` is not hardened-runtime signed, so injecting the clip shim via
-/// `DYLD_INSERT_LIBRARIES` can take. Shells out to `codesign --display --verbose=2`
-/// (codesign writes its report to stderr, not stdout) rather than linking a
-/// Security-framework binding — simplest option, no new framework dependency.
+/// `DYLD_INSERT_LIBRARIES` can take. Shells out to `codesign --display --verbose=2`, which
+/// writes its report to stderr, not stdout.
 ///
-/// Conservative and fail-closed: any uncertainty (`codesign` missing or unspawnable, its
-/// output not valid UTF-8, or an unrecognized report) reports `false` (non-injectable). See
+/// Fail-closed: any uncertainty (`codesign` missing or unspawnable, its output not valid UTF-8,
+/// or an unrecognized report) reports `false` (non-injectable). See
 /// [`injectable_from_codesign_report`] for the exact recognized-signal logic.
 fn target_is_injectable(program: &Path) -> bool {
     let Ok(output) = Command::new("codesign")
@@ -136,9 +131,8 @@ pub(crate) fn is_apple_platform_code(bundle: &Path) -> bool {
 const SHIM_DYLIB_ENV: &str = "GLASS_CLIP_SHIM_DYLIB";
 
 /// [`crate::shim_path::resolve_shim`] against the real environment: the running executable's
-/// directory and [`SHIM_DYLIB_ENV`]. The tier logic itself is pure and lives in
-/// [`crate::shim_path`] (unit-tested on any host); this wrapper only supplies the
-/// two OS-touching inputs it needs.
+/// directory and [`SHIM_DYLIB_ENV`]. This wrapper supplies only those two OS-touching inputs;
+/// the tier logic itself is pure and lives in [`crate::shim_path`].
 fn shim_dylib_path() -> Option<PathBuf> {
     shim_dylib_path_with(std::env::var(SHIM_DYLIB_ENV).ok().map(PathBuf::from))
 }
@@ -383,8 +377,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(reader: R, stream: Stream, si
 /// AppKit installs no `SIGTERM` handler, so the default disposition ends the process with
 /// `applicationWillTerminate:` never called and nothing flushed — measured, not assumed (see
 /// [`crate::ffi::terminate_app`]). An app that ignores or vetoes the request still gets the
-/// full signal ladder afterwards, so teardown always completes; this only adds the chance to
-/// leave cleanly, it does not make the process harder to stop.
+/// full signal ladder afterwards.
 ///
 /// This is the child-backed path. A LaunchServices-adopted app (`backend.rs`'s `Adopted`) that
 /// glass started is asked the same way but never escalated — glass will not force-kill an app it
@@ -586,13 +579,11 @@ mod tests {
         );
     }
 
-    /// Regression test for the fix this branch ships: `launch_reallows` re-allows the launch
-    /// target's OWN directory independent of `cwd` — previously only `cwd` was reallowed under the
-    /// `/Users` read-deny, so a launch target (the program itself) living under `$HOME` but
-    /// launched with a `cwd` OUTSIDE `$HOME` would fail to start (it could not even be read to be
-    /// exec'd). This is the macOS analog of the Linux
-    /// `sandbox_default_reaches_launch_target_via_argument_path` integration test; it runs on real
-    /// macOS hardware (CI macOS runner + on-device) only.
+    /// `launch_reallows` re-allows the launch target's OWN directory independent of `cwd`. With
+    /// only `cwd` reallowed under the `/Users` read-deny, a launch target living under `$HOME`
+    /// but launched with a `cwd` OUTSIDE `$HOME` could not even be read to be exec'd. The macOS
+    /// analog of the Linux `sandbox_default_reaches_launch_target_via_argument_path` integration
+    /// test; runs on real macOS hardware only.
     #[test]
     #[cfg(target_os = "macos")]
     fn default_sandbox_reaches_launch_target_under_home_when_cwd_is_elsewhere() {

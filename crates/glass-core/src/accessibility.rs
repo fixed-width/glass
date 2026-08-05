@@ -363,9 +363,9 @@ impl WalkLimits {
     /// controls the node count ONLY — `depth` and `siblings` always keep their defaults. Those
     /// two are structural safety rails, not a size budget: the recursive native-tree walkers
     /// (AT-SPI / AX / UIA) have no cycle detection, so an unbounded depth on a cyclic or
-    /// pathological tree would recurse to a stack overflow (which aborts the process). The
-    /// generous defaults (`MAX_DEPTH`/`MAX_SIBLINGS`) never bite a real UI, so keeping them costs
-    /// the caller nothing while preserving that backstop even under `max_nodes: 0`.
+    /// pathological tree would recurse to a stack overflow, which aborts the process.
+    /// `MAX_DEPTH`/`MAX_SIBLINGS` never bite a real UI, so the backstop holds even at
+    /// `max_nodes: 0`.
     pub fn from_max_nodes(max_nodes: Option<usize>) -> WalkLimits {
         match max_nodes {
             None => WalkLimits::DEFAULT,
@@ -813,10 +813,9 @@ pub trait Accessibility {
 
     /// Subscribe to change notifications for the app described by `ctx`.
     ///
-    /// `None` — the default — means this reader has no event stream, and its callers keep polling
-    /// exactly as they did before. Two readers cannot have one as built: Android's `uiautomator`
-    /// reader is a dump per call and iOS's is an `idb describe` per call. Android's *other* reader,
-    /// the on-device accessibility service, is driven by events and is the natural next one.
+    /// `None` — the default — means this reader has no event stream and its callers keep polling.
+    /// Two readers cannot have one as built: Android's `uiautomator` reader is a dump per call,
+    /// and iOS's is an `idb describe` per call.
     ///
     /// Subscribe before the first read, not after: a change that lands after a read but before the
     /// subscription is announced to nobody, and the caller then waits out its *entire* budget on a

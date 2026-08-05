@@ -1,4 +1,4 @@
-//! Input injection via `SendInput` (Task 7a).
+//! Input injection via `SendInput`.
 //!
 //! The pointer + Unicode-text paths are a port of the validated probe
 //! `tools/windows-validation/src/input.rs`; the chord (X keysym -> VK) mapping is

@@ -1070,17 +1070,12 @@ fn onbox_contained_launch_adopts_app_not_console() {
     p.stop_app().expect("stop_app");
 }
 
-/// Where the role-histogram probe writes its report: `.windows-artifacts` under the repo
-/// root. Mirrors `examples/onbox.rs`'s `out_dir()`/`save()` convention (a resolved-at-runtime
-/// directory + a small write-and-report helper) — but targets `.windows-artifacts` directly
-/// rather than `%USERPROFILE%`. That example's `%USERPROFILE%` files get swept into
-/// `.windows-artifacts` by a step in `tools/windows-validation/run-onbox.ps1` that runs only
-/// for the plain `onbox` example; an `--ignored` test run (this probe's path, via
-/// `scripts/test-windows.sh --tests`) has no such sweep. `.windows-artifacts` itself, though,
-/// is scp'd back to the caller by `scripts/test-windows.sh` after every run regardless — and
-/// it must be, since this probe's stdout is captured by the schtasks bounce into the
-/// interactive session and never reaches the caller at all. So this file is the only way the
-/// histogram gets out.
+/// Where the role-histogram probe writes its report: `.windows-artifacts` under the repo root.
+/// Targets that directly rather than `%USERPROFILE%`, which `run-onbox.ps1` sweeps into
+/// `.windows-artifacts` only for the plain `onbox` example — an `--ignored` test run (this
+/// probe's path) gets no such sweep. `scripts/test-windows.sh` scp's `.windows-artifacts` back
+/// after every run, and it must: this probe's stdout is captured by the schtasks bounce into
+/// the interactive session and never reaches the caller, so the file is the only way out.
 fn artifacts_dir() -> std::path::PathBuf {
     repo_root().join(".windows-artifacts")
 }
@@ -1153,7 +1148,7 @@ const COST_REPEATS: usize = 10;
 /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot that
 /// fails here must not strand the window the caller is about to close, cost the later probes their
 /// evidence, or skip the artifacts write. Twin of `print_snapshot_cost` in
-/// `glass-macos/tests/role_probe.rs` — keep the two in step.
+/// `glass-macos/tests/role_probe.rs`.
 fn render_snapshot_cost(a11y: &mut WindowsA11y, ctx: &AxContext) -> String {
     let mut samples = Vec::with_capacity(COST_REPEATS);
     for repeat in 0..COST_REPEATS {
@@ -1365,11 +1360,8 @@ fn probe_role_histogram(label: &str, spec: &AppSpec, report: &mut String) -> Pro
 /// map to is never asserted here; that is the human's reading.
 ///
 /// The histogram is both printed to stdout AND written to `role-histogram-windows.txt` under
-/// [`artifacts_dir`] (see that function's doc for why the file is required, not just a nicety
-/// on top of stdout): run through `scripts/test-windows.sh`, this test's stdout is captured by
-/// the schtasks bounce into the interactive session and never reaches the caller, so the file
-/// is the only way the evidence gets out of that path. Printing it too costs nothing and helps
-/// anyone running the test directly on a box with a desktop session.
+/// [`artifacts_dir`] — see that function's doc for why the file, not stdout, is the only way
+/// the evidence gets out of a `scripts/test-windows.sh` run.
 ///
 /// Runs charmap, Notepad, Task Manager, and File Explorer. charmap/Notepad alone gave clean
 /// output but no tabular UI, so `DataItem` (UIA id 50029), `Header` (50034), and

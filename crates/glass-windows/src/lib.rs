@@ -128,7 +128,7 @@ mod backend {
         /// The active window, stored as a raw `HWND` (`isize`) so the backend stays
         /// `Send` (a raw `*mut c_void` is not). Reconstruct with
         /// [`crate::util::raw_to_hwnd`] at the point of use. `None` until window
-        /// discovery (here) or select (Task 6) sets it.
+        /// discovery or `select_window` sets it.
         active_hwnd: Option<isize>,
     }
 

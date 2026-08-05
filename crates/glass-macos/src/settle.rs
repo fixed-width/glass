@@ -5,8 +5,7 @@
 //! [`SettleTracker`] decides when a run of readings has stopped changing; [`settle_by_polling`]
 //! owns the poll loop itself (sleeping between reads) so a caller only has to supply how to take
 //! one reading. Kept generic and out of the `#[cfg(target_os = "macos")]` modules so the rule is
-//! unit-tested on any host, and so `glass-core` could adopt it if the other backends turn out to
-//! race the same way.
+//! unit-tested on any host.
 #![forbid(unsafe_code)]
 
 use std::time::{Duration, Instant};
@@ -23,11 +22,10 @@ pub(crate) enum SettleStep<T> {
 
 /// Feeds readings in, one at a time, and reports the first time two consecutive readings agree.
 ///
-/// Two samples rather than three or a fixed duration: a value that was already stable when first
-/// read needs only one more reading to confirm it — the cheapest path through this loop, though
-/// not the likely one. On the macOS backend that motivated this (#263), it was the minority
-/// outcome: 1 of 12 measured cold launches was already stable at adoption; the other 11 needed
-/// further polling before settling.
+/// Two samples rather than three or a fixed duration: a value already stable when first read
+/// needs only one more reading to confirm it. On the macOS backend that motivated this (#263)
+/// that was the minority outcome — 1 of 12 measured cold launches was already stable at
+/// adoption; the other 11 needed further polling.
 #[derive(Clone, Debug)]
 pub(crate) struct SettleTracker<T> {
     previous: Option<T>,
@@ -79,19 +77,15 @@ pub enum SettleOutcome<E> {
 /// `read` never succeeded — paired with how the poll ended.
 ///
 /// `interval` throttles `read`: a value that never settles is called roughly
-/// `budget / (interval + read's own cost)` times — `interval` alone only bounds the count when
-/// `read` is cheap relative to it, which is true of the tests below (an instant closure) but not
-/// of a real `read` that does I/O. `Duration::ZERO` busy-spins between calls rather than pacing
-/// them — fine for a test with a cheap, instant `read`, but not the shape a real caller wants.
-/// The one production caller today (macOS's `settle_window`, #263) uses 25ms, well under its
-/// own `read`'s cost (a live query), so pacing there comes mostly from the query itself.
+/// `budget / (interval + read's own cost)` times, so `interval` alone bounds the count only when
+/// `read` is cheap relative to it — true of the tests below (an instant closure), not of a real
+/// `read` that does I/O. `Duration::ZERO` busy-spins between calls rather than pacing them.
 ///
-/// `T`'s `PartialEq` decides settlement on the *whole* value — pick a `T` that carries only the
+/// `T`'s `PartialEq` decides settlement on the *whole* value — pick a `T` carrying only the
 /// fields that should hold the loop open while they change. A `T` with an extra field that never
-/// repeats (an unrounded coordinate a rounded one was derived from, say) never settles, even once
-/// the fields that actually matter have stopped moving; see the caller-side regression this was
-/// built to close, `settle_window` (`backend.rs`, #263), and this module's own
-/// `a_wide_t_never_settles_while_any_of_its_fields_keeps_drifting` test.
+/// repeats (an unrounded coordinate a rounded one was derived from, say) never settles, even
+/// once the fields that matter have stopped moving; see `settle_window` (`backend.rs`, #263) and
+/// the `a_wide_t_never_settles_while_any_of_its_fields_keeps_drifting` test below.
 pub fn settle_by_polling<T, E>(
     seed: T,
     budget: Duration,
@@ -249,8 +243,7 @@ mod tests {
 
     /// A `read` that fails on its very first call — before any reading past the seed ever
     /// succeeded — must report the seed itself, per `settle_by_polling`'s own doc ("seed itself
-    /// if `read` never succeeded"). The previous failure test only proves a *later* failure keeps
-    /// the last good reading; this covers the zero-successes case that doc separately promises.
+    /// if `read` never succeeded").
     #[test]
     fn a_read_failure_on_the_first_poll_reports_the_seed() {
         let (value, outcome) =

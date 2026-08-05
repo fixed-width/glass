@@ -1,5 +1,4 @@
-//! The macOS `Platform` backend for glass (ScreenCaptureKit + CGEvent + AXUIElement,
-//! rendered onto a `CGVirtualDisplay`).
+//! The macOS `Platform` backend for glass (ScreenCaptureKit + CGEvent + AXUIElement).
 //!
 //! Like `glass-windows`, the pure logic ([`keymap`], [`coords`], [`clipboard_route`],
 //! [`shim_path`], [`bundle`], [`adoption_log`], [`settle`]) is crate-level and unit-tested on

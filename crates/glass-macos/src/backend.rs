@@ -1,6 +1,4 @@
-//! The macOS `Platform` backend. Plan 1 lands the struct + trait surface with the
-//! window-server methods stubbed; Plan 2 fills capture + display provisioning, Plan 3
-//! input, Plan 4 windows. `new()` runs the TCC preflight so a missing grant fails fast.
+//! The macOS `Platform` backend. `new()` runs the TCC preflight so a missing grant fails fast.
 
 use std::path::Path;
 use std::process::Child;
@@ -25,41 +23,32 @@ use crate::permissions;
 use crate::process::{self, ClipLaunch, LogSink};
 use crate::settle::{SettleOutcome, settle_by_polling};
 
-/// Poll interval between discovery attempts in [`MacosPlatform::discover_window`] —
-/// matches `scwindow::find_window_for_pids`'s own poll cadence
-/// (`poll_until(100, ..)`), which that loop takes over here so it can also race
-/// against `child.try_wait()`.
+/// Poll interval between discovery attempts in [`MacosPlatform::discover_window`], which
+/// reimplements `scwindow::find_window_for_pids`'s `poll_until(100, ..)` loop so it can also
+/// race `child.try_wait()`.
 const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Timeout for the fresh per-call window re-resolution [`MacosPlatform::capture_frame`],
-/// [`MacosPlatform::send_pointer`], and [`MacosPlatform::send_key`] each do on every call
-/// (via `scwindow::find_window_by_id` when `active_window` is set, else
-/// `scwindow::find_window_for_pids`). Short (unlike `start_app`'s `spec.timeout_ms`, which
-/// waits for a brand-new window to first appear): the window is already known to have
-/// existed as of the last successful call, so this only needs to cover the ordinary
-/// query-round-trip latency, not a real "is the app even launching" wait.
+/// [`MacosPlatform::send_pointer`], and [`MacosPlatform::send_key`] each do (via
+/// `scwindow::find_window_by_id` when `active_window` is set, else
+/// `scwindow::find_window_for_pids`). Covers a query round trip, not a launch: the window
+/// existed as of the last successful call, unlike `start_app`'s `spec.timeout_ms`.
 const WINDOW_RESOLVE_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// How often to re-read an adopted window's geometry while waiting for it to stop changing, and
 /// how long to keep waiting. macOS reports a window's geometry while it is still opening, so the
-/// reading adoption captured is routinely a frame of the open animation (#263). `settle_window`'s
-/// own read is an `SCShareableContent` query; its per-call cost was never isolated here — that
-/// would need an A/B against a build without the settle. The only measured number available is a
-/// different reader's: the probe's dense early-sampling loop (`tests/window_adopt_probe.rs`)
-/// clocked `platform.window(&WindowOp::Geometry)`, an AX read, at ~45-100ms per call. Adding
-/// `SETTLE_POLL_INTERVAL` gives ~70-125ms as arithmetic, not a measurement of this path. A window
-/// still moving at adoption needs at least one further poll before two consecutive readings can
-/// agree — 11 of the 12 cold launches measured for #263 fell into that case. The budget bounds a
-/// window that never stops moving at all (a clock, a video player, an animating splash).
+/// reading adoption captured is routinely a frame of the open animation — 11 of the 12 cold
+/// launches measured for #263 needed at least one further poll before two readings agreed. This
+/// path's own per-poll cost was never isolated; the nearest measurement is a different reader's,
+/// `tests/window_adopt_probe.rs` clocking an AX `WindowOp::Geometry` read at ~45-100ms. The
+/// budget bounds a window that never stops moving at all (a clock, a video player, a splash).
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SETTLE_BUDGET: Duration = Duration::from_millis(500);
-/// Per-poll resolution bound, deliberately far below [`WINDOW_RESOLVE_TIMEOUT`] (a tenth of it):
-/// a settle poll that cannot find the window ends the settle attempt outright rather than
-/// retrying (see [`crate::settle::settle_by_polling`]'s `ReadFailed` handling), so this only
-/// bounds how long that one lookup burns before giving up. `settle_by_polling` checks its
-/// deadline only between reads, never mid-read, so `SETTLE_BUDGET` is a soft cap: a resolve
-/// that runs close to this full timeout right before the deadline can push actual elapsed time
-/// past `SETTLE_BUDGET` by nearly as much.
+/// Per-poll resolution bound, a tenth of [`WINDOW_RESOLVE_TIMEOUT`]: a settle poll that cannot
+/// find the window ends the settle attempt outright rather than retrying (see
+/// [`crate::settle::settle_by_polling`]'s `ReadFailed` handling). `settle_by_polling` checks its
+/// deadline only between reads, so `SETTLE_BUDGET` is a soft cap — a resolve starting just
+/// before the deadline can overrun it by nearly this much.
 const SETTLE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Read-back tolerance (pixels) [`MacosPlatform::window`]'s mutating ops use to decide
@@ -69,31 +58,22 @@ const SETTLE_RESOLVE_TIMEOUT: Duration = Duration::from_millis(200);
 /// enough to absorb point<->pixel rounding across a position/size round trip without masking
 /// a real refusal.
 ///
-/// This is deliberately a *separate* constant from [`REQUEST_EPSILON_PX`] (final-review fix
-/// 3): using this same 8px value to also decide "was a change requested at all" let a
-/// fully-refused Move/Resize whose target happened to be within 8px of the window's starting
-/// position report success — the read-back (unchanged, since it was refused) was
-/// coincidentally within 8px of a target that was itself only a few pixels away. Splitting
-/// "was a change requested" (tight, `REQUEST_EPSILON_PX`) from "does the read-back match"
-/// (loose, this constant) closes that hole.
+/// Do not also use this to decide whether a change was requested at all (that is
+/// [`REQUEST_EPSILON_PX`]): with one 8px constant for both roles, a fully-refused Move/Resize
+/// whose target sat within 8px of the window's starting position reported success.
 const WINDOW_OP_TOLERANCE_PX: i32 = 8;
 
 /// Threshold (pixels) [`move_took_effect`]/[`resize_was_refused`] use to decide whether a
-/// `Move`/`Resize` request asked for a genuinely different position/size than the window
-/// already had — as opposed to [`WINDOW_OP_TOLERANCE_PX`], which judges whether the
-/// *read-back* matches the *request*. Kept tight (well under `WINDOW_OP_TOLERANCE_PX`) so a
-/// real (if small) requested change that's totally refused — the read-back stays at the
-/// window's original position/size — is still caught as a refusal rather than waved through
-/// because the unmoved position happens to already sit within `WINDOW_OP_TOLERANCE_PX` of
-/// the target. See both functions' docs for the exact logic.
+/// `Move`/`Resize` asked for a genuinely different position/size than the window already had —
+/// as opposed to [`WINDOW_OP_TOLERANCE_PX`], which judges whether the *read-back* matches the
+/// *request*. Must stay well under it, or a small real change that was totally refused reads as
+/// no change requested.
 const REQUEST_EPSILON_PX: i32 = 2;
 
-/// macOS backend. v1 renders the target app onto a `CGVirtualDisplay` (Plan 2) and
-/// drives it with ScreenCaptureKit + CGEvent + AXUIElement.
+/// macOS backend, driving the target app with ScreenCaptureKit + CGEvent + AXUIElement.
 pub struct MacosPlatform {
-    /// Logs drained by `drain_logs`, filled by `process::spawn`'s per-stream reader
-    /// threads once `start_app` exists (Plan 2). `Arc<Mutex<_>>` because those threads
-    /// push into it concurrently with `drain_logs` reading it here. Empty until
+    /// Logs drained by `drain_logs`, filled by `process::spawn`'s per-stream reader threads —
+    /// `Arc<Mutex<_>>` because those threads push while `drain_logs` reads. Empty until
     /// `start_app` launches a child.
     logs: LogSink,
     /// The launched app's root pid; `None` until `start_app`.
@@ -102,13 +82,10 @@ pub struct MacosPlatform {
     /// it. `None` until `start_app` and after `stop_app` (idempotent).
     child: Option<Child>,
     /// The active window's `CGWindowID` — the implicit target of `capture_frame`/
-    /// `send_pointer`/`send_key`, per the `Platform` contract. `start_app` sets it to the
-    /// first window discovered for the launched app; `select_window` (Plan 4 Task 5) is
-    /// the only other place that changes it, and is exactly the "retargeting" the
-    /// `Platform` contract describes — once an agent picks a different window, capture and
-    /// input follow it. `None` only before any `start_app` call (or after `stop_app`),
-    /// meaning "no window chosen yet"; every per-call resolver below falls back to the
-    /// original first-on-screen-by-pid lookup in that case.
+    /// `send_pointer`/`send_key`, per the `Platform` contract. Set by `start_app` to the first
+    /// window discovered, and by `select_window`; `None` before `start_app` and after
+    /// `stop_app`, where every per-call resolver below falls back to the
+    /// first-on-screen-by-pid lookup.
     active_window: Option<u32>,
     /// How `get_clipboard`/`set_clipboard` route the active session's clipboard. Decided in
     /// `start_app` (success path, from `clip` below plus a live `clipboard::shim_present`
@@ -116,29 +93,21 @@ pub struct MacosPlatform {
     /// `crate::clipboard_route`'s module doc for the full decision and the three routes.
     clipboard_route: ClipboardRoute,
     /// The clip-shim launch facts `process::spawn` produced for the current session's app —
-    /// `Some` only for a contained, injectable launch (see `process::ClipLaunch`'s doc).
-    /// `None` until `start_app`, and whenever the launch was uncontained or non-injectable.
-    /// Held here (rather than consumed inside `start_app`) so the clipboard-routing decision
-    /// that depends on it can run after the launched window is confirmed; reset in
+    /// `Some` only for a contained, injectable launch (see `process::ClipLaunch`'s doc), `None`
+    /// otherwise and until `start_app`. Held here, not consumed inside `start_app`, so the
+    /// clipboard-routing decision can run after the launched window is confirmed; reset in
     /// `stop_app`.
     clip: Option<ClipLaunch>,
     /// Set when the active window belongs to a LaunchServices-adopted app — one `start_bundle`
-    /// handed off to `NSWorkspace` because the direct-spawned inner executable exited before a
-    /// window appeared (see `start_bundle`'s doc). `None` in every other case, including a
-    /// bundle that direct-spawned successfully (`self.child` is `Some` then, same as a plain
-    /// exec). The [`Adopted`]'s `disposition` records how `stop_app`/`Drop` must reap it:
-    /// `Fresh` when this call's own `ffi::launch_bundle` started the app (glass terminates it),
-    /// `PreExisting` when `ffi::running_pid_for_bundle_id` found an instance already running
-    /// before this call (glass leaves it running rather than killing an app it didn't start).
+    /// handed off to `NSWorkspace` (see its doc). `None` otherwise, including a bundle that
+    /// direct-spawned successfully. The [`Adopted`]'s `disposition` records how `stop_app`/
+    /// `Drop` must reap it: `Fresh` when `ffi::launch_bundle` started the app (glass terminates
+    /// it), `PreExisting` when it was already running (glass leaves it).
     adopted: Option<Adopted>,
 }
 
-/// A LaunchServices-adopted app tracked by `start_bundle`'s handoff path, bundled with the
-/// decision of how `stop_app`/`Drop` must reap it. Replaces the former bare `(i32, bool)`
-/// pair so the pid and its reap disposition travel together as one named unit, and the reap
-/// decision itself lives in a pure, testable predicate
-/// ([`crate::bundle::Disposition::should_terminate`]) rather than a lone `bool` hand-decoded
-/// identically at the two reap sites.
+/// A LaunchServices-adopted app tracked by `start_bundle`'s handoff path, paired with how
+/// `stop_app`/`Drop` must reap it ([`crate::bundle::Disposition::should_terminate`]).
 struct Adopted {
     /// The adopted app's pid — an `NSRunningApplication` process id, always non-negative.
     pid: i32,
@@ -149,15 +118,11 @@ struct Adopted {
 
 impl Adopted {
     /// Reap the adopted app iff glass started it
-    /// ([`crate::bundle::Disposition::should_terminate`]). Uses [`crate::ffi::terminate_app`],
-    /// which is graceful-only (`-[NSRunningApplication terminate]`, no `SIGKILL`
-    /// escalation): an app that vetoes quit (e.g. an unsaved-changes sheet) is left running
-    /// by design, trading a possible stray process for never forcibly killing an app
-    /// mid-edit and losing the user's work.
-    ///
-    /// Having no escalation to fall back to is exactly why a failed request is *reported*: it
-    /// is the only thing left to do with it, and `stop_app` otherwise returns success while an
-    /// app glass launched is still on screen.
+    /// ([`crate::bundle::Disposition::should_terminate`]). [`crate::ffi::terminate_app`] is
+    /// graceful-only (`-[NSRunningApplication terminate]`, no `SIGKILL` escalation), so an app
+    /// that vetoes quit (an unsaved-changes sheet) is left running by design rather than killed
+    /// mid-edit. With no escalation to fall back to, a failed request is reported: otherwise
+    /// `stop_app` returns success while an app glass launched is still on screen.
     fn reap(self) {
         if self.disposition.should_terminate() && !crate::ffi::terminate_app(self.pid) {
             eprintln!(
@@ -211,18 +176,13 @@ impl MacosPlatform {
     /// Poll for `child`'s window, alternating a single
     /// [`crate::scwindow::query_once_with_candidates`] discovery attempt with
     /// `child.try_wait()` so a crashed launch fails fast with [`GlassError::AppExited`]
-    /// instead of riding out the whole `timeout_ms` budget waiting for a window that will
-    /// never appear — mirrors `glass-x11/src/platform.rs`'s `discover_window`. Can't
-    /// delegate this to `scwindow::find_window_for_pids`: that helper owns its *entire*
-    /// poll loop internally, with no child handle to race against.
+    /// instead of riding out the whole `timeout_ms` budget — mirrors
+    /// `glass-x11/src/platform.rs`'s `discover_window`. Can't delegate to
+    /// `scwindow::find_window_for_pids`: that helper owns its *entire* poll loop internally,
+    /// with no child handle to race against.
     ///
-    /// Returns the whole [`crate::scwindow::WindowMatch`] (not just its `geometry`), even
-    /// though `start_app` only reads `geometry` from it today — `send_pointer` does its own
-    /// independent, fresh `scwindow::find_window_for_pids` resolution per call rather than
-    /// reusing anything cached here (see its doc), so this return type is just the natural
-    /// shape of a `query_once_with_candidates` result, not evidence of caching elsewhere. The
-    /// match's `geometry` is the settled one — [`Self::settle_window`] re-reads past the
-    /// adoption instant before this returns (#263).
+    /// Returns the whole [`crate::scwindow::WindowMatch`], whose `geometry` is the settled one
+    /// — [`Self::settle_window`] re-reads past the adoption instant before this returns (#263).
     fn discover_window(
         child: &mut Child,
         pid: u32,
@@ -255,13 +215,11 @@ impl MacosPlatform {
     }
 
     /// Poll for a window owned by `pid` alone, with no `Child` to race against —
-    /// `start_bundle`'s handoff path adopts a pid `NSWorkspace`/LaunchServices owns (found
-    /// already-running via `ffi::running_pid_for_bundle_id`, or just started via
-    /// `ffi::launch_bundle`), so unlike [`discover_window`] there is no local `Child` handle
-    /// (`std::process::Child`) to `try_wait` if the adopted app dies before its window
-    /// appears; this loop only re-queries `scwindow::query_once_with_candidates` until
-    /// `timeout_ms` elapses. Like [`discover_window`], the returned match's `geometry` is the
-    /// settled one, not the adoption-instant reading.
+    /// `start_bundle`'s handoff path adopts a pid LaunchServices owns, so unlike
+    /// [`discover_window`] there is no `std::process::Child` to `try_wait` if the adopted app
+    /// dies before its window appears; this loop only re-queries
+    /// `scwindow::query_once_with_candidates` until `timeout_ms` elapses. The returned match's
+    /// `geometry` is the settled one.
     fn discover_window_pid(pid: i32, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
         crate::ffi::app_kit_init();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
@@ -282,29 +240,22 @@ impl MacosPlatform {
     /// carrying that settled geometry.
     ///
     /// Adoption reads the window's geometry the moment it finds it, which on macOS is routinely
-    /// mid-open-animation — 11 of 12 cold launches measured on 2026-08-01 returned a geometry a few
-    /// pixels off the settled one, and the geometry `start_app` reports for it is what
-    /// `Glass::start_on_inner` hands the caller and caches as the session's geometry.
+    /// mid-open-animation — 11 of 12 cold launches measured on 2026-08-01 returned a geometry a
+    /// few pixels off the settled one, and that geometry is what `Glass::start_on_inner` hands
+    /// the caller and caches as the session's geometry.
     ///
-    /// Thin glue over [`settle_by_polling`]: this only builds the per-poll re-resolution closure
-    /// (fixed to `window_id` and `pid`, since a re-resolved match always carries the same two —
-    /// `find_window_by_id` is what pins them) and turns its [`SettleOutcome`] into the
-    /// stderr disclosure. Never fails the launch: a window that never stops changing (a clock, a
-    /// video player, an animating splash) would otherwise become unlaunchable, so a budget expiry
-    /// reports the freshest reading rather than an error, and likewise a resolve that fails
-    /// mid-settle, where the window was already confirmed present at adoption. Neither path is
-    /// silent.
+    /// Never fails the launch: a window that never stops changing (a clock, a video player, an
+    /// animating splash) would otherwise become unlaunchable, so a budget expiry reports the
+    /// freshest reading rather than an error, as does a resolve that fails mid-settle. Neither
+    /// path is silent.
     ///
     /// Settles on `geometry` alone, not the whole [`crate::scwindow::WindowMatch`] — `geometry`
     /// is rounded-to-pixel (`(v * scale).round()`), but `WindowMatch::origin_pt` is the raw
-    /// unrounded point origin it was rounded from, so two readings can agree on `geometry` while
-    /// `origin_pt` keeps drifting inside the same pixel. Comparing the whole match would make
-    /// that drift block settling forever for a window whose on-screen geometry had already
-    /// stopped changing (#263 review). The closure captures every other field of the freshest
-    /// successful read in `freshest` as it goes, so the returned match still carries them.
-    ///
-    /// Only *when* the geometry is read changes here. Which window was adopted is already decided
-    /// by the time this runs.
+    /// unrounded point origin, so two readings can agree on `geometry` while `origin_pt` keeps
+    /// drifting inside the same pixel. Comparing the whole match makes that drift block settling
+    /// forever for a window that had already stopped moving on screen (#263 review). The closure
+    /// captures every other field of the freshest successful read, so the returned match still
+    /// carries them.
     fn settle_window(
         pid: i32,
         adopted: crate::scwindow::WindowMatch,
@@ -353,19 +304,13 @@ impl MacosPlatform {
     }
 
     /// Resolve the window `capture_frame`/`send_pointer`/`send_key` should target *this*
-    /// call: `scwindow::find_window_by_id(active_window, [pid], ..)` once `select_window`
-    /// (or `start_app`'s initial discovery) has set an active `CGWindowID` — the retargeting
-    /// the `Platform` contract requires (see the `active_window` field's doc) — falling back
-    /// to the pre-Plan-4 "first on-screen window for this pid" lookup when nothing is
-    /// selected yet. Always fresh (never cached): mirrors `find_window_for_pids`'s own
-    /// per-call re-resolution, since the window may have moved/resized/closed since the last
-    /// call.
+    /// call: `scwindow::find_window_by_id(active_window, [pid], ..)` once an active
+    /// `CGWindowID` is set, falling back to the "first on-screen window for this pid" lookup
+    /// when nothing is selected yet. Always fresh (never cached): the window may have
+    /// moved/resized/closed since the last call.
     ///
-    /// Passes `&[pid]` to `find_window_by_id` (final-review fix 1): `active_window` is only
-    /// ever set to an id this backend itself resolved for `pid`, but scoping the lookup here
-    /// too means a stale/foreign id can never silently resolve to another app's window — it
-    /// surfaces `GlassError::WindowNotFound` instead, exactly like every other resolution
-    /// path in this module.
+    /// Scoped to `&[pid]` so a stale or foreign id can never silently resolve to another app's
+    /// window — it surfaces `GlassError::WindowNotFound` instead.
     fn resolve_active_window(&self, pid: i32) -> Result<crate::scwindow::WindowMatch> {
         match self.active_window {
             Some(id) => crate::scwindow::find_window_by_id(id, &[pid], WINDOW_RESOLVE_TIMEOUT),
@@ -374,47 +319,35 @@ impl MacosPlatform {
     }
 
     /// `start_app`'s bundle path, taken when `spec.run[0]` names a `.app` directory
-    /// (`bundle::is_app_bundle`): A-preferred, direct-spawn the bundle's inner executable
+    /// (`bundle::is_app_bundle`): direct-spawn the bundle's inner executable
     /// (`bundle::resolve_inner_exec`) exactly like a plain exec — same logs, containment, and
-    /// window-tracking as the non-bundle path — and only fall back to handing the launch off
-    /// to `NSWorkspace` if that direct spawn's process exits before a window ever appears
-    /// (`GlassError::AppExited` — an app that re-execs itself via LaunchServices and leaves the
-    /// direct-spawned process a dead stub, or one the kernel refused to run as a child at all;
-    /// see the platform-code note below). Any other discovery failure (e.g.
-    /// `GlassError::Timeout`) is NOT treated as a handoff signal — the direct-spawned process
-    /// is still alive and simply never grew a window, so it's terminated and the error
-    /// propagated, same as the plain-exec path.
+    /// window-tracking as the non-bundle path — and fall back to handing the launch off to
+    /// `NSWorkspace` only if that direct spawn's process exits before a window ever appears
+    /// (`GlassError::AppExited`). Any other discovery failure (e.g. `GlassError::Timeout`) is
+    /// NOT a handoff signal — the direct-spawned process is still alive and simply never grew a
+    /// window, so it's terminated and the error propagated.
     ///
-    /// The handoff itself can't be Seatbelt-contained (`bundle::handoff_gate` fails closed:
-    /// only `sandbox: off` may adopt it), and has no clipboard shim (an
-    /// `NSWorkspace`-launched process is never `direct.env`'s `DYLD_INSERT_LIBRARIES`
-    /// target), so its `ClipboardRoute` is decided directly as the sandbox-off/no-shim case
-    /// rather than via [`decide_clip`].
+    /// The handoff can't be Seatbelt-contained (`bundle::handoff_gate` fails closed: only
+    /// `sandbox: off` may adopt it) and has no clipboard shim (an `NSWorkspace`-launched process
+    /// is never `direct.env`'s `DYLD_INSERT_LIBRARIES` target), so its `ClipboardRoute` is
+    /// decided directly rather than via [`decide_clip`].
     ///
     /// **Apple platform code is handed off without attempting the spawn**, when the spec allows
     /// a handoff at all. macOS gives a system app a launch constraint requiring it to be started
     /// by launchd/LaunchServices, and the kernel `SIGKILL`s one spawned as another process's
     /// child — `EXC_CRASH SIGKILL (Code Signature Invalid)`, `CODESIGNING` / "Launch Constraint
-    /// Violation". The launch still succeeded, via the fallback below, but every attempt left a
-    /// crash report and a "quit unexpectedly" dialog for the user. Measured: 10 of 12 stock apps
-    /// tried (Notes, Preview, Calculator, TextEdit, Reminders, Music, Chess, Dictionary, Console,
-    /// Activity Monitor) die that way; Terminal and Disk Utility survive, as does Safari.
+    /// Violation" — leaving a crash report and a "quit unexpectedly" dialog behind each time.
+    /// Measured: 10 of 12 stock apps tried (Notes, Preview, Calculator, TextEdit, Reminders,
+    /// Music, Chess, Dictionary, Console, Activity Monitor) die that way; Terminal, Disk Utility
+    /// and Safari survive. Nothing in the signature distinguishes the two groups — both are
+    /// `Platform identifier=` code, and App Sandbox does not correlate (Music and Console carry
+    /// no app-sandbox entitlement and still die) — so this cannot predict which system apps
+    /// *would* have spawned, and gives up the attempt for all of them at the cost of their piped
+    /// logs (an `NSWorkspace` launch has no stdio to capture).
     ///
-    /// Nothing in the signature distinguishes those two groups — both are `Platform identifier=`
-    /// code, and App Sandbox does not correlate (Music and Console carry no app-sandbox
-    /// entitlement and still die) — so this cannot predict which system apps *would* have
-    /// spawned. It gives up the attempt for all of them rather than crash-report its way to the
-    /// same place, which costs those few their piped logs: an `NSWorkspace` launch has no stdio
-    /// to capture.
-    ///
-    /// **Only when `sandbox: off`.** A contained launch cannot be handed off at all (the gate),
-    /// so extending this to one would turn "run this system app contained" into an error whose
-    /// only remedy is `sandbox: off` — pushing the caller to run system code *less* contained
-    /// than they asked for, to avoid a crash dialog. Not a trade worth making: contained system
-    /// apps do work (Terminal and Disk Utility run fine under the profile), and glass's
-    /// containment is there for the app under development, which is never Apple platform code.
-    /// A constrained app asked for with containment therefore still attempts the spawn, dies,
-    /// and reaches the same gate error it always did.
+    /// A contained launch can't be handed off at all, so a constrained app asked for with
+    /// containment still attempts the spawn, dies, and reaches the gate error — rather than
+    /// glass pushing the caller to `sandbox: off` to avoid a crash dialog.
     fn start_bundle(&mut self, spec: &AppSpec, bundle: &Path) -> Result<WindowGeometry> {
         if spec.sandbox == SandboxLevel::Off && process::is_apple_platform_code(bundle) {
             return self.adopt_via_launch_services(spec, bundle);
@@ -535,13 +468,11 @@ impl MacosPlatform {
 }
 
 /// Decide the launched session's `ClipboardRoute` from the sandbox level and the clip-shim
-/// launch facts `process::spawn` produced (`None` for an uncontained or non-injectable
-/// launch) — shared by `start_app`'s and `start_bundle`'s direct-spawn success paths, both of
-/// which reach this only once the launched window is confirmed. `clip`'s presence only means
-/// the launch was injectable; a live `clipboard::shim_present` check confirms the swizzle
-/// actually took before a `Private` route is trusted (an injectable target whose injection
-/// silently failed must still land on `Unsupported`, not a `Private` route to a pasteboard
-/// the app was never redirected to).
+/// launch facts `process::spawn` produced (`None` for an uncontained or non-injectable launch)
+/// — shared by `start_app`'s and `start_bundle`'s direct-spawn success paths. `clip`'s presence
+/// only means the launch was injectable; a live `clipboard::shim_present` check confirms the
+/// swizzle actually took, so an injectable target whose injection silently failed lands on
+/// `Unsupported` rather than a `Private` route to a pasteboard the app never saw.
 fn decide_clip(sandbox: SandboxLevel, clip: Option<&ClipLaunch>) -> ClipboardRoute {
     match clip {
         Some(c) => {
@@ -554,9 +485,8 @@ fn decide_clip(sandbox: SandboxLevel, clip: Option<&ClipLaunch>) -> ClipboardRou
 
 /// Release `clip`'s named pasteboards (the content board and its `.ready` sentinel), a no-op
 /// when `clip` is `None`. Named pasteboards persist system-wide until released, so every path
-/// that ends a `ClipLaunch`'s lifetime — `start_app`'s/`start_bundle`'s discovery-failure arms
-/// (the launch never became a session), and `stop_app`/`Drop` (an established session ended) —
-/// must release it here, or the boards leak for the life of the host process.
+/// that ends a `ClipLaunch`'s lifetime — the discovery-failure arms, `stop_app`, `Drop` — must
+/// call this or the boards leak for the life of the host process.
 fn release_clip(clip: Option<&ClipLaunch>) {
     if let Some(c) = clip {
         crate::clipboard::release_named(&c.name);
@@ -566,15 +496,12 @@ fn release_clip(clip: Option<&ClipLaunch>) {
 
 /// Bring the launched app (`app_pid`) frontmost so its windows register with the AX API —
 /// otherwise `glass_a11y_snapshot` `WindowNotFound`s until the first input activates it. This
-/// front-loads the raise the first `glass_click`/`glass_type` would do anyway (`send_pointer`/
-/// `send_key` both call `input::focus` first).
+/// front-loads the raise the first `glass_click`/`glass_type` would do anyway.
 ///
-/// **Best-effort — never fatal.** `input::focus` already tolerates an OS-deprioritized
-/// (declined) activation by discarding `activateWithOptions`'s `false` and returning `Ok`, so
-/// the *only* error it can yield is `AppExited` — the app died in the gap after
-/// `discover_window` confirmed its window. The launch still succeeded (the returned geometry is
-/// from a window that was confirmed present), and the next capture/a11y/input op surfaces that
-/// `AppExited` with a structured error, so here we log and continue rather than fail the launch.
+/// **Best-effort — never fatal.** `input::focus` discards an OS-declined activation and returns
+/// `Ok`, so its only possible error is `AppExited`: the app died after `discover_window`
+/// confirmed its window. The launch still succeeded, and the next capture/a11y/input op
+/// surfaces that `AppExited`, so this logs and continues.
 fn activate_launched(app_pid: Option<u32>) {
     if let Some(pid) = app_pid
         && let Err(e) = crate::input::focus(pid as i32)
@@ -585,15 +512,12 @@ fn activate_launched(app_pid: Option<u32>) {
 
 /// Bounds-check every window-relative coordinate `event` carries against `geom` via
 /// `coords::check_in_bounds`, failing with `GlassError::CoordOutOfBounds` before
-/// `input::send_pointer` ever maps a coordinate to a global point — the "no
-/// silently-wrong click" invariant. `glass_core::session` already runs an equivalent check
-/// (`Session::check_bounds`) above every backend, but that's not a substitute here: this
-/// crate's mac-gated integration tests (Task 6) call `MacosPlatform::send_pointer`
-/// directly, bypassing the session layer entirely, so the backend must not depend on a
-/// caller it can't guarantee sits in front of it. Mirrors `Session::check_bounds`'s own
-/// per-variant coverage (both endpoints of a `Drag`, every pointer of a `Gesture`) even
-/// though `Gesture` itself is `Unsupported` on macOS — bounds-checking still runs first so
-/// an out-of-bounds `Gesture` reports `CoordOutOfBounds`, not `Unsupported`.
+/// `input::send_pointer` maps a coordinate to a global point — the "no silently-wrong click"
+/// invariant. Do not drop this as redundant with `glass_core::session`'s equivalent
+/// `Session::check_bounds`: this crate's mac-gated integration tests call
+/// `MacosPlatform::send_pointer` directly, bypassing the session layer. Mirrors
+/// `Session::check_bounds`'s per-variant coverage (both endpoints of a `Drag`, every pointer of
+/// a `Gesture`) so an out-of-bounds `Gesture` reports `CoordOutOfBounds`, not `Unsupported`.
 fn check_pointer_bounds(event: &PointerEvent, geom: &WindowGeometry) -> Result<()> {
     let check = |x: i32, y: i32| coords::check_in_bounds(x, y, geom.width, geom.height);
     match *event {
@@ -620,10 +544,9 @@ fn check_pointer_bounds(event: &PointerEvent, geom: &WindowGeometry) -> Result<(
     }
 }
 
-/// Map one `scwindow::AppWindow` into the `WindowInfo` [`MacosPlatform::list_windows`]
-/// returns, given the backend's current `active_window`. Factored out of `list_windows` as
-/// a pure step so it's unit-testable without a live `SCShareableContent` query — runtime
-/// enumeration coverage is Task 6's.
+/// Map one `scwindow::AppWindow` into the `WindowInfo` [`MacosPlatform::list_windows`] returns,
+/// given the backend's current `active_window`. A pure step so it's unit-testable without a live
+/// `SCShareableContent` query.
 fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -> WindowInfo {
     WindowInfo {
         id: WindowId(w.window_id as u64),
@@ -637,10 +560,8 @@ fn window_info_from(w: crate::scwindow::AppWindow, active_window: Option<u32>) -
 /// Read `el`'s current `AXPosition`/`AXSize` (points) and convert to the pixel
 /// `WindowGeometry` [`MacosPlatform::window`] returns for every op — the shared read-back
 /// step after `Focus`/`Move`/`Resize`'s mutation, and the sole step for `Geometry`. Reuses
-/// `coords::pixel_geometry_from_content_rect`'s point->pixel scaling rather than
-/// reimplementing it: an AX position+size pair is exactly that function's `x`/`y`/`width`/
-/// `height` args (see `coords.rs`'s module doc), so this crate keeps one scaling
-/// implementation, not two.
+/// `coords::pixel_geometry_from_content_rect`'s point->pixel scaling so this crate keeps one
+/// scaling implementation, not two.
 fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
     let (x, y) = axwindow::ax_position(el)?;
     let (width, height) = axwindow::ax_size(el)?;
@@ -650,15 +571,11 @@ fn read_ax_geometry(el: &AXUIElement, scale: f64) -> Result<WindowGeometry> {
 }
 
 /// True if a `Move { x, y }` request succeeded: either `x`/`y` was already (within
-/// [`REQUEST_EPSILON_PX`]) `before`'s own position — no real change was requested, so
-/// whatever `after` reads back as is fine — or `after` is within [`WINDOW_OP_TOLERANCE_PX`]
-/// of the target AND the window actually moved away from `before` (not just coincidentally
-/// unmoved-but-within-tolerance-of-a-nearby-target — see [`WINDOW_OP_TOLERANCE_PX`]/
-/// [`REQUEST_EPSILON_PX`]'s docs for why both checks are needed). The signal `window(op)`'s
-/// `Move` branch uses to catch a macOS window that silently ignores `AXPosition` (the
-/// no-silent-no-op contract `window(op)`'s doc describes). Computed in `i64` before `.abs()`
-/// so no cast can wrap for any input (matches `coords.rs`'s house rule). Pure so it's
-/// unit-testable without a live `AXUIElement`.
+/// [`REQUEST_EPSILON_PX`]) `before`'s own position, or `after` is within
+/// [`WINDOW_OP_TOLERANCE_PX`] of the target AND the window actually moved away from `before`.
+/// Both checks are needed — see those constants' docs. The signal `window(op)`'s `Move` branch
+/// uses to catch a macOS window that silently ignores `AXPosition`. Computed in `i64` before
+/// `.abs()` so no cast can wrap (matches `coords.rs`'s house rule).
 fn move_took_effect(before: &WindowGeometry, after: &WindowGeometry, x: i32, y: i32) -> bool {
     let requested_a_change = (i64::from(x) - i64::from(before.x)).abs()
         > i64::from(REQUEST_EPSILON_PX)
@@ -678,16 +595,10 @@ fn move_took_effect(before: &WindowGeometry, after: &WindowGeometry, x: i32, y: 
 /// True if a `Resize { width, height }` had no visible effect at all: `after` is (within
 /// [`WINDOW_OP_TOLERANCE_PX`]) the same size as `before`, even though `width`/`height` asked
 /// for a genuinely different size than `before`'s own (more than [`REQUEST_EPSILON_PX`]
-/// different — see that constant's doc for why this must be tighter than
-/// `WINDOW_OP_TOLERANCE_PX`, otherwise a small-but-real requested resize that's totally
-/// refused would not even count as "a change was requested"). This is deliberately narrower
-/// than "does `after` exactly match the request": macOS may legitimately clamp to an
-/// intermediate size (a window's min/max content-size constraint), which is expected
-/// behavior, not a bug — the resulting `after` geometry is still returned to the caller in
-/// that case (see `window(op)`'s `Resize` doc). Only a total no-op (the size never moved,
-/// despite a real change being requested) is treated as the "macOS refused the resize"
-/// failure. Computed in `i64` before `.abs()` so no cast can wrap for any input (matches
-/// `coords.rs`'s house rule). Pure so it's unit-testable without a live `AXUIElement`.
+/// different). Deliberately narrower than "does `after` exactly match the request": macOS may
+/// legitimately clamp to an intermediate size (a min/max content-size constraint), and that
+/// `after` geometry is still returned to the caller. Only a total no-op counts as a refusal.
+/// Computed in `i64` before `.abs()` so no cast can wrap (matches `coords.rs`'s house rule).
 fn resize_was_refused(
     before: &WindowGeometry,
     after: &WindowGeometry,
@@ -705,22 +616,17 @@ fn resize_was_refused(
 }
 
 impl Platform for MacosPlatform {
-    /// Run the optional build step, spawn the app, then confirm a window appears for its
-    /// pid within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent`
-    /// enumeration — alternated with `child.try_wait()` so a crashed launch fails fast
-    /// with `GlassError::AppExited` instead of riding out the whole timeout (see
-    /// `discover_window`).
+    /// Run the optional build step, spawn the app, then confirm a window appears for its pid
+    /// within `spec.timeout_ms` via ScreenCaptureKit's `SCShareableContent` enumeration —
+    /// alternated with `child.try_wait()` so a crashed launch fails fast with
+    /// `GlassError::AppExited` (see `discover_window`).
     ///
-    /// **Main-thread affinity:** `discover_window` calls `ffi::app_kit_init()`, which
-    /// requires the true main thread (`MainThreadMarker` panics off it). In Plan 2 this is
-    /// exercised only by Task 6's `harness=false` main-thread test; wiring it under
-    /// glass-mcp's worker-thread dispatcher (main-thread marshaling) is deferred to Plan 5.
+    /// **Main-thread affinity:** `discover_window` calls `ffi::app_kit_init()`, which requires
+    /// the true main thread (`MainThreadMarker` panics off it).
     ///
     /// **`.app` bundles:** when `spec.run[0]` names a `.app` bundle directory
-    /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`] instead of the
-    /// plain-exec path below — see its doc for the direct-spawn-then-NSWorkspace-handoff
-    /// design. Every other `run[0]` (the plain-exec case) takes the unchanged path that
-    /// follows.
+    /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
+    /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         Self::run_build(spec)?;
         let run0 = spec
@@ -774,15 +680,10 @@ impl Platform for MacosPlatform {
     /// Terminate the launched app (however it was launched) and clear the active pid/window.
     /// Idempotent — a call with nothing running is `Ok(())`.
     ///
-    /// An `adopted` app (`start_bundle`'s NSWorkspace-handoff path — no `self.child` to
-    /// terminate) is reaped first: a freshly-launched adoptee is terminated via
-    /// `ffi::terminate_app` (glass started it, so glass stops it), while an activated-existing
-    /// one is left running (glass only raised it, so it isn't glass's to kill) — see the
-    /// `adopted` field's doc. This then falls through to the child/pasteboard cleanup below
-    /// rather than returning early: a session is only ever `adopted` XOR `child`-backed, so the
-    /// fall-through is a no-op for an adopted session, but it keeps `stop_app` and `Drop`
-    /// structurally identical (both reap `adopted`, then `child`, then release pasteboards)
-    /// instead of `stop_app` carrying its own divergent early-return.
+    /// An `adopted` app (`start_bundle`'s NSWorkspace-handoff path, no `self.child`) is reaped
+    /// first, per the `adopted` field's doc. This then falls through to the child/pasteboard
+    /// cleanup rather than returning early: a session is `adopted` XOR `child`-backed, so the
+    /// fall-through is a no-op, and it keeps `stop_app` and `Drop` structurally identical.
     fn stop_app(&mut self) -> Result<()> {
         if let Some(a) = self.adopted.take() {
             a.reap();
@@ -805,24 +706,17 @@ impl Platform for MacosPlatform {
     }
 
     /// Capture the active window as an RGBA8 frame, re-resolving it fresh on every call
-    /// (see `scwindow.rs`'s module doc — a `Retained<SCWindow>` can't be cached across
-    /// calls).
+    /// (see `scwindow.rs`'s module doc — a `Retained<SCWindow>` can't be cached across calls).
     ///
-    /// NOTE: targets `active_window` when set (`capture::capture_window_by_id`, exact
-    /// `CGWindowID` match scoped to `&[pid]` — final-review fix 1, same rationale as
-    /// `resolve_active_window`'s doc) — the retargeting `select_window` (a later task)
-    /// drives, per the `Platform` contract's "implicit target of capture/input" — else falls
-    /// back to the pre-Plan-4 first-on-screen-window-for-this-pid path
-    /// (`capture::capture_window`). `resolve_active_window`'s doc covers the shared
-    /// decision; capture takes its own `capture_window`/`capture_window_by_id` branch
-    /// (rather than calling `resolve_active_window` itself) because capture needs the live
-    /// `SCWindow` inside a single completion-handler callback to build its
-    /// `SCContentFilter`, not just the `WindowMatch` snapshot `resolve_active_window`
-    /// returns.
+    /// Targets `active_window` when set (`capture::capture_window_by_id`, exact `CGWindowID`
+    /// match scoped to `&[pid]`), else the first-on-screen-window-for-this-pid path
+    /// (`capture::capture_window`). Takes its own branch rather than calling
+    /// `resolve_active_window` because capture needs the live `SCWindow` inside a single
+    /// completion-handler callback to build its `SCContentFilter`, not just a `WindowMatch`
+    /// snapshot.
     ///
-    /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()`
-    /// (via `capture::capture_window`/`capture_window_by_id`) and must run on the true main
-    /// thread; see the note on `start_app`.
+    /// **Main-thread affinity:** like `start_app`, this reaches `ffi::app_kit_init()` and must
+    /// run on the true main thread.
     fn capture_frame(&mut self, region: Option<&Region>) -> Result<Frame> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -831,22 +725,16 @@ impl Platform for MacosPlatform {
             None => crate::capture::capture_window(&[pid as i32], region),
         }
     }
-    /// Map the active window into `input::send_pointer` — see `input.rs`'s module doc for
-    /// the CGEvent details and its main-thread-affinity note (shared with
-    /// `start_app`/`capture_frame` above).
+    /// Map the active window into `input::send_pointer` — see `input.rs`'s module doc for the
+    /// CGEvent details and its main-thread-affinity note.
     ///
-    /// NOTE: re-resolves the window fresh via `resolve_active_window` on every call —
-    /// targeting `active_window` when set (the retargeting `select_window`, a later task,
-    /// drives), else falling back to the pre-Plan-4 first-on-screen-window-for-this-pid
-    /// path — mirroring `capture_frame`'s per-call resolution above. The window may have
-    /// moved or resized since `start_app` (or any earlier `send_pointer` call), so a
-    /// `scale`/`origin_pt`/geometry cached once at `start_app` would go stale. Both the
-    /// bounds check (`check_pointer_bounds`, see its doc) and the coordinate mapping use
-    /// this freshly-resolved geometry/scale/origin; the CGEvent focus target is the
-    /// resolved window's own owning pid (`m.pid`, from the fresh `SCShareableContent`
-    /// lookup), not necessarily `self.app_pid` — today they're always the same pid (glass
-    /// launches one app per session), but `m.pid` is the one actually tied to the window
-    /// being clicked.
+    /// Re-resolves the window fresh via `resolve_active_window` on every call, like
+    /// `capture_frame`: the window may have moved or resized since `start_app`, so a
+    /// `scale`/`origin_pt`/geometry cached once would go stale. Both the bounds check
+    /// (`check_pointer_bounds`) and the coordinate mapping use the freshly-resolved values. The
+    /// CGEvent focus target is the resolved window's own owning pid (`m.pid`), not
+    /// `self.app_pid` — the same pid today, but `m.pid` is the one tied to the window being
+    /// clicked.
     fn send_pointer(&mut self, event: &PointerEvent) -> Result<()> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -857,15 +745,12 @@ impl Platform for MacosPlatform {
     /// Map the active window into `input::send_key` — see `input.rs`'s module doc for the
     /// CGEvent keyboard details.
     ///
-    /// NOTE: re-resolves the active window via `resolve_active_window` first, same as
-    /// `send_pointer`, even though keyboard CGEvents target a *process* (`focus(pid)`
-    /// activates the app, and the posted event then goes to whatever window that app
-    /// currently has key/main — there is no per-window keyboard targeting yet; that needs
-    /// AXUIElement raise/main, Plan 4 Task 4). The resolution here still matters: if
-    /// `active_window` is set but that window has closed, this surfaces
-    /// `GlassError::WindowNotFound` instead of silently posting keys to whatever else
-    /// happens to be focused — the same no-silent-wrong-target discipline `send_pointer`'s
-    /// bounds check enforces for clicks.
+    /// Re-resolves the active window via `resolve_active_window` first, same as `send_pointer`,
+    /// even though keyboard CGEvents target a *process*: `focus(pid)` activates the app and the
+    /// event goes to whatever window that app currently has key/main, so there is no per-window
+    /// keyboard targeting. The resolution still matters — if `active_window` is set but that
+    /// window has closed, this surfaces `GlassError::WindowNotFound` instead of silently posting
+    /// keys to whatever else is focused.
     fn send_key(&mut self, event: &KeyEvent) -> Result<()> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -873,30 +758,24 @@ impl Platform for MacosPlatform {
         crate::input::send_key(event, m.pid)
     }
     /// Resolve the active window's `AXUIElement` (fresh every call, same rationale as
-    /// `resolve_active_window`: the window may have moved/resized/closed since the last
-    /// call) and dispatch `op` onto it:
+    /// `resolve_active_window`) and dispatch `op` onto it:
     ///
-    /// - `Focus` activates the owning app (`input::focus`, the same
-    ///   `NSRunningApplication::activate` call `send_pointer`/`send_key` already make),
-    ///   then `AXRaise`s and marks the window `AXMain` — CGEvents alone can't target a
-    ///   specific window (see `send_key`'s doc), this is what actually does. Propagates
-    ///   `input::focus`'s error (final-review fix 4) if the owning app is no longer running
-    ///   rather than silently raising/main-ing an `AXUIElement` for a process that's gone.
+    /// - `Focus` activates the owning app (`input::focus`), then `AXRaise`s and marks the
+    ///   window `AXMain` — CGEvents alone can't target a specific window (see `send_key`'s
+    ///   doc), this is what does. Propagates `input::focus`'s error if the owning app is gone
+    ///   rather than raising an `AXUIElement` for a dead process.
     /// - `Move { x, y }` converts the target from global-screen PIXELS to Quartz POINTS
     ///   (`coords::global_pixel_to_point`) and sets `AXPosition`.
-    /// - `Resize { width, height }` sets `AXSize`, then re-sets `AXPosition` to its
-    ///   just-read current value, then sets `AXSize` again — the brief-specified workaround
-    ///   (verified by the Task 6 window integration test) for a window that won't grow past
-    ///   its current on-screen bounds via a single `AXSize` set alone.
+    /// - `Resize { width, height }` sets `AXSize`, re-sets `AXPosition` to its just-read
+    ///   current value, then sets `AXSize` again — a window won't grow past its current
+    ///   on-screen bounds via a single `AXSize` set alone.
     /// - `Geometry` performs no mutation.
     ///
-    /// Every branch reads back the window's position/size afterward
-    /// ([`read_ax_geometry`]) and returns it in pixels — the tool boundary's unit. `Move`/
-    /// `Resize` additionally check the read-back actually reflects the request
-    /// ([`move_took_effect`]/[`resize_was_refused`]), returning `GlassError::Backend`
-    /// naming what didn't take rather than silently reporting success on a macOS window
-    /// that refused the change; `Focus`/`Geometry` have no such check since they assert
-    /// nothing about position/size.
+    /// Every branch reads back the window's position/size afterward ([`read_ax_geometry`]) and
+    /// returns it in pixels — the tool boundary's unit. `Move`/`Resize` additionally check the
+    /// read-back reflects the request ([`move_took_effect`]/[`resize_was_refused`]), returning
+    /// `GlassError::Backend` naming what didn't take rather than reporting success on a window
+    /// that refused the change.
     fn window(&mut self, op: &WindowOp) -> Result<WindowGeometry> {
         permissions::preflight()?;
         let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
@@ -946,12 +825,11 @@ impl Platform for MacosPlatform {
         }
     }
     /// Enumerate every on-screen window owned by the launched app's pid via
-    /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches — not just
-    /// the active one), mapping each into a `WindowInfo` via [`window_info_from`].
+    /// `scwindow::list_app_windows` (one `SCShareableContent` query, all matches), mapping each
+    /// into a `WindowInfo` via [`window_info_from`].
     ///
-    /// **Main-thread affinity:** like `start_app`/`capture_frame`, reaches
-    /// `ffi::app_kit_init()` (via `scwindow::list_app_windows`) and must run on the true
-    /// main thread; see the note on `start_app`.
+    /// **Main-thread affinity:** reaches `ffi::app_kit_init()` and must run on the true main
+    /// thread.
     fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -961,38 +839,25 @@ impl Platform for MacosPlatform {
             .map(|w| window_info_from(w, self.active_window))
             .collect())
     }
-    /// Retarget `active_window` to `id` — the `Platform` contract's "make `id` the
-    /// active window, the implicit target of capture/input/window ops" (see
-    /// `glass_core::platform`'s doc on this method).
+    /// Retarget `active_window` to `id` — the `Platform` contract's "make `id` the active
+    /// window, the implicit target of capture/input/window ops".
     ///
-    /// First confirms `id` is currently on-screen AND owned by `self.app_pid` via
-    /// `scwindow::find_window_by_id(id, &[app_pid], ..)` (final-review fix 1 — pid-scoped,
-    /// unlike the pre-fix version which matched any on-screen `CGWindowID` system-wide),
-    /// which already maps a lookup that never turns up `id` before `WINDOW_RESOLVE_TIMEOUT`
-    /// elapses to `GlassError::WindowNotFound` (see that function's own doc) — exactly this
-    /// method's "not currently one of the app's windows" contract, so no extra `Timeout` ->
-    /// `WindowNotFound` mapping is needed here. Only after that check succeeds does
-    /// `active_window` actually change — a failed `select_window` must leave the previous
-    /// target in place, not (say) clear it.
+    /// First confirms `id` is on-screen AND owned by `self.app_pid` via
+    /// `scwindow::find_window_by_id(id, &[app_pid], ..)`, which already maps a lookup that never
+    /// turns up `id` before `WINDOW_RESOLVE_TIMEOUT` elapses to `GlassError::WindowNotFound` —
+    /// exactly this method's "not currently one of the app's windows" contract, so no extra
+    /// `Timeout` -> `WindowNotFound` mapping is needed. Only then does `active_window` change: a
+    /// failed `select_window` leaves the previous target in place rather than clearing it.
     ///
-    /// Then raises and focuses the newly-selected window by delegating to
-    /// `self.window(&WindowOp::Focus)` rather than duplicating its AXUIElement logic: that
-    /// path re-resolves `id`'s `AXUIElement` scoped to `self.app_pid`
-    /// (`axwindow::ax_window_for_cgwindowid`) too, via a completely independent lookup path
-    /// (`SCShareableContent` above vs. `AXUIElementCreateApplication` here) — belt-and-
-    /// suspenders with the pid-scoped check above, not a second layer this method actually
-    /// depends on. `window(Focus)`'s own read-back ([`read_ax_geometry`]) supplies the pixel
-    /// `WindowGeometry` this method returns, so the window is queried fresh exactly once
-    /// more (mirroring every other op's no-caching discipline) rather than reusing the first
-    /// lookup's now-slightly-stale geometry.
+    /// Then raises and focuses the window by delegating to `self.window(&WindowOp::Focus)`
+    /// rather than duplicating its AXUIElement logic; that path's own read-back
+    /// ([`read_ax_geometry`]) supplies the pixel `WindowGeometry` returned here, so the window
+    /// is queried fresh once more rather than reusing the first lookup's stale geometry.
     ///
-    /// If `self.window(&WindowOp::Focus)` fails after `active_window` has already been
-    /// retargeted — e.g. the window closed in the gap between the check above and the
-    /// `AXRaise`/`AXMain` calls — `active_window` is rolled back to its prior value
-    /// (final-review fix 2) rather than left pointing at a window this call never actually
-    /// confirmed glass can operate on. Belt-and-suspenders with the pid-scoped check above:
-    /// that check already rejects a foreign/stale `id` before any mutation, so this rollback
-    /// only matters for the narrower window-closed-mid-call race.
+    /// If `self.window(&WindowOp::Focus)` fails after `active_window` was retargeted — the
+    /// window closed in the gap between the check and the `AXRaise`/`AXMain` calls —
+    /// `active_window` is rolled back rather than left pointing at a window this call never
+    /// confirmed glass can operate on.
     fn select_window(&mut self, id: WindowId) -> Result<WindowGeometry> {
         permissions::preflight()?;
         let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
@@ -1037,15 +902,12 @@ impl Platform for MacosPlatform {
 
 impl Drop for MacosPlatform {
     /// Reap a still-running launched app on drop — parity with the X11/Wayland/Windows
-    /// backends, so a backend dropped without an explicit `stop_app()` (panic-unwind, or
-    /// the process-exit backstop path) does not orphan its child. `process::terminate`
-    /// is idempotent, and `child.take()` in `stop_app` means this is a no-op if
-    /// `stop_app` already ran.
+    /// backends, so a backend dropped without an explicit `stop_app()` (panic-unwind, or the
+    /// process-exit backstop) does not orphan its child. `process::terminate` is idempotent, and
+    /// `child.take()` in `stop_app` means this is a no-op if `stop_app` already ran.
     ///
-    /// A freshly-launched `adopted` app (`start_bundle`'s handoff path — no `self.child`)
-    /// gets the same treatment via `ffi::terminate_app`, for the same "don't orphan what
-    /// this backend launched" reason; an activated-existing adoptee is left running, same as
-    /// in `stop_app`.
+    /// A freshly-launched `adopted` app gets the same treatment via `ffi::terminate_app`; an
+    /// activated-existing adoptee is left running, same as in `stop_app`.
     fn drop(&mut self) {
         if let Some(a) = self.adopted.take() {
             a.reap();

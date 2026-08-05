@@ -148,7 +148,7 @@ mod macos_main {
     ///
     /// Never asserted and never fatal: a latency bound would flake on a loaded box, and a snapshot
     /// that fails here must not cost this app its role-parity check or the later apps their runs.
-    /// Twin of `render_snapshot_cost` in `glass-windows/tests/onbox.rs` — keep the two in step.
+    /// Twin of `render_snapshot_cost` in `glass-windows/tests/onbox.rs`.
     fn print_snapshot_cost(a11y: &mut MacosA11y, ctx: &AxContext) {
         let mut samples = Vec::with_capacity(COST_REPEATS);
         for repeat in 0..COST_REPEATS {
@@ -218,13 +218,12 @@ mod macos_main {
     /// regardless; see [`WalkLimits::from_max_nodes`]), print its role histogram, then stop
     /// it. Returns `Err` when the app could not be launched, a snapshot could not be taken at
     /// all, or a token glass maps came back unmapped ([`mapped_token_violations`]) — never
-    /// merely because an app exposed something unexpected (see this file's module doc). Beyond
-    /// that one check the histogram's contents are never asserted; reading the printed output
-    /// to decide which `Gap` cell in `glass_core::role_support::ROLE_SUPPORT` a real native
-    /// token now justifies filling is the human's job.
-    /// `Ok` carries how many of this app's nodes the reader gave a description — an observation
-    /// per app (an app with no `AXHelp` is a legitimate zero), summed by [`run`] so a whole run
-    /// of zeros can be challenged there.
+    /// merely because an app exposed something unexpected. Beyond that one check the histogram's
+    /// contents are never asserted; deciding which `Gap` cell in
+    /// `glass_core::role_support::ROLE_SUPPORT` a real native token justifies filling is the
+    /// human's job. `Ok` carries how many of this app's nodes the reader gave a description (an
+    /// app with no `AXHelp` is a legitimate zero), summed by [`run`] so a whole run of zeros can
+    /// be challenged there.
     fn probe_one(run0: &str) -> Result<usize, String> {
         println!("\n--- launching {run0} ---");
         let mut platform =
