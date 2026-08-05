@@ -56,11 +56,9 @@ fn default_backend_check(raw: Option<&str>) -> Check {
 /// level (`GLASS_SANDBOX_FLOOR`, consumed by `tools::resolve_sandbox`), so an operator can
 /// confirm their policy is actually in effect without reading source or triggering a launch.
 /// Host-level and backend-independent, hence its home in `general` rather than a per-backend
-/// `sandbox` section. Pure in `raw` (the read `GLASS_SANDBOX_FLOOR` value) so it's unit-tested
-/// without touching the process environment, mirroring [`default_backend_check`]. Unlike a
-/// mis-set `GLASS_BACKEND` (which silently falls back to a host default), a `GLASS_SANDBOX_FLOOR`
-/// that fails to parse makes `resolve_sandbox` reject *every* `glass_start` call — so that case is
-/// a `Fail`, not a `Warn`.
+/// `sandbox` section. Pure in `raw`. Unlike a mis-set `GLASS_BACKEND` (which silently falls back
+/// to a host default), a `GLASS_SANDBOX_FLOOR` that fails to parse makes `resolve_sandbox`
+/// reject *every* `glass_start` call — so that case is a `Fail`, not a `Warn`.
 fn sandbox_floor_check(raw: Option<&str>, not_utf8: bool) -> Check {
     if not_utf8 {
         // A set-but-non-UTF-8 floor is treated as fail-closed by `start` (the launch is refused),
@@ -324,14 +322,12 @@ fn soften_inactive_android(checks: &mut [Check], deep_requested: bool) {
 
 /// Assemble the `[ios]` section: the base toolchain checks (`glass_ios::doctor::checks`) plus the
 /// always-present `idb_companion` check, then — when ios isn't the selected backend — soften any
-/// `Fail` to an advisory `Warn` via the shared [`soften_inactive_fails`], so a missing tool for a
-/// backend the user isn't driving doesn't fail the overall diagnosis. The companion line is
-/// appended unconditionally: it gates all iOS input + a11y, so an operator must see its status even
-/// when driving iOS per-call from a macos-default server, where an absent companion then reads as
-/// that advisory `Warn` rather than an omitted line. Unlike android, `glass_ios::doctor::checks`
-/// emits no "run with --deep" skip line, so there is no skip message to re-point. Pure over its
-/// inputs (no OS probes) so this behaviour is unit-tested on every host, not only macOS; kept out
-/// of `#[cfg]` (only its caller is macOS-only), mirroring [`idb_companion_check`].
+/// `Fail` via the shared [`soften_inactive_fails`]. The companion line is appended
+/// unconditionally: it gates all iOS input + a11y, so an operator must see its status even when
+/// driving iOS per-call from a macos-default server, where an absent companion reads as that
+/// advisory `Warn` rather than an omitted line. Unlike android, `glass_ios::doctor::checks`
+/// emits no "run with --deep" skip line, so there is no skip message to re-point. Pure, and kept
+/// out of `#[cfg]` (only its caller is macOS-only) so it is tested on every host.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn ios_checks_assembled(mut base: Vec<Check>, companion: Check, ios_selected: bool) -> Vec<Check> {
     base.push(companion);
@@ -419,17 +415,13 @@ pub(crate) fn companion_deep_check(probe: glass_ios::doctor::CompanionProbe) -> 
     }
 }
 
-/// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console
-/// session's three-way state (unlocked/locked/nobody-logged-in), and the resolved
-/// backend. Pure — takes already-gathered facts, makes no OS calls itself — so it's
-/// unit-tested without needing real grants or a particular session state;
-/// [`macos_checks`] gathers the real facts via `glass_macos`. A locked/asleep session
-/// is a `Warn`, not a `Fail`: it's recoverable in-place (`caffeinate -d`), unlike a
-/// genuinely missing grant. No account being logged in at the console at all
-/// (`SessionState::NoSession` — see `glass_macos::session`, verified to be a
-/// console-wide fact, not merely "called over SSH") is also a `Warn`: distinct from
-/// both, not fixable by unlocking, but still surfaced without failing the whole
-/// doctor run over what's usually a launch-configuration issue rather than a broken
+/// macOS checks: the two TCC grants (Screen Recording, Accessibility), the console session's
+/// three-way state (unlocked/locked/nobody-logged-in), and the resolved backend. Pure;
+/// [`macos_checks`] gathers the real facts via `glass_macos`. A locked/asleep session is a
+/// `Warn`, not a `Fail`: it's recoverable in-place (`caffeinate -d`), unlike a genuinely missing
+/// grant. No account logged in at the console at all (`SessionState::NoSession` — see
+/// `glass_macos::session`, a console-wide fact, not merely "called over SSH") is also a `Warn`:
+/// not fixable by unlocking, but usually a launch-configuration issue rather than a broken
 /// install.
 #[cfg(target_os = "macos")]
 fn macos_checks_from(

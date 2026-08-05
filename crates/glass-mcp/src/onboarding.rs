@@ -113,8 +113,8 @@ fn grant_rows(accessibility: bool, screen_recording: bool) -> [(&'static str, bo
 
 /// Build the checklist's row widgets from this launch's TCC grant snapshot: one [`GrantRow`]
 /// per permission, each carrying its live snapshot and the "Request…" closure that requests
-/// the grant. Factored out of [`run`] so the menu-bar self-onboard fallback (Task 4) can reuse
-/// the *identical* row wiring.
+/// the grant. Shared with the menu-bar self-onboard fallback, which reuses the *identical* row
+/// wiring.
 ///
 /// Only the row widgets are shared, not a whole [`ChecklistActions`] — `on_recheck` is
 /// necessarily per-caller: the onboarder's recheck relaunches a fresh process and `exit(0)`s
