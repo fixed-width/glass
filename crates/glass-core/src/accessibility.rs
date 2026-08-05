@@ -721,9 +721,13 @@ impl AxDeadline {
 
     /// Stop `ms` milliseconds from now.
     pub fn from_millis(ms: u64) -> Self {
-        Self(Some(
-            std::time::Instant::now() + std::time::Duration::from_millis(ms),
-        ))
+        Self::at(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+    }
+
+    /// Stop at `instant` — for a caller that already holds the moment it stops waiting, and for a
+    /// test that needs the same instant on both sides of a comparison.
+    pub const fn at(instant: std::time::Instant) -> Self {
+        Self(Some(instant))
     }
 
     /// `proposed`, or this deadline when it falls first — the bound one step of a call runs under.
@@ -1184,6 +1188,9 @@ mod tests {
         assert!(soon.governs(now + std::time::Duration::from_secs(60)));
         assert!(!soon.governs(now));
         assert!(!AxDeadline::UNBOUNDED.governs(now + std::time::Duration::from_secs(60)));
+        // The tie itself, which only a shared instant can express: `<=` here would blame the
+        // caller for a backend that hung for exactly its own ceiling.
+        assert!(!AxDeadline::at(now).governs(now));
     }
 
     #[test]
