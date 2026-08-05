@@ -1,37 +1,28 @@
-//! `SCShareableContent` window discovery by pid, and by `CGWindowID` (Plan 4's
-//! active-window retargeting).
+//! `SCShareableContent` window discovery by pid, and by `CGWindowID` (active-window
+//! retargeting).
 //!
-//! Polls ScreenCaptureKit's `SCShareableContent` enumeration — the same async
-//! completion-handler API proven end-to-end in the objc2 spike — for the first on-screen
-//! window
-//! owned by one of a set of pids ([`find_window_for_pids`], the launched app's process
-//! set) or for the specific on-screen window with a given `CGWindowID` that is *also* owned
-//! by one of that same pid set ([`find_window_by_id`], `MacosPlatform`'s active window once
-//! `select_window` has run — the pid scoping closes a silent-wrong-target hole a bare
-//! `CGWindowID` match would otherwise open, since window ids are not namespaced per app),
-//! following `ffi.rs`'s documented async-bridge convention.
+//! Polls ScreenCaptureKit's `SCShareableContent` enumeration for the first on-screen window
+//! owned by one of a set of pids ([`find_window_for_pids`], the launched app's process set) or
+//! for the specific on-screen window with a given `CGWindowID` that is *also* owned by one of
+//! that same pid set ([`find_window_by_id`]) — window ids are not namespaced per app, so the
+//! pid scoping closes a silent-wrong-target hole a bare `CGWindowID` match would open. Follows
+//! `ffi.rs`'s documented async-bridge convention.
 //!
 //! ## Why this returns [`WindowMatch`], not `Retained<SCWindow>`
 //!
-//! The natural signature would return `(Retained<SCWindow>, WindowGeometry)`. That isn't
-//! achievable safely: `SCShareableContent`'s completion handler fires on an internal
-//! ScreenCaptureKit queue, not this function's calling thread, and `objc2`'s
-//! `Retained<T>` is only `Send`/`Sync` when `T: Send + Sync`
-//! (`unsafe impl<T: ?Sized + Sync + Send> Send for Retained<T> {}` in `objc2`'s
-//! `rc::retained` module) — `SCWindow` (an `extern_class!`-declared binding with no such
-//! bound, confirmed by reading the generated source: no `unsafe impl Send`/`Sync` for it
-//! anywhere in `objc2-screen-capture-kit`) is neither. Apple never documents `SCWindow`'s
-//! methods as safe to call concurrently from multiple threads, so `objc2` doesn't assert
-//! it either. Smuggling a `Retained<SCWindow>` out of the completion block via a raw
-//! pointer + `unsafe impl Send` wrapper would compile, but there'd be no real safety
-//! argument backing it — exactly the gotcha `ffi.rs`'s module doc warns against ("never
-//! send a `Retained<T>`/raw objc2 object across the channel").
+//! `SCShareableContent`'s completion handler fires on an internal ScreenCaptureKit queue, not
+//! the calling thread, and `objc2`'s `Retained<T>` is only `Send`/`Sync` when `T: Send + Sync`
+//! (`unsafe impl<T: ?Sized + Sync + Send> Send for Retained<T> {}` in `objc2`'s `rc::retained`
+//! module). `SCWindow` is neither: `objc2-screen-capture-kit` declares it via `extern_class!`
+//! with no such bound, and Apple never documents its methods as safe to call concurrently.
+//! Smuggling one out of the completion block via a raw pointer + `unsafe impl Send` wrapper
+//! compiles with no safety argument behind it — the gotcha `ffi.rs`'s module doc warns against
+//! ("never send a `Retained<T>`/raw objc2 object across the channel").
 //!
-//! Instead, [`find_window_for_pids`] returns [`WindowMatch`]: the owning pid, the
-//! `CGWindowID` (a plain `u32`, stable for the window's lifetime and re-findable via a
-//! fresh query), and the geometry. That's everything a later capture call needs to
-//! re-resolve the exact window — which it must do per-call anyway, since a
-//! `Retained<SCWindow>` can't be cached across the same thread-crossing boundary.
+//! Instead, [`find_window_for_pids`] returns [`WindowMatch`]: the owning pid, the `CGWindowID`
+//! (a plain `u32`, stable for the window's lifetime and re-findable via a fresh query), and the
+//! geometry — everything a later capture call needs to re-resolve the exact window, which it
+//! must do per-call anyway.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -76,12 +67,10 @@ pub(crate) struct WindowMatch {
     pub(crate) origin_pt: (f64, f64),
 }
 
-/// A discovered on-screen window, as returned by [`list_app_windows`] (Plan 4's
-/// `list_windows`): the `CGWindowID`, pixel geometry, title, and owning application name —
-/// everything `backend::list_windows` needs to build a `WindowInfo` per window. Same
-/// can't-hold-a-live-`SCWindow`-across-the-completion-boundary rationale as [`WindowMatch`]
-/// (see the module doc); `title`/`application_name` are read out as owned `String`s inside
-/// the completion block for the same reason `WindowMatch`'s fields are plain owned data.
+/// A discovered on-screen window, as returned by [`list_app_windows`]: the `CGWindowID`, pixel
+/// geometry, title, and owning application name — everything `backend::list_windows` needs to
+/// build a `WindowInfo` per window. `title`/`application_name` are read out as owned `String`s
+/// inside the completion block, same rationale as [`WindowMatch`] (see the module doc).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AppWindow {
     /// `SCWindow.windowID()` (`CGWindowID`) — becomes `WindowInfo.id`.
@@ -100,8 +89,6 @@ pub(crate) struct AppWindow {
 
 /// Poll `SCShareableContent` roughly every 100ms for the first on-screen window whose
 /// `owningApplication().processID()` is in `pids`, until found or `timeout` elapses.
-/// Multi-window selection (picking among several matches for the same app) is Plan 4;
-/// this returns the first on-screen match.
 ///
 /// Calls [`crate::ffi::app_kit_init`] first to establish the window-server connection —
 /// required before any ScreenCaptureKit call from a bare CLI process (see `ffi.rs`).
@@ -111,15 +98,11 @@ pub(crate) struct AppWindow {
 /// [`GlassError::CaptureFailed`] for anything else) or [`GlassError::Timeout`] if no
 /// matching window appears before `timeout` elapses.
 ///
-/// `MacosPlatform::start_app` still can't use this directly: it runs its own poll loop
-/// (`backend.rs::discover_window`) that alternates a single `query_once_with_candidates`
-/// attempt with `child.try_wait()` so a crashed launch fails fast with `AppExited`, and
-/// this function's self-contained `poll_until` has no child handle to race against. But
-/// `MacosPlatform::send_pointer` does call this directly on every invocation, to
-/// re-resolve the window's current geometry/scale/origin fresh (the window may have moved
-/// or resized since `start_app`, or since the previous `send_pointer` call) — there's no
-/// child handle to race there either (the session is already established), so this
-/// self-contained poll-until-found-or-timeout is exactly what it needs.
+/// `MacosPlatform::start_app` can't use this: it runs its own poll loop
+/// (`backend.rs::discover_window`) alternating a single `query_once_with_candidates` attempt
+/// with `child.try_wait()`, and this function's self-contained `poll_until` has no child handle
+/// to race against. `MacosPlatform::send_pointer` does call it directly on every invocation, to
+/// re-resolve the window's current geometry/scale/origin fresh.
 pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<WindowMatch> {
     crate::ffi::app_kit_init();
 
@@ -130,26 +113,20 @@ pub(crate) fn find_window_for_pids(pids: &[i32], timeout: Duration) -> Result<Wi
 
 /// Poll `SCShareableContent` roughly every 100ms for the on-screen window whose
 /// `windowID() == window_id` AND `owningApplication().processID() ∈ pids`, until found or
-/// `timeout` elapses. This is Plan 4's active-window retargeting lookup: `backend.rs` calls
-/// it on every `capture_frame`/`send_pointer`/`send_key` once `select_window` has set an
-/// active `CGWindowID`, in place of [`find_window_for_pids`]'s first-on-screen-by-pid
-/// resolution — see its module doc for why re-resolving fresh per call (rather than caching
-/// a `Retained<SCWindow>`) is the only safe option.
+/// `timeout` elapses. The active-window retargeting lookup: `backend.rs` calls it on every
+/// `capture_frame`/`send_pointer`/`send_key` once `select_window` has set an active
+/// `CGWindowID`, in place of [`find_window_for_pids`]'s first-on-screen-by-pid resolution.
 ///
-/// The `pids` filter (final-review fix 1) closes a silent-wrong-target hole: without it, a
-/// stale/foreign `CGWindowID` — e.g. left over in `MacosPlatform::active_window` after the
-/// windowing system recycles an id, or a bug that stores an id from a window that was never
-/// actually confirmed to belong to this app — would happily match *any* on-screen window
-/// system-wide, and every caller would silently capture/click/type into someone else's
-/// window. Scoping the match to `pids` turns that into a loud [`GlassError::WindowNotFound`]
-/// instead.
+/// Do not drop the `pids` filter: `windowID` is not scoped to any app, so without it a
+/// stale or foreign `CGWindowID` — one left over in `MacosPlatform::active_window` after the
+/// windowing system recycles an id — matches *any* on-screen window system-wide, and callers
+/// silently capture/click/type into someone else's window. Scoped, that becomes a loud
+/// [`GlassError::WindowNotFound`].
 ///
-/// Unlike `find_window_for_pids`'s [`GlassError::Timeout`] (appropriate while waiting for a
-/// brand-new window to first appear at launch), a `window_id` that never turns up here means
-/// a *previously known* window is gone — closed, no longer owned by `pids`, or the id was
-/// never valid — so this returns [`GlassError::WindowNotFound`] instead, matching the
-/// `Platform` contract's `select_window`/window-op error (`glass_core::platform`'s doc) for
-/// exactly that case.
+/// Unlike `find_window_for_pids`'s [`GlassError::Timeout`] (waiting for a brand-new window at
+/// launch), a `window_id` that never turns up here means a *previously known* window is gone —
+/// closed, no longer owned by `pids`, or never valid — so this returns
+/// [`GlassError::WindowNotFound`], matching the `Platform` contract's `select_window` error.
 ///
 /// Returns a classified [`GlassError::PermissionDenied`]/[`GlassError::CaptureFailed`]
 /// immediately on a genuine `SCShareableContent` failure, same as `find_window_for_pids`.
@@ -167,12 +144,10 @@ pub(crate) fn find_window_by_id(
 
 /// Whether a scan should also collect a summary of every candidate it saw.
 ///
-/// [`Candidates::Skip`] stops at the first match and allocates nothing — `capture_window`'s
-/// and `find_window_for_pids`'s fallback, reached only while `active_window` is unset; once a
-/// session has adopted a window, `capture_frame`/`resolve_active_window` resolve by id via
-/// `find_window_by_id` instead, a separate loop this enum doesn't touch. [`Candidates::Collect`]
-/// is the once-per-session adoption path, which pays for a full pass so the adoption record can
-/// name what it chose between (#263).
+/// [`Candidates::Skip`] stops at the first match and allocates nothing — `capture_window`'s and
+/// `find_window_for_pids`'s fallback, reached only while `active_window` is unset.
+/// [`Candidates::Collect`] is the once-per-session adoption path, which pays for a full pass so
+/// the adoption record can name what it chose between (#263).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Candidates {
     Skip,
@@ -184,9 +159,8 @@ pub(crate) enum Candidates {
 /// summary of every such window in the same order, with the returned one marked adopted.
 ///
 /// One loop for both modes so the hot lookup and the adoption record can never disagree about
-/// what "the target window" means. [`find_on_screen_window_by_id`] keeps its own separate
-/// loop rather than sharing this one — it matches by `window_id` + pid, not pid alone, so
-/// there's no `Candidates`-style mode to dedup against here.
+/// what "the target window" means. [`find_on_screen_window_by_id`] keeps its own loop — it
+/// matches by `window_id` + pid, not pid alone.
 pub(crate) fn scan_on_screen_windows(
     content: &SCShareableContent,
     pids: &[i32],
@@ -252,19 +226,13 @@ pub(crate) fn find_on_screen_window(
 
 /// Find the on-screen `SCWindow` in `content.windows()` whose `windowID() == window_id` AND
 /// `owningApplication().processID() ∈ pids`, returning it alongside its owning pid. The
-/// `find_window_by_id`-side counterpart of [`find_on_screen_window`] (which filters by
-/// owning pid alone instead of a specific window + pid set): its own copy of the same
-/// on-screen filter shape as [`scan_on_screen_windows`]'s loop, not a shared call — keeping
-/// the two in sync on what "on-screen" means is a discipline, not something enforced.
-/// The `pids` check (final-review fix 1) is load-bearing, not defensive: `windowID` alone
-/// is not scoped to any particular app, so without it this would match *any* on-screen
-/// window system-wide, letting a stale/foreign `CGWindowID` silently resolve to someone
-/// else's window — see [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] (which
-/// then builds a [`WindowMatch`] snapshot via [`window_match_from`], the same builder
-/// `query_once_inner` uses) and by `capture::capture_window_by_id` (which, like
-/// `capture_window`, needs the live `SCWindow` itself, still inside the same
-/// completion-handler callback, to build an `SCContentFilter` — see
-/// [`find_on_screen_window`]'s doc).
+/// `find_window_by_id`-side counterpart of [`find_on_screen_window`] (which filters by owning
+/// pid alone). Carries its own copy of [`scan_on_screen_windows`]'s on-screen filter rather
+/// than sharing it — keeping the two in sync on what "on-screen" means is a discipline, not
+/// something enforced. The `pids` check is load-bearing, not defensive: see
+/// [`find_window_by_id`]'s doc. Used by [`query_once_by_id`] and by
+/// `capture::capture_window_by_id`, which needs the live `SCWindow` itself inside the
+/// completion-handler callback to build an `SCContentFilter`.
 pub(crate) fn find_on_screen_window_by_id(
     content: &SCShareableContent,
     window_id: u32,
@@ -343,14 +311,12 @@ fn window_match_from(w: &SCWindow, pid: i32) -> WindowMatch {
 }
 
 /// Build an [`AppWindow`] snapshot from a live `SCWindow` + its already-resolved owning
-/// `app` — [`list_app_windows`]'s per-window counterpart of [`window_match_from`], reading
-/// out title and owning application name as owned `String`s alongside the same pixel
-/// geometry derivation. Takes `app` rather than re-deriving it via `w.owningApplication()`
-/// (final-review fix M3): `list_app_windows`'s loop has already called that getter once to
-/// filter by pid, so a second call here would be redundant — and since that filter already
-/// guarantees every `w` passed here has an owning application, `application_name` is always
-/// `Some` (the field stays `Option<String>` to match `AppWindow`'s general shape, matching
-/// `WindowInfo::class`'s own `Option<String>`).
+/// `app` — [`list_app_windows`]'s per-window counterpart of [`window_match_from`], reading out
+/// title and owning application name as owned `String`s alongside the same pixel geometry
+/// derivation. Takes `app` rather than re-deriving it via `w.owningApplication()`, which
+/// `list_app_windows`'s loop has already called to filter by pid. That filter also guarantees
+/// every `w` here has an owning application, so `application_name` is always `Some`; the field
+/// stays `Option<String>` to match `WindowInfo::class`.
 fn app_window_from(w: &SCWindow, app: &SCRunningApplication) -> AppWindow {
     // SAFETY: `w` is live (see `window_geometry_and_scale`'s identical note); these are
     // plain property getters with no other preconditions.
@@ -371,11 +337,10 @@ fn app_window_from(w: &SCWindow, app: &SCRunningApplication) -> AppWindow {
 }
 
 /// Enumerate every on-screen window owned by one of `pids`, via a single `SCShareableContent`
-/// query (the multi-window counterpart of [`find_window_for_pids`]'s first-match lookup —
-/// Plan 4's `list_windows`). Unlike [`find_window_for_pids`]/[`find_window_by_id`], this does
-/// not `poll_until` retry: it's a one-shot snapshot, and an app legitimately having zero
-/// on-screen windows at some moment is a normal `Ok(vec![])`, not a `Timeout`/`WindowNotFound`
-/// condition worth retrying.
+/// query (the multi-window counterpart of [`find_window_for_pids`]'s first-match lookup).
+/// Unlike [`find_window_for_pids`]/[`find_window_by_id`], this does not `poll_until` retry:
+/// it's a one-shot snapshot, and an app legitimately having zero on-screen windows at some
+/// moment is a normal `Ok(vec![])`.
 ///
 /// Calls [`crate::ffi::app_kit_init`] first, same as `find_window_for_pids`. Returns a
 /// classified error immediately on a genuine `SCShareableContent` failure (same
@@ -458,12 +423,10 @@ pub(crate) fn list_app_windows(pids: &[i32]) -> Result<Vec<AppWindow>> {
 }
 
 /// Cap on a single [`query_once`]/[`query_once_with_candidates`] attempt's wait for its
-/// `SCShareableContent` completion handler. A query resolves in well under a second in the
-/// spike's observations, so this is a wedged-handler backstop, not normal latency; kept
-/// small (rather than the old 5s) so it can't itself eat much of the outer poll loop's
-/// `timeout_ms`/deadline budget on a single bad tick — that budget is owned by the caller
-/// (`find_window_for_pids`'s `poll_until`, or `backend.rs::discover_window`'s own loop),
-/// which retries (or times out) regardless of this cap.
+/// `SCShareableContent` completion handler. A query resolves in well under a second, so this is
+/// a wedged-handler backstop, not normal latency. Kept small so it can't eat much of the outer
+/// poll loop's deadline budget on a single bad tick — that budget belongs to the caller
+/// (`find_window_for_pids`'s `poll_until`, or `backend.rs::discover_window`'s own loop).
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The shared body of [`query_once`] and [`query_once_with_candidates`]: one
@@ -477,10 +440,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// pays nothing for a candidate summary it never uses.
 ///
 /// The adopted window's geometry is read once here, from the `WindowMatch` snapshot
-/// ([`window_match_from`]) — not re-derived from the scan's own (separately-read) candidate
-/// entry — so the printed record and the geometry glass goes on to use can't diverge even in
-/// theory (final-review fix, #263): whichever candidate is `adopted` gets its `geometry`
-/// overwritten with the `WindowMatch`'s.
+/// ([`window_match_from`]) — not re-derived from the scan's own separately-read candidate entry
+/// — so the printed record and the geometry glass goes on to use can't diverge (#263):
+/// whichever candidate is `adopted` gets its `geometry` overwritten with the `WindowMatch`'s.
 fn query_once_inner(
     pids: &[i32],
     collect: Candidates,
@@ -568,8 +530,8 @@ enum CandidateQueryReply {
 
 /// [`find_window_by_id`]'s per-attempt round trip — identical shape to [`query_once`] (same
 /// `RcBlock` -> `mpsc` bridge, same `QUERY_TIMEOUT` cap, same error classification) but
-/// matching on a specific `window_id` (scoped to `pids`, final-review fix 1) via
-/// [`find_on_screen_window_by_id`] instead of an owning-pid set alone.
+/// matching on a specific `window_id` (scoped to `pids`) via [`find_on_screen_window_by_id`]
+/// instead of an owning-pid set alone.
 fn query_once_by_id(window_id: u32, pids: &[i32]) -> Result<Option<WindowMatch>> {
     let (tx, rx) = mpsc::channel::<QueryReply>();
     let pids_owned: Vec<i32> = pids.to_vec();

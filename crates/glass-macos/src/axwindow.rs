@@ -11,11 +11,10 @@
 //! [`_AXUIElementGetWindow`] is the well-known private symbol every AX-based window
 //! manager (Rectangle, yabai, BetterDisplay, Hammerspoon) uses for exactly this: given an
 //! `AXUIElementRef`, it writes out the `CGWindowID` that window belongs to. It is
-//! undocumented, unversioned, and Apple could remove or rename it in any macOS release —
-//! the same posture this codebase takes with other private APIs (e.g. the planned
-//! `CGVirtualDisplay` provider): contained in one module, never the *only* path, and
-//! flagged here so a later maintainer knows to re-validate it against each new macOS
-//! major. [`ax_window_for_cgwindowid`] never trusts it exclusively: if the private call
+//! undocumented, unversioned, and Apple could remove or rename it in any macOS release, so
+//! it is contained in one module, never the *only* path, and flagged here so a later
+//! maintainer knows to re-validate it against each new macOS major.
+//! [`ax_window_for_cgwindowid`] never trusts it exclusively: if the private call
 //! errors on *every* enumerated window (the "symbol looks broken" signal — distinct from
 //! "this particular window just isn't among them"), it falls back to matching the
 //! `AXUIElement`'s own position/size (converted points -> pixels via
