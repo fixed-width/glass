@@ -105,8 +105,8 @@ pub(crate) fn dump_once(
     let stderr = match run(&["shell", "uiautomator", "dump", &path], deadline) {
         Ok((_, stderr)) => stderr,
         Err(e) if died_unexplained(&e) => {
-            // The crash is raised mid-walk, after the file is opened, so this attempt can own one
-            // even though it never finished it. Retried, each crash would strand another.
+            // The crash is raised after the file is opened, so this attempt can own one. Retried,
+            // each crash would strand another.
             let _ = run(&["shell", "rm", "-f", &path], deadline);
             return Err(GlassError::AccessibilityUnavailable(format!(
                 "uiautomator dump exited without writing {path} and without saying why; \
@@ -149,7 +149,7 @@ fn bound_fired(e: &GlassError) -> bool {
 /// It dies with a `NullPointerException` walking a tree that is still changing, exiting non-zero
 /// with an empty stderr because the trace goes to logcat via `AndroidRuntime` (glass#341). That
 /// resolves by waiting. adb's own failures — a device that is gone, a wedged server — always carry
-/// a reason and do not, so only the silent one is treated as a readiness problem.
+/// a reason and do not.
 fn died_unexplained(e: &GlassError) -> bool {
     !bound_fired(e) && e.to_string().trim_end().ends_with("failed:")
 }
@@ -512,8 +512,7 @@ mod tests {
         ))
     }
 
-    /// What `Adb` raises for a `uiautomator` that crashed: a non-zero exit with **nothing** on
-    /// stderr, because the trace went to logcat via `AndroidRuntime` (glass#341).
+    /// What `Adb` raises for the crash [`died_unexplained`] names: non-zero exit, empty stderr.
     fn crash_err(path: &str) -> GlassError {
         GlassError::Backend(format!("`adb shell uiautomator dump {path}` failed: "))
     }
@@ -875,9 +874,8 @@ mod tests {
 
     #[test]
     fn a_dump_that_died_without_explaining_itself_is_retried() {
-        // `uiautomator` crashes walking a tree that is still changing, exiting non-zero with an
-        // empty stderr because the trace went to logcat (glass#341). Measured at 3 failures in 14
-        // runs; a later dump against a settled tree succeeds, so waiting is the whole remedy.
+        // Measured at 3 failures in 14 runs entering the suite straight from a snapshot restore;
+        // a later dump against a settled tree succeeds, so waiting is the whole remedy.
         let mut run = fake_crashing(2);
         let xml = dump_until_ready(&mut run, PREFIX, Duration::from_secs(30), Duration::ZERO)
             .expect("a dump that crashed must be retried inside the budget");
@@ -886,9 +884,7 @@ mod tests {
 
     #[test]
     fn a_dump_that_crashed_takes_its_partial_file_with_it() {
-        // The crash is raised inside `dumpWindowToFile`, so the file can already exist when
-        // uiautomator dies. Retrying a crash that leaves its file behind would strand one per
-        // attempt on /sdcard.
+        // The crash is raised inside `dumpWindowToFile`, so a dead attempt can still own a file.
         let mut files: HashMap<String, String> = HashMap::new();
         let mut dumps = 0;
         {
