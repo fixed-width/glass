@@ -820,8 +820,7 @@ mod tests {
     fn a_cell_naming_a_token_names_one_token_and_not_prose() {
         // The token is machine-checked by each backend's column test, so it has to be a token:
         // a phrase slipped into the field would resolve to `Other` and pass every check
-        // vacuously, which is exactly the "reads plausible, proves nothing" failure this
-        // field exists to end.
+        // vacuously.
         for (role, cells) in ROLE_SUPPORT {
             for (i, cell) in cells.iter().enumerate() {
                 let Some(token) = cell.named_token() else {

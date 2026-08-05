@@ -1491,10 +1491,8 @@ mod tests {
 
     #[test]
     fn for_region_rejects_a_zero_area_rect_before_intersecting() {
-        // `for_region` validates zero-area up front — before intersecting with the
-        // region — so region-scoping can't launder a zero-area rect into a silent
-        // drop. Exercises `for_region`'s own validation branch, distinct from
-        // `new`'s (covered by `zero_area_rect_is_an_error`).
+        // `for_region` validates zero-area up front, before intersecting with the region, so
+        // region-scoping can't launder a zero-area rect into a silent drop.
         let region = rect(0, 0, 10, 10);
         assert!(matches!(
             IgnoreMask::for_region(&[rect(0, 0, 0, 4)], &region).unwrap_err(),
@@ -1767,13 +1765,10 @@ mod tests {
 
         let masked = diff_perceptual_with_mask(&a, &b, 0.1, &mask).unwrap();
 
-        // The real invariant: every surviving pixel must classify exactly as it
-        // would from the true, unmutated frames. `reference_perceptual_masked`
-        // is that definition made concrete — it calls `classify` on `a.pixels`
-        // and `b.pixels` verbatim and never mutates either frame. Equality here
-        // is what "in-loop masking never disturbs anti-alias classification"
-        // means; it would still hold trivially if this fixture didn't
-        // discriminate, which is why the concrete counts below matter too.
+        // The real invariant: every surviving pixel must classify exactly as it would from
+        // the true, unmutated frames. `reference_perceptual_masked` is that definition made
+        // concrete — it calls `classify` on `a.pixels` and `b.pixels` verbatim and mutates
+        // neither frame.
         let reference = reference_perceptual_masked(&a, &b, 0.1, &mask);
         assert_eq!(
             masked, reference,
