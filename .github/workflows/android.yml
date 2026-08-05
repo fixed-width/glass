@@ -1,30 +1,26 @@
 name: Android
 
-# WHY THIS RUNS ON A SCHEDULE AND NOT ON PULL REQUESTS
+# WHY THIS IS SCHEDULE-ONLY AND NOT PART OF CI
 #
-# Not for speed: a warm run is ~3-4 minutes, the two jobs in parallel, of which the tests are
-# ~70 seconds. It stays off pull requests because:
+# Every run costs larger-runner minutes on a real AVD, so no code event may trigger one: not pull
+# requests, and not pushes to master. The nightly is the whole budget; `workflow_dispatch` spends
+# more only when someone asks for it by hand.
 #
-#   - A cache miss is not 3 minutes — a cold run pays full AVD creation, and bumping AGENT_TAG
-#     also pays a JDK install and a Gradle build, landing on whichever PR follows an eviction.
-#   - These are larger-runner minutes, billed per run, on every push to every branch.
-#   - The flake profile is young: bringing this up found three intermittent tests.
+# It also could not gate a merge if it wanted to — these tests drive a live emulator and the flake
+# profile is real: three intermittent tests so far, and `set_value_reports_whether_the_write_landed`
+# has failed on master runs that a rerun of the same commit passed (glass#338).
 #
 # So this detects rather than prevents: a PR that drops every click to a pointer tap still merges
-# green, and the push-to-master trigger then names the merge that broke it. See glass#320.
-#
-# Worth revisiting once there is real nightly history.
+# green, and the nightly names the day it broke. See glass#320.
 
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC (02:00 PT in summer, 01:00 in winter)
   workflow_dispatch:
-  push:
-    branches: [master]
 
 concurrency:
-  # One group covers the schedule, push:master and dispatch, so cancelling would let a merge
-  # landing mid-nightly kill it — cancelled is not failed, so no artifacts and no signal.
+  # One group covers the schedule and dispatch, so cancelling would let a hand-run kill a nightly
+  # — cancelled is not failed, so no artifacts and no signal.
   group: android-${{ github.ref }}
   cancel-in-progress: false
 
