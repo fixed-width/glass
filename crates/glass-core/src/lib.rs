@@ -7,13 +7,13 @@
 // Modules are added task-by-task.
 
 pub mod error;
-pub use error::{GlassError, Result};
+pub use error::{BoundKind, GlassError, Result};
 
 pub mod toolpath;
 pub use toolpath::tool_path;
 
 pub mod bounded;
-pub use bounded::{NOT_STARTED, TIMED_OUT, run_bounded, run_bounded_until, run_bounded_with_stdin};
+pub use bounded::{run_bounded, run_bounded_until, run_bounded_with_stdin};
 
 pub mod set_value;
 pub use set_value::{read_back_confirms, typed_clear_landed, typed_text_landed};

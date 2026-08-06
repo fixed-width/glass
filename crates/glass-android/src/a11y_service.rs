@@ -504,8 +504,15 @@ const SOCKET: &str = "glass-a11y";
 
 /// True when an `adb install` failure is the "existing package signed differently" case
 /// that only an uninstall can clear (e.g. a release APK over a local debug build).
-fn is_signature_mismatch(err: &str) -> bool {
-    err.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || err.contains("signatures do not match")
+///
+/// Read from what the tool said, never from the rendered message: that also names the argv, so an
+/// APK path quoting either phrase sent every install failure down the uninstall branch — the
+/// hazard `AdbOp::for_args` documents for argv (glass#348).
+fn is_signature_mismatch(e: &GlassError) -> bool {
+    e.tool_said().is_some_and(|said| {
+        said.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+            || said.contains("signatures do not match")
+    })
 }
 
 /// Install the service APK, recovering from a signature mismatch. glass owns this package
@@ -514,7 +521,7 @@ fn is_signature_mismatch(err: &str) -> bool {
 fn install_service(adb: &Adb, apk: &str) -> Result<()> {
     match adb.run(["install", "-r", apk]) {
         Ok(_) => Ok(()),
-        Err(e) if is_signature_mismatch(&e.to_string()) => {
+        Err(e) if is_signature_mismatch(&e) => {
             eprintln!(
                 "glass-a11y: replacing a differently-signed existing install of {SERVICE_PACKAGE}"
             );
@@ -1086,16 +1093,41 @@ mod tests {
 
     #[test]
     fn signature_mismatch_detected() {
-        assert!(is_signature_mismatch(
+        let failed = |said: &str| {
+            crate::adb::a_failed_call(&["install", "-r", "/opt/glass/glass-a11y.apk"], said)
+        };
+        assert!(is_signature_mismatch(&failed(
             "Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match newer version; ignoring!]"
-        ));
-        assert!(is_signature_mismatch(
+        )));
+        assert!(is_signature_mismatch(&failed(
             "signatures do not match newer version"
-        ));
-        assert!(!is_signature_mismatch(
+        )));
+        assert!(!is_signature_mismatch(&failed(
             "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"
-        ));
-        assert!(!is_signature_mismatch("error: device offline"));
+        )));
+        assert!(!is_signature_mismatch(&failed("error: device offline")));
+    }
+
+    /// `GLASS_ANDROID_A11Y_APK` is caller-supplied and lands in the argv the error names, so a
+    /// path quoting the phrase used to make every install failure take the uninstall branch.
+    #[test]
+    fn a_phrase_in_the_apk_path_does_not_make_an_unrelated_failure_a_signature_mismatch() {
+        let poisoned = "/home/u/signatures do not match/glass-a11y.apk";
+        for said in [
+            "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]",
+            "error: device offline",
+        ] {
+            let e = crate::adb::a_failed_call(&["install", "-r", poisoned], said);
+            assert!(!is_signature_mismatch(&e), "{e}");
+        }
+    }
+
+    /// A timed-out install says nothing about signatures: it names no exit status, and the message
+    /// it does carry quotes whatever the child printed first.
+    #[test]
+    fn an_install_that_timed_out_is_not_a_signature_mismatch() {
+        let e = crate::adb::a_real_timeout_hinted();
+        assert!(!is_signature_mismatch(&e), "{e}");
     }
 
     #[test]

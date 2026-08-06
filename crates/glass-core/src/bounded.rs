@@ -13,16 +13,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::{GlassError, Result};
+use crate::{BoundKind, GlassError, Result};
 
-/// The phrase a timeout error carries, so a caller can recognise one without matching on prose it
-/// does not own — `glass-android` offers `adb kill-server` for a timeout and for nothing else.
-pub const TIMED_OUT: &str = "no answer within";
+/// The phrase a timeout error carries, for a reader of the message. What a *caller* keys on is
+/// [`BoundKind::TimedOut`]: the message this appears in embeds the child's own output, so matching
+/// on it is matching prose the device helps write (glass#348).
+const TIMED_OUT: &str = "no answer within";
 
 /// The phrase an error carries when a call was never started, because the deadline it serves was
 /// already spent. Deliberately not [`TIMED_OUT`]: the remedies for a tool that hung do not apply to
-/// one that never ran.
-pub const NOT_STARTED: &str = "was not started";
+/// one that never ran, and [`BoundKind`] keeps the two apart for callers.
+const NOT_STARTED: &str = "was not started";
 
 /// Longest gap between checks on a child that has not exited yet. The wait starts far tighter and
 /// backs off to this, so a one-shot that answers in a millisecond is not billed a full tick and a
@@ -67,7 +68,7 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
 /// Several calls can answer one request: one `uiautomator dump` is a remove, a dump and a read.
 /// Each carrying only its own budget makes the sequence cost their sum, so the deadline travels
 /// down and each step gets whichever bound is nearer. A step with nothing left is not started at
-/// all, and says [`NOT_STARTED`].
+/// all, and fails with [`BoundKind::NotStarted`].
 pub fn run_bounded_until(
     cmd: &mut Command,
     budget: Duration,
@@ -76,10 +77,13 @@ pub fn run_bounded_until(
 ) -> Result<Output> {
     let budget = budget_within(budget, deadline, Instant::now());
     if budget.is_zero() {
-        return Err(GlassError::Backend(format!(
-            "{op}: the deadline it shares with the rest of the call was already spent, so it \
-             {NOT_STARTED}"
-        )));
+        return Err(GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            message: format!(
+                "{op}: the deadline it shares with the rest of the call was already spent, so it \
+                 {NOT_STARTED}"
+            ),
+        });
     }
     run_bounded_inner(cmd, budget, op, None)
 }
@@ -384,7 +388,10 @@ fn timed_out(
     } else {
         "so the process was killed, though it had not exited yet (it may be stuck in the kernel)"
     };
-    GlassError::Backend(format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"))
+    GlassError::Bounded {
+        kind: BoundKind::TimedOut,
+        message: format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -807,8 +814,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("test:spent-deadline"), "{msg}");
         assert!(msg.contains(NOT_STARTED), "{msg}");
-        // Nothing was asked, so nothing failed to answer — and `with_adb_hint` and its kind key on
-        // this phrase to offer remedies for a wedged tool.
+        // Nothing was asked, so nothing failed to answer — a reader must not be told the tool
+        // hung. Callers key on `BoundKind`, not on this phrase.
         assert!(!msg.contains(TIMED_OUT), "{msg}");
     }
 
@@ -826,6 +833,65 @@ mod tests {
         .expect("a fast command yields its Output");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ready");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_call_killed_at_its_bound_says_it_timed_out_as_a_value() {
+        // That a bound fired decides whether a backend retries and whether a caller's spent budget
+        // is reported as a device failure; which one decides whether the wedged-tool remedy is
+        // offered.
+        let hung = run_bounded(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(300),
+            "test:kind-timeout",
+        )
+        .expect_err("must time out");
+        assert_eq!(hung.bound(), Some(BoundKind::TimedOut), "{hung}");
+    }
+
+    #[test]
+    fn a_call_with_nothing_left_says_it_never_started_as_a_value() {
+        // This path returns before anything is spawned, so the binary need not exist — which is
+        // what lets the Windows leg cover the kind a `wait_for_element` polls through.
+        let spent = run_bounded_until(
+            &mut Command::new("/nonexistent/glass-test-binary"),
+            Duration::from_secs(20),
+            Instant::now(),
+            "test:kind-not-started",
+        )
+        .expect_err("a call with no time left must fail rather than run");
+        assert_eq!(spent.bound(), Some(BoundKind::NotStarted), "{spent}");
+    }
+
+    #[test]
+    fn a_failure_that_is_not_a_bound_firing_carries_no_kind() {
+        // The classification must not widen to "this call failed": a missing binary read as a
+        // bound becomes a wait polling on for its whole timeout instead of failing at once.
+        // Portable, so the Windows leg covers this direction too.
+        let spawn = run_bounded(
+            &mut Command::new("/nonexistent/glass-test-binary"),
+            Duration::from_secs(10),
+            "test:kind-spawn",
+        )
+        .expect_err("spawn must fail");
+        assert_eq!(spawn.bound(), None, "{spawn}");
+
+        assert_eq!(GlassError::Backend("device offline".into()).bound(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_answered_before_a_glass_side_timer_elapsed_is_no_bound_firing() {
+        // `DRAIN_SETTLE` does elapse here, so this is the case that looks most like a bound and is
+        // not one: the child exited on its own, and the deadline never came near.
+        let held_open = run_bounded(
+            Command::new("/bin/sh").args(["-c", "printf head; { sleep 1; printf tail; } &"]),
+            Duration::from_secs(20),
+            "test:kind-incomplete",
+        )
+        .expect_err("an incomplete read is an error");
+        assert_eq!(held_open.bound(), None, "{held_open}");
     }
 
     #[test]
