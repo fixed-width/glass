@@ -186,11 +186,21 @@ pub enum GlassError {
     #[error("{which} permission denied: {remedy}")]
     PermissionDenied { which: String, remedy: String },
 
-    /// A backend failure the backend itself reported. A call that ended at one of glass's own
-    /// bounds is [`Self::Bounded`], which displays identically — classify with [`Self::bound`]
-    /// rather than by matching this variant, which is false for it.
+    /// A backend failure the backend itself reported. Two neighbours display identically and this
+    /// variant is false for both — [`Self::Bounded`] for a call that ended at one of glass's own
+    /// bounds, [`Self::ToolFailed`] for a tool that ran and exited non-zero. Classify with
+    /// [`Self::bound`] and [`Self::tool_said`] rather than by matching this variant.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// A tool glass drove ran and exited non-zero, carrying what it wrote to stderr.
+    ///
+    /// `said` is empty when the tool failed without a word — for `uiautomator` that is a crash
+    /// whose trace went to the platform log instead (glass#341), and waiting resolves it where an
+    /// explained failure will not. It is a fact about the tool, not about this message, which the
+    /// tool's own output is otherwise free to imitate (glass#348).
+    #[error("backend error: {call} failed: {said}")]
+    ToolFailed { call: String, said: String },
 
     /// A bounded call that ended at one of its bounds instead of at an answer, naming which.
     ///
@@ -239,7 +249,7 @@ impl GlassError {
     /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
     /// accepts is a write onto the wrong element, reported as `Ok`.
     ///
-    /// Some verdicts cannot be classified at all: Android raises `Backend`, `Bounded` and
+    /// Some verdicts cannot be classified at all: Android raises `ToolFailed`, `Bounded` and
     /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
     /// adb handshake fail the same way its post-write read-back does — so no variant-level split
     /// separates them, and the recoverable answer has to win.
@@ -256,6 +266,18 @@ impl GlassError {
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// What a tool wrote to stderr before exiting non-zero, if this is a tool that ran at all.
+    ///
+    /// `Some("")` is the one a backend acts on: a tool that failed saying nothing crashed, and
+    /// crashes are worth retrying where a refusal it explained is not. `None` for every other
+    /// failure, including a bound firing, and for any variant added later.
+    pub fn tool_said(&self) -> Option<&str> {
+        match self {
+            GlassError::ToolFailed { said, .. } => Some(said),
             _ => None,
         }
     }
@@ -328,6 +350,60 @@ mod tests {
             "window not found — the app may not have opened its window yet, or the window glass \
              is targeting is no longer one of its windows"
         );
+    }
+
+    #[test]
+    fn a_tool_failure_reads_exactly_as_the_backend_error_it_replaced() {
+        // The split is a channel for glass, not a message change for the agent — `glass-android`
+        // built this string by hand before it was a variant, down to the trailing space that a
+        // tool which said nothing leaves.
+        assert_eq!(
+            GlassError::ToolFailed {
+                call: "`adb shell cat /sdcard/x.xml`".into(),
+                said: "cat: /sdcard/x.xml: No such file".into(),
+            }
+            .to_string(),
+            "backend error: `adb shell cat /sdcard/x.xml` failed: cat: /sdcard/x.xml: No such file"
+        );
+        assert_eq!(
+            GlassError::ToolFailed {
+                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                said: String::new(),
+            }
+            .to_string(),
+            "backend error: `adb shell uiautomator dump /sdcard/x.xml` failed: "
+        );
+    }
+
+    #[test]
+    fn only_a_tool_that_ran_and_said_nothing_reads_as_a_crash() {
+        // `Some("")` and `None` are the two a backend must not confuse: one is a tool that failed
+        // without a word, which waiting can resolve, the other is a call that never reached one.
+        assert_eq!(
+            GlassError::ToolFailed {
+                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                said: String::new(),
+            }
+            .tool_said(),
+            Some("")
+        );
+        assert_eq!(
+            GlassError::ToolFailed {
+                call: "`adb shell cat /sdcard/x.xml`".into(),
+                said: "No such file".into(),
+            }
+            .tool_said(),
+            Some("No such file")
+        );
+        for e in [
+            GlassError::Backend("device offline".into()),
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                message: "adb:shell: no answer within 10s".into(),
+            },
+        ] {
+            assert_eq!(e.tool_said(), None, "{e}");
+        }
     }
 
     #[test]
@@ -418,6 +494,10 @@ mod tests {
                 kind: BoundKind::TimedOut,
                 message: "adb:shell: no answer within 10s".into(),
             },
+            GlassError::ToolFailed {
+                call: "`adb shell input tap 1 2`".into(),
+                said: String::new(),
+            },
         ] {
             assert!(!e.invoke_fallback_eligible(), "{e}");
         }
@@ -442,6 +522,10 @@ mod tests {
             GlassError::Bounded {
                 kind: BoundKind::TimedOut,
                 message: "adb:uiautomator dump: no answer within 20s".into(),
+            },
+            GlassError::ToolFailed {
+                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                said: String::new(),
             },
         ] {
             assert!(!e.set_value_failed_after_writing(), "{e}");

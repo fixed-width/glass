@@ -118,9 +118,9 @@ fn out_of_time(last: Option<&GlassError>) -> GlassError {
 /// What one dump attempt settled, for a loop deciding whether another would help.
 ///
 /// The judgement is made here, where the failure is diagnosed, rather than inferred by the caller
-/// from which error variant escaped: `uiautomator` crashing without a word arrived as
-/// `GlassError::Backend`, and the `matches!` gate on `AccessibilityUnavailable` that refused to
-/// retry it was repaired by restating the error rather than by fixing the gate (glass#341).
+/// from which error variant escaped: `uiautomator` crashing without a word arrived as an ordinary
+/// backend failure, and the `matches!` gate on `AccessibilityUnavailable` that refused to retry it
+/// was repaired by restating the error rather than by fixing the gate (glass#341).
 pub(crate) enum Attempt {
     Dumped(String),
     /// The device cannot serve a dump *yet* — waiting is what resolves it.
@@ -199,8 +199,12 @@ fn bound_fired(e: &GlassError) -> bool {
 /// with an empty stderr because the trace goes to logcat via `AndroidRuntime` (glass#341). That
 /// resolves by waiting. adb's own failures — a device that is gone, a wedged server — always carry
 /// a reason and do not.
+///
+/// Read off the stderr the error carries rather than the message it renders, which ends in that
+/// same stderr: a device whose last word was "failed:" used to answer this for `uiautomator`
+/// (glass#348).
 fn died_unexplained(e: &GlassError) -> bool {
-    !bound_fired(e) && e.to_string().trim_end().ends_with("failed:")
+    e.tool_said().is_some_and(str::is_empty)
 }
 
 /// How long a readiness wait may retry for, and how many attempts it owes regardless.
@@ -674,7 +678,7 @@ mod tests {
         editable_target, locate_editable_target, locate_for_write, snapshot_bound,
         snapshot_with_runner, verify_write,
     };
-    use crate::adb::{AdbOp, a_real_timeout_hinted};
+    use crate::adb::{AdbOp, a_failed_call, a_real_timeout_hinted};
     use glass_core::accessibility::{
         AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
         WalkLimits,
@@ -735,14 +739,18 @@ mod tests {
     /// The `cat` of a file the dump never wrote — the error the old code surfaced in place
     /// of the dump's own.
     fn read_err(path: &str) -> GlassError {
-        GlassError::Backend(format!(
-            "`adb shell cat {path}` failed: cat: {path}: No such file"
-        ))
+        a_failed_call(
+            &["shell", "cat", path],
+            &format!("cat: {path}: No such file"),
+        )
     }
 
     /// What `Adb` raises for the crash [`died_unexplained`] names: non-zero exit, empty stderr.
+    ///
+    /// Built by `Adb`'s own constructor, so a fixture cannot go on describing a crash the classifier
+    /// has stopped recognising.
     fn crash_err(path: &str) -> GlassError {
-        GlassError::Backend(format!("`adb shell uiautomator dump {path}` failed: "))
+        a_failed_call(&["shell", "uiautomator", "dump", path], "")
     }
 
     /// An adb whose `uiautomator dump` crashes for `crashes` attempts, then succeeds.
@@ -1137,9 +1145,9 @@ mod tests {
     fn an_adb_failure_under_a_live_deadline_is_still_a_broken_device() {
         let mut gone = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
             match argv {
-                ["shell", "uiautomator", "dump", _] => Err(GlassError::Backend(
-                    "`adb shell uiautomator dump` failed: error: device 'emulator-5554' not found"
-                        .into(),
+                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
+                    &["shell", "uiautomator", "dump", path],
+                    "error: device 'emulator-5554' not found",
                 )),
                 _ => Ok((String::new(), String::new())),
             }
@@ -1155,7 +1163,11 @@ mod tests {
         )
         .expect_err("the device is gone");
 
-        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+        assert_eq!(
+            e.bound(),
+            None,
+            "a dead device was read as a bound of glass's: {e}"
+        );
         assert!(
             !e.to_string().contains("within the time this call allowed"),
             "a dead device was reported as a spent caller budget: {e}"
@@ -1184,7 +1196,7 @@ mod tests {
     /// nobody is waiting on any more.
     ///
     /// The stderr matters: `said_before_the_kill` quotes it into the timeout message, so the
-    /// message really does end in `failed:`.
+    /// message really does end in `failed:` — which is what the old prose match keyed on.
     #[test]
     #[cfg(unix)]
     fn a_bound_that_fired_is_no_crash_even_when_the_message_ends_as_one() {
@@ -1223,10 +1235,9 @@ mod tests {
     fn a_device_failure_that_quotes_the_deadline_wording_is_still_a_broken_device() {
         let mut quoting = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
             match argv {
-                ["shell", "uiautomator", "dump", _] => Err(GlassError::Backend(
-                    "`adb shell uiautomator dump` failed: java.lang.IllegalStateException: \
-                     UiAutomation was not started"
-                        .into(),
+                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
+                    &["shell", "uiautomator", "dump", path],
+                    "java.lang.IllegalStateException: UiAutomation was not started",
                 )),
                 _ => Ok((String::new(), String::new())),
             }
@@ -1240,7 +1251,11 @@ mod tests {
         )
         .expect_err("the device failed");
 
-        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+        assert_eq!(e.bound(), None, "{e}");
+        assert!(
+            e.to_string().contains("IllegalStateException"),
+            "the device's own reason was replaced: {e}"
+        );
     }
 
     /// [`RetryBound::least`] says how many attempts the *device* is owed, not how many a caller
@@ -1318,7 +1333,7 @@ mod tests {
     }
 
     /// Retryability is the attempt's own verdict, not a guess from the error variant it carries:
-    /// both of these are `GlassError::Backend` underneath.
+    /// both of these are `GlassError::ToolFailed` underneath, differing only in what the tool said.
     #[test]
     fn an_attempt_says_whether_waiting_could_help_rather_than_leaving_it_to_be_inferred() {
         let mut crashed = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
@@ -1334,8 +1349,9 @@ mod tests {
 
         let mut gone = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
             match argv {
-                ["shell", "uiautomator", "dump", _] => Err(GlassError::Backend(
-                    "`adb shell uiautomator dump` failed: device offline".into(),
+                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
+                    &["shell", "uiautomator", "dump", path],
+                    "device offline",
                 )),
                 _ => Ok((String::new(), String::new())),
             }
@@ -1344,6 +1360,29 @@ mod tests {
             dump_once(&mut gone, PREFIX, ample()),
             Attempt::Fatal(_)
         ));
+    }
+
+    /// A device that said why is never the silent crash, whatever its last word was. The crash is
+    /// retried and its reason replaced with "without saying why", so misreading one loses the only
+    /// explanation there was and sends an operator to a log that has nothing.
+    ///
+    /// The stderr below is constructed rather than observed: no `uiautomator` is known to end a
+    /// line this way, and nothing stops one.
+    #[test]
+    fn a_device_that_explained_itself_is_not_a_crash_however_its_message_ends() {
+        let mut explained = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
+                    &["shell", "uiautomator", "dump", path],
+                    "java.lang.SecurityException: dump failed:",
+                )),
+                _ => Ok((String::new(), String::new())),
+            }
+        };
+        let Attempt::Fatal(e) = dump_once(&mut explained, PREFIX, ample()) else {
+            panic!("a device that gave a reason is not a crash that waiting resolves");
+        };
+        assert!(e.to_string().contains("SecurityException"), "{e}");
     }
 
     #[test]
@@ -1485,7 +1524,11 @@ mod tests {
             }
         };
         let e = settled(dump_once(&mut run, PREFIX, ample())).unwrap_err();
-        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+        assert!(
+            e.tool_said()
+                .is_some_and(|said| said.contains("No such file")),
+            "the read's own reason was replaced: {e}"
+        );
         assert!(!e.to_string().contains("did not write"), "{e}");
     }
 
@@ -1678,10 +1721,11 @@ mod tests {
         let mut attempts = 0;
         let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
             match argv {
-                ["shell", "uiautomator", "dump", _] => {
+                ["shell", "uiautomator", "dump", path] => {
                     attempts += 1;
-                    Err(GlassError::Backend(
-                        "device 'emulator-5554' not found".into(),
+                    Err(a_failed_call(
+                        &["shell", "uiautomator", "dump", path],
+                        "device 'emulator-5554' not found",
                     ))
                 }
                 _ => Ok((String::new(), String::new())),
@@ -1695,7 +1739,7 @@ mod tests {
             AxDeadline::UNBOUNDED,
         )
         .unwrap_err();
-        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+        assert!(e.to_string().contains("not found"), "{e}");
         assert_eq!(
             attempts, 1,
             "must not wait out the budget on a device error"

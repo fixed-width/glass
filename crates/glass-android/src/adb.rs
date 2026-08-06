@@ -170,7 +170,11 @@ impl Adb {
         if out.status.success() {
             Ok(out)
         } else {
-            Err(exit_error(&self.bin, &argv, &out))
+            Err(exit_error(
+                &self.bin,
+                &argv,
+                &String::from_utf8_lossy(&out.stderr),
+            ))
         }
     }
 }
@@ -243,12 +247,20 @@ pub(crate) fn build_argv(serial: Option<&str>, args: &[&str]) -> Vec<String> {
     v
 }
 
-fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
-    GlassError::Backend(format!(
-        "`{bin} {}` failed: {}",
-        argv.join(" "),
-        String::from_utf8_lossy(&out.stderr).trim()
-    ))
+/// The error for a call that ran and exited non-zero. `said` is what it wrote to stderr.
+fn exit_error(bin: &str, argv: &[String], said: &str) -> GlassError {
+    GlassError::ToolFailed {
+        call: format!("`{bin} {}`", argv.join(" ")),
+        said: said.trim().to_string(),
+    }
+}
+
+/// [`exit_error`] as production builds it, for a test that needs a chosen `said` — the whole
+/// question `a11y::died_unexplained` asks is whether that is empty.
+#[cfg(test)]
+pub(crate) fn a_failed_call(argv: &[&str], said: &str) -> GlassError {
+    let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
+    exit_error("adb", &argv, said)
 }
 
 #[cfg(test)]
