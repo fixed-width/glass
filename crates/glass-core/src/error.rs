@@ -195,11 +195,15 @@ pub enum GlassError {
 
     /// A tool glass drove ran and exited non-zero, carrying what it wrote to stderr.
     ///
-    /// `said` is empty when the tool failed without a word — for `uiautomator` that is a crash
-    /// whose trace went to the platform log instead (glass#341), and waiting resolves it where an
-    /// explained failure will not. It is a fact about the tool, not about this message, which the
-    /// tool's own output is otherwise free to imitate (glass#348).
-    #[error("backend error: {call} failed: {said}")]
+    /// `said` is that stderr, trimmed — empty when the tool failed without a word, which for
+    /// `uiautomator` is a crash whose trace went to the platform log instead (glass#341), and
+    /// waiting resolves it where an explained failure will not. Read it through [`Self::tool_said`]
+    /// rather than out of the rendered message, which the tool's own output is free to imitate
+    /// (glass#348). A tool that explains itself on *stdout* reads as silent here.
+    ///
+    /// Not `#[non_exhaustive]`, unlike its sibling [`Self::Bounded`]: every backend that drives an
+    /// external tool raises this legitimately, where only glass's own clock raises a bound.
+    #[error("backend error: `{call}` failed: {said}")]
     ToolFailed { call: String, said: String },
 
     /// A bounded call that ended at one of its bounds instead of at an answer, naming which.
@@ -270,14 +274,17 @@ impl GlassError {
         }
     }
 
-    /// What a tool wrote to stderr before exiting non-zero, if this is a tool that ran at all.
+    /// What a tool wrote to stderr before exiting non-zero, trimmed, if a tool ran at all.
     ///
     /// `Some("")` is the one a backend acts on: a tool that failed saying nothing crashed, and
     /// crashes are worth retrying where a refusal it explained is not. `None` for every other
     /// failure, including a bound firing, and for any variant added later.
+    ///
+    /// Trimmed here and not only at construction, so a producer that forgets cannot turn a crash
+    /// that wrote a bare newline into a refusal glass stops retrying.
     pub fn tool_said(&self) -> Option<&str> {
         match self {
-            GlassError::ToolFailed { said, .. } => Some(said),
+            GlassError::ToolFailed { said, .. } => Some(said.trim()),
             _ => None,
         }
     }
@@ -359,7 +366,7 @@ mod tests {
         // tool which said nothing leaves.
         assert_eq!(
             GlassError::ToolFailed {
-                call: "`adb shell cat /sdcard/x.xml`".into(),
+                call: "adb shell cat /sdcard/x.xml".into(),
                 said: "cat: /sdcard/x.xml: No such file".into(),
             }
             .to_string(),
@@ -367,7 +374,7 @@ mod tests {
         );
         assert_eq!(
             GlassError::ToolFailed {
-                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                call: "adb shell uiautomator dump /sdcard/x.xml".into(),
                 said: String::new(),
             }
             .to_string(),
@@ -378,10 +385,11 @@ mod tests {
     #[test]
     fn only_a_tool_that_ran_and_said_nothing_reads_as_a_crash() {
         // `Some("")` and `None` are the two a backend must not confuse: one is a tool that failed
-        // without a word, which waiting can resolve, the other is a call that never reached one.
+        // without a word, which waiting can resolve; the other has no stderr to speak for it at
+        // all, a killed call included — [`BoundKind::TimedOut`] ran the tool.
         assert_eq!(
             GlassError::ToolFailed {
-                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                call: "adb shell uiautomator dump /sdcard/x.xml".into(),
                 said: String::new(),
             }
             .tool_said(),
@@ -389,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             GlassError::ToolFailed {
-                call: "`adb shell cat /sdcard/x.xml`".into(),
+                call: "adb shell cat /sdcard/x.xml".into(),
                 said: "No such file".into(),
             }
             .tool_said(),
@@ -401,9 +409,26 @@ mod tests {
                 kind: BoundKind::TimedOut,
                 message: "adb:shell: no answer within 10s".into(),
             },
+            GlassError::AccessibilityUnavailable("uiautomator dump wrote nothing".into()),
+            GlassError::AccessibilityNotReady("no tree yet".into()),
         ] {
             assert_eq!(e.tool_said(), None, "{e}");
         }
+    }
+
+    #[test]
+    fn a_tool_that_wrote_only_whitespace_still_reads_as_having_said_nothing() {
+        // A crash that manages a bare newline is still a crash. Trimmed on the way out as well as
+        // on the way in, so a producer that forgets cannot turn one into a refusal glass stops
+        // retrying.
+        assert_eq!(
+            GlassError::ToolFailed {
+                call: "adb shell uiautomator dump /sdcard/x.xml".into(),
+                said: "\n  ".into(),
+            }
+            .tool_said(),
+            Some("")
+        );
     }
 
     #[test]
@@ -495,7 +520,7 @@ mod tests {
                 message: "adb:shell: no answer within 10s".into(),
             },
             GlassError::ToolFailed {
-                call: "`adb shell input tap 1 2`".into(),
+                call: "adb shell input tap 1 2".into(),
                 said: String::new(),
             },
         ] {
@@ -524,7 +549,7 @@ mod tests {
                 message: "adb:uiautomator dump: no answer within 20s".into(),
             },
             GlassError::ToolFailed {
-                call: "`adb shell uiautomator dump /sdcard/x.xml`".into(),
+                call: "adb shell uiautomator dump /sdcard/x.xml".into(),
                 said: String::new(),
             },
         ] {

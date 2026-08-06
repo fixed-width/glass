@@ -170,11 +170,8 @@ impl Adb {
         if out.status.success() {
             Ok(out)
         } else {
-            Err(exit_error(
-                &self.bin,
-                &argv,
-                &String::from_utf8_lossy(&out.stderr),
-            ))
+            let said = String::from_utf8_lossy(&out.stderr);
+            Err(exit_error(&self.bin, &argv, &said))
         }
     }
 }
@@ -250,7 +247,7 @@ pub(crate) fn build_argv(serial: Option<&str>, args: &[&str]) -> Vec<String> {
 /// The error for a call that ran and exited non-zero. `said` is what it wrote to stderr.
 fn exit_error(bin: &str, argv: &[String], said: &str) -> GlassError {
     GlassError::ToolFailed {
-        call: format!("`{bin} {}`", argv.join(" ")),
+        call: format!("{bin} {}", argv.join(" ")),
         said: said.trim().to_string(),
     }
 }
@@ -263,9 +260,29 @@ pub(crate) fn a_failed_call(argv: &[&str], said: &str) -> GlassError {
     exit_error("adb", &argv, said)
 }
 
+/// The error a call to a *missing* binary raises — the shape `a11y` must not read as a tool that
+/// ran and said nothing.
+#[cfg(test)]
+pub(crate) fn a_real_spawn_failure() -> GlassError {
+    let adb = Adb {
+        bin: "/nonexistent/glass-test-adb".to_string(),
+        serial: None,
+    };
+    let e = adb
+        .run(["devices"])
+        .expect_err("a missing binary cannot run");
+    assert_eq!(e.bound(), None, "a missing binary is not a bound: {e}");
+    assert_eq!(
+        e.tool_said(),
+        None,
+        "a tool that never ran said nothing: {e}"
+    );
+    e
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Adb, AdbOp, a_real_timeout, build_argv, with_adb_hint};
+    use super::{Adb, AdbOp, a_failed_call, a_real_timeout, build_argv, with_adb_hint};
     use glass_core::{BoundKind, GlassError};
     use std::time::Duration;
 
@@ -341,6 +358,75 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(err.bound(), Some(BoundKind::TimedOut), "{err}");
+    }
+
+    /// Which stream `said` comes from, proven against a real non-zero exit rather than asserted in
+    /// a doc comment.
+    ///
+    /// `Adb::output` picks the stream, and nothing else exercises that branch: passing `out.stdout`
+    /// instead leaves the whole workspace green while a dead emulator — which writes its reason to
+    /// stderr — reads as the silent crash `a11y` retries for the cold bound, its only explanation
+    /// replaced by "without saying why".
+    ///
+    /// `/bin/sh` stands in for adb; `cmd` does on Windows.
+    #[test]
+    fn a_tool_that_exits_non_zero_carries_its_stderr_and_not_its_stdout() {
+        #[cfg(unix)]
+        let (bin, loud): (&str, &[&str]) = (
+            "/bin/sh",
+            &["-c", "printf not-this; printf boom 1>&2; exit 1"],
+        );
+        #[cfg(windows)]
+        let (bin, loud): (&str, &[&str]) =
+            ("cmd", &["/c", "echo not-this& echo boom 1>&2& exit 1"]);
+        let adb = Adb {
+            bin: bin.to_string(),
+            serial: None,
+        };
+
+        let e = adb
+            .run(loud.iter().copied())
+            .expect_err("a non-zero exit is a failure");
+        // Only `said` discriminates: the message also carries the argv, and the argv here is the
+        // shell command that prints the stdout text, so searching the message finds it either way.
+        assert_eq!(
+            e.tool_said(),
+            Some("boom"),
+            "stdout was read as the reason: {e}"
+        );
+    }
+
+    /// A real silent exit is the crash `a11y::died_unexplained` names — the one fact this whole
+    /// classification turns on, and the one a typed fixture cannot prove.
+    #[test]
+    fn a_tool_that_exits_non_zero_saying_nothing_reads_as_having_said_nothing() {
+        #[cfg(unix)]
+        let (bin, quiet): (&str, &[&str]) = ("/bin/sh", &["-c", "exit 9"]);
+        #[cfg(windows)]
+        let (bin, quiet): (&str, &[&str]) = ("cmd", &["/c", "exit 9"]);
+        let adb = Adb {
+            bin: bin.to_string(),
+            serial: None,
+        };
+
+        let e = adb
+            .run(quiet.iter().copied())
+            .expect_err("a non-zero exit is a failure");
+        assert_eq!(e.tool_said(), Some(""), "{e}");
+        assert_eq!(e.bound(), None, "{e}");
+    }
+
+    /// The fixture the `a11y` tests build their device failures from renders what production does.
+    #[test]
+    fn the_failed_call_fixture_renders_what_a_real_exit_error_does() {
+        assert_eq!(
+            a_failed_call(
+                &["shell", "cat", "/sdcard/x.xml"],
+                "cat: /sdcard/x.xml: No such file"
+            )
+            .to_string(),
+            "backend error: `adb shell cat /sdcard/x.xml` failed: cat: /sdcard/x.xml: No such file"
+        );
     }
 
     #[test]

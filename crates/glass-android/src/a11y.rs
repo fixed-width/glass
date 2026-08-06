@@ -678,7 +678,7 @@ mod tests {
         editable_target, locate_editable_target, locate_for_write, snapshot_bound,
         snapshot_with_runner, verify_write,
     };
-    use crate::adb::{AdbOp, a_failed_call, a_real_timeout_hinted};
+    use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::accessibility::{
         AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
         WalkLimits,
@@ -790,6 +790,20 @@ mod tests {
             ["shell", "cat", path] => Err(read_err(path)),
             ["shell", "rm", "-f", _] => Ok((String::new(), String::new())),
             other => panic!("unexpected adb command: {other:?}"),
+        }
+    }
+
+    /// An adb whose `uiautomator dump` fails with `said` on stderr, answering every other call —
+    /// the `rm -f` that follows a crash included — emptily.
+    ///
+    /// `said` is the whole variable: empty is the crash [`died_unexplained`] names, anything else a
+    /// device that gave a reason.
+    fn fake_failing_dump(
+        said: &'static str,
+    ) -> impl FnMut(&[&str], Instant) -> Result<(String, String)> {
+        move |argv: &[&str], _deadline: Instant| match argv {
+            ["shell", "uiautomator", "dump", _] => Err(a_failed_call(argv, said)),
+            _ => Ok((String::new(), String::new())),
         }
     }
 
@@ -1143,15 +1157,7 @@ mod tests {
     /// deadline, so the mutant would report every dead emulator as an app that is slow to publish.
     #[test]
     fn an_adb_failure_under_a_live_deadline_is_still_a_broken_device() {
-        let mut gone = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            match argv {
-                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
-                    &["shell", "uiautomator", "dump", path],
-                    "error: device 'emulator-5554' not found",
-                )),
-                _ => Ok((String::new(), String::new())),
-            }
-        };
+        let mut gone = fake_failing_dump("error: device 'emulator-5554' not found");
         let e = dump_until_ready(
             &mut gone,
             PREFIX,
@@ -1164,9 +1170,9 @@ mod tests {
         .expect_err("the device is gone");
 
         assert_eq!(
-            e.bound(),
-            None,
-            "a dead device was read as a bound of glass's: {e}"
+            e.tool_said(),
+            Some("error: device 'emulator-5554' not found"),
+            "a dead device's own reason was replaced: {e}"
         );
         assert!(
             !e.to_string().contains("within the time this call allowed"),
@@ -1191,38 +1197,47 @@ mod tests {
         }
     }
 
-    /// A bound that fired is never the silent crash `died_unexplained` names, however the device
-    /// ended its sentence — that crash is retried, so reading one as the other retries a deadline
-    /// nobody is waiting on any more.
-    ///
-    /// The stderr matters: `said_before_the_kill` quotes it into the timeout message, so the
-    /// message really does end in `failed:` — which is what the old prose match keyed on.
+    /// A crash that managed only a newline is still a crash. `exit_error` trims on the way in and
+    /// [`GlassError::tool_said`] on the way out, so removing either leaves the other holding this.
     #[test]
-    #[cfg(unix)]
-    fn a_bound_that_fired_is_no_crash_even_when_the_message_ends_as_one() {
-        // Imported here, not with the module's other uses: this is the only test that needs it, so
-        // a `use` up there is an unused import on every non-unix target, which `-D warnings` fails.
-        use super::died_unexplained;
+    fn a_dump_that_crashed_writing_only_whitespace_is_still_retried() {
+        let mut barely = fake_failing_dump("\n  ");
+        assert!(matches!(
+            dump_once(&mut barely, PREFIX, ample()),
+            Attempt::NotReady(_)
+        ));
+    }
 
-        let mut hang = std::process::Command::new("/bin/sh");
-        hang.args([
-            "-c",
-            "printf '`adb shell uiautomator dump /sdcard/x.xml` failed:' >&2; sleep 30",
-        ]);
-        let e = glass_core::run_bounded(
-            &mut hang,
-            Duration::from_millis(200),
-            "adb:uiautomator dump",
-        )
-        .expect_err("must time out");
+    /// A call that never reached the tool is not a tool that said nothing — the distinction
+    /// [`GlassError::tool_said`] draws, and the one a missing `adb` turns on.
+    ///
+    /// Without this nothing exercises `Backend` through `dump_once` at all: every fake in this
+    /// module now raises the variant a tool that *ran* produces.
+    #[test]
+    fn a_dump_whose_adb_could_not_start_is_not_the_crash_that_waiting_resolves() {
+        let mut missing = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            Err(a_real_spawn_failure())
+        };
+        assert!(matches!(
+            dump_once(&mut missing, PREFIX, ample()),
+            Attempt::Fatal(_)
+        ));
+    }
 
-        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
-        // Without this the test stops discriminating the moment the quoting changes shape.
-        assert!(
-            e.to_string().trim_end().ends_with("failed:"),
-            "the fixture no longer bites: {e}"
-        );
-        assert!(!died_unexplained(&e), "{e}");
+    /// Only the *dump* step's silence is retried. A `cat` that dies the same way is fatal — the
+    /// dump already reported success, so a read that cannot speak for itself is about the device.
+    #[test]
+    fn a_read_that_failed_silently_is_not_retried_the_way_a_silent_dump_is() {
+        let mut run = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "cat", path] => Err(a_failed_call(&["shell", "cat", path], "")),
+                _ => Ok((DUMPED.to_string(), String::new())),
+            }
+        };
+        assert!(matches!(
+            dump_once(&mut run, PREFIX, ample()),
+            Attempt::Fatal(_)
+        ));
     }
 
     /// Text the device wrote is not a bound of glass's own. `Adb::exit_error` interpolates the
@@ -1233,15 +1248,8 @@ mod tests {
     /// nothing stops one.
     #[test]
     fn a_device_failure_that_quotes_the_deadline_wording_is_still_a_broken_device() {
-        let mut quoting = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            match argv {
-                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
-                    &["shell", "uiautomator", "dump", path],
-                    "java.lang.IllegalStateException: UiAutomation was not started",
-                )),
-                _ => Ok((String::new(), String::new())),
-            }
-        };
+        let mut quoting =
+            fake_failing_dump("java.lang.IllegalStateException: UiAutomation was not started");
         let e = dump_until_ready(
             &mut quoting,
             PREFIX,
@@ -1347,15 +1355,7 @@ mod tests {
             Attempt::NotReady(_)
         ));
 
-        let mut gone = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            match argv {
-                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
-                    &["shell", "uiautomator", "dump", path],
-                    "device offline",
-                )),
-                _ => Ok((String::new(), String::new())),
-            }
-        };
+        let mut gone = fake_failing_dump("device offline");
         assert!(matches!(
             dump_once(&mut gone, PREFIX, ample()),
             Attempt::Fatal(_)
@@ -1370,15 +1370,7 @@ mod tests {
     /// line this way, and nothing stops one.
     #[test]
     fn a_device_that_explained_itself_is_not_a_crash_however_its_message_ends() {
-        let mut explained = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            match argv {
-                ["shell", "uiautomator", "dump", path] => Err(a_failed_call(
-                    &["shell", "uiautomator", "dump", path],
-                    "java.lang.SecurityException: dump failed:",
-                )),
-                _ => Ok((String::new(), String::new())),
-            }
-        };
+        let mut explained = fake_failing_dump("java.lang.SecurityException: dump failed:");
         let Attempt::Fatal(e) = dump_once(&mut explained, PREFIX, ample()) else {
             panic!("a device that gave a reason is not a crash that waiting resolves");
         };
