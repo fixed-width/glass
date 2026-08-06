@@ -505,9 +505,9 @@ const SOCKET: &str = "glass-a11y";
 /// True when an `adb install` failure is the "existing package signed differently" case
 /// that only an uninstall can clear (e.g. a release APK over a local debug build).
 ///
-/// Read from what the tool said, never from the rendered message: that also names the argv, which
-/// carries the caller's APK path, so a path quoting either phrase would send every install failure
-/// down the uninstall branch — the hazard `AdbOp::for_args` documents for argv (glass#348).
+/// Read from what the tool said, never from the rendered message: that also names the argv, so an
+/// APK path quoting either phrase sent every install failure down the uninstall branch — the
+/// hazard `AdbOp::for_args` documents for argv (glass#348).
 fn is_signature_mismatch(e: &GlassError) -> bool {
     e.tool_said().is_some_and(|said| {
         said.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
@@ -1108,10 +1108,8 @@ mod tests {
         assert!(!is_signature_mismatch(&failed("error: device offline")));
     }
 
-    /// The verdict is the device's, so only the device's words may carry it. `GLASS_ANDROID_A11Y_APK`
-    /// is caller-supplied and lands in the argv the error names, so a path that quotes the phrase
-    /// used to make every install failure take the uninstall branch — the hazard `AdbOp::for_args`
-    /// already warns about for argv, one file over.
+    /// `GLASS_ANDROID_A11Y_APK` is caller-supplied and lands in the argv the error names, so a
+    /// path quoting the phrase used to make every install failure take the uninstall branch.
     #[test]
     fn a_phrase_in_the_apk_path_does_not_make_an_unrelated_failure_a_signature_mismatch() {
         let poisoned = "/home/u/signatures do not match/glass-a11y.apk";

@@ -186,20 +186,19 @@ pub enum GlassError {
     #[error("{which} permission denied: {remedy}")]
     PermissionDenied { which: String, remedy: String },
 
-    /// A backend failure the backend itself reported. Two neighbours display identically and this
-    /// variant is false for both — [`Self::Bounded`] for a call that ended at one of glass's own
-    /// bounds, [`Self::ToolFailed`] for a tool that ran and exited non-zero. Classify with
-    /// [`Self::bound`] and [`Self::tool_said`] rather than by matching this variant.
+    /// A backend failure the backend itself reported. [`Self::Bounded`] and [`Self::ToolFailed`]
+    /// display identically and this variant is false for both, so classify with [`Self::bound`]
+    /// and [`Self::tool_said`] rather than by matching it.
     #[error("backend error: {0}")]
     Backend(String),
 
     /// A tool glass drove ran and exited non-zero, carrying what it wrote to stderr.
     ///
     /// `said` is that stderr, trimmed — empty when the tool failed without a word, which for
-    /// `uiautomator` is a crash whose trace went to the platform log instead (glass#341), and
-    /// waiting resolves it where an explained failure will not. Read it through [`Self::tool_said`]
-    /// rather than out of the rendered message, which the tool's own output is free to imitate
-    /// (glass#348). A tool that explains itself on *stdout* reads as silent here.
+    /// `uiautomator` is a crash whose trace went to the platform log instead (glass#341) and
+    /// waiting resolves. Read it through [`Self::tool_said`], never out of the rendered message,
+    /// which the tool's own output can imitate (glass#348). A tool that explains itself on
+    /// *stdout* reads as silent here.
     ///
     /// Not `#[non_exhaustive]`, unlike its sibling [`Self::Bounded`]: every backend that drives an
     /// external tool raises this legitimately, where only glass's own clock raises a bound.
@@ -281,7 +280,7 @@ impl GlassError {
     /// failure, including a bound firing, and for any variant added later.
     ///
     /// Trimmed here and not only at construction, so a producer that forgets cannot turn a crash
-    /// that wrote a bare newline into a refusal glass stops retrying.
+    /// into a refusal.
     pub fn tool_said(&self) -> Option<&str> {
         match self {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
@@ -418,9 +417,8 @@ mod tests {
 
     #[test]
     fn a_tool_that_wrote_only_whitespace_still_reads_as_having_said_nothing() {
-        // A crash that manages a bare newline is still a crash. Trimmed on the way out as well as
-        // on the way in, so a producer that forgets cannot turn one into a refusal glass stops
-        // retrying.
+        // A crash that manages a bare newline is still a crash — trimmed on the way out as well
+        // as on the way in, so removing either leaves the other holding this.
         assert_eq!(
             GlassError::ToolFailed {
                 call: "adb shell uiautomator dump /sdcard/x.xml".into(),

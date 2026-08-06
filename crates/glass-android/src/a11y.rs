@@ -1197,8 +1197,8 @@ mod tests {
         }
     }
 
-    /// A crash that managed only a newline is still a crash. `exit_error` trims on the way in and
-    /// [`GlassError::tool_said`] on the way out, so removing either leaves the other holding this.
+    /// A crash that managed only a newline is still a crash — `exit_error` trims on the way in and
+    /// [`GlassError::tool_said`] on the way out.
     #[test]
     fn a_dump_that_crashed_writing_only_whitespace_is_still_retried() {
         let mut barely = fake_failing_dump("\n  ");
@@ -1208,11 +1208,10 @@ mod tests {
         ));
     }
 
-    /// A call that never reached the tool is not a tool that said nothing — the distinction
-    /// [`GlassError::tool_said`] draws, and the one a missing `adb` turns on.
+    /// A call that never reached the tool is not a tool that said nothing.
     ///
-    /// Without this nothing exercises `Backend` through `dump_once` at all: every fake in this
-    /// module now raises the variant a tool that *ran* produces.
+    /// Without this nothing exercises `Backend` through `dump_once` at all: every other fake in
+    /// this module raises the variant a tool that *ran* produces.
     #[test]
     fn a_dump_whose_adb_could_not_start_is_not_the_crash_that_waiting_resolves() {
         let mut missing = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {

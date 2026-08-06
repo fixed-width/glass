@@ -363,10 +363,9 @@ mod tests {
     /// Which stream `said` comes from, proven against a real non-zero exit rather than asserted in
     /// a doc comment.
     ///
-    /// `Adb::output` picks the stream, and nothing else exercises that branch: passing `out.stdout`
-    /// instead leaves the whole workspace green while a dead emulator — which writes its reason to
-    /// stderr — reads as the silent crash `a11y` retries for the cold bound, its only explanation
-    /// replaced by "without saying why".
+    /// `Adb::output` picks the stream and nothing else exercises that branch: passing `out.stdout`
+    /// leaves the workspace green while a dead emulator, which writes its reason to stderr, reads
+    /// as the silent crash `a11y` retries.
     ///
     /// `/bin/sh` stands in for adb; `cmd` does on Windows.
     #[test]
