@@ -104,11 +104,8 @@ const VERIFY_ATTEMPTS: usize = 3;
 ///
 /// The element is re-resolved by its pre-order id, which the write itself can perturb (a tap that
 /// navigates renumbers everything after it), so a mismatch is a claim about the tree rather than
-/// about the write. [`AxTarget::drifted`] decides which: still somewhere → `AxElementChanged`,
-/// nowhere → `AxElementGone`. The difference matters most where the write itself replaced the
-/// screen — typing into a search field — because "re-snapshot" reads as "re-address that id", and
-/// the write it would repeat has already landed. A tree cut short by the walk caps explains an
-/// absent element better than either, so that case says so instead.
+/// about the write; [`AxTarget::drifted`] decides which. A tree cut short by the walk caps explains
+/// an absent element better than either, so that case says so instead.
 ///
 /// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
 /// in `value`, so a label that changed inside the settle window would otherwise read as a successful
@@ -372,10 +369,8 @@ mod tests {
     #[test]
     fn a_write_that_replaced_the_screen_says_the_element_is_gone() {
         // Measured on the Simulator: typing into Settings' search field replaces the settings list
-        // with a results screen, taking the tree from 16 nodes to 5 and the field with it. The
-        // write had landed — the results read "No Results for …" and the field held the text — but
-        // "changed; re-snapshot" tells an agent to re-address that id, which is how a landed write
-        // gets typed twice. Nothing here presents as the target, so the honest answer is gone.
+        // with a results screen, taking the tree from 16 nodes to 5 and the field with it, while
+        // the write itself lands (glass#359).
         let replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
         assert!(matches!(
             verify_write(&replaced, &matching_target(), "world"),

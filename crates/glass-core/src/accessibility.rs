@@ -800,12 +800,11 @@ impl AxTarget {
     }
 
     /// Whether any node in `tree` still presents as this target — same role and name, wherever it
-    /// sits. Bounds and value are excluded: both move under a live app without the control going
-    /// anywhere.
+    /// sits.
     ///
-    /// Do not tighten this to include bounds or value. Android's service reader relaxes a moved
-    /// control back into a write, and that relaxation needs [`Self::drifted`] to answer
-    /// `AxElementChanged` in every case it can relax.
+    /// Do not tighten this to include bounds or value: both move under a live app without the
+    /// control going anywhere, and Android's service reader relaxes a moved control back into a
+    /// write, which needs [`Self::drifted`] to answer `AxElementChanged` in every case it can relax.
     pub fn still_on_screen(&self, tree: &AxTree) -> bool {
         fn walk(node: &AxNode, target: &AxTarget) -> bool {
             target.matches(node.role, node.name.as_deref())
@@ -816,15 +815,13 @@ impl AxTarget {
 
     /// Which of the two disagreements a tree that no longer agrees with this target has.
     ///
-    /// [`GlassError::AxElementChanged`] sends the reader looking for where the element went, which
-    /// is worth doing only while it is still somewhere. Nothing carrying its role and name means
-    /// the screen was replaced or the app that drew it restarted (glass#323), and re-addressing
-    /// that id would land on whatever now occupies it — for a `set_value` read-back, that is how a
-    /// write that already landed gets typed a second time.
+    /// [`GlassError::AxElementChanged`] sends the reader looking for where the element went, worth
+    /// doing only while it is still somewhere. Nothing carrying its role and name means the screen
+    /// was replaced or the app that drew it restarted (glass#323); telling that caller to
+    /// re-address the id is how a `set_value` read-back retypes a write that already landed.
     ///
-    /// Shared rather than per-backend: both Android readers and iOS ask this same question, and
-    /// the two implementations had already drifted apart once — Android learned to tell the cases
-    /// apart while iOS went on calling every disagreement `AxElementChanged`.
+    /// Keep this shared. Android and iOS ask the same question, and per-backend copies drifted
+    /// apart once already — Android learned to tell the cases apart, iOS did not.
     pub fn drifted(&self, tree: &AxTree) -> GlassError {
         if self.still_on_screen(tree) {
             GlassError::AxElementChanged(self.id.0)
@@ -2026,8 +2023,7 @@ mod tests {
 
     #[test]
     fn a_target_still_on_screen_is_changed_not_gone() {
-        // Renumbered, not removed: re-snapshotting finds it again, which is what `AxElementChanged`
-        // tells the caller to do.
+        // Renumbered, not removed — re-snapshotting finds it again.
         let tree = drift_tree(vec![
             leaf(AxRole::Label, "Heading"),
             leaf(AxRole::TextField, "Note"),
@@ -2041,8 +2037,7 @@ mod tests {
 
     #[test]
     fn a_target_no_longer_anywhere_is_gone_not_changed() {
-        // The screen was replaced. Telling the caller to re-address that id would send a set_value
-        // read-back to retype a write that already landed.
+        // The screen was replaced.
         let tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
         assert!(!drift_target().still_on_screen(&tree));
         assert!(matches!(
