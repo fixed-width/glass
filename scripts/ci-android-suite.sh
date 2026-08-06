@@ -54,6 +54,52 @@ logcat_pid=$!
 # teardown rather than this kill.
 trap 'kill "$logcat_pid" 2>/dev/null' EXIT
 
+# `boot_completed` is not readiness: the action restores a cached AVD snapshot and reports boot
+# the moment the property flips, while package scans and GMS's Phenotype config commits keep
+# force-stopping apps for another ~15s — including `com.google.android.settings.intelligence`,
+# which the search-screen tests drive. Starting there made the leg red ~25% of runs (glass#331).
+#
+# The signal is this file's own growth rate, so it costs no adb call and needs no message to be
+# matched. Measured on an idle API 34 AVD from `boot_completed`, lines per 5s:
+#
+#   +0s 4561   +5s 5127   +10s 1132   +15s 787   +20s 229   +25s 14   +30s 50 …
+#
+# No window before +25s is under 100 and the first that is falls 16x, so the threshold sits in a
+# wide gap rather than on a slope. Two consecutive quiet windows, because GMS goes on producing
+# bursts (+60s, +100s, +150s here).
+#
+# It never fails the run: a device that stays busy is a slow one, and the suite is what decides
+# that. Both outcomes are logged, or a gate that stopped waiting would read like one that worked.
+settle_window=5
+settle_quiet=100
+settle_needed=2
+settle_budget=120
+
+settled=0
+quiet=0
+waited=0
+while [ "$waited" -lt "$settle_budget" ]; do
+  before=$(wc -l < diagnostics/logcat.txt 2>/dev/null || echo 0)
+  sleep "$settle_window"
+  waited=$((waited + settle_window))
+  grew=$(( $(wc -l < diagnostics/logcat.txt 2>/dev/null || echo 0) - before ))
+  if [ "$grew" -lt "$settle_quiet" ]; then
+    quiet=$((quiet + 1))
+    if [ "$quiet" -ge "$settle_needed" ]; then
+      settled=1
+      break
+    fi
+  else
+    quiet=0
+  fi
+done
+if [ "$settled" -eq 1 ]; then
+  echo "ci-android-suite: device settled after ${waited}s (last window ${grew} lines)"
+else
+  echo "ci-android-suite: device still busy after ${settle_budget}s (last window ${grew} lines); \
+running the suite anyway" >&2
+fi
+
 ./scripts/test-android.sh "$@" 2>&1 | tee diagnostics/test-output.txt
 rc=${PIPESTATUS[0]}
 
