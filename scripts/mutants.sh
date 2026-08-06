@@ -25,10 +25,16 @@
 # back to mutating the whole of each file the diff touched.
 #
 # Usage:
-#   scripts/mutants.sh <output-dir> [extra cargo-mutants args...]
+#   scripts/mutants.sh <output-dir> [--package NAME]... [extra cargo-mutants args...]
 #
-#   scripts/mutants.sh target/mutants                     # the whole crate
-#   scripts/mutants.sh target/mutants --in-diff pr.diff   # only what a diff touched
+#   scripts/mutants.sh target/mutants                      # the whole default crate
+#   scripts/mutants.sh target/mutants --in-diff pr.diff    # only what a diff touched
+#   scripts/mutants.sh target/mutants --package glass-android
+#   scripts/mutants.sh target/mutants --package glass-core --package glass-android
+#
+# `--package` is read here, not forwarded: it sets the `--file` glob too, and forwarding it
+# alone would mutate only the default package's files under a widened package set — a clean
+# run over a crate that was never in scope. Repeat it for more.
 #
 # MUTANTS_JOBS sets concurrency (default 2); `--jobs` cannot be passed through,
 # because cargo-mutants rejects it twice over.
@@ -43,32 +49,54 @@ shift
 
 # glass-core is the platform-agnostic heart — the Platform/Accessibility seams, session,
 # frame diffing, stability, the log buffer — so it is pure logic that mutates meaningfully and
-# tests without a display. `**` so a file moved into a subdirectory stays covered; keep this in
+# tests without a display. Changing this default changes what CI gates — `--package` scopes a
+# run to another crate without touching it.
+readonly DEFAULT_PACKAGE='glass-core'
+
+# A package's own sources. `**` so a file moved into a subdirectory stays covered; keep this in
 # step with the git pathspec the in-diff caller uses.
-readonly TARGET_GLOB='crates/glass-core/src/**/*.rs'
-readonly TARGET_PACKAGE='glass-core'
+package_glob() { echo "crates/$1/src/**/*.rs"; }
 
 # Fixed rather than derived from the unmutated baseline: cargo-mutants ranks a timeout above a
 # missed mutant, so once anything times out a genuine survivor is invisible at the exit code. A
 # generous explicit value keeps the grade from depending on how loaded the host is.
 readonly MUTANT_TIMEOUT=${MUTANT_TIMEOUT:-180}
 
-# The caller's `--in-diff` path, and the same argument list with it removed — the
-# fallback re-runs without it but must keep everything else, `--test-tool` included.
+# The caller's `--in-diff` path and `--package` names, and the same argument list with both
+# removed — the fallback re-runs without `--in-diff` but must keep everything else,
+# `--test-tool` included.
 diff_file=""
+packages=()
 passthrough=()
-skip_next=false
+want=""
 for arg in "$@"; do
-    if [ "$skip_next" = true ]; then
-        diff_file=$arg
-        skip_next=false
+    if [ -n "$want" ]; then
+        case "$want" in
+            in-diff) diff_file=$arg ;;
+            package) packages+=("$arg") ;;
+        esac
+        want=""
         continue
     fi
     case "$arg" in
-        --in-diff) skip_next=true ;;
+        --in-diff) want=in-diff ;;
         --in-diff=*) diff_file=${arg#--in-diff=} ;;
+        --package | -p) want=package ;;
+        --package=*) packages+=("${arg#--package=}") ;;
         *) passthrough+=("$arg") ;;
     esac
+done
+# A flag left waiting for its value would otherwise swallow the next one silently.
+if [ -n "$want" ]; then
+    echo "--$want was given no value" >&2
+    exit 2
+fi
+[ "${#packages[@]}" -eq 0 ] && packages=("$DEFAULT_PACKAGE")
+
+# `--package p1 --package p2 …`, the form both cargo-mutants calls below want.
+pkg_args=()
+for p in "${packages[@]}"; do
+    pkg_args+=(--package "$p")
 done
 
 # How many mutants a set of scope arguments yields, ignoring any `--shard` the caller
@@ -76,7 +104,7 @@ done
 # question is answered before a single mutant is compiled — and answered for the whole
 # run rather than for one shard, which may legitimately receive none.
 list_count() {
-    cargo mutants --list --package "$TARGET_PACKAGE" "$@" \
+    cargo mutants --list "${pkg_args[@]}" "$@" \
         ${diff_file:+--in-diff "$diff_file"} 2>/dev/null | wc -l
 }
 
@@ -89,7 +117,7 @@ attempt() {
     shift
     status=0
     cargo mutants \
-        --package "$TARGET_PACKAGE" \
+        "${pkg_args[@]}" \
         --cargo-arg=--locked \
         --timeout "$MUTANT_TIMEOUT" \
         -j "${MUTANTS_JOBS:-2}" \
@@ -109,7 +137,10 @@ attempt() {
 # Choose the scope before building anything: the module glob, or — when the diff
 # changed only test code and so yields nothing to mutate — the whole of each file it
 # touched, so a deleted test cannot bring a survivor back unnoticed.
-scope=(--file "$TARGET_GLOB")
+scope=()
+for p in "${packages[@]}"; do
+    scope+=(--file "$(package_glob "$p")")
+done
 planned=$(list_count "${scope[@]}")
 
 if [ "$planned" -eq 0 ] && [ -n "$diff_file" ] && [ -s "$diff_file" ]; then
@@ -134,7 +165,8 @@ fi
 
 if [ "$planned" -eq 0 ]; then
     echo "This run would gate nothing: no mutants under the scope it was given."
-    echo "Check that --file still matches the files under test and that the package"
+    echo "Scoped to: ${packages[*]}"
+    echo "Check that --file still matches the files under test and that each package"
     echo "still exists."
     exit 1
 fi
