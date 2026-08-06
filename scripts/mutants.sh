@@ -51,7 +51,7 @@ readonly TARGET_PACKAGE='glass-core'
 # Fixed rather than derived from the unmutated baseline: cargo-mutants ranks a timeout above a
 # missed mutant, so once anything times out a genuine survivor is invisible at the exit code. A
 # generous explicit value keeps the grade from depending on how loaded the host is.
-readonly MUTANT_TIMEOUT=180
+readonly MUTANT_TIMEOUT=${MUTANT_TIMEOUT:-180}
 
 # The caller's `--in-diff` path, and the same argument list with it removed — the
 # fallback re-runs without it but must keep everything else, `--test-tool` included.
