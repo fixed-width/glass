@@ -68,12 +68,20 @@ trap 'kill "$logcat_pid" 2>/dev/null' EXIT
 # wide gap rather than on a slope. Two consecutive quiet windows, because GMS goes on producing
 # bursts (+60s, +100s, +150s here).
 #
+# The budget is a CEILING, not a wait: a device that settles in 30s pays 30s whatever it is set to,
+# so it is sized for "this device is broken" rather than "this device is slow". Ten reruns of the
+# same CI job settled at 85 90 90 95 95 95 95 105 105 110s, which is 71-92% of the 120s this
+# replaces — one slow run from giving up and starting the suite anyway.
+#
+# Do NOT re-size this from a local run: the same measurement on this project's dev box was 25-30s,
+# 3-4x faster than the CI snapshot restore it has to cover.
+#
 # It never fails the run: a device that stays busy is a slow one, and the suite is what decides
 # that. Both outcomes are logged, or a gate that stopped waiting would read like one that worked.
 settle_window=5
 settle_quiet=100
 settle_needed=2
-settle_budget=120
+settle_budget=300
 
 settled=0
 quiet=0
