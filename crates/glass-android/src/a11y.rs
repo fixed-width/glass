@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree};
 use glass_core::{
-    GlassError, KeyEvent, MouseButton, NOT_STARTED, PointerEvent, Result, TIMED_OUT,
-    WindowGeometry, typed_clear_landed, typed_text_landed,
+    GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
+    typed_text_landed,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -180,15 +180,17 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, prefix: &str, deadline: Instant
     }
 }
 
-/// Whether an error is the attempt's own deadline firing rather than the device answering.
+/// Whether an error is a deadline firing rather than the device answering.
 ///
 /// A read that ran out of its time never reached the device, so the dump's stderr is no
 /// explanation for it — and that substitution is retryable, so the loop would go on retrying a
-/// device that had answered. Matched on the phrases `glass_core` publishes for exactly this, which
-/// is why it says only *that* a bound fired: which one is settled before the attempt.
+/// device that had answered.
+///
+/// Says only *that* a bound fired, not which: which one is settled before the attempt. Read off
+/// the bound's own signal rather than the message, which `Adb::exit_error` composes partly from
+/// the device's output — the device could otherwise answer for glass's deadline (glass#348).
 fn bound_fired(e: &GlassError) -> bool {
-    let msg = e.to_string();
-    msg.contains(TIMED_OUT) || msg.contains(NOT_STARTED)
+    e.bound().is_some()
 }
 
 /// Whether a failed dump gave no reason of its own — the mark of a `uiautomator` that crashed.
@@ -668,22 +670,60 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, dump_once, dump_until_ready, editable_target,
-        locate_editable_target, locate_for_write, snapshot_bound, snapshot_with_runner,
-        verify_write,
+        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, died_unexplained, dump_once,
+        dump_until_ready, editable_target, locate_editable_target, locate_for_write,
+        snapshot_bound, snapshot_with_runner, verify_write,
     };
-    use crate::adb::AdbOp;
+    use crate::adb::{AdbOp, with_adb_hint};
     use glass_core::accessibility::{
         AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
         WalkLimits,
     };
-    use glass_core::{GlassError, Result, WindowGeometry};
+    use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     /// A deadline no test reaches, for the cases that are not about the bound.
     fn ample() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// A timeout as `glass_core` really raises one, hinted as every adb call's is.
+    ///
+    /// Run rather than typed: a fixture that builds the error itself measures the classifier's
+    /// agreement with the fixture, and would stay green through a runner that had stopped raising
+    /// what the classifier reads (glass#348).
+    ///
+    /// `/bin/sh` stands in for adb; `ping` does on Windows, which has no `/bin/sh` and paces one
+    /// echo per second whether or not the transmission succeeds.
+    fn cut_short_by_a_bound() -> GlassError {
+        #[cfg(unix)]
+        let mut hang = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        hang.args(["-c", "sleep 30"]);
+        #[cfg(windows)]
+        let mut hang = std::process::Command::new("ping");
+        #[cfg(windows)]
+        hang.args(["-n", "31", "127.0.0.1"]);
+
+        let e = glass_core::run_bounded(&mut hang, Duration::from_millis(200), "adb:shell")
+            .expect_err("must time out");
+        // A spawn failure is also an `Err`, and would sail through as a device error nobody
+        // classified.
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        with_adb_hint(e)
+    }
+
+    /// A spent-deadline error as `glass_core` really raises one. Nothing is spawned on that path,
+    /// so it needs no real command.
+    fn never_started_for_want_of_time() -> GlassError {
+        glass_core::run_bounded_until(
+            &mut std::process::Command::new("adb"),
+            Duration::from_secs(10),
+            Instant::now(),
+            "adb:uiautomator dump",
+        )
+        .expect_err("a spent deadline starts nothing")
     }
 
     /// An attempt as a plain `Result`, for the tests about what a dump reports rather than about
@@ -1148,6 +1188,52 @@ mod tests {
         );
     }
 
+    /// Both bounds `glass_core` fires are the ones the classifier reads, checked against errors it
+    /// really raised rather than against a constant both sides share.
+    ///
+    /// The two are otherwise coupled only by convention: nothing stops the runner reporting a
+    /// bound the classifier does not recognise, and no test of either side alone would see it.
+    #[test]
+    fn every_bound_glass_core_fires_is_one_the_classifier_recognises() {
+        for e in [cut_short_by_a_bound(), never_started_for_want_of_time()] {
+            assert!(bound_fired(&e), "{e}");
+            // A bound firing says nothing about the tool, so it is never the silent crash that
+            // `died_unexplained` names — which is retried, and would retry a spent deadline.
+            assert!(!died_unexplained(&e), "{e}");
+        }
+    }
+
+    /// Text the device wrote is not a bound of glass's own. `Adb::exit_error` interpolates the
+    /// child's stderr verbatim, so a phrase glass reads as its own deadline reaches the classifier
+    /// intact — and a device reported as a spent budget is one `wait_for_element` polls through
+    /// rather than surfaces.
+    ///
+    /// The stderr below is constructed rather than observed: no device is known to print it, and
+    /// nothing stops one.
+    #[test]
+    fn a_device_failure_that_quotes_the_deadline_wording_is_still_a_broken_device() {
+        let mut quoting = |argv: &[&str], _d: Instant| -> Result<(String, String)> {
+            match argv {
+                ["shell", "uiautomator", "dump", _] => Err(GlassError::Backend(
+                    "`adb shell uiautomator dump` failed: java.lang.IllegalStateException: \
+                     UiAutomation was not started"
+                        .into(),
+                )),
+                _ => Ok((String::new(), String::new())),
+            }
+        };
+        let e = dump_until_ready(
+            &mut quoting,
+            PREFIX,
+            RetryBound::ONCE,
+            Duration::ZERO,
+            AxDeadline::from_millis(5_000),
+        )
+        .expect_err("the device failed");
+
+        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+    }
+
     /// [`RetryBound::least`] says how many attempts the *device* is owed, not how many a caller
     /// must pay for: an owed attempt is not started once the caller has stopped waiting. Both
     /// *retrying* bounds owe two, so this is the shape a real not-ready read takes.
@@ -1188,10 +1274,7 @@ mod tests {
     #[test]
     fn an_attempt_the_caller_cut_short_reports_the_budget_rather_than_the_device() {
         let timed_out = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            Err(GlassError::Backend(format!(
-                "`adb shell uiautomator dump` {}",
-                glass_core::TIMED_OUT
-            )))
+            Err(cut_short_by_a_bound())
         };
 
         let mut cut_short = timed_out;
@@ -1207,7 +1290,7 @@ mod tests {
         // A wedged adb reaches this arm too, and its message is the only place glass names the
         // `adb kill-server` remedy — dropping it leaves an operator reading "the app is slow".
         assert!(
-            e.to_string().contains(glass_core::TIMED_OUT),
+            e.to_string().contains("adb kill-server"),
             "the abandoned attempt's own error was discarded: {e}"
         );
 
@@ -1222,7 +1305,7 @@ mod tests {
             AxDeadline::UNBOUNDED,
         )
         .expect_err("the attempt timed out");
-        assert!(matches!(e, GlassError::Backend(_)), "{e}");
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
     }
 
     /// Retryability is the attempt's own verdict, not a guess from the error variant it carries:
@@ -1272,10 +1355,7 @@ mod tests {
                     dumps += 1;
                     if dumps == 1 {
                         abandoned = Some((*path).to_string());
-                        return Err(GlassError::Backend(format!(
-                            "`adb shell uiautomator dump` {}",
-                            glass_core::TIMED_OUT
-                        )));
+                        return Err(cut_short_by_a_bound());
                     }
                     files.insert((*path).to_string(), XML.to_string());
                     Ok((DUMPED.to_string(), String::new()))
@@ -1511,19 +1591,6 @@ mod tests {
     fn a_read_that_ran_out_of_the_attempts_time_is_not_reported_as_a_dump_that_wrote_nothing() {
         // Sharing one deadline across the three steps is what makes this reachable: an earlier slow
         // step can leave the read none.
-        //
-        // The error is the one `glass_core` really produces for a spent deadline, not a fixture
-        // repeating wording this crate does not own. Nothing is spawned on that path, so it needs
-        // no real command.
-        let spent = glass_core::run_bounded_until(
-            &mut std::process::Command::new("adb"),
-            Duration::from_secs(10),
-            Instant::now(),
-            "adb:uiautomator dump",
-        )
-        .expect_err("a spent deadline starts nothing")
-        .to_string();
-
         let mut attempts = 0;
         let mut run = |argv: &[&str], _deadline: Instant| -> Result<(String, String)> {
             match argv {
@@ -1531,7 +1598,7 @@ mod tests {
                     attempts += 1;
                     Ok((String::new(), format!("{NOT_READY}\n")))
                 }
-                ["shell", "cat", _] => Err(GlassError::Backend(spent.clone())),
+                ["shell", "cat", _] => Err(never_started_for_want_of_time()),
                 _ => Ok((String::new(), String::new())),
             }
         };
@@ -1545,8 +1612,9 @@ mod tests {
         .unwrap_err();
 
         let msg = e.to_string();
-        assert!(
-            msg.contains(glass_core::NOT_STARTED),
+        assert_eq!(
+            e.bound(),
+            Some(BoundKind::NotStarted),
             "the step that ran out of time must be the one reported: {msg}"
         );
         assert!(

@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use glass_core::{GlassError, Result, TIMED_OUT, run_bounded, run_bounded_until};
+use glass_core::{BoundKind, GlassError, Result, run_bounded, run_bounded_until};
 
 /// What an adb invocation is doing, which is what decides how long it may take.
 ///
@@ -181,11 +181,18 @@ impl Adb {
 /// `Display` print its prefix twice, and an agent reads this text. Gated on the timeout because the
 /// other failure is a spawn failure — a missing or mis-resolved binary, the most common Android
 /// setup problem — where `adb kill-server` is advice for a binary that is not there.
-fn with_adb_hint(e: GlassError) -> GlassError {
+///
+/// The rebuilt error keeps its [`BoundKind`]: `a11y::bound_fired` reads it downstream of this, so
+/// dropping it here reports every hint-carrying timeout as a device that failed.
+pub(crate) fn with_adb_hint(e: GlassError) -> GlassError {
     match e {
-        GlassError::Backend(msg) if msg.contains(TIMED_OUT) => GlassError::Backend(format!(
-            "{msg}; if this repeats, run `adb kill-server` and retry"
-        )),
+        GlassError::Bounded {
+            kind: kind @ BoundKind::TimedOut,
+            message,
+        } => GlassError::Bounded {
+            kind,
+            message: format!("{message}; if this repeats, run `adb kill-server` and retry"),
+        },
         other => other,
     }
 }
@@ -213,7 +220,7 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 #[cfg(test)]
 mod tests {
     use super::{Adb, AdbOp, build_argv, with_adb_hint};
-    use glass_core::{GlassError, TIMED_OUT};
+    use glass_core::{BoundKind, GlassError};
     use std::time::Duration;
 
     /// Live proof that a wedged adb call ends instead of hanging. Ignored by default:
@@ -287,7 +294,7 @@ mod tests {
             "waited {:?} — the deadline never reached the process",
             started.elapsed()
         );
-        assert!(err.to_string().contains(TIMED_OUT), "{err}");
+        assert_eq!(err.bound(), Some(BoundKind::TimedOut), "{err}");
     }
 
     #[test]
@@ -387,8 +394,8 @@ mod tests {
         ));
         assert!(!spawn.to_string().contains("kill-server"), "{spawn}");
 
-        // Built by running a real timeout rather than typed here: the gate keys on wording that
-        // `glass-core` owns, so a fixture repeating that wording could not notice it drifting.
+        // Built by running a real timeout rather than typed here: the gate keys on a bound
+        // `glass-core` sets, so a fixture setting it too could not notice the runner stopping.
         //
         // `ping` stands in for `sleep` on Windows (no `/bin/sh` there) — it paces one echo per
         // second even when transmission fails, so it reliably outlives the 200ms budget.
@@ -409,8 +416,9 @@ mod tests {
         .expect_err("must time out");
         // A spawn failure is also an Err: it sails past `expect_err`, then fails the hint
         // assertion below, blaming `with_adb_hint` for a missing binary.
-        assert!(
-            real_timeout.to_string().contains(TIMED_OUT),
+        assert_eq!(
+            real_timeout.bound(),
+            Some(BoundKind::TimedOut),
             "expected a timeout, got: {real_timeout}"
         );
         let timeout = with_adb_hint(real_timeout);
@@ -418,6 +426,9 @@ mod tests {
         // Extending the message must not wrap one Backend in another: Display prints its prefix
         // per layer, and "backend error: backend error: ..." is what an agent would read.
         assert_eq!(timeout.to_string().matches("backend error").count(), 1);
+        // The hinted error is what reaches `a11y::bound_fired`, so the rebuild must keep the bound:
+        // without it every timed-out read is reported as a device that failed.
+        assert_eq!(timeout.bound(), Some(BoundKind::TimedOut), "{timeout}");
     }
 
     #[test]

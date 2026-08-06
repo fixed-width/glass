@@ -1,5 +1,17 @@
 use thiserror::Error;
 
+/// Which bound ended a call that produced no answer — the distinction
+/// [`crate::run_bounded_until`] makes and [`GlassError::Bounded`] carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundKind {
+    /// The call ran and was killed when its own budget elapsed. The tool may be wedged, so the
+    /// remedies for one apply.
+    TimedOut,
+    /// The call never ran: the deadline it shares with the rest of a sequence was already spent.
+    /// Nothing was asked, so nothing about the tool is known.
+    NotStarted,
+}
+
 /// All fallible glass-core operations return this error.
 ///
 /// Variants map to the actionable error kinds the MCP layer surfaces to the
@@ -173,6 +185,14 @@ pub enum GlassError {
     #[error("backend error: {0}")]
     Backend(String),
 
+    /// A bounded call that ended at one of its bounds instead of at an answer, naming which.
+    ///
+    /// Displayed exactly as [`Self::Backend`], and it is one: the split exists so glass can tell
+    /// its own deadline firing from the tool failing without reading that back out of the message,
+    /// which carries the child's own output verbatim (glass#348).
+    #[error("backend error: {message}")]
+    Bounded { kind: BoundKind, message: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -213,6 +233,18 @@ impl GlassError {
     /// separates them, and the recoverable answer has to win.
     pub fn set_value_failed_after_writing(&self) -> bool {
         matches!(self, GlassError::AxValueNotApplied(_))
+    }
+
+    /// Which bound ended this call, if a bound did rather than the tool answering.
+    ///
+    /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
+    /// before reporting a caller's spent budget as a device failure. `None` for every other
+    /// failure, including ones a bounded call raises for a tool that did answer.
+    pub fn bound(&self) -> Option<BoundKind> {
+        match self {
+            GlassError::Bounded { kind, .. } => Some(*kind),
+            _ => None,
+        }
     }
 
     /// Runtime "this operation is unsupported on the active backend" error, worded

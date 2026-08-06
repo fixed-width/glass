@@ -13,16 +13,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::{GlassError, Result};
+use crate::{BoundKind, GlassError, Result};
 
-/// The phrase a timeout error carries, so a caller can recognise one without matching on prose it
-/// does not own — `glass-android` offers `adb kill-server` for a timeout and for nothing else.
-pub const TIMED_OUT: &str = "no answer within";
+/// The phrase a timeout error carries, for a reader of the message. What a *caller* keys on is
+/// [`BoundKind::TimedOut`] — this text is composed partly from the child's own output, so anything
+/// matching on it is matching on prose the device helps write (glass#348).
+const TIMED_OUT: &str = "no answer within";
 
 /// The phrase an error carries when a call was never started, because the deadline it serves was
 /// already spent. Deliberately not [`TIMED_OUT`]: the remedies for a tool that hung do not apply to
-/// one that never ran.
-pub const NOT_STARTED: &str = "was not started";
+/// one that never ran, and [`BoundKind`] keeps the two apart for callers.
+const NOT_STARTED: &str = "was not started";
 
 /// Longest gap between checks on a child that has not exited yet. The wait starts far tighter and
 /// backs off to this, so a one-shot that answers in a millisecond is not billed a full tick and a
@@ -76,10 +77,13 @@ pub fn run_bounded_until(
 ) -> Result<Output> {
     let budget = budget_within(budget, deadline, Instant::now());
     if budget.is_zero() {
-        return Err(GlassError::Backend(format!(
-            "{op}: the deadline it shares with the rest of the call was already spent, so it \
-             {NOT_STARTED}"
-        )));
+        return Err(GlassError::Bounded {
+            kind: BoundKind::NotStarted,
+            message: format!(
+                "{op}: the deadline it shares with the rest of the call was already spent, so it \
+                 {NOT_STARTED}"
+            ),
+        });
     }
     run_bounded_inner(cmd, budget, op, None)
 }
@@ -384,7 +388,10 @@ fn timed_out(
     } else {
         "so the process was killed, though it had not exited yet (it may be stuck in the kernel)"
     };
-    GlassError::Backend(format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"))
+    GlassError::Bounded {
+        kind: BoundKind::TimedOut,
+        message: format!("{op}: {TIMED_OUT} {budget:?}, {fate}; {said}"),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -826,6 +833,56 @@ mod tests {
         .expect("a fast command yields its Output");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ready");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_call_that_ended_at_a_bound_says_which_one_as_a_value() {
+        // Which bound fired decides whether a backend retries, whether it offers the wedged-adb
+        // remedy, and whether a caller's spent budget is reported as a device failure. The runner
+        // knows it exactly; a caller reconstructing it from the message reads a message the child's
+        // own output helps write.
+        let hung = run_bounded(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(300),
+            "test:kind-timeout",
+        )
+        .expect_err("must time out");
+        assert_eq!(hung.bound(), Some(BoundKind::TimedOut), "{hung}");
+
+        let spent = run_bounded_until(
+            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            Duration::from_secs(20),
+            Instant::now(),
+            "test:kind-not-started",
+        )
+        .expect_err("a call with no time left must fail rather than run");
+        assert_eq!(spent.bound(), Some(BoundKind::NotStarted), "{spent}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failure_that_is_not_a_bound_firing_carries_no_kind() {
+        // The classification must not widen to "this call failed": a wedged adb and a crashed
+        // `uiautomator` both reach the same guards, and only a bound firing means the deadline —
+        // not the device — ended the call.
+        let spawn = run_bounded(
+            &mut Command::new("/nonexistent/glass-test-binary"),
+            Duration::from_secs(10),
+            "test:kind-spawn",
+        )
+        .expect_err("spawn must fail");
+        assert_eq!(spawn.bound(), None, "{spawn}");
+
+        let held_open = run_bounded(
+            Command::new("/bin/sh").args(["-c", "printf head; { sleep 1; printf tail; } &"]),
+            Duration::from_secs(20),
+            "test:kind-incomplete",
+        )
+        .expect_err("an incomplete read is an error");
+        assert_eq!(held_open.bound(), None, "{held_open}");
+
+        assert_eq!(GlassError::Backend("device offline".into()).bound(), None);
     }
 
     #[test]
