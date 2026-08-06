@@ -200,6 +200,16 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- On the iOS Simulator, a `glass_set_value` whose own write replaced the screen now reports the
+  element as gone rather than as changed. Typing into a field that navigates — a search box is the
+  ordinary case — replaces the tree the element was addressed in, and glass answered `element #N
+  changed since the snapshot; re-snapshot`. That reads as an instruction to re-address that id, and
+  the write it would have repeated has already landed: measured on the Simulator, typing into
+  Settings' search field takes the tree from 16 elements to 5, the field is no longer in it, and the
+  text is on screen. glass now asks whether anything in the tree still carries the element's role
+  and name — the question Android has asked since it learned the same lesson — and where nothing
+  does, says the element is gone and to look at where the app is now instead of writing again. When
+  a write is refused has not changed; only what the refusal is called.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion

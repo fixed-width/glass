@@ -329,11 +329,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
                 t.limit_value,
                 t.limit.label(),
             )),
-            None => drifted(after_tree, target),
+            None => target.drifted(after_tree),
         });
     };
     if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
-        return Err(drifted(after_tree, target));
+        return Err(target.drifted(after_tree));
     }
     let landed = if text.is_empty() {
         typed_clear_landed(node.value.as_deref())
@@ -502,32 +502,6 @@ impl Default for AndroidA11y {
     }
 }
 
-/// Whether any node in `tree` still presents as `target` — same role and name, wherever it sits.
-/// Bounds and value are excluded: both move under a live app without the control going anywhere.
-fn still_on_screen(tree: &AxTree, target: &AxTarget) -> bool {
-    fn walk(node: &AxNode, target: &AxTarget) -> bool {
-        target.matches(node.role, node.name.as_deref())
-            || node.children.iter().any(|c| walk(c, target))
-    }
-    walk(&tree.root, target)
-}
-
-/// Which of the two disagreements a tree that no longer agrees with `target` has.
-///
-/// `AxElementChanged` sends the reader looking for where the element went, which is worth doing
-/// only while it is still somewhere; nothing carrying its role and name means the screen was
-/// replaced or the app that drew it restarted (glass#323).
-///
-/// Both Android readers get this. Do not tighten [`still_on_screen`] to include bounds or value:
-/// `a11y_service`'s relaxation needs `AxElementChanged` in every case it can relax.
-fn drifted(tree: &AxTree, target: &AxTarget) -> GlassError {
-    if still_on_screen(tree, target) {
-        GlassError::AxElementChanged(target.id.0)
-    } else {
-        GlassError::AxElementGone(target.id.0)
-    }
-}
-
 /// Find `target.id` and reject a tree that drifted under it — shared by [`editable_target`]
 /// and the service reader's `invoke`, which needs the same rejection without the editable check.
 ///
@@ -541,7 +515,7 @@ pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&
         || !target.bounds_consistent(node.bounds, 8)
         || !target.value_consistent(node.value.as_deref())
     {
-        return Err(drifted(tree, target));
+        return Err(target.drifted(tree));
     }
     Ok(node)
 }

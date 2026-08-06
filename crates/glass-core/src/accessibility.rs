@@ -6,7 +6,7 @@
 //! `glass-a11y-linux`) map their native roles/states into the normalized types
 //! here; no OS/AT-SPI/D-Bus types appear in this module.
 
-use crate::error::Result;
+use crate::error::{GlassError, Result};
 use crate::platform::{Segment, WindowGeometry};
 
 /// Normalized accessibility role — the union of the AT-SPI / AX / UIA
@@ -797,6 +797,40 @@ impl AxTarget {
     /// Whether a reached node's role + name match this target.
     pub fn matches(&self, role: AxRole, name: Option<&str>) -> bool {
         self.role == role && self.name.as_deref() == name
+    }
+
+    /// Whether any node in `tree` still presents as this target — same role and name, wherever it
+    /// sits. Bounds and value are excluded: both move under a live app without the control going
+    /// anywhere.
+    ///
+    /// Do not tighten this to include bounds or value. Android's service reader relaxes a moved
+    /// control back into a write, and that relaxation needs [`Self::drifted`] to answer
+    /// `AxElementChanged` in every case it can relax.
+    pub fn still_on_screen(&self, tree: &AxTree) -> bool {
+        fn walk(node: &AxNode, target: &AxTarget) -> bool {
+            target.matches(node.role, node.name.as_deref())
+                || node.children.iter().any(|c| walk(c, target))
+        }
+        walk(&tree.root, self)
+    }
+
+    /// Which of the two disagreements a tree that no longer agrees with this target has.
+    ///
+    /// [`GlassError::AxElementChanged`] sends the reader looking for where the element went, which
+    /// is worth doing only while it is still somewhere. Nothing carrying its role and name means
+    /// the screen was replaced or the app that drew it restarted (glass#323), and re-addressing
+    /// that id would land on whatever now occupies it — for a `set_value` read-back, that is how a
+    /// write that already landed gets typed a second time.
+    ///
+    /// Shared rather than per-backend: both Android readers and iOS ask this same question, and
+    /// the two implementations had already drifted apart once — Android learned to tell the cases
+    /// apart while iOS went on calling every disagreement `AxElementChanged`.
+    pub fn drifted(&self, tree: &AxTree) -> GlassError {
+        if self.still_on_screen(tree) {
+            GlassError::AxElementChanged(self.id.0)
+        } else {
+            GlassError::AxElementGone(self.id.0)
+        }
     }
 
     /// Whether a reached element's bounds `got` are consistent with the bounds
@@ -1969,6 +2003,60 @@ mod tests {
             bounds: None,
             children: vec![],
         }
+    }
+
+    /// A target naming the `TextField "Note"` that `drift_tree` puts on screen.
+    fn drift_target() -> AxTarget {
+        AxTarget {
+            id: AxNodeId(1),
+            role: AxRole::TextField,
+            name: Some("Note".into()),
+            bounds: None,
+            value: None,
+        }
+    }
+
+    fn drift_tree(children: Vec<AxNode>) -> AxTree {
+        let mut root = leaf(AxRole::Window, "App");
+        root.children = children;
+        let mut t = AxTree::new(root);
+        t.assign_ids();
+        t
+    }
+
+    #[test]
+    fn a_target_still_on_screen_is_changed_not_gone() {
+        // Renumbered, not removed: re-snapshotting finds it again, which is what `AxElementChanged`
+        // tells the caller to do.
+        let tree = drift_tree(vec![
+            leaf(AxRole::Label, "Heading"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(drift_target().still_on_screen(&tree));
+        assert!(matches!(
+            drift_target().drifted(&tree),
+            GlassError::AxElementChanged(1)
+        ));
+    }
+
+    #[test]
+    fn a_target_no_longer_anywhere_is_gone_not_changed() {
+        // The screen was replaced. Telling the caller to re-address that id would send a set_value
+        // read-back to retype a write that already landed.
+        let tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        assert!(!drift_target().still_on_screen(&tree));
+        assert!(matches!(
+            drift_target().drifted(&tree),
+            GlassError::AxElementGone(1)
+        ));
+    }
+
+    #[test]
+    fn a_same_named_element_of_another_role_does_not_keep_a_target_on_screen() {
+        // Role and name together, not name alone — otherwise a heading that happens to repeat the
+        // field's label would report a replaced screen as merely renumbered.
+        let tree = drift_tree(vec![leaf(AxRole::Label, "Note")]);
+        assert!(!drift_target().still_on_screen(&tree));
     }
 
     #[test]
