@@ -670,9 +670,9 @@ impl Accessibility for AndroidA11y {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, died_unexplained, dump_once,
-        dump_until_ready, editable_target, locate_editable_target, locate_for_write,
-        snapshot_bound, snapshot_with_runner, verify_write,
+        Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, dump_once, dump_until_ready,
+        editable_target, locate_editable_target, locate_for_write, snapshot_bound,
+        snapshot_with_runner, verify_write,
     };
     use crate::adb::{AdbOp, a_real_timeout_hinted};
     use glass_core::accessibility::{
@@ -1188,6 +1188,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_bound_that_fired_is_no_crash_even_when_the_message_ends_as_one() {
+        // Imported here, not with the module's other uses: this is the only test that needs it, so
+        // a `use` up there is an unused import on every non-unix target, which `-D warnings` fails.
+        use super::died_unexplained;
+
         let mut hang = std::process::Command::new("/bin/sh");
         hang.args([
             "-c",
