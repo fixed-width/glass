@@ -178,18 +178,16 @@ impl Adb {
 /// Add adb's one-command remedy to a TIMEOUT, and nothing else.
 ///
 /// Appended in place rather than wrapped: nesting one error inside another makes `Display` print
-/// `"backend error: "` twice, and an agent reads this text. Editing the message also leaves the
-/// [`BoundKind`] where it was, which `a11y::bound_fired` reads downstream of this — a rebuild that
-/// dropped it would report every hint-carrying timeout as a device that failed.
+/// `"backend error: "` twice, and an agent reads this text. In place also keeps the [`BoundKind`],
+/// which `a11y::bound_fired` reads downstream — a rebuild that dropped it would report every
+/// hint-carrying timeout as a device that failed.
 fn with_adb_hint(mut e: GlassError) -> GlassError {
     if let GlassError::Bounded { kind, message, .. } = &mut e {
         match kind {
             BoundKind::TimedOut => {
                 message.push_str("; if this repeats, run `adb kill-server` and retry");
             }
-            // adb was never asked, so nothing about the server is implicated — and the other
-            // failure it could be advice for is a missing or mis-resolved binary, the most common
-            // Android setup problem.
+            // adb was never asked, so nothing about the server is implicated.
             BoundKind::NotStarted => {}
         }
     }
@@ -432,8 +430,8 @@ mod tests {
 
         let timeout = with_adb_hint(a_real_timeout());
         assert!(timeout.to_string().contains("adb kill-server"), "{timeout}");
-        // Extending the message must not wrap one error in another: Display prints its prefix per
-        // layer, and "backend error: backend error: ..." is what an agent would read.
+        // Display prints its prefix per layer, and "backend error: backend error: ..." is what
+        // an agent would read.
         assert_eq!(timeout.to_string().matches("backend error").count(), 1);
         assert_eq!(timeout.bound(), Some(BoundKind::TimedOut), "{timeout}");
     }

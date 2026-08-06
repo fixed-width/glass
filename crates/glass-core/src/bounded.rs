@@ -840,7 +840,7 @@ mod tests {
     fn a_call_killed_at_its_bound_says_it_timed_out_as_a_value() {
         // That a bound fired decides whether a backend retries and whether a caller's spent budget
         // is reported as a device failure; which one decides whether the wedged-tool remedy is
-        // offered. The runner knows both exactly, and used to discard them into the message.
+        // offered.
         let hung = run_bounded(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_millis(300),
@@ -852,8 +852,8 @@ mod tests {
 
     #[test]
     fn a_call_with_nothing_left_says_it_never_started_as_a_value() {
-        // Portable: this path returns before anything is spawned, so the binary need not exist —
-        // which is what lets the Windows leg cover the kind a `wait_for_element` polls through.
+        // This path returns before anything is spawned, so the binary need not exist — which is
+        // what lets the Windows leg cover the kind a `wait_for_element` polls through.
         let spent = run_bounded_until(
             &mut Command::new("/nonexistent/glass-test-binary"),
             Duration::from_secs(20),
@@ -866,10 +866,9 @@ mod tests {
 
     #[test]
     fn a_failure_that_is_not_a_bound_firing_carries_no_kind() {
-        // The classification must not widen to "this call failed": a missing or mis-resolved binary
-        // is the commonest Android setup problem, and read as a bound it becomes a wait polling on
-        // for its whole timeout instead of failing at once. Portable, so the Windows leg — where
-        // that binary is likeliest to be missing — covers this direction too.
+        // The classification must not widen to "this call failed": a missing binary read as a
+        // bound becomes a wait polling on for its whole timeout instead of failing at once.
+        // Portable, so the Windows leg covers this direction too.
         let spawn = run_bounded(
             &mut Command::new("/nonexistent/glass-test-binary"),
             Duration::from_secs(10),

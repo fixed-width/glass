@@ -186,11 +186,9 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, prefix: &str, deadline: Instant
 /// explanation for it — and that substitution is retryable, so the loop would go on retrying a
 /// device that had answered.
 ///
-/// Says only *that* a bound fired, not which *deadline* governed — the caller's or the attempt's
-/// own, which [`dump_until_ready`] settles before the attempt rather than reading back out of the
-/// error. Read off the bound's own signal rather than the message, which `Adb::exit_error`
-/// composes partly from the device's output — the device could otherwise answer for glass's
-/// deadline (glass#348).
+/// Says only *that* a bound fired, not which deadline governed — [`dump_until_ready`] settles
+/// that before the attempt. Read off the bound's signal rather than the message, which
+/// `Adb::exit_error` composes partly from the device's output (glass#348).
 fn bound_fired(e: &GlassError) -> bool {
     e.bound().is_some()
 }
@@ -1168,8 +1166,8 @@ mod tests {
     /// really raised rather than against a constant both sides share.
     ///
     /// `bound_fired` recognises any [`BoundKind`], so what it can miss is a bound arriving as some
-    /// other variant — which `with_adb_hint` rebuilding a hinted timeout could silently do, and no
-    /// test of either side alone would see.
+    /// other variant — which a wrapper on the way out of `Adb` could silently do, and no test of
+    /// either side alone would see.
     #[test]
     fn every_bound_glass_core_fires_is_one_the_classifier_recognises() {
         for (want, e) in [
@@ -1185,9 +1183,8 @@ mod tests {
     /// ended its sentence — that crash is retried, so reading one as the other retries a deadline
     /// nobody is waiting on any more.
     ///
-    /// The stderr is what makes this bite: `said_before_the_kill` quotes it into the timeout
-    /// message, so the message really does end in `failed:`, which is the whole of the other
-    /// classifier's test.
+    /// The stderr matters: `said_before_the_kill` quotes it into the timeout message, so the
+    /// message really does end in `failed:`.
     #[test]
     #[cfg(unix)]
     fn a_bound_that_fired_is_no_crash_even_when_the_message_ends_as_one() {
@@ -1213,9 +1210,8 @@ mod tests {
     }
 
     /// Text the device wrote is not a bound of glass's own. `Adb::exit_error` interpolates the
-    /// child's stderr verbatim, so a phrase glass *once read* as its own deadline still arrives
-    /// intact — and keyed on the message it was reported as a spent budget, which
-    /// `wait_for_element` polls through rather than surfaces (glass#348).
+    /// child's stderr verbatim, so keyed on the message this was reported as a spent budget —
+    /// which `wait_for_element` polls through rather than surfaces (glass#348).
     ///
     /// The stderr below is constructed rather than observed: no device is known to print it, and
     /// nothing stops one.
