@@ -16,23 +16,45 @@ use glass_core::{GlassError, Result};
 use crate::axmap::{LabelInputs, class_to_role, labels};
 use crate::conn::{CallFailure, Conn};
 
+/// One walk of a device `tree` reply: the bounds it runs under, and the device `ref` of every
+/// node it keeps, in the pre-order those nodes are about to be numbered in.
+struct Walk {
+    budget: WalkBudget,
+    refs: Vec<u32>,
+}
+
+impl Walk {
+    fn new(limits: WalkLimits) -> Walk {
+        Walk {
+            budget: WalkBudget::with_limits(limits),
+            refs: Vec::new(),
+        }
+    }
+}
+
 /// Map one device `tree` JSON node (+descendants) into an `AxNode`, converting screen bounds to
-/// window-relative. Ids are left `AxNodeId(0)`; the core's `AxTree::assign_ids` numbers them
-/// pre-order (root = 0).
+/// window-relative, and record its device `ref` in `walk`. Ids are left `AxNodeId(0)`;
+/// `tree_from_json` numbers them pre-order (root = 0).
 ///
-/// INVARIANT: `AxNodeId(n)` equals the device's `ref` n. Both sides number the *same* node set in
-/// the *same* pre-order: the device assigns `ref` while walking its adapted tree, sends that tree
-/// as JSON `children` (in order), and this mapper recurses `children` in order without skipping or
-/// reordering — a node with malformed/missing bounds errors the whole snapshot rather than being
-/// dropped (which would shift every later id). So `set_value` can send `target.id.0` as the device
-/// `ref` and hit the right node. Keep both walks pre-order if either side changes.
-fn json_to_node(
-    v: &Value,
-    win: &WindowGeometry,
-    depth: usize,
-    budget: &mut WalkBudget,
-) -> Result<AxNode> {
-    budget.visit();
+/// The `ref` is read, never inferred from walk order. The two numberings agree only while the
+/// host keeps every node the device sent: the `Depth` and `Siblings` caps drop a subtree and
+/// carry on with later siblings, so past the first pruned subtree a host id is *lower* than the
+/// device's own `ref` for that node (glass#288).
+///
+/// The push happens on entry, before the children, so `walk.refs` ends up in the same pre-order
+/// [`AxTree::assign_ids`] numbers by — `refs[n]` is the node numbered `AxNodeId(n)`.
+fn json_to_node(v: &Value, win: &WindowGeometry, depth: usize, walk: &mut Walk) -> Result<AxNode> {
+    walk.budget.visit();
+    // Dropping the node would shift every later id, so a missing ref fails the whole snapshot
+    // like malformed bounds below. Every released companion numbers every node.
+    let device_ref = v
+        .get("ref")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            GlassError::AccessibilityUnavailable("tree node carries no usable ref".into())
+        })?;
+    walk.refs.push(device_ref);
     let cls = v.get("class").and_then(Value::as_str).unwrap_or("");
     let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
     // The device agent omits an empty text/desc rather than sending `""`, so both arrive as
@@ -76,12 +98,12 @@ fn json_to_node(
     let children = match v.get("children").and_then(Value::as_array) {
         None => vec![],
         Some(arr) if arr.is_empty() => vec![],
-        Some(_) if budget.depth_exhausted(depth) => {
-            budget.hit(TruncationLimit::Depth);
+        Some(_) if walk.budget.depth_exhausted(depth) => {
+            walk.budget.hit(TruncationLimit::Depth);
             vec![]
         }
-        Some(_) if budget.nodes_exhausted() => {
-            budget.hit(TruncationLimit::Nodes);
+        Some(_) if walk.budget.nodes_exhausted() => {
+            walk.budget.hit(TruncationLimit::Nodes);
             vec![]
         }
         Some(arr) => {
@@ -89,15 +111,15 @@ fn json_to_node(
             for (i, c) in arr.iter().enumerate() {
                 // Checked before processing each child (not after) so the child that merely
                 // completes the tree doesn't get mistaken for one the walk declined to visit.
-                if budget.nodes_exhausted() {
-                    budget.hit(TruncationLimit::Nodes);
+                if walk.budget.nodes_exhausted() {
+                    walk.budget.hit(TruncationLimit::Nodes);
                     break;
                 }
-                if i >= budget.max_siblings() {
-                    budget.hit(TruncationLimit::Siblings);
+                if i >= walk.budget.max_siblings() {
+                    walk.budget.hit(TruncationLimit::Siblings);
                     break;
                 }
-                out.push(json_to_node(c, win, depth + 1, budget)?);
+                out.push(json_to_node(c, win, depth + 1, walk)?);
             }
             out
         }
@@ -133,26 +155,64 @@ fn json_to_node(
     })
 }
 
-/// Build the `AxTree` from a device `tree` response value (the `"tree"` object).
+/// A tree read off the device, paired with the device `ref` of each of its nodes.
+///
+/// The halves are only meaningful together: `refs[n]` is the `ref` the device gave the node this
+/// host numbered `AxNodeId(n)`, so an action a caller addresses by host id can be dispatched to
+/// the node the *device* knows by that name.
+#[derive(Debug)]
+pub(crate) struct RefTree {
+    pub(crate) tree: AxTree,
+    refs: Vec<u32>,
+}
+
+impl RefTree {
+    /// The device `ref` for a node of this tree.
+    fn device_ref(&self, id: AxNodeId) -> Result<u32> {
+        self.refs
+            .get(id.0 as usize)
+            .copied()
+            .ok_or(GlassError::AxElementNotFound(id.0))
+    }
+
+    /// The app whose nodes these refs number: what the tree actually described, falling back to
+    /// what was asked about when the companion made no claim. A ref is only meaningful against
+    /// that app — see [`rearm_tree`].
+    fn acting_on<'a>(&'a self, asked: &'a str) -> &'a str {
+        self.tree.subject.as_ref().map_or(asked, |s| &s.actual)
+    }
+}
+
+/// Build the tree from a device `tree` response value (the `"tree"` object), keeping each node's
+/// device `ref`.
 pub(crate) fn tree_from_json(
     tree: &Value,
     win: &WindowGeometry,
     limits: WalkLimits,
-) -> Result<AxTree> {
-    let mut budget = WalkBudget::with_limits(limits);
-    let mut root = json_to_node(tree, win, 0, &mut budget)?;
+) -> Result<RefTree> {
+    let mut walk = Walk::new(limits);
+    let mut root = json_to_node(tree, win, 0, &mut walk)?;
     // The device answers with the root of the ACTIVE WINDOW, so this node is the window
     // whatever layout class it carries. Both Android readers have to agree about the root, or
     // a `role:` selector written against one misses on the other.
     //
-    // No synthetic wrapper: `AxNodeId(n)` is the device's `ref` n, and an extra node would
-    // shift every id `set_value` addresses by. `raw_role` keeps the device's class on the
-    // node, though it no longer reaches the outline, which names a native token only for an
-    // element glass has no role for.
+    // `raw_role` keeps the device's class on the node, though it no longer reaches the outline,
+    // which names a native token only for an element glass has no role for.
     root.role = AxRole::Window;
     let mut tree = AxTree::new(root);
-    tree.truncated = budget.truncation();
-    Ok(tree)
+    tree.truncated = walk.budget.truncation();
+    // Numbered here rather than by the caller: `refs` is indexed by the id `assign_ids` hands a
+    // node. The session re-runs it on every snapshot, which is a no-op.
+    tree.assign_ids();
+    debug_assert_eq!(
+        tree.count,
+        walk.refs.len(),
+        "one ref per kept node, or the index is meaningless"
+    );
+    Ok(RefTree {
+        tree,
+        refs: walk.refs,
+    })
 }
 
 /// A `tree` reply: the tree, and the window it came from when the companion names one.
@@ -351,8 +411,7 @@ impl ServiceA11y {
     fn wait_for_check(&mut self, ctx: &AxContext, plan: &InvokePlan, want: bool) -> Result<()> {
         let deadline = std::time::Instant::now() + self.check_timeout;
         loop {
-            let mut after = self.snapshot(ctx)?;
-            after.assign_ids();
+            let after = self.snapshot(ctx)?;
             let seen = check_state(&after, &plan.actuated);
             if seen == CheckState::Reached(want) {
                 return Ok(());
@@ -369,23 +428,40 @@ impl ServiceA11y {
     /// step and this one — a window `invoke`'s own straight-line execution never otherwise
     /// exposes to a caller.
     ///
-    /// `subject` (the plan's tree's own `AxTree::subject`) is passed separately from `plan`: it
-    /// borrows the tree, not `self`, so the caller can still hand it to this `&mut self` method.
+    /// `rt` is the tree the plan was resolved against, passed separately from `plan`: it borrows
+    /// the tree, not `self`, so the caller can still hand it to this `&mut self` method. It is
+    /// also the only thing that can say which device `ref` the actuated node has.
     fn dispatch_click(
         &mut self,
         ctx: &AxContext,
         target: &AxTarget,
         plan: &InvokePlan,
-        subject: Option<&Subject>,
+        rt: &RefTree,
     ) -> Result<Option<AxNodeId>> {
-        let acting_on = subject.map_or(self.package.as_str(), |s| s.actual.as_str());
+        let device_ref = rt.device_ref(plan.actuated.id)?;
         self.client
-            .click(plan.actuated.id.0, acting_on)
+            .click(device_ref, rt.acting_on(&self.package))
             .map_err(|f| action_error(target.id.0, f))?;
         if let Some(want) = plan.want_checked {
             self.wait_for_check(ctx, plan, want)?;
         }
         Ok(plan.substituted())
+    }
+
+    /// [`Accessibility::snapshot`], keeping each node's device `ref` — what an action addressed
+    /// by a host id has to be dispatched by.
+    fn snapshot_with_refs(&mut self, ctx: &AxContext) -> Result<RefTree> {
+        // Checked before the round-trip: a companion that answers after the caller has gone costs
+        // a socket timeout nobody is waiting through.
+        if ctx.deadline.has_passed() {
+            return Err(GlassError::AccessibilityNotReady(
+                "no accessibility tree within the time this call allowed".into(),
+            ));
+        }
+        let reply = self.client.tree_within(&self.package, ctx.deadline)?;
+        let mut rt = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
+        rt.tree.subject = subject_of(&self.package, reply.package.as_deref());
+        Ok(rt)
     }
 }
 
@@ -415,43 +491,25 @@ impl Drop for ReadBound<'_> {
 
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        // Checked before the round-trip: a companion that answers after the caller has gone costs
-        // a socket timeout nobody is waiting through.
-        if ctx.deadline.has_passed() {
-            return Err(GlassError::AccessibilityNotReady(
-                "no accessibility tree within the time this call allowed".into(),
-            ));
-        }
-        let reply = self.client.tree_within(&self.package, ctx.deadline)?;
-        let mut tree = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
-        tree.subject = subject_of(&self.package, reply.package.as_deref());
-        Ok(tree)
+        Ok(self.snapshot_with_refs(ctx)?.tree)
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        // Guard: re-snapshot and verify the ref still points at the same editable element before
+        // Guard: re-snapshot and verify the id still points at the same editable element before
         // acting — `invoke`'s guard plus the editable check.
-        let tree = {
-            let mut t = self.snapshot(ctx)?;
-            t.assign_ids();
-            t
-        };
-        resolved_editable_target(&tree, target)?;
-        // Re-arm against the app the served tree actually described, not the one asked about —
-        // that's the app `target`'s ref came from (see `rearm_tree`).
-        let acting_on = tree
-            .subject
-            .as_ref()
-            .map_or(self.package.as_str(), |s| s.actual.as_str());
-        self.client.set_text(target.id.0, text, acting_on)?;
+        let rt = self.snapshot_with_refs(ctx)?;
+        // Addressed by the node the guard approved, not by the id the caller named, so a guard
+        // that ever relaxes into a search cannot dispatch to a node it never approved.
+        let device_ref = rt.device_ref(resolved_editable_target(&rt.tree, target)?.id)?;
+        self.client
+            .set_text(device_ref, text, rt.acting_on(&self.package))?;
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
         // value to land; error honestly only on timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let mut after = self.snapshot(ctx)?;
-            after.assign_ids();
+            let after = self.snapshot(ctx)?;
             let node = after.find(target.id);
             let got = node.and_then(|n| n.value.clone());
             // An empty field reports no value (None), not Some(""), so compare against "".
@@ -484,13 +542,9 @@ impl Accessibility for ServiceA11y {
     }
 
     fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
-        let tree = {
-            let mut t = self.snapshot(ctx)?;
-            t.assign_ids();
-            t
-        };
-        let plan = invoke_plan(&tree, target)?;
-        self.dispatch_click(ctx, target, &plan, tree.subject.as_ref())
+        let rt = self.snapshot_with_refs(ctx)?;
+        let plan = invoke_plan(&rt.tree, target)?;
+        self.dispatch_click(ctx, target, &plan, &rt)
     }
 }
 
@@ -923,18 +977,6 @@ fn invoke_plan(tree: &AxTree, target: &AxTarget) -> Result<InvokePlan> {
     if !chosen.states.enabled {
         return Err(disabled_error(target.id.0, chosen.id));
     }
-    // Under these caps the kept nodes are no longer a pre-order prefix — the walk drops a
-    // subtree and carries on with later siblings — so a host id no longer equals the device
-    // `ref` it would be sent as. `Nodes` stops the walk outright and keeps the prefix.
-    // Fallback-eligible on purpose: nothing was dispatched, and the pointer path aims at this
-    // tree's own bounds, which the id/`ref` skew does not touch. It must therefore stay below
-    // both `enabled` refusals — reached first, it hands a disabled control to the pointer
-    // path.
-    if let Some(t) = &tree.truncated
-        && matches!(t.limit, TruncationLimit::Depth | TruncationLimit::Siblings)
-    {
-        return Err(GlassError::AxActionUnavailable(target.id.0));
-    }
     let want = if toggles(chosen.role) {
         !chosen.states.checked
     } else {
@@ -1091,6 +1133,44 @@ mod tests {
         }
     }
 
+    /// Number every node that carries no `ref` the way the companion's `treeJson` does —
+    /// pre-order, root = 0 — so a fixture reads like a real device reply without restating what
+    /// every companion release already sends. A fixture that states its own refs keeps them,
+    /// which is how a tree whose refs and host ids diverge is written.
+    fn with_refs(v: &Value) -> Value {
+        fn walk(v: &mut Value, next: &mut u32) {
+            let r = *next;
+            *next += 1;
+            if let Some(o) = v.as_object_mut() {
+                o.entry("ref").or_insert(json!(r));
+            }
+            if let Some(kids) = v.get_mut("children").and_then(Value::as_array_mut) {
+                for c in kids {
+                    walk(c, next);
+                }
+            }
+        }
+        let mut out = v.clone();
+        walk(&mut out, &mut 0);
+        out
+    }
+
+    /// [`tree_from_json`] over a fixture numbered like a device reply.
+    fn read_json(v: &Value, limits: WalkLimits) -> Result<RefTree> {
+        tree_from_json(&with_refs(v), &win(), limits)
+    }
+
+    /// [`json_to_node`] over a single fixture node numbered like a device reply.
+    fn mapped_node(v: &Value) -> AxNode {
+        json_to_node(
+            &with_refs(v),
+            &win(),
+            0,
+            &mut Walk::new(WalkLimits::DEFAULT),
+        )
+        .expect("maps")
+    }
+
     #[test]
     fn signature_mismatch_detected() {
         let failed = |said: &str| {
@@ -1145,8 +1225,7 @@ mod tests {
                  "editable": false, "clickable": true, "enabled": true, "scrollable": false}
             ]
         });
-        let mut t = tree_from_json(&v, &win(), WalkLimits::DEFAULT).unwrap();
-        t.assign_ids();
+        let t = read_json(&v, WalkLimits::DEFAULT).unwrap().tree;
         assert_eq!(t.count, 3);
         let email = t.find(AxNodeId(1)).unwrap();
         assert_eq!(email.role, AxRole::TextField);
@@ -1182,8 +1261,9 @@ mod tests {
             width: 1080,
             height: 2400,
         };
-        let mut tree = tree_from_json(&device_tree(), &win, WalkLimits::DEFAULT).expect("builds");
-        tree.assign_ids();
+        let tree = tree_from_json(&with_refs(&device_tree()), &win, WalkLimits::DEFAULT)
+            .expect("builds")
+            .tree;
         // The service asks the device for the active window's root, so that node IS the
         // window — and both Android readers must agree on it, or one `role:` selector
         // cannot address the root on both.
@@ -1209,7 +1289,7 @@ mod tests {
             "class": "android.widget.CheckBox", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
             "checkable": true, "checked": true
         });
-        let n = json_to_node(&on, &win(), 0, &mut WalkBudget::new()).unwrap();
+        let n = mapped_node(&on);
         assert!(
             n.states.checkable && n.states.checked,
             "on checkbox → checkable + checked"
@@ -1217,7 +1297,7 @@ mod tests {
         let plain = json!({
             "class": "android.widget.TextView", "bounds": {"x": 0, "y": 100, "w": 10, "h": 10}
         });
-        let p = json_to_node(&plain, &win(), 0, &mut WalkBudget::new()).unwrap();
+        let p = mapped_node(&plain);
         assert!(
             !p.states.checkable && !p.states.checked,
             "a node with no checkable/checked keys stays false"
@@ -1244,18 +1324,17 @@ mod tests {
     }
 
     #[test]
-    fn truncation_stops_the_walk_and_never_shifts_surviving_ids() {
-        // The device numbers refs in pre-order over the SAME node set. If truncation dropped
-        // nodes from the middle instead of stopping at the end, every later id would shift and
-        // set_value would write to the wrong element.
+    fn the_node_cap_stops_the_walk_rather_than_dropping_nodes_from_the_middle() {
+        // Unlike Depth and Siblings, this cap ends the walk outright, so what survives is a
+        // genuine prefix of the device's tree.
         let json = wide_device_json(glass_core::MAX_NODES + 50);
-        let mut tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
-        tree.assign_ids();
+        let tree = read_json(&json, WalkLimits::DEFAULT)
+            .expect("tree parses")
+            .tree;
 
         assert!(tree.truncated.is_some(), "the node cap must have been hit");
-        // `tree_from_json` maps the device root directly (no synthetic wrapper), so the
-        // FrameLayout itself is id 0 and child at array index i is id i+1 — every surviving
-        // child must still carry the name matching its own id-derived index.
+        // The device root maps directly (no synthetic wrapper), so the FrameLayout itself is
+        // id 0 and the child at array index i is id i+1.
         let third = tree.find(AxNodeId(3)).expect("id 3 survives");
         assert_eq!(third.name.as_deref(), Some("btn2"));
     }
@@ -1267,8 +1346,9 @@ mod tests {
         // what pushes the running count to MAX_NODES. Nothing was declined, so this must NOT
         // be reported truncated (regression for the false-positive-at-the-cap bug).
         let json = wide_device_json(glass_core::MAX_NODES - 1);
-        let mut tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
-        tree.assign_ids();
+        let tree = read_json(&json, WalkLimits::DEFAULT)
+            .expect("tree parses")
+            .tree;
         assert_eq!(tree.count, glass_core::MAX_NODES);
         assert_eq!(tree.truncated, None);
     }
@@ -1279,7 +1359,9 @@ mod tests {
         // declines to visit, so the cap must still fire — proving the fix didn't just
         // disable it.
         let json = wide_device_json(glass_core::MAX_NODES);
-        let tree = tree_from_json(&json, &win(), WalkLimits::DEFAULT).expect("tree parses");
+        let tree = read_json(&json, WalkLimits::DEFAULT)
+            .expect("tree parses")
+            .tree;
         assert_eq!(
             tree.truncated.map(|t| t.limit),
             Some(TruncationLimit::Nodes)
@@ -1320,12 +1402,12 @@ mod tests {
             "class": "android.widget.TextView",
             "bounds": {"x": 0, "y": 0, "w": 10, "h": 10}
         });
-        let mut budget = WalkBudget::new();
+        let mut walk = Walk::new(WalkLimits::DEFAULT);
         for _ in 0..glass_core::MAX_NODES {
-            budget.visit();
+            walk.budget.visit();
         }
-        let _ = json_to_node(&leaf, &win(), 0, &mut budget).unwrap();
-        assert!(budget.truncation().is_none());
+        let _ = json_to_node(&with_refs(&leaf), &win(), 0, &mut walk).unwrap();
+        assert!(walk.budget.truncation().is_none());
     }
 
     #[test]
@@ -1336,8 +1418,9 @@ mod tests {
             "bounds": {"x": -5, "y": 10, "w": -3, "h": 0},
             "editable": false, "clickable": false, "enabled": true, "scrollable": false
         });
-        let t = tree_from_json(&v, &win(), WalkLimits::DEFAULT)
-            .expect("degenerate bounds must not error the snapshot");
+        let t = read_json(&v, WalkLimits::DEFAULT)
+            .expect("degenerate bounds must not error the snapshot")
+            .tree;
         let b = t.root.bounds.unwrap();
         assert_eq!((b.width, b.height), (0, 0)); // negative/zero w/h clamp to 0
         assert_eq!((b.x, b.y), (-5, -90)); // window-relative: x -5-0, y 10-100
@@ -1370,8 +1453,7 @@ mod tests {
     }
 
     fn mapped(text: Option<&str>, desc: Option<&str>) -> AxNode {
-        let mut budget = WalkBudget::new();
-        json_to_node(&node_json(text, desc, None, None), &win(), 0, &mut budget).expect("maps")
+        mapped_node(&node_json(text, desc, None, None))
     }
 
     /// [`mapped`], for an editable field; omits `resource_id`/`hint`, the shape an older
@@ -1380,8 +1462,7 @@ mod tests {
         let mut v = node_json(text, desc, None, None);
         v["class"] = json!("android.widget.EditText");
         v["editable"] = json!(true);
-        let mut budget = WalkBudget::new();
-        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+        mapped_node(&v)
     }
 
     /// [`mapped_editable`], additionally setting `resource_id` and `hint`.
@@ -1397,8 +1478,7 @@ mod tests {
             v["class"] = json!("android.widget.EditText");
             v["editable"] = json!(true);
         }
-        let mut budget = WalkBudget::new();
-        json_to_node(&v, &win(), 0, &mut budget).expect("maps")
+        mapped_node(&v)
     }
 
     #[test]
@@ -1558,9 +1638,7 @@ mod tests {
     }
 
     fn built(v: &Value) -> AxTree {
-        let mut t = tree_from_json(v, &win(), WalkLimits::DEFAULT).expect("maps");
-        t.assign_ids();
-        t
+        read_json(v, WalkLimits::DEFAULT).expect("maps").tree
     }
 
     /// The target a caller would hold after selecting `id` from `tree`.
@@ -1973,38 +2051,6 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_control_is_refused_before_a_truncated_tree_can_fall_back() {
-        // Same shape as the test above, in a truncated tree. `AxActionUnavailable` is
-        // fallback-eligible, so a truncation guard reached before the climb's `enabled` check
-        // taps the disabled control's centre and reports ok.
-        let mut v = nested_clickables();
-        v["children"][0]["children"][0]["clickable"] = json!(false);
-        v["children"][0]["enabled"] = json!(false);
-        v["children"].as_array_mut().expect("root children").push(
-            json!({"class": "android.widget.TextView", "text": "Cancel",
-                         "bounds": {"x": 40, "y": 800, "w": 200, "h": 60},
-                         "clickable": false, "enabled": true}),
-        );
-        let mut t = tree_from_json(
-            &v,
-            &win(),
-            WalkLimits {
-                siblings: 1,
-                ..WalkLimits::DEFAULT
-            },
-        )
-        .expect("maps");
-        t.assign_ids();
-        assert_eq!(
-            t.truncated.map(|x| x.limit),
-            Some(TruncationLimit::Siblings)
-        );
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(3))).unwrap_err();
-        assert!(e.to_string().contains("element 1 is disabled"), "{e}");
-        assert!(!e.invoke_fallback_eligible(), "{e}");
-    }
-
-    #[test]
     fn a_disabled_target_with_nothing_clickable_around_it_is_refused_too() {
         // With no clickable ancestor the climb ends in `AxActionUnavailable`, which IS
         // fallback-eligible — so reaching it taps the disabled control's centre and reports ok.
@@ -2090,57 +2136,14 @@ mod tests {
     /// The compose fixture read back under `limits` — small caps make the walk report the
     /// truncation a huge device tree would.
     fn truncated_compose(limits: WalkLimits) -> AxTree {
-        let mut t = tree_from_json(&compose_like(), &win(), limits).expect("maps");
-        t.assign_ids();
-        t
+        read_json(&compose_like(), limits).expect("maps").tree
     }
 
     #[test]
-    fn a_depth_truncated_tree_does_not_actuate_natively() {
-        // The depth cap drops a node's children and carries on with later siblings, so the kept
-        // set is no longer a pre-order prefix.
-        let t = truncated_compose(WalkLimits {
-            depth: 1,
-            ..WalkLimits::DEFAULT
-        });
-        assert_eq!(t.truncated.map(|x| x.limit), Some(TruncationLimit::Depth));
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap_err();
-        assert!(matches!(e, GlassError::AxActionUnavailable(1)), "{e}");
-        // Nothing was dispatched and the pointer path aims at this tree's own bounds, so the
-        // click still lands, disclosed as a pointer click.
-        assert!(e.invoke_fallback_eligible(), "{e}");
-    }
-
-    #[test]
-    fn a_sibling_truncated_tree_does_not_actuate_natively() {
-        let mut v = compose_like();
-        v["children"].as_array_mut().unwrap().push(
-            json!({"class": "android.widget.TextView", "text": "Cancel",
-                         "bounds": {"x": 60, "y": 700, "w": 210, "h": 130},
-                         "clickable": false, "enabled": true}),
-        );
-        let mut t = tree_from_json(
-            &v,
-            &win(),
-            WalkLimits {
-                siblings: 1,
-                ..WalkLimits::DEFAULT
-            },
-        )
-        .expect("maps");
-        t.assign_ids();
-        assert_eq!(
-            t.truncated.map(|x| x.limit),
-            Some(TruncationLimit::Siblings)
-        );
-        let e = invoke_plan(&t, &target_for(&t, AxNodeId(1))).unwrap_err();
-        assert!(matches!(e, GlassError::AxActionUnavailable(1)), "{e}");
-    }
-
-    #[test]
-    fn a_node_capped_tree_still_actuates_natively() {
-        // The node cap stops the walk outright, so every surviving id still equals its device
-        // `ref`.
+    fn a_truncated_tree_still_actuates_natively() {
+        // Truncation of any kind leaves the surviving nodes addressable — each carries the
+        // device's own `ref` — so a plan over one still dispatches natively rather than
+        // falling back to a pointer click.
         let t = truncated_compose(WalkLimits {
             nodes: 2,
             ..WalkLimits::DEFAULT
@@ -2153,6 +2156,180 @@ mod tests {
                 .id,
             AxNodeId(1)
         );
+    }
+
+    /// A device tree with a trailing sibling *after* a subtree the host will prune, so the host's
+    /// pre-order id and the device's own `ref` come apart under a Depth or a Siblings cap
+    /// (glass#288): `root > [Card > (c1, c2, c3), trailing]`.
+    ///
+    /// - `depth: 1` drops Card's children — kept ids `0,1,2`, so the trailing node is id 2.
+    /// - `siblings: 2` drops `c3` — kept ids `0..=4`, so the trailing node is id 4.
+    ///
+    /// Either way the device numbered that node `ref` 5, and its own `ref` 2 and 4 are `c1` and
+    /// `c3`. An action addressed by the host id lands on one of those instead.
+    fn trailing_after_a_pruned_subtree(trailing: Value) -> Value {
+        let leaf = |r: u32, y: i64| {
+            json!({
+                "ref": r, "class": "android.widget.TextView", "text": format!("c{r}"),
+                "bounds": {"x": 60, "y": y, "w": 80, "h": 50},
+                "clickable": false, "enabled": true
+            })
+        };
+        json!({
+            "ref": 0, "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 1080, "h": 2300},
+            "clickable": false, "enabled": true,
+            "children": [
+                {"ref": 1, "class": "android.view.View",
+                 "bounds": {"x": 60, "y": 480, "w": 210, "h": 130},
+                 "clickable": false, "enabled": true,
+                 "children": [leaf(2, 500), leaf(3, 540), leaf(4, 580)]},
+                trailing
+            ]
+        })
+    }
+
+    /// [`trailing_after_a_pruned_subtree`] trailing a clickable "Save" button (device `ref` 5).
+    fn save_after_a_pruned_subtree() -> Value {
+        trailing_after_a_pruned_subtree(json!({
+            "ref": 5, "class": "android.widget.Button", "desc": "Save",
+            "bounds": {"x": 60, "y": 700, "w": 210, "h": 130},
+            "clickable": true, "enabled": true
+        }))
+    }
+
+    /// [`trailing_after_a_pruned_subtree`] trailing an editable "Email" field (device `ref` 5)
+    /// holding `value`.
+    fn field_after_a_pruned_subtree(value: &str) -> Value {
+        trailing_after_a_pruned_subtree(json!({
+            "ref": 5, "class": "android.widget.EditText", "text": value, "desc": "Email",
+            "bounds": {"x": 60, "y": 700, "w": 600, "h": 120},
+            "editable": true, "clickable": true, "enabled": true
+        }))
+    }
+
+    /// The target a caller would hold after picking the node named `name` out of `tree`.
+    fn target_named(tree: &AxTree, name: &str) -> AxTarget {
+        fn walk<'a>(node: &'a AxNode, name: &str) -> Option<&'a AxNode> {
+            if node.name.as_deref() == Some(name) {
+                return Some(node);
+            }
+            node.children.iter().find_map(|c| walk(c, name))
+        }
+        let n = walk(&tree.root, name).expect("the tree holds a node with that name");
+        AxTarget {
+            id: n.id,
+            role: n.role,
+            name: n.name.clone(),
+            bounds: n.bounds,
+            value: n.value.clone(),
+        }
+    }
+
+    /// Read a tree under `limits` from a fake device serving `trees`, and return the reader, the
+    /// context, the tree as a caller receives it, and the request log.
+    fn read_under(
+        trees: Vec<Value>,
+        limits: WalkLimits,
+    ) -> (ServiceA11y, AxContext, AxTree, Arc<Mutex<Vec<String>>>) {
+        let (port, ops) = fake_service(trees, OnAction::Ok);
+        let mut a11y = reader(port, std::time::Duration::ZERO);
+        let mut ctx = ctx();
+        ctx.limits = limits;
+        let mut tree = a11y.snapshot(&ctx).expect("snapshot");
+        // What the session does to every snapshot before a caller sees an id.
+        tree.assign_ids();
+        (a11y, ctx, tree, ops)
+    }
+
+    #[test]
+    fn a_depth_truncated_tree_clicks_the_ref_the_device_gave_the_node() {
+        let (mut a11y, ctx, tree, ops) = read_under(
+            vec![save_after_a_pruned_subtree()],
+            WalkLimits {
+                depth: 1,
+                ..WalkLimits::DEFAULT
+            },
+        );
+        assert_eq!(
+            tree.truncated.map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+        let save = target_named(&tree, "Save");
+        assert_eq!(
+            save.id,
+            AxNodeId(2),
+            "the host numbered Save 2, the device 5"
+        );
+
+        a11y.invoke(&ctx, &save).expect("the click is dispatched");
+
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn1:click ref=5".to_string()
+            ],
+            "sending the host id would have clicked c3, the device's own ref 2; the second tree \
+             is invoke's own guard read"
+        );
+    }
+
+    #[test]
+    fn a_sibling_truncated_tree_writes_to_the_ref_the_device_gave_the_node() {
+        let (mut a11y, ctx, tree, ops) = read_under(
+            vec![
+                field_after_a_pruned_subtree("old"),
+                field_after_a_pruned_subtree("old"),
+                field_after_a_pruned_subtree("new"),
+            ],
+            WalkLimits {
+                siblings: 2,
+                ..WalkLimits::DEFAULT
+            },
+        );
+        assert_eq!(
+            tree.truncated.map(|t| t.limit),
+            Some(TruncationLimit::Siblings)
+        );
+        let email = target_named(&tree, "Email");
+        assert_eq!(
+            email.id,
+            AxNodeId(4),
+            "the host numbered Email 4, the device 5"
+        );
+
+        a11y.set_value(&ctx, &email, "new")
+            .expect("the write lands");
+
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:tree".to_string(),
+                "conn1:set_text ref=5".to_string(),
+                "conn1:tree".to_string()
+            ],
+            "sending the host id would have written to c3, the device's own ref 4; the trees are \
+             the caller's read, set_value's guard read and its verification read"
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_ref_is_refused_rather_than_numbered_by_inference() {
+        // The companion has numbered every node since its first release. Inferring the missing
+        // one from walk order is the glass#288 bug in miniature, and dropping the node would
+        // shift every later one — so this is a protocol violation, like missing bounds.
+        let mut v = save_after_a_pruned_subtree();
+        v["children"][1]
+            .as_object_mut()
+            .expect("node")
+            .remove("ref");
+        let e = tree_from_json(&v, &win(), WalkLimits::DEFAULT)
+            .expect_err("a node with no ref cannot be addressed");
+        assert!(matches!(e, GlassError::AccessibilityUnavailable(_)), "{e}");
+        assert!(e.to_string().contains("ref"), "{e}");
     }
 
     /// How the fake device answers an `action` request.
@@ -2228,6 +2405,9 @@ mod tests {
         packages: Vec<TreePackage>,
         on_tree: Vec<OnTree>,
     ) -> (u16, Arc<Mutex<Vec<String>>>) {
+        // Numbered on the way out, like the real companion's `treeJson`, so a fixture never has
+        // to restate what every device reply carries.
+        let trees: Vec<Value> = trees.iter().map(with_refs).collect();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let ops: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2830,9 +3010,8 @@ mod tests {
         let target = target_for(&t, AxNodeId(1));
 
         // `invoke`'s own first half, called directly: snapshot + resolve the plan.
-        let mut tree = a.snapshot(&ctx()).expect("snapshot");
-        tree.assign_ids();
-        let plan = invoke_plan(&tree, &target).expect("plan resolves");
+        let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
+        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
 
         // Break the connection's write half — deterministic, not raced: this line has already
         // returned before `dispatch_click` is called below.
@@ -2844,7 +3023,7 @@ mod tests {
             .shutdown(std::net::Shutdown::Write)
             .expect("shutdown");
 
-        a.dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
+        a.dispatch_click(&ctx(), &target, &plan, &rt)
             .expect("the caller's own configured package must match the rearm's fixed reply");
     }
 
@@ -2879,9 +3058,8 @@ mod tests {
         let t = built(&clickable);
         let target = target_for(&t, AxNodeId(1));
 
-        let mut tree = a.snapshot(&ctx()).expect("snapshot");
-        tree.assign_ids();
-        let plan = invoke_plan(&tree, &target).expect("plan resolves");
+        let rt = a.snapshot_with_refs(&ctx()).expect("snapshot");
+        let plan = invoke_plan(&rt.tree, &target).expect("plan resolves");
 
         a.client
             .conn
@@ -2892,7 +3070,7 @@ mod tests {
             .expect("shutdown");
 
         let e = a
-            .dispatch_click(&ctx(), &target, &plan, tree.subject.as_ref())
+            .dispatch_click(&ctx(), &target, &plan, &rt)
             .expect_err("the rearm names the asked-about app, not the app the ref came from");
         let msg = e.to_string();
         assert!(msg.contains("com.other.app"), "{msg}");
@@ -3030,7 +3208,7 @@ mod tests {
             r.read_line(&mut line).expect("read request");
             let req: Value = serde_json::from_str(&line).expect("request is json");
             let reply = json!({
-                "id": req["id"], "ok": true, "tree": compose_like(),
+                "id": req["id"], "ok": true, "tree": with_refs(&compose_like()),
                 "package": "com.google.android.permissioncontroller"
             });
             writeln!(w, "{reply}")
