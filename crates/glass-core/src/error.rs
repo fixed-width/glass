@@ -4,8 +4,12 @@ use thiserror::Error;
 /// [`crate::run_bounded_until`] makes and [`GlassError::Bounded`] carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundKind {
-    /// The call ran and was killed when its own budget elapsed. The tool may be wedged, so the
-    /// remedies for one apply.
+    /// The call ran and was killed when its effective bound elapsed — its own budget or the
+    /// deadline it shares, whichever was nearer.
+    ///
+    /// It does not say which of the two governed, so a caller that passed a deadline must still
+    /// compare them: its own budget firing is evidence the tool is wedged, and its caller's is
+    /// evidence of nothing at all (glass#341, glass#347).
     TimedOut,
     /// The call never ran: the deadline it shares with the rest of a sequence was already spent.
     /// Nothing was asked, so nothing about the tool is known.
@@ -182,14 +186,22 @@ pub enum GlassError {
     #[error("{which} permission denied: {remedy}")]
     PermissionDenied { which: String, remedy: String },
 
+    /// A backend failure the backend itself reported. A call that ended at one of glass's own
+    /// bounds is [`Self::Bounded`], which displays identically — classify with [`Self::bound`]
+    /// rather than by matching this variant, which is false for it.
     #[error("backend error: {0}")]
     Backend(String),
 
     /// A bounded call that ended at one of its bounds instead of at an answer, naming which.
     ///
-    /// Displayed exactly as [`Self::Backend`], and it is one: the split exists so glass can tell
-    /// its own deadline firing from the tool failing without reading that back out of the message,
-    /// which carries the child's own output verbatim (glass#348).
+    /// Displays exactly as [`Self::Backend`] — an agent reads the same text — but is a distinct
+    /// variant, so glass can tell its own deadline firing from the tool failing without reading
+    /// that back out of the message, which carries the child's own output verbatim (glass#348).
+    ///
+    /// `#[non_exhaustive]` so [`crate::bounded`] stays the only crate that can raise one: a bound
+    /// forged elsewhere — an iOS gRPC deadline, say — would make [`Self::bound`] answer for a
+    /// clock glass does not own.
+    #[non_exhaustive]
     #[error("backend error: {message}")]
     Bounded { kind: BoundKind, message: String },
 
@@ -227,7 +239,7 @@ impl GlassError {
     /// re-snapshot, recoverable. Dropping it can only make the guard accept more, and what it then
     /// accepts is a write onto the wrong element, reported as `Ok`.
     ///
-    /// Some verdicts cannot be classified at all: Android raises `Backend` and
+    /// Some verdicts cannot be classified at all: Android raises `Backend`, `Bounded` and
     /// `AccessibilityUnavailable` on *both* sides of the dispatch — its pre-write re-snapshot and
     /// adb handshake fail the same way its post-write read-back does — so no variant-level split
     /// separates them, and the recoverable answer has to win.
@@ -235,11 +247,12 @@ impl GlassError {
         matches!(self, GlassError::AxValueNotApplied(_))
     }
 
-    /// Which bound ended this call, if a bound did rather than the tool answering.
+    /// Which of glass's own bounds ended this call, if one did rather than the tool answering.
     ///
     /// The question a backend asks before retrying, before offering a wedged-tool remedy, and
     /// before reporting a caller's spent budget as a device failure. `None` for every other
-    /// failure, including ones a bounded call raises for a tool that did answer.
+    /// failure — including ones a bounded call raises for a tool that did answer, and any variant
+    /// added later, which reads as the tool having failed rather than as a bound of glass's.
     pub fn bound(&self) -> Option<BoundKind> {
         match self {
             GlassError::Bounded { kind, .. } => Some(*kind),
@@ -401,6 +414,10 @@ mod tests {
             GlassError::NoActiveSession,
             GlassError::Timeout(10),
             GlassError::Backend("bus died".into()),
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                message: "adb:shell: no answer within 10s".into(),
+            },
         ] {
             assert!(!e.invoke_fallback_eligible(), "{e}");
         }
@@ -422,6 +439,10 @@ mod tests {
             GlassError::AccessibilityUnavailable("uiautomator dump not ready".into()),
             GlassError::Backend("adb died".into()),
             GlassError::Timeout(10),
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                message: "adb:uiautomator dump: no answer within 20s".into(),
+            },
         ] {
             assert!(!e.set_value_failed_after_writing(), "{e}");
         }

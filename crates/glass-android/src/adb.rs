@@ -177,24 +177,60 @@ impl Adb {
 
 /// Add adb's one-command remedy to a TIMEOUT, and nothing else.
 ///
-/// Extends the message rather than wrapping the error: nesting one `Backend` inside another makes
-/// `Display` print its prefix twice, and an agent reads this text. Gated on the timeout because the
-/// other failure is a spawn failure — a missing or mis-resolved binary, the most common Android
-/// setup problem — where `adb kill-server` is advice for a binary that is not there.
-///
-/// The rebuilt error keeps its [`BoundKind`]: `a11y::bound_fired` reads it downstream of this, so
-/// dropping it here reports every hint-carrying timeout as a device that failed.
-pub(crate) fn with_adb_hint(e: GlassError) -> GlassError {
-    match e {
-        GlassError::Bounded {
-            kind: kind @ BoundKind::TimedOut,
-            message,
-        } => GlassError::Bounded {
-            kind,
-            message: format!("{message}; if this repeats, run `adb kill-server` and retry"),
-        },
-        other => other,
+/// Appended in place rather than wrapped: nesting one error inside another makes `Display` print
+/// `"backend error: "` twice, and an agent reads this text. Editing the message also leaves the
+/// [`BoundKind`] where it was, which `a11y::bound_fired` reads downstream of this — a rebuild that
+/// dropped it would report every hint-carrying timeout as a device that failed.
+fn with_adb_hint(mut e: GlassError) -> GlassError {
+    if let GlassError::Bounded { kind, message, .. } = &mut e {
+        match kind {
+            BoundKind::TimedOut => {
+                message.push_str("; if this repeats, run `adb kill-server` and retry");
+            }
+            // adb was never asked, so nothing about the server is implicated — and the other
+            // failure it could be advice for is a missing or mis-resolved binary, the most common
+            // Android setup problem.
+            BoundKind::NotStarted => {}
+        }
     }
+    e
+}
+
+/// A timeout as `glass_core` really raises one for an adb call, before [`with_adb_hint`].
+///
+/// Run rather than typed: every caller keys on a bound `glass-core` sets, so a fixture that set it
+/// too could not notice the runner stopping (glass#348).
+///
+/// `/bin/sh` stands in for adb; `ping` does on Windows, which has no `/bin/sh` — it paces one echo
+/// per second even when transmission fails, so it outlives the 200ms budget either way.
+#[cfg(test)]
+pub(crate) fn a_real_timeout() -> GlassError {
+    #[cfg(unix)]
+    let (bin, args): (&str, &[&str]) = ("/bin/sh", &["-c", "sleep 30"]);
+    #[cfg(windows)]
+    let (bin, args): (&str, &[&str]) = ("ping", &["-n", "31", "127.0.0.1"]);
+
+    let e = run_bounded(
+        Command::new(bin).args(args),
+        Duration::from_millis(200),
+        "adb:shell",
+    )
+    .expect_err("must time out");
+    // A spawn failure is also an `Err`: it sails past `expect_err`, then fails whatever the caller
+    // asserts next, blaming the code under test for a missing binary.
+    assert_eq!(
+        e.bound(),
+        Some(BoundKind::TimedOut),
+        "expected a timeout, got: {e}"
+    );
+    e
+}
+
+/// [`a_real_timeout`] as a caller outside this module meets one: every adb error leaves
+/// [`Adb::output`] through [`with_adb_hint`], and `a11y`'s classifier reads what comes out.
+#[cfg(test)]
+pub(crate) fn a_real_timeout_hinted() -> GlassError {
+    with_adb_hint(a_real_timeout())
 }
 
 /// Build the adb argument vector, prefixing `-s <serial>` when targeting a device.
@@ -219,7 +255,7 @@ fn exit_error(bin: &str, argv: &[String], out: &Output) -> GlassError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adb, AdbOp, build_argv, with_adb_hint};
+    use super::{Adb, AdbOp, a_real_timeout, build_argv, with_adb_hint};
     use glass_core::{BoundKind, GlassError};
     use std::time::Duration;
 
@@ -394,40 +430,11 @@ mod tests {
         ));
         assert!(!spawn.to_string().contains("kill-server"), "{spawn}");
 
-        // Built by running a real timeout rather than typed here: the gate keys on a bound
-        // `glass-core` sets, so a fixture setting it too could not notice the runner stopping.
-        //
-        // `ping` stands in for `sleep` on Windows (no `/bin/sh` there) — it paces one echo per
-        // second even when transmission fails, so it reliably outlives the 200ms budget.
-        #[cfg(unix)]
-        let mut hang = std::process::Command::new("/bin/sh");
-        #[cfg(unix)]
-        hang.args(["-c", "sleep 30"]);
-        #[cfg(windows)]
-        let mut hang = std::process::Command::new("ping");
-        #[cfg(windows)]
-        hang.args(["-n", "31", "127.0.0.1"]);
-
-        let real_timeout = glass_core::run_bounded(
-            &mut hang,
-            std::time::Duration::from_millis(200),
-            "adb:shell",
-        )
-        .expect_err("must time out");
-        // A spawn failure is also an Err: it sails past `expect_err`, then fails the hint
-        // assertion below, blaming `with_adb_hint` for a missing binary.
-        assert_eq!(
-            real_timeout.bound(),
-            Some(BoundKind::TimedOut),
-            "expected a timeout, got: {real_timeout}"
-        );
-        let timeout = with_adb_hint(real_timeout);
+        let timeout = with_adb_hint(a_real_timeout());
         assert!(timeout.to_string().contains("adb kill-server"), "{timeout}");
-        // Extending the message must not wrap one Backend in another: Display prints its prefix
-        // per layer, and "backend error: backend error: ..." is what an agent would read.
+        // Extending the message must not wrap one error in another: Display prints its prefix per
+        // layer, and "backend error: backend error: ..." is what an agent would read.
         assert_eq!(timeout.to_string().matches("backend error").count(), 1);
-        // The hinted error is what reaches `a11y::bound_fired`, so the rebuild must keep the bound:
-        // without it every timed-out read is reported as a device that failed.
         assert_eq!(timeout.bound(), Some(BoundKind::TimedOut), "{timeout}");
     }
 

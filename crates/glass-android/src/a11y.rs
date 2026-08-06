@@ -186,9 +186,11 @@ pub(crate) fn dump_once(run: &mut AdbRunner<'_>, prefix: &str, deadline: Instant
 /// explanation for it — and that substitution is retryable, so the loop would go on retrying a
 /// device that had answered.
 ///
-/// Says only *that* a bound fired, not which: which one is settled before the attempt. Read off
-/// the bound's own signal rather than the message, which `Adb::exit_error` composes partly from
-/// the device's output — the device could otherwise answer for glass's deadline (glass#348).
+/// Says only *that* a bound fired, not which *deadline* governed — the caller's or the attempt's
+/// own, which [`dump_until_ready`] settles before the attempt rather than reading back out of the
+/// error. Read off the bound's own signal rather than the message, which `Adb::exit_error`
+/// composes partly from the device's output — the device could otherwise answer for glass's
+/// deadline (glass#348).
 fn bound_fired(e: &GlassError) -> bool {
     e.bound().is_some()
 }
@@ -674,7 +676,7 @@ mod tests {
         dump_until_ready, editable_target, locate_editable_target, locate_for_write,
         snapshot_bound, snapshot_with_runner, verify_write,
     };
-    use crate::adb::{AdbOp, with_adb_hint};
+    use crate::adb::{AdbOp, a_real_timeout_hinted};
     use glass_core::accessibility::{
         AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
         WalkLimits,
@@ -686,32 +688,6 @@ mod tests {
     /// A deadline no test reaches, for the cases that are not about the bound.
     fn ample() -> Instant {
         Instant::now() + Duration::from_secs(60)
-    }
-
-    /// A timeout as `glass_core` really raises one, hinted as every adb call's is.
-    ///
-    /// Run rather than typed: a fixture that builds the error itself measures the classifier's
-    /// agreement with the fixture, and would stay green through a runner that had stopped raising
-    /// what the classifier reads (glass#348).
-    ///
-    /// `/bin/sh` stands in for adb; `ping` does on Windows, which has no `/bin/sh` and paces one
-    /// echo per second whether or not the transmission succeeds.
-    fn cut_short_by_a_bound() -> GlassError {
-        #[cfg(unix)]
-        let mut hang = std::process::Command::new("/bin/sh");
-        #[cfg(unix)]
-        hang.args(["-c", "sleep 30"]);
-        #[cfg(windows)]
-        let mut hang = std::process::Command::new("ping");
-        #[cfg(windows)]
-        hang.args(["-n", "31", "127.0.0.1"]);
-
-        let e = glass_core::run_bounded(&mut hang, Duration::from_millis(200), "adb:shell")
-            .expect_err("must time out");
-        // A spawn failure is also an `Err`, and would sail through as a device error nobody
-        // classified.
-        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
-        with_adb_hint(e)
     }
 
     /// A spent-deadline error as `glass_core` really raises one. Nothing is spawned on that path,
@@ -1191,22 +1167,55 @@ mod tests {
     /// Both bounds `glass_core` fires are the ones the classifier reads, checked against errors it
     /// really raised rather than against a constant both sides share.
     ///
-    /// The two are otherwise coupled only by convention: nothing stops the runner reporting a
-    /// bound the classifier does not recognise, and no test of either side alone would see it.
+    /// `bound_fired` recognises any [`BoundKind`], so what it can miss is a bound arriving as some
+    /// other variant — which `with_adb_hint` rebuilding a hinted timeout could silently do, and no
+    /// test of either side alone would see.
     #[test]
     fn every_bound_glass_core_fires_is_one_the_classifier_recognises() {
-        for e in [cut_short_by_a_bound(), never_started_for_want_of_time()] {
+        for (want, e) in [
+            (BoundKind::TimedOut, a_real_timeout_hinted()),
+            (BoundKind::NotStarted, never_started_for_want_of_time()),
+        ] {
+            assert_eq!(e.bound(), Some(want), "{e}");
             assert!(bound_fired(&e), "{e}");
-            // A bound firing says nothing about the tool, so it is never the silent crash that
-            // `died_unexplained` names — which is retried, and would retry a spent deadline.
-            assert!(!died_unexplained(&e), "{e}");
         }
     }
 
+    /// A bound that fired is never the silent crash `died_unexplained` names, however the device
+    /// ended its sentence — that crash is retried, so reading one as the other retries a deadline
+    /// nobody is waiting on any more.
+    ///
+    /// The stderr is what makes this bite: `said_before_the_kill` quotes it into the timeout
+    /// message, so the message really does end in `failed:`, which is the whole of the other
+    /// classifier's test.
+    #[test]
+    #[cfg(unix)]
+    fn a_bound_that_fired_is_no_crash_even_when_the_message_ends_as_one() {
+        let mut hang = std::process::Command::new("/bin/sh");
+        hang.args([
+            "-c",
+            "printf '`adb shell uiautomator dump /sdcard/x.xml` failed:' >&2; sleep 30",
+        ]);
+        let e = glass_core::run_bounded(
+            &mut hang,
+            Duration::from_millis(200),
+            "adb:uiautomator dump",
+        )
+        .expect_err("must time out");
+
+        assert_eq!(e.bound(), Some(BoundKind::TimedOut), "{e}");
+        // Without this the test stops discriminating the moment the quoting changes shape.
+        assert!(
+            e.to_string().trim_end().ends_with("failed:"),
+            "the fixture no longer bites: {e}"
+        );
+        assert!(!died_unexplained(&e), "{e}");
+    }
+
     /// Text the device wrote is not a bound of glass's own. `Adb::exit_error` interpolates the
-    /// child's stderr verbatim, so a phrase glass reads as its own deadline reaches the classifier
-    /// intact — and a device reported as a spent budget is one `wait_for_element` polls through
-    /// rather than surfaces.
+    /// child's stderr verbatim, so a phrase glass *once read* as its own deadline still arrives
+    /// intact — and keyed on the message it was reported as a spent budget, which
+    /// `wait_for_element` polls through rather than surfaces (glass#348).
     ///
     /// The stderr below is constructed rather than observed: no device is known to print it, and
     /// nothing stops one.
@@ -1274,7 +1283,7 @@ mod tests {
     #[test]
     fn an_attempt_the_caller_cut_short_reports_the_budget_rather_than_the_device() {
         let timed_out = |_argv: &[&str], _d: Instant| -> Result<(String, String)> {
-            Err(cut_short_by_a_bound())
+            Err(a_real_timeout_hinted())
         };
 
         let mut cut_short = timed_out;
@@ -1355,7 +1364,7 @@ mod tests {
                     dumps += 1;
                     if dumps == 1 {
                         abandoned = Some((*path).to_string());
-                        return Err(cut_short_by_a_bound());
+                        return Err(a_real_timeout_hinted());
                     }
                     files.insert((*path).to_string(), XML.to_string());
                     Ok((DUMPED.to_string(), String::new()))

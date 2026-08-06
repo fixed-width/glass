@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use crate::{BoundKind, GlassError, Result};
 
 /// The phrase a timeout error carries, for a reader of the message. What a *caller* keys on is
-/// [`BoundKind::TimedOut`] — this text is composed partly from the child's own output, so anything
-/// matching on it is matching on prose the device helps write (glass#348).
+/// [`BoundKind::TimedOut`]: the message this appears in embeds the child's own output, so matching
+/// on it is matching prose the device helps write (glass#348).
 const TIMED_OUT: &str = "no answer within";
 
 /// The phrase an error carries when a call was never started, because the deadline it serves was
@@ -68,7 +68,7 @@ pub fn run_bounded(cmd: &mut Command, budget: Duration, op: &str) -> Result<Outp
 /// Several calls can answer one request: one `uiautomator dump` is a remove, a dump and a read.
 /// Each carrying only its own budget makes the sequence cost their sum, so the deadline travels
 /// down and each step gets whichever bound is nearer. A step with nothing left is not started at
-/// all, and says [`NOT_STARTED`].
+/// all, and fails with [`BoundKind::NotStarted`].
 pub fn run_bounded_until(
     cmd: &mut Command,
     budget: Duration,
@@ -814,8 +814,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("test:spent-deadline"), "{msg}");
         assert!(msg.contains(NOT_STARTED), "{msg}");
-        // Nothing was asked, so nothing failed to answer — and `with_adb_hint` and its kind key on
-        // this phrase to offer remedies for a wedged tool.
+        // Nothing was asked, so nothing failed to answer — a reader must not be told the tool
+        // hung. Callers key on `BoundKind`, not on this phrase.
         assert!(!msg.contains(TIMED_OUT), "{msg}");
     }
 
@@ -837,11 +837,10 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_call_that_ended_at_a_bound_says_which_one_as_a_value() {
-        // Which bound fired decides whether a backend retries, whether it offers the wedged-adb
-        // remedy, and whether a caller's spent budget is reported as a device failure. The runner
-        // knows it exactly; a caller reconstructing it from the message reads a message the child's
-        // own output helps write.
+    fn a_call_killed_at_its_bound_says_it_timed_out_as_a_value() {
+        // That a bound fired decides whether a backend retries and whether a caller's spent budget
+        // is reported as a device failure; which one decides whether the wedged-tool remedy is
+        // offered. The runner knows both exactly, and used to discard them into the message.
         let hung = run_bounded(
             Command::new("/bin/sh").args(["-c", "sleep 30"]),
             Duration::from_millis(300),
@@ -849,9 +848,14 @@ mod tests {
         )
         .expect_err("must time out");
         assert_eq!(hung.bound(), Some(BoundKind::TimedOut), "{hung}");
+    }
 
+    #[test]
+    fn a_call_with_nothing_left_says_it_never_started_as_a_value() {
+        // Portable: this path returns before anything is spawned, so the binary need not exist —
+        // which is what lets the Windows leg cover the kind a `wait_for_element` polls through.
         let spent = run_bounded_until(
-            Command::new("/bin/sh").args(["-c", "sleep 30"]),
+            &mut Command::new("/nonexistent/glass-test-binary"),
             Duration::from_secs(20),
             Instant::now(),
             "test:kind-not-started",
@@ -861,11 +865,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_failure_that_is_not_a_bound_firing_carries_no_kind() {
-        // The classification must not widen to "this call failed": a wedged adb and a crashed
-        // `uiautomator` both reach the same guards, and only a bound firing means the deadline —
-        // not the device — ended the call.
+        // The classification must not widen to "this call failed": a missing or mis-resolved binary
+        // is the commonest Android setup problem, and read as a bound it becomes a wait polling on
+        // for its whole timeout instead of failing at once. Portable, so the Windows leg — where
+        // that binary is likeliest to be missing — covers this direction too.
         let spawn = run_bounded(
             &mut Command::new("/nonexistent/glass-test-binary"),
             Duration::from_secs(10),
@@ -874,6 +878,14 @@ mod tests {
         .expect_err("spawn must fail");
         assert_eq!(spawn.bound(), None, "{spawn}");
 
+        assert_eq!(GlassError::Backend("device offline".into()).bound(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_answered_before_a_glass_side_timer_elapsed_is_no_bound_firing() {
+        // `DRAIN_SETTLE` does elapse here, so this is the case that looks most like a bound and is
+        // not one: the child exited on its own, and the deadline never came near.
         let held_open = run_bounded(
             Command::new("/bin/sh").args(["-c", "printf head; { sleep 1; printf tail; } &"]),
             Duration::from_secs(20),
@@ -881,8 +893,6 @@ mod tests {
         )
         .expect_err("an incomplete read is an error");
         assert_eq!(held_open.bound(), None, "{held_open}");
-
-        assert_eq!(GlassError::Backend("device offline".into()).bound(), None);
     }
 
     #[test]
