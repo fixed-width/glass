@@ -200,6 +200,47 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- A native Android click or `set_value` through the optional on-device companion no longer acts on a
+  different element than the one you named when the snapshot was truncated. glass numbered elements
+  by their position in the tree it kept and dispatched the action by that number, but the companion
+  numbers every node it walked — including the ones a depth or sibling cap dropped — so past the
+  first pruned subtree the two disagreed, the action reached another element, and it reported
+  success. Each element now carries the device's own reference for the node and the action is
+  dispatched by that, so the two cannot drift apart. The companion has sent that reference since its
+  first release, so nothing needs updating; a node that arrives without one now fails the snapshot
+  rather than having one inferred for it. A tree the caps did trim now takes the native path as
+  well, since the mismatch the refusal guarded against is gone.
+- A failing Android device is no longer mistaken for an app that has not published its accessibility
+  tree yet. glass decided what a failure meant by matching words in the rendered error message, and
+  the tail of that message is the device's own output — so a device that described itself in the
+  words glass uses for its own deadlines had its failure read as "not ready yet", the condition
+  `glass_wait_for_element` deliberately waits out. A wedged emulator could be polled to the end of a
+  wait rather than reported. glass now reads which deadline fired, and whether the tool said anything
+  at all, from the failure itself rather than from its wording; every message reads exactly as
+  before. The same defect could send an unrelated install failure down the reinstall-on-signature-
+  mismatch path, because the message names the caller's own `GLASS_ANDROID_A11Y_APK` argument: an
+  APK kept under a directory whose name quoted the phrase changed what any install failure did.
+- Android now says when the element you addressed is gone, instead of reporting it as changed. Every
+  disagreement between your snapshot and the tree at write time came back as `element … changed
+  since the snapshot; re-snapshot`, including the case where the screen the element was on had been
+  destroyed — so the advice was to re-snapshot a screen that no longer exists. glass now asks
+  whether anything in the tree still carries that element's role and name: if so the refusal reads
+  as before, and if not it reports the element as gone, which re-snapshotting will not fix. When a
+  refusal happens is unchanged.
+- The accessibility tree now discloses subtrees it could not read. A child read that fails drops
+  everything beneath it, and the tree came back looking complete — indistinguishable from one where
+  there was genuinely nothing there, so an agent concludes an element does not exist and routes
+  around it. `glass_a11y_snapshot` now reports the count in its own block beside the truncation
+  notice. Two blocks rather than one because the recourse differs: a truncated tree hit a limit you
+  can raise with `max_nodes`, while an unreadable subtree is usually an element that went away
+  mid-walk, so a fresh snapshot may show it. Reported on Linux, Windows and macOS; Android and iOS
+  build their trees from a single dump and have no such failure to report.
+- `glass_clipboard_set` on the iOS Simulator no longer reports success for text that never reached
+  the pasteboard. The payload was written on a thread whose outcome nothing waited for, so a write
+  still in flight when the call returned was indistinguishable from one that had finished, and the
+  call answered `ok` for a clipboard that had not been set. glass now waits for that outcome under
+  the deadline the call already carries, and a write it cannot account for is reported rather than
+  returned as success.
 - `glass_wait_for_element`'s `timeout_ms` now bounds the accessibility reader too, so a wait can no
   longer sit inside a single read for far longer than the time it was given. Each tick re-reads the
   tree, and a read carried a flat ceiling of its own — 20 seconds per `uiautomator dump` on Android,
