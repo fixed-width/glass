@@ -800,6 +800,21 @@ pub struct AxTarget {
     pub value: Option<String>,
 }
 
+/// Where a target turned up in a tree read after it was captured — see [`AxTarget::relocate`].
+#[derive(Debug)]
+pub enum Located<'a> {
+    /// Still at its own id. The common case, and the only one that costs no walk.
+    AtId(&'a AxNode),
+    /// Exactly one node elsewhere carries its role and name.
+    Moved(&'a AxNode),
+    /// Several do, so the id no longer picks one out. Carries them for the error to name.
+    Ambiguous(Vec<&'a AxNode>),
+    /// None does, in a tree complete enough to say so.
+    Gone,
+    /// None does, but the read stopped early — absence is not shown.
+    Unproven,
+}
+
 impl AxTarget {
     /// Whether a reached node's role + name match this target.
     pub fn matches(&self, role: AxRole, name: Option<&str>) -> bool {
@@ -820,6 +835,33 @@ impl AxTarget {
                 || node.children.iter().any(|c| walk(c, target))
         }
         walk(&tree.root, self)
+    }
+
+    /// Where `tree` now holds this target, if anywhere.
+    ///
+    /// The id is a pre-order index, so anything inserted ahead of the element moves it: on the iOS
+    /// Simulator the focusing tap of a write raises the soft keyboard and shifts the field two places
+    /// (glass#359). Re-finding by identity rather than by index is what lets a read-back confirm a
+    /// write it just performed.
+    ///
+    /// Identity is role and name. Not `value`, which a write changes by definition, and not `bounds`,
+    /// which move under a live app — measured, a field narrowed 1008→828px as its clear button
+    /// appeared. That leaves a weak key, so [`Located::Ambiguous`] refuses rather than picking: a
+    /// second control matching the target anywhere means its id no longer tells them apart.
+    pub fn relocate<'a>(&self, tree: &'a AxTree) -> Located<'a> {
+        if let Some(node) = tree.find(self.id)
+            && self.matches(node.role, node.name.as_deref())
+        {
+            return Located::AtId(node);
+        }
+        let mut candidates = Vec::new();
+        collect(&tree.root, self, &mut candidates);
+        match candidates.len() {
+            1 => Located::Moved(candidates[0]),
+            0 if tree.is_complete() => Located::Gone,
+            0 => Located::Unproven,
+            _ => Located::Ambiguous(candidates),
+        }
     }
 
     /// Which of the two disagreements a tree that no longer agrees with this target has.
@@ -870,6 +912,16 @@ impl AxTarget {
     /// emptied field as no value at all, which is a real change, not a missing observation.
     pub fn value_consistent(&self, got: Option<&str>) -> bool {
         self.value.is_none() || self.value.as_deref() == got
+    }
+}
+
+/// Every node carrying `target`'s role and name, in pre-order.
+fn collect<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
+    if target.matches(node.role, node.name.as_deref()) {
+        out.push(node);
+    }
+    for child in &node.children {
+        collect(child, target, out);
     }
 }
 
@@ -2047,6 +2099,67 @@ mod tests {
             drift_target().drift_error(&tree),
             GlassError::AxElementChanged(1)
         ));
+    }
+
+    #[test]
+    fn a_target_still_at_its_id_is_located_there() {
+        let tree = drift_tree(vec![leaf(AxRole::TextField, "Note")]);
+        assert!(matches!(drift_target().relocate(&tree), Located::AtId(n) if n.id == AxNodeId(1)));
+    }
+
+    #[test]
+    fn a_target_renumbered_is_located_at_its_new_id() {
+        // The measured case: the write's keyboard inserts a node ahead of the field.
+        let tree = drift_tree(vec![
+            leaf(AxRole::Label, "Suggestions"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Moved(n) if n.id == AxNodeId(2)));
+    }
+
+    #[test]
+    fn a_second_node_matching_the_target_refuses_rather_than_guessing() {
+        let tree = drift_tree(vec![
+            leaf(AxRole::Label, "Suggestions"),
+            leaf(AxRole::TextField, "Note"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Ambiguous(c) if c.len() == 2));
+    }
+
+    #[test]
+    fn a_target_nothing_matches_in_a_complete_tree_is_gone() {
+        let tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Gone));
+    }
+
+    #[test]
+    fn a_truncated_tree_cannot_prove_the_target_absent() {
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 1,
+            nodes_walked: 1,
+        });
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_dropped_subtree_cannot_prove_the_target_absent() {
+        // `unreadable` is independent of the caps.
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.unreadable = 1;
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_node_at_the_id_that_is_not_the_target_does_not_shortcut_the_search() {
+        // The id resolves, but to something else; the field is elsewhere. Without the match check on
+        // the AtId path this would return the wrong node.
+        let mut occupied = leaf(AxRole::Button, "Cancel");
+        occupied.children = vec![leaf(AxRole::TextField, "Note")];
+        let tree = drift_tree(vec![occupied]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Moved(n) if n.id == AxNodeId(2)));
     }
 
     #[test]
