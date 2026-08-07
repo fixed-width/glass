@@ -441,6 +441,21 @@ impl Drop for FakeAdb {
     }
 }
 
+/// A stand-in for the `emulator` binary, to sit beside a [`FakeAdb`] via
+/// [`FakeAdb::alongside`]. `-list-avds` prints the contents of an `avds` file in the same
+/// directory; anything else records its argv in `boots` and then stays up, which is what a boot
+/// waits on.
+#[cfg(all(test, unix))]
+pub(crate) const FAKE_EMULATOR_SCRIPT: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+if [ "$1" = "-list-avds" ]; then
+    cat "$dir/avds"
+    exit 0
+fi
+printf '%s\n' "$*" >> "$dir/boots"
+sleep 30
+"#;
+
 /// Whether `pid` is still a live process. A child that was killed *and reaped* is gone rather
 /// than left as a zombie, which would still answer here.
 #[cfg(all(test, unix))]

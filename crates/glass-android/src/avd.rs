@@ -524,19 +524,6 @@ mod tests {
         assert_eq!(fake.calls().len(), 2);
     }
 
-    /// A stand-in for the `emulator` binary. `-list-avds` prints the names it was given; a boot
-    /// records its argv and then stays up, which is what `boot_avd` waits on.
-    #[cfg(unix)]
-    const FAKE_EMULATOR: &str = r#"#!/bin/sh
-dir=$(dirname "$0")
-if [ "$1" = "-list-avds" ]; then
-    cat "$dir/avds"
-    exit 0
-fi
-printf '%s\n' "$*" >> "$dir/boots"
-sleep 30
-"#;
-
     #[test]
     #[cfg(unix)]
     fn booting_waits_for_the_device_to_appear_and_finish_booting() {
@@ -555,7 +542,7 @@ sleep 30
                 vec![&booted],
             ),
         ]);
-        let emulator = fake.alongside("emulator", FAKE_EMULATOR);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
         std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
 
         let get = |k: &str| match k {
@@ -581,7 +568,7 @@ sleep 30
 
         let none = Answer::says("List of devices attached\n\n");
         let fake = FakeAdb::scripted(&[("devices", vec![&none])]);
-        let emulator = fake.alongside("emulator", FAKE_EMULATOR);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
         std::fs::write(emulator.parent().unwrap().join("avds"), "glass\n").unwrap();
 
         let get = |k: &str| match k {
@@ -608,7 +595,7 @@ sleep 30
         use crate::adb::{Answer, FakeAdb};
 
         let fake = FakeAdb::new(&[("devices", Answer::says("List of devices attached\n\n"))]);
-        let emulator = fake.alongside("emulator", FAKE_EMULATOR);
+        let emulator = fake.alongside("emulator", crate::adb::FAKE_EMULATOR_SCRIPT);
         std::fs::write(emulator.parent().unwrap().join("avds"), "Pixel_6\nglass\n").unwrap();
 
         let get = |k: &str| match k {

@@ -79,17 +79,28 @@ pub fn checks(deep: bool) -> Vec<Check> {
 
 fn probe(deep_requested: bool) -> Probe {
     let get = |k: &str| std::env::var(k).ok();
-    let adb_resolution = crate::sdk::resolve_adb(&get, &|p| p.exists());
+    probe_with(deep_requested, &Adb::from_env(), &get, &|p| p.exists())
+}
+
+/// [`probe`] against a given adb and environment, so the whole probe can be exercised without a
+/// device: what it reports is read back out of the tools it ran, and every branch here turns on
+/// what they said.
+fn probe_with(
+    deep_requested: bool,
+    adb: &Adb,
+    get: &dyn Fn(&str) -> Option<String>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> Probe {
+    let adb_resolution = crate::sdk::resolve_adb(get, exists);
     let adb_detail = adb_resolution.describe();
-    let adb_trail = crate::sdk::sdk_search_trail(&get);
-    let adb = Adb::from_env();
+    let adb_trail = crate::sdk::sdk_search_trail(get);
     let adb_bin = adb.bin().to_string();
     let adb_version = adb
         .run(["version"])
         .ok()
         .map(|s| first_line(&s))
         .filter(|s| !s.is_empty());
-    let emulator_bin = resolve_emulator_bin(&get, &|p| p.exists());
+    let emulator_bin = resolve_emulator_bin(get, exists);
     let avds = list_avds(&emulator_bin);
 
     let online_devices: Vec<Device> = if adb_version.is_some() {
@@ -112,14 +123,14 @@ fn probe(deep_requested: bool) -> Probe {
 
     // Deep-probe exactly the device glass would attach to (it never boots one).
     let deep = match &selection {
-        Action::Attach(serial) if deep_requested => Some(deep_probe(&adb, serial)),
+        Action::Attach(serial) if deep_requested => Some(deep_probe(adb, serial)),
         _ => None,
     };
 
     let agent_off = get("GLASS_ANDROID_AGENT")
         .map(|v| v.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
-    let agent_jar = crate::agent::agent_jar(&get);
+    let agent_jar = crate::agent::agent_jar(get);
     let agent_jar_exists = agent_jar
         .as_deref()
         .map(|p| std::path::Path::new(p).is_file())
@@ -130,7 +141,7 @@ fn probe(deep_requested: bool) -> Probe {
         Action::Attach(serial) if deep_requested && !agent_off && agent_jar_exists => {
             let reg = crate::agent::AgentRegistry::new();
             let r = reg
-                .ensure(&adb.with_serial(serial.clone()), &get)
+                .ensure(&adb.with_serial(serial.clone()), get)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
             reg.shutdown();
@@ -142,7 +153,7 @@ fn probe(deep_requested: bool) -> Probe {
     let a11y_off = get("GLASS_ANDROID_A11Y")
         .map(|v| v.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
-    let a11y_apk = crate::a11y_service::a11y_apk(&get);
+    let a11y_apk = crate::a11y_service::a11y_apk(get);
     let a11y_apk_exists = a11y_apk
         .as_deref()
         .map(|p| std::path::Path::new(p).is_file())
@@ -490,6 +501,223 @@ mod tests {
             screencap: Ok("captured 1080x2400, 10368016 bytes raw".into()),
             uiautomator: Ok("a11y dump OK".into()),
         }
+    }
+
+    /// A probe run against a fake adb and a chosen environment.
+    ///
+    /// The device tools all fail here, deliberately: the guards under test decide *whether* a
+    /// deep probe runs, and a probe that ran and failed is `Some` just as one that succeeded is.
+    #[cfg(unix)]
+    fn probe_against_a_fake(deep: bool, env: &[(&str, &str)]) -> Probe {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            (
+                "version",
+                Answer::says("Android Debug Bridge version 1.0.41\nInstalled as /x/adb\n"),
+            ),
+            (
+                "devices",
+                Answer::says(
+                    "List of devices attached\nemulator-5554\tdevice\nemulator-5556\toffline\n",
+                ),
+            ),
+            // Fail the two deep companions fast, so a guard that lets them through is visible
+            // as `Some(Err(..))` without waiting out a readiness budget.
+            ("* forward tcp:0 *", Answer::says("")),
+            ("* install *", Answer::fails("INSTALL_FAILED_INVALID_APK")),
+            ("*", Answer::Silent),
+        ]);
+
+        // The jar and the APK have to be files on disk; the fake adb's own script is one.
+        let real_file = fake.adb().bin().to_string();
+        let owned: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| {
+                let v = if *v == "@file" {
+                    real_file.clone()
+                } else {
+                    (*v).to_string()
+                };
+                ((*k).to_string(), v)
+            })
+            .collect();
+        let get = move |k: &str| {
+            owned
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+
+        probe_with(deep, fake.adb(), &get, &|_| false)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probing_reports_the_adb_version_and_only_the_online_devices() {
+        let p = probe_against_a_fake(false, &[]);
+        assert_eq!(
+            p.adb_version.as_deref(),
+            Some("Android Debug Bridge version 1.0.41"),
+            "the version is the first line of what adb said"
+        );
+        assert_eq!(
+            p.online,
+            ["emulator-5554"],
+            "an offline device is not one glass can attach to"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deep_probe_runs_only_when_it_was_asked_for() {
+        // `checks(false)` is the default path, and running the device probes there would make
+        // every plain `glass_doctor` install an APK and launch a companion.
+        let shallow = probe_against_a_fake(
+            false,
+            &[
+                ("GLASS_ANDROID_AGENT_JAR", "@file"),
+                ("GLASS_ANDROID_A11Y_APK", "@file"),
+            ],
+        );
+        assert!(shallow.deep.is_none());
+        assert!(shallow.agent_deep.is_none());
+        assert!(shallow.a11y_deep.is_none());
+
+        let deep = probe_against_a_fake(
+            true,
+            &[
+                ("GLASS_ANDROID_AGENT_JAR", "@file"),
+                ("GLASS_ANDROID_A11Y_APK", "@file"),
+            ],
+        );
+        assert!(deep.deep.is_some());
+        assert!(deep.agent_deep.is_some(), "configured and asked for");
+        assert!(deep.a11y_deep.is_some(), "configured and asked for");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deep_probe_skips_a_companion_that_is_off_or_unconfigured() {
+        // Each half of the guard in turn: turned off, and configured-but-absent.
+        let off = probe_against_a_fake(
+            true,
+            &[
+                ("GLASS_ANDROID_AGENT", "off"),
+                ("GLASS_ANDROID_AGENT_JAR", "@file"),
+                ("GLASS_ANDROID_A11Y", "off"),
+                ("GLASS_ANDROID_A11Y_APK", "@file"),
+            ],
+        );
+        assert!(
+            off.agent_deep.is_none(),
+            "an agent that is off is not probed"
+        );
+        assert!(
+            off.a11y_deep.is_none(),
+            "a service that is off is not probed"
+        );
+
+        let missing = probe_against_a_fake(
+            true,
+            &[
+                ("GLASS_ANDROID_AGENT_JAR", "/nonexistent/glass-agent.jar"),
+                ("GLASS_ANDROID_A11Y_APK", "/nonexistent/glass-a11y.apk"),
+            ],
+        );
+        assert!(!missing.agent_jar_exists);
+        assert!(missing.agent_deep.is_none(), "there is nothing to launch");
+        assert!(missing.a11y_deep.is_none(), "there is nothing to install");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_avd_list_comes_from_the_emulator_and_is_absent_when_it_cannot_answer() {
+        use crate::adb::{Answer, FAKE_EMULATOR_SCRIPT, FakeAdb};
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let emulator = fake.alongside("emulator", FAKE_EMULATOR_SCRIPT);
+        std::fs::write(
+            emulator.parent().expect("a parent").join("avds"),
+            "Pixel_6\nglass\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_avds(&emulator.to_string_lossy()),
+            Some(vec!["Pixel_6".to_string(), "glass".to_string()])
+        );
+        // A binary that cannot be run answers nothing, which is not the same as a device with no
+        // AVDs — the remedy the caller is given differs.
+        assert_eq!(list_avds("/nonexistent/emulator"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_deep_probe_reads_the_frame_and_the_tree_it_captured() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2u32.to_le_bytes());
+        frame.extend_from_slice(&3u32.to_le_bytes());
+        frame.extend_from_slice(&1u32.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 2 * 3 * 4]);
+
+        let fake = FakeAdb::new(&[
+            ("* exec-out screencap", Answer::says(&frame)),
+            (
+                "* shell cat *",
+                Answer::says(r#"<?xml version='1.0'?><hierarchy rotation="0"></hierarchy>"#),
+            ),
+            ("*", Answer::Silent),
+        ]);
+
+        let probed = deep_probe(fake.adb(), "emulator-5554");
+        assert_eq!(
+            probed.screencap.as_deref(),
+            Ok("captured 2x3, 36 bytes raw"),
+            "the frame is decoded, not merely fetched"
+        );
+        assert_eq!(probed.uiautomator.as_deref(), Ok("a11y dump OK"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dump_without_a_hierarchy_is_reported_rather_than_passed() {
+        // `uiautomator dump` exits 0 having written nothing usable, so the content is the only
+        // thing that says whether the tree arrived.
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            ("* shell cat *", Answer::says("Killed\n")),
+            ("*", Answer::Silent),
+        ]);
+
+        let probed = deep_probe(fake.adb(), "emulator-5554");
+        assert_eq!(
+            probed.uiautomator.as_deref().map_err(String::as_str),
+            Err("uiautomator dump produced no hierarchy")
+        );
+    }
+
+    #[test]
+    fn a_device_still_to_be_booted_is_named_as_such_rather_than_as_unattachable() {
+        // Deep, configured, but no device yet: `glass_start` will boot one, so this is not the
+        // same as devices being present and refused, and the remedy differs.
+        let mut p = base_probe();
+        p.deep_requested = true;
+        p.online = vec![];
+        p.selection = Action::Boot;
+        assert_eq!(
+            find(&build_checks(&p), "agent").detail,
+            "no online device to probe (glass will boot one on start)"
+        );
+
+        p.selection = Action::Error("2 online devices; set GLASS_ANDROID_SERIAL".into());
+        assert_eq!(
+            find(&build_checks(&p), "agent").detail,
+            "no attachable device to probe (see the device check)"
+        );
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> &'a Check {
