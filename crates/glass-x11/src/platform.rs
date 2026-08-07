@@ -2076,6 +2076,556 @@ mod display_tests {
         assert_eq!(x.focused(), win);
     }
 
+    // --- the Platform surface --------------------------------------------------------
+
+    /// A real child to stand in for a launched app. The pid accessors, window enumeration
+    /// and the close ladder all read `self.child`, and `_NET_WM_PID` matching needs a pid
+    /// that is genuinely in `/proc`. `sleep` leaves on its own, so a test that panics before
+    /// its teardown cannot strand it.
+    fn spawn_stand_in() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("the stand-in app should spawn")
+    }
+
+    /// The buttons and their positions a watching window saw, as `(detail, x, y)`.
+    fn clicks_seen(x: &TestX) -> Vec<(u8, i16, i16)> {
+        x.drain_events(Duration::from_millis(80))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::ButtonPress(b) => Some((b.detail, b.event_x, b.event_y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_app_pid_and_its_tree_are_empty_until_something_is_launched() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert_eq!(plat.app_pid(), None);
+        assert!(plat.app_pids().is_empty());
+
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        assert_eq!(plat.app_pid(), Some(pid));
+        assert!(
+            plat.app_pids().contains(&pid),
+            "the process tree must include the launched child itself"
+        );
+    }
+
+    #[test]
+    fn there_is_no_a11y_bus_address_without_a_bus() {
+        let x = TestX::start();
+        let plat = x.platform();
+        assert_eq!(
+            plat.a11y_bus_addr(),
+            None,
+            "a launch that did not ask for a11y must not advertise an address"
+        );
+    }
+
+    #[test]
+    fn draining_logs_hands_over_the_buffer_and_leaves_it_empty() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.logs
+            .lock()
+            .expect("log buffer")
+            .push((Stream::Stdout, "hello".to_string()));
+        assert_eq!(
+            plat.drain_logs(),
+            vec![(Stream::Stdout, "hello".to_string())]
+        );
+        assert!(
+            plat.drain_logs().is_empty(),
+            "a drain must not hand back what it already returned"
+        );
+    }
+
+    #[test]
+    fn a_click_presses_the_mapped_button_at_the_requested_point() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Click {
+            x: 30,
+            y: 40,
+            button: glass_core::MouseButton::Right,
+            count: 2,
+            modifiers: vec![],
+        })
+        .expect("click");
+
+        assert_eq!(
+            clicks_seen(&x),
+            vec![(3, 30, 40), (3, 30, 40)],
+            "a double right-click is button 3 twice, at the point asked for"
+        );
+    }
+
+    #[test]
+    fn a_scroll_clicks_the_wheel_buttons_for_each_axis() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Scroll {
+            x: 5,
+            y: 5,
+            dx: 0,
+            dy: -2,
+            modifiers: vec![],
+        })
+        .expect("scroll");
+
+        let buttons: Vec<u8> = clicks_seen(&x).into_iter().map(|(b, _, _)| b).collect();
+        assert_eq!(buttons, vec![4, 4], "scrolling up twice is button 4 twice");
+    }
+
+    #[test]
+    fn a_drag_presses_at_the_start_and_releases_at_the_end() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.window = Some(win);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_pointer(&PointerEvent::Drag {
+            from_x: 10,
+            from_y: 10,
+            to_x: 200,
+            to_y: 150,
+            button: glass_core::MouseButton::Left,
+            modifiers: vec![],
+            duration_ms: 40,
+        })
+        .expect("drag");
+
+        let events = x.drain_events(Duration::from_millis(80));
+        let press = events.iter().find_map(|e| match e {
+            x11rb::protocol::Event::ButtonPress(b) => Some((b.event_x, b.event_y)),
+            _ => None,
+        });
+        let release = events.iter().find_map(|e| match e {
+            x11rb::protocol::Event::ButtonRelease(b) => Some((b.event_x, b.event_y)),
+            _ => None,
+        });
+        assert_eq!(press, Some((10, 10)), "the button goes down at the start");
+        assert_eq!(release, Some((200, 150)), "and comes up at the end");
+    }
+
+    #[test]
+    fn a_multi_touch_gesture_is_refused_by_this_backend() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        let err = plat
+            .send_pointer(&PointerEvent::Gesture {
+                pointers: vec![glass_core::Segment {
+                    from_x: 0,
+                    from_y: 0,
+                    to_x: 10,
+                    to_y: 10,
+                }],
+                duration_ms: 10,
+            })
+            .expect_err("X11 has no multi-touch");
+        assert!(err.to_string().contains("multi_touch"), "{err}");
+    }
+
+    #[test]
+    fn typed_text_sends_one_key_per_character() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Text("ab".to_string()))
+            .expect("type");
+
+        let pressed: Vec<u8> = x
+            .drain_events(Duration::from_millis(120))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        let a = plat.keycode_for(KEYSYM_A).expect("a").0;
+        let b = plat.keycode_for(0x62).expect("b").0;
+        assert_eq!(pressed, vec![a, b], "each character in order");
+    }
+
+    #[test]
+    fn a_chord_holds_its_modifier_across_the_key() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.window = Some(win);
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.send_key(&KeyEvent::Chord("ctrl+a".to_string()))
+            .expect("chord");
+
+        let control = plat
+            .modifier_keycode(glass_core::keys::Modifier::Control)
+            .expect("control");
+        let a = plat.keycode_for(KEYSYM_A).expect("a").0;
+        let pressed: Vec<u8> = x
+            .drain_events(Duration::from_millis(80))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pressed,
+            vec![control, a],
+            "the modifier goes down before the key it modifies"
+        );
+    }
+
+    #[test]
+    fn a_window_op_moves_and_resizes_and_reports_the_result() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().at(5, 5).sized(100, 80).create();
+        plat.window = Some(win);
+
+        let resized = plat
+            .window(&WindowOp::Resize {
+                width: 321,
+                height: 211,
+            })
+            .expect("resize");
+        assert_eq!((resized.width, resized.height), (321, 211));
+
+        let moved = plat.window(&WindowOp::Move { x: 40, y: 60 }).expect("move");
+        assert_eq!((moved.x, moved.y), (40, 60));
+        assert_eq!(
+            (moved.width, moved.height),
+            (321, 211),
+            "a move must not resize"
+        );
+
+        let same = plat.window(&WindowOp::Geometry).expect("geometry");
+        assert_eq!(same, moved, "a bare geometry read changes nothing");
+    }
+
+    #[test]
+    fn listing_windows_reports_the_apps_windows_and_marks_the_active_one() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let main = x
+            .window()
+            .owned_by(pid)
+            .named("main")
+            .classed("app", "App")
+            .at(3, 4)
+            .sized(150, 120)
+            .create();
+        let other = x.window().owned_by(pid).named("other").create();
+        plat.window = Some(main);
+
+        let listed = plat.list_windows().expect("list");
+        let entry = listed
+            .iter()
+            .find(|w| w.id == WindowId(main as u64))
+            .expect("the active window must be listed");
+        assert_eq!(entry.title.as_deref(), Some("main"));
+        assert_eq!(entry.class.as_deref(), Some("App"));
+        assert_eq!(
+            entry.geometry,
+            WindowGeometry {
+                x: 3,
+                y: 4,
+                width: 150,
+                height: 120
+            }
+        );
+        assert!(entry.active, "the active window must be flagged as active");
+        let sibling = listed
+            .iter()
+            .find(|w| w.id == WindowId(other as u64))
+            .expect("the app's other window must be listed too");
+        assert!(!sibling.active, "only one window is the active one");
+    }
+
+    #[test]
+    fn listing_windows_without_an_active_one_is_an_error_not_an_empty_list() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert!(matches!(
+            plat.list_windows(),
+            Err(GlassError::WindowNotFound)
+        ));
+    }
+
+    #[test]
+    fn selecting_a_window_makes_it_active_and_refuses_one_that_is_not_the_apps() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let mine = x.window().owned_by(pid).at(9, 8).sized(70, 60).create();
+        let stranger = x.window().owned_by(999_999).create();
+        plat.window = Some(mine);
+
+        let geo = plat
+            .select_window(WindowId(mine as u64))
+            .expect("selecting the app's own window");
+        assert_eq!((geo.x, geo.y, geo.width, geo.height), (9, 8, 70, 60));
+        assert_eq!(plat.window, Some(mine));
+
+        assert!(
+            matches!(
+                plat.select_window(WindowId(stranger as u64)),
+                Err(GlassError::WindowNotFound)
+            ),
+            "a window outside the launched process tree is not selectable"
+        );
+    }
+
+    #[test]
+    fn capturing_a_named_window_reads_that_windows_own_area() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let win = x
+            .window()
+            .owned_by(pid)
+            .at(0, 0)
+            .sized(48, 32)
+            .filled_with(0x0000_00ff)
+            .create();
+        plat.window = Some(win);
+        x.flush();
+
+        let frame = plat
+            .capture_window(WindowId(win as u64), None)
+            .expect("capture");
+        assert_eq!((frame.width, frame.height), (48, 32));
+
+        let stranger = x.window().owned_by(999_999).create();
+        assert!(
+            matches!(
+                plat.capture_window(WindowId(stranger as u64), None),
+                Err(GlassError::WindowNotFound)
+            ),
+            "a window the app does not own is not capturable"
+        );
+    }
+
+    // --- the close ladder ------------------------------------------------------------
+
+    #[test]
+    fn only_a_window_advertising_wm_delete_window_can_be_asked_to_close() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let protocols = plat.intern(b"WM_PROTOCOLS").expect("intern");
+        let delete = plat.intern(b"WM_DELETE_WINDOW").expect("intern");
+
+        let polite = x.window().accepting_delete().create();
+        let silent = x.window().create();
+        assert!(plat.accepts_delete(polite, protocols, delete));
+        assert!(
+            !plat.accepts_delete(silent, protocols, delete),
+            "a window with no WM_PROTOCOLS cannot be asked, and must not be counted as asked"
+        );
+    }
+
+    #[test]
+    fn a_close_request_arrives_as_the_delete_client_message() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let protocols = plat.intern(b"WM_PROTOCOLS").expect("intern");
+        let delete = plat.intern(b"WM_DELETE_WINDOW").expect("intern");
+        let win = x.window().accepting_delete().create();
+
+        plat.send_delete(win, protocols, delete).expect("send");
+        commit(&plat);
+
+        let message = x
+            .next_event(Duration::from_secs(2))
+            .expect("the window's owner should receive the request");
+        match message {
+            x11rb::protocol::Event::ClientMessage(m) => {
+                assert_eq!(m.window, win);
+                assert_eq!(m.type_, protocols);
+                assert_eq!(
+                    m.data.as_data32()[0],
+                    delete,
+                    "the protocol atom comes first, as ICCCM 4.2.8 specifies"
+                );
+            }
+            other => panic!("expected a ClientMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asking_the_app_to_close_reaches_every_window_that_accepts_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let polite = x.window().owned_by(pid).accepting_delete().create();
+        plat.window = Some(polite);
+
+        let asked = plat.request_close(pid);
+        assert!(asked.any(), "the app's window should have been asked");
+        assert!(
+            x.next_event(Duration::from_secs(2)).is_some(),
+            "the request must actually reach the window"
+        );
+    }
+
+    #[test]
+    fn an_app_with_no_window_is_not_reported_as_asked() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        assert!(
+            !plat.request_close(pid).any(),
+            "there was no window to ask, so nothing was asked"
+        );
+    }
+
+    #[test]
+    fn the_bounded_ask_reaches_the_window_through_its_own_connection() {
+        // The ask runs on a second connection so the caller can abandon it without leaving
+        // this backend's connection stopped mid-request.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+        let polite = x.window().owned_by(pid).accepting_delete().create();
+        plat.window = Some(polite);
+
+        assert!(plat.request_close_bounded(pid).any());
+        assert!(
+            x.next_event(Duration::from_secs(2)).is_some(),
+            "the bounded ask must deliver the same request"
+        );
+    }
+
+    #[test]
+    fn stopping_the_app_reaps_the_child_and_forgets_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        plat.child = Some(child);
+
+        plat.stop_app().expect("stop");
+        assert_eq!(plat.app_pid(), None, "the child must be forgotten");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} outlived the stop that was supposed to reap it"
+        );
+    }
+
+    #[test]
+    fn dropping_the_backend_reaps_an_app_that_was_never_stopped() {
+        // Parity with the other backends: a panic-unwind or the process-exit backstop must
+        // not leave the launched app running.
+        let x = TestX::start();
+        let pid = {
+            let mut plat = x.platform();
+            let child = spawn_stand_in();
+            let pid = child.id();
+            plat.child = Some(child);
+            pid
+        };
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} outlived the backend that launched it"
+        );
+    }
+
+    #[test]
+    fn a_launch_whose_app_never_appears_is_a_timeout_and_leaves_nothing_running() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let spec = AppSpec {
+            build: None,
+            run: vec!["sleep".to_string(), "30".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 250,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let err = plat
+            .start_app(&spec)
+            .expect_err("a command that maps no window cannot be launched");
+        assert!(matches!(err, GlassError::Timeout(250)), "{err:?}");
+        assert_eq!(
+            plat.app_pid(),
+            None,
+            "a launch that failed must not leave its child behind"
+        );
+    }
+
+    #[test]
+    fn a_launch_whose_command_does_not_exist_reports_the_spawn_failure() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let spec = AppSpec {
+            build: None,
+            run: vec!["/nonexistent/glass-test-binary".to_string()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 250,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let err = plat.start_app(&spec).expect_err("nothing to spawn");
+        assert!(matches!(err, GlassError::AppNotStarted(_)), "{err:?}");
+    }
+
     // --- capture ---------------------------------------------------------------------
 
     #[test]
