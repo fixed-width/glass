@@ -383,11 +383,32 @@ mod tests {
     }
 
     #[test]
+    fn an_id_past_the_end_still_confirms_a_landed_write() {
+        // The mirror image of the renumbering case: the keyboard dismissing after a landed write
+        // can shrink the tree back down, leaving the field's old id past the end of it — nothing
+        // resolves there, but the field itself never moved and still holds the text.
+        let after = tree_with_value(Some("world"));
+        let mut t = matching_target();
+        t.id = AxNodeId(9);
+        assert!(verify_write(&after, &t, "world").is_ok());
+    }
+
+    #[test]
     fn a_write_that_replaced_the_screen_says_it_was_typed_but_unconfirmed() {
         let replaced = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
+        // A capped tree would answer Unproven, not Gone; pin the fixture so a future change to
+        // `tree_with` cannot silently move this test onto the wrong arm and still pass.
+        assert!(
+            replaced.is_complete(),
+            "a capped tree would answer Unproven, not Gone"
+        );
         let err = verify_write(&replaced, &matching_target(), "world").unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        // "the text was typed" is common to every AxWriteUnconfirmed arm (it's in the #[error]
+        // template, not this arm's own clause) — assert the Gone arm's own sentence too, or a
+        // change to just this arm's message would leave the suite green.
         assert!(err.to_string().contains("the text was typed"), "{err}");
+        assert!(err.to_string().contains("replaced"), "{err}");
     }
 
     #[test]
