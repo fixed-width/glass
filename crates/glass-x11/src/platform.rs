@@ -483,9 +483,8 @@ impl X11Platform {
         // covers `start_app`'s failure path (which calls `kill_child`), so a launch
         // that never finds a window doesn't leave the bus running until Drop.
         self.dbus = None;
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
-        }
+        // Dropping the owner stops its thread and releases the CLIPBOARD selection.
+        self.clipboard_owner = None;
     }
 
     /// Poll the window tree until a top-level window matches a pid in the process
@@ -1354,12 +1353,10 @@ impl Drop for X11Platform {
     /// `self.child.take()`, so this is idempotent with `stop_app`. Field order then
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
-        self.kill_child(); // also stops clipboard_owner
-        // Redundant safety: kill_child already calls take(), but be explicit
-        // in case clipboard_owner was set after the last kill_child call.
-        if let Some(owner) = self.clipboard_owner.take() {
-            owner.stop();
-        }
+        self.kill_child(); // also drops clipboard_owner
+        // Redundant safety: kill_child already clears it, but be explicit in case
+        // clipboard_owner was set after the last kill_child call.
+        self.clipboard_owner = None;
     }
 }
 
@@ -2137,13 +2134,21 @@ mod display_tests {
     }
 
     #[test]
-    fn there_is_no_a11y_bus_address_without_a_bus() {
+    fn the_a11y_bus_address_is_the_private_buss_own_and_absent_without_one() {
+        // The a11y reader connects to whatever this returns. Reporting nothing for a launch
+        // that did start a bus leaves the tree unreadable; reporting something for one that
+        // did not points the reader at the host's bus.
         let x = TestX::start();
-        let plat = x.platform();
-        assert_eq!(
-            plat.a11y_bus_addr(),
-            None,
-            "a launch that did not ask for a11y must not advertise an address"
+        let mut plat = x.platform();
+        assert_eq!(plat.a11y_bus_addr(), None);
+
+        let bus = glass_dbus_linux::PrivateBus::start().expect("a private a11y bus should start");
+        let expected = bus.a11y_bus_address().to_string();
+        plat.dbus = Some(bus);
+        assert_eq!(plat.a11y_bus_addr().as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.is_empty(),
+            "an address that is blank reaches nothing"
         );
     }
 
@@ -2558,6 +2563,39 @@ mod display_tests {
             ),
             "a window the app does not own is not capturable"
         );
+    }
+
+    #[test]
+    fn the_clipboard_round_trips_through_the_backend() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert_eq!(
+            plat.get_clipboard().expect("get"),
+            "",
+            "nothing has been copied on this display yet"
+        );
+        plat.set_clipboard("copied text").expect("set");
+        assert_eq!(plat.get_clipboard().expect("get"), "copied text");
+        plat.set_clipboard("replaced").expect("set again");
+        assert_eq!(plat.get_clipboard().expect("get"), "replaced");
+    }
+
+    #[test]
+    fn a_copy_after_another_client_took_the_selection_starts_a_fresh_owner() {
+        // glass's owner retires when something else takes CLIPBOARD. Handing the next copy to
+        // that retired owner puts the text somewhere nothing serves it, and the paste that
+        // follows returns the other application's clipboard instead.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.set_clipboard("ours").expect("set");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours");
+
+        x.take_clipboard();
+        std::thread::sleep(Duration::from_millis(200));
+
+        plat.set_clipboard("ours again")
+            .expect("set after losing it");
+        assert_eq!(plat.get_clipboard().expect("get"), "ours again");
     }
 
     // --- the close ladder ------------------------------------------------------------

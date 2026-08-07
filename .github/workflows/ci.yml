@@ -292,7 +292,8 @@ jobs:
           # nothing, and one present here but not named there is never mutated at all.
           git diff "origin/$BASE_REF...HEAD" \
             -- ':(glob)crates/glass-core/src/**/*.rs' \
-               ':(glob)crates/glass-android/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
+               ':(glob)crates/glass-android/src/**/*.rs' \
+               ':(glob)crates/glass-x11/src/**/*.rs' > "$RUNNER_TEMP/pr.diff"
           wc -l "$RUNNER_TEMP/pr.diff"
           if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "touched=true" >> "$GITHUB_OUTPUT"
@@ -313,13 +314,21 @@ jobs:
         if: steps.diff.outputs.touched == 'true'
         with:
           tool: cargo-mutants,cargo-nextest
+      - name: Install the X and a11y stack glass-x11's tests drive
+        if: steps.diff.outputs.touched == 'true'
+        # xvfb: those tests each start a private headless display (~45ms) and drive real X
+        # protocol against it, which is the only way most of that backend is reachable at all.
+        # at-spi2-core: one test starts the private a11y bus, the only source of the address
+        # `a11y_bus_addr` reports. Absent either, the tests fail and every mutant reads as
+        # caught.
+        run: sudo apt-get update && sudo apt-get install -y xvfb at-spi2-core
       - name: Mutation gate
         if: steps.diff.outputs.touched == 'true'
         # nextest runs each test in its own process, so slow tests overlap rather than sum.
         run: |
           scripts/mutants.sh "$RUNNER_TEMP/mutants" \
             --test-tool nextest \
-            --package glass-core --package glass-android \
+            --package glass-core --package glass-android --package glass-x11 \
             --shard ${{ matrix.shard }}/8 --sharding round-robin \
             --in-diff "$RUNNER_TEMP/pr.diff"
 
@@ -327,7 +336,8 @@ jobs:
   # to require. This one has a fixed name and fails if any shard did.
   #
   # The ruleset's required check matches this name, so it is frozen — renaming it blocks every
-  # pull request. It gates glass-android too despite the name; rename only with the ruleset.
+  # pull request. It gates glass-android and glass-x11 too despite the name; rename only with
+  # the ruleset.
   mutants-gate:
     name: Mutation gate (glass-core)
     runs-on: ubuntu-latest

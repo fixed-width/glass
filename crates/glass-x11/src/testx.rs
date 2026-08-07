@@ -52,10 +52,6 @@ impl TestX {
         &self.xvfb.display
     }
 
-    pub(crate) fn root(&self) -> Window {
-        self.root
-    }
-
     /// A backend attached to this display.
     pub(crate) fn platform(&self) -> X11Platform {
         X11Platform::connect(Some(self.display())).expect("the backend should connect")
@@ -150,6 +146,53 @@ impl TestX {
             .change_property32(PropMode::REPLACE, self.root, atom, AtomEnum::WINDOW, wins)
             .expect("set _NET_CLIENT_LIST");
         self.flush();
+    }
+
+    /// Take the CLIPBOARD selection for this client, which is how another application
+    /// displaces glass's owner — the server sends the previous owner a `SelectionClear`.
+    /// Returns the window now holding it.
+    pub(crate) fn take_clipboard(&self) -> Window {
+        let win = self.window().unmapped().create();
+        let clipboard = self.intern(b"CLIPBOARD");
+        self.conn
+            .set_selection_owner(win, clipboard, x11rb::CURRENT_TIME)
+            .expect("set_selection_owner");
+        self.flush();
+        win
+    }
+
+    /// Ask the current CLIPBOARD owner to convert the selection to `target`, and return the
+    /// property named in the reply — `x11rb::NONE` when the owner refuses.
+    pub(crate) fn request_selection(&self, target: Atom, within: Duration) -> Option<Atom> {
+        let requestor = self.window().unmapped().create();
+        let clipboard = self.intern(b"CLIPBOARD");
+        let into = self.intern(b"GLASS_TEST_CLIP");
+        self.conn
+            .convert_selection(requestor, clipboard, target, into, x11rb::CURRENT_TIME)
+            .expect("convert_selection");
+        self.flush();
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if let Some(Event::SelectionNotify(n)) =
+                self.conn.poll_for_event().expect("poll_for_event")
+                && n.requestor == requestor
+            {
+                return Some(n.property);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+
+    /// How many windows the root currently has — a leaked temporary shows up here.
+    pub(crate) fn root_child_count(&self) -> usize {
+        self.conn
+            .query_tree(self.root)
+            .expect("query_tree")
+            .reply()
+            .expect("query_tree reply")
+            .children
+            .len()
     }
 
     pub(crate) fn destroy(&self, win: Window) {

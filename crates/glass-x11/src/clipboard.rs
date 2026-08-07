@@ -77,7 +77,9 @@ pub fn get(display: &str) -> Result<String> {
 
     let atoms = intern_get_atoms(&req_conn)?;
 
-    // Create a temporary INPUT_ONLY window to receive the SelectionNotify.
+    // A temporary INPUT_ONLY window to receive the SelectionNotify. It needs no explicit
+    // teardown: `req_conn` is dropped when this returns, and an X server destroys everything
+    // a client created once its connection closes (close-down mode defaults to DestroyAll).
     let win = req_conn
         .generate_id()
         .map_err(|e| GlassError::Backend(format!("generate_id: {e}")))?;
@@ -98,11 +100,6 @@ pub fn get(display: &str) -> Result<String> {
         .map_err(|e| GlassError::Backend(format!("create temp window: {e}")))?
         .check()
         .map_err(|e| GlassError::Backend(format!("create temp window check: {e}")))?;
-
-    let _cleanup = WindowGuard {
-        conn: &req_conn,
-        win,
-    };
 
     // Request the selection conversion.
     req_conn
@@ -168,19 +165,6 @@ pub fn get(display: &str) -> Result<String> {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-    }
-}
-
-/// RAII guard that destroys the temp window when it goes out of scope.
-struct WindowGuard<'a> {
-    conn: &'a RustConnection,
-    win: Window,
-}
-
-impl Drop for WindowGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.conn.destroy_window(self.win);
-        let _ = self.conn.flush();
     }
 }
 
@@ -278,14 +262,6 @@ impl ClipboardOwner {
     /// selection; `false` means `SelectionClear` was received).
     pub fn is_alive(&self) -> bool {
         !self.stop.load(Ordering::Relaxed)
-    }
-
-    /// Signal the thread to stop and wait for it to exit.
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 
@@ -514,4 +490,138 @@ fn handle_selection_request(
         .check()?;
     conn.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testx::TestX;
+
+    /// Long enough that a truncated read is visibly short: the property read asks for a
+    /// length in 4-byte units, and a slip there caps the text at a handful of bytes.
+    const LONG_TEXT: &str = "the quick brown fox jumps over the lazy dog";
+
+    /// Wait for `f` to hold, up to `within`. The owner thread runs on its own connection, so
+    /// what it has done is observed rather than sequenced.
+    fn eventually(within: Duration, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+
+    #[test]
+    fn an_unowned_clipboard_reads_as_empty_rather_than_failing() {
+        // A display where nothing has ever copied is the normal starting state, not an error.
+        let x = TestX::start();
+        assert_eq!(get(x.display()).expect("get"), "");
+    }
+
+    #[test]
+    fn repeated_reads_leave_no_windows_behind() {
+        // Each read creates a temporary window to receive the SelectionNotify on. An agent
+        // polls the clipboard, so one leaked window per read accumulates for the session.
+        let x = TestX::start();
+        let _owner =
+            ClipboardOwner::spawn(x.display().to_string(), "text".to_string()).expect("spawn");
+        let before = x.root_child_count();
+        for _ in 0..5 {
+            get(x.display()).expect("get");
+        }
+        assert_eq!(
+            x.root_child_count(),
+            before,
+            "five reads should leave the window tree as they found it"
+        );
+    }
+
+    #[test]
+    fn text_handed_to_the_owner_reads_back_whole() {
+        let x = TestX::start();
+        let _owner = ClipboardOwner::spawn(x.display().to_string(), LONG_TEXT.to_string())
+            .expect("the owner should take the selection");
+        assert_eq!(get(x.display()).expect("get"), LONG_TEXT);
+    }
+
+    #[test]
+    fn a_later_copy_replaces_what_the_owner_serves() {
+        let x = TestX::start();
+        let owner =
+            ClipboardOwner::spawn(x.display().to_string(), "first".to_string()).expect("spawn");
+        assert_eq!(get(x.display()).expect("get"), "first");
+        owner.set_text("second");
+        assert_eq!(get(x.display()).expect("get"), "second");
+    }
+
+    #[test]
+    fn the_owner_is_alive_until_it_is_dropped_and_then_serves_nothing() {
+        let x = TestX::start();
+        let owner =
+            ClipboardOwner::spawn(x.display().to_string(), "gone soon".to_string()).expect("spawn");
+        assert!(owner.is_alive());
+        drop(owner);
+        assert_eq!(
+            get(x.display()).expect("get"),
+            "",
+            "a dropped owner must release the selection, not keep serving it"
+        );
+    }
+
+    #[test]
+    fn another_client_taking_the_selection_retires_the_owner() {
+        // The server sends SelectionClear; ignoring it leaves a thread that believes it still
+        // owns a selection it does not, so the next copy is served by nobody.
+        let x = TestX::start();
+        let owner =
+            ClipboardOwner::spawn(x.display().to_string(), "ours".to_string()).expect("spawn");
+        assert!(owner.is_alive());
+
+        x.take_clipboard();
+        assert!(
+            eventually(Duration::from_secs(3), || !owner.is_alive()),
+            "the owner should have retired when another client took the selection"
+        );
+    }
+
+    #[test]
+    fn the_owner_advertises_the_targets_it_can_convert_to() {
+        let x = TestX::start();
+        let _owner =
+            ClipboardOwner::spawn(x.display().to_string(), "text".to_string()).expect("spawn");
+        let targets = x.intern(b"TARGETS");
+        let granted = x
+            .request_selection(targets, Duration::from_secs(2))
+            .expect("the owner should answer a TARGETS request");
+        assert_ne!(
+            granted,
+            x11rb::NONE,
+            "TARGETS is a request every selection owner must answer"
+        );
+    }
+
+    #[test]
+    fn a_target_the_owner_cannot_produce_is_refused_rather_than_answered_wrongly() {
+        // Refusal is `property = NONE`. Answering with the text regardless would hand a
+        // requestor asking for an image a string it cannot use.
+        let x = TestX::start();
+        let _owner =
+            ClipboardOwner::spawn(x.display().to_string(), "text".to_string()).expect("spawn");
+        let png = x.intern(b"image/png");
+        let granted = x
+            .request_selection(png, Duration::from_secs(2))
+            .expect("the owner should still reply");
+        assert_eq!(granted, x11rb::NONE);
+    }
+
+    #[test]
+    fn spawning_against_an_unreachable_display_fails_instead_of_hanging() {
+        let Err(err) = ClipboardOwner::spawn(":9999".to_string(), "text".to_string()) else {
+            panic!("there is no server on :9999, so no owner can take its selection");
+        };
+        assert!(matches!(err, GlassError::Backend(_)), "{err:?}");
+    }
 }
