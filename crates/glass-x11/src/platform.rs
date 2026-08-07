@@ -85,7 +85,7 @@ fn display_target(glass_display: Option<&str>) -> DisplayTarget {
 }
 
 /// Accept both `:42` and bare `42`.
-fn normalize_display(d: &str) -> String {
+pub(crate) fn normalize_display(d: &str) -> String {
     if d.starts_with(':') {
         d.to_string()
     } else {
