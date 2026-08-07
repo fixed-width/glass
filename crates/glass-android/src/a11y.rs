@@ -6,7 +6,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use glass_core::accessibility::{Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree};
+use glass_core::accessibility::{
+    Accessibility, AxContext, AxDeadline, AxNode, AxTarget, AxTree, Located,
+};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, WindowGeometry, typed_clear_landed,
     typed_text_landed,
@@ -299,14 +301,15 @@ fn dump_until_ready(
 /// Exact match, not "changed from before": tap-and-type is not atomic, so a dropped key or an input
 /// filter leaves the field holding something that is neither the request nor the old value, and
 /// calling that success is the failure this check exists to prevent. `glass_core::typed_text_landed`
-/// and `glass_core::typed_clear_landed` carry the rules and the cost of them.
+/// and `glass_core::typed_clear_landed` carry the rules and the cost of them. Twin of `verify_write`
+/// in `glass-ios/src/a11y.rs` — keep the two in step.
 ///
-/// The element is re-resolved by its pre-order id, which the write can perturb if the tap changes
-/// what is on screen. Raising the soft keyboard does not: measured on the dogfood AVD with
-/// `mInputShown=true`, `uiautomator dump` emits the focused window only and no IME window, so the
-/// keyboard cannot shift ids. A tap that navigates — Settings' search entry opens a different
-/// window — does shift them, so a mismatch is a claim about the tree rather than about the write;
-/// [`AxTarget::drift_error`] decides which of the two it is.
+/// The element is re-resolved by identity (role + name) via [`AxTarget::relocate`], not by its
+/// pre-order id. The soft keyboard does not itself shift ids — measured on the dogfood AVD with
+/// `mInputShown=true`, `uiautomator dump` emits the focused window only and no IME window — but a
+/// tap that navigates does: Settings' search entry opens a different window, and the field can turn
+/// up renumbered inside it rather than gone. Re-finding by identity is what lets that be confirmed
+/// instead of refused.
 ///
 /// Role and name are checked but bounds deliberately are not, unlike the pre-write
 /// [`locate_editable_target`]: the IME reflows the layout under the field it is typing into, so a
@@ -315,24 +318,44 @@ fn dump_until_ready(
 /// The node must also still be editable, which excludes a non-editable neighbour that inherited the
 /// id — but not a second nameless editable, since an editable's name comes from `content-desc` alone
 /// and `AxTarget::matches` compares `None` to `None`. The exact-value requirement is what covers
-/// that case.
+/// that case. A node reached by [`Located::AtId`] or [`Located::Moved`] already carries the target's
+/// role and name, so an editability mismatch there is always a change, never a disappearance —
+/// [`AxTarget::drift_error`] cannot return `AxElementGone` on this path.
 fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()> {
-    let Some(node) = after_tree.find(target.id) else {
-        // A tree cut short by the node cap explains an absent element better than "it moved" does.
-        return Err(match &after_tree.truncated {
-            // `Truncation::notice()` is written to close a rendered outline — a leading ellipsis
-            // and its own pixel-fallback advice — so this states the cap itself instead.
-            Some(t) => GlassError::AccessibilityUnavailable(format!(
-                "set_value: the text was typed, but the read-back could not find element {} \
-                 because the tree was truncated at {} {}; re-snapshot rather than retyping",
+    let node = match target.relocate(after_tree) {
+        Located::AtId(node) | Located::Moved(node) => node,
+        Located::Ambiguous(candidates) => {
+            return Err(GlassError::AxWriteUnconfirmed(
                 target.id.0,
-                t.limit_value,
-                t.limit.label(),
-            )),
-            None => target.drift_error(after_tree),
-        });
+                format!(
+                    "{} elements now match its role and name, so which one holds it cannot be told",
+                    candidates.len()
+                ),
+            ));
+        }
+        Located::Gone => {
+            return Err(GlassError::AxWriteUnconfirmed(
+                target.id.0,
+                "nothing in the tree carries its role and name, so the screen it was on was \
+                 replaced"
+                    .into(),
+            ));
+        }
+        Located::Unproven => {
+            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`, and
+            // existing tests assert it. `unreadable` has no number to name, so it says why instead.
+            let why = match &after_tree.truncated {
+                Some(t) => format!(
+                    "the tree was truncated at {} {}, so the element may be past the cap",
+                    t.limit_value,
+                    t.limit.label()
+                ),
+                None => "a subtree could not be read, so the element may be inside it".to_string(),
+            };
+            return Err(GlassError::AxWriteUnconfirmed(target.id.0, why));
+        }
     };
-    if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
+    if !node.states.editable {
         return Err(target.drift_error(after_tree));
     }
     let landed = if text.is_empty() {
@@ -1922,25 +1945,39 @@ mod tests {
     }
 
     #[test]
-    fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
-        // The write may well have landed — on something that then moved. Saying "not applied"
-        // would send an agent to retype into whatever now sits at that id.
+    fn a_write_confirmed_at_a_new_id_is_a_success() {
+        // A node grew above the field, so its id moved. The field is still there holding exactly
+        // what was asked for, and re-finding it by role and name is what lets that be confirmed
+        // instead of refused (glass#359).
         let after = under_a_container(tree_holding(Some("world")));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        assert!(verify_write(&after, &t, "world").is_ok());
+    }
+
+    #[test]
+    fn a_write_confirmed_at_a_new_id_still_checks_what_landed() {
+        // Re-finding must not weaken the value check: the field is found, and holds the wrong text.
+        let after = under_a_container(tree_holding(Some("worl")));
         let t = target(0, Some("Search"), Some(BOUNDS));
         assert!(matches!(
             verify_write(&after, &t, "world"),
-            Err(GlassError::AxElementChanged(0))
+            Err(GlassError::AxValueNotApplied(0))
         ));
     }
 
     #[test]
-    fn a_read_back_of_a_screen_that_was_replaced_reports_the_element_gone() {
+    fn a_write_whose_screen_was_replaced_says_it_was_typed_but_unconfirmed() {
         // glass#323's other half: the kill can land between the write and the read-back, which
         // is where four of the nine observed refusals came from.
-        let t = target(0, Some("Search"), Some(BOUNDS));
-        let e = verify_write(&a_different_screen(), &t, "world")
-            .expect_err("the field the write was aimed at is not in this tree");
-        assert!(matches!(e, GlassError::AxElementGone(0)), "{e}");
+        let err = verify_write(
+            &a_different_screen(),
+            &target(0, Some("Search"), Some(BOUNDS)),
+            "world",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(err.to_string().contains("the text was typed"), "{err}");
+        assert!(err.to_string().contains("replaced"), "{err}");
     }
 
     #[test]
@@ -1957,32 +1994,61 @@ mod tests {
     }
 
     #[test]
-    fn a_target_missing_from_the_read_back_is_reported_as_changed() {
-        // The element is still in the tree, just no longer at that id — renumbered, which is what
-        // "changed" means.
+    fn an_id_past_the_end_still_confirms_a_landed_write() {
+        // The mirror image of the renumbering case: the keyboard dismissing after a landed write
+        // can shrink the tree back down, leaving the field's old id past the end of it — nothing
+        // resolves there, but the field itself never moved and still holds the text.
         let after = tree_holding(Some("world"));
         let t = target(7, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxElementChanged(7))
-        ));
+        assert!(verify_write(&after, &t, "world").is_ok());
     }
 
     #[test]
     fn a_truncated_read_back_says_so_rather_than_blaming_drift() {
-        // The tree carries the reason the element is absent; reporting "it moved" would throw away
-        // the one fact that explains it.
-        let mut after = tree_holding(Some("world"));
+        // No node here carries the target's role and name, so a complete tree would call this
+        // Gone — the cap is what keeps it Unproven, and the cap is what tells a caller to raise
+        // max_nodes, so the message must keep naming it.
+        let mut after = tree(AxRole::Label, Some("No Results"), Some(BOUNDS), false);
         after.truncated = Some(glass_core::accessibility::Truncation {
             limit: glass_core::accessibility::TruncationLimit::Nodes,
             limit_value: 1,
             nodes_walked: 1,
         });
         let t = target(7, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AccessibilityUnavailable(_))
-        ));
+        let err = verify_write(&after, &t, "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(7, _)), "{err}");
+        assert!(err.to_string().contains("truncated at 1 nodes"), "{err}");
+    }
+
+    #[test]
+    fn two_matching_fields_refuse_and_name_where_they_are() {
+        // The target's own id must land on something else first — a node still holding it would
+        // take the AtId fast path and never learn a second candidate exists.
+        let mut container = tree(AxRole::Group, None, Some(BOUNDS), false);
+        let mut a = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+        a.root.value = Some("world".into());
+        let mut b = tree(AxRole::TextField, Some("Search"), Some(BOUNDS), true);
+        b.root.value = Some("world".into());
+        container.root.children = vec![a.root, b.root];
+        container.assign_ids();
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        let err = verify_write(&container, &t, "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(err.to_string().contains('2'), "names how many: {err}");
+    }
+
+    #[test]
+    fn an_incomplete_tree_does_not_claim_the_element_vanished() {
+        // `unreadable` is independent of the caps, and equally unable to support "replaced".
+        let mut after = tree(AxRole::Label, Some("No Results"), Some(BOUNDS), false);
+        after.unreadable = 1;
+        let t = target(9, Some("Search"), Some(BOUNDS));
+        let err = verify_write(&after, &t, "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(9, _)), "{err}");
+        assert!(
+            !err.to_string().contains("replaced"),
+            "an incomplete read must not assert the screen changed: {err}"
+        );
     }
 
     #[test]
