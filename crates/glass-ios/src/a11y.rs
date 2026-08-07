@@ -2,7 +2,7 @@
 //! nested JSON to an AxTree; set_value re-verifies the target element (guarding
 //! against a stale id landing on a different element), focuses it, clears it, and
 //! types the new text via synthetic HID input, then reads the element back and reports the write as not applied if it does not hold it.
-use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree};
+use glass_core::accessibility::{Accessibility, AxContext, AxRect, AxTarget, AxTree, Located};
 use std::time::Duration;
 
 use glass_core::{
@@ -102,31 +102,50 @@ const VERIFY_ATTEMPTS: usize = 3;
 /// `glass_core::typed_clear_landed` carry the rules and the cost of them. Twin of `verify_write` in
 /// `glass-android/src/a11y.rs` — keep the two in step.
 ///
-/// The element is re-resolved by its pre-order id, which the write itself perturbs: measured on the
-/// Simulator, the focusing tap raises the soft keyboard and inserts two nodes ahead of the field
-/// (glass#359). So a mismatch is a claim about the tree rather than about the write, and
-/// [`AxTarget::drift_error`] decides which of the two. A tree cut short by the walk caps explains an
-/// absent element better than either, so that case says so instead.
+/// The element is re-resolved by identity (role + name) via [`AxTarget::relocate`], not by its
+/// pre-order id: measured on the Simulator, the focusing tap raises the soft keyboard and inserts
+/// two nodes ahead of the field (glass#359), so the id itself is not stable across the write.
 ///
 /// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
 /// in `value`, so a label that changed inside the settle window would otherwise read as a successful
-/// write into a Label.
+/// write into a Label. A node reached by [`Located::AtId`] or [`Located::Moved`] already carries the
+/// target's role and name, so an editability mismatch there is always a change, never a disappearance
+/// — [`AxTarget::drift_error`] cannot return `AxElementGone` on this path.
 fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()> {
-    let Some(node) = after_tree.find(target.id) else {
-        return Err(match &after_tree.truncated {
-            // `Truncation::notice()` is written to close a rendered outline — a leading ellipsis and
-            // its own pixel-fallback advice — so this states the cap itself instead.
-            Some(t) => GlassError::AccessibilityUnavailable(format!(
-                "a11y set_value: the text was typed, but the read-back could not find element {} \
-                 because the tree was truncated at {} {}; re-snapshot rather than retyping",
+    let node = match target.relocate(after_tree) {
+        Located::AtId(node) | Located::Moved(node) => node,
+        Located::Ambiguous(candidates) => {
+            return Err(GlassError::AxWriteUnconfirmed(
                 target.id.0,
-                t.limit_value,
-                t.limit.label(),
-            )),
-            None => target.drift_error(after_tree),
-        });
+                format!(
+                    "{} elements now match its role and name, so which one holds it cannot be told",
+                    candidates.len()
+                ),
+            ));
+        }
+        Located::Gone => {
+            return Err(GlassError::AxWriteUnconfirmed(
+                target.id.0,
+                "nothing in the tree carries its role and name, so the screen it was on was \
+                 replaced"
+                    .into(),
+            ));
+        }
+        Located::Unproven => {
+            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`, and
+            // existing tests assert it. `unreadable` has no number to name, so it says why instead.
+            let why = match &after_tree.truncated {
+                Some(t) => format!(
+                    "the tree was truncated at {} {}, so the element may be past the cap",
+                    t.limit_value,
+                    t.limit.label()
+                ),
+                None => "a subtree could not be read, so the element may be inside it".to_string(),
+            };
+            return Err(GlassError::AxWriteUnconfirmed(target.id.0, why));
+        }
     };
-    if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
+    if !node.states.editable {
         return Err(target.drift_error(after_tree));
     }
     let landed = if text.is_empty() {
@@ -217,7 +236,7 @@ mod tests {
         }
     }
 
-    fn tree_with(field: AxNode) -> AxTree {
+    fn tree_with(children: Vec<AxNode>) -> AxTree {
         let root = AxNode {
             id: AxNodeId(0),
             role: AxRole::Window,
@@ -232,7 +251,7 @@ mod tests {
                 width: 400,
                 height: 800,
             }),
-            children: vec![field],
+            children,
         };
         let mut t = AxTree::new(root);
         t.assign_ids();
@@ -250,7 +269,7 @@ mod tests {
     fn tree_with_value(value: Option<&str>) -> AxTree {
         let mut field = leaf(0, AxRole::TextField, "Note", FIELD);
         field.value = value.map(Into::into);
-        tree_with(field)
+        tree_with(vec![field])
     }
 
     /// A target matching that field as the snapshot before the write saw it.
@@ -293,19 +312,17 @@ mod tests {
     #[test]
     fn a_truncated_read_back_says_so_rather_than_blaming_drift() {
         // The iOS tree carries the same truncation record Android's does; reporting "it moved" would
-        // throw away the one fact that explains the absence.
-        let mut after = tree_with_value(Some("world"));
+        // throw away the one fact that explains the absence. No node here carries the target's role
+        // and name, so a complete tree would call this Gone — the cap is what keeps it Unproven.
+        let mut after = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
         after.truncated = Some(glass_core::accessibility::Truncation {
             limit: glass_core::accessibility::TruncationLimit::Nodes,
             limit_value: 1,
             nodes_walked: 1,
         });
-        let mut t = matching_target();
-        t.id = AxNodeId(99);
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AccessibilityUnavailable(_))
-        ));
+        let err = verify_write(&after, &matching_target(), "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("truncated at 1 nodes"), "{err}");
     }
 
     #[test]
@@ -329,17 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn a_target_that_moved_is_reported_as_changed_not_as_a_failed_write() {
-        // A genuine move: something else now occupies the target's id, and the field is further
-        // down the tree.
+    fn a_relocated_write_still_checks_what_landed() {
+        // Re-finding by identity must not shortcut the value check: something else now occupies the
+        // target's id, the field is elsewhere in the tree, and it holds text other than what was
+        // typed — still not a successful write.
         let mut root_field = leaf(0, AxRole::Label, "Heading", FIELD);
         let mut moved = leaf(0, AxRole::TextField, "Note", FIELD);
-        moved.value = Some("world".into());
+        moved.value = Some("hello".into());
         root_field.children.push(moved);
-        let after = tree_with(root_field);
+        let after = tree_with(vec![root_field]);
         assert!(matches!(
             verify_write(&after, &matching_target(), "world"),
-            Err(GlassError::AxElementChanged(1))
+            Err(GlassError::AxValueNotApplied(1))
         ));
     }
 
@@ -356,43 +374,40 @@ mod tests {
     }
 
     #[test]
-    fn a_target_missing_from_the_read_back_is_reported_as_changed() {
-        let after = tree_with_value(Some("world"));
-        let mut t = matching_target();
-        t.id = AxNodeId(9);
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxElementChanged(9))
-        ));
+    fn a_write_confirmed_at_a_new_id_is_a_success() {
+        // glass#359, the measured case: the keyboard renumbered the field and the text landed.
+        let mut moved = leaf(0, AxRole::TextField, "Note", FIELD);
+        moved.value = Some("world".into());
+        let after = tree_with(vec![leaf(0, AxRole::Label, "Suggestions", FIELD), moved]);
+        assert!(verify_write(&after, &matching_target(), "world").is_ok());
     }
 
     #[test]
-    fn a_write_that_replaced_the_screen_says_the_element_is_gone() {
-        let replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
-        assert!(matches!(
-            verify_write(&replaced, &matching_target(), "world"),
-            Err(GlassError::AxElementGone(1))
-        ));
+    fn a_write_that_replaced_the_screen_says_it_was_typed_but_unconfirmed() {
+        let replaced = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
+        let err = verify_write(&replaced, &matching_target(), "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("the text was typed"), "{err}");
     }
 
     #[test]
-    fn an_id_past_the_end_of_a_replaced_tree_says_gone_not_changed() {
-        // The arm the measured case takes, and the one the test above cannot reach: `tree_with`
-        // roots at a Window, so an id inside the tree resolves and lands on the other refusal site.
-        let replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
-        let mut t = matching_target();
-        t.id = AxNodeId(15);
-        assert!(replaced.is_complete(), "a capped tree would answer Changed");
-        assert!(matches!(
-            verify_write(&replaced, &t, "world"),
-            Err(GlassError::AxElementGone(15))
-        ));
+    fn two_matching_fields_refuse_and_name_where_they_are() {
+        // The target's own id must land on something else first — a node still holding it would
+        // take the AtId fast path and never learn a second candidate exists.
+        let mut a = leaf(0, AxRole::TextField, "Note", FIELD);
+        a.value = Some("world".into());
+        let mut b = leaf(0, AxRole::TextField, "Note", FIELD);
+        b.value = Some("world".into());
+        let after = tree_with(vec![leaf(0, AxRole::Label, "Suggestions", FIELD), a, b]);
+        let err = verify_write(&after, &matching_target(), "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains('2'), "names how many: {err}");
     }
 
     #[test]
     fn an_incomplete_tree_cannot_report_the_element_gone() {
         // A cap that fired hides elements, so absence from what was kept is not absence.
-        let mut replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
+        let mut replaced = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
         replaced.truncated = Some(glass_core::accessibility::Truncation {
             limit: glass_core::accessibility::TruncationLimit::Nodes,
             limit_value: 2,
@@ -400,26 +415,39 @@ mod tests {
         });
         let mut t = matching_target();
         t.id = AxNodeId(15);
-        assert!(matches!(
-            verify_write(&replaced, &t, "world"),
-            Err(GlassError::AccessibilityUnavailable(_))
-        ));
-        // The mismatched-id arm has no truncation branch of its own and must not assert gone.
-        assert!(matches!(
-            verify_write(&replaced, &matching_target(), "world"),
-            Err(GlassError::AxElementChanged(1))
-        ));
+        let err = verify_write(&replaced, &t, "world").unwrap_err();
+        assert!(
+            matches!(err, GlassError::AxWriteUnconfirmed(15, _)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("truncated at 2 nodes"), "{err}");
     }
 
     #[test]
-    fn a_dropped_subtree_cannot_report_the_element_gone() {
-        // `unreadable` is independent of the caps, and equally unable to support "gone".
-        let mut replaced = tree_with(leaf(0, AxRole::Label, "No Results", FIELD));
+    fn an_id_resolving_to_a_mismatch_takes_the_same_truncation_branch() {
+        // The id-mismatch arm used to skip the truncation check entirely; it must fall through to
+        // the same search, and the same cap, as an out-of-range id.
+        let mut replaced = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
+        replaced.truncated = Some(glass_core::accessibility::Truncation {
+            limit: glass_core::accessibility::TruncationLimit::Nodes,
+            limit_value: 2,
+            nodes_walked: 2,
+        });
+        let err = verify_write(&replaced, &matching_target(), "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("truncated at 2 nodes"), "{err}");
+    }
+
+    #[test]
+    fn an_incomplete_tree_does_not_claim_the_element_vanished() {
+        let mut replaced = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
         replaced.unreadable = 1;
-        assert!(matches!(
-            verify_write(&replaced, &matching_target(), "world"),
-            Err(GlassError::AxElementChanged(1))
-        ));
+        let err = verify_write(&replaced, &matching_target(), "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(
+            !err.to_string().contains("replaced"),
+            "an incomplete read must not assert the screen changed: {err}"
+        );
     }
 
     #[test]
@@ -430,7 +458,7 @@ mod tests {
             width: 100,
             height: 30,
         };
-        let tree = tree_with(leaf(0, AxRole::TextField, "inputField", r));
+        let tree = tree_with(vec![leaf(0, AxRole::TextField, "inputField", r)]);
         let target = AxTarget {
             id: AxNodeId(1),
             role: AxRole::TextField,
@@ -449,7 +477,7 @@ mod tests {
             width: 100,
             height: 30,
         };
-        let tree = tree_with(leaf(0, AxRole::Button, "inputField", r));
+        let tree = tree_with(vec![leaf(0, AxRole::Button, "inputField", r)]);
         let target = AxTarget {
             id: AxNodeId(1),
             role: AxRole::TextField,
@@ -469,7 +497,7 @@ mod tests {
             height: 30,
         };
         // The tree only has ids 0 (root) and 1 (the field); id 9 resolves to nothing.
-        let tree = tree_with(leaf(0, AxRole::TextField, "inputField", r));
+        let tree = tree_with(vec![leaf(0, AxRole::TextField, "inputField", r)]);
         let target = AxTarget {
             id: AxNodeId(9),
             role: AxRole::TextField,
@@ -493,7 +521,7 @@ mod tests {
             width: 100,
             height: 30,
         };
-        let tree = tree_with(leaf(0, AxRole::TextField, "inputField", r));
+        let tree = tree_with(vec![leaf(0, AxRole::TextField, "inputField", r)]);
         // Same role+name, but the target's captured bounds sit far from the node's —
         // beyond the tolerance, so a drifted id landing on a same-role element is rejected.
         let target = AxTarget {
