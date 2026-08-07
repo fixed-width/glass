@@ -384,11 +384,7 @@ impl FakeAdb {
         }
         std::fs::write(dir.join("rules"), rendered).expect("write the fake adb's rules");
 
-        let bin = dir.join("adb");
-        std::fs::write(&bin, FAKE_ADB_SCRIPT).expect("write the fake adb");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .expect("make the fake adb executable");
+        let bin = write_executable(&dir, "adb", FAKE_ADB_SCRIPT);
 
         FakeAdb {
             adb: Adb {
@@ -420,18 +416,32 @@ impl FakeAdb {
     /// Write another executable script into this fake's directory and return its path — an
     /// `emulator` to stand beside the `adb`, cleaned up with it.
     pub(crate) fn alongside(&self, name: &str, script: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = self.dir.join(name);
-        std::fs::write(&path, script).expect("write the stand-in tool");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stand-in tool executable");
-        path
+        write_executable(&self.dir, name, script)
     }
 
     /// A file in this fake's directory, for a stand-in tool that records what it was asked.
     pub(crate) fn read(&self, name: &str) -> String {
         std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
     }
+}
+
+/// Write `script` into `dir` as an executable `name`, and return its path.
+///
+/// Written under a temporary name and renamed into place, never opened for writing at its final
+/// path: these tests run in parallel, and a `Command::spawn` on one thread forks while another is
+/// mid-write, so the child inherits the write handle. Executing a file some process holds open
+/// for writing is `ETXTBSY`, which surfaces as an unrelated test failing to run its adb at all.
+#[cfg(all(test, unix))]
+fn write_executable(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let staged = dir.join(format!("{name}.staged"));
+    let path = dir.join(name);
+    std::fs::write(&staged, script).expect("write the stand-in tool");
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in tool executable");
+    std::fs::rename(&staged, &path).expect("move the stand-in tool into place");
+    path
 }
 
 #[cfg(all(test, unix))]
