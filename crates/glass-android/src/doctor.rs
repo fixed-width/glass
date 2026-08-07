@@ -130,7 +130,7 @@ fn probe(deep_requested: bool) -> Probe {
         Action::Attach(serial) if deep_requested && !agent_off && agent_jar_exists => {
             let reg = crate::agent::AgentRegistry::new();
             let r = reg
-                .ensure(&adb.with_serial(serial.clone()))
+                .ensure(&adb.with_serial(serial.clone()), &get)
                 .map(|_| ())
                 .map_err(|e| e.to_string());
             reg.shutdown();

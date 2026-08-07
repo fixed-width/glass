@@ -98,17 +98,11 @@ mod tests {
         (stream, pid)
     }
 
-    /// Whether `pid` is still a live process. A killed child is reaped by `stop`, so its pid is
-    /// gone rather than left as a zombie that would still answer here.
+    /// Whether `pid` is still a live process — `stop` reaps what it kills, so a stopped child's
+    /// pid is gone rather than left as a zombie that would still answer.
     #[cfg(unix)]
     fn still_running(pid: u32) -> bool {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            // A gone process is the answer this asks for, not a problem to report on stderr.
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill -0")
-            .success()
+        crate::adb::still_running(&pid.to_string())
     }
 
     #[test]

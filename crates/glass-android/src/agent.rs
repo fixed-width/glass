@@ -212,11 +212,14 @@ pub struct AgentRegistry {
 }
 
 /// A launched agent: the backgrounded `adb shell` child (killing it SIGHUPs the device
-/// process — no `pkill`), the forwarded local port, and the device serial it was bound to.
+/// process — no `pkill`), the forwarded local port, and the adb client it was reached through.
+///
+/// The client is kept rather than resolved again at teardown: `Adb::from_env` reads the
+/// environment as it is *then*, which need not be what launched the agent.
 struct AgentProc {
     child: Child,
     port: u16,
-    serial: Option<String>,
+    adb: Adb,
 }
 
 impl Drop for AgentProc {
@@ -235,7 +238,11 @@ impl AgentRegistry {
     /// port. Idempotent: a second call returns the cached port when the device serial matches.
     /// If the serial changed (a different device), the stale agent is torn down first.
     /// The jar is resolved from env.
-    pub fn ensure(&self, adb: &Adb) -> Result<u16> {
+    ///
+    /// `get` reads the environment — the jar's location is all it needs from there — passed in
+    /// rather than read here, so a test can point it at a jar without touching the environment
+    /// the whole process shares.
+    pub fn ensure(&self, adb: &Adb, get: &dyn Fn(&str) -> Option<String>) -> Result<u16> {
         let mut guard = self
             .state
             .lock()
@@ -243,24 +250,20 @@ impl AgentRegistry {
 
         // Cache hit: same serial (or both unset) — reuse the existing port.
         if let Some(p) = guard.as_ref()
-            && p.serial.as_deref() == adb.serial()
+            && p.adb.serial() == adb.serial()
         {
             return Ok(p.port);
         }
         // Serial changed (or first-ever call with a stale entry): tear down the stale agent.
         // Taking it out of the guard drops it, which kills + reaps the child via Drop.
         if let Some(stale) = guard.take() {
-            let stale_adb = Adb::from_env();
-            let stale_adb = match &stale.serial {
-                Some(s) => stale_adb.with_serial(s.clone()),
-                None => stale_adb,
-            };
-            let _ = stale_adb.run(["forward", "--remove", &format!("tcp:{}", stale.port)]);
+            let _ = stale
+                .adb
+                .run(["forward", "--remove", &format!("tcp:{}", stale.port)]);
             // stale drops here → Drop kills + reaps the child
         }
 
-        let get = |k: &str| std::env::var(k).ok();
-        let jar = agent_jar(&get)
+        let jar = agent_jar(get)
             .ok_or_else(|| GlassError::Backend("GLASS_ANDROID_AGENT_JAR not set".into()))?;
 
         // Push the jar (idempotent).
@@ -315,7 +318,7 @@ impl AgentRegistry {
         *guard = Some(AgentProc {
             child,
             port,
-            serial,
+            adb: adb.clone(),
         });
         Ok(port)
     }
@@ -325,12 +328,9 @@ impl AgentRegistry {
         if let Ok(mut guard) = self.state.lock()
             && let Some(p) = guard.take()
         {
-            let adb = Adb::from_env();
-            let adb = match &p.serial {
-                Some(s) => adb.with_serial(s.clone()),
-                None => adb,
-            };
-            let _ = adb.run(["forward", "--remove", &format!("tcp:{}", p.port)]);
+            let _ = p
+                .adb
+                .run(["forward", "--remove", &format!("tcp:{}", p.port)]);
             // p drops here → Drop kills + reaps the child
         }
     }
@@ -517,6 +517,93 @@ mod tests {
         // wrong way round — makes that first attempt the answer.
         let port = agent_that_answers_after(1);
         wait_for_agent(port).expect("an agent that answers on the second try must be waited for");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensuring_the_agent_pushes_it_launches_it_and_forwards_a_port_to_it() {
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let (agent_port, _) = fake_agent(HELLO, vec![OK]);
+        let forwarded = Answer::says(format!("{agent_port}\n"));
+        let (lingers, silent) = (Answer::Lingers, Answer::Silent);
+        // Specific rules first: the catch-all would otherwise answer everything.
+        let fake = FakeAdb::scripted(&[
+            ("forward tcp:0 *", vec![&forwarded]),
+            ("shell CLASSPATH=*", vec![&lingers]),
+            ("*", vec![&silent]),
+        ]);
+        // The jar has to be a file on disk, and the fake adb's own script is one.
+        let jar = fake.adb().bin().to_string();
+        let get = move |k: &str| match k {
+            "GLASS_ANDROID_AGENT_JAR" => Some(jar.clone()),
+            _ => None,
+        };
+
+        let registry = AgentRegistry::new();
+        let port = registry
+            .ensure(fake.adb(), &get)
+            .expect("the agent answers on the port adb forwarded");
+
+        assert_eq!(
+            port, agent_port,
+            "the forwarded port is the one handed back"
+        );
+        assert!(fake.called("push"), "{:?}", fake.calls());
+        assert!(fake.called("app_process"), "{:?}", fake.calls());
+
+        // A second call reuses the running agent. Pushing and relaunching per call would
+        // restart the companion under whatever was mid-gesture against it.
+        assert_eq!(registry.ensure(fake.adb(), &get).unwrap(), agent_port);
+        assert_eq!(
+            fake.calls().iter().filter(|c| c.contains("push")).count(),
+            1,
+            "{:?}",
+            fake.calls()
+        );
+
+        // The launch is a child that stays up; killing it is what SIGHUPs the device process.
+        let child = fake.read("linger.pid");
+        assert!(!child.is_empty(), "the launch should still be running");
+        assert!(still_running(&child));
+
+        registry.shutdown();
+        assert!(fake.called("forward --remove"), "{:?}", fake.calls());
+        assert!(
+            !still_running(&child),
+            "the adb shell holding the device agent outlived shutdown"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_agent_that_cannot_be_forwarded_a_port_leaves_no_child_behind() {
+        // Every failure after the launch has to kill and reap the child itself: `Child::drop`
+        // does not, so a bailout that forgets leaves one adb shell — and one device-side
+        // app_process — per attempt.
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let (lingers, quiet) = (Answer::Lingers, Answer::says(""));
+        let fake = FakeAdb::scripted(&[
+            ("forward tcp:0 *", vec![&quiet]),
+            ("shell CLASSPATH=*", vec![&lingers]),
+            ("*", vec![&Answer::Silent]),
+        ]);
+        let jar = fake.adb().bin().to_string();
+        let get = move |k: &str| match k {
+            "GLASS_ANDROID_AGENT_JAR" => Some(jar.clone()),
+            _ => None,
+        };
+
+        let registry = AgentRegistry::new();
+        let err = registry
+            .ensure(fake.adb(), &get)
+            .expect_err("a forward that names no port cannot be connected to");
+        assert!(err.to_string().contains("no port"), "{err}");
+
+        let child = fake.read("linger.pid");
+        assert!(!child.is_empty(), "the launch should have happened");
+        assert!(!still_running(&child), "the failed launch leaked its child");
     }
 
     #[test]

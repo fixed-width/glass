@@ -56,7 +56,10 @@ impl AndroidPlatform {
 
         // Best-effort: use the agent when enabled; on any failure, fall back to adb paths.
         let agent = if crate::agent::agent_enabled(&get) {
-            match agents.ensure(target.adb()).and_then(AgentClient::connect) {
+            match agents
+                .ensure(target.adb(), &get)
+                .and_then(AgentClient::connect)
+            {
                 Ok(client) => Some(Arc::new(client)),
                 Err(e) => {
                     eprintln!("glass-android: agent unavailable, using adb fallback: {e}");

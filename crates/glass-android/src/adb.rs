@@ -270,6 +270,9 @@ pub(crate) enum Answer {
     Fails(Vec<u8>),
     /// Exit 0 having said nothing, like `am force-stop` on success.
     Silent,
+    /// Stay up rather than returning, like the backgrounded `adb shell` that holds the on-device
+    /// agent open. Writes its pid to `linger.pid` so a test can watch for it being killed.
+    Lingers,
 }
 
 #[cfg(all(test, unix))]
@@ -317,9 +320,15 @@ while IFS='\t' read -r glob answers stem; do
             [ -f \"$dir/$stem.seen\" ] && n=$(cat \"$dir/$stem.seen\")
             printf '%s' \"$((n + 1))\" > \"$dir/$stem.seen\"
             [ \"$n\" -ge \"$answers\" ] && n=$((answers - 1))
+            code=$(cat \"$dir/${stem}_$n.code\")
+            if [ \"$code\" = linger ]; then
+                printf '%s' \"$$\" > \"$dir/linger.pid\"
+                sleep 30
+                exit 0
+            fi
             cat \"$dir/${stem}_$n.out\"
             cat \"$dir/${stem}_$n.err\" >&2
-            exit \"$(cat \"$dir/${stem}_$n.code\")\"
+            exit \"$code\"
             ;;
     esac
 done < \"$dir/rules\"
@@ -360,15 +369,16 @@ impl FakeAdb {
             assert!(!answers.is_empty(), "rule {glob:?} answers nothing");
             let stem = format!("r{i}");
             for (k, answer) in answers.iter().enumerate() {
-                let (code, out, err): (i32, &[u8], &[u8]) = match answer {
-                    Answer::Says(s) => (0, s, b""),
-                    Answer::Fails(s) => (1, b"", s),
-                    Answer::Silent => (0, b"", b""),
+                let (code, out, err): (&str, &[u8], &[u8]) = match answer {
+                    Answer::Says(s) => ("0", s, b""),
+                    Answer::Fails(s) => ("1", b"", s),
+                    Answer::Silent => ("0", b"", b""),
+                    Answer::Lingers => ("linger", b"", b""),
                 };
                 let at = |ext| dir.join(format!("{stem}_{k}.{ext}"));
                 std::fs::write(at("out"), out).expect("write the fake adb's stdout");
                 std::fs::write(at("err"), err).expect("write the fake adb's stderr");
-                std::fs::write(at("code"), code.to_string()).expect("write the fake adb's status");
+                std::fs::write(at("code"), code).expect("write the fake adb's status");
             }
             rendered.push_str(&format!("{glob}\t{}\t{stem}\n", answers.len()));
         }
@@ -429,6 +439,19 @@ impl Drop for FakeAdb {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Whether `pid` is still a live process. A child that was killed *and reaped* is gone rather
+/// than left as a zombie, which would still answer here.
+#[cfg(all(test, unix))]
+pub(crate) fn still_running(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        // A gone process is the answer this asks for, not a problem to report on stderr.
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("kill -0")
+        .success()
 }
 
 /// The error a call to a *missing* binary raises — the shape `a11y` must not read as a tool that
