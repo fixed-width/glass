@@ -63,21 +63,27 @@ impl IosA11y {
 /// Locate `target` in a tree described for the write and return its window-relative pixel bounds —
 /// the guard every write runs before it dispatches.
 ///
-/// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id. The caller's snapshot
-/// and this describe are separate reads of a live app, so anything that shifted the tree between
-/// them renumbers the field without moving it — the soft keyboard an earlier write raised is the
-/// measured case, inserting two nodes ahead of it (glass#361). Same resolution the read-back uses,
-/// so a write is refused before it dispatches only where it would also be refused after.
+/// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id alone. The caller's
+/// snapshot and this describe are separate reads of a live app, so anything that shifted the tree
+/// between them renumbers the field without moving it — the soft keyboard an earlier write raised is
+/// the measured case, inserting two nodes ahead of it (glass#361). The read-back resolves the same
+/// way, so no write is refused here for an identity the read-back would have accepted.
 ///
-/// Bounds are no longer compared against the snapshot's. [`Located::Moved`] already requires the
-/// re-found node to overlap where the target was, which is where bounds carry evidence; on
-/// [`Located::AtId`] the id and the identity already agree, and a field that legitimately moved
-/// should be tapped where it now is rather than refused.
+/// Identity alone does not decide it. Role and name repeat across a form's rows and are both `None`
+/// on an unlabelled field, and [`Located::AtId`] is granted on that key plus a pre-order index this
+/// very write perturbs — so on its own it would accept whatever editable renumbering slid onto the
+/// id, tap it, and type into it, and the read-back would confirm the text in that same wrong node.
+/// Bounds and value are therefore checked on whichever node was reached: overlap rather than
+/// equality, so a field the keyboard shifted is still written where it now is, and value because a
+/// recycled row keeps its identifier and its rect and differs only there — the discriminator
+/// `AxTarget::value` exists for and Android's `fingerprinted` has always compared.
 ///
-/// Every refusal is pre-dispatch, so each is a typed drift verdict from
-/// [`AxTarget::drift_error`] — `AxElementGone` where nothing presents as the element, and
-/// `AxElementChanged` otherwise, truncation included (glass#361 replaced the `Backend` strings that
-/// told an agent to re-snapshot without saying which had happened).
+/// Every refusal is pre-dispatch. One the tree can no longer place, or that no longer looks like
+/// what was addressed, answers with a typed drift verdict from [`AxTarget::drift_error`] —
+/// `AxElementGone` where nothing presents as the element, `AxElementChanged` otherwise, truncation
+/// included. A node that *is* the element but is no longer editable, or reports no bounds, answers
+/// `AxElementNotEditable` / `AxElementNotClickable`. glass#361 replaced the `Backend` strings that
+/// told an agent to re-snapshot without saying which had happened.
 fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     let node = match target.relocate(tree) {
         Located::AtId(node) | Located::Moved(node) => node,
@@ -85,9 +91,12 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
             return Err(target.drift_error(tree));
         }
     };
-    // Android and macOS gate on this and iOS did not, which mattered once the write is checked: for
-    // a non-editable node `axmap` puts the element's AXLabel in `value`, so a label that changed for
-    // any reason inside the settle window would have read as a successful write into a Label.
+    if !target.bounds_overlap(node.bounds) || !target.value_consistent(node.value.as_deref()) {
+        return Err(target.drift_error(tree));
+    }
+    // Defence in depth rather than a reachable arm: iOS derives `editable` from the role alone, and
+    // `relocate` already required the roles to match, so a target that was editable resolves to a
+    // node that still is.
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
@@ -125,7 +134,7 @@ const VERIFY_ATTEMPTS: usize = 3;
 /// and name, so a node reached here that is not editable is not a neighbour that inherited the id —
 /// it is the identified element having lost editability. Every refusal here is post-dispatch, hence
 /// [`GlassError::AxWriteUnconfirmed`] throughout, where `verify` above refuses before the write goes
-/// out and answers in drift verdicts.
+/// out and answers in pre-write verdicts — drift, not-editable or not-clickable.
 ///
 /// A clear (`text` empty) is confirmed only for a target that carries a name. An empty read-back is
 /// what any untouched same-role, same-name field would also show, so it is evidence of the write
@@ -203,19 +212,51 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
     }
 }
 
-/// The whole write as one batch of HID events: select-all, delete, then the text.
+/// The write's keystrokes as one batch of HID events: select-all, delete, then the text.
 ///
 /// One batch because each `IdbClient::hid` is its own RPC, and a pause between the delete and the
-/// text loses the text. Measured on the Simulator against `examples/ios-role-fixture`: back to
-/// back it lands 12/12, and with a pause in between 2/4 at 0.14s, 0/4 at 0.34s and 0/4 at 2s
-/// (glass#363). Sending them a call each let one slow round-trip open that window, which is what
-/// made the write fail roughly one run in six. Do not split this back into a call per keystroke
-/// for readability — the failure it prevents is invisible on a fast, idle host.
+/// text loses the text. Measured on the Simulator against `examples/ios-role-fixture`: back to back
+/// the text lands 12/12; with a screenshot in between (0.14s) 2/4, with an accessibility read
+/// (0.34s) 0/4, and with a bare sleep making no call at all (2s) 0/4 — so it is elapsed time, not
+/// the extra request. Sending the groups a call each let one slow round-trip open that window
+/// (glass#363). Do not split this back into a call per group for readability — the failure it
+/// prevents is invisible on a fast, idle host.
 fn clear_and_type_keys(injector: &IdbInjector, text: &str) -> Result<Vec<proto::HidEvent>> {
     let mut events = injector.key_events(&KeyEvent::Chord("super+a".into()))?;
     events.extend(injector.key_events(&KeyEvent::Chord("Delete".into()))?);
     events.extend(injector.key_events(&KeyEvent::Text(text.to_string()))?);
     Ok(events)
+}
+
+/// Send the whole write: the focusing tap, then the keystrokes, in exactly two calls.
+///
+/// Over a `send` seam rather than [`IdbClient`] directly so the call *count* is testable without a
+/// device. That count is the fix for glass#363 — [`clear_and_type_keys`] returns a plain `Vec`, so
+/// nothing but this function stops a caller sending it in pieces again.
+///
+/// The batch is built before the tap goes out: `KeyEvent::Text` refuses a non-ASCII character, and
+/// building afterwards spent a tap that raised the keyboard and moved first responder before
+/// reporting a write that never happened.
+///
+/// A failure of the second send is post-dispatch and says so. The batch clears the field before it
+/// types, and `IdbClient::hid` streams it, so a failure part-way through can leave the field emptied
+/// with the text lost — reporting that as a bare transport error would tell an agent nothing was
+/// sent, and the session would keep the value it cached.
+fn dispatch_write(
+    send: &mut dyn FnMut(Vec<proto::HidEvent>) -> Result<()>,
+    injector: &IdbInjector,
+    tap: &PointerEvent,
+    target_id: u32,
+    text: &str,
+) -> Result<()> {
+    let keys = clear_and_type_keys(injector, text)?;
+    send(injector.pointer_events(tap)?)?;
+    send(keys).map_err(|e| {
+        GlassError::AxWriteUnconfirmed(
+            target_id,
+            format!("sending the keystrokes failed part-way through ({e}), so the field may have been cleared without receiving the text"),
+        )
+    })
 }
 
 /// The read-back's own failure, reported as an unconfirmed write.
@@ -233,8 +274,8 @@ impl Accessibility for IosA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        // One describe yields both the id-assigned tree and the scale to place input at;
-        // the ids here are final, not walked again.
+        // One describe serves both the guard and the injector's scale — no second read before the
+        // keystrokes go out.
         let (tree, scale) = self.describe(ctx)?;
         let bounds = verify(&tree, target)?;
         let (cx, cy) = bounds
@@ -250,11 +291,17 @@ impl Accessibility for IosA11y {
             count: 1,
             modifiers: vec![],
         };
-        self.client.hid(injector.pointer_events(&tap)?)?;
-        // A gap before the keystrokes is harmless, so the tap stays its own call — the field has
-        // to become first responder before they arrive. A gap *within* them is not: see
-        // `clear_and_type_keys`.
-        self.client.hid(clear_and_type_keys(&injector, text)?)?;
+        // The tap keeps its own call — the field has to become first responder before the
+        // keystrokes arrive, and a gap there is harmless (measured: the same write with 400ms
+        // inserted between the two passes the smoke 6/6). A gap *within* the keystrokes is not.
+        let client = &self.client;
+        dispatch_write(
+            &mut |events| client.hid(events),
+            &injector,
+            &tap,
+            target.id.0,
+            text,
+        )?;
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
@@ -332,6 +379,16 @@ mod tests {
         let mut field = leaf(0, AxRole::TextField, "Note", FIELD);
         field.value = value.map(Into::into);
         tree_with(vec![field])
+    }
+
+    /// A target whose captured rect overlaps `shifted` in
+    /// `a_renumbered_field_that_also_shifted_is_tapped_where_it_now_is` — the keyboard moving a
+    /// field a little, not a different field elsewhere.
+    fn shifted_target() -> AxTarget {
+        AxTarget {
+            bounds: Some(AxRect { y: 30, ..FIELD }),
+            ..matching_target()
+        }
     }
 
     /// A target matching that field as the snapshot before the write saw it.
@@ -650,12 +707,107 @@ mod tests {
         );
     }
 
+    /// A `send` that records what it was handed instead of reaching a device, so a test can assert
+    /// how many calls the write made — the property glass#363 turns on.
+    fn recording_send(
+        log: &mut Vec<Vec<proto::HidEvent>>,
+    ) -> impl FnMut(Vec<proto::HidEvent>) -> Result<()> {
+        move |events| {
+            log.push(events);
+            Ok(())
+        }
+    }
+
+    fn a_tap() -> PointerEvent {
+        PointerEvent::Click {
+            x: 10,
+            y: 20,
+            button: MouseButton::Left,
+            count: 1,
+            modifiers: vec![],
+        }
+    }
+
     #[test]
-    fn the_clear_and_the_text_go_out_as_one_batch() {
-        // What makes the single `hid` call possible, and the thing a later refactor would undo:
-        // the three keystroke groups have to arrive concatenated, in order, in one vector. A
-        // pause between the delete and the text loses the text on the Simulator (glass#363), and
-        // nothing downstream of here can tell that it happened.
+    fn the_whole_write_goes_out_in_exactly_two_calls() {
+        // glass#363: each call is its own RPC, and a pause between the clear and the text loses the
+        // text. One call for the tap, one for every keystroke — three calls reinstates the bug, and
+        // `clear_and_type_keys` returning a plain Vec is what would let someone split it again.
+        let injector = IdbInjector::new(2.0);
+        let mut log = Vec::new();
+        dispatch_write(&mut recording_send(&mut log), &injector, &a_tap(), 1, "hi").unwrap();
+
+        assert_eq!(log.len(), 2, "the tap, then every keystroke in one call");
+        assert_eq!(log[0], injector.pointer_events(&a_tap()).unwrap());
+        assert_eq!(log[1], clear_and_type_keys(&injector, "hi").unwrap());
+    }
+
+    #[test]
+    fn a_failed_focus_tap_never_dispatches_the_keystrokes() {
+        // Typing into whatever had focus before is worse than not writing at all.
+        let injector = IdbInjector::new(2.0);
+        let mut calls = 0;
+        let mut send = |_events| {
+            calls += 1;
+            Err(GlassError::Backend("idb: connection reset".into()))
+        };
+        let err = dispatch_write(&mut send, &injector, &a_tap(), 1, "hi").unwrap_err();
+        assert_eq!(calls, 1, "the keystrokes must not follow a tap that failed");
+        assert!(
+            !err.set_value_failed_after_writing(),
+            "nothing was typed, so the session must keep its cached value: {err}"
+        );
+    }
+
+    #[test]
+    fn keystrokes_lost_part_way_report_the_field_may_be_cleared() {
+        // The batch clears before it types, so a stream that dies between the two leaves the field
+        // empty. Reporting that as a bare transport error would read as "nothing was sent".
+        let injector = IdbInjector::new(2.0);
+        let mut calls = 0;
+        let mut send = |_events| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(GlassError::Backend("idb hid timed out after 30s".into()))
+            }
+        };
+        let err = dispatch_write(&mut send, &injector, &a_tap(), 7, "hi").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(7, _)), "{err}");
+        assert!(
+            err.set_value_failed_after_writing(),
+            "the session must drop the value it cached: {err}"
+        );
+        assert!(err.to_string().contains("may have been cleared"), "{err}");
+    }
+
+    #[test]
+    fn text_the_backend_cannot_type_refuses_before_anything_is_sent() {
+        // Building the batch before the tap is what makes this a true no-op: under the old order
+        // the clear had already emptied the field when the text was found to be untypeable.
+        let injector = IdbInjector::new(2.0);
+        let mut log = Vec::new();
+        let err = dispatch_write(
+            &mut recording_send(&mut log),
+            &injector,
+            &a_tap(),
+            1,
+            "café",
+        )
+        .unwrap_err();
+        assert!(matches!(err, GlassError::Unsupported(_)), "{err}");
+        assert!(
+            log.is_empty(),
+            "nothing may be sent for a write that cannot be built"
+        );
+        assert!(!err.set_value_failed_after_writing(), "{err}");
+    }
+
+    #[test]
+    fn clear_and_type_keys_concatenates_the_three_groups_in_order() {
+        // Content and order only — that these leave in ONE call is
+        // `the_whole_write_goes_out_in_exactly_two_calls`.
         let injector = IdbInjector::new(2.0);
         let select_all = injector
             .key_events(&KeyEvent::Chord("super+a".into()))
@@ -682,19 +834,23 @@ mod tests {
 
     #[test]
     fn a_clear_still_sends_the_keystrokes_that_empty_the_field() {
-        // `set_value(id, "")` types nothing, so the batch is select-all + delete alone — and it
-        // must still be non-empty, or a clear would dispatch no keystrokes at all.
+        // `set_value(id, "")` types nothing, so the batch is select-all then delete and nothing
+        // else. Assert both, in order: a length total alone passes with the two swapped, which on
+        // a device deletes one character instead of the field.
         let injector = IdbInjector::new(2.0);
-        let batch = clear_and_type_keys(&injector, "").unwrap();
-        let cleared = injector
+        let mut expected = injector
             .key_events(&KeyEvent::Chord("super+a".into()))
-            .unwrap()
-            .len()
-            + injector
+            .unwrap();
+        expected.extend(
+            injector
                 .key_events(&KeyEvent::Chord("Delete".into()))
-                .unwrap()
-                .len();
-        assert_eq!(batch.len(), cleared);
+                .unwrap(),
+        );
+
+        let batch = clear_and_type_keys(&injector, "").unwrap();
+
+        assert!(!batch.is_empty(), "a clear must still dispatch keystrokes");
+        assert_eq!(batch, expected);
     }
 
     #[test]
@@ -749,17 +905,92 @@ mod tests {
             leaf(0, AxRole::Label, "Suggestions", FIELD),
             leaf(0, AxRole::TextField, "Note", FIELD),
         ]);
+        // Pin the arm: `AtId` returns the same rect, so without this the test would keep passing
+        // while no longer exercising the relocation it is named for.
+        assert!(
+            matches!(matching_target().relocate(&tree), Located::Moved(_)),
+            "the fixture must reach Moved"
+        );
         assert_eq!(verify(&tree, &matching_target()).unwrap(), FIELD);
     }
 
     #[test]
-    fn a_field_that_moved_but_kept_its_id_is_tapped_where_it_now_is() {
-        // The tap is placed at the bounds this returns, so a field the keyboard pushed up the
-        // screen must yield its current rect. Comparing against the snapshot's would refuse a
-        // write that has nothing wrong with it.
-        let moved = AxRect { y: 600, ..FIELD };
-        let tree = tree_with(vec![leaf(0, AxRole::TextField, "Note", moved)]);
-        assert_eq!(verify(&tree, &matching_target()).unwrap(), moved);
+    fn a_renumbered_field_that_also_shifted_is_tapped_where_it_now_is() {
+        // The tap goes to the rect this returns, so it must be the node's current one and not the
+        // target's — the keyboard both renumbers the field and moves it.
+        let shifted = AxRect { y: 45, ..FIELD };
+        let tree = tree_with(vec![
+            leaf(0, AxRole::Label, "Suggestions", FIELD),
+            leaf(0, AxRole::TextField, "Note", shifted),
+        ]);
+        assert!(
+            matches!(matching_target().relocate(&tree), Located::Moved(_)),
+            "the fixture must reach Moved"
+        );
+        assert_eq!(verify(&tree, &shifted_target()).unwrap(), shifted);
+    }
+
+    #[test]
+    fn a_same_named_field_elsewhere_at_the_id_refuses_the_write() {
+        // A form's rows share role and name, and an unlabelled field has neither, so identity plus
+        // a pre-order index the write itself perturbs is not identification. Without a positional
+        // check this is tapped and typed into, and the read-back — resolving the same way — reads
+        // the text back out of it and calls the write a success.
+        let other_row = AxRect { y: 600, ..FIELD };
+        let tree = tree_with(vec![leaf(0, AxRole::TextField, "Note", other_row)]);
+        assert!(
+            matches!(matching_target().relocate(&tree), Located::AtId(_)),
+            "the fixture must reach AtId, the arm without a positional check of its own"
+        );
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_recycled_row_holding_a_different_value_refuses_the_write() {
+        // A scrolled table reuses the cell, so role, name and rect all survive and only the value
+        // differs — the one discriminator left, and the reason `AxTarget::value` is captured.
+        let mut recycled = leaf(0, AxRole::TextField, "Note", FIELD);
+        recycled.value = Some("row 9".into());
+        let tree = tree_with(vec![recycled]);
+        let mut target = matching_target();
+        target.value = Some("row 3".into());
+        assert!(matches!(
+            verify(&tree, &target),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_field_drawn_clear_of_the_target_refuses_the_write_before_it_dispatches() {
+        // The tap navigated to another screen carrying a same-named field. The read-back refuses
+        // this after the write; the guard must refuse it before one goes out.
+        let tree = tree_with(vec![
+            leaf(0, AxRole::Label, "Suggestions", FIELD),
+            leaf(0, AxRole::TextField, "Note", AxRect { y: 600, ..FIELD }),
+        ]);
+        assert!(
+            matches!(matching_target().relocate(&tree), Located::Unproven),
+            "the fixture must reach Unproven"
+        );
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_tree_with_an_unreadable_subtree_refuses_the_write_as_changed_not_gone() {
+        // Independent of the node cap: a subtree that could not be read hides elements just as a
+        // cap does, so absence from what was read is not absence.
+        let mut tree = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
+        tree.unreadable = 1;
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementChanged(1))
+        ));
     }
 
     #[test]

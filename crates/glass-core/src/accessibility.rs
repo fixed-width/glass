@@ -920,9 +920,11 @@ impl AxTarget {
     ///
     /// Lives in core rather than in its caller because the question is not Android's: any reader
     /// holding an `AxTree` asks it before a write, and the desktop ones would if they had a tree
-    /// (they re-resolve against live platform elements instead). Its one production caller today is
-    /// `glass-android`'s `fingerprinted`; a write's *post*-dispatch read-back answers with
-    /// [`Self::relocate`] and [`GlassError::AxWriteUnconfirmed`], never with this.
+    /// (they re-resolve against live platform elements instead). Both mobile pre-write guards call
+    /// it — `glass-android`'s `fingerprinted`, which reaches it from a plain id walk, and
+    /// `glass-ios`'s `verify`, which reaches it from [`Self::relocate`]'s unlocated arms. A write's
+    /// *post*-dispatch read-back never answers with this: it owes the caller
+    /// [`GlassError::AxWriteUnconfirmed`], which says the text went out.
     #[must_use]
     pub fn drift_error(&self, tree: &AxTree) -> GlassError {
         if self.still_present(tree) || !tree.is_complete() {
