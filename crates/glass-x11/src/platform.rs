@@ -885,12 +885,6 @@ fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
     })
 }
 
-fn note_if_clipped(rect: &crate::coords::ClippedRect) {
-    if let Some(note) = clip_note(rect) {
-        eprintln!("{note}");
-    }
-}
-
 // The process-tree walk (`/proc`-based) that maps the spawned child to the
 // real app's descendants now lives in the shared `glass-proc-linux` crate
 // (`proc_tree_pids`), used by both the X11 and Wayland backends.
@@ -1115,7 +1109,9 @@ impl Platform for X11Platform {
         // the "is there an active window" guard — no separate binding needed.
         let geo = self.window_geometry()?;
         let rect = self.resolve_capture_rect(&geo, region)?;
-        note_if_clipped(&rect);
+        if let Some(note) = clip_note(&rect) {
+            eprintln!("{note}");
+        }
         // Capture from ROOT over the window's screen region so overlapping popovers
         // (separate override-redirect top-levels) are included, not just this window's
         // own (possibly-obscured) drawable.
@@ -1143,7 +1139,9 @@ impl Platform for X11Platform {
             r.check_fits(geo.width, geo.height)?;
         }
         let rect = self.resolve_capture_rect(&geo, region)?;
-        note_if_clipped(&rect);
+        if let Some(note) = clip_note(&rect) {
+            eprintln!("{note}");
+        }
         self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)
     }
 
@@ -1491,6 +1489,49 @@ mod tests {
             Some(("xcalc", "XCalc")),
             &h
         ));
+    }
+
+    /// Keycodes 8, 9, 10 with two columns each: unshifted then shifted.
+    fn two_column_map() -> Vec<u32> {
+        vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+    }
+
+    #[test]
+    fn a_keysym_in_the_unshifted_column_needs_no_shift() {
+        let map = two_column_map();
+        assert_eq!(
+            super::keycode_in(&map, 2, 8, 10, 0xcc),
+            Some((9, false)),
+            "0xcc is keycode 9's unshifted keysym"
+        );
+    }
+
+    #[test]
+    fn a_keysym_in_the_shifted_column_reports_that_shift_is_needed() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xbb), Some((8, true)));
+    }
+
+    #[test]
+    fn the_last_keycode_in_the_range_is_still_searched() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xee), Some((10, false)));
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0xff), Some((10, true)));
+    }
+
+    #[test]
+    fn a_keysym_the_map_does_not_carry_is_not_found() {
+        let map = two_column_map();
+        assert_eq!(super::keycode_in(&map, 2, 8, 10, 0x99), None);
+    }
+
+    #[test]
+    fn a_single_column_map_never_reads_into_the_next_keycode() {
+        // With one keysym per keycode there is no shifted column, and index `base + 1` is
+        // already the *next* key — reading it would report the wrong keycode entirely.
+        let map = vec![0xaa, 0xbb, 0xcc];
+        assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xbb), Some((9, false)));
+        assert_eq!(super::keycode_in(&map, 1, 8, 10, 0xcc), Some((10, false)));
     }
 
     #[test]
@@ -2053,17 +2094,24 @@ mod display_tests {
             width: 0,
             height: 40,
         };
-        assert!(
-            plat.resolve_capture_rect(&geo, Some(&flat)).is_err(),
-            "a region with no width has no pixels to read"
-        );
+        // Asserting the message, not just an error: clipping rejects an empty rectangle too,
+        // so "it failed" would pass even if the zero-area check had stopped running.
+        let flat_err = plat
+            .resolve_capture_rect(&geo, Some(&flat))
+            .expect_err("a region with no width has no pixels to read")
+            .to_string();
+        assert!(flat_err.contains("zero area"), "{flat_err}");
         let thin = Region {
             x: 0,
             y: 0,
             width: 40,
             height: 0,
         };
-        assert!(plat.resolve_capture_rect(&geo, Some(&thin)).is_err());
+        let thin_err = plat
+            .resolve_capture_rect(&geo, Some(&thin))
+            .expect_err("a region with no height has no pixels to read")
+            .to_string();
+        assert!(thin_err.contains("zero area"), "{thin_err}");
         assert!(
             plat.resolve_capture_rect(&geo, None).is_ok(),
             "a window with area must still resolve"
