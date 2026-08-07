@@ -1480,6 +1480,270 @@ mod tests {
     }
 }
 
+/// Everything the backend can only do against a real display: enumerating windows, reading
+/// their properties, translating the server's errors, and driving XTEST.
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use crate::testx::TestX;
+
+    /// A pid no window on a fresh private display can be carrying.
+    const OTHER_PID: u32 = 999_999;
+
+    #[test]
+    fn interning_is_stable_per_name_and_distinct_across_names() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid = plat.intern(b"_NET_WM_PID").expect("intern");
+        assert_ne!(pid, 0, "an interned atom is never the null atom");
+        assert_eq!(pid, plat.intern(b"_NET_WM_PID").expect("intern"));
+        assert_ne!(pid, plat.intern(b"_NET_CLIENT_LIST").expect("intern"));
+    }
+
+    #[test]
+    fn there_is_no_active_window_until_one_is_selected() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        assert!(matches!(
+            plat.require_window(),
+            Err(GlassError::WindowNotFound)
+        ));
+        let win = x.window().create();
+        plat.window = Some(win);
+        assert_eq!(plat.require_window().expect("now set"), win);
+    }
+
+    #[test]
+    fn a_windows_name_is_read_back_and_absence_is_not_an_empty_string() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let named = x.window().named("Calculator").create();
+        let anonymous = x.window().create();
+        assert_eq!(plat.window_name(named).as_deref(), Some("Calculator"));
+        assert_eq!(
+            plat.window_name(anonymous),
+            None,
+            "a window with no WM_NAME has no name, rather than an empty one"
+        );
+    }
+
+    #[test]
+    fn a_windows_class_is_read_back_as_the_instance_class_pair() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().classed("xcalc", "XCalc").create();
+        assert_eq!(
+            plat.window_class(win),
+            Some(("xcalc".to_string(), "XCalc".to_string()))
+        );
+        assert_eq!(plat.window_class(x.window().create()), None);
+    }
+
+    #[test]
+    fn a_single_component_class_stands_for_both_halves() {
+        // ICCCM wants `instance\0class\0`; some apps write only one string, and dropping the
+        // pair rather than doubling it would make their windows unmatchable by class.
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().classed("solo", "").create();
+        assert_eq!(
+            plat.window_class(win),
+            Some(("solo".to_string(), "solo".to_string()))
+        );
+    }
+
+    #[test]
+    fn geometry_is_reported_in_root_coordinates() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().at(37, 53).sized(321, 211).create();
+        assert_eq!(
+            plat.geometry_of(win).expect("geometry"),
+            WindowGeometry {
+                x: 37,
+                y: 53,
+                width: 321,
+                height: 211
+            }
+        );
+    }
+
+    #[test]
+    fn the_active_windows_geometry_is_its_own() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().at(11, 22).sized(133, 144).create();
+        plat.window = Some(win);
+        assert_eq!(
+            plat.window_geometry().expect("geometry"),
+            WindowGeometry {
+                x: 11,
+                y: 22,
+                width: 133,
+                height: 144
+            }
+        );
+    }
+
+    #[test]
+    fn an_op_on_a_destroyed_window_reports_it_gone_and_forgets_it() {
+        // The stale id must not come back on the next call as a raw protocol error — the
+        // caller gets one actionable WindowNotFound either way.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        x.destroy(win);
+        assert!(matches!(
+            plat.window_geometry(),
+            Err(GlassError::WindowNotFound)
+        ));
+        assert_eq!(plat.window, None, "the stale id must be forgotten");
+    }
+
+    #[test]
+    fn a_dead_display_is_a_backend_failure_not_a_closed_window() {
+        // Only `BadWindow`/`BadDrawable` mean the window went away. Reporting a lost
+        // connection as WindowNotFound would send the caller looking for an app that closed,
+        // when the whole display is gone — and would drop the window id it can still use.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.window = Some(win);
+        drop(x);
+
+        let err = plat
+            .window_geometry()
+            .expect_err("a request on a dead display cannot succeed");
+        assert!(
+            matches!(err, GlassError::Backend(_)),
+            "expected a backend failure, got {err:?}"
+        );
+        assert_eq!(
+            plat.window,
+            Some(win),
+            "a dead display must not make glass forget which window it was driving"
+        );
+    }
+
+    #[test]
+    fn the_client_list_is_read_from_the_root_and_empty_when_unset() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let atom = plat.intern(b"_NET_CLIENT_LIST").expect("intern");
+        assert!(
+            plat.client_list_windows(atom).is_empty(),
+            "a bare Xvfb has no window manager and so no client list"
+        );
+        let (a, b) = (x.window().create(), x.window().create());
+        x.set_client_list(&[a, b]);
+        assert_eq!(plat.client_list_windows(atom), vec![a, b]);
+    }
+
+    #[test]
+    fn a_mapped_window_owned_by_the_app_matches() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let win = x.window().owned_by(4242).create();
+        assert!(
+            plat.window_matches(win, &[4242], pid_atom, None)
+                .expect("match")
+        );
+        assert!(
+            !plat
+                .window_matches(win, &[OTHER_PID], pid_atom, None)
+                .expect("match"),
+            "another process's window is not the app's"
+        );
+    }
+
+    #[test]
+    fn an_unmapped_window_never_matches() {
+        // Windows exist in the tree before they are shown; treating one as the app's window
+        // hands back a target with nothing on screen.
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let hidden = x.window().owned_by(4242).unmapped().create();
+        assert!(
+            !plat
+                .window_matches(hidden, &[4242], pid_atom, None)
+                .expect("match")
+        );
+    }
+
+    #[test]
+    fn a_window_hint_matches_a_window_outside_the_pid_set() {
+        // The fallback for apps that never set _NET_WM_PID.
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let win = x.window().named("Calculator").create();
+        let hint = WindowHint {
+            title: Some("Calculator".into()),
+            class: None,
+        };
+        assert!(
+            plat.window_matches(win, &[], pid_atom, Some(&hint))
+                .expect("match")
+        );
+        let wrong = WindowHint {
+            title: Some("Spreadsheet".into()),
+            class: None,
+        };
+        assert!(
+            !plat
+                .window_matches(win, &[], pid_atom, Some(&wrong))
+                .expect("match")
+        );
+    }
+
+    #[test]
+    fn scanning_returns_every_window_the_app_owns_and_nothing_else() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let main = x.window().owned_by(4242).named("main").create();
+        let dialog = x.window().owned_by(4242).named("dialog").create();
+        let _stranger = x.window().owned_by(OTHER_PID).named("stranger").create();
+        let mut found = plat.scan_all_windows(&[4242]).expect("scan");
+        found.sort_unstable();
+        let mut want = vec![main, dialog];
+        want.sort_unstable();
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn a_window_listed_twice_is_returned_once() {
+        // `_NET_CLIENT_LIST` and the root's children overlap whenever a window is not
+        // reparented, which is every window under a bare Xvfb.
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x.window().owned_by(4242).create();
+        x.set_client_list(&[win]);
+        assert_eq!(plat.scan_all_windows(&[4242]).expect("scan"), vec![win]);
+    }
+
+    #[test]
+    fn scanning_for_one_window_finds_a_match_and_reports_none_otherwise() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
+        let list_atom = plat.intern(b"_NET_CLIENT_LIST").expect("intern");
+        let win = x.window().owned_by(4242).create();
+        assert_eq!(
+            plat.scan_for_window(&[4242], pid_atom, list_atom, None)
+                .expect("scan"),
+            Some(win)
+        );
+        assert_eq!(
+            plat.scan_for_window(&[OTHER_PID], pid_atom, list_atom, None)
+                .expect("scan"),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod env_display_tests {
     use super::{DisplayTarget, display_target, normalize_display};

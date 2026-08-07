@@ -12,6 +12,10 @@ pub mod coords;
 pub mod doctor;
 pub mod pixels;
 pub mod platform;
+// A separate file, declared `#[cfg(test)]`: cargo-mutants stops at an excluded `mod` before
+// it records the external file, so the harness itself never gets mutated.
+#[cfg(test)]
+mod testx;
 pub mod xvfb;
 pub use platform::X11Platform;
 pub use xvfb::Xvfb;
