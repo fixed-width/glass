@@ -296,7 +296,7 @@ fn dump_until_ready(
 }
 
 /// Judge a typed `set_value` from a tree read back after it. `Ok(())` only when the field holds
-/// exactly what was asked for, or — for a clear — reads back empty.
+/// exactly what was asked for, or — for a clear confirmed at its own id — reads back empty.
 ///
 /// Exact match, not "changed from before": tap-and-type is not atomic, so a dropped key or an input
 /// filter leaves the field holding something that is neither the request nor the old value, and
@@ -315,15 +315,25 @@ fn dump_until_ready(
 /// [`locate_editable_target`]: the IME reflows the layout under the field it is typing into, so a
 /// moved-but-correct element is the normal case here.
 ///
-/// The node must also still be editable, which excludes a non-editable neighbour that inherited the
-/// id — but not a second nameless editable, since an editable's name comes from `content-desc` alone
-/// and `AxTarget::matches` compares `None` to `None`. The exact-value requirement is what covers
-/// that case. A node reached by [`Located::AtId`] or [`Located::Moved`] already carries the target's
-/// role and name, so an editability mismatch there is always a change, never a disappearance —
-/// [`AxTarget::drift_error`] cannot return `AxElementGone` on this path.
+/// [`Located::AtId`] and [`Located::Moved`] both already carry the target's role and name —
+/// `relocate` requires the match on the first, and finds the second by searching for exactly that
+/// role and name. So a node reached here that is not editable is not a neighbour that inherited the
+/// id; it is the identified element having lost editability. The write has already dispatched by
+/// this point, so that is [`GlassError::AxWriteUnconfirmed`], not the pre-write
+/// [`AxTarget::drift_error`].
+///
+/// Role+name identity is weakest for a nameless editable — Android names one from `content-desc`
+/// alone, absent on most `EditText`s. A second one elsewhere in the tree is [`Located::Ambiguous`]
+/// and refused; one that happens to sit at the target's own id is accepted on that position alone —
+/// `relocate` never searches once `AtId` matches, and [`AxTarget::matches`] compares `None` to
+/// `None`. A non-empty write's exact-text check is what would catch a coincidental match there; a
+/// clear has nothing for it to catch, so a clear (`text` empty) is confirmed by an empty read-back
+/// only on `AtId`. [`Located::Moved`] found its node purely by search, with no such grounding, so a
+/// clear reached that way is refused as unconfirmed instead.
 fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()> {
-    let node = match target.relocate(after_tree) {
-        Located::AtId(node) | Located::Moved(node) => node,
+    let (node, relocated) = match target.relocate(after_tree) {
+        Located::AtId(node) => (node, false),
+        Located::Moved(node) => (node, true),
         Located::Ambiguous(candidates) => {
             return Err(GlassError::AxWriteUnconfirmed(
                 target.id.0,
@@ -356,7 +366,19 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
         }
     };
     if !node.states.editable {
-        return Err(target.drift_error(after_tree));
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the element at that id is no longer editable, so the value could not be read back"
+                .into(),
+        ));
+    }
+    if relocated && text.is_empty() {
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the element had to be re-found by role and name, so an empty field alone cannot \
+             confirm a clear landed on it"
+                .into(),
+        ));
     }
     let landed = if text.is_empty() {
         typed_clear_landed(node.value.as_deref())
@@ -1981,16 +2003,30 @@ mod tests {
     }
 
     #[test]
-    fn a_non_editable_node_at_the_id_is_reported_as_changed() {
-        // Excludes a non-editable neighbour that inherited the id — a label, or a container the
-        // walk shifted into place.
+    fn a_node_that_lost_editability_is_unconfirmed_not_changed() {
+        // relocate's own role+name match already excludes an unrelated neighbour that inherited
+        // the id, so a non-editable node reached here is the identified element having lost
+        // editability after the write dispatched — AxWriteUnconfirmed, not the pre-write
+        // AxElementChanged, or a caller reading "not dispatched" off it would retype into whatever
+        // it collapsed into.
         let mut after = tree_holding(Some("world"));
         after.root.states.editable = false;
         let t = target(0, Some("Search"), Some(BOUNDS));
-        assert!(matches!(
-            verify_write(&after, &t, "world"),
-            Err(GlassError::AxElementChanged(0))
-        ));
+        let err = verify_write(&after, &t, "world").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(err.to_string().contains("editable"), "{err}");
+    }
+
+    #[test]
+    fn a_clear_confirmed_only_by_relocating_is_unconfirmed_not_a_success() {
+        // An empty read-back is what any untouched same-role, same-name field would also show, so
+        // Located::Moved's search-only grounding is not enough to trust it: only AtId's own-id
+        // match is. The keystrokes may never have reached this element.
+        let after = under_a_container(tree_holding(None));
+        let t = target(0, Some("Search"), Some(BOUNDS));
+        let err = verify_write(&after, &t, "").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(err.to_string().contains("clear"), "{err}");
     }
 
     #[test]
