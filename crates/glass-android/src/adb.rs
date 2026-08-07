@@ -260,6 +260,177 @@ pub(crate) fn a_failed_call(argv: &[&str], said: &str) -> GlassError {
     exit_error("adb", &argv, said)
 }
 
+/// What the fake adb does for one invocation it matches.
+#[cfg(all(test, unix))]
+pub(crate) enum Answer {
+    /// Exit 0, writing these bytes on stdout.
+    Says(Vec<u8>),
+    /// Exit non-zero, writing these bytes on stderr — what [`Adb::output`] turns into
+    /// `ToolFailed`, and the stream `a11y` reads a device's reason from.
+    Fails(Vec<u8>),
+    /// Exit 0 having said nothing, like `am force-stop` on success.
+    Silent,
+}
+
+#[cfg(all(test, unix))]
+impl Answer {
+    pub(crate) fn says(s: impl AsRef<[u8]>) -> Answer {
+        Answer::Says(s.as_ref().to_vec())
+    }
+    pub(crate) fn fails(s: impl AsRef<[u8]>) -> Answer {
+        Answer::Fails(s.as_ref().to_vec())
+    }
+}
+
+/// An `adb` that is a shell script rather than the real tool: it answers the first rule whose
+/// glob matches the argv and records every invocation.
+///
+/// The seam is the one production already has — [`Adb`] runs whatever `bin` names — so nothing is
+/// stubbed out and the argv under test is the argv that would reach a device. What a call *did*
+/// is otherwise invisible: a backend method replaced by `Ok(Default::default())` returns the same
+/// shape as one that ran, and only the reply it parsed or the call it made tells them apart.
+///
+/// Unix-only: it is a `/bin/sh` script. The mutation gate and the coverage run are Linux, and
+/// `adb.rs` already gates its process-level tests this way.
+#[cfg(all(test, unix))]
+pub(crate) struct FakeAdb {
+    dir: std::path::PathBuf,
+    adb: Adb,
+}
+
+/// Each answer lives in files rather than inline in the rules line: `adb devices` prints
+/// tab-separated rows and `exec-out screencap` prints raw bytes, and a tab-separated line can
+/// express neither — POSIX `read` folds repeated tabs together, and `printf %b` has no way to
+/// write an arbitrary byte.
+#[cfg(all(test, unix))]
+const FAKE_ADB_SCRIPT: &str = "\
+#!/bin/sh
+# Stand-in for the adb binary; see FakeAdb in adb.rs. Records the argv, then answers the first
+# rule whose glob matches it, stepping through that rule's answers and repeating the last. An
+# unmatched call exits 0 saying nothing.
+dir=$(dirname \"$0\")
+printf '%s\\n' \"$*\" >> \"$dir/calls\"
+while IFS='\t' read -r glob answers stem; do
+    case \"$*\" in
+        $glob)
+            n=0
+            [ -f \"$dir/$stem.seen\" ] && n=$(cat \"$dir/$stem.seen\")
+            printf '%s' \"$((n + 1))\" > \"$dir/$stem.seen\"
+            [ \"$n\" -ge \"$answers\" ] && n=$((answers - 1))
+            cat \"$dir/${stem}_$n.out\"
+            cat \"$dir/${stem}_$n.err\" >&2
+            exit \"$(cat \"$dir/${stem}_$n.code\")\"
+            ;;
+    esac
+done < \"$dir/rules\"
+exit 0
+";
+
+#[cfg(all(test, unix))]
+impl FakeAdb {
+    /// Serve `rules` — an argv glob and what to answer — tried in order.
+    ///
+    /// The glob is matched against the whole argv joined by spaces, as adb received it: that is
+    /// *after* `-s <serial>` is prefixed, so a rule for a serial-bound call has to allow for it.
+    pub(crate) fn new(rules: &[(&str, Answer)]) -> FakeAdb {
+        let scripted: Vec<(&str, Vec<&Answer>)> =
+            rules.iter().map(|(g, a)| (*g, vec![a])).collect();
+        FakeAdb::scripted(&scripted)
+    }
+
+    /// [`FakeAdb::new`], but each rule steps through a sequence: the k'th call matching that glob
+    /// gets the k'th answer, and the last answer repeats.
+    ///
+    /// A device changes under the caller — an emulator that was not in `adb devices` a moment ago
+    /// is there now — and a fake that answers the same thing forever can only model a device that
+    /// never does.
+    pub(crate) fn scripted(rules: &[(&str, Vec<&Answer>)]) -> FakeAdb {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "glass-fake-adb-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create the fake adb's directory");
+
+        let mut rendered = String::new();
+        for (i, (glob, answers)) in rules.iter().enumerate() {
+            assert!(!answers.is_empty(), "rule {glob:?} answers nothing");
+            let stem = format!("r{i}");
+            for (k, answer) in answers.iter().enumerate() {
+                let (code, out, err): (i32, &[u8], &[u8]) = match answer {
+                    Answer::Says(s) => (0, s, b""),
+                    Answer::Fails(s) => (1, b"", s),
+                    Answer::Silent => (0, b"", b""),
+                };
+                let at = |ext| dir.join(format!("{stem}_{k}.{ext}"));
+                std::fs::write(at("out"), out).expect("write the fake adb's stdout");
+                std::fs::write(at("err"), err).expect("write the fake adb's stderr");
+                std::fs::write(at("code"), code.to_string()).expect("write the fake adb's status");
+            }
+            rendered.push_str(&format!("{glob}\t{}\t{stem}\n", answers.len()));
+        }
+        std::fs::write(dir.join("rules"), rendered).expect("write the fake adb's rules");
+
+        let bin = dir.join("adb");
+        std::fs::write(&bin, FAKE_ADB_SCRIPT).expect("write the fake adb");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fake adb executable");
+
+        FakeAdb {
+            adb: Adb {
+                bin: bin.to_string_lossy().into_owned(),
+                serial: None,
+            },
+            dir,
+        }
+    }
+
+    pub(crate) fn adb(&self) -> &Adb {
+        &self.adb
+    }
+
+    /// The argv of every invocation so far, in order, joined by spaces.
+    pub(crate) fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether any invocation's argv contains `needle`.
+    pub(crate) fn called(&self, needle: &str) -> bool {
+        self.calls().iter().any(|c| c.contains(needle))
+    }
+
+    /// Write another executable script into this fake's directory and return its path — an
+    /// `emulator` to stand beside the `adb`, cleaned up with it.
+    pub(crate) fn alongside(&self, name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.dir.join(name);
+        std::fs::write(&path, script).expect("write the stand-in tool");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in tool executable");
+        path
+    }
+
+    /// A file in this fake's directory, for a stand-in tool that records what it was asked.
+    pub(crate) fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for FakeAdb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// The error a call to a *missing* binary raises — the shape `a11y` must not read as a tool that
 /// ran and said nothing.
 #[cfg(test)]
@@ -474,6 +645,12 @@ mod tests {
                 vec!["shell", "rm", "-f", "/sdcard/glass_dump_1_2_0.xml"],
                 AdbOp::Shell,
             ),
+            // `am` alone is not a launch: force-stop runs during teardown, inside
+            // TEARDOWN_BUDGET, and a 60s deadline there would outlast the budget that calls it.
+            (
+                vec!["shell", "am", "force-stop", "com.example.app"],
+                AdbOp::Shell,
+            ),
             (vec!["shell", "pidof", "com.example.app"], AdbOp::Shell),
             (vec!["shell", "dumpsys", "window", "windows"], AdbOp::Shell),
             (vec!["devices"], AdbOp::Shell),
@@ -534,6 +711,27 @@ mod tests {
     }
 
     #[test]
+    fn every_operation_names_the_tool_that_hung() {
+        // A timeout message carries nothing else about which call stalled, and every one of
+        // these deadlines exists because something did.
+        let labelled = [
+            (AdbOp::Dump, "adb:uiautomator dump"),
+            (AdbOp::Screencap, "adb:screencap"),
+            (AdbOp::Transfer, "adb:file transfer"),
+            (AdbOp::Launch, "adb:am start"),
+            (AdbOp::Shell, "adb:shell"),
+        ];
+        for (op, want) in labelled {
+            assert_eq!(op.label(), want, "{op:?}");
+        }
+        // Distinct, so the message tells the operations apart rather than merely naming adb.
+        let mut labels: Vec<&str> = labelled.iter().map(|(_, l)| *l).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), labelled.len());
+    }
+
+    #[test]
     fn a_launch_is_not_billed_as_a_tap() {
         // Ordering only; the variant doc explains why a launch is not a tap.
         assert!(AdbOp::Launch.budget() > AdbOp::Shell.budget());
@@ -544,6 +742,120 @@ mod tests {
         // Fail fast beats hanging for two minutes when a future caller forgets to extend the
         // classifier.
         assert_eq!(AdbOp::for_args(&["some-future-subcommand"]), AdbOp::Shell);
+    }
+
+    /// The fixture itself: a rule's reply must reach the caller and the argv must reach the log,
+    /// or every test built on it would pass against a fake that does nothing.
+    #[test]
+    #[cfg(unix)]
+    fn the_fake_adb_answers_its_rules_and_records_what_it_was_asked() {
+        use super::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            (
+                "devices",
+                Answer::says("List of devices attached\nemulator-5554\tdevice\n"),
+            ),
+            ("shell getprop *", Answer::says("1\n")),
+            ("shell am force-stop *", Answer::Silent),
+            ("install *", Answer::fails("adb: failed to install")),
+        ]);
+        let adb = fake.adb();
+
+        // Tab-separated rows survive the rules file, which is itself tab-separated.
+        assert_eq!(
+            adb.run(["devices"]).unwrap(),
+            "List of devices attached\nemulator-5554\tdevice\n"
+        );
+        assert_eq!(
+            adb.run(["shell", "getprop", "sys.boot_completed"]).unwrap(),
+            "1\n"
+        );
+        assert_eq!(adb.run(["shell", "am", "force-stop", "com.x"]).unwrap(), "");
+
+        let err = adb
+            .run(["install", "-r", "/tmp/app.apk"])
+            .expect_err("a non-zero exit is a failure");
+        assert_eq!(err.tool_said(), Some("adb: failed to install"), "{err}");
+
+        assert_eq!(
+            fake.calls(),
+            [
+                "devices",
+                "shell getprop sys.boot_completed",
+                "shell am force-stop com.x",
+                "install -r /tmp/app.apk",
+            ]
+        );
+    }
+
+    /// The scripted form, which everything modelling a device that changes rests on.
+    #[test]
+    #[cfg(unix)]
+    fn a_scripted_rule_steps_through_its_answers_and_then_repeats_the_last() {
+        use super::{Answer, FakeAdb};
+
+        let (empty, one) = (Answer::says("none\n"), Answer::says("one\n"));
+        let fake = FakeAdb::scripted(&[("devices", vec![&empty, &one])]);
+        let adb = fake.adb();
+
+        assert_eq!(adb.run(["devices"]).unwrap(), "none\n");
+        assert_eq!(adb.run(["devices"]).unwrap(), "one\n");
+        assert_eq!(
+            adb.run(["devices"]).unwrap(),
+            "one\n",
+            "the last answer repeats"
+        );
+        assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_serial_bound_client_names_its_device_on_every_call() {
+        use super::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[("*", Answer::says("ok\n"))]);
+        let adb = fake.adb().with_serial("emulator-5556");
+
+        assert_eq!(adb.serial(), Some("emulator-5556"));
+        adb.run(["shell", "input", "tap", "1", "2"]).unwrap();
+
+        // `bin()` is for callers that spawn their own adb process — `LogcatStream` does — so
+        // what it owes them is a runnable binary, not merely a string.
+        let spawned = std::process::Command::new(adb.bin())
+            .arg("version")
+            .status()
+            .expect("bin() must name something that runs");
+        assert!(spawned.success());
+
+        // The serial reaches the wire, not just the struct: an accessor that answered `None`
+        // would send every call to whichever device adb picked for itself.
+        assert!(
+            fake.called("-s emulator-5556 shell input tap 1 2"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn raw_bytes_come_back_exactly_as_the_device_wrote_them() {
+        use super::{Answer, FakeAdb};
+
+        // A screencap header: little-endian 1x1, format 1, then four pixel bytes. Raw bytes
+        // rather than text, because that is what `exec-out screencap` returns — including the
+        // zeroes and the high bytes no string payload would survive.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u32.to_le_bytes()); // width
+        frame.extend_from_slice(&1u32.to_le_bytes()); // height
+        frame.extend_from_slice(&1u32.to_le_bytes()); // RGBA_8888
+        frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let fake = FakeAdb::new(&[("exec-out screencap", Answer::says(&frame))]);
+
+        let bytes = fake.adb().run_bytes(["exec-out", "screencap"]).unwrap();
+        assert_eq!(bytes.len(), 16, "got {bytes:?}");
+        assert_eq!(&bytes[0..4], &1u32.to_le_bytes());
+        assert_eq!(&bytes[12..], &[0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]

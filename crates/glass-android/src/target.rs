@@ -29,10 +29,24 @@ impl AttachedDevice {
     }
 }
 
+/// Whether an emulator glass booted itself should be registered for cleanup.
+/// `GLASS_EMULATOR_KEEP` set to anything non-empty leaves it up for the next run to attach to.
+fn should_register(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    get("GLASS_EMULATOR_KEEP")
+        .filter(|v| !v.is_empty())
+        .is_none()
+}
+
 /// Resolve an adb target: attach to an online device, or (lifecycle `auto`) boot the
 /// configured AVD, register it for cleanup, and attach. Attach-preferred.
-pub fn resolve(base: Adb, registry: &EmulatorRegistry) -> Result<AttachedDevice> {
-    let get = |k: &str| std::env::var(k).ok();
+///
+/// `get` reads the environment, passed in rather than read here so a test can choose a
+/// lifecycle and a serial without touching the one the process shares.
+pub fn resolve(
+    base: Adb,
+    registry: &EmulatorRegistry,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<AttachedDevice> {
     let online: Vec<Device> = parse_devices(&base.run(["devices"])?)
         .into_iter()
         .filter(|d| d.state == "device")
@@ -42,12 +56,9 @@ pub fn resolve(base: Adb, registry: &EmulatorRegistry) -> Result<AttachedDevice>
         Action::Attach(s) => s,
         Action::Error(msg) => return Err(GlassError::Backend(msg)),
         Action::Boot => {
-            let s = boot_avd(&base, &get)?;
-            if get("GLASS_EMULATOR_KEEP")
-                .filter(|v| !v.is_empty())
-                .is_none()
-            {
-                registry.register(s.clone());
+            let s = boot_avd(&base, get)?;
+            if should_register(get) {
+                registry.register(&base, s.clone());
             }
             s
         }
@@ -128,6 +139,73 @@ mod tests {
     const LISTING: &str = "List of devices attached\n\
                            emulator-5554\tdevice\n\
                            emulator-5556\toffline\n";
+
+    /// An env reader over a fixed table, so a test can choose a lifecycle without touching the
+    /// environment the whole process shares.
+    fn getter(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_device_that_has_not_finished_booting_is_not_attached_to() {
+        // Attaching mid-boot hands the caller a device whose home screen is not up yet, and
+        // every launch against it fails for reasons that look like the app's fault. The
+        // property is the only thing that tells them apart.
+        use crate::adb::{Answer, FakeAdb};
+        for (property, ready) in [("1\n", true), ("0\n", false), ("\n", false)] {
+            let fake =
+                FakeAdb::new(&[("shell getprop sys.boot_completed", Answer::says(property))]);
+            assert_eq!(
+                ensure_booted(fake.adb()).is_ok(),
+                ready,
+                "sys.boot_completed = {property:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_attaches_to_the_online_device_and_not_the_offline_one() {
+        use crate::adb::{Answer, FakeAdb};
+        let fake = FakeAdb::new(&[
+            ("devices", Answer::says(LISTING)),
+            (
+                "-s emulator-5554 shell getprop sys.boot_completed",
+                Answer::says("1\n"),
+            ),
+        ]);
+
+        let registry = EmulatorRegistry::new();
+        let target = resolve(fake.adb().clone(), &registry, &getter(&[]))
+            .expect("exactly one device is online");
+
+        assert_eq!(target.adb().serial(), Some("emulator-5554"));
+        // Nothing was booted, so nothing is owed cleanup.
+        assert!(registry.serials().is_empty());
+    }
+
+    #[test]
+    fn an_emulator_is_registered_for_cleanup_unless_the_caller_asked_to_keep_it() {
+        assert!(
+            should_register(&getter(&[])),
+            "unset means glass stops what it started"
+        );
+        assert!(
+            should_register(&getter(&[("GLASS_EMULATOR_KEEP", "")])),
+            "set to nothing is not asking for anything"
+        );
+        assert!(!should_register(&getter(&[("GLASS_EMULATOR_KEEP", "1")])));
+    }
 
     #[test]
     fn parse_devices_skips_header_and_keeps_state() {

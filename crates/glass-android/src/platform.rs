@@ -50,11 +50,11 @@ impl AndroidPlatform {
         emulators: &crate::avd::EmulatorRegistry,
         agents: &AgentRegistry,
     ) -> Result<Self> {
+        let get = |k: &str| std::env::var(k).ok();
         let base = Adb::from_env();
-        let target = crate::target::resolve(base, emulators)?;
+        let target = crate::target::resolve(base, emulators, &get)?;
 
         // Best-effort: use the agent when enabled; on any failure, fall back to adb paths.
-        let get = |k: &str| std::env::var(k).ok();
         let agent = if crate::agent::agent_enabled(&get) {
             match agents.ensure(target.adb()).and_then(AgentClient::connect) {
                 Ok(client) => Some(Arc::new(client)),
