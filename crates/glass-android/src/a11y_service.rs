@@ -1302,6 +1302,68 @@ mod tests {
     }
 
     #[test]
+    fn a_childless_node_at_the_depth_cap_records_no_truncation() {
+        // The device sends `"children": []` for a leaf. Reaching one with the depth budget
+        // already spent declines nothing, so reporting the tree truncated is a false positive —
+        // and the caller's remedy for it, raising `max_depth`, returns the identical tree.
+        let leaf_at_the_cap = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 100, "h": 100},
+            "enabled": true,
+            "children": [{
+                "class": "android.widget.TextView",
+                "text": "leaf",
+                "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+                "enabled": true,
+                "children": [],
+            }],
+        });
+        let mut walk = Walk::new(WalkLimits {
+            depth: 1,
+            ..WalkLimits::DEFAULT
+        });
+        let root = json_to_node(&with_refs(&leaf_at_the_cap), &win(), 0, &mut walk).expect("maps");
+
+        assert_eq!(root.children.len(), 1, "the leaf is still mapped");
+        assert!(
+            walk.budget.truncation().is_none(),
+            "nothing was declined: {:?}",
+            walk.budget.truncation()
+        );
+    }
+
+    #[test]
+    fn a_node_whose_children_are_past_the_depth_cap_does_report_truncation() {
+        // The other side of it, so the case above is not simply asserting the cap never fires.
+        let child_at_the_cap = json!({
+            "class": "android.widget.FrameLayout",
+            "bounds": {"x": 0, "y": 100, "w": 100, "h": 100},
+            "enabled": true,
+            "children": [{
+                "class": "android.widget.FrameLayout",
+                "bounds": {"x": 0, "y": 100, "w": 50, "h": 50},
+                "enabled": true,
+                "children": [{
+                    "class": "android.widget.TextView",
+                    "text": "too deep",
+                    "bounds": {"x": 0, "y": 100, "w": 10, "h": 10},
+                    "enabled": true,
+                }],
+            }],
+        });
+        let mut walk = Walk::new(WalkLimits {
+            depth: 1,
+            ..WalkLimits::DEFAULT
+        });
+        let _ = json_to_node(&with_refs(&child_at_the_cap), &win(), 0, &mut walk).expect("maps");
+
+        assert_eq!(
+            walk.budget.truncation().map(|t| t.limit),
+            Some(TruncationLimit::Depth)
+        );
+    }
+
+    #[test]
     fn enclosure_is_measured_from_each_rectangle_far_edge() {
         let rect = |x, y, width, height| {
             Some(AxRect {
