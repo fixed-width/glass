@@ -94,9 +94,9 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     if !target.bounds_overlap(node.bounds) || !target.value_consistent(node.value.as_deref()) {
         return Err(target.drift_error(tree));
     }
-    // Defence in depth rather than a reachable arm: iOS derives `editable` from the role alone, and
-    // `relocate` already required the roles to match, so a target that was editable resolves to a
-    // node that still is.
+    // Nothing upstream checks this: `glass_set_value` reaches here for any element the caller
+    // names, so a Label addressed by mistake resolves and matches. Without this the write would tap
+    // an inert label and type into whatever had focus instead.
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
@@ -125,8 +125,12 @@ const VERIFY_ATTEMPTS: usize = 3;
 /// The element is re-resolved by identity (role + name) via [`AxTarget::relocate`], not by its
 /// pre-order id: measured on the Simulator, the focusing tap raises the soft keyboard and inserts
 /// two nodes ahead of the field (glass#359), so the id itself is not stable across the write. A node
-/// re-found that way is accepted only from a complete tree and only where it still overlaps where
-/// the target was, so a same-named field on a screen the tap navigated to is refused instead.
+/// re-found that way is accepted only from a complete tree, and whichever node was reached must
+/// still overlap where the target was — so a same-named field on a screen the tap navigated to is
+/// refused instead. Overlap is checked here and not left to [`Located::Moved`]: the write's own tap
+/// is what renumbers the tree, so the id can land on a neighbouring row that shares role and name,
+/// and [`Located::AtId`] grants that without consulting bounds. An untouched neighbour reads back
+/// empty, which is indistinguishable from a landed clear.
 ///
 /// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
 /// in `value`, so a label that changed inside the settle window would otherwise read as a successful
@@ -185,6 +189,14 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
             return Err(GlassError::AxWriteUnconfirmed(target.id.0, why));
         }
     };
+    if !target.bounds_overlap(node.bounds) {
+        return Err(GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the element carrying its role and name is drawn clear of where this one was, so the \
+             text may have gone to a different one"
+                .into(),
+        ));
+    }
     if !node.states.editable {
         return Err(GlassError::AxWriteUnconfirmed(
             target.id.0,
@@ -607,6 +619,23 @@ mod tests {
     }
 
     #[test]
+    fn a_clear_is_not_confirmed_against_a_sibling_row_at_the_id() {
+        // The write's own tap is what renumbers the tree, so at read-back the id can resolve to a
+        // neighbouring field that shares role and name. An untouched one reads back empty, which is
+        // exactly what a landed clear looks like — so without a positional check the clear is
+        // confirmed against a row nothing was typed into.
+        let sibling = leaf(0, AxRole::TextField, "Note", AxRect { y: 600, ..FIELD });
+        let after = tree_with(vec![sibling]);
+        assert!(
+            matches!(matching_target().relocate(&after), Located::AtId(_)),
+            "the fixture must reach AtId, the arm relocate grants without checking bounds"
+        );
+        let err = verify_write(&after, &matching_target(), "").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(err.to_string().contains("drawn clear of where"), "{err}");
+    }
+
+    #[test]
     fn a_write_confirmed_at_a_new_id_is_a_success() {
         // glass#359, the measured case: the keyboard renumbered the field and the text landed.
         let mut moved = leaf(0, AxRole::TextField, "Note", FIELD);
@@ -924,7 +953,7 @@ mod tests {
             leaf(0, AxRole::TextField, "Note", shifted),
         ]);
         assert!(
-            matches!(matching_target().relocate(&tree), Located::Moved(_)),
+            matches!(shifted_target().relocate(&tree), Located::Moved(_)),
             "the fixture must reach Moved"
         );
         assert_eq!(verify(&tree, &shifted_target()).unwrap(), shifted);

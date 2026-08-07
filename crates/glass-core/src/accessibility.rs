@@ -797,10 +797,10 @@ impl AxDeadline {
 /// A fingerprint identifying the element a value-set targets: its synthetic id
 /// (pre-order index), the role/name the caller saw in the snapshot, the
 /// element's window-relative bounds when known, and the value it held. The
-/// backend re-walks to the id and verifies role+name (and bounds, when present;
-/// on Android the value too) so a stale id — or tree drift that lands a
-/// *different* same-role+name element on the id — errors rather than
-/// overwriting the wrong element.
+/// backend re-resolves the element and verifies role+name (and bounds, when
+/// present; on the two mobile backends the value too) so a stale id — or tree
+/// drift that lands a *different* same-role+name element on the id — errors
+/// rather than overwriting the wrong element.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxTarget {
     pub id: AxNodeId,
@@ -811,10 +811,11 @@ pub struct AxTarget {
     /// same-role+name element if the tree drifted, and that element sits
     /// elsewhere — see [`Self::bounds_consistent`].
     pub bounds: Option<AxRect>,
-    /// The element's value at snapshot time, when it had one. Captured on every backend, but
-    /// compared only by Android's `set_value` guard (`editable_target`), where a recycled list
-    /// row reuses the same view — role, name and rect all identical, only this different. The
-    /// other backends carry it without reading it; see [`Self::value_consistent`].
+    /// The element's value at snapshot time, when it had one. Captured on every backend, and
+    /// compared by both mobile `set_value` guards — Android's `editable_target` and iOS's
+    /// `verify` — where a recycled list row reuses the same view, so role, name and rect are all
+    /// identical and only this differs. The desktop backends carry it without reading it; see
+    /// [`Self::value_consistent`].
     ///
     /// After a successful write the session cache patches this to the text that was requested —
     /// an exact fact only on a typed-write backend (Android/iOS, verified by

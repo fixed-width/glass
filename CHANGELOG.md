@@ -228,12 +228,14 @@ internal refactors, CI, or test-only changes.
   was renumbered between the snapshot you read and the write itself. The check that runs before a
   write re-walked to the element's position in the tree and refused when something else was there —
   and on the Simulator a soft keyboard raised by an earlier interaction inserts elements ahead of a
-  field, which is enough to move it. The write now re-finds the element by its role and name, the
-  same way the check after the write does, and acts on it wherever it now is, so a field that simply
-  moved is written where it is rather than refused. The refusals it does still make say which
-  happened — the element is gone, several now match it, the read covered only part of the tree, it
-  is no longer editable, or it reports no on-screen geometry — where before every one of them was
-  the same "re-snapshot" sentence.
+  field, which is enough to move it. The write now re-finds the element by its role and name and
+  acts on it wherever it now is, so a field that shifted is written where it is rather than refused.
+  Role and name alone do not decide it — they repeat across a form's rows and are both absent on an
+  unlabelled field, so the element must also still be drawn overlapping where you saw it and still
+  hold the value you saw, which is what stops a write landing on a neighbouring row. The refusals it
+  does make now say which happened — the element is gone, several now match it, it no longer looks
+  like what you addressed, the read covered only part of the tree, it is not editable, or it reports
+  no on-screen geometry — where before every one of them was the same "re-snapshot" sentence.
 - A `glass_set_value` on the iOS Simulator no longer intermittently leaves the field without the
   text it was given. Clearing the field and typing the new text went to the device as separate
   calls, and the field stops accepting typed input within a fraction of a second of the clear:
