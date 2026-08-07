@@ -200,6 +200,18 @@ internal refactors, CI, or test-only changes.
   Android paths have no such live check.
 
 ### Fixed
+- On the iOS Simulator, a `glass_set_value` that cannot confirm its write now distinguishes an
+  element that moved from one that is no longer there. Both used to come back as `element #N changed
+  since the snapshot; re-snapshot`, which tells you to re-address that id — the wrong advice when
+  the screen the element was on has been replaced, because the id now belongs to something else and
+  the write it would repeat has already landed. Where nothing in the tree still carries the
+  element's role and name, glass now says the element is gone and to look at where the app is now.
+  Android has answered this way since it learned the same lesson.
+- An accessibility read that stopped early can no longer report an element as gone. "Gone" states
+  that nothing carries the element's role and name any more, which a tree cut short by the element
+  cap — or missing a subtree a failed child read dropped — only shows for the part it covered. Such
+  a read now reports the element as changed, which sends you to re-snapshot rather than to conclude
+  the screen was replaced. Affects Android as well as iOS.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion

@@ -305,8 +305,8 @@ fn dump_until_ready(
 /// what is on screen. Raising the soft keyboard does not: measured on the dogfood AVD with
 /// `mInputShown=true`, `uiautomator dump` emits the focused window only and no IME window, so the
 /// keyboard cannot shift ids. A tap that navigates — Settings' search entry opens a different
-/// window — does shift them, so a mismatch is [`GlassError::AxElementChanged`] ("re-snapshot")
-/// rather than a claim about the write.
+/// window — does shift them, so a mismatch is a claim about the tree rather than about the write;
+/// [`AxTarget::drift_error`] decides which of the two it is.
 ///
 /// Role and name are checked but bounds deliberately are not, unlike the pre-write
 /// [`locate_editable_target`]: the IME reflows the layout under the field it is typing into, so a
@@ -329,11 +329,11 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
                 t.limit_value,
                 t.limit.label(),
             )),
-            None => drifted(after_tree, target),
+            None => target.drift_error(after_tree),
         });
     };
     if !target.matches(node.role, node.name.as_deref()) || !node.states.editable {
-        return Err(drifted(after_tree, target));
+        return Err(target.drift_error(after_tree));
     }
     let landed = if text.is_empty() {
         typed_clear_landed(node.value.as_deref())
@@ -502,37 +502,11 @@ impl Default for AndroidA11y {
     }
 }
 
-/// Whether any node in `tree` still presents as `target` — same role and name, wherever it sits.
-/// Bounds and value are excluded: both move under a live app without the control going anywhere.
-fn still_on_screen(tree: &AxTree, target: &AxTarget) -> bool {
-    fn walk(node: &AxNode, target: &AxTarget) -> bool {
-        target.matches(node.role, node.name.as_deref())
-            || node.children.iter().any(|c| walk(c, target))
-    }
-    walk(&tree.root, target)
-}
-
-/// Which of the two disagreements a tree that no longer agrees with `target` has.
-///
-/// `AxElementChanged` sends the reader looking for where the element went, which is worth doing
-/// only while it is still somewhere; nothing carrying its role and name means the screen was
-/// replaced or the app that drew it restarted (glass#323).
-///
-/// Both Android readers get this. Do not tighten [`still_on_screen`] to include bounds or value:
-/// `a11y_service`'s relaxation needs `AxElementChanged` in every case it can relax.
-fn drifted(tree: &AxTree, target: &AxTarget) -> GlassError {
-    if still_on_screen(tree, target) {
-        GlassError::AxElementChanged(target.id.0)
-    } else {
-        GlassError::AxElementGone(target.id.0)
-    }
-}
-
 /// Find `target.id` and reject a tree that drifted under it — shared by [`editable_target`]
 /// and the service reader's `invoke`, which needs the same rejection without the editable check.
 ///
-/// An id that resolves to nothing stays [`GlassError::AxElementNotFound`]; [`drifted`] classifies
-/// only an id occupied by something unrelated.
+/// An id that resolves to nothing stays [`GlassError::AxElementNotFound`];
+/// [`AxTarget::drift_error`] classifies only an id occupied by something unrelated.
 pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&'a AxNode> {
     let node = tree
         .find(target.id)
@@ -541,15 +515,16 @@ pub(crate) fn fingerprinted<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<&
         || !target.bounds_consistent(node.bounds, 8)
         || !target.value_consistent(node.value.as_deref())
     {
-        return Err(drifted(tree, target));
+        return Err(target.drift_error(tree));
     }
     Ok(node)
 }
 
 /// Re-resolve `target` in an already-numbered `tree` and return the node only if it is still the
-/// element that was addressed and still editable. Errors specifically when the target is gone
-/// (`AxElementNotFound`), has drifted in role/name/bounds/value (`AxElementChanged`), or is not
-/// editable (`AxElementNotEditable`).
+/// element that was addressed and still editable. Errors specifically when the id resolves to
+/// nothing (`AxElementNotFound`), when it has drifted in role/name/bounds/value
+/// (`AxElementChanged`, or `AxElementGone` where nothing in the tree presents as it — see
+/// [`AxTarget::drift_error`]), or when it is not editable (`AxElementNotEditable`).
 ///
 /// Both Android readers' `set_value` guards route through this — the check that stops a write
 /// landing on whatever inherited the id between the snapshot the caller read and the one the write
