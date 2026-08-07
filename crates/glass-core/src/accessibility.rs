@@ -548,6 +548,16 @@ pub struct AxTree {
 }
 
 impl AxTree {
+    /// Whether this tree describes everything the backend walked — no bound stopped it early and
+    /// no child read dropped a subtree.
+    ///
+    /// Both fields, because they are independent: a tree can hit no cap at all and still be missing
+    /// a subtree.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.truncated.is_none() && self.unreadable == 0
+    }
+
     /// A complete (non-truncated) tree. Callers still run [`AxTree::assign_ids`]. A backend
     /// that stopped early sets [`AxTree::truncated`] afterward.
     pub fn new(root: AxNode) -> AxTree {
@@ -799,13 +809,15 @@ impl AxTarget {
         self.role == role && self.name.as_deref() == name
     }
 
-    /// Whether any node in `tree` still presents as this target — same role and name, wherever it
-    /// sits.
+    /// Whether any node in `tree` carries this target's role and name, wherever it sits. Says
+    /// nothing about visibility: a scrolled-away row counts.
     ///
     /// Do not tighten this to include bounds or value: both move under a live app without the
     /// control going anywhere, and Android's service reader relaxes a moved control back into a
-    /// write, which needs [`Self::drifted`] to answer `AxElementChanged` in every case it can relax.
-    pub fn still_on_screen(&self, tree: &AxTree) -> bool {
+    /// write, which needs [`Self::drift_error`] to answer `AxElementChanged` in every case it can
+    /// relax. Pinned by `a_relaxable_move_is_never_reported_as_gone` below, and from the other side
+    /// by `a11y_service`'s `a_target_that_only_moved_is_actuated_where_it_now_is`.
+    fn still_present(&self, tree: &AxTree) -> bool {
         fn walk(node: &AxNode, target: &AxTarget) -> bool {
             target.matches(node.role, node.name.as_deref())
                 || node.children.iter().any(|c| walk(c, target))
@@ -820,10 +832,16 @@ impl AxTarget {
     /// was replaced or the app that drew it restarted (glass#323); telling that caller to
     /// re-address the id is how a `set_value` read-back retypes a write that already landed.
     ///
-    /// Keep this shared. Android and iOS ask the same question, and per-backend copies drifted
-    /// apart once already — Android learned to tell the cases apart, iOS did not.
-    pub fn drifted(&self, tree: &AxTree) -> GlassError {
-        if self.still_on_screen(tree) {
+    /// An incomplete tree cannot support that second answer: it shows absence only for the part it
+    /// kept, so one that is not [`AxTree::is_complete`] gets the recoverable `AxElementChanged`.
+    ///
+    /// Keep this shared. The two snapshot-tree backends ask the same question, and their
+    /// `verify_write` twins drifted apart once already — Android learned to tell the cases apart in
+    /// glass#330, iOS not until glass#360. The desktop readers cannot use it: they re-resolve
+    /// against live platform elements and never hold an `AxTree` to search.
+    #[must_use]
+    pub fn drift_error(&self, tree: &AxTree) -> GlassError {
+        if self.still_present(tree) || !tree.is_complete() {
             GlassError::AxElementChanged(self.id.0)
         } else {
             GlassError::AxElementGone(self.id.0)
@@ -2022,15 +2040,14 @@ mod tests {
     }
 
     #[test]
-    fn a_target_still_on_screen_is_changed_not_gone() {
+    fn a_target_still_present_is_changed_not_gone() {
         // Renumbered, not removed — re-snapshotting finds it again.
         let tree = drift_tree(vec![
             leaf(AxRole::Label, "Heading"),
             leaf(AxRole::TextField, "Note"),
         ]);
-        assert!(drift_target().still_on_screen(&tree));
         assert!(matches!(
-            drift_target().drifted(&tree),
+            drift_target().drift_error(&tree),
             GlassError::AxElementChanged(1)
         ));
     }
@@ -2039,19 +2056,77 @@ mod tests {
     fn a_target_no_longer_anywhere_is_gone_not_changed() {
         // The screen was replaced.
         let tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
-        assert!(!drift_target().still_on_screen(&tree));
         assert!(matches!(
-            drift_target().drifted(&tree),
+            drift_target().drift_error(&tree),
             GlassError::AxElementGone(1)
         ));
     }
 
     #[test]
-    fn a_same_named_element_of_another_role_does_not_keep_a_target_on_screen() {
+    fn a_same_named_element_of_another_role_is_not_the_target() {
         // Role and name together, not name alone — otherwise a heading that happens to repeat the
         // field's label would report a replaced screen as merely renumbered.
         let tree = drift_tree(vec![leaf(AxRole::Label, "Note")]);
-        assert!(!drift_target().still_on_screen(&tree));
+        assert!(matches!(
+            drift_target().drift_error(&tree),
+            GlassError::AxElementGone(1)
+        ));
+    }
+
+    #[test]
+    fn a_relaxable_move_is_never_reported_as_gone() {
+        // The tightening `still_present`'s doc forbids, pinned in this crate rather than only from
+        // `a11y_service`: every node that reader relaxes back into a write matches on role and name
+        // while differing in bounds and value, so folding either into the walk kills the relaxation.
+        let mut moved = leaf(AxRole::TextField, "Note");
+        moved.bounds = Some(AxRect {
+            x: 0,
+            y: 400,
+            width: 200,
+            height: 40,
+        });
+        moved.value = Some("typed since the snapshot".into());
+        let tree = drift_tree(vec![moved]);
+        let mut target = drift_target();
+        target.bounds = Some(AxRect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 40,
+        });
+        target.value = Some("before the write".into());
+        assert!(matches!(
+            target.drift_error(&tree),
+            GlassError::AxElementChanged(1)
+        ));
+    }
+
+    #[test]
+    fn an_incomplete_tree_never_reports_the_target_gone() {
+        // Both fields, because they are independent: a tree can hit no cap and still drop a subtree.
+        let replaced = || drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        let mut capped = replaced();
+        capped.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 1,
+            nodes_walked: 1,
+        });
+        assert!(matches!(
+            drift_target().drift_error(&capped),
+            GlassError::AxElementChanged(1)
+        ));
+        let mut dropped = replaced();
+        dropped.unreadable = 1;
+        assert!(matches!(
+            drift_target().drift_error(&dropped),
+            GlassError::AxElementChanged(1)
+        ));
+        // The same tree, complete, is the case that may answer gone — otherwise this test would
+        // pass against a `drift_error` that never says gone at all.
+        assert!(matches!(
+            drift_target().drift_error(&replaced()),
+            GlassError::AxElementGone(1)
+        ));
     }
 
     #[test]
