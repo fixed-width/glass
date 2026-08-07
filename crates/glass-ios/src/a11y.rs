@@ -63,27 +63,19 @@ impl IosA11y {
 /// Locate `target` in a tree described for the write and return its window-relative pixel bounds —
 /// the guard every write runs before it dispatches.
 ///
-/// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id alone. The caller's
-/// snapshot and this describe are separate reads of a live app, so anything that shifted the tree
-/// between them renumbers the field without moving it — the soft keyboard an earlier write raised is
-/// the measured case, inserting two nodes ahead of it (glass#361). The read-back resolves the same
-/// way, so no write is refused here for an identity the read-back would have accepted.
+/// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id alone: on the Simulator
+/// a soft keyboard raised by an earlier write inserts nodes ahead of the field, renumbering it
+/// without moving it (glass#361).
 ///
-/// Identity alone does not decide it. Role and name repeat across a form's rows and are both `None`
-/// on an unlabelled field, and [`Located::AtId`] is granted on that key plus a pre-order index this
-/// very write perturbs — so on its own it would accept whatever editable renumbering slid onto the
-/// id, tap it, and type into it, and the read-back would confirm the text in that same wrong node.
-/// Bounds and value are therefore checked on whichever node was reached: overlap rather than
-/// equality, so a field the keyboard shifted is still written where it now is, and value because a
-/// recycled row keeps its identifier and its rect and differs only there — the discriminator
-/// `AxTarget::value` exists for and Android's `fingerprinted` has always compared.
+/// Bounds and value are then checked on whichever node was reached — do not drop them again.
+/// [`Located::AtId`] is granted on role+name plus that same unstable id, and role and name repeat
+/// across a form's rows and are absent on an unlabelled field, so identity alone accepts a
+/// neighbour and the read-back confirms the text in it. Overlap, not equality, so a field the
+/// keyboard shifted is still written where it now is.
 ///
-/// Every refusal is pre-dispatch. One the tree can no longer place, or that no longer looks like
-/// what was addressed, answers with a typed drift verdict from [`AxTarget::drift_error`] —
-/// `AxElementGone` where nothing presents as the element, `AxElementChanged` otherwise, truncation
-/// included. A node that *is* the element but is no longer editable, or reports no bounds, answers
-/// `AxElementNotEditable` / `AxElementNotClickable`. glass#361 replaced the `Backend` strings that
-/// told an agent to re-snapshot without saying which had happened.
+/// Refusals are pre-dispatch: [`AxTarget::drift_error`] for a node the tree cannot place or that no
+/// longer looks like what was addressed, `AxElementNotEditable` / `AxElementNotClickable` for one
+/// that is the element but cannot be written or tapped.
 fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     let node = match target.relocate(tree) {
         Located::AtId(node) | Located::Moved(node) => node,
@@ -94,9 +86,8 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     if !target.bounds_overlap(node.bounds) || !target.value_consistent(node.value.as_deref()) {
         return Err(target.drift_error(tree));
     }
-    // Nothing upstream checks this: `glass_set_value` reaches here for any element the caller
-    // names, so a Label addressed by mistake resolves and matches. Without this the write would tap
-    // an inert label and type into whatever had focus instead.
+    // Load-bearing, not belt-and-braces: nothing upstream rejects a non-editable target, so without
+    // this a Label addressed by mistake is tapped and the text goes to whatever had focus.
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
@@ -124,13 +115,12 @@ const VERIFY_ATTEMPTS: usize = 3;
 ///
 /// The element is re-resolved by identity (role + name) via [`AxTarget::relocate`], not by its
 /// pre-order id: measured on the Simulator, the focusing tap raises the soft keyboard and inserts
-/// two nodes ahead of the field (glass#359), so the id itself is not stable across the write. A node
+/// nodes ahead of the field (glass#359), so the id itself is not stable across the write. A node
 /// re-found that way is accepted only from a complete tree, and whichever node was reached must
 /// still overlap where the target was — so a same-named field on a screen the tap navigated to is
-/// refused instead. Overlap is checked here and not left to [`Located::Moved`]: the write's own tap
-/// is what renumbers the tree, so the id can land on a neighbouring row that shares role and name,
-/// and [`Located::AtId`] grants that without consulting bounds. An untouched neighbour reads back
-/// empty, which is indistinguishable from a landed clear.
+/// refused instead. Overlap is checked here rather than left to [`Located::Moved`] because the
+/// write's own tap renumbers the tree onto a neighbouring row, which [`Located::AtId`] accepts
+/// without consulting bounds and which reads back empty like a landed clear.
 ///
 /// The node must also still be editable: for a non-editable node `axmap` puts the element's AXLabel
 /// in `value`, so a label that changed inside the settle window would otherwise read as a successful
@@ -226,13 +216,9 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
 
 /// The write's keystrokes as one batch of HID events: select-all, delete, then the text.
 ///
-/// One batch because each `IdbClient::hid` is its own RPC, and a pause between the delete and the
-/// text loses the text. Measured on the Simulator against `examples/ios-role-fixture`: back to back
-/// the text lands 12/12; with a screenshot in between (0.14s) 2/4, with an accessibility read
-/// (0.34s) 0/4, and with a bare sleep making no call at all (2s) 0/4 — so it is elapsed time, not
-/// the extra request. Sending the groups a call each let one slow round-trip open that window
-/// (glass#363). Do not split this back into a call per group for readability — the failure it
-/// prevents is invisible on a fast, idle host.
+/// Do not send these a group at a time again: each `IdbClient::hid` is its own RPC, and the
+/// Simulator drops typed text arriving a fraction of a second after the field is cleared
+/// (glass#363).
 fn clear_and_type_keys(injector: &IdbInjector, text: &str) -> Result<Vec<proto::HidEvent>> {
     let mut events = injector.key_events(&KeyEvent::Chord("super+a".into()))?;
     events.extend(injector.key_events(&KeyEvent::Chord("Delete".into()))?);
@@ -242,18 +228,13 @@ fn clear_and_type_keys(injector: &IdbInjector, text: &str) -> Result<Vec<proto::
 
 /// Send the whole write: the focusing tap, then the keystrokes, in exactly two calls.
 ///
-/// Over a `send` seam rather than [`IdbClient`] directly so the call *count* is testable without a
-/// device. That count is the fix for glass#363 — [`clear_and_type_keys`] returns a plain `Vec`, so
-/// nothing but this function stops a caller sending it in pieces again.
+/// Over a `send` seam so the call count — the fix for glass#363 — is testable without a device.
 ///
 /// The batch is built before the tap goes out: `KeyEvent::Text` refuses a non-ASCII character, and
-/// building afterwards spent a tap that raised the keyboard and moved first responder before
-/// reporting a write that never happened.
+/// building afterwards spent a tap that had already moved first responder.
 ///
-/// A failure of the second send is post-dispatch and says so. The batch clears the field before it
-/// types, and `IdbClient::hid` streams it, so a failure part-way through can leave the field emptied
-/// with the text lost — reporting that as a bare transport error would tell an agent nothing was
-/// sent, and the session would keep the value it cached.
+/// The second send's failure is post-dispatch: the batch clears before it types, so a stream dying
+/// part-way through leaves the field emptied with the text lost.
 fn dispatch_write(
     send: &mut dyn FnMut(Vec<proto::HidEvent>) -> Result<()>,
     injector: &IdbInjector,
@@ -303,9 +284,8 @@ impl Accessibility for IosA11y {
             count: 1,
             modifiers: vec![],
         };
-        // The tap keeps its own call — the field has to become first responder before the
-        // keystrokes arrive, and a gap there is harmless (measured: the same write with 400ms
-        // inserted between the two passes the smoke 6/6). A gap *within* the keystrokes is not.
+        // The tap keeps its own call: a delay here is harmless where one inside the keystrokes
+        // loses the text.
         let client = &self.client;
         dispatch_write(
             &mut |events| client.hid(events),
@@ -515,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_named_field_clears_after_being_re_found() {
-        // The write's own focusing tap inserts two nodes ahead of the field, so a clear into a field
+        // The write's own focusing tap inserts nodes ahead of the field, so a clear into a field
         // that was not already focused ALWAYS relocates. Keying the refusal on that made it fail by
         // construction; the name is what identifies the field, and the name survives the move.
         let moved = leaf(0, AxRole::TextField, "Note", FIELD);
@@ -759,9 +739,8 @@ mod tests {
 
     #[test]
     fn the_whole_write_goes_out_in_exactly_two_calls() {
-        // glass#363: each call is its own RPC, and a pause between the clear and the text loses the
-        // text. One call for the tap, one for every keystroke — three calls reinstates the bug, and
-        // `clear_and_type_keys` returning a plain Vec is what would let someone split it again.
+        // Three calls reinstates glass#363: each is its own RPC, and a pause between the clear and
+        // the text loses the text.
         let injector = IdbInjector::new(2.0);
         let mut log = Vec::new();
         dispatch_write(&mut recording_send(&mut log), &injector, &a_tap(), 1, "hi").unwrap();
@@ -790,8 +769,8 @@ mod tests {
 
     #[test]
     fn keystrokes_lost_part_way_report_the_field_may_be_cleared() {
-        // The batch clears before it types, so a stream that dies between the two leaves the field
-        // empty. Reporting that as a bare transport error would read as "nothing was sent".
+        // The batch clears before it types, so a stream dying between the two leaves the field
+        // empty — a bare transport error would read as "nothing was sent".
         let injector = IdbInjector::new(2.0);
         let mut calls = 0;
         let mut send = |_events| {
@@ -813,8 +792,8 @@ mod tests {
 
     #[test]
     fn text_the_backend_cannot_type_refuses_before_anything_is_sent() {
-        // Building the batch before the tap is what makes this a true no-op: under the old order
-        // the clear had already emptied the field when the text was found to be untypeable.
+        // Under the old order the clear had already emptied the field by the time the text was
+        // found to be untypeable.
         let injector = IdbInjector::new(2.0);
         let mut log = Vec::new();
         let err = dispatch_write(
@@ -863,9 +842,8 @@ mod tests {
 
     #[test]
     fn a_clear_still_sends_the_keystrokes_that_empty_the_field() {
-        // `set_value(id, "")` types nothing, so the batch is select-all then delete and nothing
-        // else. Assert both, in order: a length total alone passes with the two swapped, which on
-        // a device deletes one character instead of the field.
+        // Assert content and order, not a length total: a total passes with the two swapped, which
+        // on a device deletes one character instead of the field.
         let injector = IdbInjector::new(2.0);
         let mut expected = injector
             .key_events(&KeyEvent::Chord("super+a".into()))
@@ -927,9 +905,8 @@ mod tests {
 
     #[test]
     fn a_renumbered_field_is_located_by_identity_before_the_write() {
-        // glass#361, the measured case: between the caller's snapshot and the write's own describe
-        // the soft keyboard inserted nodes ahead of the field, so its id now resolves elsewhere.
-        // The field itself never moved, and the write must reach it rather than refuse.
+        // glass#361, the measured case: the soft keyboard inserted nodes ahead of the field between
+        // the caller's snapshot and the write's describe, so its id now resolves elsewhere.
         let tree = tree_with(vec![
             leaf(0, AxRole::Label, "Suggestions", FIELD),
             leaf(0, AxRole::TextField, "Note", FIELD),
@@ -945,8 +922,7 @@ mod tests {
 
     #[test]
     fn a_renumbered_field_that_also_shifted_is_tapped_where_it_now_is() {
-        // The tap goes to the rect this returns, so it must be the node's current one and not the
-        // target's — the keyboard both renumbers the field and moves it.
+        // The tap goes to the rect this returns, so it must be the node's and not the target's.
         let shifted = AxRect { y: 45, ..FIELD };
         let tree = tree_with(vec![
             leaf(0, AxRole::Label, "Suggestions", FIELD),
@@ -962,9 +938,8 @@ mod tests {
     #[test]
     fn a_same_named_field_elsewhere_at_the_id_refuses_the_write() {
         // A form's rows share role and name, and an unlabelled field has neither, so identity plus
-        // a pre-order index the write itself perturbs is not identification. Without a positional
-        // check this is tapped and typed into, and the read-back — resolving the same way — reads
-        // the text back out of it and calls the write a success.
+        // an id the write itself perturbs is not identification — and the read-back, resolving the
+        // same way, would read the text back out of the wrong node and call it a success.
         let other_row = AxRect { y: 600, ..FIELD };
         let tree = tree_with(vec![leaf(0, AxRole::TextField, "Note", other_row)]);
         assert!(
@@ -980,7 +955,7 @@ mod tests {
     #[test]
     fn a_recycled_row_holding_a_different_value_refuses_the_write() {
         // A scrolled table reuses the cell, so role, name and rect all survive and only the value
-        // differs — the one discriminator left, and the reason `AxTarget::value` is captured.
+        // differs.
         let mut recycled = leaf(0, AxRole::TextField, "Note", FIELD);
         recycled.value = Some("row 9".into());
         let tree = tree_with(vec![recycled]);
@@ -994,8 +969,8 @@ mod tests {
 
     #[test]
     fn a_field_drawn_clear_of_the_target_refuses_the_write_before_it_dispatches() {
-        // The tap navigated to another screen carrying a same-named field. The read-back refuses
-        // this after the write; the guard must refuse it before one goes out.
+        // A tap that navigated to another screen carrying a same-named field — refused after the
+        // write, so it must be refused before one goes out.
         let tree = tree_with(vec![
             leaf(0, AxRole::Label, "Suggestions", FIELD),
             leaf(0, AxRole::TextField, "Note", AxRect { y: 600, ..FIELD }),
