@@ -2577,6 +2577,25 @@ mod display_tests {
     }
 
     #[test]
+    fn a_second_copy_updates_the_owner_it_already_has() {
+        // Re-taking the selection for every copy is visible to every other client on the
+        // display: a clipboard manager watching ownership sees churn that did not happen.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        plat.set_clipboard("first").expect("set");
+        let owner = x.clipboard_owner();
+        assert_ne!(owner, x11rb::NONE, "the first copy takes the selection");
+
+        plat.set_clipboard("second").expect("set again");
+        assert_eq!(
+            x.clipboard_owner(),
+            owner,
+            "a live owner should be handed the new text, not replaced"
+        );
+        assert_eq!(plat.get_clipboard().expect("get"), "second");
+    }
+
+    #[test]
     fn a_copy_after_another_client_took_the_selection_starts_a_fresh_owner() {
         // glass's owner retires when something else takes CLIPBOARD. Handing the next copy to
         // that retired owner puts the text somewhere nothing serves it, and the paste that
@@ -2750,11 +2769,13 @@ mod display_tests {
     }
 
     #[test]
-    fn a_launch_waits_out_its_timeout_before_giving_up() {
-        // The budget has to be spent, not just reported: a launch that gives up at once
-        // fails every app slower than instant.
+    fn discovery_waits_out_its_timeout_before_giving_up() {
+        // The budget has to be spent, not just reported: giving up at once fails every app
+        // slower than instant. Timed around `discover_window`, so a spawn that fails under
+        // load cannot read as a deadline that was not honoured.
         let x = TestX::start();
         let mut plat = x.platform();
+        plat.child = Some(spawn_stand_in());
         let spec = AppSpec {
             build: None,
             run: vec!["sleep".to_string(), "30".to_string()],
@@ -2766,7 +2787,9 @@ mod display_tests {
             a11y: false,
         };
         let started = Instant::now();
-        let err = plat.start_app(&spec).expect_err("no window ever appears");
+        let err = plat
+            .discover_window(&spec)
+            .expect_err("the stand-in never maps a window");
         let waited = started.elapsed();
         assert!(matches!(err, GlassError::Timeout(400)), "{err:?}");
         assert!(

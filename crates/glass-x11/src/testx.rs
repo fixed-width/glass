@@ -184,6 +184,17 @@ impl TestX {
         None
     }
 
+    /// The window currently holding the CLIPBOARD selection, or `x11rb::NONE`.
+    pub(crate) fn clipboard_owner(&self) -> Window {
+        let clipboard = self.intern(b"CLIPBOARD");
+        self.conn
+            .get_selection_owner(clipboard)
+            .expect("get_selection_owner")
+            .reply()
+            .expect("get_selection_owner reply")
+            .owner
+    }
+
     /// How many windows the root currently has — a leaked temporary shows up here.
     pub(crate) fn root_child_count(&self) -> usize {
         self.conn
