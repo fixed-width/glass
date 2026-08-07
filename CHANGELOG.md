@@ -201,21 +201,24 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 - `glass_set_value` now confirms a write into a field that was not already focused, instead of
-  reporting it as an element that had changed or gone missing. Both mobile backends confirm a write
-  by re-reading the element afterwards, and they used to re-find it by its position in the
-  accessibility tree — which the write itself moves: typing into an unfocused field raises the
-  keyboard, and on the iOS Simulator that inserts elements ahead of the field. A landed write could
-  not be confirmed, on the ordinary path of writing into a field you have not touched yet. The
-  read-back now re-finds the element by its role and name wherever it moved to, and refuses if more
-  than one element now matches, since then which one holds the text cannot be told.
-- A `glass_set_value` that cannot confirm its write — the element is gone, several now match it, the
-  read stopped early, or it is no longer editable to read back — now says the text was typed and
-  names what to re-snapshot for, instead of reporting only that the element could not be
-  re-addressed, which reads as an instruction to write again when the write has already gone out. A
-  read cut short by the node cap still names the cap, so raising `max_nodes` is the fix when that's
-  the reason. Writing an empty value to clear a field is the one case re-finding the element isn't
-  enough to confirm: an empty field alone isn't evidence it's the right one, so a clear whose element
-  had to be re-found by role and name reports unconfirmed rather than a success it cannot prove.
+  reporting it as an element that had changed or gone missing. On iOS, and on Android's
+  `uiautomator` reader, a write taps the field and types into it, then confirms by re-reading the
+  element afterwards — and used to re-find it by its position in the accessibility tree, which the
+  write itself moves: typing into an unfocused field raises the keyboard, and on the iOS Simulator
+  that inserts elements ahead of the field. A landed write could not be confirmed, on the ordinary
+  path of writing into a field you have not touched yet. The read-back now re-finds the element by
+  its role and name wherever it moved to, and refuses if more than one element now matches, since
+  then which one holds the text cannot be told. The optional on-device companion sets a field's
+  value directly rather than typing into it, so it was never affected.
+- A `glass_set_value` that cannot confirm its write on either of those two readers — the element is
+  gone, several now match it, the read stopped early, or it is no longer editable to read back — now
+  says the text was typed and names what to re-snapshot for, instead of reporting only that the
+  element could not be re-addressed, which reads as an instruction to write again when the write has
+  already gone out. A read cut short by the node cap still names the cap, so raising `max_nodes` is
+  the fix when that's the reason. Writing an empty value to clear a field is the one case re-finding
+  the element isn't enough to confirm: an empty field alone isn't evidence it's the right one, so a
+  clear whose element had to be re-found by role and name reports unconfirmed rather than a success
+  it cannot prove.
 - A native Android click or `set_value` through the optional on-device companion no longer acts on a
   different element than the one you named when the snapshot was truncated. glass numbered elements
   by their position in the tree it kept and dispatched the action by that number, but the companion
@@ -243,9 +246,8 @@ internal refactors, CI, or test-only changes.
   that no longer exists. It now asks whether anything in the tree still carries that element's role
   and name: if something might, the refusal still reads as before; if nothing does, and the read
   covered the whole tree, it reports the element as gone instead, which re-snapshotting the same
-  screen will not fix. A read cut short by the node cap, or missing a subtree a failed child read
-  dropped, only shows absence for the part it covered, so that weaker read still answers changed
-  rather than gone.
+  screen will not fix. A read cut short by the node cap only shows absence for the part it covered,
+  so that weaker read still answers changed rather than gone.
 - The accessibility tree now discloses subtrees it could not read. A child read that fails drops
   everything beneath it, and the tree came back looking complete — indistinguishable from one where
   there was genuinely nothing there, so an agent concludes an element does not exist and routes
