@@ -579,6 +579,9 @@ mod tests {
             msg.contains("nothing in the tree carries its role and name"),
             "{msg}"
         );
+        // The id is what a caller re-addresses; dropping `element #{0}` from the template left
+        // every other assertion here green.
+        assert!(msg.contains("element #7"), "names the element: {msg}");
         assert!(
             msg.contains("rather than"),
             "names what to do instead of retyping: {msg}"
