@@ -176,10 +176,7 @@ fn with_stderr(msg: String, stderr: &str) -> String {
     if stderr.len() <= STDERR_SHOWN {
         return format!("{msg}; Xvfb stderr: {stderr}");
     }
-    let mut cut = STDERR_SHOWN;
-    while !stderr.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = stderr.floor_char_boundary(STDERR_SHOWN);
     format!(
         "{msg}; Xvfb stderr (first {cut} bytes of {}): {}…",
         stderr.len(),
@@ -325,6 +322,30 @@ mod tests {
         panic!("ETXTBSY persisted after 100 retries: {last:?}")
     }
 
+    /// Spawn a fixture script directly with its stderr piped, for the tests that drive
+    /// `StderrTail` rather than a whole start. Retries past ETXTBSY for the same reason
+    /// `start_fixture` does.
+    fn spawn_fixture(script: &std::path::Path) -> std::process::Child {
+        for _ in 0..100 {
+            match Command::new(script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => return child,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("the fixture {} is not runnable: {e}", script.display()),
+            }
+        }
+        panic!("the fixture stayed ETXTBSY after 100 retries")
+    }
+
+    fn running(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
     /// Write an executable fake-Xvfb shell script into a unique temp dir and
     /// return its path. `$0.ran` is the script's own scratch marker.
     fn fixture(name: &str, body: &str) -> std::path::PathBuf {
@@ -335,6 +356,87 @@ mod tests {
         std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    #[test]
+    fn the_start_deadline_covers_both_attempts_and_both_reaps() {
+        // doctor's deep probe puts its own timeout around `Xvfb::start`. Budget less than
+        // the wedge-retry ladder actually takes and it reports a start that the retry
+        // would have completed as a failure.
+        let one_attempt = super::READY_TIMEOUT + glass_proc_linux::REAP_GRACE;
+        assert!(
+            super::start_deadline() >= one_attempt + one_attempt,
+            "a caller budgeting {:?} cannot outlast two wedged attempts",
+            super::start_deadline()
+        );
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_clip_point_is_not_split() {
+        // Xvfb's stderr is whatever the server prints, which is not guaranteed ASCII;
+        // slicing mid-character would panic on the error path itself.
+        let head = "a".repeat(super::STDERR_SHOWN - 1);
+        let out = super::with_stderr("Xvfb failed".into(), &format!("{head}é{}", "b".repeat(600)));
+        assert!(
+            out.contains(&format!("first {} bytes", super::STDERR_SHOWN - 1)),
+            "must clip back to the boundary before the two-byte char: {out}"
+        );
+    }
+
+    #[test]
+    fn the_drain_stops_keeping_bytes_at_the_documented_cap() {
+        // A server dumping megabytes must cost bounded memory, while the kept head stays
+        // large enough for a real Xvfb option table (~5KB).
+        let script = fixture(
+            "flood.sh",
+            "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\\0' e >&2\n",
+        );
+        let mut child = spawn_fixture(&script);
+        let tail = super::StderrTail::drain(child.stderr.take().expect("piped stderr"));
+        child.wait().expect("fixture exits");
+        assert_eq!(tail.snapshot(Duration::from_secs(5)).len(), 8 * 1024);
+    }
+
+    #[test]
+    fn a_snapshot_waits_for_the_pipe_to_close_before_reading() {
+        // The diagnostics arrive after the caller asks for them. Read without waiting for
+        // EOF and a failed start reports an empty stderr — the only clue it had.
+        let script = fixture(
+            "late-stderr.sh",
+            "sleep 0.3\nprintf 'the fatal line\\n' >&2\n",
+        );
+        let mut child = spawn_fixture(&script);
+        let tail = super::StderrTail::drain(child.stderr.take().expect("piped stderr"));
+        let captured = tail.snapshot(Duration::from_secs(5));
+        child.wait().expect("fixture exits");
+        assert_eq!(captured, "the fatal line");
+    }
+
+    #[test]
+    fn the_reported_pid_is_the_server_itself() {
+        // A test that SIGSTOPs this pid to make the display unresponsive stops something
+        // else entirely if it is wrong.
+        let script = fixture("pid.sh", "echo 4321\nexec sleep 30\n");
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", server.pid()))
+            .expect("the reported pid must be a live process");
+        let cmdline = String::from_utf8_lossy(&cmdline);
+        assert!(
+            cmdline.contains("pid.sh"),
+            "the reported pid must be this fixture's server, not another process: {cmdline}"
+        );
+    }
+
+    #[test]
+    fn dropping_the_server_reaps_it() {
+        // Without this the display outlives the session that spawned it, and a run that
+        // starts a few of them leaves an X server per launch behind.
+        let script = fixture("reap.sh", "echo 4321\nexec sleep 30\n");
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+        let pid = server.pid();
+        assert!(running(pid), "the fixture server should be up first");
+        drop(server);
+        assert!(!running(pid), "pid {pid} outlived the Xvfb that owned it");
     }
 
     #[test]
