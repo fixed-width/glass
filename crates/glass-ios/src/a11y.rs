@@ -143,8 +143,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
             ));
         }
         Located::Unproven => {
-            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`, and
-            // existing tests assert it. A complete tree has no hole to blame, so the one way it
+            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`. A
+            // complete tree has no hole to blame, so the one way it
             // reaches here is a lone match drawn clear of where the element was.
             let why = if let Some(t) = &after_tree.truncated {
                 format!(
@@ -401,11 +401,8 @@ mod tests {
 
     #[test]
     fn a_node_that_lost_editability_is_unconfirmed_not_changed() {
-        // relocate's own role+name match already excludes an unrelated neighbour that inherited
-        // the id, so a non-editable node reached here is the identified element having lost
-        // editability after the write dispatched. That has to be AxWriteUnconfirmed and not the
-        // AxElementNotEditable the pre-write `verify` raises, or a caller reading "not dispatched"
-        // off it would retype into whatever the element collapsed into.
+        // Not the `AxElementNotEditable` the pre-write `verify` raises: a caller reading "not
+        // dispatched" off that would retype into whatever the element collapsed into.
         let mut after = tree_with_value(Some("world"));
         after.root.children[0].states.editable = false;
         let err = verify_write(&after, &matching_target(), "world").unwrap_err();

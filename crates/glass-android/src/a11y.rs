@@ -308,8 +308,7 @@ fn dump_until_ready(
 /// pre-order id. The soft keyboard does not itself shift ids — measured on the dogfood AVD with
 /// `mInputShown=true`, `uiautomator dump` emits the focused window only and no IME window — but a
 /// tap that navigates does: Settings' search entry opens a different window, and the field can turn
-/// up renumbered inside it rather than gone. Re-finding by identity is what lets that be confirmed
-/// instead of refused.
+/// up renumbered inside it rather than gone.
 ///
 /// Bounds are deliberately no part of that identity, unlike the pre-write
 /// [`locate_editable_target`]: the IME reflows the layout under the field it is typing into, so a
@@ -320,11 +319,9 @@ fn dump_until_ready(
 /// time. A leaf like `search_src_text` names a *layout*: it repeats across every instance of it,
 /// and across apps, so a navigating tap can find the next screen's field matching uniquely.
 ///
-/// [`Located::AtId`] and [`Located::Moved`] both already carry the target's role and name —
-/// `relocate` requires the match on the first, and finds the second by searching for exactly that
-/// role and name. So a node reached here that is not editable is not a neighbour that inherited the
-/// id; it is the identified element having lost editability. The write has already dispatched by
-/// this point, so that is [`GlassError::AxWriteUnconfirmed`], not the pre-write
+/// Both arms carry the target's role and name, so a node reached here that is not editable is not a
+/// neighbour that inherited the id; it is the identified element having lost editability. The write
+/// has already dispatched by this point, so that is [`GlassError::AxWriteUnconfirmed`], not the
 /// [`AxTarget::drift_error`].
 ///
 /// A clear (`text` empty) is confirmed only for a target that carries a name. An empty read-back is
@@ -354,8 +351,8 @@ fn verify_write(after_tree: &AxTree, target: &AxTarget, text: &str) -> Result<()
             ));
         }
         Located::Unproven => {
-            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`, and
-            // existing tests assert it. A complete tree has no hole to blame, so the one way it
+            // Keep the cap in the message: it is what tells a caller to raise `max_nodes`. A
+            // complete tree has no hole to blame, so the one way it
             // reaches here is a lone match drawn clear of where the element was.
             let why = if let Some(t) = &after_tree.truncated {
                 format!(
@@ -2021,11 +2018,8 @@ mod tests {
 
     #[test]
     fn a_node_that_lost_editability_is_unconfirmed_not_changed() {
-        // relocate's own role+name match already excludes an unrelated neighbour that inherited
-        // the id, so a non-editable node reached here is the identified element having lost
-        // editability after the write dispatched — AxWriteUnconfirmed, not the pre-write
-        // AxElementChanged, or a caller reading "not dispatched" off it would retype into whatever
-        // it collapsed into.
+        // A caller reading "not dispatched" off this would retype into whatever the field
+        // collapsed into.
         let mut after = tree_holding(Some("world"));
         after.root.states.editable = false;
         let t = target(0, Some("Search"), Some(BOUNDS));
