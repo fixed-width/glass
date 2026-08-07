@@ -19,6 +19,8 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-07
+
 ### Added
 - The advertised MCP schema now documents what it did not. Every tool parameter carries a
   description, and `glass_type`, `glass_key`, `glass_drag`, `glass_stop`, `glass_baseline_save` and
@@ -944,7 +946,8 @@ First public release — open core, Apache-2.0.
 - Core tools: `glass_start`, `glass_stop`, `glass_screenshot`, `glass_click`,
   `glass_list_windows`, `glass_select_window`, and `glass_doctor`.
 
-[Unreleased]: https://github.com/fixed-width/glass/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/fixed-width/glass/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/fixed-width/glass/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/fixed-width/glass/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/fixed-width/glass/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/fixed-width/glass/compare/v0.5.0...v1.0.0
