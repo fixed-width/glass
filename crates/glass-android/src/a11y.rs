@@ -718,7 +718,7 @@ mod tests {
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::accessibility::{
         AxContext, AxDeadline, AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree,
-        WalkLimits,
+        Located, WalkLimits,
     };
     use glass_core::{BoundKind, GlassError, Result, WindowGeometry};
     use std::collections::HashMap;
@@ -2061,6 +2061,27 @@ mod tests {
         let err = verify_write(&after, &t, "").unwrap_err();
         assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
         assert!(err.to_string().contains("clear"), "{err}");
+    }
+
+    #[test]
+    fn a_nameless_field_cannot_confirm_a_clear_after_being_re_found_either() {
+        // The `Moved` half of the same hole: `matches` compares None to None during the search too,
+        // so one nameless editable elsewhere is found by identity alone. Refusing only on `AtId`
+        // would let this one through.
+        let after = under_a_container(tree(AxRole::TextField, None, Some(BOUNDS), true));
+        let t = target(0, None, Some(BOUNDS));
+        // Pin the arm: without this the fixture could drift onto AtId and still refuse, for the
+        // reason the test above already covers.
+        assert!(
+            matches!(t.relocate(&after), Located::Moved(n) if n.id == AxNodeId(1)),
+            "fixture must reach the Moved arm"
+        );
+        let err = verify_write(&after, &t, "").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(0, _)), "{err}");
+        assert!(
+            err.to_string().contains("no name"),
+            "refused for the identity, not for having relocated: {err}"
+        );
     }
 
     #[test]

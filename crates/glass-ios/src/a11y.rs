@@ -445,6 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn a_nameless_field_cannot_confirm_a_clear_after_being_re_found_either() {
+        // The `Moved` half of the same hole: `matches` compares None to None during the search too,
+        // so one nameless editable elsewhere is found by identity alone. Refusing only on `AtId`
+        // would let this one through.
+        let mut moved = leaf(0, AxRole::TextField, "Note", FIELD);
+        moved.name = None;
+        let after = tree_with(vec![leaf(0, AxRole::Label, "Suggestions", FIELD), moved]);
+        let mut target = matching_target();
+        target.name = None;
+        // Pin the arm: without this the fixture could drift onto AtId and still refuse, for the
+        // reason the test above already covers.
+        assert!(
+            matches!(target.relocate(&after), Located::Moved(n) if n.id == AxNodeId(2)),
+            "fixture must reach the Moved arm"
+        );
+        let err = verify_write(&after, &target, "").unwrap_err();
+        assert!(matches!(err, GlassError::AxWriteUnconfirmed(1, _)), "{err}");
+        assert!(
+            err.to_string().contains("no name"),
+            "refused for the identity, not for having relocated: {err}"
+        );
+    }
+
+    #[test]
     fn a_nameless_field_still_confirms_the_text_it_was_given() {
         // The identity is just as weak here; the typed text is what grounds it instead.
         let (after, target) = nameless(Some("world"));
