@@ -557,6 +557,16 @@ snapshot, does not hold the requested value afterwards, or the app exposes no ac
 field that reformats what it is given, and a cleared field that reports its placeholder as its text,
 both read as not applied even though the text arrived — read the element to see what it holds.
 
+One error is not a refusal: *the text was typed, but the write could not be confirmed*. The
+keystrokes went out and the read-back afterwards could not establish where they landed — it failed
+outright, several elements now match the one you named, nothing does, the read was cut short, or the
+element is no longer editable to read back. **Do not call `glass_set_value` again on that error** —
+the app has the text already, and writing again types it twice. Re-snapshot and read the element to
+see what it holds. When the message names a node cap, raising `max_nodes` on the snapshot is what
+fixes it. Clearing a field (`text: ""`) additionally needs the element to have a `name`: an empty
+field is not by itself evidence the clear landed on the element you meant, so a nameless one reports
+unconfirmed rather than a success it cannot prove.
+
 - `id` (integer, **required**) — the element's `#id`.
 - `text` (string, **required**) — the value to set.
 - `return` (string) — `"snapshot"`, `"settle"`, or `"none"` (default), as for `glass_click_element`.

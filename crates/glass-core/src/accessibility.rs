@@ -217,6 +217,31 @@ pub struct AxRect {
 }
 
 impl AxRect {
+    /// Whether this rect shares any area with `other`.
+    ///
+    /// Deliberately the weakest geometric relation there is: it admits a control that moved or
+    /// resized under a live app — measured, a field kept its origin and narrowed 1008→828px as its
+    /// clear button appeared — while still separating it from one drawn somewhere else entirely.
+    /// [`AxTarget::bounds_consistent`] is the strict counterpart, for a caller that can demand the
+    /// element has not moved at all. Edges are exclusive, matching
+    /// [`Self::visible_intersection`]'s emptiness test: a zero-area rect overlaps nothing.
+    ///
+    /// `i64` internally so a rect at `i32::MAX` cannot overflow its own right edge.
+    pub fn overlaps(&self, other: AxRect) -> bool {
+        fn edges(r: AxRect) -> (i64, i64, i64, i64) {
+            let (left, top) = (i64::from(r.x), i64::from(r.y));
+            (
+                left,
+                top,
+                left + i64::from(r.width),
+                top + i64::from(r.height),
+            )
+        }
+        let (l1, t1, r1, b1) = edges(*self);
+        let (l2, t2, r2, b2) = edges(other);
+        l1.max(l2) < r1.min(r2) && t1.max(t2) < b1.min(b2)
+    }
+
     /// The element's visible intersection with `[0,win_w) × [0,win_h)`, as
     /// `(left, top, right, bottom)`. `None` when the rect or window has zero area, or the element
     /// has no visible overlap with the window (fully clipped off-screen). Every actuation point
@@ -800,6 +825,25 @@ pub struct AxTarget {
     pub value: Option<String>,
 }
 
+/// Where a target turned up in a tree read after it was captured — see [`AxTarget::relocate`].
+#[derive(Debug)]
+pub enum Located<'a> {
+    /// Still at its own id. The common case, and the only one that needs no second, full-tree
+    /// search.
+    AtId(&'a AxNode),
+    /// One node elsewhere carries its role and name, in a tree complete enough for that to mean
+    /// it is the only one, and it overlaps where the target was.
+    Moved(&'a AxNode),
+    /// Several do, so the id no longer picks one out. Carries them for the error to name.
+    Ambiguous(Vec<&'a AxNode>),
+    /// None does, in a tree complete enough to say so.
+    Gone,
+    /// The tree cannot answer: it is missing part of itself (a cap fired, or a subtree could not be
+    /// read and it completed with a hole), or the one node carrying the identity is nowhere near
+    /// where the target was.
+    Unproven,
+}
+
 impl AxTarget {
     /// Whether a reached node's role + name match this target.
     pub fn matches(&self, role: AxRole, name: Option<&str>) -> bool {
@@ -822,6 +866,48 @@ impl AxTarget {
         walk(&tree.root, self)
     }
 
+    /// Where `tree` now holds this target, if anywhere.
+    ///
+    /// The id is a pre-order index, so anything inserted ahead of the element moves it: on the iOS
+    /// Simulator the focusing tap of a write raises the soft keyboard and shifts the field two places
+    /// (glass#359). Re-finding by identity rather than by index is what lets a read-back confirm a
+    /// write it just performed.
+    ///
+    /// Identity is role and name. Not `value`, which a write changes by definition, and not `bounds`,
+    /// which move under a live app. That leaves a weak key — on Android an editable's name is
+    /// usually its resource-id leaf, which names a *layout* and so repeats across every screen
+    /// built from it — so [`Located::Moved`] is not granted on the search alone. It also needs:
+    ///
+    /// * [`AxTree::is_complete`], because "one node matches" is a claim about the whole tree and a
+    ///   read that stopped early can only make it about the part it kept; and
+    /// * the candidate's bounds to *overlap* the target's, so a same-named field on a screen the
+    ///   write navigated to is not mistaken for the one that was written into.
+    ///
+    /// Overlap rather than equality: a control moves and resizes without going anywhere, so
+    /// [`AxRect::overlaps`] is the weakest test that still separates two screens. A side with no
+    /// bounds cannot contradict, and does not (see [`Self::bounds_overlap`]). Failing either
+    /// condition is [`Located::Unproven`] — refusing, not accepting on weaker evidence.
+    ///
+    /// The bounds are a disqualifier on acceptance, never part of the search: `matches` stays
+    /// role+name for the reason `still_present`'s doc gives.
+    pub fn relocate<'a>(&self, tree: &'a AxTree) -> Located<'a> {
+        if let Some(node) = tree.find(self.id)
+            && self.matches(node.role, node.name.as_deref())
+        {
+            return Located::AtId(node);
+        }
+        let mut candidates = Vec::new();
+        collect_matches(&tree.root, self, &mut candidates);
+        match candidates.len() {
+            1 if tree.is_complete() && self.bounds_overlap(candidates[0].bounds) => {
+                Located::Moved(candidates[0])
+            }
+            0 if tree.is_complete() => Located::Gone,
+            0 | 1 => Located::Unproven,
+            _ => Located::Ambiguous(candidates),
+        }
+    }
+
     /// Which of the two disagreements a tree that no longer agrees with this target has.
     ///
     /// [`GlassError::AxElementChanged`] sends the reader looking for where the element went, worth
@@ -832,10 +918,11 @@ impl AxTarget {
     /// An incomplete tree cannot support that second answer: it shows absence only for the part it
     /// kept, so one that is not [`AxTree::is_complete`] gets the recoverable `AxElementChanged`.
     ///
-    /// Keep this shared. The two snapshot-tree backends ask the same question, and their
-    /// `verify_write` twins drifted apart once already — Android learned to tell the cases apart in
-    /// glass#330, iOS not until glass#360. The desktop readers cannot use it: they re-resolve
-    /// against live platform elements and never hold an `AxTree` to search.
+    /// Lives in core rather than in its caller because the question is not Android's: any reader
+    /// holding an `AxTree` asks it before a write, and the desktop ones would if they had a tree
+    /// (they re-resolve against live platform elements instead). Its one production caller today is
+    /// `glass-android`'s `fingerprinted`; a write's *post*-dispatch read-back answers with
+    /// [`Self::relocate`] and [`GlassError::AxWriteUnconfirmed`], never with this.
     #[must_use]
     pub fn drift_error(&self, tree: &AxTree) -> GlassError {
         if self.still_present(tree) || !tree.is_complete() {
@@ -863,6 +950,17 @@ impl AxTarget {
         }
     }
 
+    /// Whether a reached element's bounds `got` still share any area with this target's captured
+    /// bounds. `true` when either side has none: an absent observation cannot contradict a present
+    /// one. The loose counterpart to [`Self::bounds_consistent`] — see [`AxRect::overlaps`] — and
+    /// what [`Self::relocate`] disqualifies a re-found candidate on.
+    pub fn bounds_overlap(&self, got: Option<AxRect>) -> bool {
+        match (self.bounds, got) {
+            (Some(a), Some(b)) => a.overlaps(b),
+            _ => true,
+        }
+    }
+
     /// Whether a reached element's value `got` is consistent with the value captured for this
     /// target. `true` when none was captured: a captured `None` says the element held no value
     /// then, not which element it was, so gating on it would make every element that never held
@@ -870,6 +968,16 @@ impl AxTarget {
     /// emptied field as no value at all, which is a real change, not a missing observation.
     pub fn value_consistent(&self, got: Option<&str>) -> bool {
         self.value.is_none() || self.value.as_deref() == got
+    }
+}
+
+/// Every node carrying `target`'s role and name, in pre-order.
+fn collect_matches<'a>(node: &'a AxNode, target: &AxTarget, out: &mut Vec<&'a AxNode>) {
+    if target.matches(node.role, node.name.as_deref()) {
+        out.push(node);
+    }
+    for child in &node.children {
+        collect_matches(child, target, out);
     }
 }
 
@@ -2047,6 +2155,185 @@ mod tests {
             drift_target().drift_error(&tree),
             GlassError::AxElementChanged(1)
         ));
+    }
+
+    #[test]
+    fn a_target_still_at_its_id_is_located_there() {
+        let tree = drift_tree(vec![leaf(AxRole::TextField, "Note")]);
+        assert!(matches!(drift_target().relocate(&tree), Located::AtId(n) if n.id == AxNodeId(1)));
+    }
+
+    #[test]
+    fn a_target_renumbered_is_located_at_its_new_id() {
+        // The measured case: the write's keyboard inserts a node ahead of the field.
+        let tree = drift_tree(vec![
+            leaf(AxRole::Label, "Suggestions"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Moved(n) if n.id == AxNodeId(2)));
+    }
+
+    #[test]
+    fn a_second_node_matching_the_target_refuses_rather_than_guessing() {
+        let tree = drift_tree(vec![
+            leaf(AxRole::Label, "Suggestions"),
+            leaf(AxRole::TextField, "Note"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Ambiguous(c) if c.len() == 2));
+    }
+
+    #[test]
+    fn a_target_nothing_matches_in_a_complete_tree_is_gone() {
+        let tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Gone));
+    }
+
+    #[test]
+    fn a_truncated_tree_cannot_prove_the_target_absent() {
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 1,
+            nodes_walked: 1,
+        });
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_dropped_subtree_cannot_prove_the_target_absent() {
+        // `unreadable` is independent of the caps.
+        let mut tree = drift_tree(vec![leaf(AxRole::Label, "No Results")]);
+        tree.unreadable = 1;
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    /// Where the measured iOS field sat before the write: origin `(99,2409)`, 1008px wide.
+    const CAPTURED: AxRect = AxRect {
+        x: 99,
+        y: 2409,
+        width: 1008,
+        height: 44,
+    };
+
+    /// The `TextField "Note"` `drift_target` names, drawn at `bounds`.
+    fn field_at(bounds: AxRect) -> AxNode {
+        let mut node = leaf(AxRole::TextField, "Note");
+        node.bounds = Some(bounds);
+        node
+    }
+
+    /// [`drift_target`], captured at `bounds` rather than with none.
+    fn target_at(bounds: AxRect) -> AxTarget {
+        AxTarget {
+            bounds: Some(bounds),
+            ..drift_target()
+        }
+    }
+
+    /// The renumbered-field tree, with `moved` standing in for the field at its new id.
+    fn renumbered(moved: AxNode) -> AxTree {
+        drift_tree(vec![leaf(AxRole::Label, "Suggestions"), moved])
+    }
+
+    #[test]
+    fn a_truncated_tree_cannot_prove_the_only_match_is_the_only_one() {
+        // Moved is a claim about the whole tree — this node and no other. A cap that fired makes it
+        // a claim about the part that was kept, and the second field may be the one past the cap.
+        let mut tree = renumbered(leaf(AxRole::TextField, "Note"));
+        tree.truncated = Some(Truncation {
+            limit: TruncationLimit::Nodes,
+            limit_value: 2,
+            nodes_walked: 2,
+        });
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_dropped_subtree_cannot_prove_the_only_match_is_the_only_one() {
+        // Independent of the caps: the read completed, with a hole the second field could be in.
+        let mut tree = renumbered(leaf(AxRole::TextField, "Note"));
+        tree.unreadable = 1;
+        assert!(matches!(drift_target().relocate(&tree), Located::Unproven));
+    }
+
+    #[test]
+    fn a_match_drawn_somewhere_else_is_not_the_element_that_moved() {
+        // An Android editable is usually named by its resource-id leaf, which names a layout rather
+        // than an instance, so a tap that navigates finds the next screen's field matching uniquely
+        // on role and name. Geometry is the only thing that says it is not the one written into.
+        let elsewhere = renumbered(field_at(AxRect { y: 120, ..CAPTURED }));
+        assert!(matches!(
+            target_at(CAPTURED).relocate(&elsewhere),
+            Located::Unproven
+        ));
+    }
+
+    #[test]
+    fn a_match_that_only_resized_is_still_the_element() {
+        // Why overlap and not equality: measured, the field kept its origin and narrowed 1008→828px
+        // as its clear button appeared. Demanding the same rect would refuse the very write the
+        // relocation exists to confirm.
+        let narrowed = renumbered(field_at(AxRect {
+            width: 828,
+            ..CAPTURED
+        }));
+        assert!(
+            matches!(target_at(CAPTURED).relocate(&narrowed), Located::Moved(n) if n.id == AxNodeId(2))
+        );
+    }
+
+    #[test]
+    fn bounds_disqualify_a_match_only_when_both_sides_have_them() {
+        // A missing observation cannot contradict a present one, on either side — and gating on one
+        // would make every element a backend reports without geometry unconfirmable.
+        let bounded = renumbered(field_at(CAPTURED));
+        assert!(matches!(
+            drift_target().relocate(&bounded),
+            Located::Moved(_)
+        ));
+        let unbounded = renumbered(leaf(AxRole::TextField, "Note"));
+        assert!(matches!(
+            target_at(CAPTURED).relocate(&unbounded),
+            Located::Moved(_)
+        ));
+    }
+
+    #[test]
+    fn a_genuine_match_at_the_id_beats_a_second_one_elsewhere() {
+        // The AtId fast path is checked before the search on purpose: the node on the target's own
+        // id carries its role and name, so the id does still pick one out, and a same-named control
+        // elsewhere does not make that ambiguous. Returning Ambiguous first leaves the rest green.
+        let tree = drift_tree(vec![
+            leaf(AxRole::TextField, "Note"),
+            leaf(AxRole::TextField, "Note"),
+        ]);
+        assert!(matches!(drift_target().relocate(&tree), Located::AtId(n) if n.id == AxNodeId(1)));
+    }
+
+    #[test]
+    fn rects_overlap_only_where_they_share_area() {
+        let a = AxRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(a.overlaps(AxRect { x: 9, y: 9, ..a }));
+        // Edge-to-edge is not shared area, and a zero-area rect covers nothing.
+        assert!(!a.overlaps(AxRect { x: 10, ..a }));
+        assert!(!a.overlaps(AxRect { y: 10, ..a }));
+        assert!(!a.overlaps(AxRect { width: 0, ..a }));
+    }
+
+    #[test]
+    fn a_node_at_the_id_that_is_not_the_target_does_not_shortcut_the_search() {
+        // The id resolves, but to something else; the field is elsewhere. Without the match check on
+        // the AtId path this would return the wrong node.
+        let mut occupied = leaf(AxRole::Button, "Cancel");
+        occupied.children = vec![leaf(AxRole::TextField, "Note")];
+        let tree = drift_tree(vec![occupied]);
+        assert!(matches!(drift_target().relocate(&tree), Located::Moved(n) if n.id == AxNodeId(2)));
     }
 
     #[test]
