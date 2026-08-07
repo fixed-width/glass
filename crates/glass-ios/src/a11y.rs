@@ -58,22 +58,31 @@ impl IosA11y {
     }
 }
 
-/// Re-walk to `target.id`, confirm role+name (and bounds when known), return its
-/// window-relative pixel bounds. Errors if the element drifted or vanished.
+/// Locate `target` in a tree described for the write and return its window-relative pixel bounds —
+/// the guard every write runs before it dispatches.
+///
+/// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id. The caller's snapshot
+/// and this describe are separate reads of a live app, so anything that shifted the tree between
+/// them renumbers the field without moving it — the soft keyboard an earlier write raised is the
+/// measured case, inserting two nodes ahead of it (glass#361). Same resolution the read-back uses,
+/// so a write is refused before it dispatches only where it would also be refused after.
+///
+/// Bounds are no longer compared against the snapshot's. [`Located::Moved`] already requires the
+/// re-found node to overlap where the target was, which is where bounds carry evidence; on
+/// [`Located::AtId`] the id and the identity already agree, and a field that legitimately moved
+/// should be tapped where it now is rather than refused.
+///
+/// Every refusal is pre-dispatch, so each is a typed drift verdict from
+/// [`AxTarget::drift_error`] — `AxElementGone` where nothing presents as the element, and
+/// `AxElementChanged` otherwise, truncation included (glass#361 replaced the `Backend` strings that
+/// told an agent to re-snapshot without saying which had happened).
 fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
-    let node = tree
-        .find(target.id)
-        .ok_or(GlassError::AxElementNotFound(target.id.0))?;
-    if !target.matches(node.role, node.name.as_deref()) {
-        return Err(GlassError::Backend(
-            "a11y set_value: element at that id changed since the snapshot; re-snapshot".into(),
-        ));
-    }
-    if !target.bounds_consistent(node.bounds, 2) {
-        return Err(GlassError::Backend(
-            "a11y set_value: element moved since the snapshot; re-snapshot".into(),
-        ));
-    }
+    let node = match target.relocate(tree) {
+        Located::AtId(node) | Located::Moved(node) => node,
+        Located::Ambiguous(_) | Located::Gone | Located::Unproven => {
+            return Err(target.drift_error(tree));
+        }
+    };
     // Android and macOS gate on this and iOS did not, which mattered once the write is checked: for
     // a non-editable node `axmap` puts the element's AXLabel in `value`, so a label that changed for
     // any reason inside the settle window would have read as a successful write into a Label.
@@ -81,7 +90,7 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
     node.bounds
-        .ok_or_else(|| GlassError::Backend("a11y set_value: element has no bounds".into()))
+        .ok_or(GlassError::AxElementNotClickable(target.id.0))
 }
 
 /// How long to let the app commit typed text before each read-back attempt. Generous next to a
@@ -213,7 +222,7 @@ impl Accessibility for IosA11y {
         let bounds = verify(&tree, target)?;
         let (cx, cy) = bounds
             .clamped_center(ctx.window.width, ctx.window.height)
-            .ok_or_else(|| GlassError::Backend("a11y set_value: element not on screen".into()))?;
+            .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
         // Focus by tapping the element, select-all + delete to clear, then type — all
         // through an injector at this describe's scale.
         let injector = IdbInjector::new(scale);
@@ -661,57 +670,88 @@ mod tests {
             bounds: Some(r),
             value: None,
         };
-        assert!(verify(&tree, &target).is_err());
-    }
-
-    #[test]
-    fn verify_rejects_missing_id() {
-        let r = AxRect {
-            x: 10,
-            y: 20,
-            width: 100,
-            height: 30,
-        };
-        // The tree only has ids 0 (root) and 1 (the field); id 9 resolves to nothing.
-        let tree = tree_with(vec![leaf(0, AxRole::TextField, "inputField", r)]);
-        let target = AxTarget {
-            id: AxNodeId(9),
-            role: AxRole::TextField,
-            name: Some("inputField".into()),
-            bounds: Some(r),
-            value: None,
-        };
-        // Pin the variant: an unresolved id must report AxElementNotFound (naming the id),
-        // not the generic AxUnsupported — both are `Err`, so `.is_err()` alone wouldn't guard it.
+        // Nothing in a complete tree carries the target's role, so the element is gone rather
+        // than merely changed.
         assert!(matches!(
             verify(&tree, &target),
-            Err(GlassError::AxElementNotFound(id)) if id == target.id.0
+            Err(GlassError::AxElementGone(1))
         ));
     }
 
     #[test]
-    fn verify_rejects_bounds_drift() {
-        let r = AxRect {
-            x: 10,
-            y: 20,
-            width: 100,
-            height: 30,
-        };
-        let tree = tree_with(vec![leaf(0, AxRole::TextField, "inputField", r)]);
-        // Same role+name, but the target's captured bounds sit far from the node's —
-        // beyond the tolerance, so a drifted id landing on a same-role element is rejected.
-        let target = AxTarget {
-            id: AxNodeId(1),
-            role: AxRole::TextField,
-            name: Some("inputField".into()),
-            bounds: Some(AxRect {
-                x: 200,
-                y: 400,
-                width: 100,
-                height: 30,
-            }),
-            value: None,
-        };
-        assert!(verify(&tree, &target).is_err());
+    fn a_renumbered_field_is_located_by_identity_before_the_write() {
+        // glass#361, the measured case: between the caller's snapshot and the write's own describe
+        // the soft keyboard inserted nodes ahead of the field, so its id now resolves elsewhere.
+        // The field itself never moved, and the write must reach it rather than refuse.
+        let tree = tree_with(vec![
+            leaf(0, AxRole::Label, "Suggestions", FIELD),
+            leaf(0, AxRole::TextField, "Note", FIELD),
+        ]);
+        assert_eq!(verify(&tree, &matching_target()).unwrap(), FIELD);
+    }
+
+    #[test]
+    fn a_field_that_moved_but_kept_its_id_is_tapped_where_it_now_is() {
+        // The tap is placed at the bounds this returns, so a field the keyboard pushed up the
+        // screen must yield its current rect. Comparing against the snapshot's would refuse a
+        // write that has nothing wrong with it.
+        let moved = AxRect { y: 600, ..FIELD };
+        let tree = tree_with(vec![leaf(0, AxRole::TextField, "Note", moved)]);
+        assert_eq!(verify(&tree, &matching_target()).unwrap(), moved);
+    }
+
+    #[test]
+    fn two_matching_fields_refuse_the_write_as_changed() {
+        // The id must land on something else first, or the AtId path would take the first one
+        // and never learn a second exists.
+        let tree = tree_with(vec![
+            leaf(0, AxRole::Label, "Suggestions", FIELD),
+            leaf(0, AxRole::TextField, "Note", FIELD),
+            leaf(0, AxRole::TextField, "Note", FIELD),
+        ]);
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_truncated_tree_refuses_the_write_as_changed_not_gone() {
+        // A cap that fired hides elements, so absence from what was kept is not absence — the
+        // element may be past the cap, which `AxElementGone` would assert it is not.
+        let mut tree = tree_with(vec![leaf(0, AxRole::Label, "No Results", FIELD)]);
+        tree.truncated = Some(glass_core::accessibility::Truncation {
+            limit: glass_core::accessibility::TruncationLimit::Nodes,
+            limit_value: 2,
+            nodes_walked: 2,
+        });
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementChanged(1))
+        ));
+    }
+
+    #[test]
+    fn a_non_editable_element_refuses_the_write() {
+        let mut field = leaf(0, AxRole::TextField, "Note", FIELD);
+        field.states.editable = false;
+        let tree = tree_with(vec![field]);
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementNotEditable(1))
+        ));
+    }
+
+    #[test]
+    fn an_element_without_bounds_refuses_the_write_as_not_clickable() {
+        // The write's only way in is a tap at the element's center, so a node reporting no
+        // geometry has to say that rather than fail later as a write that did not take.
+        let mut field = leaf(0, AxRole::TextField, "Note", FIELD);
+        field.bounds = None;
+        let tree = tree_with(vec![field]);
+        assert!(matches!(
+            verify(&tree, &matching_target()),
+            Err(GlassError::AxElementNotClickable(1))
+        ));
     }
 }
