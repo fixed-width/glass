@@ -282,14 +282,33 @@ fn read_displayfd(
     }
 }
 
+/// The pid inside `/tmp/.X{num}-lock`, which an X server fills with its own. The only way to
+/// tell a lock this server left behind from one the next server on that number just created.
+fn lock_holder(num: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/tmp/.X{num}-lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 impl Drop for Xvfb {
     fn drop(&mut self) {
+        let pid = self.child.id();
         glass_proc_linux::reap_graceful(&mut self.child, glass_proc_linux::REAP_GRACE);
-        // Fallback: Xvfb removes its own lock/socket on SIGTERM, but if it had to
-        // be SIGKILLed (ignored SIGTERM) they linger; clean them up.
-        if let Some(num) = self.display.strip_prefix(':') {
-            let _ = std::fs::remove_file(format!("/tmp/.X{num}-lock"));
+        // Fallback: Xvfb removes its own lock/socket on SIGTERM, but if it had to be
+        // SIGKILLed (ignored SIGTERM) they linger.
+        //
+        // Only when the lock still names OUR server. The display number is free the moment
+        // the process dies, so by the time this runs another Xvfb can already hold it, and
+        // removing unconditionally deletes a live server's socket — after which a start that
+        // reported ready refuses the very next connection. Socket first: nobody else can take
+        // the number while the lock we own is still there.
+        if let Some(num) = self.display.strip_prefix(':')
+            && lock_holder(num) == Some(pid)
+        {
             let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{num}"));
+            let _ = std::fs::remove_file(format!("/tmp/.X{num}-lock"));
         }
     }
 }
@@ -424,6 +443,32 @@ mod tests {
         assert!(
             cmdline.contains("pid.sh"),
             "the reported pid must be this fixture's server, not another process: {cmdline}"
+        );
+    }
+
+    #[test]
+    fn tearing_down_a_departed_server_leaves_its_reused_display_number_alone() {
+        // A display number is free the moment its server's process dies, so the next Xvfb can
+        // hold it before the previous one's cleanup runs. `departed` stands in for that
+        // previous server: same number, process already on its way out.
+        let live = Xvfb::start("640x480x24").expect("a server should start");
+        let display = live.display.clone();
+
+        let mut placeholder = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the placeholder");
+        let displayfd = placeholder.stdout.take().expect("piped stdout");
+        drop(Xvfb {
+            child: placeholder,
+            display: display.clone(),
+            displayfd,
+        });
+
+        assert!(
+            x11rb::connect(Some(&display)).is_ok(),
+            "{display} stopped answering when a server that no longer owned it was torn down"
         );
     }
 

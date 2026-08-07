@@ -80,7 +80,66 @@ impl TestX {
             rect: (0, 0, 200, 100),
             accepts_delete: false,
             map: true,
+            events: EventMask::NO_EVENT,
+            background: None,
         }
+    }
+
+    /// Where the pointer is, in root coordinates, and which buttons are down — how a test
+    /// sees the effect of XTEST motion and button events.
+    pub(crate) fn pointer(&self) -> (i16, i16, KeyButMask) {
+        let p = self
+            .conn
+            .query_pointer(self.root)
+            .expect("query_pointer")
+            .reply()
+            .expect("query_pointer reply");
+        (p.root_x, p.root_y, p.mask)
+    }
+
+    /// Whether `keycode` is currently held down, read from the server's own keyboard state.
+    pub(crate) fn key_is_down(&self, keycode: u8) -> bool {
+        let keys = self
+            .conn
+            .query_keymap()
+            .expect("query_keymap")
+            .reply()
+            .expect("query_keymap reply")
+            .keys;
+        keys[keycode as usize / 8] & (1 << (keycode % 8)) != 0
+    }
+
+    /// The window the server currently sends key events to.
+    pub(crate) fn focused(&self) -> Window {
+        self.conn
+            .get_input_focus()
+            .expect("get_input_focus")
+            .reply()
+            .expect("get_input_focus reply")
+            .focus
+    }
+
+    /// The whole keyboard mapping, as `keycode_for` reads it: `(min, max, per, keysyms)`.
+    pub(crate) fn keymap(&self) -> (u8, u8, usize, Vec<u32>) {
+        let setup = self.conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let m = self
+            .conn
+            .get_keyboard_mapping(min, max - min + 1)
+            .expect("get_keyboard_mapping")
+            .reply()
+            .expect("keyboard mapping reply");
+        (min, max, m.keysyms_per_keycode as usize, m.keysyms)
+    }
+
+    /// Drain and return every event queued for this client.
+    pub(crate) fn drain_events(&self, settle: Duration) -> Vec<Event> {
+        std::thread::sleep(settle);
+        let mut out = Vec::new();
+        while let Some(e) = self.conn.poll_for_event().expect("poll_for_event") {
+            out.push(e);
+        }
+        out
     }
 
     /// Publish `wins` as the root's `_NET_CLIENT_LIST`, the list a window manager maintains.
@@ -127,9 +186,28 @@ pub(crate) struct TestWindow<'a> {
     rect: (i16, i16, u16, u16),
     accepts_delete: bool,
     map: bool,
+    events: EventMask,
+    background: Option<u32>,
 }
 
 impl TestWindow<'_> {
+    /// Selects the input events XTEST synthesises, so a test can read back what the backend
+    /// actually sent rather than only that the call returned `Ok`.
+    pub(crate) fn watching_input(mut self) -> Self {
+        self.events = EventMask::KEY_PRESS
+            | EventMask::KEY_RELEASE
+            | EventMask::BUTTON_PRESS
+            | EventMask::BUTTON_RELEASE;
+        self
+    }
+
+    /// Fills the window with `pixel`, giving a capture something other than the root's black
+    /// to read.
+    pub(crate) fn filled_with(mut self, pixel: u32) -> Self {
+        self.background = Some(pixel);
+        self
+    }
+
     /// Sets `WM_NAME`, what `window_name` reads.
     pub(crate) fn named(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
@@ -177,6 +255,10 @@ impl TestWindow<'_> {
         let conn = &self.x.conn;
         let win = conn.generate_id().expect("generate_id");
         let (x, y, w, h) = self.rect;
+        let mut aux = CreateWindowAux::new().event_mask(self.events);
+        if let Some(pixel) = self.background {
+            aux = aux.background_pixel(pixel);
+        }
         conn.create_window(
             x11rb::COPY_DEPTH_FROM_PARENT,
             win,
@@ -188,7 +270,7 @@ impl TestWindow<'_> {
             0,
             WindowClass::INPUT_OUTPUT,
             self.x.root_visual,
-            &CreateWindowAux::new(),
+            &aux,
         )
         .expect("create_window");
 

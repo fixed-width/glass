@@ -243,13 +243,12 @@ mod tests {
     #[test]
     fn the_deep_probe_starts_a_real_display_and_takes_it_back_down() {
         let display = probe_xvfb().expect("the deep probe should start a display");
+        // Only the report is asserted. Whether the number still answers is not this test's
+        // to check: display numbers are a machine-wide namespace, and the next server to
+        // start — in this suite or outside it — takes the one the probe just released.
         assert!(
             display.starts_with(':'),
             "must report the display it came up on, got {display:?}"
-        );
-        assert!(
-            !can_connect(&display),
-            "{display} outlived the probe that started it"
         );
     }
 

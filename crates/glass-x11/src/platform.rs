@@ -688,19 +688,14 @@ impl X11Platform {
             .map_err(|e| GlassError::Backend(format!("get_keyboard_mapping: {e}")))?
             .reply()
             .map_err(|e| GlassError::Backend(format!("keyboard mapping reply: {e}")))?;
-        let per = mapping.keysyms_per_keycode as usize;
-        for kc in min..=max {
-            let base = (kc as usize - min as usize) * per;
-            if mapping.keysyms.get(base) == Some(&keysym) {
-                return Ok((kc, false));
-            }
-            if per > 1 && mapping.keysyms.get(base + 1) == Some(&keysym) {
-                return Ok((kc, true));
-            }
-        }
-        Err(GlassError::InvalidKey(format!(
-            "no keycode for keysym 0x{keysym:x}"
-        )))
+        keycode_in(
+            &mapping.keysyms,
+            mapping.keysyms_per_keycode as usize,
+            min,
+            max,
+            keysym,
+        )
+        .ok_or_else(|| GlassError::InvalidKey(format!("no keycode for keysym 0x{keysym:x}")))
     }
 
     fn modifier_keycode(&self, m: glass_core::keys::Modifier) -> Result<u8> {
@@ -875,18 +870,24 @@ impl X11Platform {
     }
 }
 
-/// Emit a one-line diagnostic when a capture was clipped to the display, so the
-/// smaller-than-requested frame the caller receives isn't a silent surprise.
-/// glass's own stderr is its diagnostic channel (same as the focus-on-launch
-/// warning); the MCP `screenshot` result additionally reports the true (clipped)
-/// dimensions, so a frame smaller than the window/region signals the clip.
-fn note_if_clipped(rect: &crate::coords::ClippedRect) {
-    if rect.clipped {
-        eprintln!(
+/// The diagnostic for a capture that was clipped to the display, or `None` when the whole
+/// requested rectangle was read — so the smaller-than-requested frame the caller receives
+/// isn't a silent surprise. glass's own stderr is its diagnostic channel (same as the
+/// focus-on-launch warning); the MCP `screenshot` result additionally reports the true
+/// (clipped) dimensions, so a frame smaller than the window/region signals the clip.
+fn clip_note(rect: &crate::coords::ClippedRect) -> Option<String> {
+    rect.clipped.then(|| {
+        format!(
             "glass: capture reached past the headless display and was clipped to the visible \
              {}x{} region at ({},{}); returning a partial frame",
             rect.w, rect.h, rect.sx, rect.sy
-        );
+        )
+    })
+}
+
+fn note_if_clipped(rect: &crate::coords::ClippedRect) {
+    if let Some(note) = clip_note(rect) {
+        eprintln!("{note}");
     }
 }
 
@@ -1400,6 +1401,25 @@ impl Drop for X11Platform {
     }
 }
 
+/// Search a `GetKeyboardMapping` table for `keysym`, returning the keycode that produces it
+/// and whether Shift is needed — column 0 is the unshifted keysym, column 1 the shifted one.
+///
+/// `keysyms` is the flat table for keycodes `min..=max`, `per` entries each. Split out from
+/// the request around it so the indexing is reachable from a test with a table it chose:
+/// against a live server every arithmetic slip here still lands on *some* real key.
+fn keycode_in(keysyms: &[u32], per: usize, min: u8, max: u8, keysym: u32) -> Option<(u8, bool)> {
+    for kc in min..=max {
+        let base = (kc as usize - min as usize) * per;
+        if keysyms.get(base) == Some(&keysym) {
+            return Some((kc, false));
+        }
+        if per > 1 && keysyms.get(base + 1) == Some(&keysym) {
+            return Some((kc, true));
+        }
+    }
+    None
+}
+
 fn button_number(button: glass_core::MouseButton) -> u8 {
     match button {
         glass_core::MouseButton::Left => 1,
@@ -1722,6 +1742,377 @@ mod display_tests {
         let win = x.window().owned_by(4242).create();
         x.set_client_list(&[win]);
         assert_eq!(plat.scan_all_windows(&[4242]).expect("scan"), vec![win]);
+    }
+
+    // --- XTEST input -----------------------------------------------------------------
+    //
+    // Every assertion here reads the server's own state or the events a watching window
+    // received. `Ok(())` from an input call means the request was written, not that anything
+    // moved — which is exactly what the mutants replacing these bodies return.
+
+    /// The keysym for a plain lowercase `a`, and for the shifted `A` on the same key.
+    const KEYSYM_A: u32 = 0x61;
+    const KEYSYM_SHIFT_A: u32 = 0x41;
+    const KEYSYM_SHIFT_L: u32 = 0xffe1;
+
+    /// Push the backend's buffered requests and wait for the server to have processed them.
+    /// The input primitives do not flush — the sinks above them commit a whole gesture at
+    /// once — and a flush alone would not be enough here anyway: these tests read the result
+    /// over a *second* connection, which is ordered against the first only by a round trip.
+    fn commit(plat: &X11Platform) {
+        plat.conn.sync().expect("sync");
+    }
+
+    #[test]
+    fn a_warp_moves_the_pointer_to_the_windows_origin_plus_the_offset() {
+        let x = TestX::start();
+        let plat = x.platform();
+        plat.warp(100, 50, 7, 9).expect("warp");
+        commit(&plat);
+        let (px, py, _) = x.pointer();
+        assert_eq!((px, py), (107, 59));
+    }
+
+    #[test]
+    fn a_button_press_is_held_until_it_is_released() {
+        let x = TestX::start();
+        let plat = x.platform();
+        plat.button(XT_BTN_PRESS, 1).expect("press");
+        commit(&plat);
+        assert!(
+            x.pointer().2.contains(KeyButMask::BUTTON1),
+            "button 1 should read as down between press and release"
+        );
+        plat.button(XT_BTN_RELEASE, 1).expect("release");
+        commit(&plat);
+        assert!(!x.pointer().2.contains(KeyButMask::BUTTON1));
+    }
+
+    /// The buttons a window watching input saw pressed, in order.
+    fn buttons_pressed(x: &TestX) -> Vec<u8> {
+        x.drain_events(Duration::from_millis(50))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::ButtonPress(b) => Some(b.detail),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_positive_scroll_clicks_the_positive_button_once_per_step() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let win = x
+            .window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.warp(0, 0, 10, 10).expect("warp into the window");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.scroll_button(4, 5, 3).expect("scroll");
+        commit(&plat);
+        assert_eq!(buttons_pressed(&x), vec![4, 4, 4], "window {win}");
+    }
+
+    #[test]
+    fn a_negative_scroll_clicks_the_negative_button_that_many_times() {
+        // The magnitude, not the signed value: a step count that stayed negative would
+        // produce an empty range and scroll nothing at all.
+        let x = TestX::start();
+        let plat = x.platform();
+        x.window()
+            .at(0, 0)
+            .sized(400, 400)
+            .watching_input()
+            .create();
+        plat.warp(0, 0, 10, 10).expect("warp into the window");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        plat.scroll_button(4, 5, -2).expect("scroll");
+        commit(&plat);
+        assert_eq!(buttons_pressed(&x), vec![5, 5]);
+    }
+
+    #[test]
+    fn an_unmapped_keysym_is_an_invalid_key_not_some_other_keycode() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let err = plat
+            .keycode_for(0x00ff_fffe)
+            .expect_err("a keysym no key produces has no keycode");
+        assert!(matches!(err, GlassError::InvalidKey(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_keysym_resolves_to_a_keycode_that_really_carries_it() {
+        // Checked against the server's own table rather than a hardcoded keycode, which
+        // varies with the keymap the runner happens to load.
+        let x = TestX::start();
+        let plat = x.platform();
+        let (min, _max, per, keysyms) = x.keymap();
+
+        let (kc, shifted) = plat.keycode_for(KEYSYM_A).expect("`a` must be typeable");
+        let base = (kc as usize - min as usize) * per;
+        assert!(!shifted, "plain `a` needs no Shift");
+        assert_eq!(keysyms.get(base), Some(&KEYSYM_A));
+
+        let (kc_upper, shifted_upper) = plat
+            .keycode_for(KEYSYM_SHIFT_A)
+            .expect("`A` must be typeable");
+        assert!(shifted_upper, "`A` is the shifted column of its key");
+        let base_upper = (kc_upper as usize - min as usize) * per;
+        assert_eq!(keysyms.get(base_upper + 1), Some(&KEYSYM_SHIFT_A));
+    }
+
+    #[test]
+    fn every_keysym_the_server_maps_can_be_resolved() {
+        // A mapping request one keycode short still resolves nearly everything; only the
+        // keys at the very end of the range go missing.
+        let x = TestX::start();
+        let plat = x.platform();
+        let (min, max, per, keysyms) = x.keymap();
+        let mut checked = 0;
+        for kc in min..=max {
+            let base = (kc as usize - min as usize) * per;
+            for col in 0..per.min(2) {
+                match keysyms.get(base + col) {
+                    Some(&sym) if sym != 0 => {
+                        assert!(
+                            plat.keycode_for(sym).is_ok(),
+                            "keysym 0x{sym:x} is on keycode {kc} but did not resolve"
+                        );
+                        checked += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(checked > 20, "the keymap looks empty ({checked} keysyms)");
+    }
+
+    #[test]
+    fn each_modifier_resolves_to_its_own_real_keycode() {
+        let x = TestX::start();
+        let plat = x.platform();
+        use glass_core::keys::Modifier;
+        let shift = plat.modifier_keycode(Modifier::Shift).expect("shift");
+        let control = plat.modifier_keycode(Modifier::Control).expect("control");
+        assert_eq!(
+            shift,
+            plat.keycode_for(KEYSYM_SHIFT_L).expect("shift sym").0
+        );
+        assert_ne!(
+            shift, control,
+            "distinct modifiers cannot share one keycode"
+        );
+    }
+
+    #[test]
+    fn tapping_a_keycode_presses_and_releases_it_at_the_focused_window() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().watching_input().create();
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+
+        let (kc, _) = plat.keycode_for(KEYSYM_A).expect("keycode");
+        plat.tap_keycode(kc).expect("tap");
+        commit(&plat);
+
+        let events = x.drain_events(Duration::from_millis(50));
+        let presses: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        let releases: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyRelease(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presses, vec![kc], "{events:?}");
+        assert_eq!(releases, vec![kc], "a tap must not leave the key down");
+    }
+
+    #[test]
+    fn pressing_modifiers_holds_them_down_and_releasing_lets_them_go() {
+        let x = TestX::start();
+        let plat = x.platform();
+        use glass_core::keys::Modifier;
+        let held = plat
+            .press_mods(&[Modifier::Shift, Modifier::Control])
+            .expect("press");
+        commit(&plat);
+        assert_eq!(
+            held,
+            vec![
+                plat.modifier_keycode(Modifier::Shift).unwrap(),
+                plat.modifier_keycode(Modifier::Control).unwrap()
+            ],
+            "the returned keycodes are what release_mods is given"
+        );
+        for kc in &held {
+            assert!(x.key_is_down(*kc), "keycode {kc} should be held down");
+        }
+        plat.release_mods(&held).expect("release");
+        commit(&plat);
+        for kc in &held {
+            assert!(!x.key_is_down(*kc), "keycode {kc} was left down");
+        }
+    }
+
+    /// The keycodes a watching window saw pressed while `f` ran, with focus already on it.
+    fn keys_pressed_during(
+        x: &TestX,
+        plat: &mut X11Platform,
+        f: impl FnOnce(&mut X11Platform),
+    ) -> Vec<u8> {
+        let win = x.window().watching_input().create();
+        plat.focus_window(win).expect("focus");
+        commit(plat);
+        let _ = x.drain_events(Duration::from_millis(50));
+        f(plat);
+        commit(plat);
+        x.drain_events(Duration::from_millis(50))
+            .into_iter()
+            .filter_map(|e| match e {
+                x11rb::protocol::Event::KeyPress(k) => Some(k.detail),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_uppercase_letter_is_typed_with_shift_held() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let pressed = keys_pressed_during(&x, &mut plat, |p| {
+            p.key_with_mods(KEYSYM_SHIFT_A, false, &[]).expect("type A");
+        });
+        assert!(
+            pressed.contains(&shift),
+            "`A` lives in the shifted column, so Shift must go down first: {pressed:?}"
+        );
+    }
+
+    #[test]
+    fn a_lowercase_letter_is_typed_without_shift() {
+        // Holding Shift for an unshifted key turns `a` into `A` at the application.
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let shift = plat
+            .modifier_keycode(glass_core::keys::Modifier::Shift)
+            .expect("shift");
+        let pressed = keys_pressed_during(&x, &mut plat, |p| {
+            p.key_with_mods(KEYSYM_A, false, &[]).expect("type a");
+        });
+        assert!(
+            !pressed.contains(&shift),
+            "Shift must not be pressed for a plain `a`: {pressed:?}"
+        );
+    }
+
+    #[test]
+    fn focusing_a_window_makes_the_server_route_keys_to_it() {
+        let x = TestX::start();
+        let mut plat = x.platform();
+        let win = x.window().create();
+        plat.focus_window(win).expect("focus");
+        commit(&plat);
+        assert_eq!(x.focused(), win);
+    }
+
+    // --- capture ---------------------------------------------------------------------
+
+    #[test]
+    fn a_zero_area_region_is_rejected_before_a_doomed_get_image() {
+        let x = TestX::start();
+        let plat = x.platform();
+        let geo = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 100,
+        };
+        let flat = Region {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 40,
+        };
+        assert!(
+            plat.resolve_capture_rect(&geo, Some(&flat)).is_err(),
+            "a region with no width has no pixels to read"
+        );
+        let thin = Region {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 0,
+        };
+        assert!(plat.resolve_capture_rect(&geo, Some(&thin)).is_err());
+        assert!(
+            plat.resolve_capture_rect(&geo, None).is_ok(),
+            "a window with area must still resolve"
+        );
+    }
+
+    #[test]
+    fn a_capture_reads_the_pixels_that_are_actually_on_screen() {
+        // Everything in the decode path — the plane mask, the depth lookup and the
+        // bytes-per-pixel it yields — is only observable in the pixels that come back.
+        let x = TestX::start();
+        let plat = x.platform();
+        x.window()
+            .at(0, 0)
+            .sized(64, 64)
+            .filled_with(0x00ff_0000)
+            .create();
+        x.flush();
+
+        let frame = plat.capture_screen_rect(0, 0, 64, 64).expect("capture");
+        assert_eq!((frame.width, frame.height), (64, 64));
+        let px = &frame.pixels[..4];
+        assert_eq!(
+            (px[0], px[1], px[2]),
+            (0xff, 0x00, 0x00),
+            "the red window should read back as red, got {px:?}"
+        );
+    }
+
+    #[test]
+    fn a_clip_note_is_produced_only_when_the_capture_was_clipped() {
+        use crate::coords::ClippedRect;
+        let clipped = ClippedRect {
+            sx: 0,
+            sy: 0,
+            w: 320,
+            h: 200,
+            clipped: true,
+        };
+        let note = clip_note(&clipped).expect("a clipped capture must say so");
+        assert!(note.contains("320x200"), "{note}");
+        assert!(
+            clip_note(&ClippedRect {
+                clipped: false,
+                ..clipped
+            })
+            .is_none(),
+            "an unclipped capture has nothing to report"
+        );
     }
 
     #[test]
